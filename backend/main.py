@@ -5,13 +5,15 @@ FastAPI app entry point.
 import os
 import sys
 from pathlib import Path
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from database import init_db
+from auth_utils import decode_token
 from routers import settings, chat, files, surgical, git, context, session_files
+from routers import auth as auth_router
 
 app = FastAPI(
     title="SurgicalAI",
@@ -31,7 +33,47 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Include routers
+# ─── JWT Auth Middleware ───────────────────────────────────────────────────────
+# Paths that do NOT require a token
+_OPEN_PATHS = {
+    "/api/health",
+    "/api/auth/login",
+    "/api/auth/setup",
+    "/api/auth/setup-required",
+}
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    path = request.url.path
+
+    # Always pass: CORS preflight, static frontend, open API paths
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    if not path.startswith("/api/"):
+        return await call_next(request)
+    if path in _OPEN_PATHS:
+        return await call_next(request)
+
+    # Extract Bearer token
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header.removeprefix("Bearer ").strip()
+
+    if not token:
+        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+
+    try:
+        payload = decode_token(token)
+        request.state.user_id = payload["sub"]
+        request.state.username = payload.get("username", "")
+        request.state.is_admin = bool(payload.get("is_admin", False))
+    except Exception:
+        return JSONResponse(status_code=401, content={"detail": "Invalid or expired token"})
+
+    return await call_next(request)
+
+
+# ─── Routers ──────────────────────────────────────────────────────────────────
+app.include_router(auth_router.router, prefix="/api/auth", tags=["auth"])
 app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
 app.include_router(chat.router, prefix="/api/chat", tags=["chat"])
 app.include_router(files.router, prefix="/api/files", tags=["files"])

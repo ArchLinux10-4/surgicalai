@@ -119,6 +119,30 @@ def init_db():
         )
     """)
 
+    # Users (auth)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            email TEXT,
+            hashed_password TEXT NOT NULL,
+            is_admin INTEGER DEFAULT 0,
+            is_active INTEGER DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_login TIMESTAMP
+        )
+    """)
+
+    # Add user_id to chat_sessions if missing (migration)
+    existing_cols = [
+        row[1]
+        for row in cursor.execute("PRAGMA table_info(chat_sessions)").fetchall()
+    ]
+    if "user_id" not in existing_cols:
+        cursor.execute(
+            "ALTER TABLE chat_sessions ADD COLUMN user_id TEXT REFERENCES users(id) ON DELETE SET NULL"
+        )
+
     # Insert defaults if not present
     defaults = {
         "architect_model": "gpt-4.1",

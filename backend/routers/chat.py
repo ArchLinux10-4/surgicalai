@@ -1,7 +1,7 @@
 """Chat router — standard AI chat with file context."""
 import uuid
 import json
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from models.schemas import ChatRequest, NewSessionRequest, ChatSession
 from database import get_db, get_setting
@@ -11,12 +11,13 @@ router = APIRouter()
 
 
 @router.post("/sessions")
-def create_session(req: NewSessionRequest):
+def create_session(req: NewSessionRequest, request: Request):
     session_id = str(uuid.uuid4())
+    user_id = getattr(request.state, "user_id", None)
     conn = get_db()
     conn.execute(
-        "INSERT INTO chat_sessions (id, title, file_path, model) VALUES (?, ?, ?, ?)",
-        (session_id, req.title, req.file_path, req.model or get_setting("architect_model", "gpt-4.1"))
+        "INSERT INTO chat_sessions (id, title, file_path, model, user_id) VALUES (?, ?, ?, ?, ?)",
+        (session_id, req.title, req.file_path, req.model or get_setting("architect_model", "gpt-4.1"), user_id)
     )
     conn.commit()
     conn.close()
@@ -24,16 +25,28 @@ def create_session(req: NewSessionRequest):
 
 
 @router.get("/sessions")
-def list_sessions():
+def list_sessions(request: Request):
+    user_id = getattr(request.state, "user_id", None)
     conn = get_db()
-    rows = conn.execute("""
-        SELECT s.*, COUNT(m.id) as message_count
-        FROM chat_sessions s
-        LEFT JOIN chat_messages m ON m.session_id = s.id
-        GROUP BY s.id
-        ORDER BY s.updated_at DESC
-        LIMIT 50
-    """).fetchall()
+    if user_id:
+        rows = conn.execute("""
+            SELECT s.*, COUNT(m.id) as message_count
+            FROM chat_sessions s
+            LEFT JOIN chat_messages m ON m.session_id = s.id
+            WHERE s.user_id = ? OR s.user_id IS NULL
+            GROUP BY s.id
+            ORDER BY s.updated_at DESC
+            LIMIT 50
+        """, (user_id,)).fetchall()
+    else:
+        rows = conn.execute("""
+            SELECT s.*, COUNT(m.id) as message_count
+            FROM chat_sessions s
+            LEFT JOIN chat_messages m ON m.session_id = s.id
+            GROUP BY s.id
+            ORDER BY s.updated_at DESC
+            LIMIT 50
+        """).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
