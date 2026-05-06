@@ -186,7 +186,7 @@ class SurgicalAnalyzeResponse(BaseModel):
 
 class SurgicalApplyRequest(BaseModel):
     file_path: str
-    change_id: str
+    change_id: Optional[str] = None
     changes: List[SurgicalChange]
     file_content: Optional[str] = None  # Required when file isn't on server disk (uploaded files)
 
@@ -196,6 +196,8 @@ class SurgicalApplyResponse(BaseModel):
     new_content: str
     applied_count: int
     backup_path: Optional[str] = None
+    cloud_mode: bool = False
+    modified_content: Optional[str] = None
 
 
 class SurgicalPreviewRequest(BaseModel):

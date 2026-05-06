@@ -89,6 +89,50 @@ export const api = {
       return controller
     },
 
+    smart: (
+      data: { session_id: string; message: string },
+      onProgress: (msg: string) => void,
+      onToken: (token: string) => void,
+      onResult: (result: any) => void,
+      onDone: (fullText: string) => void,
+      onError: (err: string) => void
+    ): AbortController => {
+      const controller = new AbortController()
+      const tokens: string[] = []
+
+      fetch(`${BASE}/chat/smart-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+        signal: controller.signal,
+      }).then(res => {
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+
+        const pump = () => reader.read().then(({ done, value }) => {
+          if (done) { onDone(tokens.join('')); return }
+          const text = decoder.decode(value, { stream: true })
+          for (const line of text.split('\n')) {
+            if (line.startsWith('data: ')) {
+              try {
+                const chunk = JSON.parse(line.slice(6))
+                if (chunk.type === 'progress') onProgress(chunk.content)
+                else if (chunk.type === 'token') { tokens.push(chunk.content); onToken(chunk.content) }
+                else if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
+                else if (chunk.type === 'done') onDone(tokens.join(''))
+                else if (chunk.type === 'error') onError(chunk.content)
+              } catch {}
+            }
+          }
+          pump()
+        }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
+
+        pump()
+      }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
+
+      return controller
+    },
+
     surgical: (data: any, onProgress: (msg: string) => void, onResult: (result: any) => void, onError: (err: string) => void): AbortController => {
       const controller = new AbortController()
 
@@ -123,6 +167,17 @@ export const api = {
 
       return controller
     },
+  },
+
+  sessionFiles: {
+    upload: (sessionId: string, data: { filename: string; content: string; language?: string }) =>
+      request<any>(`/chat/${sessionId}/files`, { method: 'POST', body: JSON.stringify(data) }),
+    list: (sessionId: string) =>
+      request<any[]>(`/chat/${sessionId}/files`),
+    get: (sessionId: string, fileId: string) =>
+      request<any>(`/chat/${sessionId}/files/${fileId}`),
+    delete: (sessionId: string, fileId: string) =>
+      request(`/chat/${sessionId}/files/${fileId}`, { method: 'DELETE' }),
   },
 
   context: {

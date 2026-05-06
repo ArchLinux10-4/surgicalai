@@ -11,7 +11,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 
 from database import init_db
-from routers import settings, chat, files, surgical, git, context
+from routers import settings, chat, files, surgical, git, context, session_files
 
 app = FastAPI(
     title="SurgicalAI",
@@ -38,6 +38,7 @@ app.include_router(files.router, prefix="/api/files", tags=["files"])
 app.include_router(surgical.router, prefix="/api/surgical", tags=["surgical"])
 app.include_router(git.router, prefix="/api/git", tags=["git"])
 app.include_router(context.router, prefix="/api/context", tags=["context"])
+app.include_router(session_files.router, prefix="/api/chat", tags=["session-files"])
 
 
 @app.on_event("startup")

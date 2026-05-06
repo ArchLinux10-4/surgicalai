@@ -787,3 +787,286 @@ def analyze_and_plan(
         changes=changes,
         tokens_used=0
     )
+
+
+# ─────────────────────────────────────────────────────────────
+# SMART PIPELINE — v1.3
+# Auto-detects edit vs chat, works across all session files
+# ─────────────────────────────────────────────────────────────
+
+SMART_ARCHITECT_SYSTEM = """You are SurgicalAI, an expert coding assistant.
+The user has uploaded code files and made a request. Your job:
+
+1. Determine if this is a CODE EDIT request or a QUESTION/CHAT request.
+2. If CODE EDIT: identify EXACTLY which file(s) and symbol(s) to change — no more, no less.
+3. If QUESTION: answer directly in markdown.
+
+CODE EDIT signals: "add", "change", "fix", "remove", "refactor", "rename", "update", "implement", "delete", "modify", "create function", "add method", etc.
+QUESTION signals: "explain", "what does", "how does", "why", "show me", "list", "summarize", "what is", etc.
+
+Output ONLY valid JSON:
+{
+  "intent": "edit" | "chat",
+  "reasoning": "one sentence: why edit vs chat and which files are relevant",
+  "chat_response": "full markdown answer (REQUIRED if intent=chat, omit if edit)",
+  "summary": "one sentence plan (REQUIRED if intent=edit)",
+  "targets": [
+    {
+      "filename": "exact filename as uploaded (e.g. settings.py)",
+      "symbol_path": "ClassName.method_name or just function_name",
+      "change_type": "modify|add|delete",
+      "description": "what changes in this symbol",
+      "new_logic": "detailed description of the new code to write",
+      "confidence": 8
+    }
+  ],
+  "risks": ["any concerns or caveats"]
+}
+
+IMPORTANT for edit intents:
+- Use the EXACT filename from the uploaded files list
+- Only target symbols that appear in the symbol map
+- For adding a new item inside a function (like adding to a list/dict), use change_type="modify" on that function"""
+
+
+async def run_smart_pipeline_stream(
+    session_files: list,
+    user_request: str,
+    conversation_history: list,
+    session_id: str = None,
+    project_memory: str = None,
+):
+    """
+    v1.3 Smart pipeline: given uploaded session files + a request,
+    auto-routes to surgical edit OR chat response.
+    Yields SSE chunks.
+
+    Chunk types:
+    - {type: "progress", content: "status message"}
+    - {type: "token", content: "text chunk"}  (for chat intent)
+    - {type: "smart_result", content: JSON string}  (for edit intent)
+    - {type: "done", content: ""}
+    - {type: "error", content: "error message"}
+    """
+    import asyncio
+
+    def sse(obj):
+        return f"data: {json.dumps(obj)}\n\n"
+
+    try:
+        if not session_files:
+            # No files — pure chat mode, stream response
+            yield sse({"type": "progress", "content": "No files uploaded — answering as chat..."})
+            chat_model = get_setting("architect_model", "gpt-4.1")
+            system = "You are SurgicalAI, an expert coding assistant. Be concise and precise. Use markdown."
+            if project_memory:
+                system += f"\n\n## Project Memory\n{project_memory}"
+            msgs = [{"role": "system", "content": system}] + conversation_history[-10:] + [{"role": "user", "content": user_request}]
+            client = _get_client()
+            stream = client.chat.completions.create(model=chat_model, messages=msgs, temperature=0.3, stream=True)
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield sse({"type": "token", "content": delta.content})
+            yield sse({"type": "done", "content": ""})
+            return
+
+        # Parse all session files
+        yield sse({"type": "progress", "content": f"Reading {len(session_files)} file(s)..."})
+
+        file_summaries = []
+        symbol_maps_by_name = {}
+
+        for sf in session_files:
+            fname = sf["filename"]
+            content = sf["content"]
+            try:
+                smap = parser.parse(content, fname)
+                symbol_maps_by_name[fname] = (smap, sf)
+                syms = []
+                for s in smap.symbols:
+                    entry = f"  [{s.symbol_type.value}] {s.full_path}"
+                    if s.signature:
+                        entry += f" — {s.signature}"
+                    entry += f" (lines {s.start_line}-{s.end_line})"
+                    syms.append(entry)
+                file_summaries.append(
+                    f"FILE: {fname} ({sf.get('lines', len(content.splitlines()))} lines, {sf.get('language', 'code')})\n"
+                    f"SYMBOLS:\n" + ("\n".join(syms[:40]) if syms else "  (no symbols parsed)")
+                )
+            except Exception as e:
+                file_summaries.append(f"FILE: {fname} — could not parse: {e}")
+                symbol_maps_by_name[fname] = (None, sf)
+
+        yield sse({"type": "progress", "content": "Architect analyzing your request..."})
+
+        # Format recent conversation history (last 6 turns)
+        hist_text = ""
+        for msg in conversation_history[-6:]:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")[:300]
+            hist_text += f"{role.upper()}: {content}\n"
+
+        context_msg = f"""UPLOADED FILES:
+{chr(10).join(file_summaries)}
+
+RECENT CONVERSATION:
+{hist_text if hist_text else "(new conversation)"}
+
+USER REQUEST:
+{user_request}"""
+
+        if project_memory:
+            context_msg = f"PROJECT MEMORY:\n{project_memory}\n\n" + context_msg
+
+        client = _get_client()
+        arch_model = get_setting("architect_model", "gpt-4.1")
+
+        response = client.chat.completions.create(
+            model=arch_model,
+            messages=[
+                {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
+                {"role": "user", "content": context_msg}
+            ],
+            temperature=0.3,
+            response_format={"type": "json_object"}
+        )
+
+        plan = json.loads(response.choices[0].message.content)
+        intent = plan.get("intent", "chat")
+
+        if intent == "chat":
+            chat_resp = plan.get("chat_response", "I analyzed your files. Here's what I found:\n\n" + plan.get("reasoning", ""))
+            yield sse({"type": "progress", "content": "Generating response..."})
+            # Stream word-by-word for nice UX
+            words = chat_resp.split(" ")
+            buffer = []
+            for word in words:
+                buffer.append(word)
+                if len(buffer) >= 4:
+                    yield sse({"type": "token", "content": " ".join(buffer) + " "})
+                    buffer = []
+                    await asyncio.sleep(0.008)
+            if buffer:
+                yield sse({"type": "token", "content": " ".join(buffer)})
+            yield sse({"type": "done", "content": ""})
+            return
+
+        # CODE EDIT intent — run surgical pipeline
+        targets = plan.get("targets", [])
+        if not targets:
+            # No targets identified — fall back to chat
+            fallback = f"I identified this as a code change, but couldn't pinpoint a specific symbol.\n\n**Reasoning:** {plan.get('reasoning', '')}\n\nTry being more specific, e.g.: \"In settings.py, add gpt-5 to the models list in get_available_models()\""
+            for word in fallback.split(" "):
+                yield sse({"type": "token", "content": word + " "})
+                await asyncio.sleep(0.005)
+            yield sse({"type": "done", "content": ""})
+            return
+
+        yield sse({"type": "progress", "content": f"Plan: {len(targets)} change(s). Running surgeon..."})
+
+        changes_by_file = {}
+
+        for i, target in enumerate(targets):
+            target_filename = target.get("filename", "")
+
+            # Find matching file (exact or suffix match)
+            matched_name = None
+            if target_filename in symbol_maps_by_name:
+                matched_name = target_filename
+            else:
+                for fn in symbol_maps_by_name:
+                    if fn.endswith(target_filename) or target_filename.endswith(fn):
+                        matched_name = fn
+                        break
+
+            if not matched_name:
+                continue
+
+            smap, sf = symbol_maps_by_name[matched_name]
+            if smap is None:
+                continue
+
+            yield sse({"type": "progress", "content": f"Surgeon: {matched_name} → {target.get('symbol_path', '?')} ({i+1}/{len(targets)})"})
+
+            symbol_path = target.get("symbol_path", "")
+            ct_str = target.get("change_type", "modify")
+
+            # Find symbol in map
+            symbol = None
+            for sym in smap.symbols:
+                if sym.full_path == symbol_path or sym.name == symbol_path:
+                    symbol = sym
+                    break
+
+            ct = ChangeType(ct_str) if ct_str in ("modify", "add", "delete", "refactor") else ChangeType.MODIFY
+
+            if symbol is None and ct == ChangeType.ADD:
+                parent_name = ".".join(symbol_path.split(".")[:-1])
+                if parent_name:
+                    symbol = next(
+                        (s for s in smap.symbols if s.full_path == parent_name or s.name == parent_name),
+                        None
+                    )
+                if symbol is None and smap.symbols:
+                    # Fall back to first class or last function
+                    symbol = next((s for s in smap.symbols if s.symbol_type.value == "class"), smap.symbols[0])
+
+            if symbol is None:
+                continue
+
+            change_target = ChangeTarget(
+                symbol_path=symbol_path,
+                change_type=ct,
+                description=target.get("description", ""),
+                new_logic=target.get("new_logic", ""),
+                dependencies=[],
+                confidence=target.get("confidence", 7)
+            )
+
+            new_code, confidence = run_surgeon(symbol, change_target, sf["content"])
+            diff = _make_diff(symbol.code, new_code, symbol_path)
+
+            change = SurgicalChange(
+                id=str(uuid.uuid4()),
+                symbol=symbol,
+                original_code=symbol.code,
+                new_code=new_code,
+                diff=diff,
+                confidence=confidence,
+                description=target.get("description", ""),
+                applied=False
+            )
+
+            if matched_name not in changes_by_file:
+                changes_by_file[matched_name] = {"file": sf, "changes": []}
+            changes_by_file[matched_name]["changes"].append(change)
+
+        if not changes_by_file:
+            fallback = f"I found the files but couldn't locate the specific symbol `{targets[0].get('symbol_path', '?')}`. Try uploading the exact file that contains it."
+            for word in fallback.split(" "):
+                yield sse({"type": "token", "content": word + " "})
+            yield sse({"type": "done", "content": ""})
+            return
+
+        result = {
+            "intent": "edit",
+            "summary": plan.get("summary", ""),
+            "reasoning": plan.get("reasoning", ""),
+            "risks": plan.get("risks", []),
+            "changes_by_file": {
+                fname: {
+                    "filename": fname,
+                    "file_id": data["file"]["id"],
+                    "changes": [c.model_dump() for c in data["changes"]],
+                }
+                for fname, data in changes_by_file.items()
+            },
+        }
+
+        yield sse({"type": "smart_result", "content": json.dumps(result)})
+        yield sse({"type": "done", "content": ""})
+
+    except Exception as e:
+        import traceback
+        yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"

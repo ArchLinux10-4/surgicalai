@@ -4,6 +4,8 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   content: string
   created_at: string
+  message_type?: string
+  surgical_data?: string
 }
 
 export interface ChatSession {
@@ -150,4 +152,27 @@ export interface StreamChunk {
   type: StreamChunkType
   content: string
   metadata?: Record<string, any>
+}
+
+export interface SessionFile {
+  id: string
+  session_id: string
+  filename: string
+  language: string
+  lines: number
+  symbol_count: number
+  created_at: string
+  content?: string  // only present when explicitly fetched
+}
+
+export interface SmartResult {
+  intent: 'edit' | 'chat'
+  summary: string
+  reasoning: string
+  risks: string[]
+  changes_by_file: Record<string, {
+    filename: string
+    file_id: string
+    changes: SurgicalChange[]
+  }>
 }

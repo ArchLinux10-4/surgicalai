@@ -71,6 +71,12 @@ interface AppState {
   // Impact analysis
   impactAnalysis: ImpactAnalysis | null
   setImpactAnalysis: (a: ImpactAnalysis | null) => void
+
+  // Session files (per-chat)
+  sessionFiles: import('../types').SessionFile[]
+  setSessionFiles: (files: import('../types').SessionFile[]) => void
+  addSessionFile: (file: import('../types').SessionFile) => void
+  removeSessionFile: (fileId: string) => void
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -136,4 +142,9 @@ export const useAppStore = create<AppState>((set) => ({
 
   impactAnalysis: null,
   setImpactAnalysis: (impactAnalysis) => set({ impactAnalysis }),
+
+  sessionFiles: [],
+  setSessionFiles: (sessionFiles) => set({ sessionFiles }),
+  addSessionFile: (file) => set((state) => ({ sessionFiles: [...state.sessionFiles.filter(f => f.filename !== file.filename), file] })),
+  removeSessionFile: (fileId) => set((state) => ({ sessionFiles: state.sessionFiles.filter(f => f.id !== fileId) })),
 }))

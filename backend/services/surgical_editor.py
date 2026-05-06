@@ -153,13 +153,24 @@ def apply_changes_to_file(
     if on_disk:
         with open(file_path, "w", encoding="utf-8") as f:
             f.write(current_content)
-
-    return SurgicalApplyResponse(
-        file_path=file_path,
-        new_content=current_content,
-        applied_count=applied_count,
-        backup_path=backup_path  # None signals cloud/in-memory mode to the frontend
-    )
+        return SurgicalApplyResponse(
+            file_path=file_path,
+            new_content=current_content,
+            applied_count=applied_count,
+            backup_path=backup_path,
+            cloud_mode=False,
+            modified_content=current_content
+        )
+    else:
+        # Cloud/in-memory mode — file was uploaded, not on disk
+        return SurgicalApplyResponse(
+            file_path=file_path,
+            new_content=current_content,
+            applied_count=applied_count,
+            backup_path=None,
+            cloud_mode=True,
+            modified_content=current_content
+        )
 
 
 def restore_backup(file_path: str, backup_path: str) -> bool:

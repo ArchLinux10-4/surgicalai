@@ -46,7 +46,15 @@ def get_messages(session_id: str):
         (session_id,)
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    msgs = []
+    for r in rows:
+        d = dict(r)
+        if d.get("content", "").startswith("__SURGICAL_RESULT__:"):
+            d["message_type"] = "surgical_result"
+            d["surgical_data"] = d["content"][len("__SURGICAL_RESULT__:"):]
+            d["content"] = ""  # don't render the raw JSON as text
+        msgs.append(d)
+    return msgs
 
 
 @router.post("/send")
@@ -227,3 +235,101 @@ def rename_session(session_id: str, body: dict):
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+@router.post("/smart-stream")
+async def smart_stream(req: dict):
+    """
+    v1.3 Smart unified endpoint.
+    Loads session files from DB, auto-routes to surgical edit or chat response.
+    """
+    from fastapi.responses import StreamingResponse
+    from services.pipeline import run_smart_pipeline_stream
+
+    session_id = req.get("session_id")
+    message = req.get("message", "")
+
+    if not get_setting("openai_api_key") and get_setting("ollama_enabled") != "true":
+        raise HTTPException(status_code=401, detail="No AI backend configured. Go to Settings.")
+
+    conn = get_db()
+
+    # Save user message
+    msg_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+        (msg_id, session_id, "user", message)
+    )
+
+    # Get conversation history
+    history = conn.execute(
+        "SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
+        (session_id,)
+    ).fetchall()
+    conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
+
+    # Load session files
+    file_rows = conn.execute(
+        "SELECT id, filename, content, language, lines, symbol_count FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
+        (session_id,)
+    ).fetchall()
+    session_files = [dict(r) for r in file_rows]
+
+    # Project memory
+    workspace = get_setting("workspace_path", "")
+    memory_row = conn.execute(
+        "SELECT content FROM project_memory WHERE workspace_path = ? LIMIT 1", (workspace,)
+    ).fetchone() if workspace else None
+    project_memory = memory_row["content"] if memory_row else None
+
+    conn.commit()
+    conn.close()
+
+    async def stream_and_save():
+        collected_tokens = []
+        result_content = None
+
+        async for chunk in run_smart_pipeline_stream(
+            session_files=session_files,
+            user_request=message,
+            conversation_history=conversation_history,
+            session_id=session_id,
+            project_memory=project_memory,
+        ):
+            if chunk.startswith("data: "):
+                try:
+                    import json as _json
+                    data = _json.loads(chunk[6:])
+                    if data.get("type") == "token":
+                        collected_tokens.append(data.get("content", ""))
+                    elif data.get("type") == "smart_result":
+                        result_content = data.get("content", "")
+                    elif data.get("type") == "done":
+                        # Save assistant message
+                        db = get_db()
+                        resp_id = str(uuid.uuid4())
+                        if result_content:
+                            # Store surgical result reference
+                            import json as _j
+                            res = _j.loads(result_content)
+                            saved_content = f"__SURGICAL_RESULT__:{result_content}"
+                        else:
+                            saved_content = "".join(collected_tokens)
+                        db.execute(
+                            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+                            (resp_id, session_id, "assistant", saved_content)
+                        )
+                        db.execute(
+                            "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (session_id,)
+                        )
+                        db.commit()
+                        db.close()
+                except Exception:
+                    pass
+            yield chunk
+
+    return StreamingResponse(stream_and_save(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })

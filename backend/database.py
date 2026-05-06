@@ -105,6 +105,20 @@ def init_db():
         )
     """)
 
+    # Per-session uploaded files
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS session_files (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            filename TEXT NOT NULL,
+            content TEXT NOT NULL,
+            language TEXT DEFAULT 'plaintext',
+            lines INTEGER DEFAULT 0,
+            symbol_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     # Insert defaults if not present
     defaults = {
         "architect_model": "gpt-4.1",
