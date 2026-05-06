@@ -1,12 +1,13 @@
 import React, { useEffect, useState, useRef } from 'react'
 import { useAppStore } from '../stores/appStore'
+import { useAuthStore } from '../stores/authStore'
 import { api } from '../api/client'
 import { FileNode } from '../types'
 import { toast } from '../lib/toast'
 import {
   Settings, MessageSquare, FolderOpen, RefreshCw, Plus,
   Search, Trash2, Pencil, Check, X, ChevronRight, ChevronDown,
-  Pin, BookOpen, Zap, MoreHorizontal, Upload, FileCode, File,
+  Pin, BookOpen, Zap, MoreHorizontal, Upload, FileCode, File, LogOut,
 } from 'lucide-react'
 import { ContextPanel } from './ContextPanel'
 
@@ -325,6 +326,55 @@ function SessionFilesPanel() {
 }
 
 // ── Sidebar Root ────────────────────────────────────
+// ── User Menu (avatar + logout) ─────────────────────
+function UserMenu() {
+  const { user, logout } = useAuthStore()
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [])
+
+  if (!user) return null
+
+  const initials = user.username.slice(0, 2).toUpperCase()
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen(!open)}
+        className="w-7 h-7 rounded-full bg-indigo-600 hover:bg-indigo-500 flex items-center justify-center text-white text-[11px] font-bold transition"
+        title={user.username}
+      >
+        {initials}
+      </button>
+      {open && (
+        <div className="absolute right-0 top-9 w-48 bg-surface border border-border rounded-xl shadow-xl z-50 py-1">
+          <div className="px-3 py-2 border-b border-border">
+            <p className="text-xs font-semibold text-ink truncate">{user.username}</p>
+            {user.email && <p className="text-[11px] text-faint truncate">{user.email}</p>}
+            {user.is_admin && (
+              <span className="inline-block mt-0.5 text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-400 font-medium">Admin</span>
+            )}
+          </div>
+          <button
+            onClick={() => { logout(); setOpen(false) }}
+            className="w-full flex items-center gap-2 px-3 py-2 text-xs text-red-400 hover:bg-overlay transition"
+          >
+            <LogOut size={13} />
+            Sign out
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function Sidebar() {
   const { sidebarTab, setSidebarTab, setSettingsOpen } = useAppStore()
 
@@ -342,9 +392,12 @@ export function Sidebar() {
           <Zap size={16} className="text-accent" />
           <span className="text-sm font-bold text-ink tracking-tight">SurgicalAI</span>
         </div>
-        <button onClick={() => setSettingsOpen(true)} className="btn-icon" title="Settings (⌘,)">
-          <Settings size={15} />
-        </button>
+        <div className="flex items-center gap-1">
+          <button onClick={() => setSettingsOpen(true)} className="btn-icon" title="Settings (⌘,)">
+            <Settings size={15} />
+          </button>
+          <UserMenu />
+        </div>
       </div>
 
       {/* Tab switcher */}

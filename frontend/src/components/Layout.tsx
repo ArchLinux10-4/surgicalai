@@ -3,9 +3,17 @@ import { Sidebar } from './Sidebar'
 import { ChatPanel } from './ChatPanel'
 import { CodePanel } from './CodePanel'
 import { useAppStore } from '../stores/appStore'
+import { useAuthStore } from '../stores/authStore'
+import { LoginPage } from '../pages/LoginPage'
 
 export function Layout() {
   const activeFile = useAppStore(s => s.activeFile)
+  const { isAuthenticated } = useAuthStore()
+
+  // Show login/setup screen until authenticated
+  if (!isAuthenticated) {
+    return <LoginPage />
+  }
 
   return (
     <div className="flex flex-1 overflow-hidden">

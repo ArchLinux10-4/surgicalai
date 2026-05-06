@@ -2,9 +2,26 @@ import type { StreamChunk, PinnedContext, ProjectMemory, PromptTemplate, ImpactA
 
 const BASE = (import.meta.env.VITE_API_URL ?? '') + '/api'
 
+/** Read JWT from persisted auth store without importing zustand (avoids circular deps). */
+function getAuthToken(): string | null {
+  try {
+    const raw = localStorage.getItem('surgicalai-auth')
+    if (!raw) return null
+    const parsed = JSON.parse(raw)
+    return parsed?.state?.token ?? null
+  } catch {
+    return null
+  }
+}
+
+function authHeaders(): Record<string, string> {
+  const token = getAuthToken()
+  return token ? { Authorization: `Bearer ${token}` } : {}
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
-    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(), ...options?.headers },
     ...options,
   })
   if (!res.ok) {
@@ -12,6 +29,28 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     throw new Error(err.detail || `HTTP ${res.status}`)
   }
   return res.json()
+}
+
+/** Axios-like client for use in auth flows (open endpoints that don't need token). */
+export const apiClient = {
+  get: async (path: string) => {
+    const url = (import.meta.env.VITE_API_URL ?? '') + path
+    const res = await fetch(url, { headers: { 'Content-Type': 'application/json' } })
+    const data = await res.json()
+    if (!res.ok) throw { response: { data } }
+    return { data }
+  },
+  post: async (path: string, body: any) => {
+    const url = (import.meta.env.VITE_API_URL ?? '') + path
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    const data = await res.json()
+    if (!res.ok) throw { response: { data } }
+    return { data }
+  },
 }
 
 // Settings
@@ -60,7 +99,7 @@ export const api = {
 
       fetch(`${BASE}/chat/stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify(data),
         signal: controller.signal,
       }).then(res => {
@@ -106,7 +145,7 @@ export const api = {
 
       fetch(`${BASE}/chat/smart-stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify(data),
         signal: controller.signal,
       }).then(res => {
@@ -142,7 +181,7 @@ export const api = {
 
       fetch(`${BASE}/surgical/analyze-stream`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify(data),
         signal: controller.signal,
       }).then(res => {
