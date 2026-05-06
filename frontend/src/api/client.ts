@@ -25,6 +25,14 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     ...options,
   })
   if (!res.ok) {
+    // Auto-logout if the server says our token is invalid/expired
+    if (res.status === 401) {
+      try {
+        localStorage.removeItem('surgicalai-auth')
+      } catch {}
+      // Reload to show login screen
+      window.location.reload()
+    }
     const err = await res.json().catch(() => ({ detail: res.statusText }))
     throw new Error(err.detail || `HTTP ${res.status}`)
   }

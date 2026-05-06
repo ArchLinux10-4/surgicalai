@@ -5,6 +5,7 @@ FastAPI app entry point.
 import os
 import sys
 from pathlib import Path
+import re as _re
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -42,6 +43,25 @@ _OPEN_PATHS = {
     "/api/auth/setup-required",
 }
 
+def _get_cors_headers(request: Request) -> dict:
+    """
+    Auth middleware runs OUTSIDE CORSMiddleware (added later = outermost).
+    So 401 responses need CORS headers added manually, otherwise the browser
+    sees a network error instead of a clean 401.
+    """
+    origin = request.headers.get("origin", "")
+    if not origin:
+        return {}
+    extra = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+    allowed_list = ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"] + extra
+    if origin in allowed_list or _re.match(r"https://.*\.vercel\.app", origin):
+        return {
+            "Access-Control-Allow-Origin": origin,
+            "Access-Control-Allow-Credentials": "true",
+            "Vary": "Origin",
+        }
+    return {}
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
@@ -59,7 +79,11 @@ async def auth_middleware(request: Request, call_next):
     token = auth_header.removeprefix("Bearer ").strip()
 
     if not token:
-        return JSONResponse(status_code=401, content={"detail": "Not authenticated"})
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Not authenticated"},
+            headers=_get_cors_headers(request),
+        )
 
     try:
         payload = decode_token(token)
@@ -67,7 +91,11 @@ async def auth_middleware(request: Request, call_next):
         request.state.username = payload.get("username", "")
         request.state.is_admin = bool(payload.get("is_admin", False))
     except Exception:
-        return JSONResponse(status_code=401, content={"detail": "Invalid or expired token"})
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Invalid or expired token"},
+            headers=_get_cors_headers(request),
+        )
 
     return await call_next(request)
 
