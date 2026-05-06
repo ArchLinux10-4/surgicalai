@@ -19,10 +19,13 @@ app = FastAPI(
     version="1.1.0"
 )
 
-# CORS for local development
+# CORS — allow local dev + any cloud origins set via ALLOWED_ORIGINS env var
+_cors_extra = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+_cors_origins = ["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"] + _cors_extra
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000", "http://127.0.0.1:5173"],
+    allow_origins=_cors_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
