@@ -2,9 +2,11 @@ import React, { useState, useEffect } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
-import { X, Eye, EyeOff, CheckCircle, Key, Brain, FolderOpen, Code, Cpu, Sliders } from 'lucide-react'
+import { X, Eye, EyeOff, CheckCircle, Key, Brain, FolderOpen, Code, Cpu, Sliders, Users } from 'lucide-react'
+import { AdminUsersPanel } from './AdminUsersPanel'
+import { useAuthStore } from '../stores/authStore'
 
-type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'local'
+type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'local' | 'users'
 
 const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'api',       icon: <Key size={14} />,       label: 'API Keys' },
@@ -12,6 +14,7 @@ const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'workspace', icon: <FolderOpen size={14} />, label: 'Workspace' },
   { id: 'editor',    icon: <Code size={14} />,       label: 'Editor' },
   { id: 'local',     icon: <Cpu size={14} />,        label: 'Local AI' },
+  { id: 'users',    icon: <Users size={14} />,     label: 'Users' },
 ]
 
 export function SettingsModal() {
@@ -266,13 +269,18 @@ export function SettingsModal() {
                 )}
               </div>
             )}
+            {tab === 'users' && (
+              <div className="space-y-5">
+                <AdminUsersPanel />
+              </div>
+            )}
           </div>
         </div>
 
         {/* Footer */}
         <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-border flex-shrink-0">
           <button onClick={() => setSettingsOpen(false)} className="btn-ghost border border-border px-5 py-2 text-sm">Cancel</button>
-          <button onClick={handleSave} className="btn-primary px-6">Save Settings</button>
+          {tab !== 'users' && <button onClick={handleSave} className="btn-primary px-6">Save Settings</button>}
         </div>
       </div>
     </div>
