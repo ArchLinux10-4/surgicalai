@@ -159,7 +159,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
             <div className="flex items-center gap-2 px-4 py-1.5 bg-zinc-900 border-b border-zinc-800/60">
               <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Diff Preview</span>
               <span className="text-[10px] text-zinc-600 ml-auto">
-                {change.diff.split('\n').filter((l: string) => l.startsWith('+')).length - 1} added &nbsp;·&nbsp;
+                {change.diff.split('\n').filter((l: string) => l.startsWith('+')).length - 1} added{' \u00b7 '}
                 {change.diff.split('\n').filter((l: string) => l.startsWith('-')).length - 1} removed
               </span>
             </div>
@@ -168,7 +168,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
                 <DiffLine key={i} line={line} />
               ))}
             </div>
-          </div>
           </div>
 
           {/* Action buttons */}
