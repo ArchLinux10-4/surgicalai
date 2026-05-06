@@ -5,10 +5,62 @@ import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import { InlineDiffCard } from './InlineDiffCard'
+import { MarkdownCode } from './CodeBlock'
 import {
   Send, X, Plus, Paperclip, FileCode, AlertTriangle, Zap, Trash2
 } from 'lucide-react'
 import type { SessionFile, SmartResult } from '../types'
+
+// ── Markdown component overrides ──────────────────────────
+const mdComponents = {
+  code: MarkdownCode as any,
+  // Beautiful prose overrides
+  h1: ({ children }: any) => (
+    <h1 className="text-lg font-bold text-zinc-100 mt-5 mb-2 border-b border-zinc-700/50 pb-1.5">{children}</h1>
+  ),
+  h2: ({ children }: any) => (
+    <h2 className="text-base font-bold text-zinc-100 mt-4 mb-1.5">{children}</h2>
+  ),
+  h3: ({ children }: any) => (
+    <h3 className="text-sm font-semibold text-zinc-200 mt-3 mb-1">{children}</h3>
+  ),
+  p: ({ children }: any) => (
+    <p className="text-sm text-zinc-300 leading-7 mb-3 last:mb-0">{children}</p>
+  ),
+  ul: ({ children }: any) => (
+    <ul className="my-2 space-y-1 pl-1">{children}</ul>
+  ),
+  ol: ({ children }: any) => (
+    <ol className="my-2 space-y-1 pl-1 list-decimal list-inside">{children}</ol>
+  ),
+  li: ({ children }: any) => (
+    <li className="flex items-start gap-2 text-sm text-zinc-300 leading-6">
+      <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-blue-400/70 flex-shrink-0 list-none" />
+      <span>{children}</span>
+    </li>
+  ),
+  blockquote: ({ children }: any) => (
+    <blockquote className="my-3 pl-4 border-l-2 border-blue-500/50 text-zinc-400 italic text-sm leading-6">{children}</blockquote>
+  ),
+  strong: ({ children }: any) => (
+    <strong className="font-semibold text-zinc-100">{children}</strong>
+  ),
+  em: ({ children }: any) => (
+    <em className="text-zinc-300 italic">{children}</em>
+  ),
+  a: ({ children, href }: any) => (
+    <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors">{children}</a>
+  ),
+  hr: () => <hr className="my-4 border-zinc-700/50" />,
+  table: ({ children }: any) => (
+    <div className="my-3 overflow-x-auto rounded-lg border border-zinc-700/60">
+      <table className="w-full text-sm">{children}</table>
+    </div>
+  ),
+  thead: ({ children }: any) => <thead className="bg-zinc-800/80">{children}</thead>,
+  th: ({ children }: any) => <th className="px-3 py-2 text-left text-xs font-semibold text-zinc-300 uppercase tracking-wide">{children}</th>,
+  td: ({ children }: any) => <td className="px-3 py-2 text-zinc-400 text-sm border-t border-zinc-700/40">{children}</td>,
+}
 
 // ── Helpers ───────────────────────────────────────────────
 function getLanguage(filename: string): string {
@@ -24,40 +76,62 @@ function getLanguage(filename: string): string {
   return m[ext] || 'plaintext'
 }
 
+// ── AI avatar ─────────────────────────────────────────────
+function AIAvatar() {
+  return (
+    <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center flex-shrink-0 shadow-md shadow-blue-500/20">
+      <Zap size={14} className="text-white" />
+    </div>
+  )
+}
+
 // ── Message bubble ────────────────────────────────────────
 function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
   const isUser = msg.role === 'user'
   const isSurgical = msg.message_type === 'surgical_result'
+  const time = msg.created_at
+    ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    : ''
 
   let surgicalResult: SmartResult | null = null
   if (isSurgical && msg.surgical_data) {
     try { surgicalResult = JSON.parse(msg.surgical_data) } catch {}
   }
 
-  return (
-    <div className={`px-4 py-3 border-b border-zinc-800/50 ${isUser ? 'bg-zinc-800/30' : 'bg-zinc-900/30'}`}>
-      <div className="flex items-center gap-2 mb-1.5">
-        <div className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold flex-shrink-0 ${
-          isUser ? 'bg-blue-500/20 text-blue-400' : 'bg-green-500/20 text-green-400'
-        }`}>
-          {isUser ? 'U' : 'AI'}
+  // ── User bubble (right-aligned) ──
+  if (isUser) {
+    return (
+      <div className="flex justify-end px-4 py-3 group">
+        <div className="max-w-[78%]">
+          <div className="flex items-center justify-end gap-2 mb-1">
+            <span className="text-[10px] text-zinc-600 opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
+            <span className="text-[11px] font-medium text-zinc-500">You</span>
+          </div>
+          <div className="bg-zinc-700/60 border border-zinc-600/40 rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm text-zinc-100 leading-relaxed whitespace-pre-wrap shadow-sm">
+            {msg.content}
+          </div>
         </div>
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">
-          {isUser ? 'You' : 'SurgicalAI'}
-        </span>
-        <span className="text-[10px] text-zinc-600 ml-auto">
-          {msg.created_at ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
-        </span>
       </div>
+    )
+  }
 
-      <div className="pl-7">
+  // ── AI bubble (left-aligned) ──
+  return (
+    <div className="flex items-start gap-3 px-4 py-4 group">
+      <AIAvatar />
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-2">
+          <span className="text-[12px] font-semibold text-zinc-300">SurgicalAI</span>
+          <span className="text-[10px] text-zinc-600 opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
+        </div>
+
         {isSurgical && surgicalResult ? (
           <InlineDiffCard result={surgicalResult} sessionId={sessionId} />
-        ) : isUser ? (
-          <div className="text-sm text-zinc-200 leading-relaxed whitespace-pre-wrap">{msg.content}</div>
         ) : (
-          <div className="markdown-body text-sm text-zinc-200">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
+          <div className="prose-ai">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+              {msg.content}
+            </ReactMarkdown>
           </div>
         )}
       </div>
@@ -68,22 +142,34 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
 // ── Streaming bubble ──────────────────────────────────────
 function StreamingBubble({ content, progress }: { content: string; progress: string }) {
   return (
-    <div className="px-4 py-3 border-b border-zinc-800/50 bg-zinc-900/30">
-      <div className="flex items-center gap-2 mb-1.5">
-        <div className="w-5 h-5 rounded-full bg-green-500/20 text-green-400 flex items-center justify-center text-[10px] font-bold">AI</div>
-        <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">SurgicalAI</span>
-        {progress && (
-          <span className="text-[11px] text-blue-400 ml-2 flex items-center gap-1">
-            <span className="animate-spin inline-block text-xs">◌</span> {progress}
-          </span>
-        )}
+    <div className="flex items-start gap-3 px-4 py-4">
+      {/* Pulsing avatar while streaming */}
+      <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center flex-shrink-0 shadow-md shadow-blue-500/20 animate-pulse">
+        <Zap size={14} className="text-white" />
       </div>
-      {content && (
-        <div className="markdown-body text-sm text-zinc-200 pl-7">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
+
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-2">
+          <span className="text-[12px] font-semibold text-zinc-300">SurgicalAI</span>
+          {progress && (
+            <span className="text-[11px] text-blue-400 flex items-center gap-1.5 bg-blue-500/10 px-2 py-0.5 rounded-full border border-blue-500/20">
+              <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+              {progress}
+            </span>
+          )}
         </div>
-      )}
-      <span className="inline-block w-2 h-3.5 bg-blue-400 rounded-sm ml-7 align-text-bottom mt-1 animate-pulse" />
+
+        {content ? (
+          <div className="prose-ai">
+            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+              {content}
+            </ReactMarkdown>
+          </div>
+        ) : null}
+
+        {/* Blinking cursor */}
+        <span className="inline-block w-2 h-[1.1em] bg-blue-400/80 rounded-sm align-text-bottom ml-0.5 animate-pulse" />
+      </div>
     </div>
   )
 }
@@ -425,20 +511,22 @@ export function ChatPanel() {
         {messages.length === 0 && !isStreaming ? (
           <EmptyState onUpload={() => fileInputRef.current?.click()} />
         ) : (
-          messages.map((msg, i) => (
-            <Message key={msg.id || i} msg={msg} sessionId={activeSessions || ''} />
-          ))
-        )}
-        {isStreaming && (streamingMessage || streamProgress) && (
-          <StreamingBubble content={streamingMessage} progress={streamProgress} />
-        )}
-        {error && (
-          <div className="mx-4 my-3 flex items-start gap-2.5 px-3.5 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-sm text-red-400">
-            <AlertTriangle size={15} className="flex-shrink-0 mt-0.5" />
-            <span>{error}</span>
-            <button onClick={() => setError(null)} className="ml-auto p-0.5 hover:text-red-300">
-              <X size={11} />
-            </button>
+          <div className="py-2">
+            {messages.map((msg, i) => (
+              <Message key={msg.id || i} msg={msg} sessionId={activeSessions || ''} />
+            ))}
+            {isStreaming && (streamingMessage || streamProgress) && (
+              <StreamingBubble content={streamingMessage} progress={streamProgress} />
+            )}
+            {error && (
+              <div className="mx-4 my-3 flex items-start gap-2.5 px-3.5 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-sm text-red-400">
+                <AlertTriangle size={15} className="flex-shrink-0 mt-0.5" />
+                <span>{error}</span>
+                <button onClick={() => setError(null)} className="ml-auto p-0.5 hover:text-red-300">
+                  <X size={11} />
+                </button>
+              </div>
+            )}
           </div>
         )}
         <div ref={bottomRef} />
