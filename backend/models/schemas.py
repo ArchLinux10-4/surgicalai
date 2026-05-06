@@ -188,6 +188,7 @@ class SurgicalApplyRequest(BaseModel):
     file_path: str
     change_id: str
     changes: List[SurgicalChange]
+    file_content: Optional[str] = None  # Required when file isn't on server disk (uploaded files)
 
 
 class SurgicalApplyResponse(BaseModel):

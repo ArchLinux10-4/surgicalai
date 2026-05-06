@@ -174,15 +174,29 @@ export function SurgicalPanel() {
         file_path: activeFile.path,
         change_id: changeId,
         changes: changes,
+        file_content: activeFile.content,
       })
       setActiveFile({ ...activeFile, content: result.new_content })
       setAppliedIds(prev => new Set([...prev, changeId]))
+      // Cloud mode: file was uploaded (not on server disk) — offer download
+      if (!result.backup_path) {
+        const blob = new Blob([result.new_content], { type: 'text/plain' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = activeFile.path.split('/').pop() || 'modified_file'
+        a.click()
+        URL.revokeObjectURL(url)
+        toast.success('Change applied — modified file downloaded!')
+      }
       if (activeSessions) {
         addMessage({
           id: Date.now().toString(),
           session_id: activeSessions,
           role: 'assistant',
-          content: `✅ Applied change to \`${changes.find(c => c.id === changeId)?.symbol.full_path}\`. Backup saved.`,
+          content: result.backup_path
+            ? `✅ Applied change to \`${changes.find(c => c.id === changeId)?.symbol.full_path}\`. Backup saved.`
+            : `✅ Applied change to \`${changes.find(c => c.id === changeId)?.symbol.full_path}\`. Modified file downloaded (cloud mode).`,
           created_at: new Date().toISOString()
         })
       }
@@ -202,7 +216,19 @@ export function SurgicalPanel() {
         file_path: activeFile.path,
         change_id: toApply[0].id,
         changes: toApply,
+        file_content: activeFile.content,
       })
+      // Cloud mode: file was uploaded (not on server disk) — offer download
+      if (!result.backup_path) {
+        const blob = new Blob([result.new_content], { type: 'text/plain' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = activeFile.path.split('/').pop() || 'modified_file'
+        a.click()
+        URL.revokeObjectURL(url)
+        toast.success('All changes applied — modified file downloaded!')
+      }
       setActiveFile({ ...activeFile, content: result.new_content })
       const newApplied = new Set(appliedIds)
       toApply.forEach(c => newApplied.add(c.id))

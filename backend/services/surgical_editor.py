@@ -101,17 +101,25 @@ def apply_change(
 def apply_changes_to_file(
     file_path: str,
     changes: list[SurgicalChange],
-    change_ids: Optional[list[str]] = None
+    change_ids: Optional[list[str]] = None,
+    file_content: Optional[str] = None
 ) -> SurgicalApplyResponse:
     """
     Apply one or more approved changes to a file.
     Creates backup first. Applies changes in reverse line order to preserve positions.
+    If file_content is provided and the file does not exist on disk (uploaded in cloud mode),
+    applies changes in-memory and returns result without writing to disk.
     """
-    if not os.path.exists(file_path):
+    on_disk = os.path.exists(file_path)
+
+    if not on_disk and not file_content:
         raise FileNotFoundError(f"File not found: {file_path}")
 
-    with open(file_path, "r", encoding="utf-8") as f:
-        original_content = f.read()
+    if on_disk:
+        with open(file_path, "r", encoding="utf-8") as f:
+            original_content = f.read()
+    else:
+        original_content = file_content
 
     # Filter to only requested changes
     to_apply = changes
@@ -124,8 +132,8 @@ def apply_changes_to_file(
     # Sort by line number descending — apply bottom-up to preserve line positions
     to_apply_sorted = sorted(to_apply, key=lambda c: c.symbol.start_line, reverse=True)
 
-    # Backup
-    backup_path = _backup_file(file_path)
+    # Backup only when file exists on disk
+    backup_path = _backup_file(file_path) if on_disk else None
 
     # Apply changes
     current_content = original_content
@@ -141,15 +149,16 @@ def apply_changes_to_file(
                 shutil.copy2(backup_path, file_path)
             raise ValueError(f"Failed applying change to {change.symbol.full_path}: {e}")
 
-    # Write final content
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(current_content)
+    # Write final content only when file exists on disk
+    if on_disk:
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(current_content)
 
     return SurgicalApplyResponse(
         file_path=file_path,
         new_content=current_content,
         applied_count=applied_count,
-        backup_path=backup_path
+        backup_path=backup_path  # None signals cloud/in-memory mode to the frontend
     )
 
 

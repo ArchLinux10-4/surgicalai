@@ -67,7 +67,8 @@ def apply(req: SurgicalApplyRequest):
         result = apply_changes_to_file(
             file_path=req.file_path,
             changes=req.changes,
-            change_ids=[req.change_id]
+            change_ids=[req.change_id],
+            file_content=req.file_content
         )
 
         # Record in change history
@@ -100,7 +101,8 @@ def apply_all(req: SurgicalApplyRequest):
         result = apply_changes_to_file(
             file_path=req.file_path,
             changes=req.changes,
-            change_ids=None  # Apply all
+            change_ids=None,  # Apply all
+            file_content=req.file_content
         )
         return result
     except Exception as e:
