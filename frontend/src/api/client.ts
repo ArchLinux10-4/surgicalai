@@ -55,6 +55,8 @@ export const api = {
     chat: (data: any, onChunk: (chunk: StreamChunk) => void, onDone: (fullText: string) => void, onError: (err: string) => void): AbortController => {
       const controller = new AbortController()
       const fullText: string[] = []
+      let doneCalled = false
+      const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone(fullText.join('')) } }
 
       fetch(`${BASE}/chat/stream`, {
         method: 'POST',
@@ -66,7 +68,7 @@ export const api = {
         const decoder = new TextDecoder()
 
         const pump = () => reader.read().then(({ done, value }) => {
-          if (done) { onDone(fullText.join('')); return }
+          if (done) { fireDone(); return }
           const text = decoder.decode(value, { stream: true })
           const lines = text.split('\n')
           for (const line of lines) {
@@ -74,7 +76,7 @@ export const api = {
               try {
                 const chunk: StreamChunk = JSON.parse(line.slice(6))
                 if (chunk.type === 'token') { fullText.push(chunk.content); onChunk(chunk) }
-                else if (chunk.type === 'done') { onDone(fullText.join('')) }
+                else if (chunk.type === 'done') { fireDone() }
                 else if (chunk.type === 'error') { onError(chunk.content) }
                 else { onChunk(chunk) }
               } catch {}
@@ -99,6 +101,8 @@ export const api = {
     ): AbortController => {
       const controller = new AbortController()
       const tokens: string[] = []
+      let doneCalled = false
+      const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone(tokens.join('')) } }
 
       fetch(`${BASE}/chat/smart-stream`, {
         method: 'POST',
@@ -110,7 +114,7 @@ export const api = {
         const decoder = new TextDecoder()
 
         const pump = () => reader.read().then(({ done, value }) => {
-          if (done) { onDone(tokens.join('')); return }
+          if (done) { fireDone(); return }
           const text = decoder.decode(value, { stream: true })
           for (const line of text.split('\n')) {
             if (line.startsWith('data: ')) {
@@ -119,7 +123,7 @@ export const api = {
                 if (chunk.type === 'progress') onProgress(chunk.content)
                 else if (chunk.type === 'token') { tokens.push(chunk.content); onToken(chunk.content) }
                 else if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
-                else if (chunk.type === 'done') onDone(tokens.join(''))
+                else if (chunk.type === 'done') fireDone()
                 else if (chunk.type === 'error') onError(chunk.content)
               } catch {}
             }
