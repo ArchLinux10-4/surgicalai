@@ -6,7 +6,7 @@ import { toast } from '../lib/toast'
 import {
   Settings, MessageSquare, FolderOpen, RefreshCw, Plus,
   Search, Trash2, Pencil, Check, X, ChevronRight, ChevronDown,
-  Pin, BookOpen, Zap, MoreHorizontal,
+  Pin, BookOpen, Zap, MoreHorizontal, Upload, FileCode, File,
 } from 'lucide-react'
 import { ContextPanel } from './ContextPanel'
 
@@ -206,94 +206,117 @@ function SessionList() {
   )
 }
 
-// ── File Browser ────────────────────────────────────
-function FileBrowser() {
-  const { fileTree, setFileTree, workspacePath, setWorkspacePath, settings } = useAppStore()
-  const [loading, setLoading] = useState(false)
-  const [pathInput, setPathInput] = useState('')
-  const [search, setSearch] = useState('')
+// ── Session Files Panel ──────────────────────────────
+const FILE_TYPE_ICONS: Record<string, string> = {
+  '.py': '🐍', '.js': '🟨', '.ts': '🔷', '.tsx': '⚛️', '.jsx': '⚛️',
+  '.go': '🐹', '.rs': '🦀', '.java': '☕', '.cs': '💜', '.cpp': '🔵', '.c': '🔵',
+  '.html': '🌐', '.css': '🎨', '.scss': '🎨', '.json': '📋', '.md': '📝',
+  '.sh': '⚡', '.sql': '🗄️', '.yaml': '⚙️', '.yml': '⚙️', '.toml': '⚙️',
+}
+function getFileIcon(filename: string) {
+  const ext = '.' + filename.split('.').pop()?.toLowerCase()
+  return FILE_TYPE_ICONS[ext] || '📄'
+}
+function fmtSize(bytes: number) {
+  if (bytes < 1024) return `${bytes}B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)}MB`
+}
 
-  useEffect(() => {
-    if (settings?.workspace_path) {
-      setWorkspacePath(settings.workspace_path)
-      setPathInput(settings.workspace_path)
-      loadTree(settings.workspace_path)
-    }
-  }, [settings?.workspace_path])
+function SessionFilesPanel() {
+  const { sessionFiles, removeSessionFile } = useAppStore()
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const { addSessionFile } = useAppStore()
 
-  const loadTree = async (p?: string) => {
-    const target = p || workspacePath
-    if (!target) return
-    setLoading(true)
-    try {
-      const tree = await api.files.getTree(target)
-      setFileTree(tree)
-    } catch (e: any) {
-      toast.error('Cannot load folder', e.message)
-    }
-    setLoading(false)
+  const handleUpload = (files: FileList | null) => {
+    if (!files) return
+    Array.from(files).forEach(file => {
+      const reader = new FileReader()
+      reader.onload = (e) => {
+        const content = e.target?.result as string
+        const lineCount = content.split('\n').length
+        addSessionFile({
+          id: `${file.name}-${Date.now()}`,
+          session_id: '',
+          filename: file.name,
+          language: file.name.split('.').pop() || 'text',
+          lines: lineCount,
+          symbol_count: 0,
+          created_at: new Date().toISOString(),
+          content,
+        })
+      }
+      reader.readAsText(file)
+    })
   }
-
-  // Filter tree nodes by search text
-  function filterTree(node: FileNode, q: string): FileNode | null {
-    if (node.type === 'file') {
-      return node.name.toLowerCase().includes(q.toLowerCase()) ? node : null
-    }
-    const filteredChildren = (node.children || []).map((c) => filterTree(c, q)).filter(Boolean) as FileNode[]
-    if (filteredChildren.length === 0) return null
-    return { ...node, children: filteredChildren }
-  }
-
-  const displayTree = search && fileTree ? filterTree(fileTree, search) : fileTree
 
   return (
     <div className="flex flex-col h-full">
-      {/* Path input */}
-      <div className="p-2 border-b border-border flex gap-1.5">
-        <input
-          value={pathInput}
-          onChange={(e) => setPathInput(e.target.value)}
-          onKeyDown={(e) => e.key === 'Enter' && loadTree(pathInput)}
-          placeholder="/path/to/project"
-          className="input text-[12px] py-1.5 flex-1"
-        />
-        <button onClick={() => loadTree(pathInput)} className="btn-icon" title="Refresh">
-          <RefreshCw size={13} className={loading ? 'spin' : ''} />
+      {/* Header row */}
+      <div className="px-3 py-2.5 border-b border-border flex items-center justify-between">
+        <span className="text-[11px] font-semibold text-muted uppercase tracking-wider">
+          {sessionFiles.length > 0 ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} in chat` : 'No files yet'}
+        </span>
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          className="flex items-center gap-1 px-2 py-1 rounded-lg bg-accent/10 text-accent text-[11px] font-semibold hover:bg-accent/20 transition-colors"
+          title="Upload files"
+        >
+          <Upload size={11} /> Add
         </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.cpp,.c,.h,.html,.css,.scss,.json,.md,.sh,.sql,.yaml,.yml,.toml,.txt,.env,.rb,.php,.swift,.kt"
+          className="hidden"
+          onChange={(e) => handleUpload(e.target.files)}
+        />
       </div>
 
-      {/* Search */}
-      {fileTree && (
-        <div className="px-2 py-1.5 border-b border-border">
-          <div className="relative">
-            <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Filter files..."
-              className="input text-[12px] py-1 pl-7"
-            />
-            {search && (
-              <button onClick={() => setSearch('')} className="absolute right-2 top-1/2 -translate-y-1/2 text-faint hover:text-ink">
-                <X size={11} />
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Tree */}
+      {/* File list */}
       <div className="flex-1 overflow-y-auto py-1">
-        {loading ? (
-          <div className="flex items-center justify-center h-24 text-faint text-xs gap-2">
-            <span className="spin inline-block">◌</span> Loading...
+        {sessionFiles.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-full gap-3 px-4 text-center pb-8">
+            <div className="w-12 h-12 rounded-2xl bg-zinc-800 flex items-center justify-center">
+              <FileCode size={22} className="text-zinc-500" />
+            </div>
+            <div>
+              <p className="text-[13px] font-semibold text-zinc-400">No files in this chat</p>
+              <p className="text-[11px] text-zinc-600 mt-1 leading-relaxed">
+                Drop files into the chat or click <strong className="text-zinc-500">Add</strong> above to get surgical edits
+              </p>
+            </div>
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              className="mt-1 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent/10 text-accent text-[12px] font-semibold hover:bg-accent/20 transition-colors border border-accent/20"
+            >
+              <Upload size={12} /> Upload files
+            </button>
           </div>
-        ) : displayTree ? (
-          <FileTreeNode node={displayTree} depth={0} />
         ) : (
-          <div className="flex flex-col items-center justify-center h-32 gap-2 text-faint px-4 text-center">
-            <FolderOpen size={24} className="opacity-40" />
-            <span className="text-xs">Enter a folder path above to browse files</span>
+          <div className="px-2 py-1 space-y-0.5">
+            {sessionFiles.map(file => (
+              <div
+                key={file.id}
+                className="group flex items-center gap-2 px-2.5 py-2 rounded-lg hover:bg-overlay transition-colors"
+              >
+                <span className="text-[14px] flex-shrink-0">{getFileIcon(file.filename)}</span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-[12px] font-medium text-ink truncate">{file.filename}</p>
+                  {file.lines > 0 && (
+                    <p className="text-[10px] text-faint">{file.lines} lines{file.symbol_count > 0 ? ` · ${file.symbol_count} symbols` : ''}</p>
+                  )}
+                </div>
+                <button
+                  onClick={() => removeSessionFile(file.id)}
+                  className="opacity-0 group-hover:opacity-100 text-faint hover:text-red-400 transition-all flex-shrink-0"
+                  title="Remove from chat"
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            ))}
           </div>
         )}
       </div>
@@ -306,7 +329,7 @@ export function Sidebar() {
   const { sidebarTab, setSidebarTab, setSettingsOpen } = useAppStore()
 
   const tabs = [
-    { id: 'files' as const, icon: FolderOpen, label: 'Files' },
+    { id: 'files' as const, icon: FileCode, label: 'Files' },
     { id: 'sessions' as const, icon: MessageSquare, label: 'Chats' },
     { id: 'context' as const, icon: Pin, label: 'Context' },
   ]
@@ -344,7 +367,7 @@ export function Sidebar() {
 
       {/* Content */}
       <div className="flex-1 overflow-hidden flex flex-col min-h-0">
-        {sidebarTab === 'files' && <FileBrowser />}
+        {sidebarTab === 'files' && <SessionFilesPanel />}
         {sidebarTab === 'sessions' && <SessionList />}
         {sidebarTab === 'context' && <ContextPanel />}
       </div>
