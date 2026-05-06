@@ -1,0 +1,128 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ── Base ──────────────────────────────────────────── */
+@layer base {
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body, #root { height: 100%; }
+  body {
+    background: #0d1117;
+    color: #e6edf3;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: rgba(88, 166, 255, 0.3); }
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 10px; }
+  ::-webkit-scrollbar-thumb:hover { background: #58a6ff; }
+  button { cursor: pointer; }
+}
+
+/* ── Components ────────────────────────────────────── */
+@layer components {
+  /* Buttons */
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-lg font-semibold transition-all duration-150 select-none outline-none;
+    @apply focus-visible:ring-2 focus-visible:ring-accent/50;
+  }
+  .btn-sm { @apply btn text-xs px-3 py-1.5; }
+  .btn-md { @apply btn text-sm px-4 py-2; }
+  .btn-primary { @apply btn-md bg-accent text-base hover:bg-accent/90 active:scale-95; }
+  .btn-ghost { @apply btn-sm bg-transparent text-muted hover:text-ink hover:bg-overlay; }
+  .btn-danger { @apply btn-sm bg-danger/10 text-danger border border-danger/30 hover:bg-danger/20; }
+  .btn-success { @apply btn-sm bg-success text-base font-bold hover:bg-success/90 active:scale-95; }
+  .btn-icon { @apply inline-flex items-center justify-center w-7 h-7 rounded-md text-muted hover:text-ink hover:bg-overlay transition-colors; }
+
+  /* Inputs */
+  .input {
+    @apply w-full bg-base border border-border text-ink rounded-lg px-3 py-2 text-sm outline-none
+           placeholder:text-faint transition-colors
+           focus:border-accent focus:ring-1 focus:ring-accent/30;
+  }
+
+  /* Card */
+  .card { @apply bg-surface border border-border rounded-lg overflow-hidden; }
+  .card-elevated { @apply bg-overlay border border-border rounded-lg overflow-hidden; }
+
+  /* Badge */
+  .badge { @apply inline-flex items-center px-2 py-0.5 rounded-full text-xs font-semibold; }
+  .badge-accent { @apply badge bg-accent/15 text-accent border border-accent/30; }
+  .badge-success { @apply badge bg-success/15 text-success border border-success/30; }
+  .badge-warning { @apply badge bg-warning/15 text-warning border border-warning/30; }
+  .badge-danger { @apply badge bg-danger/15 text-danger border border-danger/30; }
+
+  /* Panel separator */
+  .panel-divider { @apply border-b border-border; }
+
+  /* Tab bar */
+  .tab-bar { @apply flex border-b border-border; }
+  .tab-item {
+    @apply px-4 py-2 text-xs font-semibold uppercase tracking-wide cursor-pointer transition-colors
+           border-b-2 border-transparent text-muted hover:text-ink;
+  }
+  .tab-item-active { @apply tab-item border-accent text-ink; }
+
+  /* Section label */
+  .section-label { @apply text-xs font-semibold uppercase tracking-widest text-faint px-3 py-2; }
+}
+
+/* ── Markdown ──────────────────────────────────────── */
+.markdown-body { line-height: 1.65; }
+.markdown-body p { margin: 0 0 10px 0; }
+.markdown-body p:last-child { margin-bottom: 0; }
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 { color: #e6edf3; font-weight: 700; margin: 18px 0 8px 0; line-height: 1.3; }
+.markdown-body h1 { font-size: 1.2em; }
+.markdown-body h2 { font-size: 1.1em; }
+.markdown-body h3 { font-size: 1em; }
+.markdown-body ul, .markdown-body ol { padding-left: 20px; margin: 8px 0; }
+.markdown-body li { margin: 3px 0; }
+.markdown-body code {
+  background: #161b22;
+  border: 1px solid #30363d;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 0.875em;
+  font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
+  color: #79c0ff;
+}
+.markdown-body pre {
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  margin: 10px 0;
+  position: relative;
+}
+.markdown-body pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #e6edf3;
+  font-size: 0.85em;
+}
+.markdown-body table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 0.9em; }
+.markdown-body th, .markdown-body td { border: 1px solid #30363d; padding: 6px 12px; text-align: left; }
+.markdown-body th { background: #161b22; font-weight: 600; }
+.markdown-body a { color: #58a6ff; text-decoration: none; }
+.markdown-body a:hover { text-decoration: underline; }
+.markdown-body blockquote { border-left: 3px solid #30363d; margin: 8px 0; padding-left: 14px; color: #8b949e; font-style: italic; }
+.markdown-body hr { border: none; border-top: 1px solid #30363d; margin: 16px 0; }
+
+/* ── Cursor blink ──────────────────────────────────── */
+@keyframes blink { 0%, 100% { opacity: 1 } 50% { opacity: 0 } }
+.cursor-blink { animation: blink 1s step-end infinite; }
+@keyframes spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }
+.spin { animation: spin 1s linear infinite; }
+
+/* ── Drag overlay ──────────────────────────────────── */
+.drag-active { outline: 2px dashed #58a6ff; outline-offset: -2px; }
+
+/* ── Toast ─────────────────────────────────────────── */
+@keyframes toastIn { from { opacity: 0; transform: translateY(8px) scale(0.95) } to { opacity: 1; transform: translateY(0) scale(1) } }
+@keyframes toastOut { from { opacity: 1; transform: translateY(0) scale(1) } to { opacity: 0; transform: translateY(4px) scale(0.95) } }
+.toast-enter { animation: toastIn 0.25s cubic-bezier(0.22, 1, 0.36, 1) forwards; }
+.toast-exit { animation: toastOut 0.2s ease-in forwards; }

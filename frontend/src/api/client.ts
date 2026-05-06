@@ -1,0 +1,140 @@
+import type { StreamChunk, PinnedContext, ProjectMemory, PromptTemplate, ImpactAnalysis, MultiFileAnalysis } from '../types'
+
+const BASE = '/api'
+
+async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const res = await fetch(`${BASE}${path}`, {
+    headers: { 'Content-Type': 'application/json', ...options?.headers },
+    ...options,
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }))
+    throw new Error(err.detail || `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
+// Settings
+export const api = {
+  settings: {
+    get: () => request<any>('/settings'),
+    update: (data: any) => request('/settings', { method: 'POST', body: JSON.stringify(data) }),
+    verifyKey: (key: string) => request('/settings/verify-key', { method: 'POST', body: JSON.stringify({ key }) }),
+    getModels: () => request<any>('/settings/models'),
+  },
+  chat: {
+    createSession: (data: any) => request<any>('/chat/sessions', { method: 'POST', body: JSON.stringify(data) }),
+    getSessions: () => request<any[]>('/chat/sessions'),
+    getMessages: (sessionId: string) => request<any[]>(`/chat/sessions/${sessionId}/messages`),
+    send: (data: any) => request<any>('/chat/send', { method: 'POST', body: JSON.stringify(data) }),
+    deleteSession: (id: string) => request(`/chat/sessions/${id}`, { method: 'DELETE' }),
+    renameSession: (id: string, title: string) => request(`/chat/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
+  },
+  files: {
+    getTree: (root?: string) => request<any>(`/files/tree${root ? `?root=${encodeURIComponent(root)}` : ''}`),
+    read: (path: string) => request<any>(`/files/read?path=${encodeURIComponent(path)}`),
+    save: (path: string, content: string) => request('/files/save', { method: 'POST', body: JSON.stringify({ path, content }) }),
+    getSymbols: (path: string) => request<any>(`/files/symbols?path=${encodeURIComponent(path)}`),
+    listBackups: (path: string) => request<any[]>(`/files/backups?path=${encodeURIComponent(path)}`),
+    restore: (file_path: string, backup_path: string) => request('/files/restore', { method: 'POST', body: JSON.stringify({ file_path, backup_path }) }),
+  },
+  surgical: {
+    analyze: (data: any) => request<any>('/surgical/analyze', { method: 'POST', body: JSON.stringify(data) }),
+    apply: (data: any) => request<any>('/surgical/apply', { method: 'POST', body: JSON.stringify(data) }),
+    applyAll: (data: any) => request<any>('/surgical/apply-all', { method: 'POST', body: JSON.stringify(data) }),
+    getHistory: (filePath?: string) => request<any[]>(`/surgical/history${filePath ? `?file_path=${encodeURIComponent(filePath)}` : ''}`),
+  },
+  git: {
+    status: (repoPath: string) => request<any>(`/git/status?repo_path=${encodeURIComponent(repoPath)}`),
+    diff: (repoPath: string, filePath?: string) => request<any>(`/git/diff?repo_path=${encodeURIComponent(repoPath)}${filePath ? `&file_path=${encodeURIComponent(filePath)}` : ''}`),
+    commit: (data: any) => request('/git/commit', { method: 'POST', body: JSON.stringify(data) }),
+    log: (repoPath: string) => request<any[]>(`/git/log?repo_path=${encodeURIComponent(repoPath)}`),
+  },
+
+  stream: {
+    chat: (data: any, onChunk: (chunk: StreamChunk) => void, onDone: (fullText: string) => void, onError: (err: string) => void): AbortController => {
+      const controller = new AbortController()
+      const fullText: string[] = []
+
+      fetch(`${BASE}/chat/stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+        signal: controller.signal,
+      }).then(res => {
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+
+        const pump = () => reader.read().then(({ done, value }) => {
+          if (done) { onDone(fullText.join('')); return }
+          const text = decoder.decode(value, { stream: true })
+          const lines = text.split('\n')
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const chunk: StreamChunk = JSON.parse(line.slice(6))
+                if (chunk.type === 'token') { fullText.push(chunk.content); onChunk(chunk) }
+                else if (chunk.type === 'done') { onDone(fullText.join('')) }
+                else if (chunk.type === 'error') { onError(chunk.content) }
+                else { onChunk(chunk) }
+              } catch {}
+            }
+          }
+          pump()
+        }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
+
+        pump()
+      }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
+
+      return controller
+    },
+
+    surgical: (data: any, onProgress: (msg: string) => void, onResult: (result: any) => void, onError: (err: string) => void): AbortController => {
+      const controller = new AbortController()
+
+      fetch(`${BASE}/surgical/analyze-stream`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+        signal: controller.signal,
+      }).then(res => {
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+
+        const pump = () => reader.read().then(({ done, value }) => {
+          if (done) return
+          const text = decoder.decode(value, { stream: true })
+          const lines = text.split('\n')
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              try {
+                const chunk: StreamChunk = JSON.parse(line.slice(6))
+                if (chunk.type === 'progress') { onProgress(chunk.content) }
+                else if (chunk.type === 'result') { onResult(JSON.parse(chunk.content)) }
+                else if (chunk.type === 'error') { onError(chunk.content) }
+              } catch {}
+            }
+          }
+          pump()
+        }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
+
+        pump()
+      }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
+
+      return controller
+    },
+  },
+
+  context: {
+    getPins: (workspacePath: string) => request<PinnedContext[]>(`/context/pins?workspace_path=${encodeURIComponent(workspacePath)}`),
+    addPin: (data: any) => request<any>('/context/pins', { method: 'POST', body: JSON.stringify(data) }),
+    removePin: (id: string) => request<any>(`/context/pins/${id}`, { method: 'DELETE' }),
+    getMemory: (workspacePath: string) => request<ProjectMemory>(`/context/memory?workspace_path=${encodeURIComponent(workspacePath)}`),
+    saveMemory: (data: any) => request<any>('/context/memory', { method: 'POST', body: JSON.stringify(data) }),
+    getTemplates: () => request<PromptTemplate[]>('/context/templates'),
+    createTemplate: (data: any) => request<any>('/context/templates', { method: 'POST', body: JSON.stringify(data) }),
+    deleteTemplate: (id: string) => request<any>(`/context/templates/${id}`, { method: 'DELETE' }),
+    getImpact: (symbolPath: string, filePath: string, workspacePath?: string) => request<ImpactAnalysis>(`/context/impact?symbol_path=${encodeURIComponent(symbolPath)}&file_path=${encodeURIComponent(filePath)}${workspacePath ? `&workspace_path=${encodeURIComponent(workspacePath)}` : ''}`),
+    multiAnalyze: (data: any) => request<MultiFileAnalysis>('/context/multi-analyze', { method: 'POST', body: JSON.stringify(data) }),
+  },
+}
