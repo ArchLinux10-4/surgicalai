@@ -154,11 +154,21 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
             </div>
           </div>
 
-          {/* Diff */}
-          <div className="bg-zinc-950 max-h-64 overflow-y-auto border-t border-zinc-800">
-            {change.diff.split('\n').map((line: string, i: number) => (
-              <DiffLine key={i} line={line} />
-            ))}
+          {/* Diff Preview */}
+          <div className="border-t border-zinc-800">
+            <div className="flex items-center gap-2 px-4 py-1.5 bg-zinc-900 border-b border-zinc-800/60">
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Diff Preview</span>
+              <span className="text-[10px] text-zinc-600 ml-auto">
+                {change.diff.split('\n').filter((l: string) => l.startsWith('+')).length - 1} added &nbsp;·&nbsp;
+                {change.diff.split('\n').filter((l: string) => l.startsWith('-')).length - 1} removed
+              </span>
+            </div>
+            <div className="bg-zinc-950 max-h-96 overflow-y-auto">
+              {change.diff.split('\n').map((line: string, i: number) => (
+                <DiffLine key={i} line={line} />
+              ))}
+            </div>
+          </div>
           </div>
 
           {/* Action buttons */}
@@ -233,7 +243,15 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
         <div className="mt-2 flex items-start gap-2 px-3 py-2 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
           <AlertTriangle size={13} className="text-yellow-400 mt-0.5 flex-shrink-0" />
           <div className="text-[12px] text-yellow-300">
-            <strong>Risks:</strong> {result.risks.join(' · ')}
+            <strong>Risks:</strong>
+            <ul className="mt-1 space-y-0.5 list-none">
+              {result.risks.map((r: string, i: number) => (
+                <li key={i} className="flex items-start gap-1.5">
+                  <span className="mt-0.5 text-yellow-500">•</span>
+                  <span>{r}</span>
+                </li>
+              ))}
+            </ul>
           </div>
         </div>
       )}

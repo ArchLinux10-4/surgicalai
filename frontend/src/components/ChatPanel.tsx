@@ -308,6 +308,7 @@ export function ChatPanel() {
     setError(null)
     const text = input.trim()
     setInput('')
+    if (textareaRef.current) textareaRef.current.style.height = 'auto'
 
     const sessionId = await ensureSession()
 
@@ -484,8 +485,13 @@ export function ChatPanel() {
                   ? `Ask about your ${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} — "Add X", "Fix Y", "Explain Z"…`
                   : 'Ask anything, or drop files here to edit code…'
               }
-              rows={3}
-              className="w-full bg-zinc-800 border border-zinc-700 rounded-xl text-sm text-zinc-200 placeholder:text-zinc-500 resize-none px-3 py-2.5 focus:outline-none focus:border-blue-500/60 leading-relaxed font-[inherit]"
+              rows={1}
+              onInput={(e) => {
+                const el = e.currentTarget
+                el.style.height = 'auto'
+                el.style.height = Math.min(el.scrollHeight, 200) + 'px'
+              }}
+              className="w-full bg-zinc-800 border border-zinc-700 rounded-xl text-sm text-zinc-200 placeholder:text-zinc-500 resize-none px-3 py-2.5 focus:outline-none focus:border-blue-500/60 leading-relaxed font-[inherit] min-h-[44px] max-h-[200px] overflow-y-auto"
             />
           </div>
 
