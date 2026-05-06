@@ -43,7 +43,7 @@ def get_available_models():
         {"id": "gpt-4.1-mini", "name": "GPT-4.1 Mini", "role": "fast", "description": "Fast and cheap for simple tasks"},
         {"id": "gpt-4o", "name": "GPT-4o", "role": "architect", "description": "Strong reasoning for planning"},
         {"id": "o4-mini", "name": "o4-mini", "role": "architect", "description": "Reasoning model — good for architecture"},
-        {"id": "gpt-4.5-preview", "name": "GPT-4.5 Preview", "role": "architect", "description": "Enhanced coding capabilities"},
+        {"id": "gpt-5", "name": "GPT-5", "role": "architect", "description": "Most capable — best for complex architecture (no temperature control)", "no_temperature": True},
     ]
 
     ollama_models = []

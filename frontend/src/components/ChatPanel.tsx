@@ -239,10 +239,14 @@ export function ChatPanel() {
 
   // ── File upload ───────────────────────────────────────
   const uploadFiles = useCallback(async (fileList: FileList | File[]) => {
+    // Convert FileList → Array SYNCHRONOUSLY before any awaits.
+    // FileList objects tied to a cleared <input> can lose their entries
+    // once e.target.value = '' runs while an async ensureSession() is in-flight.
+    const files = Array.from(fileList)
+    if (!files.length) return
+
     const sessionId = await ensureSession()
     setUploadingFiles(true)
-
-    const files = Array.from(fileList)
     const promises = files.map(async (file) => {
       const content = await file.text()
       const language = getLanguage(file.name)

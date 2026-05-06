@@ -23,6 +23,18 @@ from services.ast_parser import ASTParser
 
 parser = ASTParser()
 
+# Models that do NOT accept a temperature parameter (reasoning / latest-gen models)
+NO_TEMPERATURE_MODELS = {"gpt-5", "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"}
+
+
+def _chat_create(client: OpenAI, model: str, messages: list, temperature: float = 0.3, **kwargs):
+    """Wrapper around client.chat.completions.create that drops temperature
+    for models that don't support it (GPT-5, o-series reasoning models)."""
+    base_model = model.split(":")[0].lower()
+    if base_model in NO_TEMPERATURE_MODELS:
+        return client.chat.completions.create(model=model, messages=messages, **kwargs)
+    return client.chat.completions.create(model=model, messages=messages, temperature=temperature, **kwargs)
+
 
 def _get_client() -> OpenAI:
     key = get_setting("openai_api_key")
@@ -173,7 +185,7 @@ USER REQUEST:
 
 Produce the surgical change plan as JSON."""
 
-    response = client.chat.completions.create(
+    response = _chat_create(client, 
         model=arch_model,
         messages=[
             {"role": "system", "content": ARCHITECT_SYSTEM},
@@ -249,7 +261,7 @@ CONTEXT AFTER (do not modify):
 
 Write the replacement for the TARGET CODE ONLY. Preserve exact indentation."""
 
-    response = client.chat.completions.create(
+    response = _chat_create(client, 
         model=surg_model,
         messages=[
             {"role": "system", "content": SURGEON_SYSTEM},
@@ -341,7 +353,7 @@ def run_chat(
         return _ollama_chat(all_messages, chat_model)
 
     client = _get_client()
-    response = client.chat.completions.create(
+    response = _chat_create(client, 
         model=chat_model,
         messages=all_messages,
         temperature=float(get_setting("temperature_architect", "0.3")),
@@ -411,7 +423,7 @@ async def run_chat_stream(
                             pass
         else:
             client = _get_client()
-            stream = client.chat.completions.create(
+            stream = _chat_create(client, 
                 model=chat_model,
                 messages=all_messages,
                 temperature=float(get_setting("temperature_architect", "0.3")),
@@ -563,7 +575,7 @@ USER REQUEST:
 Produce the surgical change plan. For each target, include the file_path field to indicate which file it belongs to.
 Add "file_path" to each target object."""
 
-    response = client.chat.completions.create(
+    response = _chat_create(client, 
         model=arch_model,
         messages=[
             {"role": "system", "content": ARCHITECT_SYSTEM + '\nIMPORTANT: Add "file_path" field to each target indicating which file the change belongs to.'},
@@ -863,7 +875,7 @@ async def run_smart_pipeline_stream(
                 system += f"\n\n## Project Memory\n{project_memory}"
             msgs = [{"role": "system", "content": system}] + conversation_history[-10:] + [{"role": "user", "content": user_request}]
             client = _get_client()
-            stream = client.chat.completions.create(model=chat_model, messages=msgs, temperature=0.3, stream=True)
+            stream = _chat_create(client, model=chat_model, messages=msgs, temperature=0.3, stream=True)
             for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta.content:
@@ -922,7 +934,7 @@ USER REQUEST:
         client = _get_client()
         arch_model = get_setting("architect_model", "gpt-4.1")
 
-        response = client.chat.completions.create(
+        response = _chat_create(client, 
             model=arch_model,
             messages=[
                 {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
