@@ -1,18 +1,43 @@
-"""Settings & API key management router."""
+"""Settings & API key management router — per-user encrypted key storage."""
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from models.schemas import SettingsUpdate, SettingsResponse
-from database import get_all_settings, set_setting, get_setting
+from database import get_all_settings, set_setting, get_setting, set_user_api_key, get_user_api_key
+from crypto_utils import encrypt_api_key, decrypt_api_key
 
 router = APIRouter()
 
 
+def _get_user_id(request: Request) -> str:
+    """Extract user_id from JWT middleware. Returns empty string if unauthenticated."""
+    return getattr(request.state, "user_id", "") or ""
+
+
+def _resolve_api_key(user_id: str, key_type: str) -> str:
+    """Get the decrypted API key for a user. Falls back to global settings for migration."""
+    if user_id:
+        encrypted = get_user_api_key(user_id, key_type)
+        if encrypted:
+            try:
+                return decrypt_api_key(encrypted)
+            except Exception:
+                pass  # Corrupted? Fall through to global
+    # Fallback: legacy global setting
+    return get_setting(f"{key_type}_api_key", "")
+
+
 @router.get("", response_model=SettingsResponse)
-def get_settings():
+def get_settings(request: Request):
     s = get_all_settings()
+    user_id = _get_user_id(request)
+
+    # Check per-user keys first, then global
+    has_openai = bool(_resolve_api_key(user_id, "openai"))
+    has_anthropic = bool(_resolve_api_key(user_id, "anthropic"))
+
     return SettingsResponse(
-        openai_api_key_set=bool(s.get("openai_api_key", "")),
-        anthropic_api_key_set=bool(s.get("anthropic_api_key", "")),
+        openai_api_key_set=has_openai,
+        anthropic_api_key_set=has_anthropic,
         architect_model=s.get("architect_model", "gpt-5"),
         surgeon_model=s.get("surgeon_model", "gpt-4.1"),
         temperature_architect=float(s.get("temperature_architect", "0.3")),
@@ -37,8 +62,10 @@ def update_settings(req: SettingsUpdate):
 
 
 @router.get("/models")
-def get_available_models():
-    """Return the list of supported models, including Ollama if enabled."""
+def get_available_models(request: Request):
+    """Return the list of supported models, including Claude if Anthropic key is set."""
+    user_id = _get_user_id(request)
+
     openai_models = [
         {"id": "gpt-4.1", "name": "GPT-4.1", "role": "surgeon", "description": "Low hallucination — best for writing code"},
         {"id": "gpt-4.1-mini", "name": "GPT-4.1 Mini", "role": "fast", "description": "Fast and cheap for simple tasks"},
@@ -48,7 +75,7 @@ def get_available_models():
     ]
 
     claude_models = []
-    if get_setting("anthropic_api_key", ""):
+    if _resolve_api_key(user_id, "anthropic"):
         claude_models = [
             {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "role": "architect", "description": "Fast, intelligent — great Architect with visible thinking", "provider": "anthropic"},
             {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "role": "architect", "description": "Most capable Claude — deep reasoning with extended thinking", "provider": "anthropic"},
@@ -78,14 +105,17 @@ def get_available_models():
 
 
 @router.delete("/api-key")
-def clear_api_key():
+def clear_api_key(request: Request):
+    user_id = _get_user_id(request)
+    if user_id:
+        set_user_api_key(user_id, "openai", "")
     set_setting("openai_api_key", "")
     return {"ok": True}
 
 
 @router.post("/verify-key")
-def verify_key(body: dict):
-    """Test if the API key works."""
+def verify_key(body: dict, request: Request):
+    """Test OpenAI key, then encrypt + store per-user."""
     from openai import OpenAI, AuthenticationError
     key = body.get("key", "")
     if not key:
@@ -93,8 +123,14 @@ def verify_key(body: dict):
     try:
         client = OpenAI(api_key=key)
         client.models.list()
+        # Store encrypted per-user
+        user_id = _get_user_id(request)
+        if user_id:
+            encrypted = encrypt_api_key(key)
+            set_user_api_key(user_id, "openai", encrypted)
+        # Also store globally for pipeline access (legacy compat)
         set_setting("openai_api_key", key)
-        return {"ok": True, "message": "API key verified and saved"}
+        return {"ok": True, "message": "API key verified, encrypted, and saved"}
     except AuthenticationError:
         raise HTTPException(status_code=401, detail="Invalid API key")
     except Exception as e:
@@ -102,22 +138,27 @@ def verify_key(body: dict):
 
 
 @router.post("/verify-anthropic-key")
-def verify_anthropic_key(body: dict):
-    """Test if the Anthropic API key works."""
+def verify_anthropic_key(body: dict, request: Request):
+    """Test Anthropic key, then encrypt + store per-user."""
     key = body.get("key", "")
     if not key:
         raise HTTPException(status_code=400, detail="No key provided")
     try:
         import anthropic
         client = anthropic.Anthropic(api_key=key)
-        # Quick validation — list models or send a tiny request
         client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=16,
             messages=[{"role": "user", "content": "Hi"}],
         )
+        # Store encrypted per-user
+        user_id = _get_user_id(request)
+        if user_id:
+            encrypted = encrypt_api_key(key)
+            set_user_api_key(user_id, "anthropic", encrypted)
+        # Also store globally for pipeline access
         set_setting("anthropic_api_key", key)
-        return {"ok": True, "message": "Anthropic key verified and saved"}
+        return {"ok": True, "message": "Anthropic key verified, encrypted, and saved"}
     except Exception as e:
         err_msg = str(e)
         if "authentication" in err_msg.lower() or "api key" in err_msg.lower() or "401" in err_msg:

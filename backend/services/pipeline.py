@@ -16,7 +16,8 @@ from typing import Optional
 from openai import OpenAI
 import httpx
 
-from database import get_setting
+from database import get_setting, get_user_api_key
+from crypto_utils import decrypt_api_key
 from models.schemas import (
     ArchitectPlan, ChangeTarget, ChangeType, SurgicalChange,
     SurgicalAnalyzeResponse, SymbolMap, SymbolInfo
@@ -40,8 +41,20 @@ def _is_claude_model(model: str) -> bool:
     return bool(model and model.startswith("claude-"))
 
 
-def _get_anthropic_key() -> str:
-    key = get_setting("anthropic_api_key")
+def _resolve_key(user_id: str, key_type: str) -> str:
+    """Decrypt per-user API key, fall back to global setting."""
+    if user_id:
+        encrypted = get_user_api_key(user_id, key_type)
+        if encrypted:
+            try:
+                return decrypt_api_key(encrypted)
+            except Exception:
+                pass
+    return get_setting(f"{key_type}_api_key", "")
+
+
+def _get_anthropic_key(user_id: str = "") -> str:
+    key = _resolve_key(user_id, "anthropic")
     if not key:
         raise ValueError("Anthropic API key not configured. Go to Settings → API Keys to add it.")
     return key
@@ -56,8 +69,8 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
     return client.chat.completions.create(model=model, messages=messages, temperature=temperature, **kwargs)
 
 
-def _get_client() -> OpenAI:
-    key = get_setting("openai_api_key")
+def _get_client(user_id: str = "") -> OpenAI:
+    key = _resolve_key(user_id, "openai")
     if not key:
         raise ValueError("OpenAI API key not configured. Go to Settings to add your key.")
     return OpenAI(api_key=key)
@@ -76,12 +89,14 @@ def _make_diff(original: str, new_code: str, symbol_path: str) -> str:
     return "".join(diff)
 
 
-def _should_use_ollama(model: Optional[str] = None) -> bool:
+def _should_use_ollama(model: Optional[str] = None, user_id: str = "") -> bool:
     """Check if we should use Ollama for this model."""
     if model and model.startswith("ollama:"):
         return True
-    if get_setting("ollama_enabled", "false") == "true" and not get_setting("openai_api_key"):
-        return True
+    if get_setting("ollama_enabled", "false") == "true":
+        has_openai = bool(_resolve_key(user_id, "openai"))
+        if not has_openai:
+            return True
     return False
 
 
@@ -173,7 +188,7 @@ def run_architect(
     GPT-5 (Architect): reads symbol map + request → produces structured change plan.
     Never sees raw code — works from the symbol map for efficiency and accuracy.
     """
-    client = _get_client()
+    client = _get_client(user_id)
     arch_model = model or get_setting("architect_model", "gpt-4.1")
     temp = float(get_setting("temperature_architect", "0.3"))
 
@@ -258,7 +273,7 @@ def run_surgeon(
     GPT-4.1 (Surgeon): receives ONE code chunk + plan → returns minimal replacement.
     Returns (new_code, confidence_score).
     """
-    client = _get_client()
+    client = _get_client(user_id)
     surg_model = model or get_setting("surgeon_model", "gpt-4.1")
     temp = float(get_setting("temperature_surgeon", "0.1"))
 
@@ -377,7 +392,7 @@ def run_chat(
     if _should_use_ollama(chat_model):
         return _ollama_chat(all_messages, chat_model)
 
-    client = _get_client()
+    client = _get_client(user_id)
     response = _chat_create(client, 
         model=chat_model,
         messages=all_messages,
@@ -447,7 +462,7 @@ async def run_chat_stream(
                         except Exception:
                             pass
         else:
-            client = _get_client()
+            client = _get_client(user_id)
             stream = _chat_create(client, 
                 model=chat_model,
                 messages=all_messages,
@@ -586,7 +601,7 @@ def analyze_multi_file(file_paths: list, file_contents: dict, user_request: str,
             combined_summary.append(entry)
 
     # Single architect call for ALL files
-    client = _get_client()
+    client = _get_client(user_id)
     arch_model = get_setting("architect_model", "gpt-4.1")
 
     multi_user_msg = f"""MULTI-FILE ANALYSIS REQUEST
@@ -952,6 +967,7 @@ async def run_smart_pipeline_stream(
     conversation_history: list,
     session_id: str = None,
     project_memory: str = None,
+    user_id: str = "",
 ):
     """
     v1.3 Smart pipeline: given uploaded session files + a request,
@@ -998,7 +1014,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
 
             if _is_claude_model(chat_model):
                 # ── Claude streaming with extended thinking ──
-                aclient = AsyncAnthropic(api_key=_get_anthropic_key())
+                aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
                 claude_msgs = conversation_history[-10:] + [{"role": "user", "content": user_request}]
                 async with aclient.messages.stream(
                     model=chat_model,
@@ -1024,7 +1040,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 yield sse({"type": "done", "content": ""})
                 return
 
-            client = _get_client()
+            client = _get_client(user_id)
             stream = _chat_create(client, model=chat_model, messages=msgs, temperature=0.3, stream=True)
             for chunk in stream:
                 delta = chunk.choices[0].delta
@@ -1105,7 +1121,7 @@ USER REQUEST:
 
         if _is_claude_model(arch_model):
             # ── Claude Architect with streaming extended thinking ──
-            aclient = AsyncAnthropic(api_key=_get_anthropic_key())
+            aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
 
             # Build user content for Claude (images use different format)
             if image_files:
@@ -1219,7 +1235,7 @@ USER REQUEST:
                     plan = {"intent": "chat", "chat_response": raw_text}
         else:
             # ── OpenAI Architect (original logic) ──
-            client = _get_client()
+            client = _get_client(user_id)
 
             # Build user message content — text + optional vision blocks
             if image_files:

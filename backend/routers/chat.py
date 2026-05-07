@@ -251,7 +251,7 @@ def rename_session(session_id: str, body: dict):
 
 
 @router.post("/smart-stream")
-async def smart_stream(req: dict):
+async def smart_stream(req: dict, request: Request):
     """
     v1.3 Smart unified endpoint.
     Loads session files from DB, auto-routes to surgical edit or chat response.
@@ -261,8 +261,13 @@ async def smart_stream(req: dict):
 
     session_id = req.get("session_id")
     message = req.get("message", "")
+    current_user_id = getattr(request.state, "user_id", "") or ""
 
-    if not get_setting("openai_api_key") and not get_setting("anthropic_api_key") and get_setting("ollama_enabled") != "true":
+    # Check per-user encrypted keys AND global settings
+    from database import get_user_api_key
+    has_openai = bool(get_setting("openai_api_key")) or bool(get_user_api_key(current_user_id, "openai") if current_user_id else "")
+    has_anthropic = bool(get_setting("anthropic_api_key")) or bool(get_user_api_key(current_user_id, "anthropic") if current_user_id else "")
+    if not has_openai and not has_anthropic and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured. Go to Settings.")
 
     conn = get_db()
@@ -308,6 +313,7 @@ async def smart_stream(req: dict):
             conversation_history=conversation_history,
             session_id=session_id,
             project_memory=project_memory,
+            user_id=current_user_id,
         ):
             if chunk.startswith("data: "):
                 try:

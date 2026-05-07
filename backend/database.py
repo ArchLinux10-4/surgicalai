@@ -231,6 +231,17 @@ def _init_sqlite():
             last_login TIMESTAMP
         )
     """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_api_keys (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            key_type TEXT NOT NULL,
+            encrypted_value TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, key_type)
+        )
+    """)
     # Migration: add user_id to chat_sessions if missing
     existing_cols = [row[1] for row in cur.execute("PRAGMA table_info(chat_sessions)").fetchall()]
     if "user_id" not in existing_cols:
@@ -390,6 +401,18 @@ def _init_postgres():
                 last_login TIMESTAMP
             )
         """)
+        # user_api_keys — encrypted API keys per user
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_api_keys (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                key_type TEXT NOT NULL,
+                encrypted_value TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, key_type)
+            )
+        """)
         # Migration: add user_id column if missing (idempotent on PG)
         conn.execute("""
             ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS user_id TEXT
@@ -473,6 +496,40 @@ def set_setting(key: str, value: str):
     )
     conn.commit()
     conn.close()
+
+
+def set_user_api_key(user_id: str, key_type: str, encrypted_value: str):
+    """Store an encrypted API key for a user. Upserts."""
+    conn = get_db()
+    key_id = hashlib.md5(f"{user_id}:{key_type}".encode()).hexdigest()
+    if USE_POSTGRES:
+        conn.execute(
+            """INSERT INTO user_api_keys (id, user_id, key_type, encrypted_value, updated_at)
+               VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+               ON CONFLICT (user_id, key_type) DO UPDATE SET
+                 encrypted_value = EXCLUDED.encrypted_value,
+                 updated_at = EXCLUDED.updated_at""",
+            (key_id, user_id, key_type, encrypted_value),
+        )
+    else:
+        conn.execute(
+            """INSERT OR REPLACE INTO user_api_keys (id, user_id, key_type, encrypted_value, updated_at)
+               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+            (key_id, user_id, key_type, encrypted_value),
+        )
+    conn.commit()
+    conn.close()
+
+
+def get_user_api_key(user_id: str, key_type: str) -> str:
+    """Retrieve encrypted API key for a user. Returns empty string if not found."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT encrypted_value FROM user_api_keys WHERE user_id = ? AND key_type = ?",
+        (user_id, key_type),
+    ).fetchone()
+    conn.close()
+    return row["encrypted_value"] if row else ""
 
 
 def get_all_settings() -> dict:

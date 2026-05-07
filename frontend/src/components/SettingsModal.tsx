@@ -189,9 +189,17 @@ export function SettingsModal() {
                         type={showKey ? 'text' : 'password'}
                         value={apiKey}
                         onChange={(e) => { setApiKey(e.target.value); setKeyStatus('idle') }}
+                        onPaste={(e) => {
+                          // Explicit paste handler — ensures pasted text always lands
+                          e.preventDefault()
+                          const pasted = e.clipboardData.getData('text').trim()
+                          if (pasted) { setApiKey(pasted); setKeyStatus('idle') }
+                        }}
                         placeholder={settings?.openai_api_key_set ? '••••••••••••••••••' : 'sk-proj-…'}
                         className={`input pr-10 ${keyStatus === 'ok' ? 'border-success focus:border-success' : keyStatus === 'error' ? 'border-danger' : ''}`}
                         onKeyDown={(e) => e.key === 'Enter' && handleVerifyKey()}
+                        autoComplete="off"
+                        spellCheck={false}
                       />
                       <button
                         onClick={() => setShowKey(!showKey)}
@@ -233,9 +241,16 @@ export function SettingsModal() {
                           type={showAnthropicKey ? 'text' : 'password'}
                           value={anthropicKey}
                           onChange={(e) => { setAnthropicKey(e.target.value); setAnthropicStatus('idle') }}
+                          onPaste={(e) => {
+                            e.preventDefault()
+                            const pasted = e.clipboardData.getData('text').trim()
+                            if (pasted) { setAnthropicKey(pasted); setAnthropicStatus('idle') }
+                          }}
                           placeholder={settings?.anthropic_api_key_set ? '••••••••••••••••••' : 'sk-ant-api03-…'}
                           className={`input pr-10 ${anthropicStatus === 'ok' ? 'border-success focus:border-success' : anthropicStatus === 'error' ? 'border-danger' : ''}`}
                           onKeyDown={(e) => e.key === 'Enter' && handleVerifyAnthropicKey()}
+                          autoComplete="off"
+                          spellCheck={false}
                         />
                         <button
                           onClick={() => setShowAnthropicKey(!showAnthropicKey)}
