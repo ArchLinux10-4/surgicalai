@@ -11,6 +11,23 @@ interface Props {
   onApplied?: (filename: string, modifiedContent: string) => void
 }
 
+// --- localStorage helpers for persisting applied state across logins ---
+const appliedKey = (sessionId: string, changeId: string) =>
+  `sai-applied:${sessionId}:${changeId}`
+
+const loadApplied = (sessionId: string, changeIds: string[]): Record<string, boolean> => {
+  const out: Record<string, boolean> = {}
+  for (const id of changeIds) {
+    if (localStorage.getItem(appliedKey(sessionId, id)) === '1') out[id] = true
+  }
+  return out
+}
+
+const saveApplied = (sessionId: string, changeId: string) => {
+  try { localStorage.setItem(appliedKey(sessionId, changeId), '1') } catch {}
+}
+// -----------------------------------------------------------------------
+
 function ConfidenceBadge({ score }: { score: number }) {
   const color = score >= 8 ? 'text-green-400 bg-green-400/10 border-green-400/30'
     : score >= 6 ? 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30'
@@ -39,15 +56,21 @@ function DiffLine({ line }: { line: string }) {
   )
 }
 
-function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
+function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeApplied }: {
   filename: string
   fileData: { filename: string; file_id: string; changes: any[] }
   sessionId: string
   onApplied?: (filename: string, content: string) => void
+  onChangeApplied?: () => void
 }) {
   const [expanded, setExpanded] = useState(true)
   const [applying, setApplying] = useState<Record<string, boolean>>({})
-  const [applied, setApplied] = useState<Record<string, boolean>>({})
+
+  // Rehydrate applied state from localStorage on mount
+  const changeIds = fileData.changes.map((c: any) => c.id)
+  const [applied, setApplied] = useState<Record<string, boolean>>(() =>
+    loadApplied(sessionId, changeIds)
+  )
   const [skipped, setSkipped] = useState<Record<string, boolean>>({})
   const [originalCode, setOriginalCode] = useState<string>('')
   const [modifiedCode, setModifiedCode] = useState<string | undefined>(undefined)
@@ -71,10 +94,15 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
     return originalCode.slice(0, idx) + next + originalCode.slice(idx + orig.length)
   }
 
+  const markApplied = (changeId: string) => {
+    saveApplied(sessionId, changeId)
+    setApplied(p => ({ ...p, [changeId]: true }))
+    onChangeApplied?.()
+  }
+
   const handleApply = async (change: any) => {
     setApplying(p => ({ ...p, [change.id]: true }))
     try {
-      // Get the file content from session
       const fileData2 = await api.sessionFiles.get(sessionId, fileData.file_id)
       if (!originalCode) setOriginalCode(fileData2.content)
       const result = await api.surgical.apply({
@@ -100,7 +128,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
         setModifiedCode(result.modified_content || '')
         onApplied?.(filename, result.modified_content || '')
       }
-      setApplied(p => ({ ...p, [change.id]: true }))
+      markApplied(change.id)
     } catch (e: any) {
       toast.error(e.message || 'Apply failed')
     } finally {
@@ -184,7 +212,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
             <div className="flex items-center gap-2 px-4 py-1.5 bg-zinc-900 border-b border-zinc-800/60">
               <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Diff Preview</span>
               <span className="text-[10px] text-zinc-600 ml-auto">
-                {((change.diff || '').split('\n').filter((l: string) => l.startsWith('+') && !l.startsWith('+++'))).length} added{' \u00b7 '}
+                {((change.diff || '').split('\n').filter((l: string) => l.startsWith('+') && !l.startsWith('+++'))).length} added{' · '}
                 {((change.diff || '').split('\n').filter((l: string) => l.startsWith('-') && !l.startsWith('---'))).length} removed
               </span>
             </div>
@@ -258,6 +286,10 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
   const fileEntries = Object.entries(result.changes_by_file)
   const totalChanges = fileEntries.reduce((sum, [, v]) => sum + v.changes.length, 0)
 
+  // Track how many changes have been applied to hide the risks alert
+  const [appliedCount, setAppliedCount] = useState(0)
+  const allApplied = appliedCount >= totalChanges
+
   return (
     <div className="mt-2">
       {/* Summary header */}
@@ -277,11 +309,13 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
           fileData={fileData}
           sessionId={sessionId}
           onApplied={onApplied}
+          onChangeApplied={() => setAppliedCount(n => n + 1)}
         />
       ))}
 
+      {/* Risks alert — hidden (not removed) once all changes applied */}
       {result.risks && result.risks.length > 0 && (
-        <div className="mt-2 flex items-start gap-2 px-3 py-2 bg-yellow-500/10 border border-yellow-500/20 rounded-lg">
+        <div className={`mt-2 flex items-start gap-2 px-3 py-2 bg-yellow-500/10 border border-yellow-500/20 rounded-lg transition-opacity duration-300 ${allApplied ? 'hidden' : ''}`}>
           <AlertTriangle size={13} className="text-yellow-400 mt-0.5 flex-shrink-0" />
           <div className="text-[12px] text-yellow-300">
             <strong>Risks:</strong>
