@@ -33,10 +33,10 @@ export default function App() {
            1. User is actually logged in
            2. Settings have finished loading (no flash while fetching)
            3. Key genuinely missing */}
-      {isAuthenticated && settingsLoaded && !settings?.openai_api_key_set && (
+      {isAuthenticated && settingsLoaded && !settings?.openai_api_key_set && !(settings as any)?.anthropic_api_key_set && (
         <div className="flex items-center gap-3 px-4 py-2 bg-surface border-b border-orange/30 text-orange text-xs">
           <span className="text-base">⚠️</span>
-          <span className="font-medium">OpenAI API key not configured — AI features are disabled.</span>
+          <span className="font-medium">No API keys configured — add an OpenAI or Anthropic key to enable AI features.</span>
           <button
             onClick={() => setSettingsOpen(true)}
             className="ml-auto px-3 py-1 rounded-md bg-orange text-base text-xs font-bold hover:bg-orange/90 transition-colors"
