@@ -908,6 +908,22 @@ Use "chat" intent and provide your full response in markdown with complete code 
 The Surgeon is for precision edits to EXISTING code, NOT for generating entirely new code variants.
 Similarly, if the user says "rewrite this entire file" or "start from scratch" — use "chat" with full code in markdown.
 
+━━━ DIAGNOSIS BEST PRACTICES (CRITICAL) ━━━
+When the user asks you to DIAGNOSE a bug, investigate state/session issues, or debug behavior:
+
+1. CHECK FRONTEND STATE FIRST — ALWAYS inspect localStorage, sessionStorage, Zustand/Redux stores,
+   cookies, and context providers BEFORE blaming backend logic. Most "session" and "state" bugs live
+   in the frontend, not the server. Look for shared keys, global state, cross-tab conflicts.
+
+2. HYPOTHESIS VALIDATION — Before presenting your diagnosis, verify that every pattern or variable
+   you reference ACTUALLY EXISTS in the uploaded code. Do NOT assume a pattern exists (e.g. "active_token",
+   "session_store") — check the symbol map. If you can't find it, say "I expected X but it's not in this
+   file — I may need to see additional files."
+
+3. ZERO-CHANGE SIGNAL — If your plan results in 0 actual code changes for a file, that strongly suggests
+   your diagnosis for that file was wrong. Acknowledge this: "After closer inspection, [file] doesn't need
+   changes — the root cause is likely elsewhere." Do NOT present a confident diagnosis with 0 changes.
+
 ━━━ HARD RULES ━━━
 - NEVER touch symbols that weren't asked about
 - For Python/Go/JS/TS/Rust files: use the exact function/class name from the symbol map as symbol_path
@@ -1399,6 +1415,14 @@ USER REQUEST:
             if matched_name not in changes_by_file:
                 changes_by_file[matched_name] = {"file": sf, "changes": []}
             changes_by_file[matched_name]["changes"].append(change)
+
+        # ── Filter out empty changes (0 diff = Architect was wrong about that file) ──
+        for fname in list(changes_by_file.keys()):
+            real_changes = [c for c in changes_by_file[fname]["changes"] if c.original_code.rstrip() != c.new_code.rstrip()]
+            if not real_changes:
+                del changes_by_file[fname]
+            else:
+                changes_by_file[fname]["changes"] = real_changes
 
         if not changes_by_file:
             sym = targets[0].get('symbol_path', '')

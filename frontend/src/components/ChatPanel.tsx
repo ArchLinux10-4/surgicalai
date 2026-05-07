@@ -799,64 +799,64 @@ export function ChatPanel() {
           </div>
         )}
 
-        {/* Textarea + buttons */}
-        <div className="flex gap-2 items-end">
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="h-[44px] w-[44px] rounded-xl bg-zinc-800 border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors flex-shrink-0 flex items-center justify-center"
-            title="Attach files"
-          >
-            <Paperclip size={16} />
-          </button>
-
-          <div className="flex-1 relative">
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={handleKey}
-              placeholder={
-                hasFiles
-                  ? `Ask about your ${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} — "Add X", "Fix Y", "Explain Z"…`
-                  : 'Ask anything, or drop files here to edit code…'
-              }
-              rows={1}
-              onInput={(e) => {
-                const el = e.currentTarget
-                el.style.height = 'auto'
-                el.style.height = Math.min(el.scrollHeight, 200) + 'px'
-              }}
-              className="w-full bg-zinc-800 border border-zinc-700 rounded-xl text-sm text-zinc-200 placeholder:text-zinc-500 resize-none px-3 py-2.5 focus:outline-none focus:border-blue-500/60 leading-relaxed font-[inherit] min-h-[44px] max-h-[200px] overflow-y-auto"
-            />
+        {/* Unified input pill — Claude/Tasklet style */}
+        <div className="relative bg-zinc-800/80 border border-zinc-700/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-zinc-600 focus-within:shadow-blue-500/5 transition-all">
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={(e) => setInput(e.target.value)}
+            onKeyDown={handleKey}
+            placeholder={
+              hasFiles
+                ? `Ask about your ${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} — "Add X", "Fix Y", "Explain Z"…`
+                : 'Ask anything, or drop files here to edit code…'
+            }
+            rows={1}
+            onInput={(e) => {
+              const el = e.currentTarget
+              el.style.height = 'auto'
+              el.style.height = Math.min(el.scrollHeight, 200) + 'px'
+            }}
+            className="w-full bg-transparent text-sm text-zinc-200 placeholder:text-zinc-500 resize-none pl-4 pr-4 pt-3 pb-10 focus:outline-none leading-relaxed font-[inherit] min-h-[52px] max-h-[200px] overflow-y-auto"
+          />
+          {/* Bottom toolbar inside pill */}
+          <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between px-2 pb-2">
+            <div className="flex items-center gap-1">
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="h-8 w-8 rounded-lg text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700/60 transition-colors flex items-center justify-center"
+                title="Attach files"
+              >
+                <Paperclip size={15} />
+              </button>
+              <span className="text-[11px] text-zinc-600 ml-1 select-none">
+                {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} attached` : ''}
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11px] text-zinc-600 mr-1 select-none">⌘↵</span>
+              {isStreaming ? (
+                <button
+                  onClick={() => { abortRef.current?.abort(); stopStream() }}
+                  className="h-8 px-3 rounded-lg bg-red-500/15 text-red-400 text-xs font-semibold flex items-center gap-1.5 hover:bg-red-500/25 transition-colors"
+                >
+                  <X size={13} /> Stop
+                </button>
+              ) : (
+                <button
+                  onClick={handleSend}
+                  disabled={!input.trim()}
+                  className={`h-8 w-8 rounded-lg flex items-center justify-center transition-all ${
+                    !input.trim()
+                      ? 'text-zinc-600 cursor-not-allowed'
+                      : 'bg-blue-500 text-white hover:bg-blue-400 active:scale-95 shadow-sm shadow-blue-500/25'
+                  }`}
+                >
+                  <Send size={14} />
+                </button>
+              )}
+            </div>
           </div>
-
-          {isStreaming ? (
-            <button
-              onClick={() => { abortRef.current?.abort(); stopStream() }}
-              className="h-[44px] px-4 rounded-xl bg-red-500/20 border border-red-500/30 text-red-400 font-bold text-sm flex items-center gap-1.5 hover:bg-red-500/30 transition-colors flex-shrink-0"
-            >
-              <X size={14} /> Stop
-            </button>
-          ) : (
-            <button
-              onClick={handleSend}
-              disabled={!input.trim()}
-              className={`h-[44px] w-[44px] rounded-xl border font-bold text-sm flex items-center justify-center transition-all flex-shrink-0 ${
-                !input.trim()
-                  ? 'bg-zinc-800 border-zinc-700 text-zinc-600 cursor-not-allowed'
-                  : 'bg-blue-500/20 border-blue-500/30 text-blue-400 hover:bg-blue-500/30 active:scale-95'
-              }`}
-            >
-              <Send size={14} />
-            </button>
-          )}
-        </div>
-
-        <div className="flex items-center justify-between mt-1.5">
-          <span className="text-[11px] text-zinc-600">
-            {hasFiles ? `AI sees all ${sessionFiles.length} file(s) — just describe what you want` : 'Drag & drop files or click 📎'}
-          </span>
-          <span className="text-[11px] text-zinc-600">⌘↵ send</span>
         </div>
       </div>
     </div>
