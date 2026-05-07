@@ -177,4 +177,8 @@ export interface SmartResult {
     file_id: string
     changes: SurgicalChange[]
   }>
+  skipped_changes?: Record<string, {
+    symbol: string
+    reason: string
+  }[]>
 }
