@@ -1037,12 +1037,30 @@ USER REQUEST:
                 {"role": "user", "content": context_msg}
             ]
 
-        response = _chat_create(client,
-            model=arch_model,
-            messages=architect_messages,
-            temperature=0.3,
-            response_format={"type": "json_object"}
-        )
+        try:
+            response = _chat_create(client,
+                model=arch_model,
+                messages=architect_messages,
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+        except Exception as img_err:
+            err_str = str(img_err).lower()
+            if image_files and ("image" in err_str or "unsupported" in err_str or "invalid" in err_str):
+                # GPT rejected one or more images — fall back gracefully to text-only
+                yield sse({"type": "progress", "content": "⚠️ One or more images couldn't be read by GPT — falling back to text context..."})
+                architect_messages = [
+                    {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
+                    {"role": "user", "content": context_msg}
+                ]
+                response = _chat_create(client,
+                    model=arch_model,
+                    messages=architect_messages,
+                    temperature=0.3,
+                    response_format={"type": "json_object"}
+                )
+            else:
+                raise
 
         plan = json.loads(response.choices[0].message.content)
         intent = plan.get("intent", "chat")
