@@ -7,14 +7,15 @@ import { api } from './api/client'
 
 export default function App() {
   const { setSettings, settings, setSettingsOpen } = useAppStore()
+  const [settingsLoaded, setSettingsLoaded] = React.useState(false)
 
   useEffect(() => {
-    api.settings.get().then(setSettings).catch(console.error)
+    api.settings.get().then((s) => { setSettings(s); setSettingsLoaded(true) }).catch(() => setSettingsLoaded(true))
   }, [])
 
   return (
     <div className="h-screen flex flex-col bg-base text-ink overflow-hidden">
-      {!settings?.openai_api_key_set && (
+      {settingsLoaded && !settings?.openai_api_key_set && (
         <div className="flex items-center gap-3 px-4 py-2 bg-surface border-b border-orange/30 text-orange text-xs">
           <span className="text-base">⚠️</span>
           <span className="font-medium">OpenAI API key not configured — AI features are disabled.</span>

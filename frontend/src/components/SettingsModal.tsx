@@ -79,6 +79,22 @@ export function SettingsModal() {
 
   const handleSave = async () => {
     try {
+      // If user typed an API key, verify+save it as part of the save flow
+      if (apiKey.trim()) {
+        setVerifying(true)
+        try {
+          await api.settings.verifyKey(apiKey.trim())
+          setKeyStatus('ok')
+          setKeyMessage('API key verified and saved!')
+        } catch (e: any) {
+          setVerifying(false)
+          setKeyStatus('error')
+          setKeyMessage(e.message)
+          toast.error('API key invalid', e.message)
+          return // Don't save other settings if key is bad
+        }
+        setVerifying(false)
+      }
       await api.settings.update(form)
       const updated = await api.settings.get()
       setSettings(updated)
