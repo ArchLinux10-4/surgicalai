@@ -283,7 +283,7 @@ async def smart_stream(req: dict):
 
     # Load session files
     file_rows = conn.execute(
-        "SELECT id, filename, content, language, lines, symbol_count FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
+        "SELECT id, filename, content, language, lines, symbol_count, file_type FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
         (session_id,)
     ).fetchall()
     session_files = [dict(r) for r in file_rows]

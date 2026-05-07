@@ -10,6 +10,7 @@ Best Practice #3: Verify before commit (confidence scoring + diff)
 import json
 import uuid
 import difflib
+from pathlib import Path
 from typing import Optional
 from openai import OpenAI
 import httpx
@@ -943,9 +944,29 @@ Be warm, friendly, and encouraging. You're helping a person build something real
         file_summaries = []
         symbol_maps_by_name = {}
 
+        image_files = []  # files to be passed as vision content blocks
+
         for sf in session_files:
             fname = sf["filename"]
             content = sf["content"]
+            file_type = sf.get("file_type", "code")
+
+            if file_type == "image":
+                # Don't add to text summaries — will be passed as vision content block
+                image_files.append(sf)
+                file_summaries.append(f"FILE: {fname} [IMAGE — passed as visual context to GPT vision]")
+                symbol_maps_by_name[fname] = (None, sf)
+                continue
+
+            if file_type in ("pdf", "csv", "excel", "text"):
+                # Treat as plain text — no AST parsing
+                preview = content[:3000] + (f"\n... [{len(content) - 3000} chars truncated]" if len(content) > 3000 else "")
+                file_summaries.append(
+                    f"FILE: {fname} [{file_type.upper()}]\nCONTENT:\n{preview}"
+                )
+                symbol_maps_by_name[fname] = (None, sf)
+                continue
+
             try:
                 smap = parser.parse(content, fname)
                 symbol_maps_by_name[fname] = (smap, sf)
@@ -988,12 +1009,37 @@ USER REQUEST:
         client = _get_client()
         arch_model = get_setting("architect_model", "gpt-4.1")
 
-        response = _chat_create(client, 
-            model=arch_model,
-            messages=[
+        # Build user message content — text + optional vision blocks
+        if image_files:
+            # Multi-modal content array
+            user_content = [{"type": "text", "text": context_msg}]
+            for img_sf in image_files:
+                img_data = img_sf["content"]
+                # Ensure it's a valid data URL
+                if not img_data.startswith("data:"):
+                    # Try to infer MIME type from filename
+                    ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
+                    mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                                "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}
+                    mime = mime_map.get(ext, "image/png")
+                    img_data = f"data:{mime};base64,{img_data}"
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": img_data}
+                })
+            architect_messages = [
+                {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
+                {"role": "user", "content": user_content}
+            ]
+        else:
+            architect_messages = [
                 {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
                 {"role": "user", "content": context_msg}
-            ],
+            ]
+
+        response = _chat_create(client,
+            model=arch_model,
+            messages=architect_messages,
             temperature=0.3,
             response_format={"type": "json_object"}
         )

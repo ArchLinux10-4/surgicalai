@@ -174,6 +174,19 @@ function StreamingBubble({ content, progress }: { content: string; progress: str
   )
 }
 
+// ── File type icon helper ─────────────────────────────────
+function getFileIcon(file: SessionFile) {
+  const ext = file.filename.split('.').pop()?.toLowerCase() || ''
+  const fileType = (file as any).file_type || ''
+  if (fileType === 'image' || ['png','jpg','jpeg','webp','gif','bmp'].includes(ext)) {
+    return '🖼️'
+  }
+  if (fileType === 'pdf' || ext === 'pdf') return '📄'
+  if (fileType === 'csv' || ext === 'csv') return '📊'
+  if (fileType === 'excel' || ['xlsx','xls'].includes(ext)) return '📊'
+  return null // use FileCode icon (existing behavior)
+}
+
 // ── File chip ─────────────────────────────────────────────
 function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void }) {
   const langColors: Record<string, string> = {
@@ -181,10 +194,15 @@ function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void 
     go: 'text-cyan-300', rust: 'text-orange-400', java: 'text-red-400',
   }
   const color = langColors[file.language] || 'text-zinc-400'
+  const emojiIcon = getFileIcon(file)
 
   return (
     <div className="flex items-center gap-1.5 px-2.5 py-1 bg-zinc-800 border border-zinc-700 rounded-lg group">
-      <FileCode size={11} className={color} />
+      {emojiIcon ? (
+        <span className="text-[11px] leading-none">{emojiIcon}</span>
+      ) : (
+        <FileCode size={11} className={color} />
+      )}
       <span className="text-[12px] font-medium text-zinc-200">{file.filename}</span>
       <span className="text-[10px] text-zinc-500">{file.lines}L</span>
       {file.symbol_count > 0 && (
@@ -334,14 +352,42 @@ export function ChatPanel() {
     const sessionId = await ensureSession()
     setUploadingFiles(true)
     const promises = files.map(async (file) => {
-      const content = await file.text()
       const language = getLanguage(file.name)
-      try {
-        const result = await api.sessionFiles.upload(sessionId, {
-          filename: file.name,
-          content,
-          language,
+      const ext = file.name.split('.').pop()?.toLowerCase() || ''
+      const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg']
+      const BINARY_EXTS = ['pdf', 'xlsx', 'xls']
+      const isImage = IMAGE_EXTS.includes(ext)
+      const isBinary = BINARY_EXTS.includes(ext)
+
+      let uploadBody: Record<string, string>
+
+      if (isImage) {
+        // Read as base64 data URL
+        const base64Data = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => resolve(reader.result as string)
+          reader.onerror = reject
+          reader.readAsDataURL(file)
         })
+        uploadBody = { filename: file.name, content: '', base64_data: base64Data, language, file_type: 'image' }
+      } else if (isBinary) {
+        // PDF or Excel — read as base64, let backend extract text
+        const base64Data = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => resolve(reader.result as string)
+          reader.onerror = reject
+          reader.readAsDataURL(file)
+        })
+        const fileType = ext === 'pdf' ? 'pdf' : 'excel'
+        uploadBody = { filename: file.name, content: '', base64_data: base64Data, language, file_type: fileType }
+      } else {
+        // Text / code — existing behavior
+        const content = await file.text()
+        uploadBody = { filename: file.name, content, language }
+      }
+
+      try {
+        const result = await api.sessionFiles.upload(sessionId, uploadBody)
         addSessionFile(result)
         return result
       } catch (e: any) {
@@ -371,7 +417,7 @@ export function ChatPanel() {
     setIsDragging(false)
     const files = Array.from(e.dataTransfer.files).filter(f => {
       const ext = f.name.split('.').pop()?.toLowerCase() || ''
-      return ['py','js','ts','tsx','jsx','go','rs','java','cs','rb','php','swift','kt','html','css','json','yaml','yml','toml','md','sh','sql','cpp','c','h'].includes(ext)
+      return ['py','js','ts','tsx','jsx','go','rs','java','cs','rb','php','swift','kt','html','css','json','yaml','yml','toml','md','sh','sql','cpp','c','h','png','jpg','jpeg','webp','gif','bmp','pdf','csv','xlsx','xls','txt'].includes(ext)
     })
     if (files.length) uploadFiles(files)
   }
@@ -482,7 +528,7 @@ export function ChatPanel() {
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.json,.yaml,.yml,.toml,.md,.sh,.sql,.cpp,.c,.h"
+        accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.json,.yaml,.yml,.toml,.md,.sh,.sql,.cpp,.c,.h,.png,.jpg,.jpeg,.webp,.gif,.bmp,.pdf,.csv,.xlsx,.xls,.txt"
         className="hidden"
         onChange={handleFileInput}
       />

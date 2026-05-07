@@ -236,6 +236,11 @@ def _init_sqlite():
     if "user_id" not in existing_cols:
         cur.execute("ALTER TABLE chat_sessions ADD COLUMN user_id TEXT REFERENCES users(id) ON DELETE SET NULL")
 
+    # Migration: add file_type to session_files if missing
+    sf_cols = [row[1] for row in cur.execute("PRAGMA table_info(session_files)").fetchall()]
+    if "file_type" not in sf_cols:
+        cur.execute("ALTER TABLE session_files ADD COLUMN file_type TEXT DEFAULT 'code'")
+
     _seed_defaults_sqlite(cur)
     conn.commit()
     conn.close()
@@ -388,6 +393,9 @@ def _init_postgres():
         # Migration: add user_id column if missing (idempotent on PG)
         conn.execute("""
             ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS user_id TEXT
+        """)
+        conn.execute("""
+            ALTER TABLE session_files ADD COLUMN IF NOT EXISTS file_type TEXT DEFAULT 'code'
         """)
         conn.commit()
 

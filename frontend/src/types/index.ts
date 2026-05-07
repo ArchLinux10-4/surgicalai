@@ -163,6 +163,7 @@ export interface SessionFile {
   symbol_count: number
   created_at: string
   content?: string  // only present when explicitly fetched
+  file_type?: string  // 'code' | 'image' | 'pdf' | 'csv' | 'excel' | 'text'
 }
 
 export interface SmartResult {
