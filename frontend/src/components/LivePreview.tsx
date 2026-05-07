@@ -319,7 +319,7 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
   }
 
   return (
-    <div ref={panelRef} className={`mt-3 border border-indigo-500/30 rounded-xl overflow-hidden ${expanded ? 'fixed inset-4 z-50 shadow-2xl bg-zinc-950' : ''}`}>
+    <div ref={panelRef} className={`mt-3 border border-indigo-500/30 rounded-xl overflow-hidden ${expanded ? 'fixed inset-4 z-50 shadow-2xl bg-base' : ''}`}>
       {/* Header bar */}
       <div className="flex items-center gap-2 px-3 py-2 bg-indigo-950 border-b border-indigo-500/20">
         <Eye size={12} className="text-indigo-400" />
@@ -363,7 +363,7 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
           title={`Preview: ${filename}`}
         />
       ) : (
-        <div className={`w-full bg-zinc-900 flex items-center justify-center ${expanded ? 'h-[calc(100vh-120px)]' : 'h-[480px]'}`}>
+        <div className={`w-full bg-base flex items-center justify-center ${expanded ? 'h-[calc(100vh-120px)]' : 'h-[480px]'}`}>
           <Loader2 size={20} className="text-indigo-400 animate-spin" />
         </div>
       )}

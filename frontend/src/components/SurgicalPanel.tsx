@@ -7,16 +7,16 @@ import { toast } from '../lib/toast'
 import { DiffView } from './DiffView'
 
 const C = {
-  bg: '#0d1117', aiBg: '#161b22', border: '#30363d',
-  text: '#e6edf3', muted: '#8b949e', accent: '#58a6ff',
-  success: '#3fb950', warning: '#d29922', danger: '#f85149',
+  bg: 'rgb(var(--c-base))', aiBg: 'rgb(var(--c-surface))', border: 'rgb(var(--c-border))',
+  text: 'rgb(var(--c-ink))', muted: 'rgb(var(--c-muted))', accent: 'rgb(var(--c-accent))',
+  success: 'rgb(var(--c-success))', warning: 'rgb(var(--c-warning))', danger: 'rgb(var(--c-danger))',
 }
 
 function ConfidenceBadge({ score }: { score: number }) {
   const color = score >= 8 ? C.success : score >= 6 ? C.warning : C.danger
   const label = score >= 8 ? 'High' : score >= 6 ? 'Medium' : 'Low'
   return (
-    <span style={{ padding: '2px 8px', borderRadius: '20px', fontSize: '11px', fontWeight: 600, border: `1px solid ${color}`, color, background: color + '20' }}>
+    <span style={{ padding: '2px 8px', borderRadius: '20px', fontSize: '11px', fontWeight: 600, border: `1px solid ${color}`, color, background: `${color}20` }}>
       {label} {score}/10
     </span>
   )
@@ -56,7 +56,7 @@ function ImpactDisplay({ symbolPath, filePath, workspacePath }: { symbolPath: st
   const riskColor = impact.risk_level === 'high' ? C.danger : impact.risk_level === 'medium' ? C.warning : C.success
 
   return (
-    <div style={{ marginTop: '8px', padding: '8px', background: '#0d1117', borderRadius: '6px', border: `1px solid ${riskColor}40` }}>
+    <div style={{ marginTop: '8px', padding: '8px', background: C.bg, borderRadius: '6px', border: `1px solid ${riskColor}40` }}>
       <div style={{ display: 'flex', alignItems: 'center', gap: '6px', marginBottom: '6px' }}>
         <span style={{ fontSize: '11px', fontWeight: 700, color: riskColor, textTransform: 'uppercase' }}>
           {impact.risk_level} risk
@@ -94,7 +94,7 @@ function ChangeCard({ change, onApply, onReject, applied }: {
             <span style={{ fontSize: '13px', fontWeight: 600, color: C.text, fontFamily: 'monospace' }}>
               {change.symbol.full_path || change.symbol.name}
             </span>
-            <span style={{ fontSize: '11px', color: C.accent, background: C.accent + '20', padding: '1px 6px', borderRadius: '4px' }}>
+            <span style={{ fontSize: '11px', color: C.accent, background: 'rgb(var(--c-accent) / 0.12)', padding: '1px 6px', borderRadius: '4px' }}>
               {change.symbol.symbol_type}
             </span>
             <ConfidenceBadge score={change.confidence} />
@@ -117,7 +117,7 @@ function ChangeCard({ change, onApply, onReject, applied }: {
               onClick={() => onApply(change.id)}
               disabled={change.confidence < 5}
               style={{
-                background: C.success, border: 'none', color: '#0d1117',
+                background: C.success, border: 'none', color: 'rgb(var(--c-base))',
                 borderRadius: '4px', padding: '4px 10px', cursor: change.confidence < 5 ? 'not-allowed' : 'pointer',
                 fontSize: '12px', fontWeight: 600, opacity: change.confidence < 5 ? 0.5 : 1
               }}
@@ -253,14 +253,14 @@ export function SurgicalPanel() {
         <div style={{ fontSize: '13px', color: C.text, lineHeight: '1.6', marginBottom: '10px' }}>{plan.summary}</div>
 
         {plan.risks.length > 0 && (
-          <div style={{ padding: '8px 10px', background: C.warning + '15', border: `1px solid ${C.warning}40`, borderRadius: '6px', marginBottom: '8px' }}>
+          <div style={{ padding: '8px 10px', background: 'rgb(var(--c-warning) / 0.08)', border: '1px solid rgb(var(--c-warning) / 0.25)', borderRadius: '6px', marginBottom: '8px' }}>
             <div style={{ color: C.warning, fontSize: '11px', fontWeight: 600, marginBottom: '4px' }}>⚠️ Risks to review:</div>
             {plan.risks.map((r, i) => <div key={i} style={{ color: C.muted, fontSize: '12px' }}>• {r}</div>)}
           </div>
         )}
 
         {plan.import_changes.length > 0 && (
-          <div style={{ padding: '8px 10px', background: C.accent + '10', border: `1px solid ${C.accent}30`, borderRadius: '6px', marginBottom: '8px' }}>
+          <div style={{ padding: '8px 10px', background: 'rgb(var(--c-accent) / 0.06)', border: '1px solid rgb(var(--c-accent) / 0.19)', borderRadius: '6px', marginBottom: '8px' }}>
             <div style={{ color: C.accent, fontSize: '11px', fontWeight: 600, marginBottom: '4px' }}>Import changes needed:</div>
             {plan.import_changes.map((imp, i) => <div key={i} style={{ color: C.muted, fontSize: '12px', fontFamily: 'monospace' }}>{imp}</div>)}
           </div>
@@ -272,7 +272,7 @@ export function SurgicalPanel() {
             disabled={applying !== null}
             style={{
               marginTop: '8px', background: C.success, border: 'none', borderRadius: '6px',
-              color: '#0d1117', padding: '6px 16px', cursor: 'pointer', fontSize: '12px', fontWeight: 700,
+              color: 'rgb(var(--c-base))', padding: '6px 16px', cursor: 'pointer', fontSize: '12px', fontWeight: 700,
               display: 'flex', alignItems: 'center', gap: '6px'
             }}
           >

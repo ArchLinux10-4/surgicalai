@@ -4,7 +4,7 @@
  */
 import React, { useState, useEffect } from 'react'
 import { useAuthStore } from '../stores/authStore'
-import { apiClient } from '../api/client'
+import { api } from '../api/client'
 import { Plus, Trash2, Shield, User, RefreshCw } from 'lucide-react'
 
 interface UserRecord {
@@ -24,31 +24,7 @@ interface CreateForm {
   is_admin: boolean
 }
 
-function getAuthHeader(): Record<string, string> {
-  try {
-    const raw = localStorage.getItem('surgicalai-auth')
-    if (!raw) return {}
-    const token = JSON.parse(raw)?.state?.token
-    return token ? { Authorization: `Bearer ${token}` } : {}
-  } catch {
-    return {}
-  }
-}
 
-async function authedFetch(path: string, init?: RequestInit) {
-  const base = (import.meta.env.VITE_API_URL ?? '')
-  const res = await fetch(base + path, {
-    ...init,
-    headers: {
-      'Content-Type': 'application/json',
-      ...getAuthHeader(),
-      ...init?.headers,
-    },
-  })
-  const data = await res.json()
-  if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`)
-  return data
-}
 
 export function AdminUsersPanel() {
   const { user } = useAuthStore()
@@ -63,7 +39,7 @@ export function AdminUsersPanel() {
   async function loadUsers() {
     setLoading(true)
     try {
-      const data = await authedFetch('/api/auth/users')
+      const data = await api.auth.getUsers()
       setUsers(data)
     } catch (e: any) {
       console.error('Failed to load users:', e.message)
@@ -79,10 +55,7 @@ export function AdminUsersPanel() {
     setFormError('')
     setCreating(true)
     try {
-      await authedFetch('/api/auth/users', {
-        method: 'POST',
-        body: JSON.stringify(form),
-      })
+      await api.auth.createUser(form)
       setForm({ username: '', email: '', password: '', is_admin: false })
       setShowForm(false)
       await loadUsers()
@@ -97,7 +70,7 @@ export function AdminUsersPanel() {
     if (!confirm(`Delete user "${username}"? This cannot be undone.`)) return
     setDeletingId(userId)
     try {
-      await authedFetch(`/api/auth/users/${userId}`, { method: 'DELETE' })
+      await api.auth.deleteUser(userId)
       await loadUsers()
     } catch (e: any) {
       alert(e.message)
@@ -241,7 +214,7 @@ export function AdminUsersPanel() {
                       <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-500/15 text-green-400 font-medium">You</span>
                     )}
                     {!Boolean(u.is_active) && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-gray-500/15 text-gray-400 font-medium">Inactive</span>
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted/15 text-muted font-medium">Inactive</span>
                     )}
                   </div>
                   {u.email && <p className="text-[11px] text-faint">{u.email}</p>}

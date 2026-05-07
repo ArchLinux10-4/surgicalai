@@ -90,7 +90,7 @@ export function DiffView({ original, modified, title }: DiffViewProps) {
           <span style={{ color: prefixColor, width: '20px', flexShrink: 0, paddingLeft: '8px', fontFamily: 'monospace', fontSize: '12px', lineHeight: '20px', userSelect: 'none' }}>
             {prefix}
           </span>
-          <span style={{ color: '#8b949e', width: '36px', flexShrink: 0, textAlign: 'right', paddingRight: '8px', fontFamily: 'monospace', fontSize: '11px', lineHeight: '20px', userSelect: 'none' }}>
+          <span style={{ color: 'rgb(var(--c-muted))', width: '36px', flexShrink: 0, textAlign: 'right', paddingRight: '8px', fontFamily: 'monospace', fontSize: '11px', lineHeight: '20px', userSelect: 'none' }}>
             {row.lineNum}
           </span>
           <span style={{ color, fontFamily: 'monospace', fontSize: '12px', lineHeight: '20px', whiteSpace: 'pre', flex: 1 }}>
@@ -102,9 +102,9 @@ export function DiffView({ original, modified, title }: DiffViewProps) {
   }
 
   return (
-    <div style={{ background: '#0d1117', border: '1px solid #30363d', borderRadius: '6px', overflow: 'hidden' }}>
+    <div style={{ background: 'rgb(var(--c-base))', border: '1px solid rgb(var(--c-border))', borderRadius: '6px', overflow: 'hidden' }}>
       {title && (
-        <div style={{ padding: '6px 12px', background: '#161b22', borderBottom: '1px solid #30363d', fontSize: '12px', color: '#8b949e' }}>
+        <div style={{ padding: '6px 12px', background: 'rgb(var(--c-surface))', borderBottom: '1px solid rgb(var(--c-border))', fontSize: '12px', color: 'rgb(var(--c-muted))' }}>
           {title}
         </div>
       )}

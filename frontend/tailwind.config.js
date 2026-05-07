@@ -4,25 +4,21 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Surfaces
-        base:     '#0d1117',
-        surface:  '#161b22',
-        overlay:  '#1c2128',
-        // Borders
-        border:   '#30363d',
-        'border-sub': '#21262d',
-        // Text
-        ink:      '#e6edf3',
-        muted:    '#8b949e',
-        faint:    '#484f58',
-        // Accents
-        accent:   '#58a6ff',
-        'accent-dark': '#1f6feb',
-        success:  '#3fb950',
-        warning:  '#d29922',
-        danger:   '#f85149',
-        purple:   '#bc8cff',
-        orange:   '#f0883e',
+        base:     'rgb(var(--c-base) / <alpha-value>)',
+        surface:  'rgb(var(--c-surface) / <alpha-value>)',
+        overlay:  'rgb(var(--c-overlay) / <alpha-value>)',
+        border:   'rgb(var(--c-border) / <alpha-value>)',
+        'border-sub': 'rgb(var(--c-border-sub) / <alpha-value>)',
+        ink:      'rgb(var(--c-ink) / <alpha-value>)',
+        muted:    'rgb(var(--c-muted) / <alpha-value>)',
+        faint:    'rgb(var(--c-faint) / <alpha-value>)',
+        accent:   'rgb(var(--c-accent) / <alpha-value>)',
+        'accent-dark': 'rgb(var(--c-accent-dark) / <alpha-value>)',
+        success:  'rgb(var(--c-success) / <alpha-value>)',
+        warning:  'rgb(var(--c-warning) / <alpha-value>)',
+        danger:   'rgb(var(--c-danger) / <alpha-value>)',
+        purple:   'rgb(var(--c-purple) / <alpha-value>)',
+        orange:   'rgb(var(--c-orange) / <alpha-value>)',
       },
       fontFamily: {
         sans: ['-apple-system', 'BlinkMacSystemFont', '"Segoe UI"', 'Helvetica', 'Arial', 'sans-serif'],
@@ -31,8 +27,8 @@ export default {
       boxShadow: {
         'soft': '0 1px 3px rgba(0,0,0,0.3), 0 1px 2px rgba(0,0,0,0.4)',
         'modal': '0 24px 48px rgba(0,0,0,0.6), 0 8px 16px rgba(0,0,0,0.4)',
-        'glow-accent': '0 0 0 3px rgba(88, 166, 255, 0.15)',
-        'glow-success': '0 0 0 3px rgba(63, 185, 80, 0.15)',
+        'glow-accent': '0 0 0 3px rgb(var(--c-accent) / 0.15)',
+        'glow-success': '0 0 0 3px rgb(var(--c-success) / 0.15)',
       },
       animation: {
         'fade-in': 'fadeIn 0.15s ease-out',

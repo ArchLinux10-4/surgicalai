@@ -7,9 +7,10 @@ import { toast } from '../lib/toast'
 import {
   Settings, MessageSquare, FolderOpen, RefreshCw, Plus,
   Search, Trash2, Pencil, Check, X, ChevronRight, ChevronDown,
-  Pin, BookOpen, Zap, MoreHorizontal, Upload, FileCode, File, LogOut,
+  Pin, BookOpen, Zap, MoreHorizontal, Upload, FileCode, File, LogOut, Sun, Moon,
 } from 'lucide-react'
 import { ContextPanel } from './ContextPanel'
+import { useThemeStore } from '../stores/themeStore'
 
 // ── File icon helper ────────────────────────────────
 const FILE_ICONS: Record<string, string> = {
@@ -279,13 +280,13 @@ function SessionFilesPanel() {
       <div className="flex-1 overflow-y-auto py-1">
         {sessionFiles.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full gap-3 px-4 text-center pb-8">
-            <div className="w-12 h-12 rounded-2xl bg-zinc-800 flex items-center justify-center">
-              <FileCode size={22} className="text-zinc-500" />
+            <div className="w-12 h-12 rounded-2xl bg-surface flex items-center justify-center">
+              <FileCode size={22} className="text-muted/70" />
             </div>
             <div>
-              <p className="text-[13px] font-semibold text-zinc-400">No files in this chat</p>
-              <p className="text-[11px] text-zinc-600 mt-1 leading-relaxed">
-                Drop files into the chat or click <strong className="text-zinc-500">Add</strong> above to get surgical edits
+              <p className="text-[13px] font-semibold text-muted">No files in this chat</p>
+              <p className="text-[11px] text-faint mt-1 leading-relaxed">
+                Drop files into the chat or click <strong className="text-muted/70">Add</strong> above to get surgical edits
               </p>
             </div>
             <button
@@ -375,6 +376,19 @@ function UserMenu() {
   )
 }
 
+function ThemeToggleBtn() {
+  const { theme, toggleTheme } = useThemeStore()
+  return (
+    <button
+      onClick={toggleTheme}
+      className="btn-icon"
+      title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+    >
+      {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
+    </button>
+  )
+}
+
 export function Sidebar() {
   const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, activeSessions } = useAppStore()
 
@@ -401,6 +415,7 @@ export function Sidebar() {
           <span className="text-sm font-bold text-ink tracking-tight">SurgicalAI</span>
         </div>
         <div className="flex items-center gap-1">
+          <ThemeToggleBtn />
           <button onClick={() => setSettingsOpen(true)} className="btn-icon" title="Settings (⌘,)">
             <Settings size={15} />
           </button>

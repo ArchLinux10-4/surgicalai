@@ -1,6 +1,8 @@
 import React, { useState } from 'react'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import { default as a11yOneLight } from 'react-syntax-highlighter/dist/esm/styles/prism/a11y-one-light'
+import { useThemeStore } from '../stores/themeStore'
 import { Copy, Check, ChevronDown, ChevronUp, Download } from 'lucide-react'
 
 const COLLAPSE_LINES = 8
@@ -32,7 +34,7 @@ const LANG_COLORS: Record<string, string> = {
   bash: 'text-green-400 bg-green-400/10 border-green-400/20',
   sh: 'text-green-400 bg-green-400/10 border-green-400/20',
   sql: 'text-purple-400 bg-purple-400/10 border-purple-400/20',
-  json: 'text-zinc-300 bg-zinc-300/10 border-zinc-300/20',
+  json: 'text-muted bg-muted/10 border-muted/20',
 }
 
 interface CodeBlockProps {
@@ -44,6 +46,7 @@ interface CodeBlockProps {
 export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps) {
   const [copied, setCopied] = useState(false)
   const [collapsed, setCollapsed] = useState(true)
+  const theme = useThemeStore(s => s.theme)
 
   const lines = code.split('\n')
   const isLong = lines.length > COLLAPSE_LINES
@@ -51,7 +54,7 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
 
   const lang = language.toLowerCase().replace(/^language-/, '')
   const label = LANG_LABELS[lang] || lang.toUpperCase() || 'CODE'
-  const colorClass = LANG_COLORS[lang] || 'text-zinc-400 bg-zinc-400/10 border-zinc-400/20'
+  const colorClass = LANG_COLORS[lang] || 'text-muted bg-muted/10 border-muted/20'
 
   const handleCopy = () => {
     navigator.clipboard.writeText(code)
@@ -82,9 +85,9 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
   }
 
   return (
-    <div className="my-3 rounded-xl overflow-hidden border border-zinc-700/60 bg-zinc-950 shadow-lg">
+    <div className="my-3 rounded-xl overflow-hidden border border-border/60 bg-base shadow-lg">
       {/* Header bar */}
-      <div className="flex items-center justify-between px-3.5 py-2 bg-zinc-800/80 border-b border-zinc-700/60">
+      <div className="flex items-center justify-between px-3.5 py-2 bg-surface/80 border-b border-border/60">
         <div className="flex items-center gap-2">
           {/* Traffic lights */}
           <div className="flex gap-1.5">
@@ -96,10 +99,10 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
             {label}
           </span>
           {filename && (
-            <span className="text-[11px] text-zinc-400 font-mono">{filename}</span>
+            <span className="text-[11px] text-muted font-mono">{filename}</span>
           )}
           {isLong && (
-            <span className="text-[10px] text-zinc-500">{lines.length} lines</span>
+            <span className="text-[10px] text-muted/70">{lines.length} lines</span>
           )}
         </div>
 
@@ -107,7 +110,7 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
           {/* Download */}
           <button
             onClick={handleDownload}
-            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/60 transition-colors"
+            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
             title="Download file"
           >
             <Download size={12} />
@@ -116,7 +119,7 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
           {/* Copy */}
           <button
             onClick={handleCopy}
-            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/60 transition-colors"
+            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
             title="Copy code"
           >
             {copied ? (
@@ -130,7 +133,7 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
           {isLong && (
             <button
               onClick={() => setCollapsed(c => !c)}
-              className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-zinc-400 hover:text-zinc-200 hover:bg-zinc-700/60 transition-colors"
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
               title={collapsed ? 'Expand' : 'Collapse'}
             >
               {collapsed ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
@@ -144,13 +147,13 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
       <div className="relative">
         <SyntaxHighlighter
           language={lang || 'text'}
-          style={vscDarkPlus}
+          style={theme === 'dark' ? vscDarkPlus : a11yOneLight}
           showLineNumbers
           wrapLines
           lineNumberStyle={{
             minWidth: '2.5em',
             paddingRight: '1em',
-            color: '#4b5563',
+            color: 'rgb(var(--c-faint))',
             fontSize: '11px',
             userSelect: 'none',
           }}
@@ -168,7 +171,7 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
 
         {/* Fade + expand overlay when collapsed */}
         {isLong && collapsed && (
-          <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-zinc-950 to-transparent pointer-events-none" />
+          <div className="absolute bottom-0 left-0 right-0 h-16 bg-gradient-to-t from-base to-transparent pointer-events-none" />
         )}
       </div>
 
@@ -176,7 +179,7 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
       {isLong && collapsed && (
         <button
           onClick={() => setCollapsed(false)}
-          className="w-full py-2 text-[12px] text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/60 transition-colors border-t border-zinc-700/60 flex items-center justify-center gap-1.5"
+          className="w-full py-2 text-[12px] text-muted hover:text-ink hover:bg-surface/60 transition-colors border-t border-border/60 flex items-center justify-center gap-1.5"
         >
           <ChevronDown size={13} />
           Show {lines.length - COLLAPSE_LINES} more lines
@@ -203,7 +206,7 @@ export function MarkdownCode({
 
   if (inline) {
     return (
-      <code className="px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-200 text-[12px] font-mono border border-zinc-700/50" {...props}>
+      <code className="px-1.5 py-0.5 rounded bg-surface text-ink text-[12px] font-mono border border-border/50" {...props}>
         {children}
       </code>
     )

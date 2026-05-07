@@ -16,16 +16,16 @@ const mdComponents = {
   code: MarkdownCode as any,
   // Beautiful prose overrides
   h1: ({ children }: any) => (
-    <h1 className="text-lg font-bold text-zinc-100 mt-5 mb-2 border-b border-zinc-700/50 pb-1.5">{children}</h1>
+    <h1 className="text-lg font-bold text-ink mt-5 mb-2 border-b border-border/50 pb-1.5">{children}</h1>
   ),
   h2: ({ children }: any) => (
-    <h2 className="text-base font-bold text-zinc-100 mt-4 mb-1.5">{children}</h2>
+    <h2 className="text-base font-bold text-ink mt-4 mb-1.5">{children}</h2>
   ),
   h3: ({ children }: any) => (
-    <h3 className="text-sm font-semibold text-zinc-200 mt-3 mb-1">{children}</h3>
+    <h3 className="text-sm font-semibold text-ink mt-3 mb-1">{children}</h3>
   ),
   p: ({ children }: any) => (
-    <p className="text-sm text-zinc-300 leading-7 mb-3 last:mb-0">{children}</p>
+    <p className="text-sm text-ink/80 leading-7 mb-3 last:mb-0">{children}</p>
   ),
   ul: ({ children }: any) => (
     <ul className="my-2 space-y-1 pl-1">{children}</ul>
@@ -34,32 +34,32 @@ const mdComponents = {
     <ol className="my-2 space-y-1 pl-1 list-decimal list-inside">{children}</ol>
   ),
   li: ({ children }: any) => (
-    <li className="flex items-start gap-2 text-sm text-zinc-300 leading-6">
+    <li className="flex items-start gap-2 text-sm text-ink/80 leading-6">
       <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-blue-400/70 flex-shrink-0 list-none" />
       <span>{children}</span>
     </li>
   ),
   blockquote: ({ children }: any) => (
-    <blockquote className="my-3 pl-4 border-l-2 border-blue-500/50 text-zinc-400 italic text-sm leading-6">{children}</blockquote>
+    <blockquote className="my-3 pl-4 border-l-2 border-blue-500/50 text-muted italic text-sm leading-6">{children}</blockquote>
   ),
   strong: ({ children }: any) => (
-    <strong className="font-semibold text-zinc-100">{children}</strong>
+    <strong className="font-semibold text-ink">{children}</strong>
   ),
   em: ({ children }: any) => (
-    <em className="text-zinc-300 italic">{children}</em>
+    <em className="text-ink/80 italic">{children}</em>
   ),
   a: ({ children, href }: any) => (
     <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors">{children}</a>
   ),
-  hr: () => <hr className="my-4 border-zinc-700/50" />,
+  hr: () => <hr className="my-4 border-border/50" />,
   table: ({ children }: any) => (
-    <div className="my-3 overflow-x-auto rounded-lg border border-zinc-700/60">
+    <div className="my-3 overflow-x-auto rounded-lg border border-border/60">
       <table className="w-full text-sm">{children}</table>
     </div>
   ),
-  thead: ({ children }: any) => <thead className="bg-zinc-800/80">{children}</thead>,
-  th: ({ children }: any) => <th className="px-3 py-2 text-left text-xs font-semibold text-zinc-300 uppercase tracking-wide">{children}</th>,
-  td: ({ children }: any) => <td className="px-3 py-2 text-zinc-400 text-sm border-t border-zinc-700/40">{children}</td>,
+  thead: ({ children }: any) => <thead className="bg-surface/80">{children}</thead>,
+  th: ({ children }: any) => <th className="px-3 py-2 text-left text-xs font-semibold text-ink/80 uppercase tracking-wide">{children}</th>,
+  td: ({ children }: any) => <td className="px-3 py-2 text-muted text-sm border-t border-border/40">{children}</td>,
 }
 
 // ── Helpers ───────────────────────────────────────────────
@@ -126,10 +126,10 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
       <div className="flex justify-end px-4 py-3 group">
         <div className="max-w-[78%]">
           <div className="flex items-center justify-end gap-2 mb-1">
-            <span className="text-[10px] text-zinc-600 opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
-            <span className="text-[11px] font-medium text-zinc-500">You</span>
+            <span className="text-[10px] text-faint opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
+            <span className="text-[11px] font-medium text-muted/70">You</span>
           </div>
-          <div className="bg-zinc-700/60 border border-zinc-600/40 rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm text-zinc-100 leading-relaxed whitespace-pre-wrap shadow-sm">
+          <div className="bg-overlay/60 border border-border/40 rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm text-ink leading-relaxed whitespace-pre-wrap shadow-sm">
             {msg.content}
           </div>
         </div>
@@ -143,8 +143,8 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
       <AIAvatar />
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-2">
-          <span className="text-[12px] font-semibold text-zinc-300">SurgicalAI</span>
-          <span className="text-[10px] text-zinc-600 opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
+          <span className="text-[12px] font-semibold text-ink/80">SurgicalAI</span>
+          <span className="text-[10px] text-faint opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
         </div>
 
         {isSurgical && surgicalResult ? (
@@ -191,7 +191,7 @@ function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boole
         )}
       </button>
       {expanded && text && (
-        <div className="mt-2 ml-5 pl-3 border-l-2 border-violet-500/30 text-[12px] text-zinc-400/90 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed font-mono">
+        <div className="mt-2 ml-5 pl-3 border-l-2 border-violet-500/30 text-[12px] text-muted/90 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed font-mono">
           {text}
           {isStreaming && <span className="inline-block w-1.5 h-3 bg-violet-400/60 rounded-sm ml-0.5 animate-pulse" />}
         </div>
@@ -223,7 +223,7 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
 
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-2">
-          <span className="text-[12px] font-semibold text-zinc-300">SurgicalAI</span>
+          <span className="text-[12px] font-semibold text-ink/80">SurgicalAI</span>
           {/* Current progress badge */}
           {progress && (
             <span className="text-[11px] text-blue-400 flex items-center gap-1.5 bg-blue-500/10 px-2 py-0.5 rounded-full border border-blue-500/20">
@@ -233,7 +233,7 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
           )}
           {/* Elapsed timer */}
           {elapsed > 0 && !content && (
-            <span className="text-[10px] text-zinc-500 tabular-nums">{elapsed}s</span>
+            <span className="text-[10px] text-muted/70 tabular-nums">{elapsed}s</span>
           )}
         </div>
 
@@ -242,15 +242,15 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
           <div className="mb-2">
             <button
               onClick={() => setThinkingExpanded(e => !e)}
-              className="text-[11px] text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
+              className="text-[11px] text-muted/70 hover:text-ink/80 flex items-center gap-1 transition-colors"
             >
               <span>{thinkingExpanded ? '▾' : '▸'}</span>
               <span>{completedSteps.length} step{completedSteps.length !== 1 ? 's' : ''} completed</span>
             </button>
             {thinkingExpanded && (
-              <div className="mt-1.5 pl-3 border-l-2 border-zinc-700/60 space-y-1">
+              <div className="mt-1.5 pl-3 border-l-2 border-border/60 space-y-1">
                 {completedSteps.map((step, i) => (
-                  <div key={i} className="text-[11px] text-zinc-500 flex items-center gap-1.5">
+                  <div key={i} className="text-[11px] text-muted/70 flex items-center gap-1.5">
                     <span className="text-green-400/80">✓</span>
                     <span>{step}</span>
                   </div>
@@ -299,24 +299,24 @@ function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void 
     python: 'text-blue-400', typescript: 'text-cyan-400', javascript: 'text-yellow-400',
     go: 'text-cyan-300', rust: 'text-orange-400', java: 'text-red-400',
   }
-  const color = langColors[file.language] || 'text-zinc-400'
+  const color = langColors[file.language] || 'text-muted'
   const emojiIcon = getFileIcon(file)
 
   return (
-    <div className="flex items-center gap-1.5 px-2.5 py-1 bg-zinc-800 border border-zinc-700 rounded-lg group">
+    <div className="flex items-center gap-1.5 px-2.5 py-1 bg-surface border border-border rounded-lg group">
       {emojiIcon ? (
         <span className="text-[11px] leading-none">{emojiIcon}</span>
       ) : (
         <FileCode size={11} className={color} />
       )}
-      <span className="text-[12px] font-medium text-zinc-200">{file.filename}</span>
-      <span className="text-[10px] text-zinc-500">{file.lines}L</span>
+      <span className="text-[12px] font-medium text-ink">{file.filename}</span>
+      <span className="text-[10px] text-muted/70">{file.lines}L</span>
       {file.symbol_count > 0 && (
-        <span className="text-[10px] text-zinc-600">{file.symbol_count}⚡</span>
+        <span className="text-[10px] text-faint">{file.symbol_count}⚡</span>
       )}
       <button
         onClick={onRemove}
-        className="ml-0.5 opacity-0 group-hover:opacity-100 transition-opacity text-zinc-500 hover:text-red-400"
+        className="ml-0.5 opacity-0 group-hover:opacity-100 transition-opacity text-muted/70 hover:text-red-400"
       >
         <X size={10} />
       </button>
@@ -331,8 +331,8 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
       <div className="w-16 h-16 rounded-2xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center mb-5">
         <Zap size={28} className="text-blue-400" />
       </div>
-      <h2 className="text-base font-bold text-zinc-100 mb-2">SurgicalAI</h2>
-      <p className="text-sm text-zinc-400 leading-relaxed mb-6 max-w-xs">
+      <h2 className="text-base font-bold text-ink mb-2">SurgicalAI</h2>
+      <p className="text-sm text-muted leading-relaxed mb-6 max-w-xs">
         Upload your code files, then describe what you want to change. The AI reads all your files and figures out exactly what to edit.
       </p>
 
@@ -349,24 +349,24 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
           { ex: 'Upload auth.ts, api.ts', desc: 'then ask: "Add rate limiting to all endpoints"' },
           { ex: 'Upload any code file', desc: 'then ask anything — edit, explain, review' },
         ].map(({ ex, desc }) => (
-          <div key={ex} className="flex items-start gap-2.5 px-3 py-2 bg-zinc-800/50 rounded-lg border border-zinc-700/50">
+          <div key={ex} className="flex items-start gap-2.5 px-3 py-2 bg-surface/50 rounded-lg border border-border/50">
             <FileCode size={12} className="text-blue-400 mt-0.5 flex-shrink-0" />
             <div>
-              <div className="text-[12px] font-semibold text-zinc-300">{ex}</div>
-              <div className="text-[11px] text-zinc-500">{desc}</div>
+              <div className="text-[12px] font-semibold text-ink/80">{ex}</div>
+              <div className="text-[11px] text-muted/70">{desc}</div>
             </div>
           </div>
         ))}
       </div>
 
       <div className="mt-6 w-full space-y-1.5 text-left">
-        <div className="text-[10px] text-zinc-600 uppercase tracking-wider font-semibold mb-1">Keyboard shortcuts</div>
+        <div className="text-[10px] text-faint uppercase tracking-wider font-semibold mb-1">Keyboard shortcuts</div>
         {[
           ['⌘↵', 'Send'], ['⌘K', 'Focus input'], ['⌘N', 'New chat'], ['Esc', 'Stop'],
         ].map(([key, desc]) => (
           <div key={key} className="flex items-center gap-2">
-            <kbd className="px-1.5 py-0.5 rounded bg-zinc-800 border border-zinc-700 text-[10px] font-mono text-zinc-400">{key}</kbd>
-            <span className="text-[11px] text-zinc-500">{desc}</span>
+            <kbd className="px-1.5 py-0.5 rounded bg-surface border border-border text-[10px] font-mono text-muted">{key}</kbd>
+            <span className="text-[11px] text-muted/70">{desc}</span>
           </div>
         ))}
       </div>
@@ -706,19 +706,19 @@ export function ChatPanel() {
       />
 
       {/* Header */}
-      <div className="flex items-center justify-between px-4 py-2.5 border-b border-zinc-800 bg-zinc-900/50 flex-shrink-0">
+      <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-base/50 flex-shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <Zap size={13} className="text-blue-400 flex-shrink-0" />
-          <span className="text-sm font-semibold text-zinc-200">
+          <span className="text-sm font-semibold text-ink">
             {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} in context` : 'SurgicalAI'}
           </span>
         </div>
         <div className="flex items-center gap-1.5">
-          <span className="text-[11px] text-zinc-500">{settings?.architect_model || 'gpt-4.1'}</span>
-          <button onClick={() => fileInputRef.current?.click()} className="p-1.5 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors" title="Upload files">
+          <span className="text-[11px] text-muted/70">{settings?.architect_model || 'gpt-4.1'}</span>
+          <button onClick={() => fileInputRef.current?.click()} className="p-1.5 rounded-lg hover:bg-overlay text-muted hover:text-ink transition-colors" title="Upload files">
             <Paperclip size={13} />
           </button>
-          <button onClick={newChat} className="p-1.5 rounded-lg hover:bg-zinc-700 text-zinc-400 hover:text-zinc-200 transition-colors" title="New chat (⌘N)">
+          <button onClick={newChat} className="p-1.5 rounded-lg hover:bg-overlay text-muted hover:text-ink transition-colors" title="New chat (⌘N)">
             <Plus size={14} />
           </button>
         </div>
@@ -751,14 +751,14 @@ export function ChatPanel() {
       </div>
 
       {/* Input area */}
-      <div className="border-t border-zinc-800 p-3 flex-shrink-0 bg-zinc-900/50">
+      <div className="border-t border-border p-3 flex-shrink-0 bg-base/50">
         {/* File chips */}
         {hasFiles && (
           <div className="mb-2.5">
             {/* Collapse toggle row */}
             <button
               onClick={() => setFilesCollapsed(c => !c)}
-              className="flex items-center gap-1.5 mb-1.5 text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors select-none"
+              className="flex items-center gap-1.5 mb-1.5 text-[11px] text-muted/70 hover:text-ink/80 transition-colors select-none"
             >
               <span>{filesCollapsed ? '▸' : '▾'}</span>
               <span>{sessionFiles.length} file{sessionFiles.length !== 1 ? 's' : ''} in context</span>
@@ -776,7 +776,7 @@ export function ChatPanel() {
                 {sessionFiles.length > 5 && !showAllFiles && (
                   <button
                     onClick={() => setShowAllFiles(true)}
-                    className="flex items-center gap-1 px-2.5 py-1 bg-zinc-800/60 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors"
+                    className="flex items-center gap-1 px-2.5 py-1 bg-surface/60 border border-border rounded-lg text-[11px] text-muted hover:text-ink hover:border-border transition-colors"
                   >
                     +{sessionFiles.length - 5} more
                   </button>
@@ -784,14 +784,14 @@ export function ChatPanel() {
                 {showAllFiles && sessionFiles.length > 5 && (
                   <button
                     onClick={() => setShowAllFiles(false)}
-                    className="flex items-center gap-1 px-2.5 py-1 bg-zinc-800/60 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors"
+                    className="flex items-center gap-1 px-2.5 py-1 bg-surface/60 border border-border rounded-lg text-[11px] text-muted hover:text-ink hover:border-border transition-colors"
                   >
                     show less
                   </button>
                 )}
                 {uploadingFiles && (
-                  <div className="flex items-center gap-1.5 px-2.5 py-1 bg-zinc-800/60 border border-zinc-700 rounded-lg">
-                    <span className="text-[11px] text-zinc-500 animate-pulse">Uploading...</span>
+                  <div className="flex items-center gap-1.5 px-2.5 py-1 bg-surface/60 border border-border rounded-lg">
+                    <span className="text-[11px] text-muted/70 animate-pulse">Uploading...</span>
                   </div>
                 )}
               </div>
@@ -800,7 +800,7 @@ export function ChatPanel() {
         )}
 
         {/* Unified input pill — Claude/Tasklet style */}
-        <div className="relative bg-zinc-800/80 border border-zinc-700/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-zinc-600 focus-within:shadow-blue-500/5 transition-all">
+        <div className="relative bg-surface/80 border border-border/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-border focus-within:shadow-blue-500/5 transition-all">
           <textarea
             ref={textareaRef}
             value={input}
@@ -817,24 +817,24 @@ export function ChatPanel() {
               el.style.height = 'auto'
               el.style.height = Math.min(el.scrollHeight, 200) + 'px'
             }}
-            className="w-full bg-transparent text-sm text-zinc-200 placeholder:text-zinc-500 resize-none pl-4 pr-4 pt-3 pb-10 focus:outline-none leading-relaxed font-[inherit] min-h-[52px] max-h-[200px] overflow-y-auto"
+            className="w-full bg-transparent text-sm text-ink placeholder:text-muted/70 resize-none pl-4 pr-4 pt-3 pb-10 focus:outline-none leading-relaxed font-[inherit] min-h-[52px] max-h-[200px] overflow-y-auto"
           />
           {/* Bottom toolbar inside pill */}
           <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between px-2 pb-2">
             <div className="flex items-center gap-1">
               <button
                 onClick={() => fileInputRef.current?.click()}
-                className="h-8 w-8 rounded-lg text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700/60 transition-colors flex items-center justify-center"
+                className="h-8 w-8 rounded-lg text-muted/70 hover:text-ink/80 hover:bg-overlay/60 transition-colors flex items-center justify-center"
                 title="Attach files"
               >
                 <Paperclip size={15} />
               </button>
-              <span className="text-[11px] text-zinc-600 ml-1 select-none">
+              <span className="text-[11px] text-faint ml-1 select-none">
                 {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} attached` : ''}
               </span>
             </div>
             <div className="flex items-center gap-1.5">
-              <span className="text-[11px] text-zinc-600 mr-1 select-none">⌘↵</span>
+              <span className="text-[11px] text-faint mr-1 select-none">⌘↵</span>
               {isStreaming ? (
                 <button
                   onClick={() => { abortRef.current?.abort(); stopStream() }}
@@ -848,7 +848,7 @@ export function ChatPanel() {
                   disabled={!input.trim()}
                   className={`h-8 w-8 rounded-lg flex items-center justify-center transition-all ${
                     !input.trim()
-                      ? 'text-zinc-600 cursor-not-allowed'
+                      ? 'text-faint cursor-not-allowed'
                       : 'bg-blue-500 text-white hover:bg-blue-400 active:scale-95 shadow-sm shadow-blue-500/25'
                   }`}
                 >

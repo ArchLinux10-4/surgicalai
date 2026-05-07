@@ -49,7 +49,7 @@ function DiffLine({ line }: { line: string }) {
       isAdd ? 'bg-green-500/10 text-green-300' :
       isRemove ? 'bg-red-500/10 text-red-300' :
       isHeader ? 'bg-blue-500/10 text-blue-300' :
-      'text-zinc-400'
+      'text-muted'
     }`}>
       {line || ' '}
     </div>
@@ -166,15 +166,15 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   }
 
   return (
-    <div className="border border-zinc-700 rounded-xl overflow-hidden mb-3">
+    <div className="border border-border rounded-xl overflow-hidden mb-3">
       {/* File header */}
       <button
         onClick={() => setExpanded(e => !e)}
-        className="w-full flex items-center gap-2.5 px-4 py-2.5 bg-zinc-800/80 hover:bg-zinc-800 transition-colors text-left"
+        className="w-full flex items-center gap-2.5 px-4 py-2.5 bg-surface/80 hover:bg-surface transition-colors text-left"
       >
         <FileCode size={14} className="text-blue-400 flex-shrink-0" />
-        <span className="text-sm font-semibold text-zinc-100">{filename}</span>
-        <span className="text-[11px] text-zinc-500 ml-1">{fileData.changes.length} change{fileData.changes.length !== 1 ? 's' : ''}</span>
+        <span className="text-sm font-semibold text-ink">{filename}</span>
+        <span className="text-[11px] text-muted/70 ml-1">{fileData.changes.length} change{fileData.changes.length !== 1 ? 's' : ''}</span>
         <div className="ml-auto flex items-center gap-2">
           {fileData.changes.length > 1 && !Object.keys(applied).length && (
             <button
@@ -184,15 +184,15 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               Apply All
             </button>
           )}
-          {expanded ? <ChevronUp size={13} className="text-zinc-500" /> : <ChevronDown size={13} className="text-zinc-500" />}
+          {expanded ? <ChevronUp size={13} className="text-muted/70" /> : <ChevronDown size={13} className="text-muted/70" />}
         </div>
       </button>
 
       {/* Changes */}
       {expanded && fileData.changes.map((change, idx) => (
-        <div key={change.id} className="border-t border-zinc-700/60">
+        <div key={change.id} className="border-t border-border/60">
           {/* Change header */}
-          <div className="flex items-start gap-3 px-4 py-2.5 bg-zinc-900/60">
+          <div className="flex items-start gap-3 px-4 py-2.5 bg-base/60">
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
                 <code className="text-[12px] text-blue-300 font-mono">{change.symbol?.full_path || change.symbol?.name || 'unknown'}</code>
@@ -203,20 +203,20 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                   </span>
                 )}
               </div>
-              <p className="text-[12px] text-zinc-400 mt-0.5">{change.description}</p>
+              <p className="text-[12px] text-muted mt-0.5">{change.description}</p>
             </div>
           </div>
 
           {/* Diff Preview */}
-          <div className="border-t border-zinc-800">
-            <div className="flex items-center gap-2 px-4 py-1.5 bg-zinc-900 border-b border-zinc-800/60">
-              <span className="text-[11px] font-semibold uppercase tracking-wide text-zinc-500">Diff Preview</span>
-              <span className="text-[10px] text-zinc-600 ml-auto">
+          <div className="border-t border-border">
+            <div className="flex items-center gap-2 px-4 py-1.5 bg-base border-b border-border/60">
+              <span className="text-[11px] font-semibold uppercase tracking-wide text-muted/70">Diff Preview</span>
+              <span className="text-[10px] text-faint ml-auto">
                 {((change.diff || '').split('\n').filter((l: string) => l.startsWith('+') && !l.startsWith('+++'))).length} added{' · '}
                 {((change.diff || '').split('\n').filter((l: string) => l.startsWith('-') && !l.startsWith('---'))).length} removed
               </span>
             </div>
-            <div className="bg-zinc-950 max-h-96 overflow-y-auto">
+            <div className="bg-base max-h-96 overflow-y-auto">
               {(change.diff || '').split('\n').map((line: string, i: number) => (
                 <DiffLine key={i} line={line} />
               ))}
@@ -224,14 +224,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           </div>
 
           {/* Action buttons */}
-          <div className="flex items-center gap-2 px-4 py-2.5 bg-zinc-900/40 border-t border-zinc-800 flex-wrap">
+          <div className="flex items-center gap-2 px-4 py-2.5 bg-base/40 border-t border-border flex-wrap">
             {/* Left: status or apply/skip */}
             {applied[change.id] ? (
               <span className="flex items-center gap-1.5 text-[12px] text-green-400 font-semibold">
                 <CheckCircle size={13} /> Applied
               </span>
             ) : skipped[change.id] ? (
-              <span className="flex items-center gap-1.5 text-[12px] text-zinc-500">
+              <span className="flex items-center gap-1.5 text-[12px] text-muted/70">
                 <XCircle size={13} /> Skipped
               </span>
             ) : (
@@ -246,7 +246,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 </button>
                 <button
                   onClick={() => setSkipped(p => ({ ...p, [change.id]: true }))}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 text-zinc-400 border border-zinc-700 rounded-lg text-[12px] font-semibold hover:bg-zinc-700 transition-colors"
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors"
                 >
                   <XCircle size={12} /> Skip
                 </button>
@@ -268,7 +268,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               {!applied[change.id] && !skipped[change.id] && (
                 <button
                   onClick={() => handleDownload(change)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 text-zinc-400 border border-zinc-700 rounded-lg text-[12px] font-semibold hover:bg-zinc-700 transition-colors"
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors"
                   title="Download modified file"
                 >
                   <Download size={12} /> Download
@@ -293,12 +293,12 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
   return (
     <div className="mt-2">
       {/* Summary header */}
-      <div className="flex items-center gap-2 mb-3 pb-2 border-b border-zinc-700/50">
-        <span className="text-sm font-semibold text-zinc-200">✂️ {result.summary || `${totalChanges} change${totalChanges !== 1 ? 's' : ''} ready`}</span>
+      <div className="flex items-center gap-2 mb-3 pb-2 border-b border-border/50">
+        <span className="text-sm font-semibold text-ink">✂️ {result.summary || `${totalChanges} change${totalChanges !== 1 ? 's' : ''} ready`}</span>
       </div>
 
       {result.reasoning && (
-        <p className="text-[12px] text-zinc-500 mb-3 italic">{result.reasoning}</p>
+        <p className="text-[12px] text-muted/70 mb-3 italic">{result.reasoning}</p>
       )}
 
       {/* Per-file cards */}

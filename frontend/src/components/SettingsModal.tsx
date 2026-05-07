@@ -2,9 +2,10 @@ import React, { useState, useEffect } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
-import { X, Eye, EyeOff, CheckCircle, Key, Brain, FolderOpen, Code, Cpu, Sliders, Users } from 'lucide-react'
+import { X, Eye, EyeOff, CheckCircle, Key, Brain, FolderOpen, Code, Cpu, Sliders, Users, Sun, Moon } from 'lucide-react'
 import { AdminUsersPanel } from './AdminUsersPanel'
 import { useAuthStore } from '../stores/authStore'
+import { useThemeStore } from '../stores/themeStore'
 
 type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'local' | 'users'
 
@@ -44,6 +45,8 @@ export function SettingsModal() {
     ollama_base_url: 'http://localhost:11434',
     ollama_model: 'qwen2.5-coder:7b',
   })
+
+  const { theme, setTheme } = useThemeStore()
 
   useEffect(() => {
     if (settings) {
@@ -335,6 +338,33 @@ export function SettingsModal() {
 
             {tab === 'editor' && (
               <div className="space-y-5">
+                {/* Theme */}
+                <div className="space-y-2">
+                  <label className="text-xs font-semibold text-ink">Theme</label>
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setTheme('dark')}
+                      className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition ${
+                        theme === 'dark'
+                          ? 'border-accent bg-accent/10 text-accent'
+                          : 'border-border bg-surface text-muted hover:text-ink'
+                      }`}
+                    >
+                      <Moon size={14} /> Dark
+                    </button>
+                    <button
+                      onClick={() => setTheme('light')}
+                      className={`flex items-center gap-2 px-3 py-2 rounded-lg border text-xs font-medium transition ${
+                        theme === 'light'
+                          ? 'border-accent bg-accent/10 text-accent'
+                          : 'border-border bg-surface text-muted hover:text-ink'
+                      }`}
+                    >
+                      <Sun size={14} /> Light
+                    </button>
+                  </div>
+                </div>
+
                 <SectionHeader title="Editor" subtitle="Monaco editor preferences" />
                 <Field label={`Font size: ${form.font_size}px`}>
                   <input type="range" min="11" max="20" step="1" value={form.font_size}

@@ -255,6 +255,12 @@ export const api = {
       request(`/chat/${sessionId}/files/${fileId}`, { method: 'DELETE' }),
   },
 
+  auth: {
+    getUsers: () => request<any[]>('/auth/users'),
+    createUser: (data: any) => request<any>('/auth/users', { method: 'POST', body: JSON.stringify(data) }),
+    deleteUser: (id: string) => request<any>(`/auth/users/${id}`, { method: 'DELETE' }),
+  },
+
   context: {
     getPins: (workspacePath: string) => request<PinnedContext[]>(`/context/pins?workspace_path=${encodeURIComponent(workspacePath)}`),
     addPin: (data: any) => request<any>('/context/pins', { method: 'POST', body: JSON.stringify(data) }),
