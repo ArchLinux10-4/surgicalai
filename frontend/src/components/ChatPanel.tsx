@@ -359,7 +359,7 @@ export function ChatPanel() {
       const isImage = IMAGE_EXTS.includes(ext)
       const isBinary = BINARY_EXTS.includes(ext)
 
-      let uploadBody: Record<string, string>
+      let uploadBody: { filename: string; content: string; language?: string; base64_data?: string; file_type?: string }
 
       if (isImage) {
         // Read as base64 data URL
