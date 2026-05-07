@@ -10,6 +10,7 @@ Best Practice #3: Verify before commit (confidence scoring + diff)
 import json
 import uuid
 import difflib
+import time
 from pathlib import Path
 from typing import Optional
 from openai import OpenAI
@@ -882,6 +883,13 @@ ONLY use "needs_clarification" when you genuinely cannot identify WHICH file or 
 If you can see the file and you can describe the change — use "edit". Do NOT fall back to "chat" just because
 the change is small or simple.
 
+━━━ CREATIVE / GENERATIVE REQUESTS ━━━
+If the user asks for "design options", "variants", "alternatives", "mockups", different "versions",
+"approaches", or to "reimagine" / "redesign" / "rewrite from scratch" — this is a CREATIVE request.
+Use "chat" intent and provide your full response in markdown with complete code blocks for each option.
+The Surgeon is for precision edits to EXISTING code, NOT for generating entirely new code variants.
+Similarly, if the user says "rewrite this entire file" or "start from scratch" — use "chat" with full code in markdown.
+
 ━━━ HARD RULES ━━━
 - NEVER touch symbols that weren't asked about
 - For Python/Go/JS/TS/Rust files: use the exact function/class name from the symbol map as symbol_path
@@ -1049,28 +1057,47 @@ USER REQUEST:
                 {"role": "user", "content": context_msg}
             ]
 
-        try:
-            response = _chat_create(client,
-                model=arch_model,
-                messages=architect_messages,
-                temperature=0.3,
-                response_format={"type": "json_object"}
+        # ── Run Architect in background thread so we can yield elapsed ticks ──
+        async def _call_architect(msgs):
+            return await asyncio.to_thread(
+                lambda: _chat_create(client,
+                    model=arch_model,
+                    messages=msgs,
+                    temperature=0.3,
+                    response_format={"type": "json_object"}
+                )
             )
+
+        arch_task = asyncio.create_task(_call_architect(architect_messages))
+        start_time = time.time()
+        tick = 0
+        while not arch_task.done():
+            await asyncio.sleep(1)
+            tick += 1
+            if tick % 3 == 0:
+                elapsed = int(time.time() - start_time)
+                yield sse({"type": "progress", "content": f"Architect thinking... ({elapsed}s)"})
+
+        try:
+            response = arch_task.result()
         except Exception as img_err:
             err_str = str(img_err).lower()
             if image_files and ("image" in err_str or "unsupported" in err_str or "invalid" in err_str):
                 # GPT rejected one or more images — fall back gracefully to text-only
-                yield sse({"type": "progress", "content": "⚠️ One or more images couldn't be read by GPT — falling back to text context..."})
+                yield sse({"type": "progress", "content": "⚠️ Images couldn't be read — falling back to text context..."})
                 architect_messages = [
                     {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
                     {"role": "user", "content": context_msg}
                 ]
-                response = _chat_create(client,
-                    model=arch_model,
-                    messages=architect_messages,
-                    temperature=0.3,
-                    response_format={"type": "json_object"}
-                )
+                arch_task2 = asyncio.create_task(_call_architect(architect_messages))
+                start_time = time.time()
+                while not arch_task2.done():
+                    await asyncio.sleep(1)
+                    tick += 1
+                    if tick % 3 == 0:
+                        elapsed = int(time.time() - start_time)
+                        yield sse({"type": "progress", "content": f"Architect retrying... ({elapsed}s)"})
+                response = arch_task2.result()
             else:
                 raise
 
@@ -1122,14 +1149,15 @@ USER REQUEST:
         targets = plan.get("targets", [])
         if not targets:
             # No targets identified — fall back to chat
-            fallback = f"I identified this as a code change, but couldn't pinpoint a specific symbol.\n\n**Reasoning:** {plan.get('reasoning', '')}\n\nTry being more specific, e.g.: \"In settings.py, add gpt-5 to the models list in get_available_models()\""
+            fallback = f"I can see what you want to change, but I'm having trouble pinpointing the exact code to edit.\n\n**What I understood:** {plan.get('reasoning', '')}\n\nCould you be a bit more specific? For example: *\"In LoginPage.tsx, change the background color of the header\"*"
             for word in fallback.split(" "):
                 yield sse({"type": "token", "content": word + " "})
                 await asyncio.sleep(0.005)
             yield sse({"type": "done", "content": ""})
             return
 
-        yield sse({"type": "progress", "content": f"Plan: {len(targets)} change(s). Running surgeon..."})
+        yield sse({"type": "progress", "content": f"Plan ready: {len(targets)} change(s) identified"})
+        yield sse({"type": "progress", "content": "Surgeon writing code..."})
 
         changes_by_file = {}
 
@@ -1209,7 +1237,8 @@ USER REQUEST:
             changes_by_file[matched_name]["changes"].append(change)
 
         if not changes_by_file:
-            fallback = f"I found the files but couldn't locate the specific symbol `{targets[0].get('symbol_path', '?')}`. Try uploading the exact file that contains it."
+            sym = targets[0].get('symbol_path', '')
+            fallback = f"I tried to make the changes but couldn't find the right code to edit in your files.\n\nThis usually happens when the file structure is different from what I expected.\n\n**💡 Try rephrasing your request** — describe what behavior you want to change rather than referencing specific code. Or try: *\"Explain the structure of this file first\"*"
             for word in fallback.split(" "):
                 yield sse({"type": "token", "content": word + " "})
             yield sse({"type": "done", "content": ""})

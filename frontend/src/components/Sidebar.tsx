@@ -376,10 +376,18 @@ function UserMenu() {
 }
 
 export function Sidebar() {
-  const { sidebarTab, setSidebarTab, setSettingsOpen } = useAppStore()
+  const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, activeSessions } = useAppStore()
 
+  // Auto-switch to FILES tab when loading a chat that has files
+  useEffect(() => {
+    if (activeSessions && sessionFiles.length > 0 && sidebarTab === 'sessions') {
+      setSidebarTab('files')
+    }
+  }, [activeSessions])
+
+  const fileCount = sessionFiles.length
   const tabs = [
-    { id: 'files' as const, icon: FileCode, label: 'Files' },
+    { id: 'files' as const, icon: FileCode, label: fileCount > 0 ? `Files (${fileCount})` : 'Files' },
     { id: 'sessions' as const, icon: MessageSquare, label: 'Chats' },
     { id: 'context' as const, icon: Pin, label: 'Context' },
   ]

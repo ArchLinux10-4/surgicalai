@@ -163,8 +163,21 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
   )
 }
 
-// ── Streaming bubble ──────────────────────────────────────
-function StreamingBubble({ content, progress }: { content: string; progress: string }) {
+// ── Streaming bubble with thinking trail ──────────────────
+function StreamingBubble({ content, progress, progressHistory }: { content: string; progress: string; progressHistory: string[] }) {
+  const [thinkingExpanded, setThinkingExpanded] = useState(true)
+  const [elapsed, setElapsed] = useState(0)
+
+  // Elapsed timer — ticks every second while streaming
+  useEffect(() => {
+    const start = Date.now()
+    const interval = setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 1000)
+    return () => clearInterval(interval)
+  }, [])
+
+  const completedSteps = progressHistory.slice(0, -1)
+  const hasSteps = completedSteps.length > 0
+
   return (
     <div className="flex items-start gap-3 px-4 py-4">
       {/* Pulsing avatar while streaming */}
@@ -175,13 +188,41 @@ function StreamingBubble({ content, progress }: { content: string; progress: str
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-2">
           <span className="text-[12px] font-semibold text-zinc-300">SurgicalAI</span>
+          {/* Current progress badge */}
           {progress && (
             <span className="text-[11px] text-blue-400 flex items-center gap-1.5 bg-blue-500/10 px-2 py-0.5 rounded-full border border-blue-500/20">
               <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
               {progress}
             </span>
           )}
+          {/* Elapsed timer */}
+          {elapsed > 0 && !content && (
+            <span className="text-[10px] text-zinc-500 tabular-nums">{elapsed}s</span>
+          )}
         </div>
+
+        {/* Collapsible thinking trail */}
+        {hasSteps && !content && (
+          <div className="mb-2">
+            <button
+              onClick={() => setThinkingExpanded(e => !e)}
+              className="text-[11px] text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
+            >
+              <span>{thinkingExpanded ? '▾' : '▸'}</span>
+              <span>{completedSteps.length} step{completedSteps.length !== 1 ? 's' : ''} completed</span>
+            </button>
+            {thinkingExpanded && (
+              <div className="mt-1.5 pl-3 border-l-2 border-zinc-700/60 space-y-1">
+                {completedSteps.map((step, i) => (
+                  <div key={i} className="text-[11px] text-zinc-500 flex items-center gap-1.5">
+                    <span className="text-green-400/80">✓</span>
+                    <span>{step}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
 
         {content ? (
           <div className="prose-ai">
@@ -307,6 +348,7 @@ export function ChatPanel() {
   const [uploadingFiles, setUploadingFiles] = useState(false)
   const [showAllFiles, setShowAllFiles] = useState(false)
   const [filesCollapsed, setFilesCollapsed] = useState(false)
+  const [progressHistory, setProgressHistory] = useState<string[]>([])
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -524,13 +566,20 @@ export function ChatPanel() {
     setIsStreaming(true)
     setStreamProgress('Thinking...')
     setStreamingMessage('')
+    setProgressHistory(['Thinking...'])
 
     let accumulated = ''
     let gotResult = false
 
     const ctrl = api.stream.smart(
       { session_id: sessionId, message: text, file_ids: sessionFiles.map(f => f.id) },
-      (progress) => setStreamProgress(progress),
+      (progress) => {
+        setStreamProgress(progress)
+        setProgressHistory(prev => {
+          if (prev[prev.length - 1] !== progress) return [...prev, progress]
+          return prev
+        })
+      },
       (token) => { accumulated += token; setStreamingMessage(accumulated) },
       (result) => {
         // Surgical result — show inline diff card
@@ -634,7 +683,7 @@ export function ChatPanel() {
               <Message key={msg.id || i} msg={msg} sessionId={activeSessions || ''} />
             ))}
             {isStreaming && (streamingMessage || streamProgress) && (
-              <StreamingBubble content={streamingMessage} progress={streamProgress} />
+              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} />
             )}
             {error && (
               <div className="mx-4 my-3 flex items-start gap-2.5 px-3.5 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-sm text-red-400">
