@@ -94,6 +94,24 @@ class CompatConn:
                 " value = EXCLUDED.value,"
                 " updated_at = EXCLUDED.updated_at"
             )
+        elif "INSERT OR REPLACE INTO change_history" in sql:
+            sql = sql.replace("INSERT OR REPLACE INTO change_history", "INSERT INTO change_history")
+            sql = sql.rstrip() + (
+                "\nON CONFLICT (id) DO UPDATE SET"
+                " file_path = EXCLUDED.file_path,"
+                " symbol_path = EXCLUDED.symbol_path,"
+                " original_code = EXCLUDED.original_code,"
+                " new_code = EXCLUDED.new_code,"
+                " applied = EXCLUDED.applied"
+            )
+        elif "INSERT OR REPLACE INTO" in sql:
+            # Generic fallback for any INSERT OR REPLACE
+            import re as _re
+            m = _re.search(r"INSERT OR REPLACE INTO (\w+)", sql)
+            if m:
+                table = m.group(1)
+                sql = sql.replace(f"INSERT OR REPLACE INTO {table}", f"INSERT INTO {table}")
+                sql = sql.rstrip() + "\nON CONFLICT DO NOTHING"
         return sql
 
     def commit(self):
