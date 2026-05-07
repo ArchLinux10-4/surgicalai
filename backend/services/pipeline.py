@@ -255,6 +255,64 @@ Produce the surgical change plan as JSON."""
         )
         validated_targets.append(target)
 
+    # Text-search redirection: if user mentioned specific text, verify it exists
+    # in the targeted symbol. If not, redirect to the correct symbol or create a virtual one.
+    if _text_line_map and validated_targets:
+        for qt, target_line in _text_line_map.items():
+            for i, target in enumerate(validated_targets):
+                # Find the symbol this target points to
+                matched_sym = None
+                for sym in symbol_map.symbols:
+                    if sym.full_path == target.symbol_path or sym.name == target.symbol_path:
+                        matched_sym = sym
+                        break
+                if matched_sym and qt.lower() not in matched_sym.code.lower():
+                    # The quoted text isn't in the targeted symbol — redirect!
+                    # Find the narrowest symbol containing the target line
+                    best_sym = None
+                    best_size = float("inf")
+                    for sym in symbol_map.symbols:
+                        if sym.start_line <= target_line <= sym.end_line:
+                            sym_size = sym.end_line - sym.start_line
+                            if sym_size < best_size:
+                                best_size = sym_size
+                                best_sym = sym
+                    if best_sym and best_sym.full_path != target.symbol_path:
+                        validated_targets[i] = ChangeTarget(
+                            symbol_path=best_sym.full_path,
+                            change_type=target.change_type,
+                            description=target.description,
+                            new_logic=target.new_logic,
+                            dependencies=target.dependencies,
+                            confidence=target.confidence
+                        )
+                    elif not best_sym:
+                        # No symbol contains this line — create a virtual window
+                        total = len(file_lines)
+                        win_start = max(1, target_line - 25)
+                        win_end = min(total, target_line + 25)
+                        win_code = "\n".join(file_lines[win_start - 1:win_end])
+                        vname = f"_text_region_L{target_line}"
+                        virtual_sym = SymbolInfo(
+                            name=vname,
+                            symbol_type=SymbolType.VARIABLE,
+                            start_line=win_start,
+                            end_line=win_end,
+                            parent=None,
+                            indentation=0,
+                            code=win_code,
+                            signature=f"text region around line {target_line}"
+                        )
+                        symbol_map.symbols.append(virtual_sym)
+                        validated_targets[i] = ChangeTarget(
+                            symbol_path=vname,
+                            change_type=target.change_type,
+                            description=target.description,
+                            new_logic=target.new_logic,
+                            dependencies=target.dependencies,
+                            confidence=target.confidence
+                        )
+
     return ArchitectPlan(
         summary=data.get("summary", ""),
         targets=validated_targets,
