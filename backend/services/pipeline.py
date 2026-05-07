@@ -1712,16 +1712,40 @@ USER REQUEST:
                     return False
             return True
 
+        skipped_changes = []
         for fname in list(changes_by_file.keys()):
-            real_changes = [c for c in changes_by_file[fname]["changes"] if _has_real_diff(c)]
+            all_c = changes_by_file[fname]["changes"]
+            real_changes = [c for c in all_c if _has_real_diff(c)]
+            ghost_changes = [c for c in all_c if not _has_real_diff(c)]
+            for c in ghost_changes:
+                reason = "already_matches" if c.original_code.rstrip() == c.new_code.rstrip() else "no_visible_diff"
+                skipped_changes.append({
+                    "filename": fname,
+                    "symbol": c.symbol.full_path if c.symbol else "unknown",
+                    "reason": reason,
+                })
             if not real_changes:
                 del changes_by_file[fname]
             else:
                 changes_by_file[fname]["changes"] = real_changes
 
         if not changes_by_file:
-            sym = targets[0].get('symbol_path', '')
-            fallback = f"I tried to make the changes but couldn't find the right code to edit in your files.\n\nThis usually happens when the file structure is different from what I expected.\n\n**💡 Try rephrasing your request** — describe what behavior you want to change rather than referencing specific code. Or try: *\"Explain the structure of this file first\"*"
+            # Build a helpful message depending on what happened
+            if skipped_changes:
+                sym_names = ", ".join(f"`{s['symbol']}`" for s in skipped_changes[:3])
+                fallback = (
+                    f"I analyzed {sym_names} but the code already looks like what you're asking for "
+                    f"— no changes were needed.\n\n"
+                    f"If that's not right, try **being more specific**: quote the exact text you want changed, "
+                    f"or describe the before/after difference clearly."
+                )
+            else:
+                fallback = (
+                    "I tried to make the changes but couldn't find the right code to edit in your files.\n\n"
+                    "This usually happens when the file structure is different from what I expected.\n\n"
+                    "**💡 Try rephrasing your request** — describe what behavior you want to change rather than "
+                    "referencing specific code. Or try: *\"Explain the structure of this file first\"*"
+                )
             for word in fallback.split(" "):
                 yield sse({"type": "token", "content": word + " "})
             yield sse({"type": "done", "content": ""})
@@ -1732,6 +1756,7 @@ USER REQUEST:
             "summary": plan.get("summary", ""),
             "reasoning": plan.get("reasoning", ""),
             "risks": plan.get("risks", []),
+            "skipped_changes": skipped_changes,
             "changes_by_file": {
                 fname: {
                     "filename": fname,

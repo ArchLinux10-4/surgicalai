@@ -225,6 +225,77 @@ def get_session_file(session_id: str, file_id: str):
     return dict(row)
 
 
+@router.put("/{session_id}/files/{file_id}")
+def update_session_file(session_id: str, file_id: str, body: dict):
+    """Update file content after applying a change. Saves current content as previous for undo."""
+    new_content = body.get("content", "")
+    conn = get_db()
+    row = conn.execute(
+        "SELECT content, filename FROM session_files WHERE id = ? AND session_id = ?",
+        (file_id, session_id)
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="File not found")
+
+    filename = row["filename"] if hasattr(row, "__getitem__") else row[1]
+    prev_content = row["content"] if hasattr(row, "__getitem__") else row[0]
+    lines = len(new_content.splitlines())
+    try:
+        smap = parser.parse(new_content, filename)
+        symbol_count = len(smap.symbols)
+    except Exception:
+        symbol_count = 0
+
+    conn.execute(
+        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ? WHERE id = ? AND session_id = ?",
+        (new_content, prev_content, lines, symbol_count, file_id, session_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"id": file_id, "lines": lines, "symbol_count": symbol_count, "ok": True}
+
+
+@router.post("/{session_id}/files/{file_id}/undo")
+def undo_session_file(session_id: str, file_id: str):
+    """Restore a file to its previous version (one-step undo)."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT content, previous_content, filename FROM session_files WHERE id = ? AND session_id = ?",
+        (file_id, session_id)
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if hasattr(row, "__getitem__"):
+        current = row["content"]
+        prev = row["previous_content"]
+        filename = row["filename"]
+    else:
+        current, prev, filename = row[0], row[1], row[2]
+
+    if not prev:
+        conn.close()
+        raise HTTPException(status_code=400, detail="No previous version to restore")
+
+    lines = len(prev.splitlines())
+    try:
+        smap = parser.parse(prev, filename)
+        symbol_count = len(smap.symbols)
+    except Exception:
+        symbol_count = 0
+
+    # Swap current ↔ previous so undo is reversible (acts as redo too)
+    conn.execute(
+        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ? WHERE id = ? AND session_id = ?",
+        (prev, current, lines, symbol_count, file_id, session_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"id": file_id, "content": prev, "lines": lines, "symbol_count": symbol_count, "ok": True}
+
+
 @router.delete("/{session_id}/files/{file_id}")
 def delete_session_file(session_id: str, file_id: str):
     """Remove a file from a session."""

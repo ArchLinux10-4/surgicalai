@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react'
-import { CheckCircle, XCircle, Download, ChevronDown, ChevronUp, AlertTriangle, FileCode } from 'lucide-react'
+import { CheckCircle, XCircle, Download, ChevronDown, ChevronUp, AlertTriangle, FileCode, RotateCcw, SkipForward } from 'lucide-react'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import type { SmartResult } from '../types'
@@ -40,6 +40,12 @@ function ConfidenceBadge({ score }: { score: number }) {
   )
 }
 
+/** Parse the first @@ hunk header to get the starting line number in the new file */
+function parseDiffStartLine(diff: string): number | null {
+  const match = diff.match(/@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+  return match ? parseInt(match[1], 10) : null
+}
+
 function DiffLine({ line }: { line: string }) {
   const isAdd = line.startsWith('+') && !line.startsWith('+++')
   const isRemove = line.startsWith('-') && !line.startsWith('---')
@@ -61,10 +67,11 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   fileData: { filename: string; file_id: string; changes: any[] }
   sessionId: string
   onApplied?: (filename: string, content: string) => void
-  onChangeApplied?: () => void
+  onChangeApplied?: (delta?: number) => void
 }) {
   const [expanded, setExpanded] = useState(true)
   const [applying, setApplying] = useState<Record<string, boolean>>({})
+  const [undoing, setUndoing] = useState<Record<string, boolean>>({})
 
   // Rehydrate applied state from localStorage on mount
   const changeIds = fileData.changes.map((c: any) => c.id)
@@ -120,28 +127,57 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         file_content: fileData2.content,
       })
 
+      const newContent = result.modified_content || ''
+
+      // ✅ Always update the session file in DB so subsequent edits chain correctly
+      if (newContent) {
+        try {
+          await api.sessionFiles.update(sessionId, fileData.file_id, newContent)
+        } catch {
+          // Non-fatal: chain editing won't work but apply still succeeds
+        }
+      }
+
       if (result.cloud_mode || result.modified_content) {
         // Cloud mode: trigger download
-        const blob = new Blob([result.modified_content], { type: 'text/plain' })
+        const blob = new Blob([newContent], { type: 'text/plain' })
         const url = URL.createObjectURL(blob)
         const a = document.createElement('a')
         a.href = url
         a.download = filename
         a.click()
         URL.revokeObjectURL(url)
-        toast.success(`Downloaded modified ${filename}`)
-        setModifiedCode(result.modified_content)
-        onApplied?.(filename, result.modified_content)
+        toast.success(`✅ Applied & downloaded ${filename}`)
+        setModifiedCode(newContent)
+        onApplied?.(filename, newContent)
       } else {
         toast.success(`Applied change to ${filename}`)
-        setModifiedCode(result.modified_content || '')
-        onApplied?.(filename, result.modified_content || '')
+        setModifiedCode(newContent)
+        onApplied?.(filename, newContent)
       }
       markApplied(change.id)
     } catch (e: any) {
       toast.error(e.message || 'Apply failed')
     } finally {
       setApplying(p => ({ ...p, [change.id]: false }))
+    }
+  }
+
+  const handleUndo = async (change: any) => {
+    setUndoing(p => ({ ...p, [change.id]: true }))
+    try {
+      const result = await api.sessionFiles.undo(sessionId, fileData.file_id)
+      // Clear applied state
+      try { localStorage.removeItem(appliedKey(sessionId, change.id)) } catch {}
+      setApplied(p => { const next = { ...p }; delete next[change.id]; return next })
+      setModifiedCode(undefined)
+      onApplied?.(filename, result.content)
+      toast.success(`↩ Reverted ${filename} to previous version`)
+      onChangeApplied?.(-1) // decrement applied count
+    } catch (e: any) {
+      toast.error(e.message || 'Undo failed')
+    } finally {
+      setUndoing(p => ({ ...p, [change.id]: false }))
     }
   }
 
@@ -188,21 +224,28 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         file_content: fileData2.content,
       })
 
+      const newContent = result.modified_content || ''
+
+      // ✅ Update session file for chain editing
+      if (newContent) {
+        try { await api.sessionFiles.update(sessionId, fileData.file_id, newContent) } catch {}
+      }
+
       if (result.cloud_mode || result.modified_content) {
-        const blob = new Blob([result.modified_content], { type: 'text/plain' })
+        const blob = new Blob([newContent], { type: 'text/plain' })
         const url = URL.createObjectURL(blob)
         const a = document.createElement('a')
         a.href = url
         a.download = filename
         a.click()
         URL.revokeObjectURL(url)
-        toast.success(`Downloaded ${filename} with all ${unapplied.length} changes applied`)
-        setModifiedCode(result.modified_content)
-        onApplied?.(filename, result.modified_content)
+        toast.success(`✅ Applied & downloaded ${filename} (${unapplied.length} changes)`)
+        setModifiedCode(newContent)
+        onApplied?.(filename, newContent)
       } else {
         toast.success(`Applied all ${unapplied.length} changes to ${filename}`)
-        setModifiedCode(result.modified_content || '')
-        onApplied?.(filename, result.modified_content || '')
+        setModifiedCode(newContent)
+        onApplied?.(filename, newContent)
       }
       // Mark all as applied
       for (const change of unapplied) {
@@ -265,9 +308,24 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           <div className="border-t border-border">
             <div className="flex items-center gap-2 px-4 py-1.5 bg-base border-b border-border/60">
               <span className="text-[11px] font-semibold uppercase tracking-wide text-muted/70">Diff Preview</span>
+              {/* Line number context */}
+              {change.symbol?.start_line && (
+                <span className="text-[10px] px-1.5 py-0.5 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded font-mono">
+                  L{change.symbol.start_line}
+                  {change.symbol.end_line && change.symbol.end_line !== change.symbol.start_line
+                    ? `–${change.symbol.end_line}` : ''}
+                </span>
+              )}
+              {(() => {
+                const startLine = parseDiffStartLine(change.diff || '')
+                return startLine ? (
+                  <span className="text-[10px] text-blue-300/70 font-mono">@ line {startLine}</span>
+                ) : null
+              })()}
               <span className="text-[10px] text-faint ml-auto">
-                {((change.diff || '').split('\n').filter((l: string) => l.startsWith('+') && !l.startsWith('+++'))).length} added{' · '}
-                {((change.diff || '').split('\n').filter((l: string) => l.startsWith('-') && !l.startsWith('---'))).length} removed
+                <span className="text-green-400">+{((change.diff || '').split('\n').filter((l: string) => l.startsWith('+') && !l.startsWith('+++'))).length}</span>
+                {' · '}
+                <span className="text-red-400">-{((change.diff || '').split('\n').filter((l: string) => l.startsWith('-') && !l.startsWith('---'))).length}</span>
               </span>
             </div>
             <div className="bg-base max-h-96 overflow-y-auto">
@@ -281,9 +339,20 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           <div className="flex items-center gap-2 px-4 py-2.5 bg-base/40 border-t border-border flex-wrap">
             {/* Left: status or apply/skip */}
             {applied[change.id] ? (
-              <span className="flex items-center gap-1.5 text-[12px] text-green-400 font-semibold">
-                <CheckCircle size={13} /> Applied
-              </span>
+              <div className="flex items-center gap-2">
+                <span className="flex items-center gap-1.5 text-[12px] text-green-400 font-semibold">
+                  <CheckCircle size={13} /> Applied
+                </span>
+                <button
+                  onClick={() => handleUndo(change)}
+                  disabled={undoing[change.id]}
+                  className="flex items-center gap-1.5 px-2.5 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors disabled:opacity-50"
+                  title="Revert this change"
+                >
+                  <RotateCcw size={11} />
+                  {undoing[change.id] ? 'Reverting...' : 'Undo'}
+                </button>
+              </div>
             ) : skipped[change.id] ? (
               <span className="flex items-center gap-1.5 text-[12px] text-muted/70">
                 <XCircle size={13} /> Skipped
@@ -363,9 +432,28 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
           fileData={fileData}
           sessionId={sessionId}
           onApplied={onApplied}
-          onChangeApplied={() => setAppliedCount(n => n + 1)}
+          onChangeApplied={(delta = 1) => setAppliedCount(n => Math.max(0, n + delta))}
         />
       ))}
+
+      {/* Skipped changes notice */}
+      {result.skipped_changes && result.skipped_changes.length > 0 && (
+        <div className="mt-2 flex items-start gap-2 px-3 py-2 bg-surface/60 border border-border/50 rounded-lg">
+          <SkipForward size={13} className="text-muted/60 mt-0.5 flex-shrink-0" />
+          <div className="text-[12px] text-muted/80">
+            <strong className="text-ink/60">Skipped {result.skipped_changes.length} symbol{result.skipped_changes.length !== 1 ? 's' : ''}:</strong>{' '}
+            {result.skipped_changes.map((s: any, i: number) => (
+              <span key={i}>
+                <code className="text-[11px] text-blue-300/70">{s.symbol}</code>
+                {s.reason === 'already_matches'
+                  ? ' — code already matches'
+                  : ' — no visible diff produced'}
+                {i < result.skipped_changes.length - 1 ? '; ' : ''}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Risks alert — hidden (not removed) once all changes applied */}
       {result.risks && result.risks.length > 0 && (

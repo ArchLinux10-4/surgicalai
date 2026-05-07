@@ -251,6 +251,10 @@ export const api = {
       request<any[]>(`/chat/${sessionId}/files`),
     get: (sessionId: string, fileId: string) =>
       request<any>(`/chat/${sessionId}/files/${fileId}`),
+    update: (sessionId: string, fileId: string, content: string) =>
+      request<any>(`/chat/${sessionId}/files/${fileId}`, { method: 'PUT', body: JSON.stringify({ content }) }),
+    undo: (sessionId: string, fileId: string) =>
+      request<any>(`/chat/${sessionId}/files/${fileId}/undo`, { method: 'POST' }),
     delete: (sessionId: string, fileId: string) =>
       request(`/chat/${sessionId}/files/${fileId}`, { method: 'DELETE' }),
   },
