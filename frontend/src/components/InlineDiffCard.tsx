@@ -448,7 +448,7 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
                 {s.reason === 'already_matches'
                   ? ' — code already matches'
                   : ' — no visible diff produced'}
-                {i < result.skipped_changes.length - 1 ? '; ' : ''}
+                {i < (result.skipped_changes?.length ?? 0) - 1 ? '; ' : ''}
               </span>
             ))}
           </div>
