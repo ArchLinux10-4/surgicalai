@@ -1307,10 +1307,13 @@ USER REQUEST:
                 plan = json.loads(raw_text)
             except json.JSONDecodeError:
                 # Try to extract JSON object from the text
-                json_match = re.search(r'\{[\s\S]*\}', raw_text)
+                # Manual JSON extraction (avoids 're' module scoping issues)
+                _brace_start = raw_text.find('{')
+                _brace_end = raw_text.rfind('}')
+                json_match = raw_text[_brace_start:_brace_end + 1] if _brace_start >= 0 and _brace_end > _brace_start else None
                 if json_match:
                     try:
-                        plan = json.loads(json_match.group())
+                        plan = json.loads(json_match)
                     except json.JSONDecodeError:
                         # Last resort: treat entire response as chat
                         plan = {"intent": "chat", "chat_response": raw_text}
@@ -1452,7 +1455,21 @@ USER REQUEST:
         yield sse({"type": "progress", "content": "Surgeon writing code..."})
 
         # Text-search assist: redirect mis-targeted symbols
-        _quoted_texts = re.findall(r"""['"](.+?)['"]""", user_request)
+        # Extract quoted text manually (avoids 're' module scoping issues)
+        _quoted_texts = []
+        for _qc in ["'", '"']:
+            _rest = user_request
+            while _qc in _rest:
+                _start = _rest.index(_qc)
+                _after = _rest[_start + 1:]
+                if _qc in _after:
+                    _end = _after.index(_qc)
+                    _quoted = _after[:_end]
+                    if len(_quoted) >= 3:
+                        _quoted_texts.append(_quoted)
+                    _rest = _after[_end + 1:]
+                else:
+                    break
         for qi, target in enumerate(targets):
             if not _quoted_texts:
                 break
