@@ -873,9 +873,21 @@ IF chat:
   "chat_response": "full markdown answer"
 }
 
+━━━ INTENT ROUTING — READ THIS CAREFULLY ━━━
+
+DEFAULT RULE: If the user asks to change, add, modify, update, fix, or refactor ANY code — use "edit" intent.
+ONLY use "chat" for pure questions ("what does X do?", "explain Y", "why is Z slow?") that require NO code changes.
+ONLY use "needs_clarification" when you genuinely cannot identify WHICH file or WHAT to change.
+
+If you can see the file and you can describe the change — use "edit". Do NOT fall back to "chat" just because
+the change is small or simple.
+
 ━━━ HARD RULES ━━━
 - NEVER touch symbols that weren't asked about
-- NEVER invent symbol names — only use names from the symbol map
+- For Python/Go/JS/TS/Rust files: use the exact function/class name from the symbol map as symbol_path
+- For TSX/JSX/HTML/CSS files: use the component function or export name as symbol_path (e.g. "LoginPage", "App", "Header").
+  Inner elements like divs/spans are NOT symbols — but that's OK. Set symbol_path to the containing component
+  and use description + new_logic to precisely identify the inner element to change.
 - confidence < 7 = use needs_clarification instead
 - Minimal footprint: if the user said "add X to function Y", only plan function Y"""
 

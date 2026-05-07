@@ -478,6 +478,8 @@ export function ChatPanel() {
           created_at: new Date().toISOString(),
         })
         api.chat.getSessions().then(setSessions).catch(() => {})
+        // Re-fetch session files to keep sidebar in sync
+        api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
       (fullText) => {
         if (gotResult) return
@@ -492,6 +494,8 @@ export function ChatPanel() {
           })
         }
         api.chat.getSessions().then(setSessions).catch(() => {})
+        // Re-fetch session files to keep sidebar in sync
+        api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
       (err) => { setError(err); stopStream() }
     )
