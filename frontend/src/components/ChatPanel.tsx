@@ -305,6 +305,8 @@ export function ChatPanel() {
   const [error, setError] = useState<string | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const [uploadingFiles, setUploadingFiles] = useState(false)
+  const [showAllFiles, setShowAllFiles] = useState(false)
+  const [filesCollapsed, setFilesCollapsed] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -652,17 +654,46 @@ export function ChatPanel() {
       <div className="border-t border-zinc-800 p-3 flex-shrink-0 bg-zinc-900/50">
         {/* File chips */}
         {hasFiles && (
-          <div className="flex flex-wrap gap-1.5 mb-2.5">
-            {sessionFiles.map(file => (
-              <FileChip
-                key={file.id}
-                file={file}
-                onRemove={() => removeFile(file.id)}
-              />
-            ))}
-            {uploadingFiles && (
-              <div className="flex items-center gap-1.5 px-2.5 py-1 bg-zinc-800/60 border border-zinc-700 rounded-lg">
-                <span className="text-[11px] text-zinc-500 animate-pulse">Uploading...</span>
+          <div className="mb-2.5">
+            {/* Collapse toggle row */}
+            <button
+              onClick={() => setFilesCollapsed(c => !c)}
+              className="flex items-center gap-1.5 mb-1.5 text-[11px] text-zinc-500 hover:text-zinc-300 transition-colors select-none"
+            >
+              <span>{filesCollapsed ? '▸' : '▾'}</span>
+              <span>{sessionFiles.length} file{sessionFiles.length !== 1 ? 's' : ''} in context</span>
+            </button>
+            {/* Chips — hidden when collapsed */}
+            {!filesCollapsed && (
+              <div className="flex flex-wrap gap-1.5">
+                {(showAllFiles ? sessionFiles : sessionFiles.slice(0, 5)).map(file => (
+                  <FileChip
+                    key={file.id}
+                    file={file}
+                    onRemove={() => removeFile(file.id)}
+                  />
+                ))}
+                {sessionFiles.length > 5 && !showAllFiles && (
+                  <button
+                    onClick={() => setShowAllFiles(true)}
+                    className="flex items-center gap-1 px-2.5 py-1 bg-zinc-800/60 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors"
+                  >
+                    +{sessionFiles.length - 5} more
+                  </button>
+                )}
+                {showAllFiles && sessionFiles.length > 5 && (
+                  <button
+                    onClick={() => setShowAllFiles(false)}
+                    className="flex items-center gap-1 px-2.5 py-1 bg-zinc-800/60 border border-zinc-700 rounded-lg text-[11px] text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors"
+                  >
+                    show less
+                  </button>
+                )}
+                {uploadingFiles && (
+                  <div className="flex items-center gap-1.5 px-2.5 py-1 bg-zinc-800/60 border border-zinc-700 rounded-lg">
+                    <span className="text-[11px] text-zinc-500 animate-pulse">Uploading...</span>
+                  </div>
+                )}
               </div>
             )}
           </div>
