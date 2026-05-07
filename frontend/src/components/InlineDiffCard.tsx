@@ -60,6 +60,17 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
       .catch(() => {})
   }, [sessionId, fileData.file_id, filename])
 
+  // Reconstruct proposed file by swapping the changed symbol — no API call needed
+  const getProposedCode = (change: any): string => {
+    if (!originalCode) return '// Loading preview...'
+    const orig = change.original_code
+    const next = change.new_code
+    if (!orig || !next) return originalCode
+    const idx = originalCode.indexOf(orig)
+    if (idx === -1) return originalCode // symbol not found verbatim — show original
+    return originalCode.slice(0, idx) + next + originalCode.slice(idx + orig.length)
+  }
+
   const handleApply = async (change: any) => {
     setApplying(p => ({ ...p, [change.id]: true }))
     try {
@@ -185,7 +196,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
           </div>
 
           {/* Action buttons */}
-          <div className="flex items-center gap-2 px-4 py-2.5 bg-zinc-900/40 border-t border-zinc-800">
+          <div className="flex items-center gap-2 px-4 py-2.5 bg-zinc-900/40 border-t border-zinc-800 flex-wrap">
+            {/* Left: status or apply/skip */}
             {applied[change.id] ? (
               <span className="flex items-center gap-1.5 text-[12px] text-green-400 font-semibold">
                 <CheckCircle size={13} /> Applied
@@ -210,24 +222,31 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
                 >
                   <XCircle size={12} /> Skip
                 </button>
-                <div className="ml-auto flex items-center gap-2">
-                  {isVisualFile(filename) && (
-                    <LivePreview
-                      code={originalCode || '// Loading...'}
-                      filename={filename}
-                      modifiedCode={modifiedCode}
-                    />
-                  )}
-                  <button
-                    onClick={() => handleDownload(change)}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 text-zinc-400 border border-zinc-700 rounded-lg text-[12px] font-semibold hover:bg-zinc-700 transition-colors"
-                    title="Download modified file"
-                  >
-                    <Download size={12} /> Download
-                  </button>
-                </div>
               </>
             )}
+            {/* Right: Preview (always visible for visual files) + Download */}
+            <div className="ml-auto flex items-center gap-2">
+              {isVisualFile(filename) && (
+                <LivePreview
+                  code={originalCode || '// Loading...'}
+                  filename={filename}
+                  modifiedCode={
+                    applied[change.id]
+                      ? modifiedCode                       // post-apply: show result of apply
+                      : getProposedCode(change)            // pre-apply: show proposed change
+                  }
+                />
+              )}
+              {!applied[change.id] && !skipped[change.id] && (
+                <button
+                  onClick={() => handleDownload(change)}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 text-zinc-400 border border-zinc-700 rounded-lg text-[12px] font-semibold hover:bg-zinc-700 transition-colors"
+                  title="Download modified file"
+                >
+                  <Download size={12} /> Download
+                </button>
+              )}
+            </div>
           </div>
         </div>
       ))}
