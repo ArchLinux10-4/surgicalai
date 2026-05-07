@@ -370,8 +370,50 @@ export function ChatPanel() {
     // Convert FileList → Array SYNCHRONOUSLY before any awaits.
     // FileList objects tied to a cleared <input> can lose their entries
     // once e.target.value = '' runs while an async ensureSession() is in-flight.
-    const files = Array.from(fileList)
+    let files = Array.from(fileList)
     if (!files.length) return
+
+    // ── Zip extraction ───────────────────────────────────
+    const zipFiles = files.filter(f => f.name.toLowerCase().endsWith('.zip'))
+    const nonZipFiles = files.filter(f => !f.name.toLowerCase().endsWith('.zip'))
+
+    if (zipFiles.length > 0) {
+      const JSZip = (await import('jszip')).default
+      const SKIP_DIRS = ['node_modules', '.git', '__pycache__', '.next', 'dist', 'build', '.venv', 'venv']
+      const SKIP_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico', 'woff', 'woff2', 'ttf', 'eot', 'otf', 'mp4', 'mp3', 'zip', 'tar', 'gz', 'exe', 'dll', 'so', 'dylib', 'lock']
+      const SKIP_FILES = ['.ds_store', 'thumbs.db', '.gitignore', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']
+
+      const extracted: File[] = []
+      for (const zipFile of zipFiles) {
+        try {
+          const zip = await JSZip.loadAsync(zipFile)
+          const entries = Object.entries(zip.files)
+          let skipped = 0
+          for (const [path, entry] of entries) {
+            if (entry.dir) continue
+            const parts = path.split('/')
+            const filename = parts[parts.length - 1]
+            const ext = filename.split('.').pop()?.toLowerCase() || ''
+            // Skip junk dirs, binary exts, hidden files, lock files
+            if (parts.some(p => SKIP_DIRS.includes(p))) { skipped++; continue }
+            if (SKIP_EXTS.includes(ext)) { skipped++; continue }
+            if (SKIP_FILES.includes(filename.toLowerCase())) { skipped++; continue }
+            if (filename.startsWith('.')) { skipped++; continue }
+            const content = await entry.async('string')
+            // Use full path as filename to preserve context (e.g. src/components/App.tsx)
+            extracted.push(new File([content], path, { type: 'text/plain' }))
+          }
+          const msg = skipped > 0
+            ? `Extracted ${extracted.length} files from ${zipFile.name} (${skipped} skipped)`
+            : `Extracted ${extracted.length} files from ${zipFile.name}`
+          toast.success(msg)
+        } catch (e: any) {
+          toast.error(`Failed to extract ${zipFile.name}: ${e.message}`)
+        }
+      }
+      files = [...nonZipFiles, ...extracted]
+      if (!files.length) return
+    }
 
     const sessionId = await ensureSession()
     setUploadingFiles(true)
@@ -556,7 +598,7 @@ export function ChatPanel() {
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.json,.yaml,.yml,.toml,.md,.sh,.sql,.cpp,.c,.h,.png,.jpg,.jpeg,.webp,.gif,.bmp,.pdf,.csv,.xlsx,.xls,.txt"
+        accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.json,.yaml,.yml,.toml,.md,.sh,.sql,.cpp,.c,.h,.png,.jpg,.jpeg,.webp,.gif,.bmp,.pdf,.csv,.xlsx,.xls,.txt,.zip"
         className="hidden"
         onChange={handleFileInput}
       />
