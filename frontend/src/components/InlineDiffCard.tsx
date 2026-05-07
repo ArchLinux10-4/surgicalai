@@ -1,8 +1,9 @@
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { CheckCircle, XCircle, Download, ChevronDown, ChevronUp, AlertTriangle, FileCode } from 'lucide-react'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import type { SmartResult } from '../types'
+import { LivePreview, isVisualFile } from './LivePreview'
 
 interface Props {
   result: SmartResult
@@ -48,12 +49,23 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
   const [applying, setApplying] = useState<Record<string, boolean>>({})
   const [applied, setApplied] = useState<Record<string, boolean>>({})
   const [skipped, setSkipped] = useState<Record<string, boolean>>({})
+  const [originalCode, setOriginalCode] = useState<string>('')
+  const [modifiedCode, setModifiedCode] = useState<string | undefined>(undefined)
+
+  // Pre-fetch original file content so Preview works before Apply
+  useEffect(() => {
+    if (!isVisualFile(filename)) return
+    api.sessionFiles.get(sessionId, fileData.file_id)
+      .then(f => setOriginalCode(f.content))
+      .catch(() => {})
+  }, [sessionId, fileData.file_id, filename])
 
   const handleApply = async (change: any) => {
     setApplying(p => ({ ...p, [change.id]: true }))
     try {
       // Get the file content from session
       const fileData2 = await api.sessionFiles.get(sessionId, fileData.file_id)
+      if (!originalCode) setOriginalCode(fileData2.content)
       const result = await api.surgical.apply({
         file_path: filename,
         changes: [change],
@@ -70,9 +82,11 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
         a.click()
         URL.revokeObjectURL(url)
         toast.success(`Downloaded modified ${filename}`)
+        setModifiedCode(result.modified_content)
         onApplied?.(filename, result.modified_content)
       } else {
         toast.success(`Applied change to ${filename}`)
+        setModifiedCode(result.modified_content || '')
         onApplied?.(filename, result.modified_content || '')
       }
       setApplied(p => ({ ...p, [change.id]: true }))
@@ -196,13 +210,22 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied }: {
                 >
                   <XCircle size={12} /> Skip
                 </button>
-                <button
-                  onClick={() => handleDownload(change)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 text-zinc-400 border border-zinc-700 rounded-lg text-[12px] font-semibold hover:bg-zinc-700 transition-colors ml-auto"
-                  title="Download modified file"
-                >
-                  <Download size={12} /> Download
-                </button>
+                <div className="ml-auto flex items-center gap-2">
+                  {isVisualFile(filename) && (
+                    <LivePreview
+                      code={originalCode || '// Loading...'}
+                      filename={filename}
+                      modifiedCode={modifiedCode}
+                    />
+                  )}
+                  <button
+                    onClick={() => handleDownload(change)}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-800 text-zinc-400 border border-zinc-700 rounded-lg text-[12px] font-semibold hover:bg-zinc-700 transition-colors"
+                    title="Download modified file"
+                  >
+                    <Download size={12} /> Download
+                  </button>
+                </div>
               </>
             )}
           </div>
