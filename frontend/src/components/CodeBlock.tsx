@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
-import { default as a11yOneLight } from 'react-syntax-highlighter/dist/esm/styles/prism/a11y-one-light'
+import { oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { useThemeStore } from '../stores/themeStore'
 import { Copy, Check, ChevronDown, ChevronUp, Download } from 'lucide-react'
 
@@ -147,7 +147,7 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
       <div className="relative">
         <SyntaxHighlighter
           language={lang || 'text'}
-          style={theme === 'dark' ? vscDarkPlus : a11yOneLight}
+          style={theme === 'dark' ? vscDarkPlus : oneLight}
           showLineNumbers
           wrapLines
           lineNumberStyle={{
