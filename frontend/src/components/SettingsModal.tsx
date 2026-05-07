@@ -25,6 +25,11 @@ export function SettingsModal() {
   const [verifying, setVerifying] = useState(false)
   const [keyStatus, setKeyStatus] = useState<'idle' | 'ok' | 'error'>('idle')
   const [keyMessage, setKeyMessage] = useState('')
+  const [anthropicKey, setAnthropicKey] = useState('')
+  const [showAnthropicKey, setShowAnthropicKey] = useState(false)
+  const [anthropicVerifying, setAnthropicVerifying] = useState(false)
+  const [anthropicStatus, setAnthropicStatus] = useState<'idle' | 'ok' | 'error'>('idle')
+  const [anthropicMessage, setAnthropicMessage] = useState('')
   const [models, setModels] = useState<any[]>([])
   const [form, setForm] = useState({
     architect_model: 'gpt-5',
@@ -77,6 +82,22 @@ export function SettingsModal() {
     setVerifying(false)
   }
 
+  const handleVerifyAnthropicKey = async () => {
+    if (!anthropicKey.trim()) return
+    setAnthropicVerifying(true); setAnthropicStatus('idle')
+    try {
+      await api.settings.verifyAnthropicKey(anthropicKey.trim())
+      setAnthropicStatus('ok'); setAnthropicMessage('Anthropic key verified and saved!')
+      const updated = await api.settings.get()
+      setSettings(updated)
+      toast.success('Anthropic key saved', 'Claude models now available')
+    } catch (e: any) {
+      setAnthropicStatus('error'); setAnthropicMessage(e.message)
+      toast.error('Anthropic key failed', e.message)
+    }
+    setAnthropicVerifying(false)
+  }
+
   const handleSave = async () => {
     try {
       // If user typed an API key, verify+save it as part of the save flow
@@ -94,6 +115,18 @@ export function SettingsModal() {
           return // Don't save other settings if key is bad
         }
         setVerifying(false)
+      }
+      // If user typed an Anthropic key, verify it too
+      if (anthropicKey.trim()) {
+        try {
+          await api.settings.verifyAnthropicKey(anthropicKey.trim())
+          setAnthropicStatus('ok')
+        } catch (e: any) {
+          setAnthropicStatus('error')
+          setAnthropicMessage(e.message)
+          toast.error('Anthropic key invalid', e.message)
+          return
+        }
       }
       await api.settings.update(form)
       const updated = await api.settings.get()
@@ -187,6 +220,52 @@ export function SettingsModal() {
                     <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" className="text-accent hover:underline">
                       platform.openai.com/api-keys
                     </a>
+                  </div>
+                </div>
+
+                {/* ── Anthropic / Claude Key ── */}
+                <div className="mt-6 pt-5 border-t border-border">
+                  <SectionHeader title="Anthropic API Key (Claude)" subtitle="Enables Claude models as Architect — with visible thinking" />
+                  <div className="mt-3">
+                    <div className="flex gap-2">
+                      <div className="relative flex-1">
+                        <input
+                          type={showAnthropicKey ? 'text' : 'password'}
+                          value={anthropicKey}
+                          onChange={(e) => { setAnthropicKey(e.target.value); setAnthropicStatus('idle') }}
+                          placeholder={settings?.anthropic_api_key_set ? '••••••••••••••••••' : 'sk-ant-api03-…'}
+                          className={`input pr-10 ${anthropicStatus === 'ok' ? 'border-success focus:border-success' : anthropicStatus === 'error' ? 'border-danger' : ''}`}
+                          onKeyDown={(e) => e.key === 'Enter' && handleVerifyAnthropicKey()}
+                        />
+                        <button
+                          onClick={() => setShowAnthropicKey(!showAnthropicKey)}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-faint hover:text-muted"
+                        >
+                          {showAnthropicKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                        </button>
+                      </div>
+                      <button
+                        onClick={handleVerifyAnthropicKey}
+                        disabled={anthropicVerifying || !anthropicKey.trim()}
+                        className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {anthropicVerifying ? '…' : 'Verify'}
+                      </button>
+                    </div>
+                    {settings?.anthropic_api_key_set && anthropicStatus === 'idle' && (
+                      <div className="flex items-center gap-1.5 mt-2 text-success text-xs">
+                        <CheckCircle size={12} /> Claude API key configured
+                      </div>
+                    )}
+                    {anthropicStatus === 'ok' && <div className="text-success text-xs mt-2">{anthropicMessage}</div>}
+                    {anthropicStatus === 'error' && <div className="text-danger text-xs mt-2">{anthropicMessage}</div>}
+                    <div className="text-[11px] text-faint mt-2">
+                      Get your key at{' '}
+                      <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" className="text-accent hover:underline">
+                        console.anthropic.com
+                      </a>
+                      {' '}— enables Claude Sonnet 4 & Opus 4 with visible thinking
+                    </div>
                   </div>
                 </div>
               </div>

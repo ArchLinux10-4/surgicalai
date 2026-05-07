@@ -7,7 +7,7 @@ import { toast } from '../lib/toast'
 import { InlineDiffCard } from './InlineDiffCard'
 import { MarkdownCode } from './CodeBlock'
 import {
-  Send, X, Plus, Paperclip, FileCode, AlertTriangle, Zap, Trash2
+  Send, X, Plus, Paperclip, FileCode, AlertTriangle, Zap, Trash2, Brain
 } from 'lucide-react'
 import type { SessionFile, SmartResult } from '../types'
 
@@ -164,7 +164,43 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
 }
 
 // ── Streaming bubble with thinking trail ──────────────────
-function StreamingBubble({ content, progress, progressHistory }: { content: string; progress: string; progressHistory: string[] }) {
+// ── Claude Thinking Block ─────────────────────────────────
+function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boolean }) {
+  const [expanded, setExpanded] = useState(isStreaming)
+
+  useEffect(() => {
+    if (isStreaming) setExpanded(true)
+  }, [isStreaming])
+
+  if (!text && !isStreaming) return null
+
+  return (
+    <div className="mb-3">
+      <button
+        onClick={() => setExpanded(!expanded)}
+        className="flex items-center gap-2 text-xs text-violet-400 hover:text-violet-300 transition-colors"
+      >
+        <span className={`transform transition-transform duration-200 ${expanded ? 'rotate-90' : ''}`}>▶</span>
+        <Brain size={12} />
+        {isStreaming ? (
+          <span className="flex items-center gap-1.5">
+            Thinking<span className="animate-pulse">…</span>
+          </span>
+        ) : (
+          <span>Claude's reasoning ({text.length > 1000 ? `${Math.round(text.length / 100)} steps` : 'click to view'})</span>
+        )}
+      </button>
+      {expanded && text && (
+        <div className="mt-2 ml-5 pl-3 border-l-2 border-violet-500/30 text-[12px] text-zinc-400/90 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed font-mono">
+          {text}
+          {isStreaming && <span className="inline-block w-1.5 h-3 bg-violet-400/60 rounded-sm ml-0.5 animate-pulse" />}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking }: { content: string; progress: string; progressHistory: string[]; thinkingText?: string; isThinking?: boolean }) {
   const [thinkingExpanded, setThinkingExpanded] = useState(true)
   const [elapsed, setElapsed] = useState(0)
 
@@ -222,6 +258,11 @@ function StreamingBubble({ content, progress, progressHistory }: { content: stri
               </div>
             )}
           </div>
+        )}
+
+        {/* Claude thinking block */}
+        {(thinkingText || isThinking) && (
+          <ThinkingBlock text={thinkingText || ''} isStreaming={!!isThinking} />
         )}
 
         {content ? (
@@ -349,6 +390,8 @@ export function ChatPanel() {
   const [showAllFiles, setShowAllFiles] = useState(false)
   const [filesCollapsed, setFilesCollapsed] = useState(false)
   const [progressHistory, setProgressHistory] = useState<string[]>([])
+  const [thinkingText, setThinkingText] = useState('')
+  const [isThinking, setIsThinking] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -543,8 +586,8 @@ export function ChatPanel() {
   // ── Send message ──────────────────────────────────────
   const handleSend = useCallback(async () => {
     if (!input.trim() || isStreaming) return
-    if (!settings?.openai_api_key_set) {
-      setError('Add your OpenAI API key in Settings first.')
+    if (!settings?.openai_api_key_set && !(settings as any)?.anthropic_api_key_set) {
+      setError('Add your API key (OpenAI or Anthropic) in Settings first.')
       return
     }
     setError(null)
@@ -567,6 +610,8 @@ export function ChatPanel() {
     setStreamProgress('Thinking...')
     setStreamingMessage('')
     setProgressHistory(['Thinking...'])
+    setThinkingText('')
+    setIsThinking(false)
 
     let accumulated = ''
     let gotResult = false
@@ -614,7 +659,13 @@ export function ChatPanel() {
         // Re-fetch session files to keep sidebar in sync
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
-      (err) => { setError(err); stopStream() }
+      (err) => { setError(err); stopStream() },
+      // onThinking — Claude's extended thinking
+      (text, phase) => {
+        if (phase === 'start') { setIsThinking(true); setThinkingText('') }
+        else if (phase === 'delta') { setThinkingText(prev => prev + text) }
+        else if (phase === 'end') { setIsThinking(false) }
+      }
     )
 
     abortRef.current = ctrl
@@ -683,7 +734,7 @@ export function ChatPanel() {
               <Message key={msg.id || i} msg={msg} sessionId={activeSessions || ''} />
             ))}
             {isStreaming && (streamingMessage || streamProgress) && (
-              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} />
+              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} />
             )}
             {error && (
               <div className="mx-4 my-3 flex items-start gap-2.5 px-3.5 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-sm text-red-400">

@@ -12,6 +12,7 @@ def get_settings():
     s = get_all_settings()
     return SettingsResponse(
         openai_api_key_set=bool(s.get("openai_api_key", "")),
+        anthropic_api_key_set=bool(s.get("anthropic_api_key", "")),
         architect_model=s.get("architect_model", "gpt-5"),
         surgeon_model=s.get("surgeon_model", "gpt-4.1"),
         temperature_architect=float(s.get("temperature_architect", "0.3")),
@@ -46,6 +47,13 @@ def get_available_models():
         {"id": "gpt-5", "name": "GPT-5", "role": "architect", "description": "Most capable — best for complex architecture (no temperature control)", "no_temperature": True},
     ]
 
+    claude_models = []
+    if get_setting("anthropic_api_key", ""):
+        claude_models = [
+            {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "role": "architect", "description": "Fast, intelligent — great Architect with visible thinking", "provider": "anthropic"},
+            {"id": "claude-opus-4-20250514", "name": "Claude Opus 4", "role": "architect", "description": "Most capable Claude — deep reasoning with extended thinking", "provider": "anthropic"},
+        ]
+
     ollama_models = []
     if get_setting("ollama_enabled", "false") == "true":
         try:
@@ -61,7 +69,7 @@ def get_available_models():
             pass
 
     return {
-        "models": openai_models + ollama_models,
+        "models": openai_models + claude_models + ollama_models,
         "pipeline_modes": [
             {"id": "auto", "name": "Auto Pipeline", "description": "Architect plans, Surgeon executes (recommended)"},
             {"id": "single", "name": "Single Model", "description": "Use one model for everything"},
@@ -91,6 +99,30 @@ def verify_key(body: dict):
         raise HTTPException(status_code=401, detail="Invalid API key")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/verify-anthropic-key")
+def verify_anthropic_key(body: dict):
+    """Test if the Anthropic API key works."""
+    key = body.get("key", "")
+    if not key:
+        raise HTTPException(status_code=400, detail="No key provided")
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=key)
+        # Quick validation — list models or send a tiny request
+        client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=10,
+            messages=[{"role": "user", "content": "Hi"}],
+        )
+        set_setting("anthropic_api_key", key)
+        return {"ok": True, "message": "Anthropic key verified and saved"}
+    except Exception as e:
+        err_msg = str(e)
+        if "authentication" in err_msg.lower() or "api key" in err_msg.lower() or "401" in err_msg:
+            raise HTTPException(status_code=401, detail="Invalid Anthropic API key")
+        raise HTTPException(status_code=500, detail=f"Verification failed: {err_msg}")
 
 
 @router.post("/test-ollama")

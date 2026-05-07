@@ -72,7 +72,7 @@ def get_messages(session_id: str):
 
 @router.post("/send")
 def send_message(req: ChatRequest):
-    if not get_setting("openai_api_key") and get_setting("ollama_enabled") != "true":
+    if not get_setting("openai_api_key") and not get_setting("anthropic_api_key") and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured. Go to Settings.")
 
     conn = get_db()
@@ -150,7 +150,7 @@ def send_message(req: ChatRequest):
 @router.post("/stream")
 async def stream_message(req: ChatRequest):
     """Streaming version of chat send. Returns SSE stream."""
-    if not get_setting("openai_api_key") and get_setting("ollama_enabled") != "true":
+    if not get_setting("openai_api_key") and not get_setting("anthropic_api_key") and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured.")
 
     conn = get_db()
@@ -262,7 +262,7 @@ async def smart_stream(req: dict):
     session_id = req.get("session_id")
     message = req.get("message", "")
 
-    if not get_setting("openai_api_key") and get_setting("ollama_enabled") != "true":
+    if not get_setting("openai_api_key") and not get_setting("anthropic_api_key") and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured. Go to Settings.")
 
     conn = get_db()

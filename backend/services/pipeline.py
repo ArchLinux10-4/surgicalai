@@ -23,10 +23,28 @@ from models.schemas import (
 )
 from services.ast_parser import ASTParser
 
+try:
+    from anthropic import AsyncAnthropic
+    HAS_ANTHROPIC = True
+except ImportError:
+    HAS_ANTHROPIC = False
+
 parser = ASTParser()
 
 # Models that do NOT accept a temperature parameter (reasoning / latest-gen models)
 NO_TEMPERATURE_MODELS = {"gpt-5", "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"}
+
+
+def _is_claude_model(model: str) -> bool:
+    """Check if a model ID is a Claude/Anthropic model."""
+    return bool(model and model.startswith("claude-"))
+
+
+def _get_anthropic_key() -> str:
+    key = get_setting("anthropic_api_key")
+    if not key:
+        raise ValueError("Anthropic API key not configured. Go to Settings → API Keys to add it.")
+    return key
 
 
 def _chat_create(client: OpenAI, model: str, messages: list, temperature: float = 0.3, **kwargs):
@@ -949,6 +967,35 @@ Be warm, friendly, and encouraging. You're helping a person build something real
             if project_memory:
                 system += f"\n\n## Project Memory\n{project_memory}"
             msgs = [{"role": "system", "content": system}] + conversation_history[-10:] + [{"role": "user", "content": user_request}]
+
+            if _is_claude_model(chat_model):
+                # ── Claude streaming with extended thinking ──
+                aclient = AsyncAnthropic(api_key=_get_anthropic_key())
+                claude_msgs = conversation_history[-10:] + [{"role": "user", "content": user_request}]
+                async with aclient.messages.stream(
+                    model=chat_model,
+                    max_tokens=16000,
+                    thinking={"type": "enabled", "budget_tokens": 10000},
+                    system=system,
+                    messages=claude_msgs,
+                ) as astream:
+                    current_block = None
+                    async for event in astream:
+                        if event.type == "content_block_start":
+                            current_block = getattr(event.content_block, 'type', None)
+                            if current_block == "thinking":
+                                yield sse({"type": "thinking_start", "content": ""})
+                        elif event.type == "content_block_delta":
+                            if hasattr(event.delta, 'thinking'):
+                                yield sse({"type": "thinking", "content": event.delta.thinking})
+                            elif hasattr(event.delta, 'text'):
+                                yield sse({"type": "token", "content": event.delta.text})
+                        elif event.type == "content_block_stop":
+                            if current_block == "thinking":
+                                yield sse({"type": "thinking_end", "content": ""})
+                yield sse({"type": "done", "content": ""})
+                return
+
             client = _get_client()
             stream = _chat_create(client, model=chat_model, messages=msgs, temperature=0.3, stream=True)
             for chunk in stream:
@@ -1026,82 +1073,183 @@ USER REQUEST:
         if project_memory:
             context_msg = f"PROJECT MEMORY:\n{project_memory}\n\n" + context_msg
 
-        client = _get_client()
         arch_model = get_setting("architect_model", "gpt-4.1")
 
-        # Build user message content — text + optional vision blocks
-        if image_files:
-            # Multi-modal content array
-            user_content = [{"type": "text", "text": context_msg}]
-            for img_sf in image_files:
-                img_data = img_sf["content"]
-                # Ensure it's a valid data URL
-                if not img_data.startswith("data:"):
-                    # Try to infer MIME type from filename
-                    ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
-                    mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                                "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}
-                    mime = mime_map.get(ext, "image/png")
-                    img_data = f"data:{mime};base64,{img_data}"
-                user_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": img_data}
-                })
-            architect_messages = [
-                {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
-                {"role": "user", "content": user_content}
-            ]
-        else:
-            architect_messages = [
-                {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
-                {"role": "user", "content": context_msg}
-            ]
+        if _is_claude_model(arch_model):
+            # ── Claude Architect with streaming extended thinking ──
+            aclient = AsyncAnthropic(api_key=_get_anthropic_key())
 
-        # ── Run Architect in background thread so we can yield elapsed ticks ──
-        async def _call_architect(msgs):
-            return await asyncio.to_thread(
-                lambda: _chat_create(client,
+            # Build user content for Claude (images use different format)
+            if image_files:
+                user_content = [{"type": "text", "text": context_msg}]
+                for img_sf in image_files:
+                    img_data = img_sf["content"]
+                    if img_data.startswith("data:"):
+                        parts = img_data.split(",", 1)
+                        media_type = parts[0].split(":")[1].split(";")[0]
+                        b64_data = parts[1]
+                    else:
+                        ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
+                        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                                    "webp": "image/webp", "gif": "image/gif"}
+                        media_type = mime_map.get(ext, "image/png")
+                        b64_data = img_data
+                    user_content.append({
+                        "type": "image",
+                        "source": {"type": "base64", "media_type": media_type, "data": b64_data}
+                    })
+            else:
+                user_content = context_msg
+
+            thinking_chunks = []
+            response_text_chunks = []
+            claude_failed = False
+
+            try:
+                async with aclient.messages.stream(
                     model=arch_model,
-                    messages=msgs,
-                    temperature=0.3,
-                    response_format={"type": "json_object"}
-                )
-            )
+                    max_tokens=16000,
+                    thinking={"type": "enabled", "budget_tokens": 10000},
+                    system=SMART_ARCHITECT_SYSTEM,
+                    messages=[{"role": "user", "content": user_content}],
+                ) as astream:
+                    current_block = None
+                    async for event in astream:
+                        if event.type == "content_block_start":
+                            current_block = getattr(event.content_block, 'type', None)
+                            if current_block == "thinking":
+                                yield sse({"type": "thinking_start", "content": ""})
+                        elif event.type == "content_block_delta":
+                            if hasattr(event.delta, 'thinking'):
+                                yield sse({"type": "thinking", "content": event.delta.thinking})
+                                thinking_chunks.append(event.delta.thinking)
+                            elif hasattr(event.delta, 'text'):
+                                response_text_chunks.append(event.delta.text)
+                        elif event.type == "content_block_stop":
+                            if current_block == "thinking":
+                                yield sse({"type": "thinking_end", "content": ""})
+            except Exception as claude_err:
+                err_str = str(claude_err).lower()
+                if image_files and ("image" in err_str or "unsupported" in err_str):
+                    yield sse({"type": "progress", "content": "⚠️ Images failed — retrying text-only..."})
+                    thinking_chunks = []
+                    response_text_chunks = []
+                    try:
+                        async with aclient.messages.stream(
+                            model=arch_model,
+                            max_tokens=16000,
+                            thinking={"type": "enabled", "budget_tokens": 10000},
+                            system=SMART_ARCHITECT_SYSTEM,
+                            messages=[{"role": "user", "content": context_msg}],
+                        ) as astream:
+                            current_block = None
+                            async for event in astream:
+                                if event.type == "content_block_start":
+                                    current_block = getattr(event.content_block, 'type', None)
+                                    if current_block == "thinking":
+                                        yield sse({"type": "thinking_start", "content": ""})
+                                elif event.type == "content_block_delta":
+                                    if hasattr(event.delta, 'thinking'):
+                                        yield sse({"type": "thinking", "content": event.delta.thinking})
+                                        thinking_chunks.append(event.delta.thinking)
+                                    elif hasattr(event.delta, 'text'):
+                                        response_text_chunks.append(event.delta.text)
+                                elif event.type == "content_block_stop":
+                                    if current_block == "thinking":
+                                        yield sse({"type": "thinking_end", "content": ""})
+                    except Exception:
+                        raise
+                else:
+                    raise
 
-        arch_task = asyncio.create_task(_call_architect(architect_messages))
-        start_time = time.time()
-        tick = 0
-        while not arch_task.done():
-            await asyncio.sleep(1)
-            tick += 1
-            if tick % 3 == 0:
-                elapsed = int(time.time() - start_time)
-                yield sse({"type": "progress", "content": f"Architect thinking... ({elapsed}s)"})
+            raw_text = "".join(response_text_chunks)
+            # Claude might wrap JSON in markdown fences
+            stripped = raw_text.strip()
+            if stripped.startswith("```"):
+                fence_lines = stripped.split("\n")
+                # Remove first line (```json) and last line (```)
+                if fence_lines[-1].strip() == "```":
+                    raw_text = "\n".join(fence_lines[1:-1])
+                else:
+                    raw_text = "\n".join(fence_lines[1:])
+            plan = json.loads(raw_text)
+        else:
+            # ── OpenAI Architect (original logic) ──
+            client = _get_client()
 
-        try:
-            response = arch_task.result()
-        except Exception as img_err:
-            err_str = str(img_err).lower()
-            if image_files and ("image" in err_str or "unsupported" in err_str or "invalid" in err_str):
-                # GPT rejected one or more images — fall back gracefully to text-only
-                yield sse({"type": "progress", "content": "⚠️ Images couldn't be read — falling back to text context..."})
+            # Build user message content — text + optional vision blocks
+            if image_files:
+                # Multi-modal content array
+                user_content = [{"type": "text", "text": context_msg}]
+                for img_sf in image_files:
+                    img_data = img_sf["content"]
+                    # Ensure it's a valid data URL
+                    if not img_data.startswith("data:"):
+                        # Try to infer MIME type from filename
+                        ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
+                        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                                    "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}
+                        mime = mime_map.get(ext, "image/png")
+                        img_data = f"data:{mime};base64,{img_data}"
+                    user_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": img_data}
+                    })
+                architect_messages = [
+                    {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
+                    {"role": "user", "content": user_content}
+                ]
+            else:
                 architect_messages = [
                     {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
                     {"role": "user", "content": context_msg}
                 ]
-                arch_task2 = asyncio.create_task(_call_architect(architect_messages))
-                start_time = time.time()
-                while not arch_task2.done():
-                    await asyncio.sleep(1)
-                    tick += 1
-                    if tick % 3 == 0:
-                        elapsed = int(time.time() - start_time)
-                        yield sse({"type": "progress", "content": f"Architect retrying... ({elapsed}s)"})
-                response = arch_task2.result()
-            else:
-                raise
 
-        plan = json.loads(response.choices[0].message.content)
+            # ── Run Architect in background thread so we can yield elapsed ticks ──
+            async def _call_architect(msgs):
+                return await asyncio.to_thread(
+                    lambda: _chat_create(client,
+                        model=arch_model,
+                        messages=msgs,
+                        temperature=0.3,
+                        response_format={"type": "json_object"}
+                    )
+                )
+
+            arch_task = asyncio.create_task(_call_architect(architect_messages))
+            start_time = time.time()
+            tick = 0
+            while not arch_task.done():
+                await asyncio.sleep(1)
+                tick += 1
+                if tick % 3 == 0:
+                    elapsed = int(time.time() - start_time)
+                    yield sse({"type": "progress", "content": f"Architect thinking... ({elapsed}s)"})
+
+            try:
+                response = arch_task.result()
+            except Exception as img_err:
+                err_str = str(img_err).lower()
+                if image_files and ("image" in err_str or "unsupported" in err_str or "invalid" in err_str):
+                    # GPT rejected one or more images — fall back gracefully to text-only
+                    yield sse({"type": "progress", "content": "⚠️ Images couldn't be read — falling back to text context..."})
+                    architect_messages = [
+                        {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
+                        {"role": "user", "content": context_msg}
+                    ]
+                    arch_task2 = asyncio.create_task(_call_architect(architect_messages))
+                    start_time = time.time()
+                    while not arch_task2.done():
+                        await asyncio.sleep(1)
+                        tick += 1
+                        if tick % 3 == 0:
+                            elapsed = int(time.time() - start_time)
+                            yield sse({"type": "progress", "content": f"Architect retrying... ({elapsed}s)"})
+                    response = arch_task2.result()
+                else:
+                    raise
+
+            plan = json.loads(response.choices[0].message.content)
         intent = plan.get("intent", "chat")
 
         # ── NEEDS CLARIFICATION: Architect doesn't have enough info to plan ──

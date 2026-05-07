@@ -70,6 +70,7 @@ export const api = {
     get: () => request<any>('/settings'),
     update: (data: any) => request('/settings', { method: 'POST', body: JSON.stringify(data) }),
     verifyKey: (key: string) => request('/settings/verify-key', { method: 'POST', body: JSON.stringify({ key }) }),
+    verifyAnthropicKey: (key: string) => request('/settings/verify-anthropic-key', { method: 'POST', body: JSON.stringify({ key }) }),
     getModels: () => request<any>('/settings/models'),
   },
   chat: {
@@ -147,7 +148,8 @@ export const api = {
       onToken: (token: string) => void,
       onResult: (result: any) => void,
       onDone: (fullText: string) => void,
-      onError: (err: string) => void
+      onError: (err: string) => void,
+      onThinking?: (text: string, phase: 'start' | 'delta' | 'end') => void
     ): AbortController => {
       const controller = new AbortController()
       const tokens: string[] = []
@@ -173,6 +175,9 @@ export const api = {
             else if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
             else if (chunk.type === 'done') fireDone()
             else if (chunk.type === 'error') onError(chunk.content)
+            else if (chunk.type === 'thinking_start') onThinking?.('', 'start')
+            else if (chunk.type === 'thinking') onThinking?.(chunk.content, 'delta')
+            else if (chunk.type === 'thinking_end') onThinking?.('', 'end')
           } catch {}
         }
 

@@ -82,6 +82,7 @@ export interface SurgicalAnalysis {
 
 export interface AppSettings {
   openai_api_key_set: boolean
+  anthropic_api_key_set: boolean
   architect_model: string
   surgeon_model: string
   temperature_architect: number
@@ -146,7 +147,7 @@ export interface MultiFileAnalysis {
   overall_summary: string
 }
 
-export type StreamChunkType = 'token' | 'done' | 'error' | 'progress' | 'result'
+export type StreamChunkType = 'token' | 'done' | 'error' | 'progress' | 'result' | 'thinking_start' | 'thinking' | 'thinking_end'
 
 export interface StreamChunk {
   type: StreamChunkType

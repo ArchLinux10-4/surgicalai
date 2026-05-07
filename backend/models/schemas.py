@@ -8,6 +8,7 @@ from enum import Enum
 
 class SettingsUpdate(BaseModel):
     openai_api_key: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
     architect_model: Optional[str] = None
     surgeon_model: Optional[str] = None
     temperature_architect: Optional[float] = None
@@ -24,6 +25,7 @@ class SettingsUpdate(BaseModel):
 
 class SettingsResponse(BaseModel):
     openai_api_key_set: bool
+    anthropic_api_key_set: bool = False
     architect_model: str
     surgeon_model: str
     temperature_architect: float
