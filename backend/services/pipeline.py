@@ -182,7 +182,8 @@ def run_architect(
     symbol_map: SymbolMap,
     user_request: str,
     file_content: str,
-    model: Optional[str] = None
+    model: Optional[str] = None,
+    user_id: str = ""
 ) -> ArchitectPlan:
     """
     GPT-5 (Architect): reads symbol map + request → produces structured change plan.
@@ -267,7 +268,8 @@ def run_surgeon(
     symbol: SymbolInfo,
     target: ChangeTarget,
     file_content: str,
-    model: Optional[str] = None
+    model: Optional[str] = None,
+    user_id: str = ""
 ) -> tuple[str, int]:
     """
     GPT-4.1 (Surgeon): receives ONE code chunk + plan → returns minimal replacement.
@@ -409,7 +411,8 @@ async def run_chat_stream(
     symbol_context: Optional[str] = None,
     model: Optional[str] = None,
     pinned_context: Optional[list] = None,
-    project_memory: Optional[str] = None
+    project_memory: Optional[str] = None,
+    user_id: str = ""
 ):
     """
     Streaming version of run_chat. Yields SSE chunks.
@@ -496,7 +499,7 @@ async def analyze_and_plan_stream(
 
         yield f"data: {json.dumps({'type': 'progress', 'content': f'Found {len(symbol_map.symbols)} symbols. Running Architect...'})}\n\n"
 
-        plan = run_architect(symbol_map, user_request, file_content)
+        plan = run_architect(symbol_map, user_request, file_content, user_id=user_id)
 
         yield f"data: {json.dumps({'type': 'progress', 'content': f'Plan: {len(plan.targets)} changes identified. Running Surgeon...'})}\n\n"
 
@@ -521,7 +524,7 @@ async def analyze_and_plan_stream(
                                 parent_symbol = sym
                                 break
                     if parent_symbol is not None:
-                        new_code, confidence = run_surgeon(parent_symbol, target, file_content)
+                        new_code, confidence = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                         diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
                         changes.append(SurgicalChange(
                             id=str(uuid.uuid4()),
@@ -549,7 +552,7 @@ async def analyze_and_plan_stream(
                 changes.append(change)
                 continue
 
-            new_code, confidence = run_surgeon(symbol, target, file_content)
+            new_code, confidence = run_surgeon(symbol, target, file_content, user_id=user_id)
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
 
             change = SurgicalChange(
@@ -663,7 +666,7 @@ Add "file_path" to each target object."""
                     break
             if symbol is None:
                 continue
-            new_code, confidence = run_surgeon(symbol, target, content)
+            new_code, confidence = run_surgeon(symbol, target, content, user_id=user_id)
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
             changes.append(SurgicalChange(
                 id=str(uuid.uuid4()),
@@ -763,7 +766,7 @@ def analyze_and_plan(
     symbol_map = parser.parse(file_content, file_path)
 
     # Step 2: Architect produces plan
-    plan = run_architect(symbol_map, user_request, file_content)
+    plan = run_architect(symbol_map, user_request, file_content, user_id=user_id)
 
     # Step 3: For each target, find symbol and run surgeon
     changes = []
@@ -787,7 +790,7 @@ def analyze_and_plan(
                             parent_symbol = sym
                             break
                 if parent_symbol is not None:
-                    new_code, confidence = run_surgeon(parent_symbol, target, file_content)
+                    new_code, confidence = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                     diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
                     change = SurgicalChange(
                         id=str(uuid.uuid4()),
@@ -818,7 +821,7 @@ def analyze_and_plan(
             continue
 
         # Run surgeon to get replacement code
-        new_code, confidence = run_surgeon(symbol, target, file_content)
+        new_code, confidence = run_surgeon(symbol, target, file_content, user_id=user_id)
         diff = _make_diff(symbol.code, new_code, target.symbol_path)
 
         change = SurgicalChange(
@@ -1426,7 +1429,7 @@ USER REQUEST:
                 confidence=target.get("confidence", 7)
             )
 
-            new_code, confidence = run_surgeon(symbol, change_target, sf["content"])
+            new_code, confidence = run_surgeon(symbol, change_target, sf["content"], user_id=user_id)
             diff = _make_diff(symbol.code, new_code, symbol_path)
 
             change = SurgicalChange(
