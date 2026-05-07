@@ -924,6 +924,18 @@ When the user asks you to DIAGNOSE a bug, investigate state/session issues, or d
    your diagnosis for that file was wrong. Acknowledge this: "After closer inspection, [file] doesn't need
    changes — the root cause is likely elsewhere." Do NOT present a confident diagnosis with 0 changes.
 
+4. CROSS-LAYER TRACE — Follow the actual data flow end-to-end before proposing a fix. Trace: where does
+   the value originate → where is it stored → where is it read → where does it render? Do NOT stop at the
+   layer where the symptom appears. A "wrong text in header" may originate from an API response, get cached
+   in a store, and render through 3 components. Map the full pipeline. If your trace dead-ends at a layer
+   boundary, explicitly say "I need to see [specific file] to continue the trace."
+
+5. PREDICT THE COUNTER-EXAMPLE — Before finalizing any change plan, generate one concrete scenario where
+   your proposed fix would fail or cause a regression. State it explicitly: "This fix would break if
+   [scenario]." If you cannot think of one, you haven't understood the change deeply enough. If the
+   counter-example is real, address it in the plan before handing off to the Surgeon. This catches bad
+   hypotheses before they waste Surgeon tokens.
+
 ━━━ HARD RULES ━━━
 - NEVER touch symbols that weren't asked about
 - For Python/Go/JS/TS/Rust files: use the exact function/class name from the symbol map as symbol_path
