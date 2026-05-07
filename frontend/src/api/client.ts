@@ -2,13 +2,23 @@ import type { StreamChunk, PinnedContext, ProjectMemory, PromptTemplate, ImpactA
 
 const BASE = (import.meta.env.VITE_API_URL ?? '') + '/api'
 
-/** Read JWT from persisted auth store without importing zustand (avoids circular deps). */
+/** Read JWT from persisted auth store without importing zustand (avoids circular deps).
+ *  Auth is stored under `surgicalai-auth-{username}` (namespaced) or legacy `surgicalai-auth`. */
 function getAuthToken(): string | null {
   try {
+    // Search for namespaced key first (surgicalai-auth-{username})
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (key && key.startsWith('surgicalai-auth-') && key !== 'surgicalai-auth') {
+        const data = JSON.parse(localStorage.getItem(key) || '')
+        if (data?.token) return data.token
+      }
+    }
+    // Fallback: legacy Zustand persist key
     const raw = localStorage.getItem('surgicalai-auth')
     if (!raw) return null
     const parsed = JSON.parse(raw)
-    return parsed?.state?.token ?? null
+    return parsed?.state?.token ?? parsed?.token ?? null
   } catch {
     return null
   }
