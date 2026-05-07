@@ -38,11 +38,10 @@ function buildIframeSrc(code: string, filename: string): string {
     .replace(/^interface\s+\w+\s*\{[\s\S]*?\n\}/gm, '')
 
   const mountCall = componentName
-    ? `\ntry {\n  const __root = ReactDOM.createRoot(document.getElementById('root'));\n  __root.render(React.createElement(${componentName}));\n} catch(__e) {\n  var __b = document.getElementById('error-banner');\n  __b.style.display = 'block';\n  __b.textContent = 'Render error: ' + (__e && __e.message ? __e.message : String(__e));\n}`
-    : `\n// Could not detect component`
+    ? `\ntry {\n  const __root = ReactDOM.createRoot(document.getElementById('root'));\n  __root.render(React.createElement(${componentName}));\n} catch(__e) {\n  var __b = document.getElementById('error-banner');\n  if (__b) { __b.style.display = 'block'; __b.textContent = 'Render error: ' + (__e && __e.message ? __e.message : String(__e)); }\n}`
+    : `\n// Could not detect component name`
 
-  // Build the mock block as a plain string (no template literal nesting issues)
-  const tailwindScript = hasTailwind ? '<script src="https://cdn.tailwindcss.com"></sc' + 'ript>' : ''
+  const tailwindTag = hasTailwind ? '<script src="https://cdn.tailwindcss.com"><\/script>' : ''
 
   const mockBlock = `
     // react-router-dom mocks
@@ -61,6 +60,19 @@ function buildIframeSrc(code: string, filename: string): string {
     var create = function() { return function() { return {}; }; };
     var api = {};
     var toast = { success: function() {}, error: function() {}, info: function() {}, warning: function() {} };
+
+    // API client mock — returns rejected promise so .catch() handlers fire correctly
+    var apiClient = {
+      get: function() { return Promise.reject(new Error('preview-offline')); },
+      post: function() { return Promise.reject(new Error('preview-offline')); },
+      put: function() { return Promise.reject(new Error('preview-offline')); },
+      patch: function() { return Promise.reject(new Error('preview-offline')); },
+      delete: function() { return Promise.reject(new Error('preview-offline')); },
+    };
+
+    // Common Zustand-style store mocks
+    var useAuthStore = function() { return { login: function() {}, logout: function() {}, currentUser: { username: 'preview', role: 'admin' }, token: null, isAuthenticated: true }; };
+    var useAppStore = function() { return { sessions: [], currentSessionId: null, setCurrentSession: function() {}, createSession: function() {}, deleteSession: function() {} }; };
 
     // Lucide icon mock factory
     var __icon = function(name) {
@@ -104,26 +116,33 @@ function buildIframeSrc(code: string, filename: string): string {
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-${tailwindScript}
-<script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></sc` + `ript>
-<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></sc` + `ript>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></sc` + `ript>
+${tailwindTag}
+<script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"><\/script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"><\/script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"><\/script>
 <style>
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}
 #root{min-height:100vh;}
 #error-banner{display:none;position:fixed;top:0;left:0;right:0;background:#7f1d1d;color:#fca5a5;
 padding:8px 12px;font-size:11px;font-family:monospace;z-index:9999;white-space:pre-wrap;word-break:break-all;}
 </style>
+<script>
+window.onerror = function(msg, src, line, col, err) {
+  var b = document.getElementById('error-banner');
+  if (b) { b.style.display='block'; b.textContent = 'JS Error: ' + msg + (err ? ' — ' + (err.stack ? err.stack.slice(0,400) : '') : ''); }
+  return true;
+};
+<\/script>
 </head>
 <body>
 <div id="error-banner"></div>
 <div id="root"></div>
-<script>${mockBlock}</sc` + `ript>
+<script>${mockBlock}<\/script>
 <script type="text/babel" data-presets="react,typescript">
 const { useState, useEffect, useRef, useCallback, useMemo, useContext, createContext, forwardRef, memo } = React;
 ${cleaned}
 ${mountCall}
-</sc` + `ript>
+<\/script>
 </body>
 </html>`
 }
