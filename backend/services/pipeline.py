@@ -1448,8 +1448,22 @@ USER REQUEST:
             changes_by_file[matched_name]["changes"].append(change)
 
         # ── Filter out empty changes (0 diff = Architect was wrong about that file) ──
+        def _has_real_diff(c):
+            """Check both code difference AND diff output for actual changes."""
+            # Code is identical after stripping → definitely empty
+            if c.original_code.rstrip() == c.new_code.rstrip():
+                return False
+            # Code differs but diff has no +/- lines → whitespace-only change, suppress
+            if c.diff:
+                diff_lines = c.diff.split("\n")
+                has_adds = any(l.startswith("+") and not l.startswith("+++") for l in diff_lines)
+                has_removes = any(l.startswith("-") and not l.startswith("---") for l in diff_lines)
+                if not has_adds and not has_removes:
+                    return False
+            return True
+
         for fname in list(changes_by_file.keys()):
-            real_changes = [c for c in changes_by_file[fname]["changes"] if c.original_code.rstrip() != c.new_code.rstrip()]
+            real_changes = [c for c in changes_by_file[fname]["changes"] if _has_real_diff(c)]
             if not real_changes:
                 del changes_by_file[fname]
             else:

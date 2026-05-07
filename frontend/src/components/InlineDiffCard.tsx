@@ -83,6 +83,15 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       .catch(() => {})
   }, [sessionId, fileData.file_id, filename])
 
+  // Filter out ghost diffs (0 added + 0 removed) on the frontend side
+  const realChanges = fileData.changes.filter((c: any) => {
+    if (!c.diff) return false
+    const lines = c.diff.split('\n')
+    const hasAdds = lines.some((l: string) => l.startsWith('+') && !l.startsWith('+++'))
+    const hasRemoves = lines.some((l: string) => l.startsWith('-') && !l.startsWith('---'))
+    return hasAdds || hasRemoves
+  })
+
   // Reconstruct proposed file by swapping the changed symbol — no API call needed
   const getProposedCode = (change: any): string => {
     if (!originalCode) return '// Loading preview...'
@@ -159,11 +168,56 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   }
 
   const handleApplyAll = async () => {
-    const unapplied = fileData.changes.filter(c => !applied[c.id] && !skipped[c.id])
-    for (const change of unapplied) {
-      await handleApply(change)
+    const unapplied = realChanges.filter(c => !applied[c.id] && !skipped[c.id])
+    if (unapplied.length === 0) return
+
+    // Single apply for single change — reuse existing logic
+    if (unapplied.length === 1) {
+      await handleApply(unapplied[0])
+      return
+    }
+
+    // Multiple changes: fetch file ONCE, send ALL changes, ONE download
+    setApplying(Object.fromEntries(unapplied.map(c => [c.id, true])))
+    try {
+      const fileData2 = await api.sessionFiles.get(sessionId, fileData.file_id)
+      if (!originalCode) setOriginalCode(fileData2.content)
+      const result = await api.surgical.applyAll({
+        file_path: filename,
+        changes: unapplied,
+        file_content: fileData2.content,
+      })
+
+      if (result.cloud_mode || result.modified_content) {
+        const blob = new Blob([result.modified_content], { type: 'text/plain' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = filename
+        a.click()
+        URL.revokeObjectURL(url)
+        toast.success(`Downloaded ${filename} with all ${unapplied.length} changes applied`)
+        setModifiedCode(result.modified_content)
+        onApplied?.(filename, result.modified_content)
+      } else {
+        toast.success(`Applied all ${unapplied.length} changes to ${filename}`)
+        setModifiedCode(result.modified_content || '')
+        onApplied?.(filename, result.modified_content || '')
+      }
+      // Mark all as applied
+      for (const change of unapplied) {
+        markApplied(change.id)
+      }
+    } catch (e: any) {
+      toast.error(e.message || 'Apply All failed')
+    } finally {
+      setApplying({})
     }
   }
+
+  // If all changes are ghosts, don't render the card at all
+  if (realChanges.length === 0) return null
+  const displayData = { ...fileData, changes: realChanges }
 
   return (
     <div className="border border-border rounded-xl overflow-hidden mb-3">
@@ -174,9 +228,9 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       >
         <FileCode size={14} className="text-blue-400 flex-shrink-0" />
         <span className="text-sm font-semibold text-ink">{filename}</span>
-        <span className="text-[11px] text-muted/70 ml-1">{fileData.changes.length} change{fileData.changes.length !== 1 ? 's' : ''}</span>
+        <span className="text-[11px] text-muted/70 ml-1">{displayData.changes.length} change{displayData.changes.length !== 1 ? 's' : ''}</span>
         <div className="ml-auto flex items-center gap-2">
-          {fileData.changes.length > 1 && !Object.keys(applied).length && (
+          {displayData.changes.length > 1 && !Object.keys(applied).length && (
             <button
               onClick={e => { e.stopPropagation(); handleApplyAll() }}
               className="text-[11px] px-2.5 py-1 bg-green-500/20 text-green-400 border border-green-500/30 rounded-lg hover:bg-green-500/30 transition-colors font-semibold"
@@ -189,7 +243,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       </button>
 
       {/* Changes */}
-      {expanded && fileData.changes.map((change, idx) => (
+      {expanded && displayData.changes.map((change, idx) => (
         <div key={change.id} className="border-t border-border/60">
           {/* Change header */}
           <div className="flex items-start gap-3 px-4 py-2.5 bg-base/60">
