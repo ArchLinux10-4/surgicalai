@@ -142,7 +142,7 @@ export const api = {
     },
 
     smart: (
-      data: { session_id: string; message: string },
+      data: { session_id: string; message: string; file_ids?: string[] },
       onProgress: (msg: string) => void,
       onToken: (token: string) => void,
       onResult: (result: any) => void,
@@ -162,21 +162,27 @@ export const api = {
       }).then(res => {
         const reader = res.body!.getReader()
         const decoder = new TextDecoder()
+        let lineBuffer = ''
+
+        const processLine = (line: string) => {
+          if (!line.startsWith('data: ')) return
+          try {
+            const chunk = JSON.parse(line.slice(6))
+            if (chunk.type === 'progress') onProgress(chunk.content)
+            else if (chunk.type === 'token') { tokens.push(chunk.content); onToken(chunk.content) }
+            else if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
+            else if (chunk.type === 'done') fireDone()
+            else if (chunk.type === 'error') onError(chunk.content)
+          } catch {}
+        }
 
         const pump = () => reader.read().then(({ done, value }) => {
           if (done) { fireDone(); return }
-          const text = decoder.decode(value, { stream: true })
-          for (const line of text.split('\n')) {
-            if (line.startsWith('data: ')) {
-              try {
-                const chunk = JSON.parse(line.slice(6))
-                if (chunk.type === 'progress') onProgress(chunk.content)
-                else if (chunk.type === 'token') { tokens.push(chunk.content); onToken(chunk.content) }
-                else if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
-                else if (chunk.type === 'done') fireDone()
-                else if (chunk.type === 'error') onError(chunk.content)
-              } catch {}
-            }
+          lineBuffer += decoder.decode(value, { stream: true })
+          const parts = lineBuffer.split('\n')
+          lineBuffer = parts.pop() ?? ''
+          for (const line of parts) {
+            processLine(line.trimEnd())
           }
           pump()
         }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })

@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useCallback } from 'react'
+import React, { useState, useRef, useEffect, useCallback, Component } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAppStore } from '../stores/appStore'
@@ -85,6 +85,28 @@ function AIAvatar() {
   )
 }
 
+// ── Diff card error boundary ──────────────────────────────
+class DiffCardBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean; error: string }> {
+  constructor(props: any) {
+    super(props)
+    this.state = { hasError: false, error: '' }
+  }
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error: error.message }
+  }
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="border border-red-500/40 rounded-xl p-4 bg-red-500/10 text-sm text-red-300">
+          <strong>Diff card error:</strong> {this.state.error}
+          <br /><span className="text-xs text-red-400 mt-1 block">The change was planned but could not be displayed. Check the console for details.</span>
+        </div>
+      )
+    }
+    return this.props.children
+  }
+}
+
 // ── Message bubble ────────────────────────────────────────
 function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
   const isUser = msg.role === 'user'
@@ -126,7 +148,9 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
         </div>
 
         {isSurgical && surgicalResult ? (
-          <InlineDiffCard result={surgicalResult} sessionId={sessionId} />
+          <DiffCardBoundary>
+            <InlineDiffCard result={surgicalResult} sessionId={sessionId} />
+          </DiffCardBoundary>
         ) : (
           <div className="prose-ai">
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
@@ -461,7 +485,7 @@ export function ChatPanel() {
     let gotResult = false
 
     const ctrl = api.stream.smart(
-      { session_id: sessionId, message: text },
+      { session_id: sessionId, message: text, file_ids: sessionFiles.map(f => f.id) },
       (progress) => setStreamProgress(progress),
       (token) => { accumulated += token; setStreamingMessage(accumulated) },
       (result) => {
