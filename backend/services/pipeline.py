@@ -8,6 +8,7 @@ Best Practice #2: Minimal footprint (surgeon only touches requested symbol)
 Best Practice #3: Verify before commit (confidence scoring + diff)
 """
 import json
+import re
 import uuid
 import difflib
 import time
