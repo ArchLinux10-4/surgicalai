@@ -1,14 +1,141 @@
 /**
- * LoginPage — handles two states:
- *   1. setup_required = true  → first-run "Create Admin Account" form
- *   2. setup_required = false → standard login form
+ * LoginPage — "The Terminal" design
+ * Hacker/IDE aesthetic: code rain background, monospace type,
+ * terminal-style login prompt, glowing green accents.
+ *
+ * Handles two states:
+ *   1. setup_required = true  → first-run "Create Admin Account"
+ *   2. setup_required = false → standard login
  */
-import { useState, useEffect, FormEvent } from 'react';
+import { useState, useEffect, useRef, FormEvent } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { apiClient } from '../api/client';
 
-const DESIGN: 'A' | 'B' = 'B'; // switch to 'B' to show split-screen.
+/* ─── Code Rain Canvas ─── */
+const CODE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789{}[]()<>=/\\|;:.,+-*&^%$#@!~`';
 
+function CodeRain() {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    let animId: number;
+    const resize = () => {
+      canvas.width = window.innerWidth * 2;
+      canvas.height = window.innerHeight * 2;
+      ctx.setTransform(2, 0, 0, 2, 0, 0);
+    };
+    resize();
+
+    const cols = Math.floor(window.innerWidth / 18);
+    const drops: number[] = Array.from({ length: cols }, () => Math.random() * -100);
+
+    const draw = () => {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
+      ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+      ctx.font = '14px monospace';
+
+      drops.forEach((y, i) => {
+        const char = CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
+        const brightness = Math.random();
+        ctx.fillStyle = brightness > 0.7
+          ? '#4ade80'
+          : `rgba(74, 222, 128, ${0.15 + brightness * 0.3})`;
+        ctx.fillText(char, i * 18, y);
+        drops[i] = y > window.innerHeight + Math.random() * 500 ? 0 : y + 16;
+      });
+      animId = requestAnimationFrame(draw);
+    };
+    animId = requestAnimationFrame(draw);
+
+    window.addEventListener('resize', resize);
+    return () => {
+      cancelAnimationFrame(animId);
+      window.removeEventListener('resize', resize);
+    };
+  }, []);
+
+  return (
+    <canvas
+      ref={canvasRef}
+      style={{
+        position: 'fixed', inset: 0, width: '100%', height: '100%',
+        background: '#0a0a0a', zIndex: 0,
+      }}
+    />
+  );
+}
+
+/* ─── Typing Animation ─── */
+function TypingText({ text, delay = 0 }: { text: string; delay?: number }) {
+  const [shown, setShown] = useState('');
+  useEffect(() => {
+    let i = 0;
+    const timeout = setTimeout(() => {
+      const interval = setInterval(() => {
+        if (i < text.length) { setShown(text.slice(0, i + 1)); i++; }
+        else clearInterval(interval);
+      }, 45);
+      return () => clearInterval(interval);
+    }, delay);
+    return () => clearTimeout(timeout);
+  }, [text, delay]);
+  return <span>{shown}<span style={{ animation: 'pulse 1s infinite' }}>▊</span></span>;
+}
+
+/* ─── Icons (inline SVGs — no extra dependency) ─── */
+const TermIcon = () => (
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
+  </svg>
+);
+const LockIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+  </svg>
+);
+const ArrowIcon = () => (
+  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
+  </svg>
+);
+const EyeIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+  </svg>
+);
+const EyeOffIcon = () => (
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+    <line x1="1" y1="1" x2="23" y2="23"/>
+  </svg>
+);
+const ShieldIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+  </svg>
+);
+const CpuIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/>
+  </svg>
+);
+const GitIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
+  </svg>
+);
+const MailIcon = () => (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>
+  </svg>
+);
+
+/* ─── Main Component ─── */
 export function LoginPage() {
   const { login } = useAuthStore();
   const [setupRequired, setSetupRequired] = useState<boolean | null>(null);
@@ -17,6 +144,8 @@ export function LoginPage() {
   const [email, setEmail] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [showPass, setShowPass] = useState(false);
+  const [focused, setFocused] = useState<string | null>(null);
 
   useEffect(() => {
     apiClient.get('/api/auth/setup-required')
@@ -28,670 +157,293 @@ export function LoginPage() {
     e.preventDefault();
     setError('');
     setLoading(true);
-
     try {
       const endpoint = setupRequired ? '/api/auth/setup' : '/api/auth/login';
       const body: Record<string, string> = { username, password };
       if (setupRequired) body.email = email;
-
       const res = await apiClient.post(endpoint, body);
       login(res.data.access_token, res.data.user);
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Login failed. Please try again.');
+      setError(err.response?.data?.detail || 'Authentication failed. Try again.');
     } finally {
       setLoading(false);
     }
   }
 
+  /* ─── Loading state ─── */
   if (setupRequired === null) {
     return (
-      <div className="sai-fullscreen-root sai-bg-darkmesh flex items-center justify-center">
-        <div className="sai-loader" />
-        <style>{`
-          .sai-fullscreen-root { min-height: 100vh; }
-          .sai-bg-darkmesh { background: #0b0f14; position: relative; }
-          .sai-loader {
-            width: 2rem; height: 2rem;
-            border: 2px solid #6366f1;
-            border-top-color: transparent;
-            border-radius: 9999px;
-            animation: sai-spin 1s linear infinite;
-          }
-          @keyframes sai-spin { to { transform: rotate(360deg); } }
-        `}</style>
+      <div style={{ minHeight: '100vh', background: '#0a0a0a', display: 'grid', placeItems: 'center' }}>
+        <div style={{
+          width: 32, height: 32,
+          border: '2px solid #4ade80', borderTopColor: 'transparent',
+          borderRadius: '50%', animation: 'spin 1s linear infinite',
+        }} />
+        <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
       </div>
     );
   }
 
-  if (DESIGN === 'A') {
-    return (
-      <div className="sai-fullscreen-root sai-bg-darkmesh" style={{ display: 'grid', minHeight: '100vh', placeItems: 'center', position: 'relative', overflow: 'hidden' }}>
-        <div className="sai-mesh-bg" aria-hidden="true" />
-        <div className="sai-card-border" style={{ background: 'linear-gradient(135deg, rgba(139,92,246,0.6), rgba(6,182,212,0.6))', padding: 1, borderRadius: 18, maxWidth: 420, width: '100%', zIndex: 1 }}>
-          <div className="sai-glass-card" style={{
-            borderRadius: 16,
-            background: 'rgba(255,255,255,0.06)',
-            border: '1px solid rgba(255,255,255,0.12)',
-            boxShadow: '0 10px 30px rgba(0,0,0,0.5)',
-            backdropFilter: 'blur(16px) saturate(140%)',
-            WebkitBackdropFilter: 'blur(16px) saturate(140%)',
-            padding: '2.5rem 2rem 2rem 2rem',
-            position: 'relative',
-            minWidth: 0,
-          }}>
-            <div className="sai-header" style={{ marginBottom: 32, textAlign: 'center' }}>
-              <span
-                className="sai-logo"
-                style={{
-                  fontWeight: 800,
-                  fontSize: 28,
-                  letterSpacing: '-0.04em',
-                  background: 'linear-gradient(90deg,#8b5cf6,#06b6d4 90%)',
-                  WebkitBackgroundClip: 'text',
-                  WebkitTextFillColor: 'transparent',
-                  backgroundClip: 'text',
-                  display: 'inline-block',
-                  marginBottom: 4,
-                }}
-              >
-                SurgicalAI
-              </span>
-              <h1 style={{
-                color: '#fff',
-                fontWeight: 700,
-                fontSize: 22,
-                margin: '12px 0 0 0',
-                letterSpacing: '-0.01em'
-              }}>
-                {setupRequired ? 'Create the first admin' : 'Welcome back'}
-              </h1>
-              <div style={{ color: '#b6b9c9', fontSize: 14, marginTop: 4 }}>
-                {setupRequired
-                  ? 'Set up your admin credentials to begin'
-                  : 'Sign in to your SurgicalAI workspace'}
-              </div>
-            </div>
-            {setupRequired && (
-              <div className="sai-firstrun-banner" style={{
-                marginBottom: 24,
-                padding: '12px 14px',
-                borderRadius: 10,
-                background: 'rgba(139,92,246,0.10)',
-                border: '1px solid rgba(139,92,246,0.22)',
-                textAlign: 'left'
-              }}>
-                <div style={{ color: '#a5b4fc', fontWeight: 600, fontSize: 13 }}>First time setup</div>
-                <div style={{ color: '#a5b4fc', opacity: 0.7, fontSize: 12, marginTop: 2 }}>
-                  This account will have admin access to manage users.
-                </div>
-              </div>
-            )}
-            <form onSubmit={handleSubmit} className="sai-form" style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
-              <div>
-                <label htmlFor="sai-username" style={{ color: '#e5e7eb', fontSize: 14, fontWeight: 500, marginBottom: 6, display: 'block' }}>Username</label>
-                <input
-                  id="sai-username"
-                  type="text"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="your-username"
-                  required
-                  minLength={3}
-                  className="sai-input"
-                  style={{
-                    width: '100%',
-                    background: 'rgba(255,255,255,0.08)',
-                    border: '1px solid rgba(255,255,255,0.13)',
-                    borderRadius: 8,
-                    padding: '11px 14px',
-                    color: '#fff',
-                    fontSize: 15,
-                    outline: 'none',
-                    transition: 'box-shadow 0.15s',
-                  }}
-                />
-              </div>
-              {setupRequired && (
-                <div>
-                  <label htmlFor="sai-email" style={{ color: '#e5e7eb', fontSize: 14, fontWeight: 500, marginBottom: 6, display: 'block' }}>
-                    Email <span style={{ color: '#a1a1aa', fontWeight: 400 }}>(optional)</span>
-                  </label>
-                  <input
-                    id="sai-email"
-                    type="email"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="you@example.com"
-                    className="sai-input"
-                    style={{
-                      width: '100%',
-                      background: 'rgba(255,255,255,0.08)',
-                      border: '1px solid rgba(255,255,255,0.13)',
-                      borderRadius: 8,
-                      padding: '11px 14px',
-                      color: '#fff',
-                      fontSize: 15,
-                      outline: 'none',
-                      transition: 'box-shadow 0.15s',
-                    }}
-                  />
-                </div>
-              )}
-              <div>
-                <label htmlFor="sai-password" style={{ color: '#e5e7eb', fontSize: 14, fontWeight: 500, marginBottom: 6, display: 'block' }}>Password</label>
-                <input
-                  id="sai-password"
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder={setupRequired ? 'Min. 8 characters' : '••••••••'}
-                  required
-                  minLength={setupRequired ? 8 : 1}
-                  className="sai-input"
-                  style={{
-                    width: '100%',
-                    background: 'rgba(255,255,255,0.08)',
-                    border: '1px solid rgba(255,255,255,0.13)',
-                    borderRadius: 8,
-                    padding: '11px 14px',
-                    color: '#fff',
-                    fontSize: 15,
-                    outline: 'none',
-                    transition: 'box-shadow 0.15s',
-                  }}
-                />
-              </div>
-              {error && (
-                <div className="sai-error" style={{
-                  padding: '12px 14px',
-                  borderRadius: 10,
-                  background: 'rgba(239,68,68,0.10)',
-                  border: '1px solid rgba(239,68,68,0.22)',
-                  color: '#f87171',
-                  fontSize: 14,
-                  marginBottom: 2,
-                }}>
-                  {error}
-                </div>
-              )}
-              <button
-                type="submit"
-                disabled={loading}
-                className="sai-primary-btn"
-                style={{
-                  width: '100%',
-                  background: 'linear-gradient(135deg,#7c3aed,#06b6d4)',
-                  color: '#fff',
-                  fontWeight: 600,
-                  border: 'none',
-                  borderRadius: 999,
-                  padding: '12px 0',
-                  fontSize: 16,
-                  marginTop: 2,
-                  boxShadow: '0 2px 8px rgba(6,182,212,0.08)',
-                  cursor: loading ? 'not-allowed' : 'pointer',
-                  opacity: loading ? 0.6 : 1,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: 10,
-                  transition: 'background-position 0.2s',
-                  backgroundSize: '200% 200%',
-                  backgroundPosition: '0% 50%',
-                }}
-                onMouseOver={e => { (e.currentTarget as HTMLButtonElement).style.backgroundPosition = '100% 50%'; }}
-                onMouseOut={e => { (e.currentTarget as HTMLButtonElement).style.backgroundPosition = '0% 50%'; }}
-                aria-busy={loading}
-              >
-                {loading ? (
-                  <>
-                    <span className="sai-btn-spinner" style={{
-                      width: 18, height: 18,
-                      border: '2px solid rgba(255,255,255,0.3)',
-                      borderTop: '2px solid #fff',
-                      borderRadius: '50%',
-                      display: 'inline-block',
-                      animation: 'sai-spin 1s linear infinite',
-                    }} />
-                    {setupRequired ? 'Creating account…' : 'Signing in…'}
-                  </>
-                ) : (
-                  setupRequired ? 'Create Admin Account' : 'Sign In'
-                )}
-              </button>
-            </form>
-            <div className="sai-footer" style={{ marginTop: 28, textAlign: 'center', color: '#7c8499', fontSize: 12, opacity: 0.65 }}>
-              © SurgicalAI
-            </div>
-          </div>
-        </div>
-        <style>{`
-          .sai-mesh-bg {
-            position: absolute;
-            inset: 0;
-            z-index: 0;
-            pointer-events: none;
-            opacity: 0.4;
-            background:
-              radial-gradient(ellipse 40% 60% at 20% 30%, rgba(139,92,246,0.23) 0%, transparent 80%),
-              radial-gradient(ellipse 30% 40% at 80% 70%, rgba(6,182,212,0.18) 0%, transparent 80%),
-              radial-gradient(ellipse 25% 30% at 60% 20%, rgba(236,72,153,0.10) 0%, transparent 80%),
-              radial-gradient(ellipse 20% 25% at 70% 80%, rgba(59,130,246,0.13) 0%, transparent 80%);
-            animation: sai-meshShift 30s infinite alternate ease-in-out;
-          }
-          @keyframes sai-meshShift {
-            0% {
-              background-position:
-                20% 30%,
-                80% 70%,
-                60% 20%,
-                70% 80%;
-              transform: scale(1);
-            }
-            100% {
-              background-position:
-                25% 35%,
-                75% 65%,
-                65% 25%,
-                65% 85%;
-              transform: scale(1.04);
-            }
-          }
-          @media (prefers-reduced-motion: reduce) {
-            .sai-mesh-bg { animation: none !important; }
-            .sai-btn-spinner { animation: none !important; }
-          }
-          .sai-input:focus-visible {
-            outline: 2px solid #06b6d4;
-            outline-offset: 2px;
-            box-shadow: 0 0 0 2px #06b6d4;
-          }
-          .sai-primary-btn:focus-visible {
-            outline: 2px solid #8b5cf6;
-            outline-offset: 2px;
-            box-shadow: 0 0 0 2px #8b5cf6;
-          }
-          @supports not ((-webkit-backdrop-filter: blur(16px)) or (backdrop-filter: blur(16px))) {
-            .sai-glass-card {
-              background: rgba(17,25,40,0.7) !important;
-            }
-          }
-          .sai-primary-btn:disabled {
-            cursor: not-allowed;
-            opacity: 0.6;
-          }
-        `}</style>
-      </div>
-    );
-  }
+  const isSetup = setupRequired;
+  const title = isSetup ? 'Initialize System' : 'SurgicalAI';
+  const subtitle = isSetup
+    ? 'Create your admin account to begin.'
+    : 'Precision code edits. Zero collateral.';
+  const btnText = isSetup ? 'Create Admin & Launch' : 'Authenticate';
 
-  // DESIGN === 'B'
+  const inputStyle = (field: string): React.CSSProperties => ({
+    width: '100%',
+    padding: '12px 16px',
+    paddingRight: field === 'pass' ? 48 : 16,
+    borderRadius: 8,
+    fontFamily: 'monospace',
+    fontSize: 14,
+    color: '#e2e8f0',
+    background: 'rgba(30, 30, 30, 0.8)',
+    border: focused === field
+      ? '1px solid rgba(74, 222, 128, 0.5)'
+      : '1px solid rgba(74, 222, 128, 0.12)',
+    boxShadow: focused === field ? '0 0 20px rgba(74, 222, 128, 0.1)' : 'none',
+    outline: 'none',
+    transition: 'all 0.2s',
+  });
+
+  const labelStyle: React.CSSProperties = {
+    display: 'flex', alignItems: 'center', gap: 6,
+    fontSize: 12, fontFamily: 'monospace',
+    color: 'rgba(148, 163, 184, 0.7)',
+    marginBottom: 6,
+  };
+
   return (
     <>
-      <style>{`
-        @keyframes lp-pulse-once {
-          0% { transform: scale(1); opacity: 1; }
-          40% { transform: scale(1.045); opacity: 1; }
-          60% { transform: scale(1.02); opacity: 1; }
-          100% { transform: scale(1); opacity: 1; }
-        }
-        .lp-pulse-once {
-          animation-name: lp-pulse-once;
-          animation-duration: 900ms;
-          animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
-          animation-iteration-count: 1;
-          animation-fill-mode: none;
-          transform-origin: center;
-          will-change: transform;
-        }
-        .lp-pulse-once--delay {
-          animation-delay: 120ms;
-        }
-        @media (prefers-reduced-motion: reduce) {
-          .lp-pulse-once, .lp-pulse-once--delay { animation: none !important; }
-        }
-      `}</style>
-      <div className="sai-split-root" style={{ display: 'flex', minHeight: '100vh', width: '100vw', background: '#f7f8fb', position: 'relative', overflow: 'hidden' }}>
-        <div className="sai-split-brand" style={{
-          flex: 1,
-          minWidth: 0,
-          background: 'linear-gradient(145deg, #1b0b3a 0%, #2b0f63 100%)',
-          display: 'flex',
-          flexDirection: 'column',
-          justifyContent: 'center',
-          alignItems: 'flex-start',
-          padding: '0 7vw',
-          position: 'relative',
-          color: '#fff',
-          boxSizing: 'border-box',
-        }}>
-          <div className="sai-split-mesh" aria-hidden="true" />
-          <div style={{ marginBottom: 36, marginTop: 12 }}>
-            <span
-              className="sai-logo lp-pulse-once"
-              style={{
-                fontWeight: 800,
-                fontSize: 30,
-                letterSpacing: '-0.04em',
-                color: '#fff',
-                textShadow: '0 2px 16px #8b5cf6, 0 1px 2px #0008',
-                display: 'inline-block',
-              }}
-            >
-              SurgicalAI
+      <CodeRain />
+
+      {/* Center glow */}
+      <div style={{
+        position: 'fixed', inset: 0, zIndex: 1, pointerEvents: 'none',
+        background: 'radial-gradient(ellipse at center, rgba(74, 222, 128, 0.08) 0%, transparent 70%)',
+      }} />
+
+      <div style={{
+        position: 'fixed', inset: 0, zIndex: 2,
+        display: 'grid', placeItems: 'center',
+        padding: 16,
+      }}>
+        {/* Terminal card */}
+        <div style={{ width: '100%', maxWidth: 440 }}>
+
+          {/* ── Title bar ── */}
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 8,
+            padding: '10px 16px',
+            background: 'rgba(30, 30, 30, 0.95)',
+            borderTopLeftRadius: 12, borderTopRightRadius: 12,
+            borderBottom: '1px solid rgba(74, 222, 128, 0.15)',
+          }}>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <div style={{ width: 12, height: 12, borderRadius: '50%', background: '#ff5f57' }} />
+              <div style={{ width: 12, height: 12, borderRadius: '50%', background: '#febc2e' }} />
+              <div style={{ width: 12, height: 12, borderRadius: '50%', background: '#28c840' }} />
+            </div>
+            <span style={{
+              marginLeft: 12, fontSize: 12, fontFamily: 'monospace',
+              color: 'rgba(74, 222, 128, 0.6)',
+            }}>
+              {isSetup ? 'surgicalai@local ~ init' : 'surgicalai@local ~ login'}
             </span>
           </div>
-          <h1
-            className="lp-pulse-once lp-pulse-once--delay"
-            style={{
-              fontSize: 32,
-              fontWeight: 800,
-              letterSpacing: '-0.03em',
-              marginBottom: 12,
-              lineHeight: 1.1,
-              color: '#fff',
-              textShadow: '0 2px 16px #8b5cf6, 0 1px 2px #0008',
-            }}>
-            Operate at the speed of thought
-          </h1>
-          <div style={{ fontSize: 17, color: '#e0e7ff', opacity: 0.92, marginBottom: 22, maxWidth: 420 }}>
-            The world's safest autonomous code editor for teams.
-          </div>
-          <ul style={{ listStyle: 'none', padding: 0, margin: 0, color: '#e0e7ff', fontSize: 16, fontWeight: 500, lineHeight: 1.7, maxWidth: 420 }}>
-            <li style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ color: '#22d3ee', fontSize: 18, marginRight: 4, display: 'inline-block' }}>
-                <svg width="18" height="18" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="10" fill="#22d3ee" opacity="0.18"/><path d="M6 10.5l2.5 2.5 5-5" stroke="#22d3ee" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
-              </span>
-              Autonomous code changes
-            </li>
-            <li style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ color: '#a78bfa', fontSize: 18, marginRight: 4, display: 'inline-block' }}>
-                <svg width="18" height="18" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="10" fill="#a78bfa" opacity="0.18"/><path d="M6 10.5l2.5 2.5 5-5" stroke="#a78bfa" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
-              </span>
-              Safe plan-and-surgery workflow
-            </li>
-            <li style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ color: '#f472b6', fontSize: 18, marginRight: 4, display: 'inline-block' }}>
-                <svg width="18" height="18" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="10" fill="#f472b6" opacity="0.18"/><path d="M6 10.5l2.5 2.5 5-5" stroke="#f472b6" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
-              </span>
-              Secure first-run admin setup
-            </li>
-            <li style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-              <span style={{ color: '#818cf8', fontSize: 18, marginRight: 4, display: 'inline-block' }}>
-                <svg width="18" height="18" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="10" fill="#818cf8" opacity="0.18"/><path d="M6 10.5l2.5 2.5 5-5" stroke="#818cf8" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"/></svg>
-              </span>
-              Battle-tested diff/PR flow
-            </li>
-          </ul>
-        </div>
-        <div className="sai-split-form" style={{
-          flex: 1,
-          minWidth: 0,
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          background: '#f7f8fb',
-          padding: '0 2vw',
-          boxSizing: 'border-box',
-        }}>
-          <div className="sai-split-card" style={{
-            background: '#fff',
-            borderRadius: 16,
-            border: '1px solid rgba(0,0,0,0.06)',
-            boxShadow: '0 10px 30px rgba(0,0,0,0.08)',
-            width: '100%',
-            maxWidth: 420,
-            padding: '2.5rem 2rem 2rem 2rem',
-            minWidth: 0,
+
+          {/* ── Body ── */}
+          <form onSubmit={handleSubmit} style={{
+            padding: '32px',
+            background: 'rgba(10, 10, 10, 0.92)',
+            border: '1px solid rgba(74, 222, 128, 0.1)',
+            borderTop: 'none',
+            borderBottomLeftRadius: 12, borderBottomRightRadius: 12,
+            backdropFilter: 'blur(16px)',
+            boxShadow: '0 0 80px rgba(74, 222, 128, 0.08), 0 25px 50px rgba(0,0,0,0.5)',
           }}>
-            <div className="sai-header" style={{ marginBottom: 32, textAlign: 'center' }}>
-              <h2 style={{
-                color: '#23263b',
-                fontWeight: 700,
-                fontSize: 22,
-                margin: 0,
-                letterSpacing: '-0.01em'
+
+            {/* Logo */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
+              <div style={{
+                padding: 8, borderRadius: 8,
+                background: 'rgba(74, 222, 128, 0.1)',
+                border: '1px solid rgba(74, 222, 128, 0.2)',
+                display: 'flex',
               }}>
-                {setupRequired ? 'Set up your admin' : 'Sign in'}
-              </h2>
-              <div style={{ color: '#6b7280', fontSize: 14, marginTop: 4 }}>
-                {setupRequired
-                  ? 'Set up your admin credentials to begin'
-                  : 'Sign in to your SurgicalAI workspace'}
+                <TermIcon />
+              </div>
+              <div>
+                <h1 style={{
+                  fontSize: 22, fontWeight: 700, fontFamily: 'monospace',
+                  color: '#e2e8f0', margin: 0,
+                }}>{title}</h1>
+                <div style={{ fontSize: 12, fontFamily: 'monospace', color: '#4ade80' }}>v2.2.0</div>
               </div>
             </div>
-            {setupRequired && (
-              <div className="sai-firstrun-banner" style={{
-                marginBottom: 24,
-                padding: '12px 14px',
-                borderRadius: 10,
-                background: 'rgba(139,92,246,0.10)',
-                border: '1px solid rgba(139,92,246,0.22)',
-                textAlign: 'left'
+
+            {/* Typing tagline */}
+            <div style={{
+              fontSize: 14, fontFamily: 'monospace', height: 24,
+              color: 'rgba(74, 222, 128, 0.7)', marginBottom: 28,
+            }}>
+              <TypingText text={subtitle} delay={400} />
+            </div>
+
+            {/* Error message */}
+            {error && (
+              <div style={{
+                padding: '10px 14px', borderRadius: 8, marginBottom: 16,
+                background: 'rgba(239, 68, 68, 0.1)',
+                border: '1px solid rgba(239, 68, 68, 0.3)',
+                color: '#f87171', fontSize: 13, fontFamily: 'monospace',
               }}>
-                <div style={{ color: '#8b5cf6', fontWeight: 600, fontSize: 13 }}>First time setup</div>
-                <div style={{ color: '#8b5cf6', opacity: 0.7, fontSize: 12, marginTop: 2 }}>
-                  This account will have admin access to manage users.
-                </div>
+                ⚠ {error}
               </div>
             )}
-            <form onSubmit={handleSubmit} className="sai-form" style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+
+            {/* Fields */}
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+              {/* Username */}
               <div>
-                <label htmlFor="sai-username" style={{ color: '#23263b', fontSize: 14, fontWeight: 500, marginBottom: 6, display: 'block' }}>Username</label>
+                <label style={labelStyle}>
+                  <span style={{ color: '#4ade80' }}>$</span> username
+                </label>
                 <input
-                  id="sai-username"
                   type="text"
                   value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  placeholder="your-username"
-                  required
-                  minLength={3}
-                  className="sai-input"
-                  style={{
-                    width: '100%',
-                    background: '#fff',
-                    border: '1px solid #e5e7eb',
-                    borderRadius: 8,
-                    padding: '11px 14px',
-                    color: '#23263b',
-                    fontSize: 15,
-                    outline: 'none',
-                    transition: 'box-shadow 0.15s',
-                  }}
+                  onChange={e => setUsername(e.target.value)}
+                  onFocus={() => setFocused('user')}
+                  onBlur={() => setFocused(null)}
+                  placeholder="enter username"
+                  autoComplete="username"
+                  style={inputStyle('user')}
                 />
               </div>
-              {setupRequired && (
+
+              {/* Email (setup only) */}
+              {isSetup && (
                 <div>
-                  <label htmlFor="sai-email" style={{ color: '#23263b', fontSize: 14, fontWeight: 500, marginBottom: 6, display: 'block' }}>
-                    Email <span style={{ color: '#6b7280', fontWeight: 400 }}>(optional)</span>
+                  <label style={labelStyle}>
+                    <MailIcon /> email
                   </label>
                   <input
-                    id="sai-email"
                     type="email"
                     value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="you@example.com"
-                    className="sai-input"
-                    style={{
-                      width: '100%',
-                      background: '#fff',
-                      border: '1px solid #e5e7eb',
-                      borderRadius: 8,
-                      padding: '11px 14px',
-                      color: '#23263b',
-                      fontSize: 15,
-                      outline: 'none',
-                      transition: 'box-shadow 0.15s',
-                    }}
+                    onChange={e => setEmail(e.target.value)}
+                    onFocus={() => setFocused('email')}
+                    onBlur={() => setFocused(null)}
+                    placeholder="admin@example.com"
+                    autoComplete="email"
+                    style={inputStyle('email')}
                   />
                 </div>
               )}
+
+              {/* Password */}
               <div>
-                <label htmlFor="sai-password" style={{ color: '#23263b', fontSize: 14, fontWeight: 500, marginBottom: 6, display: 'block' }}>Password</label>
-                <input
-                  id="sai-password"
-                  type="password"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder={setupRequired ? 'Min. 8 characters' : '••••••••'}
-                  required
-                  minLength={setupRequired ? 8 : 1}
-                  className="sai-input"
-                  style={{
-                    width: '100%',
-                    background: '#fff',
-                    border: '1px solid #e5e7eb',
-                    borderRadius: 8,
-                    padding: '11px 14px',
-                    color: '#23263b',
-                    fontSize: 15,
-                    outline: 'none',
-                    transition: 'box-shadow 0.15s',
-                  }}
-                />
-              </div>
-              {error && (
-                <div className="sai-error" style={{
-                  padding: '12px 14px',
-                  borderRadius: 10,
-                  background: 'rgba(239,68,68,0.10)',
-                  border: '1px solid rgba(239,68,68,0.22)',
-                  color: '#ef4444',
-                  fontSize: 14,
-                  marginBottom: 2,
-                }}>
-                  {error}
+                <label style={labelStyle}>
+                  <span style={{ color: '#4ade80' }}>$</span> password
+                </label>
+                <div style={{ position: 'relative' }}>
+                  <input
+                    type={showPass ? 'text' : 'password'}
+                    value={password}
+                    onChange={e => setPassword(e.target.value)}
+                    onFocus={() => setFocused('pass')}
+                    onBlur={() => setFocused(null)}
+                    placeholder="••••••••"
+                    autoComplete={isSetup ? 'new-password' : 'current-password'}
+                    style={inputStyle('pass')}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPass(!showPass)}
+                    style={{
+                      position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)',
+                      background: 'none', border: 'none', cursor: 'pointer',
+                      color: '#94a3b8', opacity: 0.5,
+                      transition: 'opacity 0.2s',
+                    }}
+                    onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
+                    onMouseLeave={e => (e.currentTarget.style.opacity = '0.5')}
+                  >
+                    {showPass ? <EyeOffIcon /> : <EyeIcon />}
+                  </button>
                 </div>
-              )}
+              </div>
+
+              {/* Submit */}
               <button
                 type="submit"
-                disabled={loading}
-                className="sai-primary-btn"
+                disabled={loading || !username || !password}
                 style={{
-                  width: '100%',
-                  background: 'linear-gradient(135deg,#7c3aed,#06b6d4)',
-                  color: '#fff',
-                  fontWeight: 600,
-                  border: 'none',
-                  borderRadius: 999,
-                  padding: '12px 0',
-                  fontSize: 16,
-                  marginTop: 2,
-                  boxShadow: '0 2px 8px rgba(6,182,212,0.08)',
-                  cursor: loading ? 'not-allowed' : 'pointer',
-                  opacity: loading ? 0.6 : 1,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  gap: 10,
-                  transition: 'background-position 0.2s',
-                  backgroundSize: '200% 200%',
-                  backgroundPosition: '0% 50%',
+                  width: '100%', padding: '12px 0', borderRadius: 8,
+                  fontFamily: 'monospace', fontSize: 14, fontWeight: 600,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
+                  background: loading || !username || !password
+                    ? 'rgba(74, 222, 128, 0.3)'
+                    : 'linear-gradient(135deg, #16a34a, #4ade80)',
+                  color: '#0a0a0a',
+                  border: 'none', cursor: loading ? 'wait' : 'pointer',
+                  boxShadow: '0 0 30px rgba(74, 222, 128, 0.2)',
+                  transition: 'all 0.2s',
+                  opacity: loading || !username || !password ? 0.6 : 1,
                 }}
-                onMouseOver={e => { (e.currentTarget as HTMLButtonElement).style.backgroundPosition = '100% 50%'; }}
-                onMouseOut={e => { (e.currentTarget as HTMLButtonElement).style.backgroundPosition = '0% 50%'; }}
-                aria-busy={loading}
               >
                 {loading ? (
                   <>
-                    <span className="sai-btn-spinner" style={{
-                      width: 18, height: 18,
-                      border: '2px solid rgba(255,255,255,0.3)',
-                      borderTop: '2px solid #fff',
-                      borderRadius: '50%',
-                      display: 'inline-block',
-                      animation: 'sai-spin 1s linear infinite',
+                    <div style={{
+                      width: 16, height: 16,
+                      border: '2px solid #0a0a0a', borderTopColor: 'transparent',
+                      borderRadius: '50%', animation: 'spin 1s linear infinite',
                     }} />
-                    {setupRequired ? 'Creating account…' : 'Signing in…'}
+                    {isSetup ? 'Initializing...' : 'Authenticating...'}
                   </>
                 ) : (
-                  setupRequired ? 'Create Admin Account' : 'Sign In'
+                  <>
+                    <LockIcon />
+                    {btnText}
+                    <ArrowIcon />
+                  </>
                 )}
               </button>
-            </form>
-            <div className="sai-footer" style={{ marginTop: 28, textAlign: 'center', color: '#7c8499', fontSize: 12, opacity: 0.65 }}>
-              © SurgicalAI
             </div>
-          </div>
+
+            {/* Status bar */}
+            <div style={{
+              marginTop: 24, paddingTop: 16,
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              borderTop: '1px solid rgba(74, 222, 128, 0.08)',
+              fontSize: 11, fontFamily: 'monospace',
+              color: 'rgba(148, 163, 184, 0.4)',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 14 }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <ShieldIcon /> AES-256
+                </span>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <CpuIcon /> Multi-model
+                </span>
+              </div>
+              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                <GitIcon /> main
+              </span>
+            </div>
+          </form>
         </div>
-        <style>{`
-          .sai-split-root { min-height: 100vh; width: 100vw; }
-          .sai-split-brand {
-            position: relative;
-            overflow: hidden;
-          }
-          .sai-split-mesh {
-            position: absolute;
-            inset: 0;
-            z-index: 0;
-            pointer-events: none;
-            opacity: 0.22;
-            background:
-              radial-gradient(ellipse 40% 60% at 20% 30%, rgba(139,92,246,0.13) 0%, transparent 80%),
-              radial-gradient(ellipse 30% 40% at 80% 70%, rgba(6,182,212,0.10) 0%, transparent 80%),
-              radial-gradient(ellipse 25% 30% at 60% 20%, rgba(236,72,153,0.07) 0%, transparent 80%),
-              radial-gradient(ellipse 20% 25% at 70% 80%, rgba(59,130,246,0.09) 0%, transparent 80%);
-            animation: sai-meshShift 30s infinite alternate ease-in-out;
-          }
-          @keyframes sai-meshShift {
-            0% {
-              background-position:
-                20% 30%,
-                80% 70%,
-                60% 20%,
-                70% 80%;
-              transform: scale(1);
-            }
-            100% {
-              background-position:
-                25% 35%,
-                75% 65%,
-                65% 25%,
-                65% 85%;
-              transform: scale(1.04);
-            }
-          }
-          @media (max-width: 920px) {
-            .sai-split-root {
-              flex-direction: column;
-            }
-            .sai-split-brand {
-              min-height: 40vh;
-              padding-top: 36px;
-              padding-bottom: 24px;
-              align-items: center;
-              text-align: center;
-            }
-            .sai-split-form {
-              min-height: 60vh;
-              padding-top: 32px;
-              padding-bottom: 32px;
-            }
-          }
-          @media (prefers-reduced-motion: reduce) {
-            .sai-split-mesh { animation: none !important; }
-            .sai-btn-spinner { animation: none !important; }
-          }
-          .sai-input:focus-visible {
-            outline: 2px solid #7c3aed;
-            outline-offset: 2px;
-            box-shadow: 0 0 0 2px #7c3aed;
-          }
-          .sai-primary-btn:focus-visible {
-            outline: 2px solid #8b5cf6;
-            outline-offset: 2px;
-            box-shadow: 0 0 0 2px #8b5cf6;
-          }
-          .sai-primary-btn:disabled {
-            cursor: not-allowed;
-            opacity: 0.6;
-          }
-          .sai-btn-spinner {
-            animation: sai-spin 1s linear infinite;
-          }
-          @keyframes sai-spin { to { transform: rotate(360deg); } }
-        `}</style>
       </div>
+
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+        input::placeholder { color: rgba(148, 163, 184, 0.3) !important; }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { overflow: hidden; }
+      `}</style>
     </>
   );
 }
