@@ -50,8 +50,8 @@ def get_available_models():
     claude_models = []
     if get_setting("anthropic_api_key", ""):
         claude_models = [
-            {"id": "claude-sonnet-4-20250514", "name": "Claude Sonnet 4", "role": "architect", "description": "Fast, intelligent — great Architect with visible thinking", "provider": "anthropic"},
-            {"id": "claude-opus-4-20250514", "name": "Claude Opus 4", "role": "architect", "description": "Most capable Claude — deep reasoning with extended thinking", "provider": "anthropic"},
+            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "role": "architect", "description": "Fast, intelligent — great Architect with visible thinking", "provider": "anthropic"},
+            {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "role": "architect", "description": "Most capable Claude — deep reasoning with extended thinking", "provider": "anthropic"},
         ]
 
     ollama_models = []
@@ -112,8 +112,8 @@ def verify_anthropic_key(body: dict):
         client = anthropic.Anthropic(api_key=key)
         # Quick validation — list models or send a tiny request
         client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=10,
+            model="claude-sonnet-4-6",
+            max_tokens=16,
             messages=[{"role": "user", "content": "Hi"}],
         )
         set_setting("anthropic_api_key", key)
