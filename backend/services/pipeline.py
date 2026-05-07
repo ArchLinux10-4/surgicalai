@@ -955,6 +955,15 @@ When the user asks you to DIAGNOSE a bug, investigate state/session issues, or d
    hypotheses before they waste Surgeon tokens.
 
 ━━━ HARD RULES ━━━
+- ALWAYS pick the NARROWEST (smallest) symbol that contains the code to change.
+  NEVER target broad container symbols like "body", "head", "main", "div#sb-root" when
+  more specific child symbols exist within the relevant line range. For example:
+  - BAD: targeting "body" (100+ lines) when "div#tb-stat" (4 lines) is where the change lives
+  - GOOD: targeting "div#tb-stat" (4 lines) directly
+  If the code you need to change is inside a named element (has an id), target THAT element.
+  If it's inside a <script> block, target that specific script_N symbol.
+  If it's injected dynamically by JavaScript, target the script that renders it.
+  Look at the line counts in the symbol map — prefer symbols under 200 lines.
 - NEVER touch symbols that weren't asked about
 - For Python/Go/JS/TS/Rust files: use the exact function/class name from the symbol map as symbol_path
 - For TSX/JSX/HTML/CSS files: use the component function or export name as symbol_path (e.g. "LoginPage", "App", "Header").
@@ -1086,10 +1095,11 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 symbol_maps_by_name[fname] = (smap, sf)
                 syms = []
                 for s in smap.symbols:
-                    entry = f"  [{s.symbol_type.value}] {s.full_path}"
+                    size = s.end_line - s.start_line + 1
+                    size_warn = " ⚠️LARGE" if size > 500 else ""
+                    entry = f"  [{s.symbol_type.value}] {s.full_path} ({size} lines, L{s.start_line}-{s.end_line}){size_warn}"
                     if s.signature:
                         entry += f" — {s.signature}"
-                    entry += f" (lines {s.start_line}-{s.end_line})"
                     syms.append(entry)
                 file_summaries.append(
                     f"FILE: {fname} ({sf.get('lines', len(content.splitlines()))} lines, {sf.get('language', 'code')})\n"
@@ -1428,6 +1438,70 @@ USER REQUEST:
                 dependencies=[],
                 confidence=target.get("confidence", 7)
             )
+
+            # ── Oversized symbol guardrail ──
+            # If symbol is >500 lines, try to find a more specific child symbol
+            symbol_size = symbol.end_line - symbol.start_line + 1
+            if symbol_size > 500:
+                # Look for child symbols within this symbol's range
+                child_candidates = [
+                    s for s in smap.symbols
+                    if s.start_line >= symbol.start_line
+                    and s.end_line <= symbol.end_line
+                    and s.full_path != symbol.full_path
+                    and (s.end_line - s.start_line + 1) < symbol_size
+                ]
+                # Try to find a child that matches the target description
+                desc_lower = (target.get("description", "") + " " + target.get("new_logic", "")).lower()
+                best_child = None
+                best_score = 0
+                for child in child_candidates:
+                    child_size = child.end_line - child.start_line + 1
+                    if child_size > 500:
+                        continue  # Skip huge children too
+                    # Score by keyword match in symbol name/code
+                    score = 0
+                    child_name_lower = child.full_path.lower()
+                    for keyword in desc_lower.split():
+                        if len(keyword) > 3 and keyword in child_name_lower:
+                            score += 10
+                        if len(keyword) > 3 and keyword in child.code[:500].lower():
+                            score += 5
+                    # Prefer smaller symbols (more surgical)
+                    if child_size < 100:
+                        score += 3
+                    if score > best_score:
+                        best_score = score
+                        best_child = child
+                if best_child:
+                    yield sse({"type": "progress", "content": f"Narrowing: {symbol.full_path} ({symbol_size}L) → {best_child.full_path} ({best_child.end_line - best_child.start_line + 1}L)"})
+                    symbol = best_child
+                elif symbol_size > 1000:
+                    # No good child found — create a focused window (±100 lines around midpoint of description keywords)
+                    # Use the target description to estimate where the change is needed
+                    all_lines = sf["content"].splitlines()
+                    search_terms = [w for w in desc_lower.split() if len(w) > 3]
+                    best_line = symbol.start_line + symbol_size // 2  # default: middle
+                    for li in range(symbol.start_line - 1, min(symbol.end_line, len(all_lines))):
+                        line_lower = all_lines[li].lower() if li < len(all_lines) else ""
+                        if any(term in line_lower for term in search_terms):
+                            best_line = li + 1
+                            break
+                    window_start = max(symbol.start_line, best_line - 100)
+                    window_end = min(symbol.end_line, best_line + 100)
+                    windowed_code = "\n".join(all_lines[window_start - 1:window_end])
+                    from models.schemas import SymbolInfo as _SI, SymbolType as _ST
+                    symbol = _SI(
+                        name=f"{symbol.name}_window",
+                        symbol_type=symbol.symbol_type,
+                        start_line=window_start,
+                        end_line=window_end,
+                        parent=symbol.parent,
+                        indentation=symbol.indentation,
+                        code=windowed_code,
+                        signature=f"Focused window L{window_start}-{window_end} of {symbol.full_path}",
+                    )
+                    yield sse({"type": "progress", "content": f"Focused window: L{window_start}-{window_end} ({window_end - window_start + 1} lines)"})
 
             new_code, confidence = run_surgeon(symbol, change_target, sf["content"], user_id=user_id)
             diff = _make_diff(symbol.code, new_code, symbol_path)
