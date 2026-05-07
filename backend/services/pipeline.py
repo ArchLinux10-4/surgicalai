@@ -1167,6 +1167,9 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                     size = s.end_line - s.start_line + 1
                     size_warn = " ⚠️LARGE" if size > 500 else ""
                     entry = f"  [{s.symbol_type.value}] {s.full_path} ({size} lines, L{s.start_line}-{s.end_line}){size_warn}"
+                    snippet = s.code[:120].replace("\n", " ").strip()
+                    if snippet:
+                        entry += f"  >> {snippet}"
                     if s.signature:
                         entry += f" — {s.signature}"
                     syms.append(entry)
@@ -1448,6 +1451,72 @@ USER REQUEST:
 
         yield sse({"type": "progress", "content": f"Plan ready: {len(targets)} change(s) identified"})
         yield sse({"type": "progress", "content": "Surgeon writing code..."})
+
+        # Text-search assist: redirect mis-targeted symbols
+        _quoted_texts = re.findall(r"""['"](.+?)['"]""", user_request)
+        for qi, target in enumerate(targets):
+            if not _quoted_texts:
+                break
+            target_filename = target.get("filename", "")
+            # Find the file and its symbol map
+            _smap_match = None
+            _sf_match = None
+            for fn in symbol_maps_by_name:
+                if fn == target_filename or fn.endswith(target_filename) or target_filename.endswith(fn):
+                    _smap_match, _sf_match = symbol_maps_by_name[fn]
+                    break
+            if not _smap_match or not _sf_match:
+                continue
+            _file_content = _sf_match.get("content", "") if isinstance(_sf_match, dict) else ""
+            if not _file_content:
+                continue
+            _file_lines = _file_content.splitlines()
+            sp = target.get("symbol_path", "")
+            # Find the targeted symbol
+            _tsym = None
+            for sym in _smap_match.symbols:
+                if sym.full_path == sp or sym.name == sp:
+                    _tsym = sym
+                    break
+            if not _tsym:
+                continue
+            # Check if any quoted text is missing from the targeted symbol
+            for qt in _quoted_texts:
+                if len(qt) < 3:
+                    continue
+                if qt.lower() in _tsym.code.lower():
+                    continue  # Text is in the symbol — no redirect needed
+                # Find where the text actually is
+                _tline = None
+                for li, line in enumerate(_file_lines, 1):
+                    if qt.lower() in line.lower():
+                        _tline = li
+                        break
+                if _tline is None:
+                    continue
+                # Find narrowest symbol containing that line
+                _best = None
+                _best_size = float("inf")
+                for sym in _smap_match.symbols:
+                    if sym.start_line <= _tline <= sym.end_line:
+                        sz = sym.end_line - sym.start_line
+                        if sz < _best_size:
+                            _best_size = sz
+                            _best = sym
+                if _best and _best.full_path != sp:
+                    targets[qi]["symbol_path"] = _best.full_path
+                elif not _best:
+                    # Create virtual window
+                    total = len(_file_lines)
+                    ws = max(1, _tline - 25)
+                    we = min(total, _tline + 25)
+                    vcode = "\n".join(_file_lines[ws - 1:we])
+                    vname = f"_text_region_L{_tline}"
+                    from models.schemas import SymbolInfo as _SI, SymbolType as _ST
+                    vsym = _SI(name=vname, symbol_type=_ST.VARIABLE, start_line=ws, end_line=we,
+                               parent=None, indentation=0, code=vcode, signature=f"text region around line {_tline}")
+                    _smap_match.symbols.append(vsym)
+                    targets[qi]["symbol_path"] = vname
 
         changes_by_file = {}
 
