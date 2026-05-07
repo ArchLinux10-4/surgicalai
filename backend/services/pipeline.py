@@ -244,7 +244,7 @@ Produce the surgical change plan as JSON."""
     valid_symbols.update({sym.name for sym in symbol_map.symbols})
 
     # Text-search assist: find quoted text from user request in the file
-    _quoted_texts = re.findall(r"['"](.+?)['"]", user_request)
+    _quoted_texts = re.findall(r"""['"](.+?)['"]""", user_request)
     _text_line_map = {}  # text -> line number where found
     file_lines = file_content.splitlines()
     for qt in _quoted_texts:
