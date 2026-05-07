@@ -12,7 +12,7 @@ def get_settings():
     s = get_all_settings()
     return SettingsResponse(
         openai_api_key_set=bool(s.get("openai_api_key", "")),
-        architect_model=s.get("architect_model", "gpt-4.1"),
+        architect_model=s.get("architect_model", "gpt-5"),
         surgeon_model=s.get("surgeon_model", "gpt-4.1"),
         temperature_architect=float(s.get("temperature_architect", "0.3")),
         temperature_surgeon=float(s.get("temperature_surgeon", "0.1")),

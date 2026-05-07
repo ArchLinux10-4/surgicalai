@@ -27,7 +27,7 @@ export function SettingsModal() {
   const [keyMessage, setKeyMessage] = useState('')
   const [models, setModels] = useState<any[]>([])
   const [form, setForm] = useState({
-    architect_model: 'gpt-4.1',
+    architect_model: 'gpt-5',
     surgeon_model: 'gpt-4.1',
     confidence_threshold: 7,
     temperature_architect: 0.3,
