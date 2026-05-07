@@ -1172,7 +1172,23 @@ USER REQUEST:
                     raw_text = "\n".join(fence_lines[1:-1])
                 else:
                     raw_text = "\n".join(fence_lines[1:])
-            plan = json.loads(raw_text)
+
+            # Robust JSON parsing — Claude may not always produce perfect JSON
+            try:
+                plan = json.loads(raw_text)
+            except json.JSONDecodeError:
+                # Try to extract JSON object from the text
+                import re
+                json_match = re.search(r'\{[\s\S]*\}', raw_text)
+                if json_match:
+                    try:
+                        plan = json.loads(json_match.group())
+                    except json.JSONDecodeError:
+                        # Last resort: treat entire response as chat
+                        plan = {"intent": "chat", "chat_response": raw_text}
+                else:
+                    # No JSON found at all — Claude gave a plain text answer
+                    plan = {"intent": "chat", "chat_response": raw_text}
         else:
             # ── OpenAI Architect (original logic) ──
             client = _get_client()
