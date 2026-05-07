@@ -766,7 +766,6 @@ def run_impact_analysis(symbol_path: str, file_path: str, file_content: str, wor
     """
     from models.schemas import ImpactResult, ImpactAnalysisResponse
     import os
-    import re
 
     symbol_name = symbol_path.split(".")[-1]
     impacts = []
@@ -1308,7 +1307,6 @@ USER REQUEST:
                 plan = json.loads(raw_text)
             except json.JSONDecodeError:
                 # Try to extract JSON object from the text
-                import re
                 json_match = re.search(r'\{[\s\S]*\}', raw_text)
                 if json_match:
                     try:
