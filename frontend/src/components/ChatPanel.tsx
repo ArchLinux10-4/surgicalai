@@ -803,10 +803,10 @@ export function ChatPanel() {
         <div className="flex gap-2 items-end">
           <button
             onClick={() => fileInputRef.current?.click()}
-            className="p-2.5 rounded-xl bg-zinc-800 border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors flex-shrink-0"
+            className="h-[44px] w-[44px] rounded-xl bg-zinc-800 border border-zinc-700 text-zinc-400 hover:text-zinc-200 hover:border-zinc-600 transition-colors flex-shrink-0 flex items-center justify-center"
             title="Attach files"
           >
-            <Paperclip size={15} />
+            <Paperclip size={16} />
           </button>
 
           <div className="flex-1 relative">
@@ -833,7 +833,7 @@ export function ChatPanel() {
           {isStreaming ? (
             <button
               onClick={() => { abortRef.current?.abort(); stopStream() }}
-              className="px-3 py-2.5 rounded-xl bg-red-500/20 border border-red-500/30 text-red-400 font-bold text-sm flex items-center gap-1.5 hover:bg-red-500/30 transition-colors flex-shrink-0"
+              className="h-[44px] px-4 rounded-xl bg-red-500/20 border border-red-500/30 text-red-400 font-bold text-sm flex items-center gap-1.5 hover:bg-red-500/30 transition-colors flex-shrink-0"
             >
               <X size={14} /> Stop
             </button>
@@ -841,7 +841,7 @@ export function ChatPanel() {
             <button
               onClick={handleSend}
               disabled={!input.trim()}
-              className={`px-3 py-2.5 rounded-xl border font-bold text-sm flex items-center gap-1.5 transition-all flex-shrink-0 ${
+              className={`h-[44px] w-[44px] rounded-xl border font-bold text-sm flex items-center justify-center transition-all flex-shrink-0 ${
                 !input.trim()
                   ? 'bg-zinc-800 border-zinc-700 text-zinc-600 cursor-not-allowed'
                   : 'bg-blue-500/20 border-blue-500/30 text-blue-400 hover:bg-blue-500/30 active:scale-95'
