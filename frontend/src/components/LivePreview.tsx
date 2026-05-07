@@ -130,7 +130,14 @@ var Slash=__icon('Slash'),Hash=__icon('Hash'),AtSign=__icon('AtSign');
 `
 
 /* ─── Build final iframe HTML ─────────────────────────────────── */
-function buildIframeHtml(compiledJs: string, filename: string, rawCode: string, error?: string): string {
+function buildIframeHtml(
+  compiledJs: string,
+  filename: string,
+  rawCode: string,
+  error?: string,
+  extraStubs?: string,
+  stubbedVars?: string[]
+): string {
   const isHtml = /\.(html|htm)$/i.test(filename)
 
   if (isHtml && !error) {
@@ -170,23 +177,30 @@ body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif
 #root{min-height:100vh;}
 #error-banner{display:none;position:fixed;top:0;left:0;right:0;background:#7f1d1d;color:#fca5a5;
 padding:8px 12px;font-size:11px;font-family:monospace;z-index:9999;white-space:pre-wrap;word-break:break-all;}
+#stub-banner{display:${stubbedVars && stubbedVars.length ? 'block' : 'none'};position:fixed;top:0;left:0;right:0;
+background:#78350f;color:#fcd34d;padding:7px 12px;font-size:11px;font-family:monospace;z-index:9998;
+white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 </style>
 <script>
 window.onerror = function(msg, src, line, col, err) {
-  var b = document.getElementById('error-banner');
-  if (b) {
-    var detail = err && err.message ? err.message : String(msg);
-    b.style.display = 'block';
-    b.textContent = 'Runtime error: ' + detail;
+  var str = err && err.message ? err.message : String(msg);
+  // Detect missing variable → ask parent to inject a stub and retry
+  var mv = str.match(/Can't find variable[:\\s]+(\\w+)/i) || str.match(/(\\w+) is not defined/i);
+  if (mv) {
+    try { window.parent.postMessage({ type: 'sai_missing_var', name: mv[1] }, '*'); } catch(_) {}
   }
+  var b = document.getElementById('error-banner');
+  if (b) { b.style.display = 'block'; b.textContent = 'Runtime error: ' + str; }
   return true;
 };
 <\/script>
 </head>
 <body>
+<div id="stub-banner">${stubbedVars && stubbedVars.length ? '⚠ Partial preview — stubbed from other files: ' + stubbedVars.join(', ') : ''}</div>
 <div id="error-banner"></div>
-<div id="root"></div>
+<div id="root" style="${stubbedVars && stubbedVars.length ? 'padding-top:30px' : ''}"></div>
 <script>${MOCK_BLOCK}<\/script>
+<script>${extraStubs || ''}<\/script>
 <script>
 try {
 ${safeJs}
@@ -208,18 +222,20 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
   const [loading, setLoading] = useState(false)
   const [iframeSrc, setIframeSrc] = useState<string | null>(null)
   const [compileError, setCompileError] = useState<string | null>(null)
+  const [stubbedVars, setStubbedVars] = useState<string[]>([])
   const iframeRef = useRef<HTMLIFrameElement>(null)
   const blobUrlRef = useRef<string | null>(null)
+  const hasRetriedRef = useRef(false)  // only one stub-retry per open session
 
   const displayCode = modifiedCode || code
 
   // Compile JSX → JS on the main page, then build iframe HTML
-  const compile = useCallback(async () => {
+  const compile = useCallback(async (extraStubs = '', extraStubbedVars: string[] = []) => {
     setLoading(true)
     setCompileError(null)
     try {
       const { js, error } = await compileJsx(displayCode, filename)
-      const html = buildIframeHtml(js, filename, displayCode, error || undefined)
+      const html = buildIframeHtml(js, filename, displayCode, error || undefined, extraStubs, extraStubbedVars)
 
       // Revoke old blob URL
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current)
@@ -233,7 +249,7 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
     } catch (e: any) {
       const msg = e.message || 'Unknown compilation error'
       setCompileError(msg)
-      const html = buildIframeHtml('', filename, displayCode, msg)
+      const html = buildIframeHtml('', filename, displayCode, msg, extraStubs, extraStubbedVars)
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current)
       const blob = new Blob([html], { type: 'text/html' })
       blobUrlRef.current = URL.createObjectURL(blob)
@@ -243,9 +259,35 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
     }
   }, [displayCode, filename])
 
+  // Listen for missing-variable reports from the iframe → inject stubs and retry once
+  useEffect(() => {
+    const missingVarsRef: string[] = []
+    const handler = (e: MessageEvent) => {
+      if (e.data?.type !== 'sai_missing_var') return
+      const name: string = e.data.name
+      if (!name || missingVarsRef.includes(name)) return
+      missingVarsRef.push(name)
+      if (hasRetriedRef.current) return  // already retried once, don't loop
+      // Debounce: collect all missing vars reported in this tick, then retry once
+      clearTimeout((handler as any).__timer)
+      ;(handler as any).__timer = setTimeout(() => {
+        hasRetriedRef.current = true
+        setStubbedVars([...missingVarsRef])
+        const stubs = missingVarsRef
+          .map(n => `var ${n} = function(props) { return React.createElement('span', { style:{opacity:0.3,fontSize:11} }, '[${n}]'); };`)
+          .join('\n')
+        compile(stubs, [...missingVarsRef])
+      }, 50)
+    }
+    window.addEventListener('message', handler)
+    return () => window.removeEventListener('message', handler)
+  }, [compile])
+
   // Compile when preview opens or code changes
   useEffect(() => {
     if (open) {
+      hasRetriedRef.current = false
+      setStubbedVars([])
       compile()
       // Scroll the panel into view smoothly so user doesn't miss it
       setTimeout(() => {
