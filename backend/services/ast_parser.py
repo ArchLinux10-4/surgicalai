@@ -65,6 +65,12 @@ class ASTParser:
             symbols = self._parse_rust(source, lines)
         elif language == "java":
             symbols = self._parse_java(source, lines)
+        elif language == "html":
+            symbols = self._parse_html(source, lines)
+        elif language == "css":
+            symbols = self._parse_css(source, lines)
+        elif language == "markdown":
+            symbols = self._parse_markdown(source, lines)
         else:
             symbols = self._parse_generic(source, lines)
 
@@ -438,6 +444,393 @@ class ASTParser:
                     indentation=indent,
                     code="\n".join(lines[line_no - 1 : end_line]),
                     signature=m.group(0).strip(),
+                )
+            )
+
+        return symbols
+
+    # ─── HTML Parser ─────────────────────────────────────────────────────────
+
+    def _find_html_close_tag(self, lines: List[str], start_idx: int, tag_name: str) -> int:
+        """
+        Find the closing </tag> for a given opening tag starting at start_idx (0-based).
+        Tracks nesting depth. Ignores self-closing tags.
+        Returns 1-based line number of the closing tag line.
+        """
+        depth = 0
+        open_re = re.compile(r"<" + re.escape(tag_name) + r"(?:\s|>)", re.IGNORECASE)
+        close_re = re.compile(r"</" + re.escape(tag_name) + r"\s*>", re.IGNORECASE)
+        self_close_re = re.compile(r"<" + re.escape(tag_name) + r"\b[^>]*/\s*>", re.IGNORECASE)
+
+        limit = min(start_idx + 5000, len(lines))
+        for i in range(start_idx, limit):
+            line = lines[i]
+            # Count self-closing occurrences to exclude them
+            sc = len(self_close_re.findall(line))
+            opens = len(open_re.findall(line)) - sc
+            closes = len(close_re.findall(line))
+            depth += opens - closes
+            if depth <= 0 and closes > 0:
+                return i + 1  # 1-based
+        # Fallback
+        return start_idx + 100
+
+    def _parse_html(self, source: str, lines: List[str]) -> List[SymbolInfo]:
+        symbols: List[SymbolInfo] = []
+
+        # Major structural tags to look for
+        major_tags = {"head", "body", "header", "nav", "main", "footer",
+                      "section", "article", "aside", "form"}
+
+        # Track parent sections for nesting — list of (tag_name, symbol_name, start_line_1based, end_line_1based)
+        section_spans: List[Tuple[str, str, int, int]] = []
+
+        # Counters for unnamed elements
+        table_counter = 0
+        style_counter = 0
+        script_counter = 0
+        heading_counter = {f"h{i}": 0 for i in range(1, 7)}
+
+        # Regex patterns
+        # Match opening tags: <tag ...> or <tag>
+        tag_re = re.compile(
+            r"<(head|body|header|nav|main|footer|section|article|aside|form|style|script|table|h[1-6])\b([^>]*)>",
+            re.IGNORECASE,
+        )
+        id_re = re.compile(r'id\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+        # For elements with id attribute on any tag
+        any_id_re = re.compile(r"<(\w+)\b([^>]*)\bid\s*=\s*[\"']([^\"']+)[\"']([^>]*)>", re.IGNORECASE)
+
+        def _find_parent(line_1based: int) -> Optional[str]:
+            """Find the innermost enclosing section for a given line."""
+            best = None
+            best_start = -1
+            for _tag, sname, sstart, send in section_spans:
+                if sstart < line_1based <= send and sstart > best_start:
+                    best = sname
+                    best_start = sstart
+            return best
+
+        # First pass: collect major sections to build parent mapping
+        for i, line in enumerate(lines):
+            for m in tag_re.finditer(line):
+                tag = m.group(1).lower()
+                attrs = m.group(2)
+                id_match = id_re.search(attrs)
+                line_no = i + 1  # 1-based
+
+                if tag in major_tags:
+                    end_line = self._find_html_close_tag(lines, i, tag)
+                    sym_name = tag
+                    if id_match:
+                        sym_name = f"{tag}#{id_match.group(1)}"
+                    section_spans.append((tag, sym_name, line_no, end_line))
+
+        # Second pass: build all symbols
+        # Track seen (line_no, col) to avoid duplicates
+        seen_positions: set = set()
+
+        for i, line in enumerate(lines):
+            for m in tag_re.finditer(line):
+                tag = m.group(1).lower()
+                attrs = m.group(2)
+                id_match = id_re.search(attrs)
+                line_no = i + 1
+                pos_key = (line_no, m.start())
+
+                if pos_key in seen_positions:
+                    continue
+
+                if tag in major_tags:
+                    end_line = self._find_html_close_tag(lines, i, tag)
+                    sym_name = tag
+                    if id_match:
+                        sym_name = f"{tag}#{id_match.group(1)}"
+                    parent = _find_parent(line_no)
+                    seen_positions.add(pos_key)
+                    symbols.append(
+                        SymbolInfo(
+                            name=sym_name,
+                            symbol_type=SymbolType.CLASS,
+                            start_line=line_no,
+                            end_line=end_line,
+                            parent=parent,
+                            indentation=0,
+                            code="\n".join(lines[line_no - 1 : end_line]),
+                            signature=lines[i].strip(),
+                        )
+                    )
+
+                elif tag == "style":
+                    style_counter += 1
+                    end_line = self._find_html_close_tag(lines, i, "style")
+                    sym_name = f"style_{style_counter}"
+                    if id_match:
+                        sym_name = f"style#{id_match.group(1)}"
+                    parent = _find_parent(line_no)
+                    seen_positions.add(pos_key)
+                    symbols.append(
+                        SymbolInfo(
+                            name=sym_name,
+                            symbol_type=SymbolType.FUNCTION,
+                            start_line=line_no,
+                            end_line=end_line,
+                            parent=parent,
+                            indentation=0,
+                            code="\n".join(lines[line_no - 1 : end_line]),
+                            signature=lines[i].strip(),
+                        )
+                    )
+
+                elif tag == "script":
+                    script_counter += 1
+                    end_line = self._find_html_close_tag(lines, i, "script")
+                    sym_name = f"script_{script_counter}"
+                    if id_match:
+                        sym_name = f"script#{id_match.group(1)}"
+                    parent = _find_parent(line_no)
+                    seen_positions.add(pos_key)
+                    symbols.append(
+                        SymbolInfo(
+                            name=sym_name,
+                            symbol_type=SymbolType.FUNCTION,
+                            start_line=line_no,
+                            end_line=end_line,
+                            parent=parent,
+                            indentation=0,
+                            code="\n".join(lines[line_no - 1 : end_line]),
+                            signature=lines[i].strip(),
+                        )
+                    )
+
+                elif tag == "table":
+                    table_counter += 1
+                    end_line = self._find_html_close_tag(lines, i, "table")
+                    sym_name = f"table_{table_counter}"
+                    if id_match:
+                        sym_name = f"table#{id_match.group(1)}"
+                    parent = _find_parent(line_no)
+                    seen_positions.add(pos_key)
+                    symbols.append(
+                        SymbolInfo(
+                            name=sym_name,
+                            symbol_type=SymbolType.FUNCTION,
+                            start_line=line_no,
+                            end_line=end_line,
+                            parent=parent,
+                            indentation=0,
+                            code="\n".join(lines[line_no - 1 : end_line]),
+                            signature=lines[i].strip(),
+                        )
+                    )
+
+                elif tag.startswith("h") and tag[1:].isdigit():
+                    # Heading: extract text content
+                    heading_counter[tag] = heading_counter.get(tag, 0) + 1
+                    # Try to get closing tag on same line
+                    heading_text = ""
+                    close_heading_re = re.compile(
+                        r"<" + re.escape(tag) + r"[^>]*>(.*?)</" + re.escape(tag) + r">",
+                        re.IGNORECASE | re.DOTALL,
+                    )
+                    # Check current line for inline heading
+                    hm = close_heading_re.search(line)
+                    if hm:
+                        # Strip any inner HTML tags from heading text
+                        heading_text = re.sub(r"<[^>]+>", "", hm.group(1)).strip()
+                        end_line = line_no
+                    else:
+                        # Multi-line heading — find close tag
+                        end_line = self._find_html_close_tag(lines, i, tag)
+                        # Extract text from the span
+                        raw = "\n".join(lines[i:end_line])
+                        heading_text = re.sub(r"<[^>]+>", "", raw).strip()
+
+                    # Sanitize heading text for symbol name
+                    sanitized = re.sub(r"[^a-zA-Z0-9_\- ]", "", heading_text).strip()
+                    sanitized = re.sub(r"\s+", "_", sanitized)
+                    if sanitized:
+                        sym_name = f"{tag}_{sanitized}"
+                    else:
+                        sym_name = f"{tag}_{heading_counter[tag]}"
+
+                    parent = _find_parent(line_no)
+                    seen_positions.add(pos_key)
+                    symbols.append(
+                        SymbolInfo(
+                            name=sym_name,
+                            symbol_type=SymbolType.CLASS,
+                            start_line=line_no,
+                            end_line=end_line,
+                            parent=parent,
+                            indentation=0,
+                            code="\n".join(lines[line_no - 1 : end_line]),
+                            signature=lines[i].strip(),
+                        )
+                    )
+
+        # Third pass: named elements (any tag with id) not already captured
+        for i, line in enumerate(lines):
+            line_no = i + 1
+            for m in any_id_re.finditer(line):
+                tag = m.group(1).lower()
+                elem_id = m.group(3)
+                # Skip tags we already handle above
+                if tag in major_tags or tag in ("style", "script", "table") or (tag.startswith("h") and len(tag) == 2 and tag[1:].isdigit()):
+                    continue
+                end_line = self._find_html_close_tag(lines, i, tag)
+                sym_name = f"{tag}#{elem_id}"
+                parent = _find_parent(line_no)
+                seen_positions.add((line_no, m.start()))
+                symbols.append(
+                    SymbolInfo(
+                        name=sym_name,
+                        symbol_type=SymbolType.CLASS,
+                        start_line=line_no,
+                        end_line=end_line,
+                        parent=parent,
+                        indentation=0,
+                        code="\n".join(lines[line_no - 1 : end_line]),
+                        signature=lines[i].strip(),
+                    )
+                )
+
+        return symbols
+
+    # ─── CSS Parser ──────────────────────────────────────────────────────────
+
+    def _parse_css(self, source: str, lines: List[str]) -> List[SymbolInfo]:
+        symbols: List[SymbolInfo] = []
+
+        # @media queries
+        media_re = re.compile(r"^(\s*)@media\b[^{]*\{", re.MULTILINE)
+        # @keyframes
+        keyframes_re = re.compile(r"^(\s*)@keyframes\s+([\w-]+)\s*\{", re.MULTILINE)
+        # General @ rules (font-face, etc.)
+        at_rule_re = re.compile(r"^(\s*)@([\w-]+)\b[^{]*\{", re.MULTILINE)
+        # Regular selectors — lines that end with { and are not @ rules
+        selector_re = re.compile(r"^(\s*)([^@/\s{}][^{}]*?)\s*\{", re.MULTILINE)
+
+        seen_starts: set = set()
+
+        # @keyframes
+        for m in keyframes_re.finditer(source):
+            line_no = source[: m.start()].count("\n") + 1
+            if line_no in seen_starts:
+                continue
+            end_line = self._find_block_end(lines, line_no - 1)
+            seen_starts.add(line_no)
+            symbols.append(
+                SymbolInfo(
+                    name=f"@keyframes {m.group(2)}",
+                    symbol_type=SymbolType.FUNCTION,
+                    start_line=line_no,
+                    end_line=end_line,
+                    parent=None,
+                    indentation=len(m.group(1)),
+                    code="\n".join(lines[line_no - 1 : end_line]),
+                    signature=m.group(0).strip(),
+                )
+            )
+
+        # @media
+        for m in media_re.finditer(source):
+            line_no = source[: m.start()].count("\n") + 1
+            if line_no in seen_starts:
+                continue
+            end_line = self._find_block_end(lines, line_no - 1)
+            # Build a name from the media query
+            raw_sig = m.group(0).strip().rstrip("{").strip()
+            seen_starts.add(line_no)
+            symbols.append(
+                SymbolInfo(
+                    name=raw_sig,
+                    symbol_type=SymbolType.CLASS,
+                    start_line=line_no,
+                    end_line=end_line,
+                    parent=None,
+                    indentation=len(m.group(1)),
+                    code="\n".join(lines[line_no - 1 : end_line]),
+                    signature=m.group(0).strip(),
+                )
+            )
+
+        # Regular selectors (top-level only — indentation == 0)
+        for m in selector_re.finditer(source):
+            line_no = source[: m.start()].count("\n") + 1
+            if line_no in seen_starts:
+                continue
+            indent = len(m.group(1))
+            selector_text = m.group(2).strip()
+            # Skip comment lines
+            if selector_text.startswith("/*") or selector_text.startswith("*"):
+                continue
+            end_line = self._find_block_end(lines, line_no - 1)
+            seen_starts.add(line_no)
+            symbols.append(
+                SymbolInfo(
+                    name=selector_text,
+                    symbol_type=SymbolType.FUNCTION,
+                    start_line=line_no,
+                    end_line=end_line,
+                    parent=None,
+                    indentation=indent,
+                    code="\n".join(lines[line_no - 1 : end_line]),
+                    signature=m.group(0).strip(),
+                )
+            )
+
+        return symbols
+
+    # ─── Markdown Parser ─────────────────────────────────────────────────────
+
+    def _parse_markdown(self, source: str, lines: List[str]) -> List[SymbolInfo]:
+        symbols: List[SymbolInfo] = []
+
+        # Collect all headings first: (line_index_0based, level, text)
+        heading_re = re.compile(r"^(#{1,6})\s+(.+)$")
+        headings: List[Tuple[int, int, str]] = []
+        for i, line in enumerate(lines):
+            m = heading_re.match(line.rstrip())
+            if m:
+                level = len(m.group(1))
+                text = m.group(2).strip()
+                headings.append((i, level, text))
+
+        if not headings:
+            return symbols
+
+        # For each heading, determine end line (next heading of same/higher level or EOF)
+        for idx, (line_idx, level, text) in enumerate(headings):
+            # Find end: next heading with level <= this level
+            end_line_0 = len(lines) - 1  # default to EOF (0-based last line index)
+            for next_idx in range(idx + 1, len(headings)):
+                next_line_idx, next_level, _ = headings[next_idx]
+                if next_level <= level:
+                    end_line_0 = next_line_idx - 1
+                    break
+
+            start_line = line_idx + 1  # 1-based
+            end_line = end_line_0 + 1  # 1-based
+
+            # Find parent: closest preceding heading with strictly lower level number
+            parent = None
+            for prev_idx in range(idx - 1, -1, -1):
+                prev_line_idx, prev_level, prev_text = headings[prev_idx]
+                if prev_level < level:
+                    parent = prev_text
+                    break
+
+            symbols.append(
+                SymbolInfo(
+                    name=text,
+                    symbol_type=SymbolType.CLASS,
+                    start_line=start_line,
+                    end_line=end_line,
+                    parent=parent,
+                    indentation=level,
+                    code="\n".join(lines[line_idx : end_line_0 + 1]),
+                    signature=lines[line_idx].strip(),
                 )
             )
 
