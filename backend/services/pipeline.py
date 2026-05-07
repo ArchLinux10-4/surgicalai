@@ -1501,7 +1501,29 @@ USER REQUEST:
                 if len(qt) < 3:
                     continue
                 if qt.lower() in _tsym.code.lower():
-                    continue  # Text is in the symbol — no redirect needed
+                    # Text IS in the symbol, but if symbol is large (>50 lines),
+                    # create a focused window around the text line for better Surgeon accuracy
+                    _tsym_size = _tsym.end_line - _tsym.start_line + 1
+                    if _tsym_size > 50:
+                        # Find the text line within the file
+                        _tline_inner = None
+                        for li, line in enumerate(_file_lines, 1):
+                            if qt.lower() in line.lower():
+                                _tline_inner = li
+                                break
+                        if _tline_inner:
+                            total = len(_file_lines)
+                            ws = max(1, _tline_inner - 25)
+                            we = min(total, _tline_inner + 25)
+                            vcode = "\n".join(_file_lines[ws - 1:we])
+                            vname = f"_focused_L{_tline_inner}"
+                            from models.schemas import SymbolInfo as _SI2, SymbolType as _ST2
+                            vsym = _SI2(name=vname, symbol_type=_ST2.VARIABLE, start_line=ws, end_line=we,
+                                       parent=None, indentation=0, code=vcode,
+                                       signature=f"focused window around line {_tline_inner}")
+                            _smap_match.symbols.append(vsym)
+                            targets[qi]["symbol_path"] = vname
+                    continue  # Text is in the symbol — no redirect needed (or already redirected)
                 # Find where the text actually is
                 _tline = None
                 for li, line in enumerate(_file_lines, 1):
