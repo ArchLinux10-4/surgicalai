@@ -243,6 +243,17 @@ Produce the surgical change plan as JSON."""
     valid_symbols = {sym.full_path for sym in symbol_map.symbols}
     valid_symbols.update({sym.name for sym in symbol_map.symbols})
 
+    # Text-search assist: find quoted text from user request in the file
+    _quoted_texts = re.findall(r"['"](.+?)['"]", user_request)
+    _text_line_map = {}  # text -> line number where found
+    file_lines = file_content.splitlines()
+    for qt in _quoted_texts:
+        if len(qt) >= 3:  # only meaningful text
+            for i, line in enumerate(file_lines, 1):
+                if qt.lower() in line.lower():
+                    _text_line_map[qt] = i
+                    break
+
     validated_targets = []
     for t in data.get("targets", []):
         target = ChangeTarget(
