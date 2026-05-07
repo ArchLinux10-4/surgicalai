@@ -253,7 +253,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               </>
             )}
             {/* Right: Preview (always visible for visual files) + Download */}
-            <div className="ml-auto flex items-center gap-2">
+            <div className="ml-auto flex items-center gap-2 pr-1">
               {isVisualFile(filename) && (
                 <LivePreview
                   code={originalCode || '// Loading...'}

@@ -203,6 +203,7 @@ ${safeJs}
 export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) {
   const [open, setOpen] = useState(false)
   const [expanded, setExpanded] = useState(false)
+  const panelRef = useRef<HTMLDivElement>(null)
   const [key, setKey] = useState(0)
   const [loading, setLoading] = useState(false)
   const [iframeSrc, setIframeSrc] = useState<string | null>(null)
@@ -244,7 +245,13 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
 
   // Compile when preview opens or code changes
   useEffect(() => {
-    if (open) compile()
+    if (open) {
+      compile()
+      // Scroll the panel into view smoothly so user doesn't miss it
+      setTimeout(() => {
+        panelRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+      }, 80)
+    }
   }, [open, compile])
 
   // Cleanup blob URL on unmount
@@ -270,9 +277,9 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
   }
 
   return (
-    <div className={`mt-3 border border-indigo-500/30 rounded-xl overflow-hidden ${expanded ? 'fixed inset-4 z-50 shadow-2xl' : ''}`}>
+    <div ref={panelRef} className={`mt-3 border border-indigo-500/30 rounded-xl overflow-hidden ${expanded ? 'fixed inset-4 z-50 shadow-2xl bg-zinc-950' : ''}`}>
       {/* Header bar */}
-      <div className="flex items-center gap-2 px-3 py-2 bg-indigo-950/60 border-b border-indigo-500/20">
+      <div className="flex items-center gap-2 px-3 py-2 bg-indigo-950 border-b border-indigo-500/20">
         <Eye size={12} className="text-indigo-400" />
         <span className="text-[11px] font-semibold text-indigo-300 uppercase tracking-wide">Live Preview</span>
         <span className="text-[10px] text-indigo-500 ml-1">{filename}</span>
