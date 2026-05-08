@@ -1290,6 +1290,7 @@ IF edit:
     {
       "filename": "exact filename as uploaded",
       "symbol_path": "ClassName.method_name or function_name",
+      "target_line": <optional integer: exact line number of the element to change, from KEYWORD MATCH / SEARCH RESULTS>,
       "change_type": "modify|add|delete",
       "description": "what changes in this symbol",
       "new_logic": "precise description of the new behavior — the Surgeon will implement exactly this. QUALITY RULE: Reference ACTUAL variable/function names from the code. Be specific: 'After const fee = calcFee(), add: if (fee < 0) throw new Error()'. Never say just 'add error handling' — always say WHAT, WHERE, and HOW.",
@@ -1380,6 +1381,10 @@ Example:
 - For TSX/JSX/HTML/CSS files: use the component function or export name as symbol_path (e.g. "LoginPage", "App", "Header").
   Inner elements like divs/spans are NOT symbols — but that's OK. Set symbol_path to the containing component
   and use description + new_logic to precisely identify the inner element to change.
+  IMPORTANT FOR LARGE HTML FILES: When a SEARCH RESULT or KEYWORD MATCH section shows the exact line of
+  an element (e.g. "rsp-eff-date at L9318"), set target_line to that line number (e.g. 9318).
+  This lets the pipeline create a focused edit window exactly where needed — not 500 lines away.
+  For multi-instance edits ("add X to ALL Y fields"), each target MUST have a different target_line.
 - confidence scale: 9-10=clear isolated change; 7-8=has dependencies; 5-6=ambiguous → use needs_clarification; <5=missing files → ask
 - confidence < 7 = use needs_clarification instead (enforce this — do NOT guess at low confidence)
 - Minimal footprint: if the user said "add X to function Y", only plan function Y"""
@@ -2308,6 +2313,7 @@ USER REQUEST:
 
         # Text-search assist: redirect mis-targeted symbols
         # Extract quoted text manually (avoids 're' module scoping issues)
+        _used_focus_lines = set()  # prevent multiple targets from collapsing to same line
         _quoted_texts = []
         for _qc in ["'", '"']:
             _rest = user_request
@@ -2340,6 +2346,34 @@ USER REQUEST:
                 continue
             _file_lines = _file_content.splitlines()
             sp = target.get("symbol_path", "")
+
+            # FIX v3.2.1: If Architect provided an exact target_line (from ReAct search results),
+            # use it directly to create a focused window. Skip text-search fallback entirely.
+            # This prevents label text at wrong line from hijacking the edit target.
+            _tl_direct = target.get("target_line")
+            if _tl_direct:
+                try:
+                    _tl_int = int(_tl_direct)
+                    if 1 <= _tl_int <= len(_file_lines) and _tl_int not in _used_focus_lines:
+                        _tl_total = len(_file_lines)
+                        _tl_ws = max(1, _tl_int - 100)
+                        _tl_we = min(_tl_total, _tl_int + 100)
+                        _tl_vcode = "\n".join(_file_lines[_tl_ws - 1:_tl_we])
+                        _tl_vname = "_focused_L{}".format(_tl_int)
+                        from models.schemas import SymbolInfo as _SI_tl, SymbolType as _ST_tl
+                        _tl_vsym = _SI_tl(
+                            name=_tl_vname, symbol_type=_ST_tl.VARIABLE,
+                            start_line=_tl_ws, end_line=_tl_we,
+                            parent=None, indentation=0, code=_tl_vcode,
+                            signature="target_line window around line {}".format(_tl_int)
+                        )
+                        _smap_match.symbols.append(_tl_vsym)
+                        targets[qi]["symbol_path"] = _tl_vname
+                        _used_focus_lines.add(_tl_int)
+                        continue  # skip text-search fallback — direct line target is authoritative
+                except (ValueError, TypeError):
+                    pass  # invalid target_line — fall through to text-search fallback
+
             # Find the targeted symbol
             _tsym = None
             for sym in _smap_match.symbols:
@@ -2357,13 +2391,27 @@ USER REQUEST:
                     # create a focused window around the text line for better Surgeon accuracy
                     _tsym_size = _tsym.end_line - _tsym.start_line + 1
                     if _tsym_size > 50:
-                        # Find the text line within the file
+                        # FIX v3.2.1: Search WITHIN the targeted symbol's own line range.
+                        # The old code scanned from line 1 and found the first occurrence
+                        # globally (e.g. a label 500 lines BEFORE the actual input element),
+                        # creating _focused_L8834 instead of _focused_L9318.
                         _tline_inner = None
-                        for li, line in enumerate(_file_lines, 1):
-                            if qt.lower() in line.lower():
-                                _tline_inner = li
+                        _sym_lo = _tsym.start_line - 1  # 0-indexed
+                        _sym_hi = min(_tsym.end_line, len(_file_lines))
+                        for li_off in range(_sym_lo, _sym_hi):
+                            candidate_line = _tsym.start_line + (li_off - _sym_lo)
+                            if (qt.lower() in _file_lines[li_off].lower()
+                                    and candidate_line not in _used_focus_lines):
+                                _tline_inner = candidate_line
                                 break
+                        # Fallback: if not found within symbol (rare edge case), try global
+                        if _tline_inner is None:
+                            for li, line in enumerate(_file_lines, 1):
+                                if qt.lower() in line.lower() and li not in _used_focus_lines:
+                                    _tline_inner = li
+                                    break
                         if _tline_inner:
+                            _used_focus_lines.add(_tline_inner)
                             total = len(_file_lines)
                             ws = max(1, _tline_inner - SYMBOL_FOCUS_WINDOW // 4)
                             we = min(total, _tline_inner + SYMBOL_FOCUS_WINDOW // 4)
@@ -2376,10 +2424,11 @@ USER REQUEST:
                             _smap_match.symbols.append(vsym)
                             targets[qi]["symbol_path"] = vname
                     continue  # Text is in the symbol — no redirect needed (or already redirected)
-                # Find where the text actually is
+                # Find where the text actually is — skip lines already used by other targets
+                # (prevents multi-target edits from all collapsing to the same location)
                 _tline = None
                 for li, line in enumerate(_file_lines, 1):
-                    if qt.lower() in line.lower():
+                    if qt.lower() in line.lower() and li not in _used_focus_lines:
                         _tline = li
                         break
                 if _tline is None:
@@ -2394,9 +2443,11 @@ USER REQUEST:
                             _best_size = sz
                             _best = sym
                 if _best and _best.full_path != sp:
+                    _used_focus_lines.add(_tline)
                     targets[qi]["symbol_path"] = _best.full_path
                 elif not _best:
                     # Create virtual window
+                    _used_focus_lines.add(_tline)
                     total = len(_file_lines)
                     ws = max(1, _tline - TEXT_SEARCH_WINDOW)
                     we = min(total, _tline + TEXT_SEARCH_WINDOW)
