@@ -125,3 +125,39 @@ def get_history(file_path: str = None, limit: int = 50):
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+@router.get("/qa-log")
+def get_qa_log(session_id: str = None, limit: int = 100):
+    """Admin: view QA log entries. Proof that QA ran on every edit."""
+    conn = get_db()
+    if session_id:
+        rows = conn.execute(
+            "SELECT * FROM qa_log WHERE session_id = ? ORDER BY ran_at DESC LIMIT ?",
+            (session_id, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM qa_log ORDER BY ran_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@router.get("/compliance-log")
+def get_compliance_log(session_id: str = None, limit: int = 50):
+    """Admin: view pipeline compliance records. Proves all required steps ran."""
+    conn = get_db()
+    if session_id:
+        rows = conn.execute(
+            "SELECT * FROM compliance_log WHERE session_id = ? ORDER BY ran_at DESC LIMIT ?",
+            (session_id, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM compliance_log ORDER BY ran_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]

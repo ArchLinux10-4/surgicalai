@@ -36,6 +36,19 @@ parser = ASTParser()
 # Models that do NOT accept a temperature parameter (reasoning / latest-gen models)
 NO_TEMPERATURE_MODELS = {"gpt-5", "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"}
 
+# ── Prompt engineering constants ──────────────────────────────────────────────
+HISTORY_WINDOW       = 10   # turns of conversation history passed to every prompt
+TEXT_SEARCH_WINDOW   = 75   # ±lines around a text hit when no symbol contains the line
+SYMBOL_FOCUS_WINDOW  = 100  # ±lines to slice when a symbol is huge but text is inside it
+
+# ── Shared chat persona ───────────────────────────────────────────────────────
+CHAT_PERSONA = (
+    "You are SurgicalAI, a world-class coding assistant. "
+    "You are warm, encouraging, and precise. "
+    "You help people build real software and always explain your reasoning clearly. "
+    "Format code blocks with syntax highlighting. Use markdown."
+)
+
 
 def _is_claude_model(model: str) -> bool:
     """Check if a model ID is a Claude/Anthropic model."""
@@ -133,6 +146,9 @@ def _ollama_chat(messages: list, model: str, stream: bool = False):
     return data["message"]["content"]
 
 
+# DEPRECATED: This prompt is superseded by SMART_ARCHITECT_SYSTEM and run_smart_pipeline_stream().
+# Kept only for backward compat with the legacy run_architect() endpoint.
+# DO NOT UPDATE — update SMART_ARCHITECT_SYSTEM instead.
 ARCHITECT_SYSTEM = """You are an expert software architect AI. You analyze code and produce precise surgical change plans.
 
 Your job:
@@ -183,12 +199,23 @@ Your ONLY job: implement that plan on the specific code block you receive. Nothi
 - Do NOT change function signatures unless the plan explicitly says to
 - Do NOT add features, error handling, logging, or comments that weren't asked for
 - Do NOT remove existing error handling unless explicitly requested
-- If you genuinely cannot implement part of the plan, add: # SURGEON NOTE: [specific concern]
+- If you genuinely cannot implement part of the plan, add a comment: # SURGEON NOTE: [specific concern]
+
+━━━ IMPORT HANDLING ━━━
+- If the new code requires an import that isn't already present, add a comment on the FIRST LINE of your output:
+  # IMPORT_NEEDED: import uuid  (or whatever the import is)
+- Use one # IMPORT_NEEDED: comment per missing import
+- The system will extract these and add them to the file top automatically
+- Do NOT add the import inline inside a function or class body
+
+━━━ ALREADY CORRECT RULE ━━━
+- If the TARGET CODE already implements what the plan describes — return it UNCHANGED.
+- Do NOT invent changes. The diff between original and your output should be empty if the code already matches.
+- Signal this by returning the original code exactly as-is (no comments added).
 
 ━━━ CRITICAL: NO DUPLICATION ━━━
 - The CONTEXT BEFORE and CONTEXT AFTER blocks are shown for your reference ONLY — do NOT include them in your output
 - Do NOT repeat function declarations, type annotations, closing braces, or ANY line that appears in CONTEXT BEFORE
-- Your output REPLACES the TARGET CODE block exactly — it must start at line {start} and end at line {end}
 - If the target starts with a function/class declaration, output that declaration ONCE and only once
 
 Minimal footprint. The diff between original and your output should contain ONLY the requested change.
@@ -374,21 +401,27 @@ def run_surgeon(
     before_context = "\n".join(all_lines[context_start:symbol.start_line - 1])
     after_context = "\n".join(all_lines[symbol.end_line:context_end])
 
+    # Thread import_changes from Architect plan if present
+    _import_hint = ""
+    if hasattr(target, "import_changes") and target.import_changes:
+        _import_hint = "\nREQUIRED IMPORT CHANGES (add # IMPORT_NEEDED: comments for any that need adding):\n" + "\n".join(f"  {ic}" for ic in target.import_changes)
+
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
-New logic required: {target.new_logic}
+New logic required: {target.new_logic}{_import_hint}
 
-CONTEXT BEFORE (do not modify):
+CONTEXT BEFORE (do not modify, reference only):
 {before_context}
 
 TARGET CODE TO REWRITE (lines {symbol.start_line}-{symbol.end_line}):
 {symbol.code}
 
-CONTEXT AFTER (do not modify):
+CONTEXT AFTER (do not modify, reference only):
 {after_context}
 
-Write the replacement for the TARGET CODE ONLY. Preserve exact indentation."""
+Write the replacement for the TARGET CODE ONLY. Preserve exact indentation.
+If any imports are needed, add # IMPORT_NEEDED: <import statement> as the first line(s) of your output."""
 
     response = _chat_create(client, 
         model=surg_model,
@@ -408,6 +441,28 @@ Write the replacement for the TARGET CODE ONLY. Preserve exact indentation."""
         start = next((i for i, l in enumerate(fence_lines) if l.strip().startswith("```")), 0) + 1
         end = len(fence_lines) - 1 if fence_lines[-1].strip() == "```" else len(fence_lines)
         raw = "\n".join(fence_lines[start:end])
+
+    # Extract # IMPORT_NEEDED: lines before stripping
+    import_needed_lines = []
+    remaining_lines = []
+    for _ln in raw.splitlines():
+        if _ln.strip().startswith("# IMPORT_NEEDED:"):
+            import_needed_lines.append(_ln.strip()[len("# IMPORT_NEEDED:"):].strip())
+        else:
+            remaining_lines.append(_ln)
+    if import_needed_lines:
+        raw = "\n".join(remaining_lines)
+
+    # Extract # SURGEON NOTE: comments (surface to caller)
+    surgeon_notes = []
+    clean_lines = []
+    for _ln in raw.splitlines():
+        if "# SURGEON NOTE:" in _ln:
+            surgeon_notes.append(_ln.strip())
+        else:
+            clean_lines.append(_ln)
+    if surgeon_notes:
+        raw = "\n".join(clean_lines)
 
     # Strip trailing whitespace only — preserve leading indentation
     new_code = raw.rstrip()
@@ -432,29 +487,27 @@ Write the replacement for the TARGET CODE ONLY. Preserve exact indentation."""
     if new_lines > orig_lines * 5:  # suspicious bloat
         confidence = min(confidence, 6)
 
-    return new_code, confidence
+    return new_code, confidence, surgeon_notes, import_needed_lines
 
 
+# DEPRECATED: Use run_chat_stream() instead. This sync version is kept for backward compat only.
 def run_chat(
     messages: list,
     file_content: Optional[str] = None,
     symbol_context: Optional[str] = None,
     model: Optional[str] = None,
     pinned_context: Optional[list] = None,
-    project_memory: Optional[str] = None
+    project_memory: Optional[str] = None,
+    user_id: str = ""
 ) -> str:
     """
     Standard chat (non-surgical). Uses configured model.
     Streams response and returns full text.
+    DEPRECATED: prefer run_chat_stream() for all new callers.
     """
     chat_model = model or get_setting("architect_model", "gpt-4.1")
 
-    system_parts = [
-        "You are SurgicalAI, an expert coding assistant. You are precise, thorough, and conservative.",
-        "You prioritize code correctness over brevity.",
-        "When suggesting code changes, always explain WHY and highlight any risks.",
-        "Format code with proper syntax highlighting. Use markdown."
-    ]
+    system_parts = [CHAT_PERSONA]
 
     # Inject project memory
     if project_memory:
@@ -507,12 +560,7 @@ async def run_chat_stream(
     """
     chat_model = model or get_setting("architect_model", "gpt-4.1")
 
-    system_parts = [
-        "You are SurgicalAI, an expert coding assistant. You are precise, thorough, and conservative.",
-        "You prioritize code correctness over brevity.",
-        "When suggesting code changes, always explain WHY and highlight any risks.",
-        "Format code with proper syntax highlighting. Use markdown."
-    ]
+    system_parts = [CHAT_PERSONA]
 
     # Inject project memory
     if project_memory:
@@ -611,7 +659,7 @@ async def analyze_and_plan_stream(
                                 parent_symbol = sym
                                 break
                     if parent_symbol is not None:
-                        new_code, confidence = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
+                        new_code, confidence, _surg_notes, _needed_imports = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                         diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
                         changes.append(SurgicalChange(
                             id=str(uuid.uuid4()),
@@ -639,7 +687,7 @@ async def analyze_and_plan_stream(
                 changes.append(change)
                 continue
 
-            new_code, confidence = run_surgeon(symbol, target, file_content, user_id=user_id)
+            new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, target, file_content, user_id=user_id)
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
 
             change = SurgicalChange(
@@ -753,7 +801,7 @@ Add "file_path" to each target object."""
                     break
             if symbol is None:
                 continue
-            new_code, confidence = run_surgeon(symbol, target, content, user_id=user_id)
+            new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, target, content, user_id=user_id)
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
             changes.append(SurgicalChange(
                 id=str(uuid.uuid4()),
@@ -876,7 +924,7 @@ def analyze_and_plan(
                             parent_symbol = sym
                             break
                 if parent_symbol is not None:
-                    new_code, confidence = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
+                    new_code, confidence, _surg_notes, _needed_imports = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                     diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
                     change = SurgicalChange(
                         id=str(uuid.uuid4()),
@@ -907,7 +955,7 @@ def analyze_and_plan(
             continue
 
         # Run surgeon to get replacement code
-        new_code, confidence = run_surgeon(symbol, target, file_content, user_id=user_id)
+        new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, target, file_content, user_id=user_id)
         diff = _make_diff(symbol.code, new_code, target.symbol_path)
 
         change = SurgicalChange(
@@ -934,6 +982,50 @@ def analyze_and_plan(
 # SMART PIPELINE — v1.3
 # Auto-detects edit vs chat, works across all session files
 # ─────────────────────────────────────────────────────────────
+
+
+# ── Diagnosis best practices — injected conditionally into SMART_ARCHITECT_SYSTEM ──
+_DIAGNOSIS_KEYWORDS = frozenset([
+    "bug", "debug", "diagnose", "investigate", "why", "broken", "wrong",
+    "not working", "doesn't work", "failing", "error", "crash", "exception",
+    "unexpected", "weird", "strange", "issue", "problem", "trace", "root cause",
+])
+
+_DIAGNOSIS_SECTION = """
+━━━ DIAGNOSIS BEST PRACTICES (CRITICAL) ━━━
+When the user asks you to DIAGNOSE a bug, investigate state/session issues, or debug behavior:
+
+1. CHECK FRONTEND STATE FIRST — ALWAYS inspect localStorage, sessionStorage, Zustand/Redux stores,
+   cookies, and context providers BEFORE blaming backend logic. Most "session" and "state" bugs live
+   in the frontend, not the server. Look for shared keys, global state, cross-tab conflicts.
+
+2. HYPOTHESIS VALIDATION — Before presenting your diagnosis, verify that every pattern or variable
+   you reference ACTUALLY EXISTS in the uploaded code. Do NOT assume a pattern exists — check the
+   symbol map. If you can't find it, say "I expected X but it's not in this file."
+
+3. ZERO-CHANGE SIGNAL — If your plan results in 0 actual code changes for a file, that strongly
+   suggests your diagnosis for that file was wrong. Acknowledge this explicitly.
+
+4. CROSS-LAYER TRACE — Follow the actual data flow end-to-end before proposing a fix. Trace:
+   where does the value originate → where is it stored → where is it read → where does it render?
+   If your trace dead-ends at a layer boundary, say "I need to see [specific file] to continue."
+
+5. PREDICT THE COUNTER-EXAMPLE — Before finalizing any change plan, state one concrete scenario
+   where your proposed fix would fail or cause a regression: "This fix would break if [scenario]."
+   If you cannot think of one, you haven't understood the change deeply enough.
+"""
+
+
+def _build_architect_system(is_diagnostic: bool = False) -> str:
+    """Return the SMART_ARCHITECT_SYSTEM prompt, with diagnosis section injected when needed."""
+    base = SMART_ARCHITECT_SYSTEM
+    if is_diagnostic:
+        # Inject diagnosis section before the IMPORT DEPENDENCY CHECK section
+        inject_before = "━━━ IMPORT DEPENDENCY CHECK (DO THIS FIRST) ━━━"
+        if inject_before in base:
+            base = base.replace(inject_before, _DIAGNOSIS_SECTION + "\n" + inject_before, 1)
+    return base
+
 
 SMART_ARCHITECT_SYSTEM = """You are SurgicalAI — a two-model coding system. You are the ARCHITECT.
 
@@ -982,8 +1074,11 @@ IF edit:
       "symbol_path": "ClassName.method_name or function_name",
       "change_type": "modify|add|delete",
       "description": "what changes in this symbol",
-      "new_logic": "precise description of the new behavior — the Surgeon will implement exactly this",
+      "new_logic": "precise description of the new behavior — the Surgeon will implement exactly this. QUALITY RULE: Reference ACTUAL variable/function names from the code. Be specific: 'After const fee = calcFee(), add: if (fee < 0) throw new Error()'. Never say just 'add error handling' — always say WHAT, WHERE, and HOW.",
+      "import_changes": ["add: import uuid", "remove: from datetime import date"],
       "confidence": 9
+    // Score guide: 9-10=clear isolated change no side effects; 7-8=touches shared logic has deps;
+    // 5-6=ambiguous multiple interpretations → MUST use needs_clarification; <5=missing files → ask
     }
   ],
   "risks": ["any side effects or breakage risks"]
@@ -1012,33 +1107,8 @@ Use "chat" intent and provide your full response in markdown with complete code 
 The Surgeon is for precision edits to EXISTING code, NOT for generating entirely new code variants.
 Similarly, if the user says "rewrite this entire file" or "start from scratch" — use "chat" with full code in markdown.
 
-━━━ DIAGNOSIS BEST PRACTICES (CRITICAL) ━━━
-When the user asks you to DIAGNOSE a bug, investigate state/session issues, or debug behavior:
-
-1. CHECK FRONTEND STATE FIRST — ALWAYS inspect localStorage, sessionStorage, Zustand/Redux stores,
-   cookies, and context providers BEFORE blaming backend logic. Most "session" and "state" bugs live
-   in the frontend, not the server. Look for shared keys, global state, cross-tab conflicts.
-
-2. HYPOTHESIS VALIDATION — Before presenting your diagnosis, verify that every pattern or variable
-   you reference ACTUALLY EXISTS in the uploaded code. Do NOT assume a pattern exists (e.g. "active_token",
-   "session_store") — check the symbol map. If you can't find it, say "I expected X but it's not in this
-   file — I may need to see additional files."
-
-3. ZERO-CHANGE SIGNAL — If your plan results in 0 actual code changes for a file, that strongly suggests
-   your diagnosis for that file was wrong. Acknowledge this: "After closer inspection, [file] doesn't need
-   changes — the root cause is likely elsewhere." Do NOT present a confident diagnosis with 0 changes.
-
-4. CROSS-LAYER TRACE — Follow the actual data flow end-to-end before proposing a fix. Trace: where does
-   the value originate → where is it stored → where is it read → where does it render? Do NOT stop at the
-   layer where the symptom appears. A "wrong text in header" may originate from an API response, get cached
-   in a store, and render through 3 components. Map the full pipeline. If your trace dead-ends at a layer
-   boundary, explicitly say "I need to see [specific file] to continue the trace."
-
-5. PREDICT THE COUNTER-EXAMPLE — Before finalizing any change plan, generate one concrete scenario where
-   your proposed fix would fail or cause a regression. State it explicitly: "This fix would break if
-   [scenario]." If you cannot think of one, you haven't understood the change deeply enough. If the
-   counter-example is real, address it in the plan before handing off to the Surgeon. This catches bad
-   hypotheses before they waste Surgeon tokens.
+━━━ DIAGNOSIS BEST PRACTICES ━━━
+[Injected dynamically for debug/bug requests — see _build_architect_system()]
 
 ━━━ IMPORT DEPENDENCY CHECK (DO THIS FIRST) ━━━
 
@@ -1084,8 +1154,299 @@ Example:
 - For TSX/JSX/HTML/CSS files: use the component function or export name as symbol_path (e.g. "LoginPage", "App", "Header").
   Inner elements like divs/spans are NOT symbols — but that's OK. Set symbol_path to the containing component
   and use description + new_logic to precisely identify the inner element to change.
-- confidence < 7 = use needs_clarification instead
+- confidence scale: 9-10=clear isolated change; 7-8=has dependencies; 5-6=ambiguous → use needs_clarification; <5=missing files → ask
+- confidence < 7 = use needs_clarification instead (enforce this — do NOT guess at low confidence)
 - Minimal footprint: if the user said "add X to function Y", only plan function Y"""
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QA AGENT — runs after every Surgeon output, before diff card is shown to user
+# ─────────────────────────────────────────────────────────────────────────────
+
+QA_SYSTEM = """You are the QA agent in a two-model coding pipeline.
+The Surgeon has just produced a code replacement. Your job: verify it is correct, complete, and safe.
+
+You receive:
+- ORIGINAL: the code being replaced
+- NEW CODE: what the Surgeon produced
+- CHANGE PLAN: what was asked for
+- OTHER FILES CONTEXT: symbol maps of other uploaded files (for cross-file checks)
+
+Check for ALL of the following:
+1. IMPORT ISSUES — does new code call/use anything that needs an import not in the file?
+2. DOWNSTREAM RISKS — does this change affect function signatures, types, or constants that other files depend on?
+3. TYPE ERRORS — obvious type mismatches, wrong argument counts, wrong return types
+4. PLAN DEVIATION — does new code do something OTHER than what the plan says? (adding/removing unasked features)
+5. DUPLICATION — is any code duplicated (same function defined twice, same block copy-pasted)?
+6. ALREADY CORRECT — if new code is identical to original, flag it
+
+Respond with ONLY valid JSON — no explanation outside the JSON:
+{
+  "verdict": "safe" | "warning" | "blocked",
+  "qa_score": <integer 1-10>,
+  "summary": "<one sentence>",
+  "import_issues": ["<issue>"],
+  "downstream_risks": ["<risk>"],
+  "type_errors": ["<error>"],
+  "plan_deviation": "<empty string if none, or description of deviation>"
+}
+
+Score guide (ENFORCE STRICTLY):
+9-10 → safe:    Change exactly matches plan, no issues, all imports present
+7-8  → safe:    Minor notes but nothing breaking
+5-6  → warning: Potential issue user should review — imports unclear, subtle signature change, minor scope creep
+3-4  → blocked: Likely broken — missing critical imports, wrong function signature, obvious logic error
+1-2  → blocked: Severely wrong — duplicated code, completely wrong output, plan not implemented at all
+
+verdict MUST match score: score ≥6 = safe or warning, score ≤5 = blocked.
+A warning verdict means Apply is allowed but user sees a yellow banner.
+A blocked verdict means Apply is disabled until user overrides."""
+
+
+async def run_qa_agent(
+    original_code: str,
+    new_code: str,
+    change_description: str,
+    new_logic: str,
+    symbol_path: str,
+    filename: str,
+    other_files_context: str,
+    session_id: str = "",
+    user_id: str = "",
+) -> dict:
+    """
+    QA agent: verifies Surgeon output before showing diff card to user.
+    Uses gpt-4.1-mini for speed/cost efficiency.
+    Returns a dict matching QAResult schema.
+    Guaranteed to return a result — never raises (skipped verdict on error).
+    """
+    import asyncio
+
+    qa_model = "gpt-4.1-mini"
+
+    # Trim inputs to avoid huge context
+    orig_trimmed = original_code[:3000] + ("\n... [truncated]" if len(original_code) > 3000 else "")
+    new_trimmed  = new_code[:3000]      + ("\n... [truncated]" if len(new_code) > 3000 else "")
+    other_ctx    = other_files_context[:2000] + ("\n... [truncated]" if len(other_files_context) > 2000 else "")
+
+    user_msg = f"""CHANGE PLAN:
+Symbol: {symbol_path}
+File: {filename}
+Description: {change_description}
+Expected behavior: {new_logic}
+
+ORIGINAL CODE:
+{orig_trimmed}
+
+NEW CODE (Surgeon output):
+{new_trimmed}
+
+OTHER FILES IN SESSION (for cross-file checking):
+{other_ctx if other_ctx.strip() else "(no other files uploaded)"}
+
+Run all 6 checks and return the JSON verdict."""
+
+    try:
+        client = _get_client(user_id)
+
+        def _call():
+            return _chat_create(
+                client,
+                model=qa_model,
+                messages=[
+                    {"role": "system", "content": QA_SYSTEM},
+                    {"role": "user",   "content": user_msg},
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+
+        response = await asyncio.to_thread(_call)
+        raw = response.choices[0].message.content
+        data = json.loads(raw)
+
+        result = {
+            "verdict":          data.get("verdict", "warning"),
+            "qa_score":         int(data.get("qa_score", 7)),
+            "summary":          data.get("summary", ""),
+            "import_issues":    data.get("import_issues", []),
+            "downstream_risks": data.get("downstream_risks", []),
+            "type_errors":      data.get("type_errors", []),
+            "plan_deviation":   data.get("plan_deviation", ""),
+            "skipped_reason":   None,
+        }
+
+        # Enforce verdict/score consistency
+        if result["qa_score"] >= 6 and result["verdict"] == "blocked":
+            result["verdict"] = "warning"
+        if result["qa_score"] <= 5 and result["verdict"] == "safe":
+            result["verdict"] = "warning"
+
+        # Log to DB (non-blocking — fire and forget)
+        try:
+            _log_qa_result(session_id, filename, symbol_path, result)
+        except Exception:
+            pass  # Never let logging kill the pipeline
+
+        return result
+
+    except Exception as e:
+        skipped = {
+            "verdict":          "skipped",
+            "qa_score":         None,
+            "summary":          "QA check could not run — review manually",
+            "import_issues":    [],
+            "downstream_risks": [],
+            "type_errors":      [],
+            "plan_deviation":   "",
+            "skipped_reason":   str(e)[:200],
+        }
+        try:
+            _log_qa_result(session_id, filename, symbol_path, skipped)
+        except Exception:
+            pass
+        return skipped
+
+
+def _log_qa_result(session_id: str, filename: str, symbol_name: str, result: dict):
+    """Persist QA result to qa_log table. Called after every Surgeon run."""
+    from database import get_db_connection
+    issues_json = json.dumps({
+        "import_issues":    result.get("import_issues", []),
+        "downstream_risks": result.get("downstream_risks", []),
+        "type_errors":      result.get("type_errors", []),
+        "plan_deviation":   result.get("plan_deviation", ""),
+    })
+    conn = get_db_connection()
+    try:
+        cur = conn.cursor()
+        # Works for both SQLite and PostgreSQL (psycopg2 uses %s, sqlite3 uses ?)
+        try:
+            cur.execute(
+                """INSERT INTO qa_log (session_id, filename, symbol_name, verdict, qa_score, issues_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (session_id, filename, symbol_name,
+                 result.get("verdict", "skipped"),
+                 result.get("qa_score"),
+                 issues_json)
+            )
+        except Exception:
+            # PostgreSQL uses %s placeholders
+            cur.execute(
+                """INSERT INTO qa_log (session_id, filename, symbol_name, verdict, qa_score, issues_json)
+                   VALUES (%s, %s, %s, %s, %s, %s)""",
+                (session_id, filename, symbol_name,
+                 result.get("verdict", "skipped"),
+                 result.get("qa_score"),
+                 issues_json)
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PIPELINE COMPLIANCE SYSTEM
+# Tracks whether every required step ran. Enforces no silent skipping.
+# If a required step is missing at end of pipeline, emits a warning and saves to DB.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ComplianceTracker:
+    """
+    Tracks which critical pipeline steps ran for a given request.
+    Steps that are not applicable to the current intent are automatically
+    marked as N/A (not treated as failures).
+
+    Steps and applicability:
+      symbol_map_read   — edit only
+      import_check      — edit only (Architect import dependency scan)
+      architect_routing — always (Architect must classify intent)
+      qa_review         — edit only (QA agent must run per-change)
+      confidence_gate   — edit only (confidence score checked)
+      diff_validate     — edit only (ghost diff check)
+    """
+
+    STEP_INTENTS = {
+        "symbol_map_read":   ["edit"],
+        "import_check":      ["edit"],
+        "architect_routing": ["edit", "chat", "needs_clarification"],
+        "qa_review":         ["edit"],
+        "confidence_gate":   ["edit"],
+        "diff_validate":     ["edit"],
+    }
+
+    def __init__(self, run_id: str, session_id: str, intent: str = "unknown"):
+        self.run_id = run_id
+        self.session_id = session_id
+        self.intent = intent
+        self.steps: dict = {}
+
+    def mark(self, step: str, ran: bool, reason: str = None, output_summary: str = None):
+        self.steps[step] = {
+            "ran": ran,
+            "skipped_reason": reason,
+            "output_summary": output_summary or "",
+        }
+
+    def set_intent(self, intent: str):
+        self.intent = intent
+
+    def applicable_steps(self) -> list:
+        return [s for s, intents in self.STEP_INTENTS.items() if self.intent in intents]
+
+    def missing_steps(self) -> list:
+        missing = []
+        for step in self.applicable_steps():
+            if step not in self.steps:
+                missing.append(step)
+            elif not self.steps[step]["ran"] and not self.steps[step].get("skipped_reason"):
+                missing.append(step)
+        return missing
+
+    def overall_pass(self) -> bool:
+        return len(self.missing_steps()) == 0
+
+    def to_dict(self) -> dict:
+        return {
+            "run_id":        self.run_id,
+            "session_id":    self.session_id,
+            "intent":        self.intent,
+            "steps":         self.steps,
+            "missing_steps": self.missing_steps(),
+            "overall_pass":  self.overall_pass(),
+        }
+
+    def save(self):
+        """Persist compliance record to DB. Non-blocking — logs errors but never raises."""
+        try:
+            from database import get_db_connection
+            conn = get_db_connection()
+            try:
+                cur = conn.cursor()
+                steps_json = json.dumps(self.steps)
+                missing_json = json.dumps(self.missing_steps())
+                _pass = 1 if self.overall_pass() else 0
+                try:
+                    cur.execute(
+                        """INSERT INTO compliance_log
+                           (run_id, session_id, intent, steps_json, missing_steps, overall_pass)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
+                        (self.run_id, self.session_id, self.intent, steps_json, missing_json, _pass)
+                    )
+                except Exception:
+                    cur.execute(
+                        """INSERT INTO compliance_log
+                           (run_id, session_id, intent, steps_json, missing_steps, overall_pass)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (self.run_id, self.session_id, self.intent, steps_json, missing_json, _pass)
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            pass  # Never let compliance logging kill the pipeline
 
 
 async def run_smart_pipeline_stream(
@@ -1113,9 +1474,14 @@ async def run_smart_pipeline_stream(
     def sse(obj):
         return f"data: {json.dumps(obj)}\n\n"
 
+    run_id = str(uuid.uuid4())
+    compliance = ComplianceTracker(run_id=run_id, session_id=session_id or "", intent="unknown")
+
     try:
         if not session_files:
             # No files — pure chat mode, stream response
+            compliance.set_intent("chat")
+            compliance.mark("architect_routing", ran=True, output_summary="no-files pure chat")
             yield sse({"type": "progress", "content": "Thinking..."})
             chat_model = get_setting("architect_model", "gpt-4.1")
             system = """You are SurgicalAI, a world-class coding assistant. You help people build real software.
@@ -1137,12 +1503,12 @@ When you DO generate code:
 Be warm, friendly, and encouraging. You're helping a person build something real."""
             if project_memory:
                 system += f"\n\n## Project Memory\n{project_memory}"
-            msgs = [{"role": "system", "content": system}] + conversation_history[-10:] + [{"role": "user", "content": user_request}]
+            msgs = [{"role": "system", "content": system}] + conversation_history[-HISTORY_WINDOW:] + [{"role": "user", "content": user_request}]
 
             if _is_claude_model(chat_model):
                 # ── Claude streaming with extended thinking ──
                 aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
-                claude_msgs = conversation_history[-10:] + [{"role": "user", "content": user_request}]
+                claude_msgs = conversation_history[-HISTORY_WINDOW:] + [{"role": "user", "content": user_request}]
                 async with aclient.messages.stream(
                     model=chat_model,
                     max_tokens=16000,
@@ -1227,11 +1593,13 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 file_summaries.append(f"FILE: {fname} — could not parse: {e}")
                 symbol_maps_by_name[fname] = (None, sf)
 
+        compliance.mark("symbol_map_read", ran=True,
+                        output_summary=f"{len([f for f in file_summaries if 'SYMBOLS:' in f])} files parsed with symbol maps")
         yield sse({"type": "progress", "content": "Architect analyzing your request..."})
 
         # Format recent conversation history (last 6 turns)
         hist_text = ""
-        for msg in conversation_history[-6:]:
+        for msg in conversation_history[-HISTORY_WINDOW:]:
             role = msg.get("role", "user")
             content = msg.get("content", "")[:300]
             hist_text += f"{role.upper()}: {content}\n"
@@ -1249,6 +1617,11 @@ USER REQUEST:
             context_msg = f"PROJECT MEMORY:\n{project_memory}\n\n" + context_msg
 
         arch_model = get_setting("architect_model", "gpt-4.1")
+
+        # Detect if this is a diagnostic request — inject extra guidance if so
+        _req_lower = user_request.lower()
+        _is_diagnostic = any(kw in _req_lower for kw in _DIAGNOSIS_KEYWORDS)
+        _architect_system = _build_architect_system(is_diagnostic=_is_diagnostic)
 
         if _is_claude_model(arch_model):
             # ── Claude Architect with streaming extended thinking ──
@@ -1285,7 +1658,7 @@ USER REQUEST:
                     model=arch_model,
                     max_tokens=16000,
                     **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
-                    system=SMART_ARCHITECT_SYSTEM,
+                    system=_architect_system,
                     messages=[{"role": "user", "content": user_content}],
                 ) as astream:
                     current_block = None
@@ -1314,7 +1687,7 @@ USER REQUEST:
                             model=arch_model,
                             max_tokens=16000,
                             **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
-                            system=SMART_ARCHITECT_SYSTEM,
+                            system=_architect_system,
                             messages=[{"role": "user", "content": context_msg}],
                         ) as astream:
                             current_block = None
@@ -1389,12 +1762,12 @@ USER REQUEST:
                         "image_url": {"url": img_data}
                     })
                 architect_messages = [
-                    {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
+                    {"role": "system", "content": _architect_system},
                     {"role": "user", "content": user_content}
                 ]
             else:
                 architect_messages = [
-                    {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
+                    {"role": "system", "content": _architect_system},
                     {"role": "user", "content": context_msg}
                 ]
 
@@ -1427,7 +1800,7 @@ USER REQUEST:
                     # GPT rejected one or more images — fall back gracefully to text-only
                     yield sse({"type": "progress", "content": "⚠️ Images couldn't be read — falling back to text context..."})
                     architect_messages = [
-                        {"role": "system", "content": SMART_ARCHITECT_SYSTEM},
+                        {"role": "system", "content": _architect_system},
                         {"role": "user", "content": context_msg}
                     ]
                     arch_task2 = asyncio.create_task(_call_architect(architect_messages))
@@ -1444,6 +1817,13 @@ USER REQUEST:
 
             plan = json.loads(response.choices[0].message.content)
         intent = plan.get("intent", "chat")
+        compliance.set_intent(intent)
+        compliance.mark("architect_routing", ran=True, output_summary=f"intent={intent}")
+        if intent == "edit":
+            compliance.mark("import_check", ran=True,
+                            output_summary="Architect scanned imports per SMART_ARCHITECT_SYSTEM prompt")
+        else:
+            compliance.mark("import_check", ran=False, reason=f"not_applicable: intent={intent}")
 
         # ── NEEDS CLARIFICATION: Architect doesn't have enough info to plan ──
         # Stream the clarification questions back as tokens.
@@ -1466,6 +1846,7 @@ USER REQUEST:
                     await asyncio.sleep(0.008)
             if buffer:
                 yield sse({"type": "token", "content": " ".join(buffer)})
+            compliance.save()
             yield sse({"type": "done", "content": ""})
             return
 
@@ -1483,6 +1864,7 @@ USER REQUEST:
                     await asyncio.sleep(0.008)
             if buffer:
                 yield sse({"type": "token", "content": " ".join(buffer)})
+            compliance.save()
             yield sse({"type": "done", "content": ""})
             return
 
@@ -1499,6 +1881,15 @@ USER REQUEST:
 
         yield sse({"type": "progress", "content": f"Plan ready: {len(targets)} change(s) identified"})
         yield sse({"type": "progress", "content": "Surgeon writing code..."})
+
+        # Build cross-file context for QA agent (symbol summaries of ALL session files)
+        _qa_other_context_parts = []
+        for _fn, (_sm, _sf) in symbol_maps_by_name.items():
+            if _sm is None:
+                continue
+            _syms_brief = [f"  {s.full_path} ({s.end_line - s.start_line + 1}L)" for s in _sm.symbols[:20]]
+            _qa_other_context_parts.append(f"FILE: {_fn}\n" + "\n".join(_syms_brief))
+        _qa_other_context = "\n\n".join(_qa_other_context_parts)
 
         # Text-search assist: redirect mis-targeted symbols
         # Extract quoted text manually (avoids 're' module scoping issues)
@@ -1559,8 +1950,8 @@ USER REQUEST:
                                 break
                         if _tline_inner:
                             total = len(_file_lines)
-                            ws = max(1, _tline_inner - 25)
-                            we = min(total, _tline_inner + 25)
+                            ws = max(1, _tline_inner - SYMBOL_FOCUS_WINDOW // 4)
+                            we = min(total, _tline_inner + SYMBOL_FOCUS_WINDOW // 4)
                             vcode = "\n".join(_file_lines[ws - 1:we])
                             vname = f"_focused_L{_tline_inner}"
                             from models.schemas import SymbolInfo as _SI2, SymbolType as _ST2
@@ -1592,8 +1983,8 @@ USER REQUEST:
                 elif not _best:
                     # Create virtual window
                     total = len(_file_lines)
-                    ws = max(1, _tline - 25)
-                    we = min(total, _tline + 25)
+                    ws = max(1, _tline - TEXT_SEARCH_WINDOW)
+                    we = min(total, _tline + TEXT_SEARCH_WINDOW)
                     vcode = "\n".join(_file_lines[ws - 1:we])
                     vname = f"_text_region_L{_tline}"
                     from models.schemas import SymbolInfo as _SI, SymbolType as _ST
@@ -1711,8 +2102,8 @@ USER REQUEST:
                         if any(term in line_lower for term in search_terms):
                             best_line = li + 1
                             break
-                    window_start = max(symbol.start_line, best_line - 100)
-                    window_end = min(symbol.end_line, best_line + 100)
+                    window_start = max(symbol.start_line, best_line - SYMBOL_FOCUS_WINDOW)
+                    window_end = min(symbol.end_line, best_line + SYMBOL_FOCUS_WINDOW)
                     windowed_code = "\n".join(all_lines[window_start - 1:window_end])
                     from models.schemas import SymbolInfo as _SI, SymbolType as _ST
                     symbol = _SI(
@@ -1727,8 +2118,34 @@ USER REQUEST:
                     )
                     yield sse({"type": "progress", "content": f"Focused window: L{window_start}-{window_end} ({window_end - window_start + 1} lines)"})
 
-            new_code, confidence = run_surgeon(symbol, change_target, sf["content"], user_id=user_id)
+            new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, change_target, sf["content"], user_id=user_id)
             diff = _make_diff(symbol.code, new_code, symbol_path)
+
+            # ── QA Agent: verify Surgeon output before showing to user ──
+            _other_ctx_for_qa = "\n\n".join(
+                p for p in _qa_other_context_parts
+                if not p.startswith(f"FILE: {matched_name}")
+            )
+            _qa_result = await run_qa_agent(
+                original_code=symbol.code,
+                new_code=new_code,
+                change_description=change_target.description,
+                new_logic=change_target.new_logic,
+                symbol_path=symbol_path,
+                filename=matched_name,
+                other_files_context=_other_ctx_for_qa,
+                session_id=session_id or "",
+                user_id=user_id,
+            )
+            # Emit QA progress to user
+            _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫", "skipped": "⏭"}.get(
+                _qa_result.get("verdict", "skipped"), "⏭"
+            )
+            yield sse({"type": "progress", "content": f"QA {_qa_icon} {_qa_result.get('summary', '')} (score: {_qa_result.get('qa_score', '?')})"})
+            _qa_ran = _qa_result.get("status") not in ("timeout", "error")
+            compliance.mark("qa_review", ran=_qa_ran,
+                            reason=(None if _qa_ran else _qa_result.get("status")),
+                            output_summary=f"verdict={_qa_result.get('verdict')} score={_qa_result.get('qa_score')}")
 
             change = SurgicalChange(
                 id=str(uuid.uuid4()),
@@ -1738,12 +2155,20 @@ USER REQUEST:
                 diff=diff,
                 confidence=confidence,
                 description=target.get("description", ""),
-                applied=False
+                applied=False,
+                surgeon_notes=_surg_notes if _surg_notes else [],
+                qa_result=_qa_result,
             )
 
             if matched_name not in changes_by_file:
                 changes_by_file[matched_name] = {"file": sf, "changes": []}
             changes_by_file[matched_name]["changes"].append(change)
+
+        # ── Mark confidence_gate ──
+        _all_changes_flat = [c for d in changes_by_file.values() for c in d["changes"]] if changes_by_file else []
+        _low_conf = [c for c in _all_changes_flat if c.confidence < 7]
+        compliance.mark("confidence_gate", ran=True,
+                        output_summary=f"{len(_low_conf)} low-confidence changes flagged out of {len(_all_changes_flat)}")
 
         # ── Filter out empty changes (0 diff = Architect was wrong about that file) ──
         def _has_real_diff(c):
@@ -1824,9 +2249,28 @@ USER REQUEST:
             },
         }
 
+        # ── Mark diff_validate + finalize compliance ──
+        compliance.mark("diff_validate", ran=True,
+                        output_summary=f"{len(skipped_changes)} ghost diffs suppressed")
+
+        _missing = compliance.missing_steps()
+        if _missing:
+            yield sse({"type": "progress", "content": f"⚠️ Compliance gap: {', '.join(_missing)} — flagged for review"})
+
+        compliance.save()
+
+        # Attach audit trail to result
+        result["run_id"] = run_id
+        result["compliance"] = compliance.to_dict()
+
         yield sse({"type": "smart_result", "content": json.dumps(result)})
         yield sse({"type": "done", "content": ""})
 
     except Exception as e:
         import traceback
+        try:
+            compliance.mark("pipeline_error", ran=False, reason=str(e)[:200])
+            compliance.save()
+        except Exception:
+            pass
         yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"

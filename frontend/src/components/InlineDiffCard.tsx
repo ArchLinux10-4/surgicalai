@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { CheckCircle, XCircle, Download, ChevronDown, ChevronUp, AlertTriangle, FileCode, RotateCcw, SkipForward } from 'lucide-react'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
-import type { SmartResult } from '../types'
+import type { SmartResult, QAResult } from '../types'
 import { LivePreview, isVisualFile } from './LivePreview'
 
 interface Props {
@@ -27,6 +27,59 @@ const saveApplied = (sessionId: string, changeId: string) => {
   try { localStorage.setItem(appliedKey(sessionId, changeId), '1') } catch {}
 }
 // -----------------------------------------------------------------------
+
+
+function QABadge({ qa }: { qa: QAResult }) {
+  const [expanded, setExpanded] = useState(false)
+  const styles: Record<string, string> = {
+    safe:    'text-green-400 bg-green-400/10 border-green-400/30',
+    warning: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
+    blocked: 'text-red-400 bg-red-400/10 border-red-400/30',
+    skipped: 'text-gray-400 bg-gray-400/10 border-gray-400/30',
+  }
+  const icons: Record<string, string> = { safe: '✅', warning: '⚠️', blocked: '🚫', skipped: '⏭' }
+  const color = styles[qa.verdict] || styles.skipped
+  const icon = icons[qa.verdict] || '⏭'
+  const score = qa.qa_score !== null ? ` ${qa.qa_score}/10` : ''
+  const issues = [
+    ...qa.import_issues,
+    ...qa.downstream_risks,
+    ...qa.type_errors,
+    ...(qa.plan_deviation ? [qa.plan_deviation] : []),
+  ].filter(Boolean)
+  return (
+    <span className="relative">
+      <button
+        onClick={() => setExpanded(e => !e)}
+        className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border cursor-pointer ${color}`}
+        title={qa.summary}
+      >
+        QA {icon}{score}
+      </button>
+      {expanded && (
+        <div className="absolute left-0 top-6 z-50 w-72 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-xl p-3 text-[12px]">
+          <div className="flex items-center justify-between mb-2">
+            <span className="font-semibold">QA Report</span>
+            <button onClick={() => setExpanded(false)} className="text-muted hover:text-white">✕</button>
+          </div>
+          <p className="text-muted mb-2">{qa.summary || 'No summary'}</p>
+          {issues.length > 0 && (
+            <ul className="space-y-1">
+              {issues.map((issue, i) => (
+                <li key={i} className="flex gap-1.5 text-yellow-300">
+                  <span>•</span><span>{issue}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+          {qa.skipped_reason && (
+            <p className="text-muted mt-1 italic">Skipped: {qa.skipped_reason}</p>
+          )}
+        </div>
+      )}
+    </span>
+  )
+}
 
 function ConfidenceBadge({ score }: { score: number }) {
   const color = score >= 8 ? 'text-green-400 bg-green-400/10 border-green-400/30'
@@ -299,6 +352,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     <AlertTriangle size={10} /> Review carefully
                   </span>
                 )}
+                {change.qa_result && <QABadge qa={change.qa_result} />}
               </div>
               <p className="text-[12px] text-muted mt-0.5">{change.description}</p>
             </div>
@@ -359,14 +413,25 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               </span>
             ) : (
               <>
-                <button
-                  onClick={() => handleApply(change)}
-                  disabled={applying[change.id]}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-green-500/20 text-green-400 border border-green-500/30 rounded-lg text-[12px] font-semibold hover:bg-green-500/30 transition-colors disabled:opacity-50"
-                >
-                  <CheckCircle size={12} />
-                  {applying[change.id] ? 'Applying...' : 'Apply'}
-                </button>
+                {change.qa_result?.verdict === 'blocked' ? (
+                  <button
+                    disabled
+                    title={`QA blocked: ${change.qa_result.summary}`}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/10 text-red-400 border border-red-500/30 rounded-lg text-[12px] font-semibold opacity-60 cursor-not-allowed"
+                  >
+                    🚫 Blocked by QA
+                  </button>
+                ) : (
+                  <button
+                    onClick={() => handleApply(change)}
+                    disabled={applying[change.id]}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-green-500/20 text-green-400 border border-green-500/30 rounded-lg text-[12px] font-semibold hover:bg-green-500/30 transition-colors disabled:opacity-50"
+                  >
+                    <CheckCircle size={12} />
+                    {applying[change.id] ? 'Applying...' : 'Apply'}
+                    {change.qa_result?.verdict === 'warning' && ' ⚠️'}
+                  </button>
+                )}
                 <button
                   onClick={() => setSkipped(p => ({ ...p, [change.id]: true }))}
                   className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors"

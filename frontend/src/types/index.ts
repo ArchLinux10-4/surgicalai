@@ -47,6 +47,17 @@ export interface SymbolInfo {
   full_path?: string
 }
 
+export interface QAResult {
+  verdict: 'safe' | 'warning' | 'blocked' | 'skipped'
+  qa_score: number | null
+  summary: string
+  import_issues: string[]
+  downstream_risks: string[]
+  type_errors: string[]
+  plan_deviation: string
+  skipped_reason?: string | null
+}
+
 export interface SurgicalChange {
   id: string
   symbol: SymbolInfo
@@ -56,6 +67,8 @@ export interface SurgicalChange {
   confidence: number
   description: string
   applied: boolean
+  surgeon_notes?: string[]
+  qa_result?: QAResult
 }
 
 export interface ArchitectPlan {

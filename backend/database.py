@@ -131,6 +131,11 @@ class CompatConn:
 # Public API
 # ---------------------------------------------------------------------------
 
+def get_db_connection():
+    """Alias for get_db() used by pipeline compliance + QA logging."""
+    return get_db()
+
+
 def get_db():
     if USE_POSTGRES:
         return CompatConn(DATABASE_URL)
@@ -274,6 +279,32 @@ def _init_sqlite():
         cur.execute("ALTER TABLE session_files ADD COLUMN previous_content TEXT")
     if "updated_at" not in sf_cols:
         cur.execute("ALTER TABLE session_files ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+
+    # Migration: add QA log + compliance log tables
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS qa_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT,
+            filename TEXT,
+            symbol_name TEXT,
+            verdict TEXT,
+            qa_score INTEGER,
+            issues_json TEXT,
+            ran_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS compliance_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id TEXT UNIQUE,
+            session_id TEXT,
+            intent TEXT,
+            steps_json TEXT,
+            missing_steps TEXT,
+            overall_pass INTEGER DEFAULT 1,
+            ran_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     _seed_defaults_sqlite(cur)
     conn.commit()
