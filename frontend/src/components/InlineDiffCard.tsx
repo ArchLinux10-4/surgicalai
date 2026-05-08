@@ -1,4 +1,6 @@
 import React, { useState, useEffect } from 'react'
+import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
+import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { CheckCircle, XCircle, Download, ChevronDown, ChevronUp, AlertTriangle, FileCode, RotateCcw, SkipForward } from 'lucide-react'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
@@ -99,6 +101,77 @@ function parseDiffStartLine(diff: string): number | null {
   return match ? parseInt(match[1], 10) : null
 }
 
+// ── Language detection from file extension ─────────────────────────────────
+const EXT_TO_LANG: Record<string, string> = {
+  py: 'python', js: 'javascript', jsx: 'jsx', ts: 'typescript', tsx: 'tsx',
+  go: 'go', rs: 'rust', java: 'java', cpp: 'cpp', cc: 'cpp', c: 'c',
+  cs: 'csharp', rb: 'ruby', php: 'php', swift: 'swift', kt: 'kotlin',
+  sh: 'bash', bash: 'bash', zsh: 'bash', json: 'json', yaml: 'yaml',
+  yml: 'yaml', toml: 'toml', md: 'markdown', html: 'html', css: 'css',
+  scss: 'scss', sql: 'sql', xml: 'xml',
+}
+
+function getLangFromFilename(filename: string): string {
+  const ext = filename.split('.').pop()?.toLowerCase() || ''
+  return EXT_TO_LANG[ext] || 'text'
+}
+
+// ── DiffBlock: single SyntaxHighlighter per change with per-line colors ──────
+function DiffBlock({ diff, language }: { diff: string; language: string }) {
+  const rawLines = diff.split('\n')
+  type Prefix = 'add' | 'remove' | 'hunk' | 'header' | 'context'
+  const prefixes: Prefix[] = []
+  const codeLines: string[] = []
+
+  for (const line of rawLines) {
+    if (line.startsWith('+++') || line.startsWith('---')) {
+      prefixes.push('header'); codeLines.push(line)
+    } else if (line.startsWith('@@')) {
+      prefixes.push('hunk'); codeLines.push(line)
+    } else if (line.startsWith('+')) {
+      prefixes.push('add'); codeLines.push(line)
+    } else if (line.startsWith('-')) {
+      prefixes.push('remove'); codeLines.push(line)
+    } else {
+      prefixes.push('context'); codeLines.push(line)
+    }
+  }
+
+  const code = codeLines.join('\n')
+
+  return (
+    <SyntaxHighlighter
+      language={language === 'text' ? 'text' : language}
+      style={vscDarkPlus}
+      wrapLines={true}
+      wrapLongLines={false}
+      lineProps={(lineNumber: number) => {
+        const p = prefixes[lineNumber - 1]
+        const s: React.CSSProperties = { display: 'block', width: '100%' }
+        if (p === 'add')    s.backgroundColor = 'rgba(74,  222, 128, 0.12)'
+        if (p === 'remove') s.backgroundColor = 'rgba(248, 113, 113, 0.12)'
+        if (p === 'hunk')   s.backgroundColor = 'rgba(96,  165, 250, 0.08)'
+        return { style: s }
+      }}
+      customStyle={{
+        background: 'transparent',
+        padding: '0',
+        margin: '0',
+        fontSize: '12px',
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        lineHeight: '1.6',
+      }}
+      codeTagProps={{ style: {
+        fontSize: '12px',
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+      }}}
+      PreTag="div"
+    >
+      {code}
+    </SyntaxHighlighter>
+  )
+}
+
 function DiffLine({ line }: { line: string }) {
   const isAdd = line.startsWith('+') && !line.startsWith('+++')
   const isRemove = line.startsWith('-') && !line.startsWith('---')
@@ -142,6 +215,9 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       .then(f => setOriginalCode(f.content))
       .catch(() => {})
   }, [sessionId, fileData.file_id, filename])
+
+  // Derive language for syntax highlighting from the filename
+  const langFromFilename = getLangFromFilename(filename)
 
   // Filter out ghost diffs (0 added + 0 removed) on the frontend side
   const realChanges = fileData.changes.filter((c: any) => {
@@ -383,9 +459,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               </span>
             </div>
             <div className="bg-base max-h-96 overflow-y-auto">
-              {(change.diff || '').split('\n').map((line: string, i: number) => (
-                <DiffLine key={i} line={line} />
-              ))}
+              <DiffBlock diff={change.diff || ''} language={langFromFilename} />
             </div>
           </div>
 
