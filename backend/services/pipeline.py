@@ -85,6 +85,54 @@ def _get_anthropic_key(user_id: str = "") -> str:
     return key
 
 
+def _friendly_error(e: Exception) -> str:
+    """Translate technical API/pipeline errors into plain-English messages for the user."""
+    msg = str(e)
+    low = msg.lower()
+    cls = type(e).__name__.lower()
+
+    # Anthropic-specific errors
+    if "anthropic" in cls or (("500" in msg or "529" in msg or "overload" in low) and "anthropic" in (cls + low)):
+        if "overloaded" in low or "529" in msg:
+            return ("The AI service is temporarily overloaded. "
+                    "Please wait a moment and try again — it usually clears in a few seconds.")
+        if "500" in msg or "internal_server_error" in low:
+            return ("The AI service hit a temporary server error (500). "
+                    "This usually resolves quickly — please try again.")
+        if "context_length" in low or "too long" in low or "max_tokens" in low:
+            return ("Your file may be too large to process in one pass. "
+                    "Try uploading just the specific function or section you want to change.")
+        if "rate_limit" in low or "429" in msg:
+            return "You've hit the API rate limit. Wait a few seconds and try again."
+        if "invalid" in low and "key" in low:
+            return "Your Anthropic API key appears to be invalid. Check **Settings → API Keys**."
+
+    # OpenAI-specific errors
+    if "openai" in cls or ("openai" in low and ("error" in low or "429" in msg or "500" in msg)):
+        if "rate_limit" in low or "429" in msg:
+            return "You've hit the OpenAI rate limit. Wait a moment and try again."
+        if "invalid" in low and "key" in low:
+            return "Your OpenAI API key appears to be invalid. Check **Settings → API Keys**."
+        if "context_length" in low or "too long" in low:
+            return ("The context window is full. Try uploading a smaller file or asking about "
+                    "a specific function.")
+
+    # Connection / timeout
+    if "timeout" in low or "timed out" in low:
+        return ("The request timed out. This can happen with large files — "
+                "try again or ask about a specific function instead of the whole file.")
+    if "connect" in low and ("refused" in low or "error" in low):
+        return "Couldn't reach the AI service. Check your internet connection and try again."
+
+    # Already-friendly messages from our own validators (pass through as-is)
+    if "not configured" in low and "api key" in low:
+        return msg
+
+    # Generic fallback — never show raw Python dict/object representations
+    short = msg[:150].replace("{", "(").replace("}", ")").replace("'type'", "type")
+    return f"Something went wrong. Please try again in a moment. *(Detail: {short})*"
+
+
 def _chat_create(client: OpenAI, model: str, messages: list, temperature: float = 0.3, **kwargs):
     """Wrapper around client.chat.completions.create that drops temperature
     for models that don't support it (GPT-5, o-series reasoning models)."""
@@ -612,7 +660,7 @@ async def run_chat_stream(
                 if delta.content:
                     yield f"data: {json.dumps({'type': 'token', 'content': delta.content})}\n\n"
     except Exception as e:
-        yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+        yield sse({"type": "error", "content": _friendly_error(e)})
 
     yield f"data: {json.dumps({'type': 'done', 'content': ''})}\n\n"
 
@@ -1574,20 +1622,35 @@ Be warm, friendly, and encouraging. You're helping a person build something real
             try:
                 smap = parser.parse(content, fname)
                 symbol_maps_by_name[fname] = (smap, sf)
+                # ── Smart symbol selection for large files ──
+                # Sort: prefer smaller (more surgical) symbols; functions before HTML elements
+                _PRIORITY_TYPES = {"function": 0, "method": 1, "class": 2, "variable": 3}
+                _sorted_syms = sorted(
+                    smap.symbols,
+                    key=lambda s: (
+                        _PRIORITY_TYPES.get(s.symbol_type.value, 9),  # functions first
+                        s.end_line - s.start_line,                    # smaller symbols first
+                    )
+                )
+                _MAX_SYMS = 60
+                _SNIPPET_LEN = 80  # shorter snippets reduce noise for large files
                 syms = []
-                for s in smap.symbols:
+                for s in _sorted_syms[:_MAX_SYMS]:
                     size = s.end_line - s.start_line + 1
                     size_warn = " ⚠️LARGE" if size > 500 else ""
                     entry = f"  [{s.symbol_type.value}] {s.full_path} ({size} lines, L{s.start_line}-{s.end_line}){size_warn}"
-                    snippet = s.code[:120].replace("\n", " ").strip()
+                    snippet = s.code[:_SNIPPET_LEN].replace("\n", " ").strip()
                     if snippet:
                         entry += f"  >> {snippet}"
                     if s.signature:
                         entry += f" — {s.signature}"
                     syms.append(entry)
+                _total_syms = len(smap.symbols)
+                _sym_header = f"SYMBOLS ({_total_syms} total" + (f", showing {_MAX_SYMS} most targeted" if _total_syms > _MAX_SYMS else "") + "):"
+                _sym_suffix = "" if _total_syms <= _MAX_SYMS else f"\n  ... [{_total_syms - _MAX_SYMS} more — use narrowest symbol rule; prefer small symbols under 200 lines]"
                 file_summaries.append(
                     f"FILE: {fname} ({sf.get('lines', len(content.splitlines()))} lines, {sf.get('language', 'code')})\n"
-                    f"SYMBOLS:\n" + ("\n".join(syms[:40]) if syms else "  (no symbols parsed)")
+                    f"{_sym_header}\n" + ("\n".join(syms) + _sym_suffix if syms else "  (no symbols parsed)")
                 )
             except Exception as e:
                 file_summaries.append(f"FILE: {fname} — could not parse: {e}")
@@ -1601,7 +1664,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
         hist_text = ""
         for msg in conversation_history[-HISTORY_WINDOW:]:
             role = msg.get("role", "user")
-            content = msg.get("content", "")[:300]
+            content = msg.get("content", "")[:1200]  # raised from 300 — preserves clarification Q&A
             hist_text += f"{role.upper()}: {content}\n"
 
         context_msg = f"""UPLOADED FILES:
@@ -1653,62 +1716,76 @@ USER REQUEST:
             response_text_chunks = []
             claude_failed = False
 
-            try:
-                async with aclient.messages.stream(
-                    model=arch_model,
-                    max_tokens=16000,
-                    **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
-                    system=_architect_system,
-                    messages=[{"role": "user", "content": user_content}],
-                ) as astream:
-                    current_block = None
-                    async for event in astream:
-                        if event.type == "content_block_start":
-                            current_block = getattr(event.content_block, 'type', None)
-                            if current_block == "thinking":
-                                yield sse({"type": "thinking_start", "content": ""})
-                        elif event.type == "content_block_delta":
-                            if hasattr(event.delta, 'thinking'):
-                                yield sse({"type": "thinking", "content": event.delta.thinking})
-                                thinking_chunks.append(event.delta.thinking)
-                            elif hasattr(event.delta, 'text'):
-                                response_text_chunks.append(event.delta.text)
-                        elif event.type == "content_block_stop":
-                            if current_block == "thinking":
-                                yield sse({"type": "thinking_end", "content": ""})
-            except Exception as claude_err:
-                err_str = str(claude_err).lower()
-                if image_files and ("image" in err_str or "unsupported" in err_str):
-                    yield sse({"type": "progress", "content": "⚠️ Images failed — retrying text-only..."})
-                    thinking_chunks = []
-                    response_text_chunks = []
-                    try:
-                        async with aclient.messages.stream(
-                            model=arch_model,
-                            max_tokens=16000,
-                            **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
-                            system=_architect_system,
-                            messages=[{"role": "user", "content": context_msg}],
-                        ) as astream:
-                            current_block = None
-                            async for event in astream:
-                                if event.type == "content_block_start":
-                                    current_block = getattr(event.content_block, 'type', None)
-                                    if current_block == "thinking":
-                                        yield sse({"type": "thinking_start", "content": ""})
-                                elif event.type == "content_block_delta":
-                                    if hasattr(event.delta, 'thinking'):
-                                        yield sse({"type": "thinking", "content": event.delta.thinking})
-                                        thinking_chunks.append(event.delta.thinking)
-                                    elif hasattr(event.delta, 'text'):
-                                        response_text_chunks.append(event.delta.text)
-                                elif event.type == "content_block_stop":
-                                    if current_block == "thinking":
-                                        yield sse({"type": "thinking_end", "content": ""})
-                    except Exception:
+            # ── Retry loop: up to 2 attempts for transient 500/529 errors ──
+            _claude_attempt = 0
+            while _claude_attempt < 2:
+                _claude_attempt += 1
+                thinking_chunks = []
+                response_text_chunks = []
+                try:
+                    async with aclient.messages.stream(
+                        model=arch_model,
+                        max_tokens=16000,
+                        **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
+                        system=_architect_system,
+                        messages=[{"role": "user", "content": user_content}],
+                    ) as astream:
+                        current_block = None
+                        async for event in astream:
+                            if event.type == "content_block_start":
+                                current_block = getattr(event.content_block, 'type', None)
+                                if current_block == "thinking":
+                                    yield sse({"type": "thinking_start", "content": ""})
+                            elif event.type == "content_block_delta":
+                                if hasattr(event.delta, 'thinking'):
+                                    yield sse({"type": "thinking", "content": event.delta.thinking})
+                                    thinking_chunks.append(event.delta.thinking)
+                                elif hasattr(event.delta, 'text'):
+                                    response_text_chunks.append(event.delta.text)
+                            elif event.type == "content_block_stop":
+                                if current_block == "thinking":
+                                    yield sse({"type": "thinking_end", "content": ""})
+                    break  # ← success: exit retry loop
+                except Exception as claude_err:
+                    err_str = str(claude_err)
+                    err_low = err_str.lower()
+                    _is_transient = "500" in err_str or "529" in err_str or "overloaded" in err_low or "internal_server_error" in err_low
+                    if _is_transient and _claude_attempt < 2:
+                        yield sse({"type": "progress", "content": "⚡ AI service hiccup — retrying once..."})
+                        await asyncio.sleep(2)
+                        continue  # retry
+                    if image_files and ("image" in err_low or "unsupported" in err_low):
+                        yield sse({"type": "progress", "content": "⚠️ Images failed — retrying text-only..."})
+                        thinking_chunks = []
+                        response_text_chunks = []
+                        try:
+                            async with aclient.messages.stream(
+                                model=arch_model,
+                                max_tokens=16000,
+                                **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
+                                system=_architect_system,
+                                messages=[{"role": "user", "content": context_msg}],
+                            ) as astream:
+                                current_block = None
+                                async for event in astream:
+                                    if event.type == "content_block_start":
+                                        current_block = getattr(event.content_block, 'type', None)
+                                        if current_block == "thinking":
+                                            yield sse({"type": "thinking_start", "content": ""})
+                                    elif event.type == "content_block_delta":
+                                        if hasattr(event.delta, 'thinking'):
+                                            yield sse({"type": "thinking", "content": event.delta.thinking})
+                                            thinking_chunks.append(event.delta.thinking)
+                                        elif hasattr(event.delta, 'text'):
+                                            response_text_chunks.append(event.delta.text)
+                                    elif event.type == "content_block_stop":
+                                        if current_block == "thinking":
+                                            yield sse({"type": "thinking_end", "content": ""})
+                        except Exception:
+                            raise
+                        break  # text-only succeeded
+                    else:
                         raise
-                else:
-                    raise
 
             raw_text = "".join(response_text_chunks)
             # Claude might wrap JSON in markdown fences
