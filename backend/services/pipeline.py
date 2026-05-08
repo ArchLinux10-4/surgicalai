@@ -1574,6 +1574,7 @@ USER REQUEST:
                     targets[qi]["symbol_path"] = vname
 
         changes_by_file = {}
+        _parse_skipped = []  # files skipped because smap is None (not parsed as code)
 
         for i, target in enumerate(targets):
             target_filename = target.get("filename", "")
@@ -1593,6 +1594,7 @@ USER REQUEST:
 
             smap, sf = symbol_maps_by_name[matched_name]
             if smap is None:
+                _parse_skipped.append(matched_name)
                 continue
 
             yield sse({"type": "progress", "content": f"Surgeon: {matched_name} → {target.get('symbol_path', '?')} ({i+1}/{len(targets)})"})
@@ -1751,17 +1753,26 @@ USER REQUEST:
             if skipped_changes:
                 sym_names = ", ".join(f"`{s['symbol']}`" for s in skipped_changes[:3])
                 fallback = (
-                    f"I analyzed {sym_names} but the code already looks like what you're asking for "
-                    f"— no changes were needed.\n\n"
-                    f"If that's not right, try **being more specific**: quote the exact text you want changed, "
-                    f"or describe the before/after difference clearly."
+                    f"I looked at {sym_names} but it already matches what you're asking for "
+                    f"— no lines would actually change.\n\n"
+                    f"**If that's not right**, try quoting the exact text you want changed. "
+                    f"For example: *\"Change the line that says `tax_rate=0.08` to `0.10`\"*"
+                )
+            elif _parse_skipped:
+                file_names = ", ".join(f"**{f}**" for f in set(_parse_skipped[:3]))
+                fallback = (
+                    f"I couldn't read the code structure of {file_names}. "
+                    f"The file may have been uploaded as a data file rather than code.\n\n"
+                    f"**Try re-uploading** — make sure it's a plain text source file (.py, .js, .ts, etc). "
+                    f"If it's a large project, try uploading just the specific file you want to edit."
                 )
             else:
                 fallback = (
-                    "I tried to make the changes but couldn't find the right code to edit in your files.\n\n"
-                    "This usually happens when the file structure is different from what I expected.\n\n"
-                    "**💡 Try rephrasing your request** — describe what behavior you want to change rather than "
-                    "referencing specific code. Or try: *\"Explain the structure of this file first\"*"
+                    "I understood what you want, but couldn't locate the right spot in your code to make that change.\n\n"
+                    "**Try being more specific** — for example:\n"
+                    "- *\"In `calculate_price`, change `0.08` to `0.10`\"*\n"
+                    "- *\"Find the line with `tax_rate` and change the default value\"*\n\n"
+                    "You can also ask me to explain the file structure first."
                 )
             for word in fallback.split(" "):
                 yield sse({"type": "token", "content": word + " "})

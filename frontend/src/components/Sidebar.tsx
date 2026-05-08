@@ -421,7 +421,7 @@ export function Sidebar() {
   const tabs = [
     { id: 'files' as const, icon: FileCode, label: fileCount > 0 ? `Files (${fileCount})` : 'Files' },
     { id: 'sessions' as const, icon: MessageSquare, label: 'Chats' },
-    { id: 'context' as const, icon: Pin, label: 'Context' },
+    { id: 'context' as const, icon: Pin, label: 'Pinned' },
   ]
 
   return (

@@ -597,6 +597,17 @@ export function ChatPanel() {
 
     const sessionId = await ensureSession()
 
+    // Capture whether this is the first message so we can auto-name the session
+    const isFirstMessage = messages.length === 0
+
+    // Helper: auto-rename session from first user message (removes technical noise)
+    const autoNameSession = () => {
+      const title = text.replace(/\s+/g, ' ').trim().slice(0, 55) || 'New Chat'
+      api.chat.renameSession(sessionId, title)
+        .then(() => api.chat.getSessions().then(setSessions).catch(() => {}))
+        .catch(() => {})
+    }
+
     // Add user message to UI immediately
     addMessage({
       id: Date.now().toString(),
@@ -639,7 +650,8 @@ export function ChatPanel() {
           content: '',
           created_at: new Date().toISOString(),
         })
-        api.chat.getSessions().then(setSessions).catch(() => {})
+        if (isFirstMessage) autoNameSession()
+        else api.chat.getSessions().then(setSessions).catch(() => {})
         // Re-fetch session files to keep sidebar in sync
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
@@ -655,7 +667,8 @@ export function ChatPanel() {
             created_at: new Date().toISOString(),
           })
         }
-        api.chat.getSessions().then(setSessions).catch(() => {})
+        if (isFirstMessage) autoNameSession()
+        else api.chat.getSessions().then(setSessions).catch(() => {})
         // Re-fetch session files to keep sidebar in sync
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
@@ -714,7 +727,16 @@ export function ChatPanel() {
           </span>
         </div>
         <div className="flex items-center gap-1.5">
-          <span className="text-[11px] text-muted/70">{settings?.architect_model || 'gpt-4.1'}</span>
+          <span className="text-[11px] text-muted/70">{(() => {
+            const m = settings?.architect_model || 'gpt-4.1'
+            if (m.includes('claude-opus')) return 'Claude Opus'
+            if (m.includes('claude-sonnet')) return 'Claude Sonnet'
+            if (m.includes('claude-haiku')) return 'Claude Haiku'
+            if (m.includes('gpt-4.1')) return 'GPT-4.1'
+            if (m.includes('gpt-5') || m.includes('gpt5')) return 'GPT-5'
+            if (m.startsWith('o3') || m.startsWith('o4')) return m.toUpperCase()
+            return m
+          })()}</span>
           <button onClick={() => fileInputRef.current?.click()} className="p-1.5 rounded-lg hover:bg-overlay text-muted hover:text-ink transition-colors" title="Upload files">
             <Paperclip size={13} />
           </button>
