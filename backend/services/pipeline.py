@@ -671,7 +671,8 @@ async def analyze_and_plan_stream(
     user_request: str,
     session_id: Optional[str] = None,
     project_memory: Optional[str] = None,
-    pinned_context: Optional[list] = None
+    pinned_context: Optional[list] = None,
+    user_id: str = ""
 ):
     """
     Streaming surgical analysis. Yields SSE progress events then final result.
@@ -761,10 +762,10 @@ async def analyze_and_plan_stream(
         yield f"data: {json.dumps({'type': 'done', 'content': ''})}\n\n"
 
     except Exception as e:
-        yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+        yield f"data: {json.dumps({'type': 'error', 'content': _friendly_error(e)})}\n\n"
 
 
-def analyze_multi_file(file_paths: list, file_contents: dict, user_request: str, session_id=None):
+def analyze_multi_file(file_paths: list, file_contents: dict, user_request: str, session_id=None, user_id: str = ""):
     """
     Analyze multiple files and produce a coordinated change plan.
     The architect sees ALL symbol maps, then surgeons work per-file.
@@ -939,7 +940,8 @@ def analyze_and_plan(
     file_path: str,
     file_content: str,
     user_request: str,
-    session_id: Optional[str] = None
+    session_id: Optional[str] = None,
+    user_id: str = ""
 ) -> SurgicalAnalyzeResponse:
     """
     Full pipeline: parse → architect → surgeon → diff → response.
@@ -2128,7 +2130,8 @@ USER REQUEST:
                 description=target.get("description", ""),
                 new_logic=target.get("new_logic", ""),
                 dependencies=[],
-                confidence=target.get("confidence", 7)
+                confidence=target.get("confidence", 7),
+                import_changes=target.get("import_changes", []),
             )
 
             # ── Oversized symbol guardrail ──
