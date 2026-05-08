@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
-import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import { vscDarkPlus, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism'
+import { useThemeStore } from '../stores/themeStore'
 import { CheckCircle, XCircle, Download, ChevronDown, ChevronUp, AlertTriangle, FileCode, RotateCcw, SkipForward } from 'lucide-react'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
@@ -34,10 +35,10 @@ const saveApplied = (sessionId: string, changeId: string) => {
 function QABadge({ qa }: { qa: QAResult }) {
   const [expanded, setExpanded] = useState(false)
   const styles: Record<string, string> = {
-    safe:    'text-green-400 bg-green-400/10 border-green-400/30',
-    warning: 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30',
-    blocked: 'text-red-400 bg-red-400/10 border-red-400/30',
-    skipped: 'text-gray-400 bg-gray-400/10 border-gray-400/30',
+    safe:    'text-success bg-success/15 border-success/30',
+    warning: 'text-warning bg-warning/15 border-warning/30',
+    blocked: 'text-danger bg-danger/15 border-danger/30',
+    skipped: 'text-muted bg-muted/10 border-muted/30',
   }
   const icons: Record<string, string> = { safe: '✅', warning: '⚠️', blocked: '🚫', skipped: '⏭' }
   const color = styles[qa.verdict] || styles.skipped
@@ -62,13 +63,13 @@ function QABadge({ qa }: { qa: QAResult }) {
         <div className="absolute left-0 top-6 z-50 w-72 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-xl p-3 text-[12px]">
           <div className="flex items-center justify-between mb-2">
             <span className="font-semibold">QA Report</span>
-            <button onClick={() => setExpanded(false)} className="text-muted hover:text-white">✕</button>
+            <button onClick={() => setExpanded(false)} className="text-muted hover:text-ink">✕</button>
           </div>
           <p className="text-muted mb-2">{qa.summary || 'No summary'}</p>
           {issues.length > 0 && (
             <ul className="space-y-1">
               {issues.map((issue, i) => (
-                <li key={i} className="flex gap-1.5 text-yellow-300">
+                <li key={i} className="flex gap-1.5 text-warning">
                   <span>•</span><span>{issue}</span>
                 </li>
               ))}
@@ -84,9 +85,9 @@ function QABadge({ qa }: { qa: QAResult }) {
 }
 
 function ConfidenceBadge({ score }: { score: number }) {
-  const color = score >= 8 ? 'text-green-400 bg-green-400/10 border-green-400/30'
-    : score >= 6 ? 'text-yellow-400 bg-yellow-400/10 border-yellow-400/30'
-    : 'text-red-400 bg-red-400/10 border-red-400/30'
+  const color = score >= 8 ? 'text-success bg-success/15 border-success/30'
+    : score >= 6 ? 'text-warning bg-warning/15 border-warning/30'
+    : 'text-danger bg-danger/15 border-danger/30'
   const label = score >= 8 ? 'High' : score >= 6 ? 'Medium' : 'Low'
   return (
     <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${color}`}>
@@ -118,6 +119,9 @@ function getLangFromFilename(filename: string): string {
 
 // ── DiffBlock: single SyntaxHighlighter per change with per-line colors ──────
 function DiffBlock({ diff, language }: { diff: string; language: string }) {
+  const { theme } = useThemeStore()
+  const isLight = theme === 'light'
+
   const rawLines = diff.split('\n')
   type Prefix = 'add' | 'remove' | 'hunk' | 'header' | 'context'
   const prefixes: Prefix[] = []
@@ -139,18 +143,23 @@ function DiffBlock({ diff, language }: { diff: string; language: string }) {
 
   const code = codeLines.join('\n')
 
+  // Row highlight colors — stronger in light mode for visibility
+  const addBg    = isLight ? 'rgba(26,  127, 55,  0.14)' : 'rgba(74,  222, 128, 0.12)'
+  const removeBg = isLight ? 'rgba(207, 34,  46,  0.12)' : 'rgba(248, 113, 113, 0.12)'
+  const hunkBg   = isLight ? 'rgba(9,   105, 218, 0.08)' : 'rgba(96,  165, 250, 0.08)'
+
   return (
     <SyntaxHighlighter
       language={language === 'text' ? 'text' : language}
-      style={vscDarkPlus}
+      style={isLight ? oneLight : vscDarkPlus}
       wrapLines={true}
       wrapLongLines={false}
       lineProps={(lineNumber: number) => {
         const p = prefixes[lineNumber - 1]
         const s: React.CSSProperties = { display: 'block', width: '100%' }
-        if (p === 'add')    s.backgroundColor = 'rgba(74,  222, 128, 0.12)'
-        if (p === 'remove') s.backgroundColor = 'rgba(248, 113, 113, 0.12)'
-        if (p === 'hunk')   s.backgroundColor = 'rgba(96,  165, 250, 0.08)'
+        if (p === 'add')    s.backgroundColor = addBg
+        if (p === 'remove') s.backgroundColor = removeBg
+        if (p === 'hunk')   s.backgroundColor = hunkBg
         return { style: s }
       }}
       customStyle={{
@@ -178,9 +187,9 @@ function DiffLine({ line }: { line: string }) {
   const isHeader = line.startsWith('@@')
   return (
     <div className={`font-mono text-[12px] px-3 py-0.5 leading-relaxed whitespace-pre-wrap break-all ${
-      isAdd ? 'bg-green-500/10 text-green-300' :
-      isRemove ? 'bg-red-500/10 text-red-300' :
-      isHeader ? 'bg-blue-500/10 text-blue-300' :
+      isAdd ? 'bg-success/10 text-success' :
+      isRemove ? 'bg-danger/10 text-danger' :
+      isHeader ? 'bg-accent/10 text-accent' :
       'text-muted'
     }`}>
       {line || ' '}
@@ -398,14 +407,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         onClick={() => setExpanded(e => !e)}
         className="w-full flex items-center gap-2.5 px-4 py-2.5 bg-surface/80 hover:bg-surface transition-colors text-left"
       >
-        <FileCode size={14} className="text-blue-400 flex-shrink-0" />
+        <FileCode size={14} className="text-accent flex-shrink-0" />
         <span className="text-sm font-semibold text-ink">{filename}</span>
         <span className="text-[11px] text-muted/70 ml-1">{displayData.changes.length} change{displayData.changes.length !== 1 ? 's' : ''}</span>
         <div className="ml-auto flex items-center gap-2">
           {displayData.changes.length > 1 && !Object.keys(applied).length && (
             <button
               onClick={e => { e.stopPropagation(); handleApplyAll() }}
-              className="text-[11px] px-2.5 py-1 bg-green-500/20 text-green-400 border border-green-500/30 rounded-lg hover:bg-green-500/30 transition-colors font-semibold"
+              className="text-[11px] px-2.5 py-1 bg-success/15 text-success border border-success/30 rounded-lg hover:bg-success/25 transition-colors font-semibold"
             >
               Apply All
             </button>
@@ -421,10 +430,10 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           <div className="flex items-start gap-3 px-4 py-2.5 bg-base/60">
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2 flex-wrap">
-                <code className="text-[12px] text-blue-300 font-mono">{change.symbol?.full_path || change.symbol?.name || 'unknown'}</code>
+                <code className="text-[12px] text-accent font-mono">{change.symbol?.full_path || change.symbol?.name || 'unknown'}</code>
                 <ConfidenceBadge score={change.confidence} />
                 {change.confidence < 7 && (
-                  <span className="flex items-center gap-1 text-[11px] text-yellow-400">
+                  <span className="flex items-center gap-1 text-[11px] text-warning">
                     <AlertTriangle size={10} /> Review carefully
                   </span>
                 )}
@@ -440,7 +449,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               <span className="text-[11px] font-semibold uppercase tracking-wide text-muted/70">Diff Preview</span>
               {/* Line number context */}
               {change.symbol?.start_line && (
-                <span className="text-[10px] px-1.5 py-0.5 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded font-mono">
+                <span className="text-[10px] px-1.5 py-0.5 bg-accent/10 text-accent border border-accent/20 rounded font-mono">
                   L{change.symbol.start_line}
                   {change.symbol.end_line && change.symbol.end_line !== change.symbol.start_line
                     ? `–${change.symbol.end_line}` : ''}
@@ -449,13 +458,13 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               {(() => {
                 const startLine = parseDiffStartLine(change.diff || '')
                 return startLine ? (
-                  <span className="text-[10px] text-blue-300/70 font-mono">@ line {startLine}</span>
+                  <span className="text-[10px] text-accent/70 font-mono">@ line {startLine}</span>
                 ) : null
               })()}
               <span className="text-[10px] text-faint ml-auto">
-                <span className="text-green-400">+{((change.diff || '').split('\n').filter((l: string) => l.startsWith('+') && !l.startsWith('+++'))).length}</span>
+                <span className="text-success">+{((change.diff || '').split('\n').filter((l: string) => l.startsWith('+') && !l.startsWith('+++'))).length}</span>
                 {' · '}
-                <span className="text-red-400">-{((change.diff || '').split('\n').filter((l: string) => l.startsWith('-') && !l.startsWith('---'))).length}</span>
+                <span className="text-danger">-{((change.diff || '').split('\n').filter((l: string) => l.startsWith('-') && !l.startsWith('---'))).length}</span>
               </span>
             </div>
             <div className="bg-base max-h-96 overflow-y-auto">
@@ -468,7 +477,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             {/* Left: status or apply/skip */}
             {applied[change.id] ? (
               <div className="flex items-center gap-2">
-                <span className="flex items-center gap-1.5 text-[12px] text-green-400 font-semibold">
+                <span className="flex items-center gap-1.5 text-[12px] text-success font-semibold">
                   <CheckCircle size={13} /> Applied
                 </span>
                 <button
@@ -491,7 +500,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                   <button
                     disabled
                     title={`QA blocked: ${change.qa_result.summary}`}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-red-500/10 text-red-400 border border-red-500/30 rounded-lg text-[12px] font-semibold opacity-60 cursor-not-allowed"
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-danger/10 text-danger border border-danger/30 rounded-lg text-[12px] font-semibold opacity-60 cursor-not-allowed"
                   >
                     🚫 Blocked by QA
                   </button>
@@ -499,7 +508,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                   <button
                     onClick={() => handleApply(change)}
                     disabled={applying[change.id]}
-                    className="flex items-center gap-1.5 px-3 py-1.5 bg-green-500/20 text-green-400 border border-green-500/30 rounded-lg text-[12px] font-semibold hover:bg-green-500/30 transition-colors disabled:opacity-50"
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-success/15 text-success border border-success/30 rounded-lg text-[12px] font-semibold hover:bg-success/25 transition-colors disabled:opacity-50"
                   >
                     <CheckCircle size={12} />
                     {applying[change.id] ? 'Applying...' : 'Apply'}
@@ -583,7 +592,7 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
             <strong className="text-ink/60">Skipped {result.skipped_changes.length} symbol{result.skipped_changes.length !== 1 ? 's' : ''}:</strong>{' '}
             {result.skipped_changes.map((s: any, i: number) => (
               <span key={i}>
-                <code className="text-[11px] text-blue-300/70">{s.symbol}</code>
+                <code className="text-[11px] text-accent/70">{s.symbol}</code>
                 {s.reason === 'already_matches'
                   ? ' — code already matches'
                   : ' — no visible diff produced'}
@@ -596,14 +605,14 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
 
       {/* Risks alert — hidden (not removed) once all changes applied */}
       {result.risks && result.risks.length > 0 && (
-        <div className={`mt-2 flex items-start gap-2 px-3 py-2 bg-yellow-500/10 border border-yellow-500/20 rounded-lg transition-opacity duration-300 ${allApplied ? 'hidden' : ''}`}>
-          <AlertTriangle size={13} className="text-yellow-400 mt-0.5 flex-shrink-0" />
-          <div className="text-[12px] text-yellow-300">
+        <div className={`mt-2 flex items-start gap-2 px-3 py-2 bg-warning/10 border border-warning/25 rounded-lg transition-opacity duration-300 ${allApplied ? 'hidden' : ''}`}>
+          <AlertTriangle size={13} className="text-warning mt-0.5 flex-shrink-0" />
+          <div className="text-[12px] text-warning">
             <strong>Risks:</strong>
             <ul className="mt-1 space-y-0.5 list-none">
               {result.risks.map((r: string, i: number) => (
                 <li key={i} className="flex items-start gap-1.5">
-                  <span className="mt-0.5 text-yellow-500">•</span>
+                  <span className="mt-0.5 text-warning/70">•</span>
                   <span>{r}</span>
                 </li>
               ))}
