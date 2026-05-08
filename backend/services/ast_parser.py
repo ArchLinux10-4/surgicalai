@@ -33,6 +33,7 @@ LANGUAGE_MAP = {
     ".yml": "yaml",
     ".json": "json",
     ".html": "html",
+    ".htm": "html",
     ".css": "css",
     ".sql": "sql",
     ".md": "markdown",
