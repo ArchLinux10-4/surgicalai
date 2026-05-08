@@ -105,18 +105,48 @@ def _grep_relevant_sections(
     file_content: str,
     window: int = 50,
     max_lines: int = 180,
+    extra_terms: list | None = None,
 ) -> str:
     """
     Search *file_content* for terms extracted from *user_request*.
-    Returns a formatted string of up to 3 relevant code sections with
+    Returns a formatted string of up to 5 relevant code sections with
     line numbers, capped at *max_lines* total.  Empty string if nothing found.
 
     This is injected into the Architect prompt for large files (>60 symbols)
     so the Architect can locate code that fell outside the symbol map cap.
+
+    extra_terms: additional terms to search for (e.g. from conversation history answers).
+    HTML-aware: for .html/.htm files, automatically adds structural form terms
+    (<input, type=, <select, etc.) when user mentions form UI words.
     """
     terms = _extract_search_terms(user_request)
+    if extra_terms:
+        for et in extra_terms:
+            if et and et.lower() not in {t.lower() for t in terms}:
+                terms.append(et)
+
     if not terms:
         return ""
+
+    # ── HTML-aware enhancements ──────────────────────────────────────────────
+    _is_html = file_name.lower().endswith((".html", ".htm"))
+    if _is_html:
+        # Bigger window for HTML — label and input often 50-100 lines apart in DOM
+        window = max(window, 100)
+        max_lines = max(max_lines, 300)
+        # When user mentions form UI words, also grep for structural HTML tags
+        _form_ui_words = {
+            "field", "input", "form", "select", "button", "date", "text", "checkbox",
+            "radio", "dropdown", "picker", "calendar", "entry", "box", "control",
+            "widget", "click", "fill", "type", "enter", "placeholder",
+        }
+        _req_words = set(user_request.lower().split())
+        if _req_words & _form_ui_words:
+            _html_structural = ['<input', '<select', '<textarea', 'type="date"',
+                                 'type="text"', 'onchange', 'oninput', 'value=']
+            for ht in _html_structural:
+                if ht.lower() not in {t.lower() for t in terms}:
+                    terms.append(ht)
 
     lines = file_content.splitlines()
     matched_lines: set = set()
@@ -145,8 +175,8 @@ def _grep_relevant_sections(
         prev = ln
     sections.append((sec_start, prev))
 
-    # Keep top 3 largest sections, re-sort by position
-    sections = sorted(sections, key=lambda s: s[1] - s[0], reverse=True)[:3]
+    # Keep top 5 largest sections (up from 3), re-sort by position
+    sections = sorted(sections, key=lambda s: s[1] - s[0], reverse=True)[:5]
     sections = sorted(sections, key=lambda s: s[0])
 
     output_parts = []
@@ -166,13 +196,12 @@ def _grep_relevant_sections(
     if not output_parts:
         return ""
 
-    matched_terms = ", ".join(f'"{t}"' for t in terms[:5])
+    matched_terms = ", ".join(f'"{t}"' for t in terms[:8])
     header = (
         f"\nKEYWORD MATCH IN {file_name} "
         f"(searched for: {matched_terms}):\n"
     )
     return header + "\n\n".join(output_parts)
-
 
 def _supports_thinking(model: str) -> bool:
     """Return True only for Claude models that support extended thinking."""
@@ -353,6 +382,17 @@ The ARCHITECT (a separate model) has already:
 3. Written a precise plan describing the new behavior
 
 Your ONLY job: implement that plan on the specific code block you receive. Nothing more.
+
+━━━ CLARIFICATION LOOP PREVENTION — CRITICAL ━━━
+
+Look at the RECENT CONVERSATION section above BEFORE deciding to use needs_clarification.
+
+- If you previously asked questions AND the user has answered them → USE those answers to plan the edit NOW.
+  Do NOT ask the same questions again. The user has already given you the information.
+- Only use needs_clarification for GENUINELY NEW unknowns that the conversation didn't address.
+- If the user's answer gives you enough to locate the code (e.g. they named an element, ID, or section),
+  treat that as sufficient — grep/scan the file and proceed with an edit plan.
+- Pattern to avoid: asking "what is the ID of the input?" when the user already said "it's effDate" in a prior turn.
 
 ━━━ HARD RULES ━━━
 - Return ONLY the replacement code — no explanation, no markdown fences, no preamble
@@ -1774,7 +1814,19 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 # for terms from the user's request and inject matching sections.
                 # This is how Tasklet works: grep first, then edit.
                 if _total_syms > _MAX_SYMS:
-                    _grep_hit = _grep_relevant_sections(user_request, fname, content)
+                    # Also extract terms from the last user answer in history
+                    # (catches cases where user answered a clarification question)
+                    _history_answer_terms = []
+                    for _hm in reversed(conversation_history[-4:]):
+                        if _hm.get("role") == "user":
+                            _ans_text = str(_hm.get("content", ""))[:300]
+                            if _ans_text.strip() and _ans_text.strip() != user_request.strip():
+                                _history_answer_terms = _extract_search_terms(_ans_text)
+                            break
+                    _grep_hit = _grep_relevant_sections(
+                        user_request, fname, content,
+                        extra_terms=_history_answer_terms or None,
+                    )
                     if _grep_hit:
                         _file_summary += _grep_hit
                 file_summaries.append(_file_summary)
@@ -1795,18 +1847,20 @@ Be warm, friendly, and encouraging. You're helping a person build something real
         )
         yield sse({"type": "progress", "content": _progress_msg})
 
-        # Format recent conversation history (last 6 turns)
-        hist_text = ""
-        for msg in conversation_history[-HISTORY_WINDOW:]:
-            role = msg.get("role", "user")
-            content = msg.get("content", "")[:1200]  # raised from 300 — preserves clarification Q&A
-            hist_text += f"{role.upper()}: {content}\n"
+        # Build real conversation history turns for Claude (passed as actual message list)
+        # This replaces the flat-text RECENT CONVERSATION block — Claude treats real turns as memory.
+        _arch_history_msgs = []
+        for _hmsg in conversation_history[-HISTORY_WINDOW:]:
+            _hrole = _hmsg.get("role", "user")
+            if _hrole not in ("user", "assistant"):
+                _hrole = "user"
+            _hcontent = str(_hmsg.get("content", ""))[:2000]
+            if _hcontent.strip():
+                _arch_history_msgs.append({"role": _hrole, "content": _hcontent})
 
+        # context_msg = file summaries + current request (no longer embeds history as text)
         context_msg = f"""UPLOADED FILES:
 {chr(10).join(file_summaries)}
-
-RECENT CONVERSATION:
-{hist_text if hist_text else "(new conversation)"}
 
 USER REQUEST:
 {user_request}"""
@@ -1863,7 +1917,7 @@ USER REQUEST:
                         max_tokens=16000,
                         **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
                         system=_architect_system,
-                        messages=[{"role": "user", "content": user_content}],
+                        messages=_arch_history_msgs + [{"role": "user", "content": user_content}],
                     ) as astream:
                         current_block = None
                         async for event in astream:
@@ -1899,7 +1953,7 @@ USER REQUEST:
                                 max_tokens=16000,
                                 **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
                                 system=_architect_system,
-                                messages=[{"role": "user", "content": context_msg}],
+                                messages=_arch_history_msgs + [{"role": "user", "content": context_msg}],
                             ) as astream:
                                 current_block = None
                                 async for event in astream:
