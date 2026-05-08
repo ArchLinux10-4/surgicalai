@@ -198,6 +198,10 @@ class SurgicalChange(BaseModel):
     # Used by apply_change() as primary match path — eliminates overlapping-window errors.
     target_element: Optional[str] = None
     replacement: Optional[str] = None
+    # INSERT mode — used for safe script injection (avoids truncation of large blocks).
+    # When True, apply_change finds insert_anchor in the file and inserts replacement before it.
+    insert_mode: bool = False
+    insert_anchor: Optional[str] = None
 
 
 class SurgicalAnalyzeRequest(BaseModel):

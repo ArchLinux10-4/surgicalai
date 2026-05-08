@@ -489,10 +489,14 @@ When wrapping an HTML element (adding an icon button, container div, date picker
 
 CRITICAL HTML SCRIPT INJECTION RULE:
 When the plan says to add a JavaScript helper function to an HTML file:
-- Find the last existing <script> block already in the file and inject your function INSIDE it, before the closing </script>.
-- Do NOT create a new <script> tag unless zero <script> tags exist anywhere in the file.
-- Your output for a script injection target = the full contents of that existing <script> block with your new function appended near the bottom, before </script>.
-- Preserve ALL existing functions in that script block. Only add. Never remove.
+- Write your function and add it into the focused window you received, near the end of the last visible script block.
+- If you CAN see a </script> closing tag in the window: inject your function just before it.
+- If you CANNOT see a </script> closing tag (the script block extends beyond the window you were given):
+  DO NOT fabricate a </script> tag. DO NOT truncate or shorten the window.
+  Add your function at the very end of the provided window — the system will place it in the right closing position.
+- CRITICAL OUTPUT RULE: Your output line count must be >= the input window line count. You may add lines but must NEVER remove or shorten existing lines.
+- Do NOT create a new <script> tag unless zero <script> tags exist anywhere in the window.
+- Preserve ALL existing code in the script block. Only add. Never remove or truncate.
 
 Start your response with the first line of code. End with the last line of code."""
 
@@ -651,6 +655,61 @@ Produce the surgical change plan as JSON."""
         risks=data.get("risks", [])
     )
 
+
+# ─── Script-injection safety helpers (v3.3.1) ────────────────────────────────
+
+def _is_script_injection_issue(symbol_code: str, new_code: str) -> tuple:
+    """
+    Detect whether the Surgeon truncated the window or fabricated a </script>.
+    Returns (has_issue: bool, extracted_function: str).
+    has_issue = True means we must use the safe INSERT path instead of REPLACE.
+    """
+    if not new_code:
+        return False, ""
+
+    orig_lines = symbol_code.splitlines()
+    new_lines = new_code.splitlines()
+
+    # Issue 1: Surgeon returned significantly fewer lines (truncation)
+    if len(new_lines) < len(orig_lines) * 0.75:
+        # Extract lines that were added (not in original)
+        orig_set = set(orig_lines)
+        added = [l for l in new_lines if l not in orig_set and l.strip()
+                 and "</script>" not in l.lower()]
+        return True, "\n".join(added)
+
+    # Issue 2: Phantom </script> — new_code has more </script> occurrences than original
+    orig_close = sum(1 for l in orig_lines if "</script>" in l.lower())
+    new_close  = sum(1 for l in new_lines  if "</script>" in l.lower())
+    if new_close > orig_close:
+        orig_set = set(orig_lines)
+        added = [l for l in new_lines if l not in orig_set and l.strip()
+                 and "</script>" not in l.lower()]
+        return True, "\n".join(added)
+
+    return False, ""
+
+
+def _find_script_close_line(file_content: str, hint_line: int) -> str:
+    """
+    Find the line text of the </script> tag that closes the script block
+    containing hint_line.  Searches FORWARD from hint_line.
+    Returns the exact line string (with leading whitespace) so we can use it
+    as insert_anchor in apply_change.
+    """
+    lines = file_content.splitlines()
+    # Search forward from hint_line for </script>
+    for i in range(hint_line, len(lines)):
+        if "</script>" in lines[i].lower():
+            return lines[i]
+    # Fallback: search backward
+    for i in range(hint_line - 1, -1, -1):
+        if "</script>" in lines[i].lower():
+            return lines[i]
+    return "</script>"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_surgeon(
     symbol: SymbolInfo,
@@ -937,17 +996,29 @@ async def analyze_and_plan_stream(
                         new_code, confidence, _surg_notes, _needed_imports = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                         diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
                         _tgt_elem, _replacement = _compute_target_element(parent_symbol.code, new_code)
+                        # v3.3.1: injection guard
+                        _inj_iss_add, _inj_fn_add = _is_script_injection_issue(parent_symbol.code, new_code)
+                        _ins_mode_add = False
+                        _ins_anc_add = None
+                        if _inj_iss_add and _inj_fn_add:
+                            _ins_anc_add = _find_script_close_line(file_content, parent_symbol.end_line)
+                            _ins_mode_add = True
+                            _tgt_elem = None
+                            _replacement = _inj_fn_add
+                            new_code = parent_symbol.code
                         changes.append(SurgicalChange(
                             id=str(uuid.uuid4()),
                             symbol=parent_symbol,
                             original_code=parent_symbol.code,
-                            new_code=new_code,
+                            new_code=new_code if not _ins_mode_add else parent_symbol.code + "\n" + _inj_fn_add,
                             diff=diff,
                             confidence=confidence,
                             description=target.description,
                             applied=False,
                             target_element=_tgt_elem,
-                            replacement=_replacement
+                            replacement=_replacement,
+                            insert_mode=_ins_mode_add,
+                            insert_anchor=_ins_anc_add
                         ))
                 continue
 
@@ -969,17 +1040,31 @@ async def analyze_and_plan_stream(
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
             _tgt_elem, _replacement = _compute_target_element(symbol.code, new_code)
 
+            # v3.3.1: detect script injection truncation / phantom </script>
+            _inject_issue, _injected_fn = _is_script_injection_issue(symbol.code, new_code)
+            _insert_mode = False
+            _insert_anchor = None
+            if _inject_issue and _injected_fn:
+                _insert_anchor_line = _find_script_close_line(file_content, symbol.end_line)
+                _insert_mode = True
+                _insert_anchor = _insert_anchor_line
+                _tgt_elem = None
+                _replacement = _injected_fn
+                new_code = symbol.code  # keep original for display; diff will show only additions
+
             change = SurgicalChange(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
                 original_code=symbol.code,
-                new_code=new_code,
+                new_code=new_code if not _insert_mode else symbol.code + "\n" + _injected_fn,
                 diff=diff,
                 confidence=confidence,
                 description=target.description,
                 applied=False,
                 target_element=_tgt_elem,
-                replacement=_replacement
+                replacement=_replacement,
+                insert_mode=_insert_mode,
+                insert_anchor=_insert_anchor
             )
             changes.append(change)
 
@@ -1085,17 +1170,32 @@ Add "file_path" to each target object."""
             new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, target, content, user_id=user_id)
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
             _tgt_elem, _replacement = _compute_target_element(symbol.code, new_code)
+
+            # v3.3.1: detect script injection truncation / phantom </script>
+            _inject_issue, _injected_fn = _is_script_injection_issue(symbol.code, new_code)
+            _insert_mode2 = False
+            _insert_anchor2 = None
+            if _inject_issue and _injected_fn:
+                _insert_anchor_line2 = _find_script_close_line(content, symbol.end_line)
+                _insert_mode2 = True
+                _insert_anchor2 = _insert_anchor_line2
+                _tgt_elem = None
+                _replacement = _injected_fn
+                new_code = symbol.code
+
             changes.append(SurgicalChange(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
                 original_code=symbol.code,
-                new_code=new_code,
+                new_code=new_code if not _insert_mode2 else symbol.code + "\n" + _injected_fn,
                 diff=diff,
                 confidence=confidence,
                 description=target.description,
                 applied=False,
                 target_element=_tgt_elem,
-                replacement=_replacement
+                replacement=_replacement,
+                insert_mode=_insert_mode2,
+                insert_anchor=_insert_anchor2
             ))
 
         result_by_file[fp] = SurgicalAnalyzeResponse(
@@ -1212,17 +1312,28 @@ def analyze_and_plan(
                     new_code, confidence, _surg_notes, _needed_imports = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                     diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
                     _tgt_elem, _replacement = _compute_target_element(parent_symbol.code, new_code)
+                    # v3.3.1: injection guard
+                    _inj_ns, _fn_ns = _is_script_injection_issue(parent_symbol.code, new_code)
+                    _im_ns, _ia_ns = False, None
+                    if _inj_ns and _fn_ns:
+                        _ia_ns = _find_script_close_line(file_content, parent_symbol.end_line)
+                        _im_ns = True
+                        _tgt_elem = None
+                        _replacement = _fn_ns
+                        new_code = parent_symbol.code
                     change = SurgicalChange(
                         id=str(uuid.uuid4()),
                         symbol=parent_symbol,
                         original_code=parent_symbol.code,
-                        new_code=new_code,
+                        new_code=new_code if not _im_ns else parent_symbol.code + "\n" + _fn_ns,
                         diff=diff,
                         confidence=confidence,
                         description=target.description,
                         applied=False,
                         target_element=_tgt_elem,
-                        replacement=_replacement
+                        replacement=_replacement,
+                        insert_mode=_im_ns,
+                        insert_anchor=_ia_ns
                     )
                     changes.append(change)
             continue
@@ -1245,16 +1356,33 @@ def analyze_and_plan(
         # Run surgeon to get replacement code
         new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, target, file_content, user_id=user_id)
         diff = _make_diff(symbol.code, new_code, target.symbol_path)
+        _tgt_elem3, _replacement3 = _compute_target_element(symbol.code, new_code)
+
+        # v3.3.1: detect script injection truncation / phantom </script>
+        _inject_issue3, _injected_fn3 = _is_script_injection_issue(symbol.code, new_code)
+        _insert_mode3 = False
+        _insert_anchor3 = None
+        if _inject_issue3 and _injected_fn3:
+            _insert_anchor_line3 = _find_script_close_line(file_content, symbol.end_line)
+            _insert_mode3 = True
+            _insert_anchor3 = _insert_anchor_line3
+            _tgt_elem3 = None
+            _replacement3 = _injected_fn3
+            new_code = symbol.code
 
         change = SurgicalChange(
             id=str(uuid.uuid4()),
             symbol=symbol,
             original_code=symbol.code,
-            new_code=new_code,
+            new_code=new_code if not _insert_mode3 else symbol.code + "\n" + _injected_fn3,
             diff=diff,
             confidence=confidence,
             description=target.description,
-            applied=False
+            applied=False,
+            target_element=_tgt_elem3,
+            replacement=_replacement3,
+            insert_mode=_insert_mode3,
+            insert_anchor=_insert_anchor3
         )
         changes.append(change)
 
@@ -2704,17 +2832,33 @@ USER REQUEST:
                             reason=(None if _qa_ran else _qa_result.get("status")),
                             output_summary=f"verdict={_qa_result.get('verdict')} score={_qa_result.get('qa_score')}")
 
+            # v3.3.1: detect script injection truncation / phantom </script>
+            _tgt_elem_sm, _replacement_sm = _compute_target_element(symbol.code, new_code)
+            _inject_issue_sm, _injected_fn_sm = _is_script_injection_issue(symbol.code, new_code)
+            _insert_mode_sm = False
+            _insert_anchor_sm = None
+            if _inject_issue_sm and _injected_fn_sm:
+                _insert_anchor_sm = _find_script_close_line(sf["content"], symbol.end_line)
+                _insert_mode_sm = True
+                _tgt_elem_sm = None
+                _replacement_sm = _injected_fn_sm
+                new_code = symbol.code
+
             change = SurgicalChange(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
                 original_code=symbol.code,
-                new_code=new_code,
+                new_code=new_code if not _insert_mode_sm else symbol.code + "\n" + _injected_fn_sm,
                 diff=diff,
                 confidence=confidence,
                 description=target.get("description", ""),
                 applied=False,
                 surgeon_notes=_surg_notes if _surg_notes else [],
                 qa_result=_qa_result,
+                target_element=_tgt_elem_sm,
+                replacement=_replacement_sm,
+                insert_mode=_insert_mode_sm,
+                insert_anchor=_insert_anchor_sm,
             )
 
             if matched_name not in changes_by_file:

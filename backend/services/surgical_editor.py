@@ -81,6 +81,40 @@ def apply_change(
     symbol = change.symbol
     hint_line = getattr(symbol, 'target_line', None) or symbol.start_line
 
+    # -- Tier -1: INSERT_BEFORE mode (v3.3.1) -----------------------------------
+    # Used for safe script injection — never replaces existing content.
+    # Finds insert_anchor in the file and inserts replacement just before it.
+    _ins_mode   = getattr(change, 'insert_mode', False)
+    _ins_anchor = getattr(change, 'insert_anchor', None)
+    _ins_repl   = getattr(change, 'replacement', None)
+
+    if _ins_mode and _ins_anchor and _ins_repl:
+        # Find insert_anchor line in file (search near hint_line first, then full file)
+        anchor_strip = _ins_anchor.strip()
+        anchor_found_at = None
+        search_ranges = [
+            range(max(0, hint_line - 1), min(len(lines), hint_line + 2000)),
+            range(len(lines))
+        ]
+        for sr in search_ranges:
+            if anchor_found_at is not None:
+                break
+            for i in sr:
+                if lines[i].strip() == anchor_strip:
+                    anchor_found_at = i
+                    break
+
+        if anchor_found_at is not None:
+            # Build insertion: ensure replacement ends with newline
+            repl_text = _ins_repl.rstrip("\n") + "\n"
+            new_file_lines = (
+                lines[:anchor_found_at] +
+                [repl_text] +
+                lines[anchor_found_at:]
+            )
+            return "".join(new_file_lines)
+        # anchor not found — fall through to normal tiers as last resort
+
     # -- Tier 0: target_element matching (primary path v3.3.0+) ---------------
     # target_element is the minimal block of lines that actually changed.
     # Narrower than the full window so overlapping windows don't interfere.
@@ -250,6 +284,34 @@ def apply_changes_to_file(
             if applied_count > 0 and backup_path:
                 shutil.copy2(backup_path, file_path)
             raise ValueError(f"Failed applying change to {change.symbol.full_path}: {e}")
+
+    # v3.3.1: HTML structure validation — reject if critical structure was lost
+    _ext = Path(file_path).suffix.lower()
+    if _ext in ('.html', '.htm'):
+        _lower = current_content.lower()
+        _orig_lower = original_content.lower()
+        _critical = ['<html', '</html>', '<body', '</body>']
+        _lost = [tag for tag in _critical
+                 if tag in _orig_lower and tag not in _lower]
+        if _lost:
+            if applied_count > 0 and backup_path:
+                shutil.copy2(backup_path, file_path)
+            raise ValueError(
+                f"Apply rejected: the change removed critical HTML structure "
+                f"({', '.join(_lost)}). This usually means the Surgeon truncated "
+                f"a large script block. Please re-analyze the file."
+            )
+        # Check that file didn't shrink by more than 15% (catches accidental deletion)
+        _orig_size = len(original_content)
+        _new_size  = len(current_content)
+        if _orig_size > 1000 and _new_size < _orig_size * 0.85:
+            if applied_count > 0 and backup_path:
+                shutil.copy2(backup_path, file_path)
+            raise ValueError(
+                f"Apply rejected: the result is {round((_orig_size - _new_size)/_orig_size*100)}% "
+                f"smaller than the original ({_orig_size:,} -> {_new_size:,} bytes). "
+                f"This likely means content was accidentally deleted. Please re-analyze."
+            )
 
     # Write final content only when file exists on disk
     if on_disk:
