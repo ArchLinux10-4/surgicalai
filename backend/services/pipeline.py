@@ -59,6 +59,11 @@ def _is_claude_model(model: str) -> bool:
 # claude-opus-4-7 and others without native thinking support must be excluded.
 _THINKING_CAPABLE_PATTERNS = ("claude-sonnet-4", "claude-3-7", "claude-3-5")
 
+# -- ReAct agentic search: per-session grep cache ----------------------------
+# Keyed by session_cache_key -> accumulated grep text from prior search rounds.
+# Avoids re-scanning large files on follow-up edits in the same session.
+_react_grep_cache: dict = {}
+
 def _extract_search_terms(user_request: str) -> list:
     """
     Extract likely code identifiers, CSS selectors, and quoted strings
@@ -1256,6 +1261,14 @@ Look at the uploaded files + the user request and choose ONE intent:
    - It's a question, explanation request, or general discussion
    - No code changes are needed
 
+4. "search" — use this when:
+   - The symbol map was capped AND you cannot see the specific element mentioned in the request
+   - A KEYWORD MATCH section shows surrounding context but NOT the element you need to edit
+   - You need to find an input/function/element by a name or ID not yet visible in your context
+   - ONLY use this up to 3 times per request — you have a limited search budget
+   - NEVER request terms already listed in ALREADY SEARCHED TERMS
+   - As soon as you locate the target element -> switch to "edit" intent immediately
+
 ━━━ OUTPUT FORMAT ━━━
 
 Output ONLY valid JSON. Pick the matching shape:
@@ -1294,6 +1307,14 @@ IF chat:
   "intent": "chat",
   "reasoning": "why this is a question not an edit",
   "chat_response": "full markdown answer"
+}
+
+IF search:
+{
+  "intent": "search",
+  "reasoning": "one sentence: what you found so far and what you still need to locate",
+  "search_terms": ["exactId", "type=\"date\"", "<input"],
+  "confidence_if_found": 8
 }
 
 ━━━ INTENT ROUTING — READ THIS CAREFULLY ━━━
@@ -1876,135 +1897,253 @@ USER REQUEST:
         _architect_system = _build_architect_system(is_diagnostic=_is_diagnostic)
 
         if _is_claude_model(arch_model):
-            # ── Claude Architect with streaming extended thinking ──
+            # -- Claude Architect with ReAct agentic search loop --
+            # Claude drives iterative grep searches until it has enough context.
+            # Each "search" intent response triggers a grep + re-call (up to 4 rounds).
             aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
 
-            # Build user content for Claude (images use different format)
-            if image_files:
-                user_content = [{"type": "text", "text": context_msg}]
-                for img_sf in image_files:
-                    img_data = img_sf["content"]
-                    if img_data.startswith("data:"):
-                        parts = img_data.split(",", 1)
-                        media_type = parts[0].split(":")[1].split(";")[0]
-                        b64_data = parts[1]
-                    else:
-                        ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
-                        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                                    "webp": "image/webp", "gif": "image/gif"}
-                        media_type = mime_map.get(ext, "image/png")
-                        b64_data = img_data
-                    user_content.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": media_type, "data": b64_data}
-                    })
-            else:
-                user_content = context_msg
+            # ReAct loop state
+            _REACT_MAX_ROUNDS = 4
+            _react_round = 0
+            _react_searched_terms = []
+            _react_accumulated = ""   # accumulated grep sections across all rounds
+            _react_budget_lines = 0   # total lines injected (budget guard at 2500)
 
-            thinking_chunks = []
-            response_text_chunks = []
-            claude_failed = False
+            # Seed from session cache (previous search rounds in this session)
+            _react_cache_key = "{}::{}".format(
+                session_id or "",
+                ":".join(sorted(symbol_maps_by_name.keys()))
+            )
+            if _react_cache_key in _react_grep_cache:
+                _react_accumulated = _react_grep_cache[_react_cache_key]
+                _react_budget_lines = _react_accumulated.count("\n")
 
-            # ── Retry loop: up to 2 attempts for transient 500/529 errors ──
-            _claude_attempt = 0
-            while _claude_attempt < 2:
-                _claude_attempt += 1
+            while _react_round < _REACT_MAX_ROUNDS:
+                _react_round += 1
+
+                # Build context for this round (base + accumulated search results)
+                _react_context = context_msg
+                if _react_accumulated:
+                    _react_context += (
+                        "\n\n=== SEARCH RESULTS (from {} search round(s)) ===\n{}".format(
+                            _react_round - 1, _react_accumulated
+                        )
+                    )
+                if _react_searched_terms:
+                    _react_context += (
+                        "\n\nALREADY SEARCHED TERMS (do NOT request again): {}".format(
+                            ", ".join(_react_searched_terms)
+                        )
+                    )
+                if _react_round >= _REACT_MAX_ROUNDS:
+                    _react_context += (
+                        "\n\n[SEARCH BUDGET EXHAUSTED] You MUST now return "
+                        "'edit', 'chat', or 'needs_clarification'. "
+                        "No more search rounds. Plan with what you have."
+                    )
+
+                # Build user content for Claude (images use different format)
+                if image_files:
+                    user_content = [{"type": "text", "text": _react_context}]
+                    for img_sf in image_files:
+                        img_data = img_sf["content"]
+                        if img_data.startswith("data:"):
+                            parts = img_data.split(",", 1)
+                            media_type = parts[0].split(":")[1].split(";")[0]
+                            b64_data = parts[1]
+                        else:
+                            ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
+                            mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                                        "png": "image/png", "webp": "image/webp",
+                                        "gif": "image/gif"}
+                            media_type = mime_map.get(ext, "image/png")
+                            b64_data = img_data
+                        user_content.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": media_type,
+                                       "data": b64_data}
+                        })
+                else:
+                    user_content = _react_context
+
                 thinking_chunks = []
                 response_text_chunks = []
-                try:
-                    async with aclient.messages.stream(
-                        model=arch_model,
-                        max_tokens=16000,
-                        **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
-                        system=_architect_system,
-                        messages=_arch_history_msgs + [{"role": "user", "content": user_content}],
-                    ) as astream:
-                        current_block = None
-                        async for event in astream:
-                            if event.type == "content_block_start":
-                                current_block = getattr(event.content_block, 'type', None)
-                                if current_block == "thinking":
-                                    yield sse({"type": "thinking_start", "content": ""})
-                            elif event.type == "content_block_delta":
-                                if hasattr(event.delta, 'thinking'):
-                                    yield sse({"type": "thinking", "content": event.delta.thinking})
-                                    thinking_chunks.append(event.delta.thinking)
-                                elif hasattr(event.delta, 'text'):
-                                    response_text_chunks.append(event.delta.text)
-                            elif event.type == "content_block_stop":
-                                if current_block == "thinking":
-                                    yield sse({"type": "thinking_end", "content": ""})
-                    break  # ← success: exit retry loop
-                except Exception as claude_err:
-                    err_str = str(claude_err)
-                    err_low = err_str.lower()
-                    _is_transient = "500" in err_str or "529" in err_str or "overloaded" in err_low or "internal_server_error" in err_low
-                    if _is_transient and _claude_attempt < 2:
-                        yield sse({"type": "progress", "content": "⚡ AI service hiccup — retrying once..."})
-                        await asyncio.sleep(2)
-                        continue  # retry
-                    if image_files and ("image" in err_low or "unsupported" in err_low):
-                        yield sse({"type": "progress", "content": "⚠️ Images failed — retrying text-only..."})
-                        thinking_chunks = []
-                        response_text_chunks = []
-                        try:
-                            async with aclient.messages.stream(
-                                model=arch_model,
-                                max_tokens=16000,
-                                **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
-                                system=_architect_system,
-                                messages=_arch_history_msgs + [{"role": "user", "content": context_msg}],
-                            ) as astream:
-                                current_block = None
-                                async for event in astream:
-                                    if event.type == "content_block_start":
-                                        current_block = getattr(event.content_block, 'type', None)
-                                        if current_block == "thinking":
-                                            yield sse({"type": "thinking_start", "content": ""})
-                                    elif event.type == "content_block_delta":
-                                        if hasattr(event.delta, 'thinking'):
-                                            yield sse({"type": "thinking", "content": event.delta.thinking})
-                                            thinking_chunks.append(event.delta.thinking)
-                                        elif hasattr(event.delta, 'text'):
-                                            response_text_chunks.append(event.delta.text)
-                                    elif event.type == "content_block_stop":
-                                        if current_block == "thinking":
-                                            yield sse({"type": "thinking_end", "content": ""})
-                        except Exception:
-                            raise
-                        break  # text-only succeeded
-                    else:
-                        raise
+                claude_failed = False
 
-            raw_text = "".join(response_text_chunks)
-            # Claude might wrap JSON in markdown fences
-            stripped = raw_text.strip()
-            if stripped.startswith("```"):
-                fence_lines = stripped.split("\n")
-                # Remove first line (```json) and last line (```)
-                if fence_lines[-1].strip() == "```":
-                    raw_text = "\n".join(fence_lines[1:-1])
-                else:
-                    raw_text = "\n".join(fence_lines[1:])
-
-            # Robust JSON parsing — Claude may not always produce perfect JSON
-            try:
-                plan = json.loads(raw_text)
-            except json.JSONDecodeError:
-                # Try to extract JSON object from the text
-                # Manual JSON extraction (avoids 're' module scoping issues)
-                _brace_start = raw_text.find('{')
-                _brace_end = raw_text.rfind('}')
-                json_match = raw_text[_brace_start:_brace_end + 1] if _brace_start >= 0 and _brace_end > _brace_start else None
-                if json_match:
+                # -- Retry loop: up to 2 attempts for transient 500/529 errors --
+                _claude_attempt = 0
+                while _claude_attempt < 2:
+                    _claude_attempt += 1
+                    thinking_chunks = []
+                    response_text_chunks = []
                     try:
-                        plan = json.loads(json_match)
-                    except json.JSONDecodeError:
-                        # Last resort: treat entire response as chat
+                        async with aclient.messages.stream(
+                            model=arch_model,
+                            max_tokens=16000,
+                            **({"thinking": {"type": "enabled", "budget_tokens": 10000}}
+                               if _supports_thinking(arch_model) else {}),
+                            system=_architect_system,
+                            messages=_arch_history_msgs + [{"role": "user",
+                                                            "content": user_content}],
+                        ) as astream:
+                            current_block = None
+                            async for event in astream:
+                                if event.type == "content_block_start":
+                                    current_block = getattr(event.content_block,
+                                                            'type', None)
+                                    if current_block == "thinking":
+                                        yield sse({"type": "thinking_start",
+                                                   "content": ""})
+                                elif event.type == "content_block_delta":
+                                    if hasattr(event.delta, 'thinking'):
+                                        yield sse({"type": "thinking",
+                                                   "content": event.delta.thinking})
+                                        thinking_chunks.append(event.delta.thinking)
+                                    elif hasattr(event.delta, 'text'):
+                                        response_text_chunks.append(event.delta.text)
+                                elif event.type == "content_block_stop":
+                                    if current_block == "thinking":
+                                        yield sse({"type": "thinking_end",
+                                                   "content": ""})
+                        break  # success: exit retry loop
+                    except Exception as claude_err:
+                        err_str = str(claude_err)
+                        err_low = err_str.lower()
+                        _is_transient = (
+                            "500" in err_str or "529" in err_str
+                            or "overloaded" in err_low
+                            or "internal_server_error" in err_low
+                        )
+                        if _is_transient and _claude_attempt < 2:
+                            yield sse({"type": "progress",
+                                       "content": "AI service hiccup -- retrying once..."})
+                            await asyncio.sleep(2)
+                            continue  # retry
+                        if image_files and ("image" in err_low or "unsupported" in err_low):
+                            yield sse({"type": "progress",
+                                       "content": "Images failed -- retrying text-only..."})
+                            thinking_chunks = []
+                            response_text_chunks = []
+                            try:
+                                async with aclient.messages.stream(
+                                    model=arch_model,
+                                    max_tokens=16000,
+                                    **({"thinking": {"type": "enabled",
+                                                    "budget_tokens": 10000}}
+                                       if _supports_thinking(arch_model) else {}),
+                                    system=_architect_system,
+                                    messages=_arch_history_msgs + [{"role": "user",
+                                                                    "content": _react_context}],
+                                ) as astream:
+                                    current_block = None
+                                    async for event in astream:
+                                        if event.type == "content_block_start":
+                                            current_block = getattr(event.content_block,
+                                                                    'type', None)
+                                            if current_block == "thinking":
+                                                yield sse({"type": "thinking_start",
+                                                           "content": ""})
+                                        elif event.type == "content_block_delta":
+                                            if hasattr(event.delta, 'thinking'):
+                                                yield sse({"type": "thinking",
+                                                           "content": event.delta.thinking})
+                                                thinking_chunks.append(event.delta.thinking)
+                                            elif hasattr(event.delta, 'text'):
+                                                response_text_chunks.append(event.delta.text)
+                                        elif event.type == "content_block_stop":
+                                            if current_block == "thinking":
+                                                yield sse({"type": "thinking_end",
+                                                           "content": ""})
+                            except Exception:
+                                raise
+                            break  # text-only succeeded
+                        else:
+                            raise
+
+                raw_text = "".join(response_text_chunks)
+                # Claude might wrap JSON in markdown fences
+                stripped = raw_text.strip()
+                if stripped.startswith("```"):
+                    fence_lines = stripped.split("\n")
+                    # Remove first line (```json) and last line (```)
+                    if fence_lines[-1].strip() == "```":
+                        raw_text = "\n".join(fence_lines[1:-1])
+                    else:
+                        raw_text = "\n".join(fence_lines[1:])
+
+                # Robust JSON parsing -- Claude may not always produce perfect JSON
+                try:
+                    plan = json.loads(raw_text)
+                except json.JSONDecodeError:
+                    # Try to extract JSON object from the text
+                    # Manual JSON extraction (avoids 're' module scoping issues)
+                    _brace_start = raw_text.find('{')
+                    _brace_end = raw_text.rfind('}')
+                    json_match = (raw_text[_brace_start:_brace_end + 1]
+                                  if _brace_start >= 0 and _brace_end > _brace_start
+                                  else None)
+                    if json_match:
+                        try:
+                            plan = json.loads(json_match)
+                        except json.JSONDecodeError:
+                            # Last resort: treat entire response as chat
+                            plan = {"intent": "chat", "chat_response": raw_text}
+                    else:
+                        # No JSON found at all -- Claude gave a plain text answer
                         plan = {"intent": "chat", "chat_response": raw_text}
-                else:
-                    # No JSON found at all — Claude gave a plain text answer
-                    plan = {"intent": "chat", "chat_response": raw_text}
+
+                # -- ReAct: check if Claude wants to search for more context --
+                _this_intent = plan.get("intent", "chat")
+                if _this_intent != "search":
+                    break  # Got a real plan (edit/chat/needs_clarification) -- exit ReAct loop
+
+                # -- Handle search round --
+                _search_terms = plan.get("search_terms", [])
+                _search_reason = plan.get("reasoning", "gathering more context")
+                _new_terms = [
+                    t for t in _search_terms
+                    if t.lower() not in {s.lower() for s in _react_searched_terms}
+                ]
+
+                if not _new_terms:
+                    # All requested terms already searched -- force clarification
+                    plan = {
+                        "intent": "needs_clarification",
+                        "questions": ["Could you paste a small snippet of the code you want to change, or tell me the exact element ID or function name?"],
+                        "clarification_response": (
+                            "I've searched through the file thoroughly but couldn't pinpoint "
+                            "the exact code. Could you paste a small snippet of the element "
+                            "you want to change, or give me the exact ID or function name? "
+                            "That will let me find it directly."
+                        )
+                    }
+                    break
+
+                if _react_budget_lines < 2500:
+                    yield sse({"type": "progress", "content":
+                               "Searching for: {} (round {}/{})...".format(
+                                   ", ".join(_new_terms[:3]), _react_round, _REACT_MAX_ROUNDS
+                               )})
+                    for _fname_r, (_smap_r, _sf_r) in symbol_maps_by_name.items():
+                        _fcontent_r = _sf_r.get("content", "")
+                        if not _fcontent_r:
+                            continue
+                        _grep_r = _grep_relevant_sections(
+                            "", _fname_r, _fcontent_r,
+                            extra_terms=_new_terms,
+                            window=100, max_lines=300,
+                        )
+                        if _grep_r:
+                            _react_accumulated += "\n" + _grep_r
+                            _react_budget_lines += _grep_r.count("\n")
+                    _react_searched_terms.extend(_new_terms)
+                    # Persist to session cache for follow-up edits
+                    _react_grep_cache[_react_cache_key] = _react_accumulated
+
+                # If budget was exceeded, the warning is injected at top of next round;
+                # the loop naturally exits when _react_round hits _REACT_MAX_ROUNDS.
+
+            # End of ReAct while loop -- plan is now set to a non-search intent
         else:
             # ── OpenAI Architect (original logic) ──
             client = _get_client(user_id)
@@ -2095,6 +2234,16 @@ USER REQUEST:
         # Stream the clarification questions back as tokens.
         # On the next turn, conversation history carries the Q&A context
         # and the Architect will proceed with a real plan.
+        # Safety: 'search' intent should be consumed inside the ReAct loop.
+        # If it leaks through (OpenAI path), convert to needs_clarification.
+        if intent == "search":
+            intent = "needs_clarification"
+            plan.setdefault("clarification_response",
+                "I need to look for more code context. Could you paste a snippet "
+                "of the code you want to change, or give me the exact element ID "
+                "or function name?")
+            compliance.set_intent(intent)
+
         if intent == "needs_clarification":
             clarification_response = plan.get(
                 "clarification_response",
