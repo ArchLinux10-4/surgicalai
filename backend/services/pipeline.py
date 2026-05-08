@@ -59,6 +59,121 @@ def _is_claude_model(model: str) -> bool:
 # claude-opus-4-7 and others without native thinking support must be excluded.
 _THINKING_CAPABLE_PATTERNS = ("claude-sonnet-4", "claude-3-7", "claude-3-5")
 
+def _extract_search_terms(user_request: str) -> list:
+    """
+    Extract likely code identifiers, CSS selectors, and quoted strings
+    from a plain-English user request.  Used to grep large files before
+    Architect sees them so hidden symbols can still be found.
+    """
+    terms = []
+    # 1. Quoted strings (user is naming something specific)
+    quoted = re.findall(r'["\']([^"\'"]{3,})["\']\s', user_request + " ")
+    terms.extend(q.strip() for q in quoted if q.strip())
+    # 2. CSS selectors: .className  #idName
+    css = re.findall(r'[.#][a-zA-Z][a-zA-Z0-9_-]+', user_request)
+    terms.extend(css)
+    # 3. camelCase / PascalCase — high signal (has uppercase after first char)
+    camel = re.findall(r'\b[a-z][a-z0-9]*(?:[A-Z][a-z0-9]+)+\b', user_request)
+    terms.extend(camel)
+    # 4. snake_case — high signal (has underscore)
+    snake = re.findall(r'\b[a-z][a-z0-9]+(?:_[a-z0-9]+)+\b', user_request)
+    terms.extend(snake)
+    # 5. Long plain words (7+ chars) — lower noise than short words
+    _STOPS = {
+        'function', 'section', 'element', 'replace', 'rename', 'remove',
+        'without', 'between', 'current', 'default', 'created', 'returns',
+        'content', 'background', 'updating', 'changed', 'looking', 'showing',
+    }
+    long_words = re.findall(r'\b[a-zA-Z]{7,}\b', user_request)
+    terms.extend(w for w in long_words if w.lower() not in _STOPS)
+    # deduplicate while preserving order, cap at 10 terms
+    seen = set()
+    result = []
+    for t in terms:
+        tl = t.lower()
+        if tl not in seen and len(tl) >= 3:
+            seen.add(tl)
+            result.append(t)
+        if len(result) >= 10:
+            break
+    return result
+
+
+def _grep_relevant_sections(
+    user_request: str,
+    file_name: str,
+    file_content: str,
+    window: int = 50,
+    max_lines: int = 180,
+) -> str:
+    """
+    Search *file_content* for terms extracted from *user_request*.
+    Returns a formatted string of up to 3 relevant code sections with
+    line numbers, capped at *max_lines* total.  Empty string if nothing found.
+
+    This is injected into the Architect prompt for large files (>60 symbols)
+    so the Architect can locate code that fell outside the symbol map cap.
+    """
+    terms = _extract_search_terms(user_request)
+    if not terms:
+        return ""
+
+    lines = file_content.splitlines()
+    matched_lines: set = set()
+
+    for term in terms:
+        tl = term.lower()
+        for i, line in enumerate(lines):
+            if tl in line.lower():
+                start = max(0, i - window)
+                end = min(len(lines), i + window + 1)
+                for j in range(start, end):
+                    matched_lines.add(j)
+
+    if not matched_lines:
+        return ""
+
+    # Group into contiguous sections (gap > 10 lines = new section)
+    sorted_lns = sorted(matched_lines)
+    sections = []
+    sec_start = sorted_lns[0]
+    prev = sorted_lns[0]
+    for ln in sorted_lns[1:]:
+        if ln > prev + 10:
+            sections.append((sec_start, prev))
+            sec_start = ln
+        prev = ln
+    sections.append((sec_start, prev))
+
+    # Keep top 3 largest sections, re-sort by position
+    sections = sorted(sections, key=lambda s: s[1] - s[0], reverse=True)[:3]
+    sections = sorted(sections, key=lambda s: s[0])
+
+    output_parts = []
+    total = 0
+    for s_start, s_end in sections:
+        if total >= max_lines:
+            break
+        budget = min(s_end - s_start + 1, max_lines - total)
+        s_end = s_start + budget - 1
+        chunk = "\n".join(
+            f"{s_start + 1 + j:5d}: {lines[s_start + j]}"
+            for j in range(s_end - s_start + 1)
+        )
+        output_parts.append(f"Lines {s_start + 1}–{s_end + 1}:\n{chunk}")
+        total += s_end - s_start + 1
+
+    if not output_parts:
+        return ""
+
+    matched_terms = ", ".join(f'"{t}"' for t in terms[:5])
+    header = (
+        f"\nKEYWORD MATCH IN {file_name} "
+        f"(searched for: {matched_terms}):\n"
+    )
+    return header + "\n\n".join(output_parts)
+
+
 def _supports_thinking(model: str) -> bool:
     """Return True only for Claude models that support extended thinking."""
     if not _is_claude_model(model):
@@ -1650,17 +1765,35 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 _total_syms = len(smap.symbols)
                 _sym_header = f"SYMBOLS ({_total_syms} total" + (f", showing {_MAX_SYMS} most targeted" if _total_syms > _MAX_SYMS else "") + "):"
                 _sym_suffix = "" if _total_syms <= _MAX_SYMS else f"\n  ... [{_total_syms - _MAX_SYMS} more — use narrowest symbol rule; prefer small symbols under 200 lines]"
-                file_summaries.append(
+                _file_summary = (
                     f"FILE: {fname} ({sf.get('lines', len(content.splitlines()))} lines, {sf.get('language', 'code')})\n"
                     f"{_sym_header}\n" + ("\n".join(syms) + _sym_suffix if syms else "  (no symbols parsed)")
                 )
+                # ── Grep injection for large files (>_MAX_SYMS hidden symbols) ──
+                # When Architect can only see 60 of 338 symbols, grep the file
+                # for terms from the user's request and inject matching sections.
+                # This is how Tasklet works: grep first, then edit.
+                if _total_syms > _MAX_SYMS:
+                    _grep_hit = _grep_relevant_sections(user_request, fname, content)
+                    if _grep_hit:
+                        _file_summary += _grep_hit
+                file_summaries.append(_file_summary)
             except Exception as e:
                 file_summaries.append(f"FILE: {fname} — could not parse: {e}")
                 symbol_maps_by_name[fname] = (None, sf)
 
         compliance.mark("symbol_map_read", ran=True,
                         output_summary=f"{len([f for f in file_summaries if 'SYMBOLS:' in f])} files parsed with symbol maps")
-        yield sse({"type": "progress", "content": "Architect analyzing your request..."})
+        _large_file_count = sum(
+            1 for fname, (smap, _sf) in symbol_maps_by_name.items()
+            if smap and len(smap.symbols) > 60
+        )
+        _progress_msg = (
+            f"Architect analyzing your request... (keyword search active on {_large_file_count} large file(s))"
+            if _large_file_count else
+            "Architect analyzing your request..."
+        )
+        yield sse({"type": "progress", "content": _progress_msg})
 
         # Format recent conversation history (last 6 turns)
         hist_text = ""
