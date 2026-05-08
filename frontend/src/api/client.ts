@@ -90,6 +90,7 @@ export const api = {
     send: (data: any) => request<any>('/chat/send', { method: 'POST', body: JSON.stringify(data) }),
     deleteSession: (id: string) => request(`/chat/sessions/${id}`, { method: 'DELETE' }),
     renameSession: (id: string, title: string) => request(`/chat/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
+    search: (q: string) => request<any[]>(`/chat/search?q=${encodeURIComponent(q)}`),
   },
   files: {
     getTree: (root?: string) => request<any>(`/files/tree${root ? `?root=${encodeURIComponent(root)}` : ''}`),

@@ -23,6 +23,65 @@ def create_session(req: NewSessionRequest, request: Request):
     conn.close()
     return {"id": session_id, "title": req.title}
 
+@router.get("/search")
+def search_chats(request: Request, q: str):
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        return []
+    q = (q or "").strip()
+    if not q:
+        return []
+    like = f"%{q}%"
+    conn = get_db()
+    # Query A: sessions matching by title
+    session_rows = conn.execute(
+        "SELECT id, title FROM chat_sessions WHERE user_id = ? AND LOWER(title) LIKE LOWER(?)",
+        (user_id, like)
+    ).fetchall()
+    # Query B: messages matching content
+    message_rows = conn.execute(
+        "SELECT m.id, m.session_id, m.role, m.content, m.created_at, s.title FROM chat_messages m JOIN chat_sessions s ON s.id = m.session_id WHERE s.user_id = ? AND LOWER(m.content) LIKE LOWER(?)",
+        (user_id, like)
+    ).fetchall()
+    results_dict = {}
+    # Seed with sessions from Query A
+    for row in session_rows:
+        results_dict[row["id"]] = {
+            "session_id": row["id"],
+            "session_name": row["title"],
+            "matched_messages": []
+        }
+    # Add messages from Query B
+    for m in message_rows:
+        sid = m["session_id"]
+        if sid not in results_dict:
+            results_dict[sid] = {
+                "session_id": sid,
+                "session_name": m["title"],
+                "matched_messages": []
+            }
+        results_dict[sid]["matched_messages"].append({
+            "message_id": m["id"],
+            "role": m["role"],
+            "content_snippet": (m["content"] or "")[:200],
+            "created_at": m["created_at"]
+        })
+    # For sessions from Query A with no matched_messages, fetch matching messages in that session
+    for sid, entry in results_dict.items():
+        if not entry["matched_messages"]:
+            extra_rows = conn.execute(
+                "SELECT id, role, content, created_at FROM chat_messages WHERE session_id = ? AND LOWER(content) LIKE LOWER(?)",
+                (sid, like)
+            ).fetchall()
+            for m in extra_rows:
+                entry["matched_messages"].append({
+                    "message_id": m["id"],
+                    "role": m["role"],
+                    "content_snippet": (m["content"] or "")[:200],
+                    "created_at": m["created_at"]
+                })
+    return list(results_dict.values())
+
 
 @router.get("/sessions")
 def list_sessions(request: Request):

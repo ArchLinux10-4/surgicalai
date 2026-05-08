@@ -152,6 +152,8 @@ function SessionItem({ session, active, onLoad, onDelete, onRename }: {
 // ── Session List ────────────────────────────────────
 function SessionList() {
   const { sessions, setSessions, activeSessions, setActiveSession, setMessages } = useAppStore()
+  const [searchQuery, setSearchQuery] = useState('')
+  const [searchResults, setSearchResults] = useState<any[]>([])
 
   const loadSessions = () => api.chat.getSessions().then(setSessions).catch(() => {})
   useEffect(() => { loadSessions() }, [])
@@ -195,6 +197,26 @@ function SessionList() {
     }
   }
 
+  useEffect(() => {
+    if (searchQuery.trim() === '') {
+      setSearchResults([])
+      return
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const response = await api.chat.search(searchQuery)
+        setSearchResults(response.results ?? response ?? [])
+      } catch {
+        setSearchResults([])
+      }
+    }, 400)
+    return () => clearTimeout(timer)
+  }, [searchQuery])
+
+  const filteredSessions = searchQuery.trim()
+    ? sessions.filter(s => (s.title || '').toLowerCase().includes(searchQuery.toLowerCase()))
+    : sessions
+
   return (
     <div className="flex flex-col h-full">
       <div className="p-2 border-b border-border">
@@ -203,14 +225,41 @@ function SessionList() {
           <kbd className="ml-auto text-[10px] opacity-50 font-mono bg-accent-dark/30 px-1 rounded">⌘N</kbd>
         </button>
       </div>
+      <div className="relative mb-2 px-2">
+        <span className="absolute left-4 top-1/2 -translate-y-1/2 text-muted-foreground">
+          <Search size={14} className="opacity-60" />
+        </span>
+        <input
+          type="text"
+          placeholder="Search sessions..."
+          value={searchQuery}
+          onChange={e => setSearchQuery(e.target.value)}
+          className="w-full pl-9 pr-8 py-1 text-sm rounded border bg-background border-border focus:outline-none"
+        />
+        {searchQuery && (
+          <button
+            type="button"
+            className="absolute right-4 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+            onClick={() => setSearchQuery('')}
+            tabIndex={-1}
+          >
+            {/* Use X icon from lucide-react if available, else × */}
+            <X size={14} />
+          </button>
+        )}
+      </div>
       <div className="flex-1 overflow-y-auto py-1">
-        {sessions.length === 0 ? (
+        {searchQuery.trim() !== '' && filteredSessions.length === 0 && searchResults.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-20 gap-2 text-faint">
+            <span className="text-xs">No matches</span>
+          </div>
+        ) : filteredSessions.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-32 gap-2 text-faint">
             <MessageSquare size={24} className="opacity-40" />
             <span className="text-xs">No chats yet</span>
           </div>
         ) : (
-          sessions.map((s) => (
+          filteredSessions.map((s) => (
             <SessionItem
               key={s.id}
               session={s}
@@ -222,6 +271,27 @@ function SessionList() {
           ))
         )}
       </div>
+      {searchResults.length > 0 && (
+        <div className="px-2 pb-2">
+          <div className="text-[10px] uppercase tracking-wide text-muted-foreground mb-1 font-semibold">Message matches</div>
+          <div className="flex flex-col gap-1">
+            {searchResults.map((result, index) => (
+              <button
+                key={result.message_id ?? result.id ?? index}
+                type="button"
+                className="text-left w-full px-2 py-1 rounded hover:bg-accent transition group"
+                onClick={() => {
+                  setActiveSession(result.session_id ?? result.id)
+                  setMessages([])
+                }}
+              >
+                <div className="text-sm font-normal truncate">{result.session_name ?? result.name ?? 'Untitled'}</div>
+                <div className="text-xs text-muted-foreground line-clamp-2">{result.content_snippet ?? result.snippet ?? ''}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
