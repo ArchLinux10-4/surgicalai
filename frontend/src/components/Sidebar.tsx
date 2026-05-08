@@ -205,7 +205,8 @@ function SessionList() {
     const timer = setTimeout(async () => {
       try {
         const response = await api.chat.search(searchQuery)
-        setSearchResults(response.results ?? response ?? [])
+        const data = response as any
+        setSearchResults(data.results ?? data ?? [])
       } catch {
         setSearchResults([])
       }
