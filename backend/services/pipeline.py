@@ -42,6 +42,17 @@ def _is_claude_model(model: str) -> bool:
     return bool(model and model.startswith("claude-"))
 
 
+# Models confirmed to support extended thinking (budget_tokens).
+# claude-opus-4-7 and others without native thinking support must be excluded.
+_THINKING_CAPABLE_PATTERNS = ("claude-sonnet-4", "claude-3-7", "claude-3-5")
+
+def _supports_thinking(model: str) -> bool:
+    """Return True only for Claude models that support extended thinking."""
+    if not _is_claude_model(model):
+        return False
+    return any(model.startswith(p) or p in model for p in _THINKING_CAPABLE_PATTERNS)
+
+
 def _resolve_key(user_id: str, key_type: str) -> str:
     """Decrypt per-user API key, fall back to global setting."""
     if user_id:
@@ -173,6 +184,12 @@ Your ONLY job: implement that plan on the specific code block you receive. Nothi
 - Do NOT add features, error handling, logging, or comments that weren't asked for
 - Do NOT remove existing error handling unless explicitly requested
 - If you genuinely cannot implement part of the plan, add: # SURGEON NOTE: [specific concern]
+
+━━━ CRITICAL: NO DUPLICATION ━━━
+- The CONTEXT BEFORE and CONTEXT AFTER blocks are shown for your reference ONLY — do NOT include them in your output
+- Do NOT repeat function declarations, type annotations, closing braces, or ANY line that appears in CONTEXT BEFORE
+- Your output REPLACES the TARGET CODE block exactly — it must start at line {start} and end at line {end}
+- If the target starts with a function/class declaration, output that declaration ONCE and only once
 
 Minimal footprint. The diff between original and your output should contain ONLY the requested change.
 
@@ -1100,7 +1117,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 async with aclient.messages.stream(
                     model=chat_model,
                     max_tokens=16000,
-                    thinking={"type": "enabled", "budget_tokens": 10000},
+                    **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(chat_model) else {}),
                     system=system,
                     messages=claude_msgs,
                 ) as astream:
@@ -1238,7 +1255,7 @@ USER REQUEST:
                 async with aclient.messages.stream(
                     model=arch_model,
                     max_tokens=16000,
-                    thinking={"type": "enabled", "budget_tokens": 10000},
+                    **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
                     system=SMART_ARCHITECT_SYSTEM,
                     messages=[{"role": "user", "content": user_content}],
                 ) as astream:
@@ -1267,7 +1284,7 @@ USER REQUEST:
                         async with aclient.messages.stream(
                             model=arch_model,
                             max_tokens=16000,
-                            thinking={"type": "enabled", "budget_tokens": 10000},
+                            **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(arch_model) else {}),
                             system=SMART_ARCHITECT_SYSTEM,
                             messages=[{"role": "user", "content": context_msg}],
                         ) as astream:
