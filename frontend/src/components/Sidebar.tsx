@@ -70,14 +70,22 @@ function FileTreeNode({ node, depth = 0 }: { node: FileNode; depth?: number }) {
   )
 }
 
+// ── Timestamp helper ────────────────────────────────
+function relativeTime(iso: string): string {
+  if (!iso) return ''
+  const diff = Date.now() - new Date(iso).getTime()
+  const mins = Math.floor(diff / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  const days = Math.floor(hrs / 24)
+  if (days < 7) return days === 1 ? 'yesterday' : `${days}d ago`
+  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
 // ── Session Item ────────────────────────────────────
 function SessionItem({ session, active, onLoad, onDelete, onRename }: {
-  session: any; active: boolean
-  onLoad: () => void; onDelete: () => void; onRename: (title: string) => void
-}) {
-  session: any; active: boolean
-  onLoad: () => void; onDelete: () => void; onRename: (title: string) => void
-}) {
   session: any; active: boolean
   onLoad: () => void; onDelete: () => void; onRename: (title: string) => void
 }) {
@@ -117,7 +125,11 @@ function SessionItem({ session, active, onLoad, onDelete, onRename }: {
         ) : (
           <div className="text-[13px] font-medium truncate leading-snug">{session.title}</div>
         )}
-        <div className="text-[11px] text-faint mt-0.5">{session.message_count} msgs · {session.model || 'gpt-4.1'}</div>
+        <div className="text-[11px] text-faint mt-0.5 flex items-center gap-1.5">
+          <span>{session.message_count} msgs</span>
+          <span className="opacity-40">·</span>
+          <span>{relativeTime(session.created_at)}</span>
+        </div>
       </div>
 
       {/* Hover actions */}
