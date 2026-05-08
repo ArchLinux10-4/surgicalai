@@ -31,6 +31,36 @@ def _backup_file(file_path: str) -> Optional[str]:
     return str(backup_path)
 
 
+def _extract_core_diff(original_code: str, new_code: str):
+    """
+    Find the lines that actually changed between original and new code.
+    Returns (orig_core_lines, new_core_lines, start_offset, end_offset)
+    where offsets are relative to the start of original_code.
+    """
+    orig_lines = original_code.splitlines(keepends=True)
+    new_lines = new_code.splitlines(keepends=True)
+
+    # Find first differing line from the top
+    top = 0
+    while top < len(orig_lines) and top < len(new_lines):
+        if orig_lines[top] != new_lines[top]:
+            break
+        top += 1
+
+    # Find first differing line from the bottom
+    bot_orig = len(orig_lines) - 1
+    bot_new = len(new_lines) - 1
+    while bot_orig > top and bot_new > top:
+        if orig_lines[bot_orig] != new_lines[bot_new]:
+            break
+        bot_orig -= 1
+        bot_new -= 1
+
+    orig_core = orig_lines[top:bot_orig + 1]
+    new_core = new_lines[top:bot_new + 1]
+    return orig_core, new_core, top, len(orig_lines) - bot_orig - 1
+
+
 def apply_change(
     file_path: str,
     file_content: str,
@@ -39,39 +69,90 @@ def apply_change(
     """
     Apply a single surgical change to file content.
     Uses line-number anchoring with context guards.
+    Falls back to core-diff matching when windows overlap (multi-change sets).
     Returns the new file content.
     """
     lines = file_content.splitlines(keepends=True)
     symbol = change.symbol
 
     # Validate the target region still matches what we parsed
-    # (guards against stale changes being applied to modified files)
     target_lines = lines[symbol.start_line - 1:symbol.end_line]
     current_block = "".join(target_lines).rstrip()
     expected_block = change.original_code.rstrip()
 
     if current_block != expected_block:
-        # Try fuzzy match — find where the original code actually is now
-        orig_lines = change.original_code.splitlines()
+        # --- Tier 1: full-block fuzzy scan (shifted location) ---
+        orig_lines = change.original_code.splitlines(keepends=True)
         first_line = orig_lines[0].strip() if orig_lines else ""
 
         found_at = None
         for i, line in enumerate(lines):
             if line.strip() == first_line:
-                # Check if this block matches
                 candidate = "".join(lines[i:i + len(orig_lines)]).rstrip()
                 if candidate == change.original_code.rstrip():
                     found_at = i
                     break
 
-        if found_at is None:
-            raise ValueError(
-                f"Cannot apply change to '{symbol.full_path}': "
-                f"the target code has been modified since analysis. "
-                f"Re-analyze the file and try again."
+        if found_at is not None:
+            actual_start = found_at
+            actual_end = found_at + len(orig_lines)
+        else:
+            # --- Tier 2: core-diff matching (handles overlapping windows) ---
+            # Extract just the lines that actually changed between original and new
+            orig_core, new_core, top_ctx, bot_ctx = _extract_core_diff(
+                change.original_code, change.new_code or ""
             )
 
-        # Update line range to actual location
+            if not orig_core:
+                raise ValueError(
+                    f"Cannot apply change to '{symbol.full_path}': "
+                    f"no differing lines found between original and new code."
+                )
+
+            core_first = orig_core[0].strip() if orig_core else ""
+
+            # Search within ±150 lines of target_line hint (or full file)
+            hint = getattr(symbol, 'target_line', None) or symbol.start_line
+            search_start = max(0, hint - 150)
+            search_end = min(len(lines), hint + 150)
+
+            core_found_at = None
+            for i in range(search_start, search_end):
+                if lines[i].strip() == core_first:
+                    candidate_core = "".join(lines[i:i + len(orig_core)]).rstrip()
+                    if candidate_core == "".join(orig_core).rstrip():
+                        core_found_at = i
+                        break
+
+            if core_found_at is None:
+                # Widen search to whole file
+                for i, line in enumerate(lines):
+                    if line.strip() == core_first:
+                        candidate_core = "".join(lines[i:i + len(orig_core)]).rstrip()
+                        if candidate_core == "".join(orig_core).rstrip():
+                            core_found_at = i
+                            break
+
+            if core_found_at is None:
+                raise ValueError(
+                    f"Cannot apply change to '{symbol.full_path}': "
+                    f"the target code was not found — it may have already been "
+                    f"applied or was modified by another change in this set. "
+                    f"Re-analyze the file if the issue persists."
+                )
+
+            # Replace only the core changed lines, leave surrounding context intact
+            new_core_block = "".join(new_core)
+            if new_core_block and not new_core_block.endswith("\n"):
+                new_core_block += "\n"
+
+            new_lines = (
+                lines[:core_found_at] +
+                ([new_core_block] if new_core_block else []) +
+                lines[core_found_at + len(orig_core):]
+            )
+            return "".join(new_lines)
+
         actual_start = found_at
         actual_end = found_at + len(orig_lines)
     else:
