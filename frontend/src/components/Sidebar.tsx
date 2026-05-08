@@ -75,6 +75,9 @@ function SessionItem({ session, active, onLoad, onDelete, onRename }: {
   session: any; active: boolean
   onLoad: () => void; onDelete: () => void; onRename: (title: string) => void
 }) {
+  session: any; active: boolean
+  onLoad: () => void; onDelete: () => void; onRename: (title: string) => void
+}) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(session.title)
   const [showMenu, setShowMenu] = useState(false)
