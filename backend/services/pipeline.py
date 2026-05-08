@@ -658,6 +658,43 @@ Produce the surgical change plan as JSON."""
 
 # ─── Script-injection safety helpers (v3.3.1) ────────────────────────────────
 
+def _extract_new_js_code(symbol_code: str, new_code: str) -> str:
+    """
+    Extract genuinely new JavaScript added by the Surgeon (functions, arrow fns,
+    const/let assignments that are new). Uses regex to avoid pulling in
+    base64 garbage or truncated original lines.
+    """
+    import re as _re
+    orig_fn_names = set(_re.findall(r'function\s+(\w+)', symbol_code))
+
+    # Find new named functions
+    fn_pattern = _re.compile(
+        r'(?:^|\n)([ \t]*function\s+\w+\s*\([^)]*\)\s*\{[^}]*(?:\{[^}]*\}[^}]*)*\})',
+        _re.MULTILINE | _re.DOTALL
+    )
+    new_fns = []
+    for m in fn_pattern.finditer(new_code):
+        body = m.group(1).strip()
+        nm = _re.search(r'function\s+(\w+)', body)
+        if nm and nm.group(1) not in orig_fn_names:
+            new_fns.append(body)
+
+    if new_fns:
+        return "\n\n".join(new_fns)
+
+    # Fallback: lines in new_code that aren't in original, filtered for JS-likeness
+    orig_set = set(symbol_code.splitlines())
+    fallback = [
+        l for l in new_code.splitlines()
+        if l.strip()
+        and l not in orig_set
+        and "</script>" not in l.lower()
+        and len(l) < 300        # skip base64 blobs
+        and not _re.search(r'[A-Za-z0-9+/]{50,}', l)  # skip base64 data
+    ]
+    return "\n".join(fallback)
+
+
 def _is_script_injection_issue(symbol_code: str, new_code: str) -> tuple:
     """
     Detect whether the Surgeon truncated the window or fabricated a </script>.
@@ -671,22 +708,19 @@ def _is_script_injection_issue(symbol_code: str, new_code: str) -> tuple:
     new_lines = new_code.splitlines()
 
     # Issue 1: Surgeon returned significantly fewer lines (truncation)
-    if len(new_lines) < len(orig_lines) * 0.75:
-        # Extract lines that were added (not in original)
-        orig_set = set(orig_lines)
-        added = [l for l in new_lines if l not in orig_set and l.strip()
-                 and "</script>" not in l.lower()]
-        return True, "\n".join(added)
+    is_truncation = len(new_lines) < len(orig_lines) * 0.75
 
     # Issue 2: Phantom </script> — new_code has more </script> occurrences than original
     orig_close = sum(1 for l in orig_lines if "</script>" in l.lower())
     new_close  = sum(1 for l in new_lines  if "</script>" in l.lower())
-    if new_close > orig_close:
-        orig_set = set(orig_lines)
-        added = [l for l in new_lines if l not in orig_set and l.strip()
-                 and "</script>" not in l.lower()]
-        return True, "\n".join(added)
+    is_phantom = new_close > orig_close
 
+    if not (is_truncation or is_phantom):
+        return False, ""
+
+    extracted = _extract_new_js_code(symbol_code, new_code)
+    if extracted:
+        return True, extracted
     return False, ""
 
 
