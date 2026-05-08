@@ -291,6 +291,9 @@ async def stream_message(req: ChatRequest):
 @router.delete("/sessions/{session_id}")
 def delete_session(session_id: str):
     conn = get_db()
+    # Cascade: delete files and messages before session row
+    conn.execute("DELETE FROM session_files WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
     conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
     conn.commit()
     conn.close()

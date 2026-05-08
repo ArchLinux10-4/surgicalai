@@ -6,6 +6,7 @@ import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import { InlineDiffCard } from './InlineDiffCard'
 import { MarkdownCode } from './CodeBlock'
+import { SessionFilesTray } from './SessionFilesTray'
 import {
   Send, X, Plus, Paperclip, FileCode, AlertTriangle, Zap, Trash2, Brain
 } from 'lucide-react'
@@ -771,6 +772,13 @@ export function ChatPanel() {
         )}
         <div ref={bottomRef} />
       </div>
+
+      {/* Session Files Tray — always-fresh download hub */}
+      {activeSessions && sessionFiles.length > 0 && (
+        <div className="px-3 pt-2 flex-shrink-0">
+          <SessionFilesTray sessionId={activeSessions} sessionFiles={sessionFiles} />
+        </div>
+      )}
 
       {/* Input area */}
       <div className="border-t border-border p-3 flex-shrink-0 bg-base/50">

@@ -234,7 +234,8 @@ def _init_sqlite():
             language TEXT DEFAULT 'plaintext',
             lines INTEGER DEFAULT 0,
             symbol_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
     cur.execute("""
@@ -271,6 +272,8 @@ def _init_sqlite():
         cur.execute("ALTER TABLE session_files ADD COLUMN file_type TEXT DEFAULT 'code'")
     if "previous_content" not in sf_cols:
         cur.execute("ALTER TABLE session_files ADD COLUMN previous_content TEXT")
+    if "updated_at" not in sf_cols:
+        cur.execute("ALTER TABLE session_files ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
 
     _seed_defaults_sqlite(cur)
     conn.commit()
@@ -405,7 +408,8 @@ def _init_postgres():
                 language TEXT DEFAULT 'plaintext',
                 lines INTEGER DEFAULT 0,
                 symbol_count INTEGER DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         # users
@@ -442,6 +446,9 @@ def _init_postgres():
         """)
         conn.execute("""
             ALTER TABLE session_files ADD COLUMN IF NOT EXISTS previous_content TEXT
+        """)
+        conn.execute("""
+            ALTER TABLE session_files ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         """)
         conn.commit()
 

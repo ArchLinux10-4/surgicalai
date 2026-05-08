@@ -258,6 +258,16 @@ export const api = {
       request<any>(`/chat/${sessionId}/files/${fileId}/undo`, { method: 'POST' }),
     delete: (sessionId: string, fileId: string) =>
       request(`/chat/${sessionId}/files/${fileId}`, { method: 'DELETE' }),
+    download: async (sessionId: string, fileId: string, filename: string) => {
+      const file = await request<any>(`/chat/${sessionId}/files/${fileId}`)
+      const blob = new Blob([file.content ?? ''], { type: 'text/plain' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      a.click()
+      URL.revokeObjectURL(url)
+    },
   },
 
   auth: {

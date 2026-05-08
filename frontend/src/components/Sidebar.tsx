@@ -154,6 +154,9 @@ function SessionList() {
   const { sessions, setSessions, activeSessions, setActiveSession, setMessages } = useAppStore()
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<any[]>([])
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
+  const [pendingDeleteFileCount, setPendingDeleteFileCount] = useState(0)
+  const [deleteConfirmLoading, setDeleteConfirmLoading] = useState(false)
 
   const loadSessions = () => api.chat.getSessions().then(setSessions).catch(() => {})
   useEffect(() => { loadSessions() }, [])
@@ -177,14 +180,31 @@ function SessionList() {
     } catch { setMessages([]) }
   }
 
-  const deleteSession = async (id: string) => {
+  const promptDeleteSession = async (id: string) => {
+    // Fetch file count so we can warn the user
     try {
-      await api.chat.deleteSession(id)
-      if (activeSessions === id) { setActiveSession(null); setMessages([]) }
+      const files = await api.sessionFiles.list(id)
+      setPendingDeleteFileCount(files.length)
+    } catch {
+      setPendingDeleteFileCount(0)
+    }
+    setPendingDeleteId(id)
+  }
+
+  const confirmDeleteSession = async () => {
+    if (!pendingDeleteId) return
+    setDeleteConfirmLoading(true)
+    try {
+      await api.chat.deleteSession(pendingDeleteId)
+      if (activeSessions === pendingDeleteId) { setActiveSession(null); setMessages([]) }
       await loadSessions()
       toast.success('Chat deleted')
     } catch (e: any) {
       toast.error('Delete failed', e.message)
+    } finally {
+      setDeleteConfirmLoading(false)
+      setPendingDeleteId(null)
+      setPendingDeleteFileCount(0)
     }
   }
 
@@ -266,7 +286,7 @@ function SessionList() {
               session={s}
               active={activeSessions === s.id}
               onLoad={() => loadSession(s.id)}
-              onDelete={() => deleteSession(s.id)}
+              onDelete={() => promptDeleteSession(s.id)}
               onRename={(title) => renameSession(s.id, title)}
             />
           ))
@@ -290,6 +310,46 @@ function SessionList() {
                 <div className="text-xs text-muted-foreground line-clamp-2">{result.content_snippet ?? result.snippet ?? ''}</div>
               </button>
             ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Delete Confirmation Modal ── */}
+      {pendingDeleteId && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-surface border border-border rounded-2xl shadow-2xl shadow-black/40 p-6 w-full max-w-sm mx-4">
+            <div className="flex items-start gap-3 mb-4">
+              <div className="shrink-0 w-10 h-10 rounded-full bg-red-500/15 border border-red-500/25 flex items-center justify-center">
+                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-[15px] font-semibold text-ink mb-1">Delete this chat?</h3>
+                <p className="text-[13px] text-muted leading-relaxed">
+                  This will permanently delete all chat history
+                  {pendingDeleteFileCount > 0 && (
+                    <> and <span className="text-red-400 font-medium">{pendingDeleteFileCount} file{pendingDeleteFileCount !== 1 ? 's' : ''}</span> attached to this session</>
+                  )}.
+                  {' '}This cannot be undone.
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setPendingDeleteId(null); setPendingDeleteFileCount(0) }}
+                className="px-4 py-2 rounded-lg text-[13px] font-medium text-muted border border-border hover:bg-surface-alt transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDeleteSession}
+                disabled={deleteConfirmLoading}
+                className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-red-500/90 hover:bg-red-500 text-white border border-red-500/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {deleteConfirmLoading ? 'Deleting…' : 'Delete Chat'}
+              </button>
+            </div>
           </div>
         </div>
       )}

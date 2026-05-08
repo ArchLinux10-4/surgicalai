@@ -174,13 +174,13 @@ def upload_session_file(session_id: str, body: dict):
     if existing:
         file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
         conn.execute(
-            "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ? WHERE id = ?",
+            "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
             (content, language, lines, symbol_count, file_type, file_id)
         )
     else:
         file_id = str(uuid.uuid4())
         conn.execute(
-            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
             (file_id, session_id, filename, content, language, lines, symbol_count, file_type)
         )
 
@@ -195,6 +195,7 @@ def upload_session_file(session_id: str, body: dict):
         "lines": lines,
         "symbol_count": symbol_count,
         "file_type": file_type,
+        "updated_at": None,  # fresh upload — DB default applies
     }
 
 
@@ -203,7 +204,7 @@ def list_session_files(session_id: str):
     """List files attached to a session (metadata only, no content)."""
     conn = get_db()
     rows = conn.execute(
-        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, created_at
+        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, created_at, updated_at
            FROM session_files WHERE session_id = ? ORDER BY created_at ASC""",
         (session_id,)
     ).fetchall()
@@ -248,7 +249,7 @@ def update_session_file(session_id: str, file_id: str, body: dict):
         symbol_count = 0
 
     conn.execute(
-        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ? WHERE id = ? AND session_id = ?",
+        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ?",
         (new_content, prev_content, lines, symbol_count, file_id, session_id)
     )
     conn.commit()

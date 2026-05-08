@@ -163,6 +163,7 @@ export interface SessionFile {
   lines: number
   symbol_count: number
   created_at: string
+  updated_at?: string  // set on every code edit — always fresh
   content?: string  // only present when explicitly fetched
   file_type?: string  // 'code' | 'image' | 'pdf' | 'csv' | 'excel' | 'text'
 }
