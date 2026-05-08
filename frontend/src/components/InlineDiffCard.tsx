@@ -117,12 +117,60 @@ function getLangFromFilename(filename: string): string {
   return EXT_TO_LANG[ext] || 'text'
 }
 
+// ── collapseDiff: trim context lines to +-CONTEXT around changes ─────────────
+const DIFF_CONTEXT_LINES = 5
+
+function collapseDiff(diff: string): { display: string; hiddenCount: number } {
+  const lines = diff.split('\n')
+  const changed = new Set<number>()
+  lines.forEach((line, i) => {
+    const isAdd    = line.startsWith('+') && !line.startsWith('+++')
+    const isRemove = line.startsWith('-') && !line.startsWith('---')
+    if (isAdd || isRemove) changed.add(i)
+  })
+  if (changed.size === 0) return { display: diff, hiddenCount: 0 }
+
+  // Build visible set
+  const visible = new Set<number>()
+  lines.forEach((line, i) => {
+    const isMeta = line.startsWith('+++') || line.startsWith('---') || line.startsWith('@@')
+    const isChange = (line.startsWith('+') && !line.startsWith('+++')) ||
+                     (line.startsWith('-') && !line.startsWith('---'))
+    if (isMeta || isChange) { visible.add(i); return }
+    for (const ci of changed) {
+      if (Math.abs(i - ci) <= DIFF_CONTEXT_LINES) { visible.add(i); break }
+    }
+  })
+
+  const hiddenCount = lines.length - visible.size
+  if (hiddenCount <= DIFF_CONTEXT_LINES) return { display: diff, hiddenCount: 0 }
+
+  // Build collapsed string — runs of visible lines separated by @@ ...N lines... @@
+  const result: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    if (visible.has(i)) {
+      result.push(lines[i]); i++
+    } else {
+      let gapStart = i
+      while (i < lines.length && !visible.has(i)) i++
+      result.push(`@@ ...${i - gapStart} unchanged lines... @@`)
+    }
+  }
+  return { display: result.join('\n'), hiddenCount }
+}
+
 // ── DiffBlock: single SyntaxHighlighter per change with per-line colors ──────
 function DiffBlock({ diff, language }: { diff: string; language: string }) {
   const { theme } = useThemeStore()
   const isLight = theme === 'light'
+  const [showAll, setShowAll] = useState(false)
 
-  const rawLines = diff.split('\n')
+  const { display: displayDiff, hiddenCount: hiddenLineCount } = showAll
+    ? { display: diff, hiddenCount: 0 }
+    : collapseDiff(diff)
+
+  const rawLines = displayDiff.split('\n')
   type Prefix = 'add' | 'remove' | 'hunk' | 'header' | 'context'
   const prefixes: Prefix[] = []
   const codeLines: string[] = []
@@ -149,35 +197,53 @@ function DiffBlock({ diff, language }: { diff: string; language: string }) {
   const hunkBg   = isLight ? 'rgba(9,   105, 218, 0.08)' : 'rgba(96,  165, 250, 0.08)'
 
   return (
-    <SyntaxHighlighter
-      language={language === 'text' ? 'text' : language}
-      style={isLight ? oneLight : vscDarkPlus}
-      wrapLines={true}
-      wrapLongLines={false}
-      lineProps={(lineNumber: number) => {
-        const p = prefixes[lineNumber - 1]
-        const s: React.CSSProperties = { display: 'block', width: '100%' }
-        if (p === 'add')    s.backgroundColor = addBg
-        if (p === 'remove') s.backgroundColor = removeBg
-        if (p === 'hunk')   s.backgroundColor = hunkBg
-        return { style: s }
-      }}
-      customStyle={{
-        background: 'transparent',
-        padding: '0',
-        margin: '0',
-        fontSize: '12px',
-        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-        lineHeight: '1.6',
-      }}
-      codeTagProps={{ style: {
-        fontSize: '12px',
-        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-      }}}
-      PreTag="div"
-    >
-      {code}
-    </SyntaxHighlighter>
+    <div>
+      <SyntaxHighlighter
+        language={language === 'text' ? 'text' : language}
+        style={isLight ? oneLight : vscDarkPlus}
+        wrapLines={true}
+        wrapLongLines={false}
+        lineProps={(lineNumber: number) => {
+          const p = prefixes[lineNumber - 1]
+          const s: React.CSSProperties = { display: 'block', width: '100%' }
+          if (p === 'add')    s.backgroundColor = addBg
+          if (p === 'remove') s.backgroundColor = removeBg
+          if (p === 'hunk')   s.backgroundColor = hunkBg
+          return { style: s }
+        }}
+        customStyle={{
+          background: 'transparent',
+          padding: '0',
+          margin: '0',
+          fontSize: '12px',
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+          lineHeight: '1.6',
+        }}
+        codeTagProps={{ style: {
+          fontSize: '12px',
+          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        }}}
+        PreTag="div"
+      >
+        {code}
+      </SyntaxHighlighter>
+      {!showAll && hiddenLineCount > DIFF_CONTEXT_LINES && (
+        <button
+          onClick={() => setShowAll(true)}
+          className="w-full text-center text-xs py-1 text-muted hover:text-foreground border-t border-border/30 hover:bg-surface/50 transition-colors"
+        >
+          Show {hiddenLineCount} unchanged lines &darr;
+        </button>
+      )}
+      {showAll && hiddenLineCount > DIFF_CONTEXT_LINES && (
+        <button
+          onClick={() => setShowAll(false)}
+          className="w-full text-center text-xs py-1 text-muted hover:text-foreground border-t border-border/30 hover:bg-surface/50 transition-colors"
+        >
+          Collapse unchanged lines &uarr;
+        </button>
+      )}
+    </div>
   )
 }
 

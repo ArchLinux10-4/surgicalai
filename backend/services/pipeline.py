@@ -428,6 +428,21 @@ Look at the RECENT CONVERSATION section above BEFORE deciding to use needs_clari
 
 Minimal footprint. The diff between original and your output should contain ONLY the requested change.
 
+CRITICAL HTML WRAP RULE:
+When wrapping an HTML element (adding an icon button, container div, date picker trigger, etc.):
+- Replace ONLY the exact specified element. Your output = original element + the wrapping described in the plan. Nothing more.
+- Do NOT add: label elements, title divs, aria-label wrappers, tooltip text, or ANY structure not explicitly in the plan.
+- Do NOT convert a single self-closing tag into a multi-line block with extra children unless the plan explicitly lists those children.
+- Count the elements described in the plan. Put exactly that many in your output. One wrapper + the original = two elements total.
+- Each Architect target covers exactly ONE element instance. Do not attempt to modify other instances.
+
+CRITICAL HTML SCRIPT INJECTION RULE:
+When the plan says to add a JavaScript helper function to an HTML file:
+- Find the last existing <script> block already in the file and inject your function INSIDE it, before the closing </script>.
+- Do NOT create a new <script> tag unless zero <script> tags exist anywhere in the file.
+- Your output for a script injection target = the full contents of that existing <script> block with your new function appended near the bottom, before </script>.
+- Preserve ALL existing functions in that script block. Only add. Never remove.
+
 Start your response with the first line of code. End with the last line of code."""
 
 
@@ -2142,6 +2157,18 @@ USER REQUEST:
                             _react_accumulated += "\n" + _grep_r
                             _react_budget_lines += _grep_r.count("\n")
                     _react_searched_terms.extend(_new_terms)
+                    # Emit found line ranges so user can see what was found
+                    _found_line_nums = re.findall(r'Lines (\d+)-\d+:', _grep_r) if _grep_r else []
+                    if _found_line_nums:
+                        yield sse({"type": "progress", "content":
+                                   "Found matches at: {}".format(
+                                       ", ".join("L{}".format(l) for l in _found_line_nums[:4])
+                                   )})
+                    elif _react_round > 1:
+                        yield sse({"type": "progress", "content":
+                                   "Round {}: no new matches for: {}".format(
+                                       _react_round, ", ".join(_new_terms[:3])
+                                   )})
                     # Persist to session cache for follow-up edits
                     _react_grep_cache[_react_cache_key] = _react_accumulated
 
