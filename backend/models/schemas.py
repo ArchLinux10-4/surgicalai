@@ -194,8 +194,10 @@ class SurgicalChange(BaseModel):
     applied: bool = False
     surgeon_notes: List[str] = []
     qa_result: Optional[QAResult] = None
-    surgeon_notes: List[str] = []
-    qa_result: Optional[QAResult] = None
+    # Surgical apply targets — just the lines that actually change (not the full window).
+    # Used by apply_change() as primary match path — eliminates overlapping-window errors.
+    target_element: Optional[str] = None
+    replacement: Optional[str] = None
 
 
 class SurgicalAnalyzeRequest(BaseModel):

@@ -298,6 +298,57 @@ def _get_client(user_id: str = "") -> OpenAI:
     return OpenAI(api_key=key)
 
 
+def _compute_target_element(original: str, new_code: str):
+    """
+    Compute the minimal changed lines between original and new_code.
+    Returns (target_element, replacement) — the exact lines being replaced.
+    These are stored on SurgicalChange and used by apply_change() as the
+    primary match target, avoiding full-window overlap errors.
+    """
+    if not new_code:
+        # DELETE: target is the full original
+        return original, ""
+
+    orig_lines = original.splitlines(keepends=True)
+    new_lines = new_code.splitlines(keepends=True)
+
+    # Find first differing line from top
+    top = 0
+    while top < len(orig_lines) and top < len(new_lines):
+        if orig_lines[top] != new_lines[top]:
+            break
+        top += 1
+
+    # If no diff found at all, return None (no-op)
+    if top >= len(orig_lines) and top >= len(new_lines):
+        return None, None
+
+    # Find first differing line from bottom
+    bot_orig = len(orig_lines) - 1
+    bot_new = len(new_lines) - 1
+    while bot_orig > top and bot_new > top:
+        if orig_lines[bot_orig] != new_lines[bot_new]:
+            break
+        bot_orig -= 1
+        bot_new -= 1
+
+    # Add ±2 lines of context around the core diff for reliable matching
+    ctx = 2
+    slice_start = max(0, top - ctx)
+    slice_end_orig = min(len(orig_lines), bot_orig + 1 + ctx)
+    slice_end_new = min(len(new_lines), bot_new + 1 + ctx)
+
+    target_element = "".join(orig_lines[slice_start:slice_end_orig]).rstrip()
+    replacement = "".join(new_lines[slice_start:slice_end_new]).rstrip()
+
+    # Safety: if target_element is too short (< 2 lines) or too generic,
+    # return the full original to avoid false matches
+    if len(target_element.splitlines()) < 2:
+        return original.rstrip(), new_code.rstrip()
+
+    return target_element, replacement
+
+
 def _make_diff(original: str, new_code: str, symbol_path: str) -> str:
     """Generate unified diff string between original and new code."""
     orig_lines = original.splitlines(keepends=True)
@@ -885,6 +936,7 @@ async def analyze_and_plan_stream(
                     if parent_symbol is not None:
                         new_code, confidence, _surg_notes, _needed_imports = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                         diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
+                        _tgt_elem, _replacement = _compute_target_element(parent_symbol.code, new_code)
                         changes.append(SurgicalChange(
                             id=str(uuid.uuid4()),
                             symbol=parent_symbol,
@@ -893,7 +945,9 @@ async def analyze_and_plan_stream(
                             diff=diff,
                             confidence=confidence,
                             description=target.description,
-                            applied=False
+                            applied=False,
+                            target_element=_tgt_elem,
+                            replacement=_replacement
                         ))
                 continue
 
@@ -913,6 +967,7 @@ async def analyze_and_plan_stream(
 
             new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, target, file_content, user_id=user_id)
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
+            _tgt_elem, _replacement = _compute_target_element(symbol.code, new_code)
 
             change = SurgicalChange(
                 id=str(uuid.uuid4()),
@@ -922,7 +977,9 @@ async def analyze_and_plan_stream(
                 diff=diff,
                 confidence=confidence,
                 description=target.description,
-                applied=False
+                applied=False,
+                target_element=_tgt_elem,
+                replacement=_replacement
             )
             changes.append(change)
 
@@ -1027,6 +1084,7 @@ Add "file_path" to each target object."""
                 continue
             new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, target, content, user_id=user_id)
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
+            _tgt_elem, _replacement = _compute_target_element(symbol.code, new_code)
             changes.append(SurgicalChange(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
@@ -1035,7 +1093,9 @@ Add "file_path" to each target object."""
                 diff=diff,
                 confidence=confidence,
                 description=target.description,
-                applied=False
+                applied=False,
+                target_element=_tgt_elem,
+                replacement=_replacement
             ))
 
         result_by_file[fp] = SurgicalAnalyzeResponse(
@@ -1151,6 +1211,7 @@ def analyze_and_plan(
                 if parent_symbol is not None:
                     new_code, confidence, _surg_notes, _needed_imports = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                     diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
+                    _tgt_elem, _replacement = _compute_target_element(parent_symbol.code, new_code)
                     change = SurgicalChange(
                         id=str(uuid.uuid4()),
                         symbol=parent_symbol,
@@ -1159,7 +1220,9 @@ def analyze_and_plan(
                         diff=diff,
                         confidence=confidence,
                         description=target.description,
-                        applied=False
+                        applied=False,
+                        target_element=_tgt_elem,
+                        replacement=_replacement
                     )
                     changes.append(change)
             continue

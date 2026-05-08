@@ -280,7 +280,7 @@ export function LoginPage() {
                   fontSize: 22, fontWeight: 700, fontFamily: 'monospace',
                   color: '#e2e8f0', margin: 0,
                 }}>{title}</h1>
-                <div style={{ fontSize: 12, fontFamily: 'monospace', color: '#4ade80' }}>v3.2.4</div>
+                <div style={{ fontSize: 12, fontFamily: 'monospace', color: '#4ade80' }}>v3.3.0</div>
               </div>
             </div>
 
