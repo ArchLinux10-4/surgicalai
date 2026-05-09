@@ -288,7 +288,8 @@ class PinRequest(BaseModel):
 
 class ProjectMemory(BaseModel):
     id: Optional[str] = None
-    workspace_path: str
+    session_id: Optional[str] = None
+    workspace_path: Optional[str] = None
     content: str
     updated_at: Optional[str] = None
 
