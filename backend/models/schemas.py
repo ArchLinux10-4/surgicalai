@@ -170,17 +170,7 @@ class QAResult(BaseModel):
     type_errors: List[str] = []
     plan_deviation: str = ""
     skipped_reason: Optional[str] = None
-
-
-class QAResult(BaseModel):
-    verdict: str = "skipped"          # safe | warning | blocked | skipped
-    qa_score: Optional[int] = None    # 1-10, None if skipped
-    summary: str = ""
-    import_issues: List[str] = []
-    downstream_risks: List[str] = []
-    type_errors: List[str] = []
-    plan_deviation: str = ""
-    skipped_reason: Optional[str] = None
+    risk_verdicts: List[dict] = []     # v3.7.1: per-risk verdicts from QA
 
 
 class SurgicalOperation(BaseModel):

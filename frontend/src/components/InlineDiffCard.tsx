@@ -88,9 +88,9 @@ function QABadge({ qa }: { qa: QAResult }) {
 function BlastRadius({ change }: { change: any }) {
   const [open, setOpen] = useState(false)
   const risks: string[] = [
-    ...(change.qa?.downstream_risks || []),
-    ...(change.qa?.import_issues || []),
-    ...(change.qa?.type_errors || []),
+    ...(change.qa_result?.downstream_risks || []),
+    ...(change.qa_result?.import_issues || []),
+    ...(change.qa_result?.type_errors || []),
   ].filter(Boolean)
   if (!risks.length) return null
   return (
@@ -811,7 +811,7 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
         const allVerdicts: Record<string, { status: string; reason: string }> = {}
         Object.values(result.changes_by_file || {}).forEach((fd: any) => {
           (fd.changes || []).forEach((ch: any) => {
-            (ch.qa?.risk_verdicts || []).forEach((rv: any) => {
+            (ch.qa_result?.risk_verdicts || []).forEach((rv: any) => {
               allVerdicts[rv.risk] = { status: rv.status, reason: rv.reason }
             })
           })
