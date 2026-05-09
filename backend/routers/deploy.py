@@ -206,3 +206,9 @@ def deploy_config(request: Request):
     has_vercel = bool(_get_token(user_id, "vercel_token"))
     has_railway = bool(_get_token(user_id, "railway_token"))
     return {"vercel": has_vercel, "railway": has_railway}
+
+
+@router.get("/poll")
+def poll_deploy_status(request: Request):
+    """Poll for latest deploy status — alias to /status, client-friendly for polling loops."""
+    return get_deploy_status(request)

@@ -199,3 +199,39 @@ async def run_tests(body: dict, request: Request):
 
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+@router.get("/detect/{session_id}")
+def detect_framework(session_id: str, request: Request):
+    """Detect test framework from files uploaded in a session."""
+    from database import get_db_conn
+    user_id = _get_user_id(request)
+    try:
+        conn = get_db_conn()
+        rows = conn.execute(
+            "SELECT filename FROM session_files WHERE session_id=? AND user_id=?",
+            (session_id, user_id)
+        ).fetchall()
+        conn.close()
+        filenames = [r[0].lower() for r in rows]
+    except Exception:
+        filenames = []
+
+    framework = None
+    # Jest / Vitest
+    if any("test.ts" in f or "test.tsx" in f or "spec.ts" in f or "spec.js" in f or "test.js" in f for f in filenames):
+        framework = "Jest/Vitest"
+    # pytest
+    elif any(f.startswith("test_") or f.endswith("_test.py") for f in filenames):
+        framework = "pytest"
+    # Go tests
+    elif any(f.endswith("_test.go") for f in filenames):
+        framework = "Go test"
+    # Rust
+    elif any(f == "main.rs" or f.endswith(".rs") for f in filenames):
+        framework = "cargo test"
+    # Ruby
+    elif any(f.endswith("_spec.rb") for f in filenames):
+        framework = "RSpec"
+
+    return {"framework": framework, "file_count": len(filenames)}
