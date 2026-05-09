@@ -809,7 +809,9 @@ Return JSON with search-and-replace operations."""
     # ---- Compute new_code from operations (backward compat: diff display + QA) ----
     new_code = symbol.code
     _ops_applied = 0
-    for op in operations:
+    try:
+      _ops_loop_ran = True
+      for op in operations:
         find_text = op.get("find", "")
         replace_text = op.get("replace", "")
         if not find_text:
@@ -920,11 +922,19 @@ Return JSON with search-and-replace operations."""
                 window_orig = "\n".join(fc_orig_lines[win_start:min(len(fc_orig_lines), win_end)])
                 # For new_code, replace symbol.code with the file-level window
                 new_code = window_new
-                # Replace the base for comparison too (stored on symbol temporarily)
-                symbol._file_window_original = window_orig
+                # Store the original window for QA comparison (avoid Pydantic setattr issues)
+                try:
+                    object.__setattr__(symbol, '_file_window_original', window_orig)
+                except Exception:
+                    pass  # Pydantic may not allow; _effective_original falls back to symbol.code
                 matched = True
                 _ops_applied += 1
+                print(f"[MATCH] Op match Tier 4 (file_content): {_find_debug}")
 
+    except Exception as _match_err:
+      print(f"[MATCH] ERROR in operations matching: {_match_err}")
+      import traceback; traceback.print_exc()
+      new_code = symbol.code  # fallback: keep original
     # Confidence: empty operations = already correct
     if not operations:
         confidence = 10
