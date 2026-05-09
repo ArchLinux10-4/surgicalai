@@ -823,7 +823,54 @@ Return JSON with search-and-replace operations."""
             matched = True
             _ops_applied += 1
 
-        # Tier 2: normalized line-endings + stripped trailing whitespace
+        # Tier 1.5: stripped-line match (handles LLM whitespace imprecision)
+        if not matched:
+            find_stripped = find_text.strip()
+            if find_stripped:
+                code_lines_raw = new_code.splitlines(keepends=True)
+                # Single-line find: match any line that contains the stripped find text
+                if "\n" not in find_stripped:
+                    for li, raw_line in enumerate(code_lines_raw):
+                        if find_stripped in raw_line.strip() or raw_line.strip() == find_stripped:
+                            # Preserve original indentation in replacement
+                            indent = raw_line[:len(raw_line) - len(raw_line.lstrip())]
+                            before = "".join(code_lines_raw[:li])
+                            after = "".join(code_lines_raw[li + 1:])
+                            # Re-indent the replacement text
+                            rep_lines = replace_text.splitlines(keepends=True)
+                            if rep_lines:
+                                reindented = indent + rep_lines[0].lstrip()
+                                for rl in rep_lines[1:]:
+                                    reindented += indent + rl.lstrip() if rl.strip() else rl
+                                new_code = before + reindented + ("\n" if not reindented.endswith("\n") else "") + after
+                            else:
+                                new_code = before + after
+                            matched = True
+                            _ops_applied += 1
+                            break
+                else:
+                    # Multi-line stripped find: match line-by-line with stripped comparison
+                    find_lines_s = [l.strip() for l in find_stripped.splitlines() if l.strip()]
+                    if find_lines_s:
+                        code_lines_s = [l.strip() for l in code_lines_raw]
+                        for si in range(len(code_lines_s) - len(find_lines_s) + 1):
+                            if all(code_lines_s[si + j] == find_lines_s[j] for j in range(len(find_lines_s))):
+                                indent = code_lines_raw[si][:len(code_lines_raw[si]) - len(code_lines_raw[si].lstrip())]
+                                before = "".join(code_lines_raw[:si])
+                                after = "".join(code_lines_raw[si + len(find_lines_s):])
+                                rep_lines = replace_text.splitlines(keepends=True)
+                                if rep_lines:
+                                    reindented = indent + rep_lines[0].lstrip()
+                                    for rl in rep_lines[1:]:
+                                        reindented += indent + rl.lstrip() if rl.strip() else rl
+                                    new_code = before + reindented + ("\n" if not reindented.endswith("\n") else "") + after
+                                else:
+                                    new_code = before + after
+                                matched = True
+                                _ops_applied += 1
+                                break
+
+        # Tier 2: normalized line-endings
         if not matched:
             norm_code = new_code.replace("\r\n", "\n").replace("\r", "\n")
             norm_find = find_text.replace("\r\n", "\n").replace("\r", "\n")
