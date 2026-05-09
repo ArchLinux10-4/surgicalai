@@ -8,6 +8,7 @@ import { TestRunnerPanel } from './TestRunnerPanel'
 import { toast } from '../lib/toast'
 import type { SmartResult, QAResult } from '../types'
 import { LivePreview, isVisualFile } from './LivePreview'
+import { useAppStore } from '../stores/appStore'
 
 interface Props {
   result: SmartResult
@@ -15,9 +16,11 @@ interface Props {
   onApplied?: (filename: string, modifiedContent: string) => void
 }
 
-// --- localStorage helpers for persisting applied state across logins ---
+// --- localStorage helpers for persisting applied/skipped state across refresh ---
 const appliedKey = (sessionId: string, changeId: string) =>
   `sai-applied:${sessionId}:${changeId}`
+const skippedKey = (sessionId: string, changeId: string) =>
+  `sai-skipped:${sessionId}:${changeId}`
 
 const loadApplied = (sessionId: string, changeIds: string[]): Record<string, boolean> => {
   const out: Record<string, boolean> = {}
@@ -27,10 +30,25 @@ const loadApplied = (sessionId: string, changeIds: string[]): Record<string, boo
   return out
 }
 
-const saveApplied = (sessionId: string, changeId: string) => {
-  try { localStorage.setItem(appliedKey(sessionId, changeId), '1') } catch {}
+const loadSkipped = (sessionId: string, changeIds: string[]): Record<string, boolean> => {
+  const out: Record<string, boolean> = {}
+  for (const id of changeIds) {
+    if (localStorage.getItem(skippedKey(sessionId, id)) === '1') out[id] = true
+  }
+  return out
 }
-// -----------------------------------------------------------------------
+
+const saveApplied = (sessionId: string, changeId: string) => {
+  try {
+    localStorage.setItem(appliedKey(sessionId, changeId), '1')
+    localStorage.removeItem(skippedKey(sessionId, changeId))
+  } catch {}
+}
+
+const saveSkipped = (sessionId: string, changeId: string) => {
+  try { localStorage.setItem(skippedKey(sessionId, changeId), '1') } catch {}
+}
+// ------------------------------------------------------------------------------------------------------------------------------------------
 
 
 function QABadge({ qa }: { qa: QAResult }) {
@@ -391,10 +409,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   // Preview toggle per change — hidden by default, shown on click
   const [showPreview, setShowPreview] = useState<Record<string, boolean>>({})
 
+  const { setSessionFiles } = useAppStore()
   const [applying, setApplying] = useState(false)
   const [undoing, setUndoing] = useState<Record<string, boolean>>({})
   const [applied, setApplied] = useState<Record<string, boolean>>(() =>
     loadApplied(sessionId, changeIds)
+  )
+  const [skipped, setSkipped] = useState<Record<string, boolean>>(() =>
+    loadSkipped(sessionId, changeIds)
   )
   const [originalCode, setOriginalCode] = useState<string>('')
   const [modifiedCode, setModifiedCode] = useState<string | undefined>(undefined)
@@ -411,11 +433,11 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 
   if (realChanges.length === 0) return null
 
-  // Pending = not yet applied
-  const pendingChanges = realChanges.filter((c: any) => !applied[c.id])
+  // Pending = not yet applied AND not skipped
+  const pendingChanges = realChanges.filter((c: any) => !applied[c.id] && !skipped[c.id])
   // Selected = pending + checked
   const selectedChanges = pendingChanges.filter((c: any) => checked[c.id])
-  const allApplied = realChanges.every((c: any) => applied[c.id])
+  const allApplied = realChanges.every((c: any) => applied[c.id] || skipped[c.id])
 
   const getProposedCode = (change: any): string => {
     if (!originalCode) return '// Loading preview...'
@@ -443,6 +465,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   const markApplied = (changeId: string) => {
     saveApplied(sessionId, changeId)
     setApplied(p => ({ ...p, [changeId]: true }))
+    setSkipped(p => { const n = { ...p }; delete n[changeId]; return n })
     onChangeApplied?.()
   }
 
@@ -471,7 +494,11 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 
       const newContent = result.modified_content || ''
       if (newContent) {
-        try { await api.sessionFiles.update(sessionId, fileData.file_id, newContent) } catch {}
+        try {
+          await api.sessionFiles.update(sessionId, fileData.file_id, newContent)
+          // Refresh session files so GitHub sync status reflects the new updated_at
+          api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
+        } catch {}
       }
 
       if (result.cloud_mode || result.modified_content) {
@@ -493,7 +520,17 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       }
       for (const change of selectedChanges) markApplied(change.id)
     } catch (e: any) {
-      toast.error(e.message || 'Apply failed')
+      const errMsg: string = e?.message || 'Apply failed'
+      // If code couldn't be found, it was likely already applied — auto-mark it
+      if (errMsg.includes("Couldn't find the exact code") || errMsg.includes("could not find") || errMsg.includes("exact code")) {
+        for (const change of selectedChanges) {
+          saveApplied(sessionId, change.id)
+          setApplied(p => ({ ...p, [change.id]: true }))
+        }
+        toast.success('These changes appear to already be applied ✓')
+      } else {
+        toast.error(errMsg)
+      }
     } finally {
       setApplying(false)
     }
@@ -504,7 +541,9 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     try {
       const result = await api.sessionFiles.undo(sessionId, fileData.file_id)
       try { localStorage.removeItem(appliedKey(sessionId, change.id)) } catch {}
+      try { localStorage.removeItem(skippedKey(sessionId, change.id)) } catch {}
       setApplied(p => { const next = { ...p }; delete next[change.id]; return next })
+      setSkipped(p => { const next = { ...p }; delete next[change.id]; return next })
       setModifiedCode(undefined)
       onApplied?.(filename, result.content)
       toast.success(`↩ Reverted ${filename} to previous version`)
@@ -553,8 +592,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   const toggleCheck = (id: string) => setChecked(p => ({ ...p, [id]: !p[id] }))
   const toggleDiff = (id: string) => setDiffExpanded(p => ({ ...p, [id]: !p[id] }))
 
-  const skipAll = () =>
+  const skipAll = () => {
+    for (const c of pendingChanges) saveSkipped(sessionId, c.id)
+    setSkipped(p => ({
+      ...p,
+      ...Object.fromEntries(pendingChanges.map((c: any) => [c.id, true]))
+    }))
     setChecked(Object.fromEntries(pendingChanges.map((c: any) => [c.id, false])))
+  }
 
   return (
     <div className="border border-border rounded-xl overflow-hidden mb-3">
@@ -576,7 +621,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       {realChanges.map((change: any, idx: number) => {
         const isBlocked = change.qa_result?.verdict === 'blocked'
         const isApplied = applied[change.id]
-        const isChecked = checked[change.id] && !isBlocked
+        const isSkipped = !isApplied && skipped[change.id]
+        const isChecked = checked[change.id] && !isBlocked && !isSkipped
         const isExpanded = diffExpanded[change.id]
 
         const addCount = (change.diff || '').split('\n')
@@ -585,7 +631,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           .filter((l: string) => l.startsWith('-') && !l.startsWith('---')).length
 
         return (
-          <div key={change.id} className={`border-t border-border/60 ${isApplied ? 'opacity-70' : ''}`}>
+          <div key={change.id} className={`border-t border-border/60 ${isApplied ? 'opacity-60' : isSkipped ? 'opacity-40' : ''}`}>
             {/* Row header — this IS the apply decision row */}
             <div className={`flex items-center gap-3 px-4 py-3 ${isApplied ? 'bg-success/5' : 'bg-base/60'}`}>
 
@@ -644,8 +690,13 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 )}
               </div>
 
-              {/* Right controls: Undo (if applied) + Preview button + Diff toggle */}
+              {/* Right controls: Skipped badge + Undo (if applied) + Preview button + Diff toggle */}
               <div className="flex items-center gap-1.5 flex-shrink-0">
+                {isSkipped && !isApplied && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-muted/20 text-muted/70 text-[10px] font-semibold border border-border/50">
+                    <XCircle size={9} /> Skipped
+                  </span>
+                )}
                 {isApplied && (
                   <button
                     onClick={() => handleUndo(change)}

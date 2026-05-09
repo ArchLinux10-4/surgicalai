@@ -3,6 +3,7 @@ import { Github } from 'lucide-react'
 import { api } from '../api/client'
 import type { SessionFile } from '../types'
 import { GitHubCommitModal } from './GitHubCommitModal'
+import { useAppStore } from '../stores/appStore'
 
 interface SessionFilesTrayProps {
   sessionId: string
@@ -54,6 +55,7 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
   const [collapsed, setCollapsed] = useState(false)
   const [downloading, setDownloading] = useState<string | null>(null)
   const [showCommitModal, setShowCommitModal] = useState(false)
+  const { setSessionFiles } = useAppStore()
 
   const isCompact = sessionFiles.length > COMPACT_THRESHOLD
 
@@ -268,7 +270,10 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
         <GitHubCommitModal
           sessionFiles={sessionFiles}
           onClose={() => setShowCommitModal(false)}
-          onSuccess={() => setShowCommitModal(false)}
+          onSuccess={() => {
+              setShowCommitModal(false)
+              api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
+            }}
         />
       )}
     </>
