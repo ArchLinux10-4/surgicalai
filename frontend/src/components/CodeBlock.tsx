@@ -189,25 +189,45 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
   )
 }
 
-/** Drop-in renderer for react-markdown's `code` prop */
+/** Drop-in renderer for react-markdown's `code` prop.
+ *
+ * react-markdown v9 removed the `inline` prop. Detection is now based on
+ * whether the element has a language class (fenced block) or not (inline).
+ *
+ * Rules:
+ *   - Has language class OR multiple lines → full CodeBlock (traffic lights, copy, etc.)
+ *   - No language class AND single short line → inline pill
+ *     This catches both real inline backticks and single-word unlabelled fences
+ *     that Claude sometimes emits for bare identifiers like `App` or `useStore()`.
+ *
+ * Colours: use CSS-variable-based Tailwind aliases (bg-surface, text-ink, border-border)
+ * so the pill adapts to both themes via [data-theme] in index.css — no dark: prefix needed.
+ */
 export function MarkdownCode({
-  inline,
   className,
   children,
   ...props
 }: {
-  inline?: boolean
   className?: string
   children?: React.ReactNode
 }) {
   const match = /language-(\w+)/.exec(className || '')
   const lang = match ? match[1] : ''
   const code = String(children).replace(/\n$/, '')
+  const lines = code.split('\n')
 
-  if (inline) {
+  // Inline pill: no language tag + fits on one short line
+  const isInlinePill = !lang && lines.length === 1 && code.length < 80
+
+  if (isInlinePill) {
     return (
-      <code className="px-1.5 py-0.5 rounded bg-surface text-ink text-[12px] font-mono border border-border/50" {...props}>
-        {children}
+      <code
+        className="px-1.5 py-0.5 rounded-md font-mono border
+          text-[12.5px] leading-none align-middle
+          bg-surface text-ink border-border/60"
+        {...props}
+      >
+        {code}
       </code>
     )
   }
