@@ -5,15 +5,15 @@ import { api } from '../api/client'
 import { FileNode } from '../types'
 import { toast } from '../lib/toast'
 import {
-  Settings, MessageSquare, FolderOpen, RefreshCw, Plus,
-  Search, Trash2, Pencil, Check, X, ChevronRight, ChevronDown,
-  Pin, BookOpen, Zap, MoreHorizontal, Upload, FileCode, File, LogOut, Sun, Moon, Github,
+  Settings, MessageSquare, Plus, Search, Trash2, Pencil,
+  X, ChevronRight, ChevronDown, ChevronLeft, Pin, Zap,
+  Upload, FileCode, LogOut, Sun, Moon, Github,
 } from 'lucide-react'
 import { ContextPanel } from './ContextPanel'
 import { GitHubPanel } from './GitHubPanel'
 import { useThemeStore } from '../stores/themeStore'
 
-// ── File icon helper ────────────────────────────────
+// ── File icon helper ─────────────────────────────────────────────────────────
 const FILE_ICONS: Record<string, string> = {
   '.py': '🐍', '.js': '🟨', '.ts': '🔷', '.tsx': '⚛️', '.jsx': '⚛️',
   '.go': '🐹', '.rs': '🦀', '.java': '☕', '.cs': '💜', '.cpp': '🔵', '.c': '🔵',
@@ -26,7 +26,7 @@ function fileIcon(node: FileNode) {
   return FILE_ICONS[node.extension || ''] || '📄'
 }
 
-// ── File Tree Node ──────────────────────────────────
+// ── File Tree Node ────────────────────────────────────────────────────────────
 function FileTreeNode({ node, depth = 0 }: { node: FileNode; depth?: number }) {
   const [expanded, setExpanded] = useState(depth < 1)
   const { setActiveFile, setRightTab } = useAppStore()
@@ -71,7 +71,7 @@ function FileTreeNode({ node, depth = 0 }: { node: FileNode; depth?: number }) {
   )
 }
 
-// ── Timestamp helper ────────────────────────────────
+// ── Timestamp helper ──────────────────────────────────────────────────────────
 function relativeTime(iso: string): string {
   if (!iso) return ''
   const diff = Date.now() - new Date(iso).getTime()
@@ -85,14 +85,13 @@ function relativeTime(iso: string): string {
   return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
 }
 
-// ── Session Item ────────────────────────────────────
+// ── Session Item ──────────────────────────────────────────────────────────────
 function SessionItem({ session, active, onLoad, onDelete, onRename }: {
   session: any; active: boolean
   onLoad: () => void; onDelete: () => void; onRename: (title: string) => void
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(session.title)
-  const [showMenu, setShowMenu] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => { if (editing) inputRef.current?.focus() }, [editing])
@@ -132,8 +131,6 @@ function SessionItem({ session, active, onLoad, onDelete, onRename }: {
           <span>{relativeTime(session.created_at)}</span>
         </div>
       </div>
-
-      {/* Hover actions */}
       {!editing && (
         <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
           <button
@@ -150,7 +147,7 @@ function SessionItem({ session, active, onLoad, onDelete, onRename }: {
   )
 }
 
-// ── Session List ────────────────────────────────────
+// ── Session List ──────────────────────────────────────────────────────────────
 function SessionList() {
   const { sessions, setSessions, activeSessions, setActiveSession, setMessages } = useAppStore()
   const [searchQuery, setSearchQuery] = useState('')
@@ -182,7 +179,6 @@ function SessionList() {
   }
 
   const promptDeleteSession = async (id: string) => {
-    // Fetch file count so we can warn the user
     try {
       const files = await api.sessionFiles.list(id)
       setPendingDeleteFileCount(files.length)
@@ -219,18 +215,13 @@ function SessionList() {
   }
 
   useEffect(() => {
-    if (searchQuery.trim() === '') {
-      setSearchResults([])
-      return
-    }
+    if (searchQuery.trim() === '') { setSearchResults([]); return }
     const timer = setTimeout(async () => {
       try {
         const response = await api.chat.search(searchQuery)
         const data = response as any
         setSearchResults(data.results ?? data ?? [])
-      } catch {
-        setSearchResults([])
-      }
+      } catch { setSearchResults([]) }
     }, 400)
     return () => clearTimeout(timer)
   }, [searchQuery])
@@ -247,16 +238,16 @@ function SessionList() {
           <kbd className="ml-auto text-[10px] opacity-50 font-mono bg-accent-dark/30 px-1 rounded">⌘N</kbd>
         </button>
       </div>
-      <div className="relative mb-2 px-2">
+      <div className="relative px-2 py-1.5">
         <span className="absolute left-4 top-1/2 -translate-y-1/2 text-muted-foreground">
-          <Search size={14} className="opacity-60" />
+          <Search size={13} className="opacity-60" />
         </span>
         <input
           type="text"
           placeholder="Search sessions..."
           value={searchQuery}
           onChange={e => setSearchQuery(e.target.value)}
-          className="w-full pl-9 pr-8 py-1 text-sm rounded border bg-background border-border focus:outline-none"
+          className="w-full pl-8 pr-7 py-1 text-[12px] rounded border bg-background border-border focus:outline-none"
         />
         {searchQuery && (
           <button
@@ -264,10 +255,7 @@ function SessionList() {
             className="absolute right-4 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
             onClick={() => setSearchQuery('')}
             tabIndex={-1}
-          >
-            {/* Use X icon from lucide-react if available, else × */}
-            <X size={14} />
-          </button>
+          ><X size={13} /></button>
         )}
       </div>
       <div className="flex-1 overflow-y-auto py-1">
@@ -302,10 +290,7 @@ function SessionList() {
                 key={result.message_id ?? result.id ?? index}
                 type="button"
                 className="text-left w-full px-2 py-1 rounded hover:bg-accent transition group"
-                onClick={() => {
-                  setActiveSession(result.session_id ?? result.id)
-                  setMessages([])
-                }}
+                onClick={() => { setActiveSession(result.session_id ?? result.id); setMessages([]) }}
               >
                 <div className="text-sm font-normal truncate">{result.session_name ?? result.name ?? 'Untitled'}</div>
                 <div className="text-xs text-muted-foreground line-clamp-2">{result.content_snippet ?? result.snippet ?? ''}</div>
@@ -315,7 +300,7 @@ function SessionList() {
         </div>
       )}
 
-      {/* ── Delete Confirmation Modal ── */}
+      {/* Delete confirmation modal */}
       {pendingDeleteId && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
           <div className="bg-surface border border-border rounded-2xl shadow-2xl shadow-black/40 p-6 w-full max-w-sm mx-4">
@@ -340,16 +325,12 @@ function SessionList() {
               <button
                 onClick={() => { setPendingDeleteId(null); setPendingDeleteFileCount(0) }}
                 className="px-4 py-2 rounded-lg text-[13px] font-medium text-muted border border-border hover:bg-surface-alt transition-colors"
-              >
-                Cancel
-              </button>
+              >Cancel</button>
               <button
                 onClick={confirmDeleteSession}
                 disabled={deleteConfirmLoading}
                 className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-red-500/90 hover:bg-red-500 text-white border border-red-500/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                {deleteConfirmLoading ? 'Deleting…' : 'Delete Chat'}
-              </button>
+              >{deleteConfirmLoading ? 'Deleting…' : 'Delete Chat'}</button>
             </div>
           </div>
         </div>
@@ -358,7 +339,7 @@ function SessionList() {
   )
 }
 
-// ── Session Files Panel ──────────────────────────────
+// ── Session Files Panel ───────────────────────────────────────────────────────
 const FILE_TYPE_ICONS: Record<string, string> = {
   '.py': '🐍', '.js': '🟨', '.ts': '🔷', '.tsx': '⚛️', '.jsx': '⚛️',
   '.go': '🐹', '.rs': '🦀', '.java': '☕', '.cs': '💜', '.cpp': '🔵', '.c': '🔵',
@@ -369,16 +350,10 @@ function getFileIcon(filename: string) {
   const ext = '.' + filename.split('.').pop()?.toLowerCase()
   return FILE_TYPE_ICONS[ext] || '📄'
 }
-function fmtSize(bytes: number) {
-  if (bytes < 1024) return `${bytes}B`
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`
-  return `${(bytes / 1024 / 1024).toFixed(1)}MB`
-}
 
 function SessionFilesPanel() {
-  const { sessionFiles, removeSessionFile } = useAppStore()
+  const { sessionFiles, removeSessionFile, addSessionFile } = useAppStore()
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const { addSessionFile } = useAppStore()
 
   const handleUpload = (files: FileList | null) => {
     if (!files) return
@@ -404,10 +379,11 @@ function SessionFilesPanel() {
 
   return (
     <div className="flex flex-col h-full">
-      {/* Header row */}
-      <div className="px-3 py-2.5 border-b border-border flex items-center justify-between">
-        <span className="text-[11px] font-semibold text-muted uppercase tracking-wider">
-          {sessionFiles.length > 0 ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} in chat` : 'No files yet'}
+      <div className="px-3 py-2 border-b border-border flex items-center justify-between">
+        <span className="text-[11px] text-muted">
+          {sessionFiles.length > 0
+            ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''}`
+            : 'No files yet'}
         </span>
         <button
           onClick={() => fileInputRef.current?.click()}
@@ -425,8 +401,6 @@ function SessionFilesPanel() {
           onChange={(e) => handleUpload(e.target.files)}
         />
       </div>
-
-      {/* File list */}
       <div className="flex-1 overflow-y-auto py-1">
         {sessionFiles.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full gap-3 px-4 text-center pb-8">
@@ -436,7 +410,7 @@ function SessionFilesPanel() {
             <div>
               <p className="text-[13px] font-semibold text-muted">No files in this chat</p>
               <p className="text-[11px] text-faint mt-1 leading-relaxed">
-                Drop files into the chat or click <strong className="text-muted/70">Add</strong> above to get surgical edits
+                Drop files into the chat or click <strong className="text-muted/70">Add</strong> above
               </p>
             </div>
             <button
@@ -464,9 +438,7 @@ function SessionFilesPanel() {
                   onClick={() => removeSessionFile(file.id)}
                   className="opacity-0 group-hover:opacity-100 text-faint hover:text-red-400 transition-all flex-shrink-0"
                   title="Remove from chat"
-                >
-                  <X size={13} />
-                </button>
+                ><X size={13} /></button>
               </div>
             ))}
           </div>
@@ -476,129 +448,168 @@ function SessionFilesPanel() {
   )
 }
 
-// ── Sidebar Root ────────────────────────────────────
-// ── User Menu (avatar + logout) ─────────────────────
-function UserMenu() {
-  const { user, logout } = useAuthStore()
-  const [open, setOpen] = useState(false)
-  const ref = useRef<HTMLDivElement>(null)
+// ── Rail items config ─────────────────────────────────────────────────────────
+type TabId = 'sessions' | 'files' | 'github' | 'context'
+const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
+  { id: 'sessions', icon: MessageSquare, label: 'Chats',  tooltip: 'Chats' },
+  { id: 'files',    icon: FileCode,      label: 'Files',  tooltip: 'Session Files' },
+  { id: 'github',   icon: Github,        label: 'GitHub', tooltip: 'GitHub' },
+  { id: 'context',  icon: Pin,           label: 'Pinned', tooltip: 'Pinned & Memory' },
+]
 
+// ── Sidebar ───────────────────────────────────────────────────────────────────
+export function Sidebar() {
+  const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles } = useAppStore()
+  const { theme, toggleTheme } = useThemeStore()
+  const { user, logout } = useAuthStore()
+  const [panelOpen, setPanelOpen] = useState(true)
+  const [userMenuOpen, setUserMenuOpen] = useState(false)
+  const userMenuRef = useRef<HTMLDivElement>(null)
+
+  // Close user menu on outside click
   useEffect(() => {
     function handleClick(e: MouseEvent) {
-      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+      if (userMenuRef.current && !userMenuRef.current.contains(e.target as Node)) {
+        setUserMenuOpen(false)
+      }
     }
     document.addEventListener('mousedown', handleClick)
     return () => document.removeEventListener('mousedown', handleClick)
   }, [])
 
-  if (!user) return null
-
-  const initials = user.username.slice(0, 2).toUpperCase()
-
-  return (
-    <div ref={ref} className="relative">
-      <button
-        onClick={() => setOpen(!open)}
-        className="w-7 h-7 rounded-full bg-indigo-600 hover:bg-indigo-500 flex items-center justify-center text-white text-[11px] font-bold transition"
-        title={user.username}
-      >
-        {initials}
-      </button>
-      {open && (
-        <div className="absolute right-0 top-9 w-48 bg-surface border border-border rounded-xl shadow-xl z-50 py-1">
-          <div className="px-3 py-2 border-b border-border">
-            <p className="text-xs font-semibold text-ink truncate">{user.username}</p>
-            {user.email && <p className="text-[11px] text-faint truncate">{user.email}</p>}
-            {user.is_admin && (
-              <span className="inline-block mt-0.5 text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-400 font-medium">Admin</span>
-            )}
-          </div>
-          <button
-            onClick={() => { logout(); setOpen(false) }}
-            className="w-full flex items-center gap-2 px-3 py-2 text-xs text-red-400 hover:bg-overlay transition"
-          >
-            <LogOut size={13} />
-            Sign out
-          </button>
-        </div>
-      )}
-    </div>
-  )
-}
-
-function ThemeToggleBtn() {
-  const { theme, toggleTheme } = useThemeStore()
-  return (
-    <button
-      onClick={toggleTheme}
-      className="btn-icon"
-      title={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
-    >
-      {theme === 'dark' ? <Sun size={14} /> : <Moon size={14} />}
-    </button>
-  )
-}
-
-export function Sidebar() {
-  const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, activeSessions } = useAppStore()
-
-  // Auto-switch to FILES tab when loading a chat that has files
-  useEffect(() => {
-    if (activeSessions && sessionFiles.length > 0 && sidebarTab === 'sessions') {
-      setSidebarTab('files')
+  const handleRailClick = (id: TabId) => {
+    if (sidebarTab === id && panelOpen) {
+      setPanelOpen(false)
+    } else {
+      setSidebarTab(id)
+      setPanelOpen(true)
     }
-  }, [activeSessions])
+  }
 
   const fileCount = sessionFiles.length
-  const tabs = [
-    { id: 'files' as const, icon: FileCode, label: fileCount > 0 ? `Files (${fileCount})` : 'Files' },
-    { id: 'sessions' as const, icon: MessageSquare, label: 'Chats' },
-    { id: 'context' as const, icon: Pin, label: 'Pinned' },
-    { id: 'github' as const, icon: Github, label: 'GitHub' },
-  ]
+  const initials = (user?.username ?? 'U').slice(0, 2).toUpperCase()
+
+  const panelLabel = RAIL_ITEMS.find(r => r.id === sidebarTab)?.label ?? ''
 
   return (
-    <div className="flex flex-col h-full">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border">
-        <div className="flex items-center gap-2">
+    <div className="flex h-full">
+
+      {/* ── Rail (always 44px) ── */}
+      <div className="flex flex-col items-center pt-3 pb-3 gap-1 w-[44px] bg-surface border-r border-border flex-shrink-0">
+
+        {/* Logo mark */}
+        <div className="mb-2 flex items-center justify-center w-8 h-8">
           <Zap size={16} className="text-accent" />
-          <span className="text-sm font-bold text-ink tracking-tight">SurgicalAI</span>
         </div>
-        <div className="flex items-center gap-1">
-          <ThemeToggleBtn />
-          <button onClick={() => setSettingsOpen(true)} className="btn-icon" title="Settings (⌘,)">
-            <Settings size={15} />
-          </button>
-          <UserMenu />
-        </div>
-      </div>
 
-      {/* Tab switcher */}
-      <div className="flex border-b border-border">
-        {tabs.map(({ id, icon: Icon, label }) => (
+        {/* Nav icons */}
+        {RAIL_ITEMS.map(({ id, icon: Icon, tooltip }) => {
+          const isActive = sidebarTab === id && panelOpen
+          const badge = id === 'files' && fileCount > 0 ? fileCount : null
+          return (
+            <button
+              key={id}
+              onClick={() => handleRailClick(id)}
+              title={tooltip}
+              className={`relative flex items-center justify-center w-8 h-8 rounded-lg transition-all ${
+                isActive
+                  ? 'bg-accent/15 text-accent'
+                  : 'text-muted hover:text-ink hover:bg-overlay'
+              }`}
+            >
+              <Icon size={17} strokeWidth={isActive ? 2 : 1.5} />
+              {badge !== null && (
+                <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] flex items-center justify-center rounded-full bg-accent text-white text-[9px] font-bold px-0.5 leading-none">
+                  {badge > 99 ? '99+' : badge}
+                </span>
+              )}
+            </button>
+          )
+        })}
+
+        {/* Spacer */}
+        <div className="flex-1" />
+
+        {/* Theme toggle */}
+        <button
+          onClick={toggleTheme}
+          title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
+          className="flex items-center justify-center w-8 h-8 rounded-lg text-muted hover:text-ink hover:bg-overlay transition-all"
+        >
+          {theme === 'dark'
+            ? <Sun size={16} strokeWidth={1.5} />
+            : <Moon size={16} strokeWidth={1.5} />}
+        </button>
+
+        {/* Settings */}
+        <button
+          onClick={() => setSettingsOpen(true)}
+          title="Settings"
+          className="flex items-center justify-center w-8 h-8 rounded-lg text-muted hover:text-ink hover:bg-overlay transition-all"
+        >
+          <Settings size={16} strokeWidth={1.5} />
+        </button>
+
+        {/* Avatar + user menu */}
+        <div ref={userMenuRef} className="relative mt-1 mb-0.5">
           <button
-            key={id}
-            onClick={() => setSidebarTab(id)}
-            className={`flex-1 flex items-center justify-center gap-1 py-2 text-[11px] font-semibold uppercase tracking-wide border-b-2 transition-colors ${
-              sidebarTab === id
-                ? 'border-accent text-ink'
-                : 'border-transparent text-faint hover:text-muted'
-            }`}
+            onClick={() => setUserMenuOpen(v => !v)}
+            title={user?.username ?? 'Account'}
+            className="w-7 h-7 rounded-full bg-indigo-600 hover:bg-indigo-500 flex items-center justify-center text-white text-[11px] font-bold transition"
           >
-            <Icon size={11} />
-            {label}
+            {initials}
           </button>
-        ))}
+          {userMenuOpen && (
+            <div className="absolute left-9 bottom-0 w-48 bg-surface border border-border rounded-xl shadow-xl z-50 py-1">
+              <div className="px-3 py-2 border-b border-border">
+                <p className="text-xs font-semibold text-ink truncate">{user?.username}</p>
+                {user?.email && <p className="text-[11px] text-faint truncate">{user.email}</p>}
+                {user?.is_admin && (
+                  <span className="inline-block mt-0.5 text-[10px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-400 font-medium">Admin</span>
+                )}
+              </div>
+              <button
+                onClick={() => { logout(); setUserMenuOpen(false) }}
+                className="w-full flex items-center gap-2 px-3 py-2 text-xs text-red-400 hover:bg-overlay transition"
+              >
+                <LogOut size={13} /> Sign out
+              </button>
+            </div>
+          )}
+        </div>
       </div>
 
-      {/* Content */}
-      <div className="flex-1 overflow-hidden flex flex-col min-h-0">
-        {sidebarTab === 'files' && <SessionFilesPanel />}
-        {sidebarTab === 'sessions' && <SessionList />}
-        {sidebarTab === 'context' && <ContextPanel />}
-        {sidebarTab === 'github' && <GitHubPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />}
+      {/* ── Sliding panel ── */}
+      <div
+        className={`flex flex-col bg-surface overflow-hidden transition-all duration-200 ${
+          panelOpen ? 'w-[220px]' : 'w-0'
+        }`}
+      >
+        {/* Panel header */}
+        <div className="flex items-center justify-between px-3 py-2.5 border-b border-border flex-shrink-0 min-w-[220px]">
+          <span className="text-[11px] font-semibold uppercase tracking-wider text-muted select-none">
+            {panelLabel}
+          </span>
+          <button
+            onClick={() => setPanelOpen(false)}
+            className="flex items-center justify-center w-5 h-5 rounded text-faint hover:text-ink hover:bg-overlay transition"
+            title="Collapse panel"
+          >
+            <ChevronLeft size={13} />
+          </button>
+        </div>
+
+        {/* Panel content */}
+        <div className="flex-1 overflow-hidden flex flex-col min-h-0 min-w-[220px]">
+          {sidebarTab === 'sessions' && <SessionList />}
+          {sidebarTab === 'files'    && <SessionFilesPanel />}
+          {sidebarTab === 'context'  && <ContextPanel />}
+          {sidebarTab === 'github'   && (
+            <GitHubPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
+          )}
+        </div>
       </div>
+
     </div>
   )
 }
