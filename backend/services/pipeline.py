@@ -794,6 +794,13 @@ Return JSON with search-and-replace operations."""
         import_needed_lines = data.get("imports_needed", [])
         if reasoning:
             surgeon_notes.append(f"Surgeon: {reasoning}")
+
+        # Fix double-escaped newlines: GPT often returns \\n in JSON strings
+        # instead of \n, resulting in literal backslash-n after json.loads
+        for _op in operations:
+            for _key in ("find", "replace"):
+                if _key in _op and isinstance(_op[_key], str):
+                    _op[_key] = _op[_key].replace("\\n", "\n").replace("\\t", "\t")
     except json.JSONDecodeError:
         # Fallback: treat as old-style code block (pre-v3.4.0 model behavior)
         if raw.lstrip().startswith("```"):
