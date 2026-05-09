@@ -51,52 +51,6 @@ function CodeRain() {
         if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) {
           drops[i] = 0;
         }
-
-function ButtonMatrixRain({ active }: { active: boolean }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-  useEffect(() => {
-    if (!active) return;
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    canvas.width = canvas.offsetWidth;
-    canvas.height = canvas.offsetHeight;
-    const cols = Math.floor(canvas.width / 10);
-    const drops = Array(cols).fill(0).map(() => Math.random() * -20);
-    const chars = 'アイウエオカキクケコサシスセソタチツテトナニヌネノハヒフヘホマミムメモヤユヨラリルレロワヲン0123456789';
-    let raf: number;
-    const startTime = performance.now();
-    function draw() {
-      if (performance.now() - startTime >= 1200) {
-        ctx.clearRect(0,0,canvas.width,canvas.height);
-        cancelAnimationFrame(raf);
-        return;
-      }
-      ctx.fillStyle = 'rgba(0,0,0,0.18)';
-      ctx.fillRect(0,0,canvas.width,canvas.height);
-      ctx.font = '11px monospace';
-      for (let i = 0; i < cols; i++) {
-        const char = chars[Math.floor(Math.random() * chars.length)];
-        ctx.fillStyle = '#00ff41';
-        ctx.fillText(char, i*10, drops[i]*10);
-        drops[i] += 0.9 + Math.random()*0.4;
-        if (drops[i]*10 > canvas.height && Math.random() > 0.92) drops[i] = 0;
-      }
-      raf = requestAnimationFrame(draw);
-    }
-    raf = requestAnimationFrame(draw);
-    return () => cancelAnimationFrame(raf);
-  }, [active]);
-  return (
-    <canvas
-      ref={canvasRef}
-      style={{
-        position:'absolute', inset:0, width:'100%', height:'100%', pointerEvents:'none', borderRadius:'inherit', opacity: active ? 1 : 0, transition:'opacity 0.15s'
-      }}
-    />
-  );
-}
         drops[i]++;
       }
       animFrameId = requestAnimationFrame(draw);
@@ -197,7 +151,6 @@ export function LoginPage() {
   const [loading, setLoading] = useState(false);
   const [showPass, setShowPass] = useState(false);
   const [focused, setFocused] = useState<string | null>(null);
-  const [loginSuccess, setLoginSuccess] = useState(false);
 
   useEffect(() => {
     apiClient.get('/api/auth/setup-required')
@@ -214,10 +167,7 @@ export function LoginPage() {
       const body: Record<string, string> = { username, password };
       if (setupRequired) body.email = email;
       const res = await apiClient.post(endpoint, body);
-      setLoginSuccess(true);
-      setTimeout(() => {
-        login(res.data.access_token, res.data.user);
-      }, 1200);
+      login(res.data.access_token, res.data.user);
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Authentication failed. Try again.');
     } finally {
@@ -447,11 +397,8 @@ export function LoginPage() {
                   boxShadow: '0 0 30px rgba(74, 222, 128, 0.2)',
                   transition: 'all 0.2s',
                   opacity: loading || !username || !password ? 0.6 : 1,
-                  position: 'relative',
-                  overflow: 'hidden',
                 }}
               >
-                <ButtonMatrixRain active={loginSuccess} />
                 {loading ? (
                   <>
                     <div style={{
