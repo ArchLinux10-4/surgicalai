@@ -943,7 +943,8 @@ def run_surgeon(
     file_content: str,
     model: Optional[str] = None,
     user_id: str = "",
-    architect_risks: list = None
+    architect_risks: list = None,
+    linter_feedback: list = None,   # NEW: list of error dicts from linter_validator
 ) -> tuple:
     """
     GPT-4.1 (Surgeon): receives ONE code chunk + plan, returns search-and-replace operations.
@@ -999,10 +1000,23 @@ def run_surgeon(
 
     _risks_list = architect_risks or []
     _risks_block = "\n".join(f"- {r}" for r in _risks_list) if _risks_list else "(none — skip risk_verdicts)"
+    # Build linter feedback block for retry attempts
+    _linter_block = ""
+    if linter_feedback:
+        from services.linter_validator import format_feedback_block as _fmt_feedback, linter_tool_name as _ltool
+        _tool_name = _ltool(symbol.name + ".py")  # fallback; caller passes correct filename via context
+        # Infer tool from file extension embedded in symbol signature when available
+        _sig_lower = (symbol.signature or "").lower()
+        if any(ext in _sig_lower for ext in (".ts", ".tsx", ".js", ".jsx")):
+            _tool_name = "tsc"
+        elif ".py" in _sig_lower:
+            _tool_name = "pyflakes"
+        _linter_block = "\n\n" + _fmt_feedback(linter_feedback, _tool_name)
+
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
-New logic required: {target.new_logic}{_import_hint}{_file_header}{_semantic_section}
+New logic required: {target.new_logic}{_import_hint}{_file_header}{_semantic_section}{_linter_block}
 
 CONTEXT BEFORE (read-only reference, do NOT include in operations):
 {before_context}
@@ -3399,78 +3413,177 @@ USER REQUEST:
                     )
                     yield sse({"type": "progress", "content": f"Focused window: L{window_start}-{window_end} ({window_end - window_start + 1} lines)"})
 
-            new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, change_target, sf["content"], user_id=user_id)
-            # Trace: operations applied (visible in Railway logs only)
-            _is_changed = new_code.rstrip() != symbol.code.rstrip()
-            print(f"[PIPELINE] {len(_operations)} ops applied, changed={_is_changed}, new={len(new_code)}, orig={len(symbol.code)}")
-            diff = _make_diff(symbol.code, new_code, symbol_path)
+            # ── v3.10.0: Surgeon retry loop with linter feedback ────────────────
+            # Max 2 attempts. On attempt 2 the Surgeon receives the exact tsc /
+            # pyflakes errors it introduced so it can fix them directly.
+            # The loop only retries when (a) verdict is blocked AND (b) the block
+            # is specifically caused by linter errors — not by other QA failures.
+            _linter_feedback_for_retry: list = []
+            _full_after_lint: str = ""       # reconstructed file after ops (reused below)
+            _MAX_SURGEON_ATTEMPTS = 2
 
-            # ── QA Agent: verify Surgeon output before showing to user ──
-            _other_ctx_for_qa = "\n\n".join(
-                p for p in _qa_other_context_parts
-                if not p.startswith(f"FILE: {matched_name}")
-            )
-            # v3.4.0: use file-window original if Tier 4 matching was used
-            _effective_original = getattr(symbol, "_file_window_original", None) or symbol.code
+            for _surgeon_attempt in range(_MAX_SURGEON_ATTEMPTS):
 
-            _qa_result = await run_qa_agent(
-                original_code=_effective_original,
-                new_code=new_code,
-                change_description=change_target.description,
-                new_logic=change_target.new_logic,
-                symbol_path=symbol_path,
-                filename=matched_name,
-                other_files_context=_other_ctx_for_qa,
-                session_id=session_id or "",
-                user_id=user_id,
-                architect_risks=plan.get("risks", []),
-            )
-            # Emit QA progress to user
-            _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫", "skipped": "⏭"}.get(
-                _qa_result.get("verdict", "skipped"), "⏭"
-            )
-            yield sse({"type": "progress", "content": f"QA {_qa_icon} {_qa_result.get('summary', '')} (score: {_qa_result.get('qa_score', '?')})"})
-            _qa_ran = _qa_result.get("status") not in ("timeout", "error")
-            compliance.mark("qa_review", ran=_qa_ran,
-                            reason=(None if _qa_ran else _qa_result.get("status")),
-                            output_summary=f"verdict={_qa_result.get('verdict')} score={_qa_result.get('qa_score')}")
+                new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(
+                    symbol, change_target, sf["content"], user_id=user_id,
+                    linter_feedback=_linter_feedback_for_retry if _surgeon_attempt > 0 else None,
+                )
+                # Trace: operations applied (visible in Railway logs only)
+                _is_changed = new_code.rstrip() != symbol.code.rstrip()
+                print(
+                    f"[PIPELINE] attempt={_surgeon_attempt+1} {len(_operations)} ops applied, "
+                    f"changed={_is_changed}, new={len(new_code)}, orig={len(symbol.code)}"
+                )
+                diff = _make_diff(symbol.code, new_code, symbol_path)
 
-            # ── v3.9.2: Compile-time syntax validation (tree-sitter) ──
-            try:
-                from services.syntax_validator import validate_syntax as _validate_syntax
-                from services.syntax_validator import count_errors as _count_errors
-                # Compare error count before/after surgeon's operations
-                # This avoids false positives from pre-existing issues in the file
-                _orig_err_count = _count_errors(sf["content"], matched_name)
-                _full_after_ops = sf["content"]
-                for _sop in _operations:
-                    _sfind = _sop.get("find", "")
-                    _srepl = _sop.get("replace", "")
-                    if _sfind and _sfind in _full_after_ops:
-                        _full_after_ops = _full_after_ops.replace(_sfind, _srepl, 1)
-                _new_err_count = _count_errors(_full_after_ops, matched_name)
-                if _new_err_count > _orig_err_count:
-                    # Surgeon introduced NEW syntax errors
-                    _syntax_errors = _validate_syntax(_full_after_ops, matched_name)
-                    yield sse({"type": "progress", "content": f"🔴 Compile check: {_syntax_errors[0]['message']} (line {_syntax_errors[0]['line']})"})
-                    if not isinstance(_qa_result.get("risk_verdicts"), list):
-                        _qa_result["risk_verdicts"] = []
-                    for _serr in _syntax_errors:
-                        _qa_result["risk_verdicts"].append({
-                            "risk": _serr["message"],
-                            "status": "blocked",
-                            "reason": f"Compile error at line {_serr['line']}: {_serr['detail']}"
+                # ── QA Agent: verify Surgeon output before showing to user ────
+                _other_ctx_for_qa = "\n\n".join(
+                    p for p in _qa_other_context_parts
+                    if not p.startswith(f"FILE: {matched_name}")
+                )
+                # v3.4.0: use file-window original if Tier 4 matching was used
+                _effective_original = getattr(symbol, "_file_window_original", None) or symbol.code
+
+                _qa_result = await run_qa_agent(
+                    original_code=_effective_original,
+                    new_code=new_code,
+                    change_description=change_target.description,
+                    new_logic=change_target.new_logic,
+                    symbol_path=symbol_path,
+                    filename=matched_name,
+                    other_files_context=_other_ctx_for_qa,
+                    session_id=session_id or "",
+                    user_id=user_id,
+                    architect_risks=plan.get("risks", []),
+                )
+                # Emit QA progress to user
+                _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫", "skipped": "⏭"}.get(
+                    _qa_result.get("verdict", "skipped"), "⏭"
+                )
+                _attempt_label = f" (attempt {_surgeon_attempt+1})" if _surgeon_attempt > 0 else ""
+                yield sse({"type": "progress", "content": f"QA {_qa_icon} {_qa_result.get('summary', '')} (score: {_qa_result.get('qa_score', '?')}){_attempt_label}"})
+                _qa_ran = _qa_result.get("status") not in ("timeout", "error")
+                compliance.mark("qa_review", ran=_qa_ran,
+                                reason=(None if _qa_ran else _qa_result.get("status")),
+                                output_summary=f"verdict={_qa_result.get('verdict')} score={_qa_result.get('qa_score')}")
+
+                # ── v3.9.2: Compile-time syntax validation (tree-sitter) ──────
+                try:
+                    from services.syntax_validator import validate_syntax as _validate_syntax
+                    from services.syntax_validator import count_errors as _count_errors
+                    _orig_err_count = _count_errors(sf["content"], matched_name)
+                    _full_after_ops = sf["content"]
+                    for _sop in _operations:
+                        _sfind = _sop.get("find", "")
+                        _srepl = _sop.get("replace", "")
+                        if _sfind and _sfind in _full_after_ops:
+                            _full_after_ops = _full_after_ops.replace(_sfind, _srepl, 1)
+                    _new_err_count = _count_errors(_full_after_ops, matched_name)
+                    if _new_err_count > _orig_err_count:
+                        _syntax_errors = _validate_syntax(_full_after_ops, matched_name)
+                        yield sse({"type": "progress", "content": f"🔴 Compile check: {_syntax_errors[0]['message']} (line {_syntax_errors[0]['line']})"})
+                        if not isinstance(_qa_result.get("risk_verdicts"), list):
+                            _qa_result["risk_verdicts"] = []
+                        for _serr in _syntax_errors:
+                            _qa_result["risk_verdicts"].append({
+                                "risk": _serr["message"],
+                                "status": "blocked",
+                                "reason": f"Compile error at line {_serr['line']}: {_serr['detail']}"
+                            })
+                        _qa_result["verdict"] = "blocked"
+                        _qa_result["summary"] = f"Syntax error — {_syntax_errors[0]['message']}"
+                        if (_qa_result.get("qa_score") or 10) > 3:
+                            _qa_result["qa_score"] = 3
+                    elif _new_err_count == 0 and _orig_err_count == 0:
+                        yield sse({"type": "progress", "content": "✅ Compile check passed"})
+                    else:
+                        yield sse({"type": "progress", "content": f"⏭ Compile check skipped (file has {_orig_err_count} pre-existing issues)"})
+                except Exception as _sv_exc:
+                    print(f"[SYNTAX_VALIDATOR] Skipped: {_sv_exc}")
+
+                # ── v3.10.0: pyflakes / tsc static linting ───────────────────
+                # Uses delta approach: only flag errors the Surgeon introduced.
+                _linter_introduced_errors: list = []
+                try:
+                    from services.linter_validator import (
+                        count_linter_errors as _count_lint,
+                        validate_linters as _validate_lint,
+                        linter_tool_name as _lint_tool_name,
+                    )
+                    _lint_tool = _lint_tool_name(matched_name)
+                    _lint_orig_count = _count_lint(sf["content"], matched_name)
+
+                    # Reconstruct full file after Surgeon ops (reuse _full_after_ops
+                    # from tree-sitter block above when available)
+                    _full_after_lint = sf["content"]
+                    for _lop in _operations:
+                        _lfind = _lop.get("find", "")
+                        _lrepl = _lop.get("replace", "")
+                        if _lfind and _lfind in _full_after_lint:
+                            _full_after_lint = _full_after_lint.replace(_lfind, _lrepl, 1)
+
+                    _lint_new_count = _count_lint(_full_after_lint, matched_name)
+
+                    if _lint_new_count > _lint_orig_count:
+                        # Surgeon introduced new linter errors
+                        _linter_introduced_errors = _validate_lint(_full_after_lint, matched_name)
+                        yield sse({
+                            "type": "progress",
+                            "content": (
+                                f"🔴 {_lint_tool}: {_linter_introduced_errors[0]['message']} "
+                                f"(line {_linter_introduced_errors[0]['line']})"
+                            ),
                         })
-                    _qa_result["verdict"] = "blocked"
-                    _qa_result["summary"] = f"Syntax error — {_syntax_errors[0]['message']}"
-                    if (_qa_result.get("qa_score") or 10) > 3:
-                        _qa_result["qa_score"] = 3
-                elif _new_err_count == 0 and _orig_err_count == 0:
-                    yield sse({"type": "progress", "content": "✅ Compile check passed"})
-                else:
-                    yield sse({"type": "progress", "content": f"⏭ Compile check skipped (file has {_orig_err_count} pre-existing issues)"})
-            except Exception as _sv_exc:
-                print(f"[SYNTAX_VALIDATOR] Skipped: {_sv_exc}")
+                        if not isinstance(_qa_result.get("risk_verdicts"), list):
+                            _qa_result["risk_verdicts"] = []
+                        for _lerr in _linter_introduced_errors:
+                            _qa_result["risk_verdicts"].append({
+                                "risk": _lerr["message"],
+                                "status": "blocked",
+                                "reason": f"{_lint_tool} error — {_lerr['detail']}",
+                            })
+                        _qa_result["verdict"] = "blocked"
+                        _qa_result["summary"] = (
+                            f"{_lint_tool} error — {_linter_introduced_errors[0]['message']}"
+                        )
+                        if (_qa_result.get("qa_score") or 10) > 3:
+                            _qa_result["qa_score"] = 3
+
+                    elif _lint_new_count == 0 and _lint_orig_count == 0:
+                        yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean"})
+                    else:
+                        yield sse({
+                            "type": "progress",
+                            "content": (
+                                f"⏭ {_lint_tool} skipped "
+                                f"(file has {_lint_orig_count} pre-existing issue(s))"
+                            ),
+                        })
+                except Exception as _lint_exc:
+                    print(f"[LINTER_VALIDATOR] Skipped: {_lint_exc}")
+
+                # ── Retry decision ────────────────────────────────────────────
+                # Only retry if: verdict is blocked, linter is the cause, and
+                # we have not exhausted attempts.
+                _is_linter_blocked = bool(_linter_introduced_errors)
+                _can_retry = (
+                    _is_linter_blocked
+                    and _surgeon_attempt < _MAX_SURGEON_ATTEMPTS - 1
+                )
+                if _can_retry:
+                    _linter_feedback_for_retry = _linter_introduced_errors
+                    yield sse({
+                        "type": "progress",
+                        "content": (
+                            f"🔁 Surgeon retry ({_surgeon_attempt+2}/{_MAX_SURGEON_ATTEMPTS}): "
+                            f"fixing {len(_linter_introduced_errors)} compile error(s)..."
+                        ),
+                    })
+                    continue  # ← back to top of for _surgeon_attempt loop
+
+                # Clean pass, non-linter block, or max attempts — exit loop
+                break  # ← out of for _surgeon_attempt loop
+            # ── end Surgeon retry loop ────────────────────────────────────────
 
             # v3.4.0: operations-based apply (search-and-replace)
             from models.schemas import SurgicalOperation as _SO
