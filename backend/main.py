@@ -19,7 +19,7 @@ from routers import auth as auth_router
 app = FastAPI(
     title="SurgicalAI",
     description="Local AI coding assistant with surgical precision",
-    version="1.1.0"
+    version="3.4.0"
 )
 
 # CORS — allow local dev + any cloud origins set via ALLOWED_ORIGINS env var
