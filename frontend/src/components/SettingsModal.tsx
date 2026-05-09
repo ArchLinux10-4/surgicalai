@@ -77,8 +77,8 @@ export function SettingsModal() {
       })
     }
     api.settings.getModels().then((d) => setModels(d.models || [])).catch(() => {})
-    ;(api as any).github.status().then((s: any) => setGithubStatus(s)).catch(() => {})
-    ;(api as any).settings.geminiStatus().then((s: any) => setGeminiConnected(s?.connected || false)).catch(() => {})
+    try { (api as any).github.status().then((s: any) => setGithubStatus(s)).catch(() => {}) } catch(_) {}
+    try { api.settings.geminiStatus().then((s: any) => setGeminiConnected(s?.connected || false)).catch(() => {}) } catch(_) {}
   }, [settings, settingsOpen])
 
   const handleVerifyGeminiKey = async () => {
@@ -87,7 +87,7 @@ export function SettingsModal() {
     setGeminiStatus('idle')
     setGeminiMessage('')
     try {
-      const res: any = await (api as any).settings.verifyGeminiKey(geminiKey.trim())
+      const res: any = await api.settings.verifyGeminiKey(geminiKey.trim())
       setGeminiStatus('ok')
       setGeminiMessage(res.message || 'Gemini API key verified!')
       setGeminiConnected(true)

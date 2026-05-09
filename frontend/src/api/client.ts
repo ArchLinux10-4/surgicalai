@@ -82,6 +82,8 @@ export const api = {
     verifyKey: (key: string) => request('/settings/verify-key', { method: 'POST', body: JSON.stringify({ key }) }),
     verifyAnthropicKey: (key: string) => request('/settings/verify-anthropic-key', { method: 'POST', body: JSON.stringify({ key }) }),
     getModels: () => request<any>('/settings/models'),
+    geminiStatus: () => request<any>('/settings/gemini-status'),
+    verifyGeminiKey: (key: string) => request('/settings/verify-gemini-key', { method: 'POST', body: JSON.stringify({ key }) }),
   },
   chat: {
     createSession: (data: any) => request<any>('/chat/sessions', { method: 'POST', body: JSON.stringify(data) }),
