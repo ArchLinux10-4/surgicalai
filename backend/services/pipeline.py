@@ -493,8 +493,11 @@ SURGEON_SYSTEM = """You are the SURGEON in a two-model coding system.
 The ARCHITECT has already analyzed the codebase and created a precise change plan.
 Your job: produce EXACT search-and-replace operations that implement the plan.
 
-You will receive a TARGET CODE window for context. Return JSON operations that find
-specific text in that code and replace it.
+You will receive:
+- FILE HEADER: top of the file (imports, key state/variables) for reference
+- CONTEXT BEFORE: lines just before the target symbol
+- TARGET CODE: the symbol you are editing — your "find" strings MUST come from here
+- CONTEXT AFTER: lines just after the target symbol
 
 OUTPUT FORMAT (return ONLY this JSON, nothing else):
 {
@@ -508,12 +511,14 @@ OUTPUT FORMAT (return ONLY this JSON, nothing else):
 
 HARD RULES:
 1. "find" MUST be an EXACT substring of the TARGET CODE or a well-known anchor (</script>, </body>, etc).
-   Copy it character-for-character, including whitespace and indentation.
-2. "find" should be the MINIMUM text needed to UNIQUELY identify the location. Usually 1-5 lines.
-   If a short string like </div> could match many places, include the line above it too.
+   Copy it character-for-character, including all whitespace and indentation.
+2. "find" should be the MINIMUM text needed to UNIQUELY identify the location. Usually 2-6 lines.
+   If a short string like </div> could match many places, include the surrounding 2-3 lines.
 3. "replace" is the new text for that exact location. Preserve original indentation style.
 4. Each operation = ONE logical change. Multiple changes = multiple operations.
 5. Do NOT include unchanged surrounding code in your operations.
+6. MULTI-PART CHANGES: if the plan requires changes in multiple locations (e.g. add CSS + add state + modify JSX),
+   produce one operation per location. Verify each "find" string is unique in the file.
 
 CHANGE TYPES:
 - MODIFY/WRAP: find = the element to change, replace = the modified version.
@@ -521,6 +526,12 @@ CHANGE TYPES:
 - ADD/INSERT: find = an anchor line (like </script> or a closing tag), replace = new code + that anchor.
   Example: find "</script>", replace "function newFunc(){...}\n</script>"
 - DELETE: find = the lines to remove, replace = "" (empty string).
+
+STYLE RULES (for UI/CSS changes):
+- Use ONLY colors and CSS variables that already exist in the FILE HEADER or TARGET CODE.
+  Do NOT invent new color values. If in doubt, reuse an existing color exactly as written.
+- Preserve TypeScript types. If adding a new useState hook, infer the type from surrounding hooks.
+- Match the indentation style exactly (spaces vs tabs, 2 vs 4 spaces).
 
 ALREADY CORRECT RULE:
 If the TARGET CODE already implements what the plan describes, return:
@@ -800,11 +811,19 @@ def run_surgeon(
     client = _get_client_for_model(surg_model, user_id)
 
     # Context around the symbol (reference only)
+    # Use ±50 lines so Surgeon sees enough of the file for complex multi-part changes
     all_lines = file_content.splitlines()
-    context_start = max(0, symbol.start_line - 11)
-    context_end = min(len(all_lines), symbol.end_line + 10)
+    context_start = max(0, symbol.start_line - 51)
+    context_end = min(len(all_lines), symbol.end_line + 50)
     before_context = "\n".join(all_lines[context_start:symbol.start_line - 1])
     after_context = "\n".join(all_lines[symbol.end_line:context_end])
+
+    # File header — top 40 lines (imports, key state) so Surgeon knows what's available
+    # Only inject if the symbol doesn't already start near the top of the file
+    _file_header = ""
+    if symbol.start_line > 50:
+        header_lines = all_lines[:40]
+        _file_header = f"\nFILE HEADER (imports + key declarations — read-only, do NOT include in operations):\n" + "\n".join(header_lines) + "\n"
 
     # Thread import_changes from Architect plan if present
     _import_hint = ""
@@ -816,7 +835,7 @@ def run_surgeon(
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
-New logic required: {target.new_logic}{_import_hint}
+New logic required: {target.new_logic}{_import_hint}{_file_header}
 
 CONTEXT BEFORE (read-only reference, do NOT include in operations):
 {before_context}
