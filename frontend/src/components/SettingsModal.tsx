@@ -447,6 +447,76 @@ export function SettingsModal() {
                 <AdminUsersPanel />
               </div>
             )}
+
+            {tab === 'github' && (
+              <div className="space-y-5">
+                <SectionHeader
+                  title="GitHub Integration"
+                  subtitle="Connect your GitHub account to browse repos, load files, and push commits directly from SurgicalAI"
+                />
+
+                {/* Connected state */}
+                {githubStatus?.connected ? (
+                  <div className="space-y-4">
+                    <div className="flex items-center gap-3 p-3 rounded-lg border border-green-500/30 bg-green-500/10">
+                      {githubStatus.avatar_url && (
+                        <img src={githubStatus.avatar_url} alt="avatar" className="w-9 h-9 rounded-full border border-border" />
+                      )}
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-semibold text-green-400">Connected as @{githubStatus.username}</div>
+                        <div className="text-xs text-muted">Your repositories are available in the GitHub sidebar tab</div>
+                      </div>
+                      <button
+                        onClick={handleDisconnectGithub}
+                        className="text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded px-3 py-1.5 hover:bg-red-500/10 transition-colors"
+                      >
+                        Disconnect
+                      </button>
+                    </div>
+                    {githubStatusMsg && (
+                      <div className="text-xs text-muted">{githubStatusMsg}</div>
+                    )}
+                  </div>
+                ) : (
+                  /* Not connected state */
+                  <div className="space-y-4">
+                    <Field label="Personal Access Token (Classic)">
+                      <div className="flex gap-2">
+                        <input
+                          type="password"
+                          className="input flex-1"
+                          placeholder="ghp_xxxxxxxxxxxxxxxxxxxx"
+                          value={githubPat}
+                          onChange={(e) => setGithubPat(e.target.value)}
+                          onKeyDown={(e) => e.key === 'Enter' && handleConnectGithub()}
+                        />
+                        <button
+                          onClick={handleConnectGithub}
+                          disabled={githubConnecting || !githubPat.trim()}
+                          className="btn-primary px-4 text-sm disabled:opacity-50"
+                        >
+                          {githubConnecting ? 'Connecting…' : 'Connect'}
+                        </button>
+                      </div>
+                    </Field>
+
+                    {githubStatusMsg && (
+                      <div className={`text-xs px-3 py-2 rounded ${githubStatusMsg.includes('success') ? 'text-green-400 bg-green-500/10' : 'text-red-400 bg-red-500/10'}`}>
+                        {githubStatusMsg}
+                      </div>
+                    )}
+
+                    <div className="text-xs text-muted space-y-1 p-3 rounded-lg bg-surface border border-border">
+                      <div className="font-medium text-ink mb-2">How to get a token:</div>
+                      <div>1. Go to <a href="https://github.com/settings/tokens" target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">github.com/settings/tokens</a></div>
+                      <div>2. Click <strong className="text-ink">"Generate new token (classic)"</strong></div>
+                      <div>3. Select the <strong className="text-ink">repo</strong> and <strong className="text-ink">read:user</strong> scopes</div>
+                      <div>4. Copy the token and paste it above</div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 
