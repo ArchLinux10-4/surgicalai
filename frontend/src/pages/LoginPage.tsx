@@ -23,39 +23,44 @@ function CodeRain() {
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
 
-    let animId: number;
-    const resize = () => {
-      canvas.width = window.innerWidth * 2;
-      canvas.height = window.innerHeight * 2;
-      ctx.setTransform(2, 0, 0, 2, 0, 0);
-    };
-    resize();
+    let animFrameId: number;
+    let columns: number;
+    let drops: number[];
+    const fontSize = 18;
 
-    const cols = Math.floor(window.innerWidth / 18);
-    const drops: number[] = Array.from({ length: cols }, () => Math.random() * -100);
+    const handleResize = () => {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+      columns = Math.floor(canvas.width / fontSize);
+      drops = new Array(columns).fill(1);
+    };
+    handleResize();
 
     const draw = () => {
       ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
-      ctx.fillRect(0, 0, window.innerWidth, window.innerHeight);
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.font = '14px monospace';
 
-      drops.forEach((y, i) => {
+      for (let i = 0; i < columns; i++) {
         const char = CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
         const brightness = Math.random();
         ctx.fillStyle = brightness > 0.7
           ? '#4ade80'
           : `rgba(74, 222, 128, ${0.15 + brightness * 0.3})`;
-        ctx.fillText(char, i * 18, y);
-        drops[i] = y > window.innerHeight + Math.random() * 500 ? 0 : y + 16;
-      });
-      animId = requestAnimationFrame(draw);
+        ctx.fillText(char, i * fontSize, drops[i] * fontSize);
+        if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) {
+          drops[i] = 0;
+        }
+        drops[i]++;
+      }
+      animFrameId = requestAnimationFrame(draw);
     };
-    animId = requestAnimationFrame(draw);
+    animFrameId = requestAnimationFrame(draw);
 
-    window.addEventListener('resize', resize);
+    window.addEventListener('resize', handleResize);
     return () => {
-      cancelAnimationFrame(animId);
-      window.removeEventListener('resize', resize);
+      cancelAnimationFrame(animFrameId);
+      window.removeEventListener('resize', handleResize);
     };
   }, []);
 
@@ -137,7 +142,7 @@ const MailIcon = () => (
 
 /* ─── Main Component ─── */
 export function LoginPage() {
-  const { login } = useAuthStore();
+  const { login, user } = useAuthStore();
   const [setupRequired, setSetupRequired] = useState<boolean | null>(null);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -217,7 +222,7 @@ export function LoginPage() {
 
   return (
     <>
-      <CodeRain />
+      {!user && <CodeRain />}
 
       {/* Center glow */}
       <div style={{
