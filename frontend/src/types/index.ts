@@ -190,8 +190,15 @@ export interface SessionFile {
   github_pushed_at?: string  // timestamp of last push to GitHub
 }
 
+export interface NewFile {
+  filename: string
+  content: string
+  language: string
+  summary: string
+}
+
 export interface SmartResult {
-  intent: 'edit' | 'chat'
+  intent: 'edit' | 'chat' | 'create'
   summary: string
   reasoning: string
   risks: string[]
@@ -201,4 +208,5 @@ export interface SmartResult {
     changes: SurgicalChange[]
   }>
   skipped_changes?: { symbol: string; reason: string }[]
+  new_files?: NewFile[]
 }

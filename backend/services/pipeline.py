@@ -1877,7 +1877,19 @@ Look at the uploaded files + the user request and choose ONE intent:
    - It's a question, explanation request, or general discussion
    - No code changes are needed
 
-4. "search" — use this when you need to see a symbol's full code before you can plan.
+4. "create" — use this when:
+   - The user asks to create, build, make, scaffold, or generate a NEW file, component, hook,
+     service, page, or module that does NOT exist in the uploaded session files
+   - MIXED: if creating also requires changing an existing file (e.g. adding an import to App.tsx),
+     include BOTH "new_files" AND "targets" in your response
+
+   Detection:
+   - "create a PaymentForm component" → create (file doesn't exist)
+   - "add a useDebounce hook" → create (hooks/useDebounce.ts doesn't exist)
+   - "add dark mode to SettingsModal" → EDIT not create (file exists)
+   - "build a payment service" → create (services/payments.ts doesn't exist)
+
+5. "search" — use this when you need to see a symbol's full code before you can plan.
    You have the FULL SYMBOL INDEX — every function and class name with its line range.
    Use it. Do not guess at symbol names or locations.
 
@@ -1951,6 +1963,25 @@ IF chat:
   "intent": "chat",
   "reasoning": "why this is a question not an edit",
   "chat_response": "full markdown answer"
+}
+
+IF create:
+{
+  "intent": "create",
+  "reasoning": "one sentence: what new file(s) are needed and why",
+  "summary": "one sentence plan",
+  "new_files": [
+    {
+      "filename": "src/components/PaymentForm.tsx",
+      "description": "what this file does and its public API",
+      "based_on": "which existing file's patterns to follow (e.g. 'follows LoginPage.tsx pattern')",
+      "content_guidance": "Detailed spec for the file generator. Reference ACTUAL existing symbols, types, imports, and API methods visible in the uploaded files. Be specific: mention exact function names, type names, import paths. The more specific, the better the output."
+    }
+  ],
+  "targets": []
+  // targets is optional — only include if creating also requires editing an existing file
+  // (e.g. registering a new route, adding an import to index.ts)
+  // Same shape as the edit intent targets array.
 }
 
 IF search:
@@ -2037,6 +2068,156 @@ Example:
 # ─────────────────────────────────────────────────────────────────────────────
 # QA AGENT — runs after every Surgeon output, before diff card is shown to user
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE CREATOR — Claude writes brand-new files based on codebase patterns
+# ─────────────────────────────────────────────────────────────────────────────
+
+FILE_CREATOR_SYSTEM = """You are an expert software engineer creating a new source file.
+
+You will receive:
+- CODEBASE CONTEXT: symbol maps and key patterns from the existing uploaded files
+- FILE SPEC: filename, description, and detailed content guidance
+
+Your job: write the COMPLETE file — production-ready, not pseudocode, no placeholders.
+
+Rules:
+1. Follow the patterns, naming conventions, and import paths from the CODEBASE CONTEXT exactly.
+   If the context shows `import { api } from '../api/client'`, use that exact path.
+   If components use Tailwind, use Tailwind. If they use inline styles, use inline styles.
+2. Match the existing code style: spacing, quotes, semicolons, export style.
+3. Use the exact type names, interface names, and function signatures visible in the context.
+4. Make the file immediately usable — a developer should be able to import it and it works.
+5. Include all necessary imports. Do not import anything not visible in the context unless
+   it is a core language/framework built-in (React, useState, useEffect, etc.).
+
+Return ONLY valid JSON — no markdown fences, no explanation outside the JSON:
+{
+  "filename": "the exact filename requested",
+  "content": "complete file content as a single string",
+  "language": "typescript|python|javascript|etc",
+  "summary": "one sentence describing what was created"
+}"""
+
+
+async def run_file_creator(
+    file_spec: dict,
+    codebase_context: str,
+    user_id: str = "",
+) -> dict:
+    """
+    Claude writes a complete new file based on:
+    - file_spec: {filename, description, based_on, content_guidance}
+    - codebase_context: formatted symbol maps + key code patterns from session files
+
+    Returns {filename, content, language, summary} or raises on failure.
+    """
+    try:
+        aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
+    except Exception:
+        # Fall back to OpenAI if no Anthropic key
+        client = _get_client(user_id)
+        model = get_setting("architect_model", "gpt-4.1")
+        user_msg = _build_creator_user_msg(file_spec, codebase_context)
+        response = _chat_create(
+            client, model,
+            messages=[
+                {"role": "system", "content": FILE_CREATOR_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content
+        return json.loads(raw)
+
+    # Prefer Claude for file creation — it generates better structured code
+    creator_model = get_setting("architect_model", "claude-sonnet-4-20250514")
+    if not _is_claude_model(creator_model):
+        creator_model = "claude-sonnet-4-20250514"
+
+    user_msg = _build_creator_user_msg(file_spec, codebase_context)
+
+    response_chunks = []
+    async with aclient.messages.stream(
+        model=creator_model,
+        max_tokens=8000,
+        system=FILE_CREATOR_SYSTEM,
+        messages=[{"role": "user", "content": user_msg}],
+    ) as stream:
+        async for text in stream.text_stream:
+            response_chunks.append(text)
+
+    raw = "".join(response_chunks).strip()
+    # Strip markdown fences if Claude wrapped it anyway
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+    data = json.loads(raw)
+    # Ensure filename matches what was requested (Claude sometimes drifts)
+    data["filename"] = file_spec.get("filename", data.get("filename", "new_file.ts"))
+    return data
+
+
+def _build_creator_user_msg(file_spec: dict, codebase_context: str) -> str:
+    return f"""CODEBASE CONTEXT (patterns to follow exactly):
+{codebase_context}
+
+FILE SPEC:
+Filename: {file_spec.get("filename", "")}
+Description: {file_spec.get("description", "")}
+Based on: {file_spec.get("based_on", "patterns visible in the codebase context")}
+Content guidance: {file_spec.get("content_guidance", "")}
+
+Write the complete file now. Return only JSON."""
+
+
+def _build_codebase_context_for_creator(symbol_maps_by_name: dict) -> str:
+    """
+    Build a rich context string for the file creator.
+    Includes: full imports block + top-level symbol signatures from each file.
+    This gives Claude enough to match patterns without flooding the context.
+    """
+    parts = []
+    for fname, (smap, sf) in symbol_maps_by_name.items():
+        if not isinstance(sf, dict):
+            continue
+        content = sf.get("content", "")
+        if not content:
+            continue
+
+        lines = content.splitlines()
+        section = [f"FILE: {fname}"]
+
+        # Full import block (first 40 lines usually covers all imports)
+        import_lines = []
+        for ln in lines[:50]:
+            stripped = ln.strip()
+            if stripped.startswith(("import ", "from ", "require(")):
+                import_lines.append(ln)
+            elif import_lines and not stripped:
+                pass  # blank line within imports
+            elif import_lines:
+                break
+        if import_lines:
+            section.append("IMPORTS:\n" + "\n".join(import_lines))
+
+        # Symbol signatures (not full code — keeps context tight)
+        if smap:
+            sigs = []
+            for sym in smap.symbols[:30]:
+                size = sym.end_line - sym.start_line + 1
+                sig = sym.signature or sym.code.splitlines()[0] if sym.code else sym.name
+                sig_short = sig[:120].replace("\n", " ").strip()
+                sigs.append(f"  [{sym.symbol_type.value}] {sym.full_path} (L{sym.start_line}–{sym.end_line}, {size}L)  {sig_short}")
+            if sigs:
+                section.append("SYMBOLS:\n" + "\n".join(sigs))
+
+        parts.append("\n".join(section))
+
+    return "\n\n" + ("─" * 60) + "\n\n".join(parts) if parts else "(no uploaded files)"
+
 
 QA_SYSTEM = """You are the QA agent in a two-model coding pipeline.
 The Surgeon has just produced a code replacement. Your job: verify it is correct, complete, and safe.
@@ -2275,7 +2456,8 @@ class ComplianceTracker:
     STEP_INTENTS = {
         "symbol_map_read":   ["edit"],
         "import_check":      ["edit"],
-        "architect_routing": ["edit", "chat", "needs_clarification"],
+        "architect_routing": ["edit", "chat", "needs_clarification", "create"],
+        "file_creation":     ["create"],
         "qa_review":         ["edit"],
         "confidence_gate":   ["edit"],
         "diff_validate":     ["edit"],
@@ -2383,7 +2565,18 @@ async def run_smart_pipeline_stream(
     compliance = ComplianceTracker(run_id=run_id, session_id=session_id or "", intent="unknown")
 
     try:
-        if not session_files:
+        # Detect create intent keywords in the request even before Architect runs.
+        # This lets the pipeline skip the early-return for no-files when the user
+        # is clearly asking to build/create something new from scratch.
+        _CREATE_KEYWORDS = {
+            "create", "build", "make", "generate", "scaffold", "new file",
+            "new component", "new page", "new hook", "new service", "new module",
+            "write a", "write me a", "add a new", "create a new",
+        }
+        _req_lower_pre = user_request.lower()
+        _looks_like_create = any(kw in _req_lower_pre for kw in _CREATE_KEYWORDS)
+
+        if not session_files and not _looks_like_create:
             # No files — pure chat mode, stream response
             compliance.set_intent("chat")
             compliance.mark("architect_routing", ran=True, output_summary="no-files pure chat")
@@ -3257,6 +3450,73 @@ USER REQUEST:
             yield sse({"type": "done", "content": ""})
             return
 
+        # ── CREATE intent — Claude writes brand-new files ──────────────────
+        if intent == "create":
+            compliance.set_intent("create")
+            new_file_specs = plan.get("new_files", [])
+            if not new_file_specs:
+                # Malformed plan — fall back to clarification
+                yield sse({"type": "token", "content": "I understood you want to create something new, but couldn't determine the file details. Could you describe what the file should do?"})
+                compliance.save()
+                yield sse({"type": "done", "content": ""})
+                return
+
+            # Build codebase context for the file creator
+            _creator_context = _build_codebase_context_for_creator(symbol_maps_by_name)
+            created_files = []
+
+            for _spec in new_file_specs:
+                _fname = _spec.get("filename", "new_file.ts")
+                yield sse({"type": "progress", "content": f"✍️ Creating {_fname}..."})
+                try:
+                    _file_result = await run_file_creator(
+                        file_spec=_spec,
+                        codebase_context=_creator_context,
+                        user_id=user_id,
+                    )
+                    created_files.append(_file_result)
+                    yield sse({"type": "progress", "content": f"✅ {_fname} ready ({len(_file_result.get('content','').splitlines())} lines)"})
+                except Exception as _cfe:
+                    yield sse({"type": "progress", "content": f"⚠️ Could not create {_fname}: {_cfe}"})
+
+            if not created_files:
+                yield sse({"type": "token", "content": "File creation failed. Try being more specific about what the file should contain."})
+                compliance.save()
+                yield sse({"type": "done", "content": ""})
+                return
+
+            compliance.mark("file_creation", ran=True,
+                            output_summary=f"{len(created_files)} file(s) created")
+
+            create_result = {
+                "intent": "create",
+                "summary": plan.get("summary", f"Created {len(created_files)} new file(s)"),
+                "reasoning": plan.get("reasoning", ""),
+                "new_files": created_files,
+                "risks": plan.get("risks", []),
+                "changes_by_file": {},   # required by SmartResult schema; empty for pure create
+                "skipped_changes": [],
+            }
+
+            # If Architect also planned edits to existing files (mixed create+edit),
+            # run the surgical pipeline for those targets too
+            _create_targets = plan.get("targets", [])
+            if _create_targets:
+                yield sse({"type": "progress", "content": f"Updating {len(_create_targets)} existing file(s)..."})
+                plan["targets"] = _create_targets
+                plan["intent"] = "edit"
+                compliance.set_intent("edit")
+                _pending_create_result = create_result
+            else:
+                compliance.save()
+                result_json = json.dumps(create_result)
+                yield sse({"type": "smart_result", "content": result_json})
+                yield sse({"type": "done", "content": ""})
+                return
+
+        else:
+            _pending_create_result = None
+
         # CODE EDIT intent — run surgical pipeline
         targets = plan.get("targets", [])
         if not targets:
@@ -3773,6 +4033,14 @@ USER REQUEST:
                 changes_by_file[fname]["changes"] = real_changes
 
         if not changes_by_file:
+            # If this was a mixed create+edit and edits produced no changes,
+            # still emit the create result
+            if _pending_create_result:
+                compliance.save()
+                yield sse({"type": "smart_result", "content": json.dumps(_pending_create_result)})
+                yield sse({"type": "done", "content": ""})
+                return
+
             # Build a helpful message depending on what happened
             if skipped_changes:
                 sym_names = ", ".join(f"`{s['symbol']}`" for s in skipped_changes[:3])
@@ -3818,6 +4086,11 @@ USER REQUEST:
                 for fname, data in changes_by_file.items()
             },
         }
+
+        # Mixed create+edit: merge created files into the result
+        if _pending_create_result:
+            result["intent"] = "create"
+            result["new_files"] = _pending_create_result.get("new_files", [])
 
         # ── Mark diff_validate + finalize compliance ──
         compliance.mark("diff_validate", ran=True,
