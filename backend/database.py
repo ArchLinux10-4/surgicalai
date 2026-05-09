@@ -500,6 +500,7 @@ def _init_postgres():
         """)
         conn.execute("""
             ALTER TABLE session_files ADD COLUMN IF NOT EXISTS github_meta TEXT
+            ALTER TABLE session_files ADD COLUMN IF NOT EXISTS github_pushed_at TIMESTAMP
         """)
         conn.commit()
 

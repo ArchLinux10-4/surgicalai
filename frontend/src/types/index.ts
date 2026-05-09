@@ -187,6 +187,7 @@ export interface SessionFile {
   content?: string  // only present when explicitly fetched
   file_type?: string  // 'code' | 'image' | 'pdf' | 'csv' | 'excel' | 'text'
   github_meta?: string  // JSON string with owner/repo/branch/path/sha
+  github_pushed_at?: string  // timestamp of last push to GitHub
 }
 
 export interface SmartResult {

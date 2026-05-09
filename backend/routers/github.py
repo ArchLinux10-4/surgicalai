@@ -339,7 +339,7 @@ def commit_changes(body: CommitRequest, request: Request):
                 updated_meta = {**github_meta, "sha": new_sha, "branch": target_branch}
                 conn = get_db()
                 conn.execute(
-                    "UPDATE session_files SET github_meta = ? WHERE id = ?",
+                    "UPDATE session_files SET github_meta = ?, github_pushed_at = CURRENT_TIMESTAMP WHERE id = ?",
                     (json.dumps(updated_meta), f.session_file_id)
                 )
                 conn.commit()

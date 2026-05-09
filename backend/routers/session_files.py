@@ -204,7 +204,7 @@ def list_session_files(session_id: str):
     """List files attached to a session (metadata only, no content)."""
     conn = get_db()
     rows = conn.execute(
-        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, github_meta, created_at, updated_at
+        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, github_meta, created_at, updated_at, github_pushed_at
            FROM session_files WHERE session_id = ? ORDER BY created_at ASC""",
         (session_id,)
     ).fetchall()
