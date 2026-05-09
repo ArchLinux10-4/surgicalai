@@ -30,9 +30,14 @@ function ensureBabel(): Promise<void> {
 
 function detectComponent(code: string): string {
   return (
+    // 1. export default function/class Foo
     code.match(/export\s+default\s+(?:function|class)\s+([A-Z]\w*)/)?.[1] ||
+    // 2. export default Foo
     code.match(/export\s+default\s+([A-Z]\w*)/)?.[1] ||
-    [...code.matchAll(/(?:function|const)\s+([A-Z][a-zA-Z0-9]*)\s*[=(]/g)].pop()?.[1] ||
+    // 3. named export: export function/class FooBar (PascalCase only)
+    code.match(/export\s+(?:function|class)\s+([A-Z][a-z]\w*)/)?.[1] ||
+    // 4. last PascalCase const/function (excludes ALL_CAPS like DURATION, W, H)
+    [...code.matchAll(/(?:function|const)\s+([A-Z][a-z][a-zA-Z0-9]*)\s*[=(]/g)].pop()?.[1] ||
     'App'
   )
 }
