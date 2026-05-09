@@ -944,14 +944,19 @@ def run_surgeon(
     model: Optional[str] = None,
     user_id: str = "",
     architect_risks: list = None,
-    linter_feedback: list = None,   # NEW: list of error dicts from linter_validator
+    linter_feedback: list = None,    # linter error dicts — injected on compile-error retry
+    extra_context: str = "",         # resolved surgeon_context from context_resolver
 ) -> tuple:
     """
     GPT-4.1 (Surgeon): receives ONE code chunk + plan, returns search-and-replace operations.
     Returns (new_code, confidence, surgeon_notes, import_needed, operations).
 
-    v3.4.0: Surgeon returns JSON operations [{find, replace}] instead of rewriting code blocks.
-    The LLM decides WHAT to change; the backend applies changes mechanically. Zero truncation risk.
+    Claude (Architect) has already planned the change and specified exactly what context
+    the Surgeon needs via surgeon_context. The pipeline resolves that context and passes
+    it here as extra_context. GPT receives a complete brief and executes with precision.
+
+    v3.4.0:  Returns JSON operations [{find, replace}].
+    v3.10.0: extra_context injects Claude-resolved code; linter_feedback injects compile errors.
     """
     client = _get_client(user_id)
     surg_model = model or get_setting("surgeon_model", "gpt-4.1")
@@ -1000,23 +1005,31 @@ def run_surgeon(
 
     _risks_list = architect_risks or []
     _risks_block = "\n".join(f"- {r}" for r in _risks_list) if _risks_list else "(none — skip risk_verdicts)"
+
     # Build linter feedback block for retry attempts
     _linter_block = ""
     if linter_feedback:
         from services.linter_validator import format_feedback_block as _fmt_feedback, linter_tool_name as _ltool
-        _tool_name = _ltool(symbol.name + ".py")  # fallback; caller passes correct filename via context
-        # Infer tool from file extension embedded in symbol signature when available
         _sig_lower = (symbol.signature or "").lower()
         if any(ext in _sig_lower for ext in (".ts", ".tsx", ".js", ".jsx")):
             _tool_name = "tsc"
         elif ".py" in _sig_lower:
             _tool_name = "pyflakes"
+        else:
+            _tool_name = "tsc"
         _linter_block = "\n\n" + _fmt_feedback(linter_feedback, _tool_name)
+
+    # Inject resolved extra_context (from context_resolver via surgeon_context plan)
+    _extra_ctx_block = (
+        f"\n\n{extra_context.strip()}"
+        if extra_context and extra_context.strip()
+        else ""
+    )
 
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
-New logic required: {target.new_logic}{_import_hint}{_file_header}{_semantic_section}{_linter_block}
+New logic required: {target.new_logic}{_import_hint}{_file_header}{_semantic_section}{_linter_block}{_extra_ctx_block}
 
 CONTEXT BEFORE (read-only reference, do NOT include in operations):
 {before_context}
@@ -1864,13 +1877,23 @@ Look at the uploaded files + the user request and choose ONE intent:
    - It's a question, explanation request, or general discussion
    - No code changes are needed
 
-4. "search" — use this when:
-   - The symbol map was capped AND you cannot see the specific element mentioned in the request
-   - A KEYWORD MATCH section shows surrounding context but NOT the element you need to edit
-   - You need to find an input/function/element by a name or ID not yet visible in your context
-   - ONLY use this up to 3 times per request — you have a limited search budget
-   - NEVER request terms already listed in ALREADY SEARCHED TERMS
-   - As soon as you locate the target element -> switch to "edit" intent immediately
+4. "search" — use this when you need to see a symbol's full code before you can plan.
+   You have the FULL SYMBOL INDEX — every function and class name with its line range.
+   Use it. Do not guess at symbol names or locations.
+
+   Search strategy (follow this order):
+   a) SYMBOL NAME FIRST: If the target symbol name is in the index, search its exact name.
+      The pipeline does an AST lookup and returns the complete function code.
+   b) STRING LITERAL SECOND: If the user mentioned a specific string or ID that appears
+      verbatim in the code, search for that exact string.
+   c) KEYWORD LAST: Only use plain keywords if neither (a) nor (b) applies.
+
+   Rules:
+   - Search budget scales with file size — up to 8 rounds on large files.
+   - NEVER request terms already in ALREADY SEARCHED TERMS.
+   - Stop searching the moment you have the exact symbol you need to edit.
+   - After 3 failed rounds, switch to needs_clarification and ask the user for
+     the function name or a quoted string from the code.
 
 ━━━ OUTPUT FORMAT ━━━
 
@@ -1899,12 +1922,22 @@ IF edit:
       "new_logic": "precise description of the new behavior — the Surgeon will implement exactly this. QUALITY RULE: Reference ACTUAL variable/function names from the code. Be specific: 'After const fee = calcFee(), add: if (fee < 0) throw new Error()'. Never say just 'add error handling' — always say WHAT, WHERE, and HOW.",
       "import_changes": ["add: import uuid", "remove: from datetime import date"],
       "context_needs": [],
-      // OPTIONAL — semantic sections the Surgeon needs from OUTSIDE the target symbol.
-      // Use when the change spans multiple file regions (e.g. add animation CSS + add useState + modify JSX).
-      // Available values: "style_block" | "state_declarations" | "hooks" | "css_vars"
-      //                   | "imports_block" | "type_declarations" | "constants"
-      // Rule: only include what the Surgeon genuinely needs to write correct code.
-      // Leave empty [] for simple single-location edits.
+      // OPTIONAL — semantic sections from OUTSIDE the target symbol.
+      // Values: "style_block"|"state_declarations"|"hooks"|"css_vars"|"imports_block"|"type_declarations"|"constants"
+
+      "surgeon_context": [],
+      // OPTIONAL — precise code the Surgeon MUST see to implement this change correctly.
+      // The pipeline resolves these via AST before the Surgeon runs.
+      // USE when the Surgeon will need to call a function, match a type, or reference a
+      // constant that is NOT visible in the target symbol's own code.
+      // Request types:
+      //   {"type":"symbol",  "name":"handleSubmit"}               — fetch by AST name lookup
+      //   {"type":"symbol",  "name":"PaymentFlow.validate", "file":"checkout.ts"}
+      //   {"type":"grep",    "pattern":"TAX_RATE"}                — search all files
+      //   {"type":"lines",   "file":"auth.py", "start":140, "end":180}
+      //   {"type":"callers", "name":"processOrder"}               — who calls this function
+      //   {"type":"usages",  "name":"PaymentSchema"}              — where this type is used
+      // Max 4 items. Leave empty [] if the Surgeon can write correct code from what it has.
       "confidence": 9
     // Score guide: 9-10=clear isolated change no side effects; 7-8=touches shared logic has deps;
     // 5-6=ambiguous multiple interpretations → MUST use needs_clarification; <5=missing files → ask
@@ -2527,43 +2560,58 @@ Be warm, friendly, and encouraging. You're helping a person build something real
             try:
                 smap = parser.parse(content, fname)
                 symbol_maps_by_name[fname] = (smap, sf)
-                # ── Smart symbol selection for large files ──
-                # Sort: prefer smaller (more surgical) symbols; functions before HTML elements
+                # ── Full symbol index — all symbols, compact format ──────────
+                # Showing all symbols costs ~45 chars each — negligible in a
+                # 200k context. Claude needs the full map to navigate a large
+                # file without keyword guessing.
                 _PRIORITY_TYPES = {"function": 0, "method": 1, "class": 2, "variable": 3}
                 _sorted_syms = sorted(
                     smap.symbols,
                     key=lambda s: (
-                        _PRIORITY_TYPES.get(s.symbol_type.value, 9),  # functions first
-                        s.end_line - s.start_line,                    # smaller symbols first
+                        _PRIORITY_TYPES.get(s.symbol_type.value, 9),
+                        s.end_line - s.start_line,
                     )
                 )
-                _MAX_SYMS = 60
-                _SNIPPET_LEN = 80  # shorter snippets reduce noise for large files
-                syms = []
-                for s in _sorted_syms[:_MAX_SYMS]:
-                    size = s.end_line - s.start_line + 1
-                    size_warn = " ⚠️LARGE" if size > 500 else ""
-                    entry = f"  [{s.symbol_type.value}] {s.full_path} ({size} lines, L{s.start_line}-{s.end_line}){size_warn}"
-                    snippet = s.code[:_SNIPPET_LEN].replace("\n", " ").strip()
-                    if snippet:
-                        entry += f"  >> {snippet}"
-                    if s.signature:
-                        entry += f" — {s.signature}"
-                    syms.append(entry)
                 _total_syms = len(smap.symbols)
-                _sym_header = f"SYMBOLS ({_total_syms} total" + (f", showing {_MAX_SYMS} most targeted" if _total_syms > _MAX_SYMS else "") + "):"
-                _sym_suffix = "" if _total_syms <= _MAX_SYMS else f"\n  ... [{_total_syms - _MAX_SYMS} more — use narrowest symbol rule; prefer small symbols under 200 lines]"
-                _file_summary = (
-                    f"FILE: {fname} ({sf.get('lines', len(content.splitlines()))} lines, {sf.get('language', 'code')})\n"
-                    f"{_sym_header}\n" + ("\n".join(syms) + _sym_suffix if syms else "  (no symbols parsed)")
+
+                # For very large files (>500 symbols) show functions/classes only
+                _show_syms = _sorted_syms
+                _index_note = ""
+                if _total_syms > 500:
+                    _show_syms = [
+                        s for s in _sorted_syms
+                        if s.symbol_type.value in ("class", "function", "method", "arrow_function")
+                    ]
+                    _index_note = (
+                        f"\n  [Showing {len(_show_syms)} functions/classes of {_total_syms} total. "
+                        f"Use search to find any symbol by name.]"
+                    )
+
+                syms = []
+                for s in _show_syms:
+                    size = s.end_line - s.start_line + 1
+                    flag = " ⚠️LARGE" if size > 500 else ""
+                    syms.append(
+                        f"  [{s.symbol_type.value}] {s.full_path:<45} "
+                        f"L{s.start_line}–{s.end_line}  ({size}L){flag}"
+                    )
+
+                _sym_header = f"SYMBOL INDEX — SYMBOLS: ({_total_syms} total — full map):"
+                _sym_index_footer = (
+                    "\nTo fetch any symbol's full code: use search intent with its exact name."
+                    "\nTo find something by content: use search intent with a keyword or string literal."
                 )
-                # ── Grep injection for large files (>_MAX_SYMS hidden symbols) ──
-                # When Architect can only see 60 of 338 symbols, grep the file
-                # for terms from the user's request and inject matching sections.
-                # This is how Tasklet works: grep first, then edit.
-                if _total_syms > _MAX_SYMS:
-                    # Also extract terms from the last user answer in history
-                    # (catches cases where user answered a clarification question)
+                _file_summary = (
+                    f"FILE: {fname} ({sf.get('lines', len(content.splitlines()))} lines, "
+                    f"{sf.get('language', 'code')})\n"
+                    f"{_sym_header}\n"
+                    + ("\n".join(syms) if syms else "  (no symbols parsed)")
+                    + _index_note
+                    + _sym_index_footer
+                )
+
+                # Initial grep: inject code preview for large files
+                if _total_syms > 60:
                     _history_answer_terms = []
                     for _hm in reversed(conversation_history[-4:]):
                         if _hm.get("role") == "user":
@@ -2583,7 +2631,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 symbol_maps_by_name[fname] = (None, sf)
 
         compliance.mark("symbol_map_read", ran=True,
-                        output_summary=f"{len([f for f in file_summaries if 'SYMBOLS:' in f])} files parsed with symbol maps")
+                        output_summary=f"{len([f for f in file_summaries if 'SYMBOL' in f])} files parsed with symbol maps")
         _large_file_count = sum(
             1 for fname, (smap, _sf) in symbol_maps_by_name.items()
             if smap and len(smap.symbols) > 60
@@ -2631,12 +2679,27 @@ USER REQUEST:
             # Each "search" intent response triggers a grep + re-call (up to 4 rounds).
             aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
 
-            # ReAct loop state
-            _REACT_MAX_ROUNDS = 4
+            # ReAct loop state — scale limits by file size
+            _largest_file_lines = max(
+                (sf_.get("lines", len(sf_.get("content", "").splitlines()))
+                 for _, sf_ in symbol_maps_by_name.values()
+                 if isinstance(sf_, dict)),
+                default=0,
+            )
+            if _largest_file_lines > 5000:
+                _REACT_MAX_ROUNDS = 8
+                _REACT_BUDGET = 8000
+            elif _largest_file_lines > 1000:
+                _REACT_MAX_ROUNDS = 6
+                _REACT_BUDGET = 5000
+            else:
+                _REACT_MAX_ROUNDS = 4
+                _REACT_BUDGET = 2500
+
             _react_round = 0
             _react_searched_terms = []
-            _react_accumulated = ""   # accumulated grep sections across all rounds
-            _react_budget_lines = 0   # total lines injected (budget guard at 2500)
+            _react_accumulated = ""
+            _react_budget_lines = 0
 
             # Seed from session cache (previous search rounds in this session)
             _react_cache_key = "{}::{}".format(
@@ -2848,37 +2911,116 @@ USER REQUEST:
                     }
                     break
 
-                if _react_budget_lines < 2500:
+                if _react_budget_lines < _REACT_BUDGET:
                     yield sse({"type": "progress", "content":
                                "Searching for: {} (round {}/{})...".format(
                                    ", ".join(_new_terms[:3]), _react_round, _REACT_MAX_ROUNDS
                                )})
+
+                    _round_hits = []
+                    _seen_sym_paths = set()
+
                     for _fname_r, (_smap_r, _sf_r) in symbol_maps_by_name.items():
-                        _fcontent_r = _sf_r.get("content", "")
+                        _fcontent_r = _sf_r.get("content", "") if isinstance(_sf_r, dict) else ""
                         if not _fcontent_r:
                             continue
-                        _grep_r = _grep_relevant_sections(
-                            "", _fname_r, _fcontent_r,
-                            extra_terms=_new_terms,
-                            window=100, max_lines=300,
-                        )
-                        if _grep_r:
-                            _react_accumulated += "\n" + _grep_r
-                            _react_budget_lines += _grep_r.count("\n")
+                        _file_lines_r = _fcontent_r.splitlines()
+
+                        # Pass 1: exact AST symbol name match — most precise
+                        if _smap_r:
+                            for _term_r in _new_terms:
+                                _term_lower = _term_r.lower()
+                                for _sym_r in _smap_r.symbols:
+                                    if (_sym_r.name.lower() == _term_lower
+                                            or _sym_r.full_path.lower() == _term_lower):
+                                        _sym_lines = _sym_r.code.splitlines()
+                                        _sym_numbered = "\n".join(
+                                            f"{_sym_r.start_line + j:5d}: {_sym_lines[j]}"
+                                            for j in range(len(_sym_lines))
+                                        )
+                                        _label = (
+                                            f"SYMBOL MATCH [{_fname_r} :: {_sym_r.full_path} "
+                                            f"({_sym_r.symbol_type.value}, "
+                                            f"L{_sym_r.start_line}–{_sym_r.end_line})]"
+                                        )
+                                        _path_key = f"{_fname_r}::{_sym_r.full_path}"
+                                        if _path_key not in _seen_sym_paths:
+                                            _seen_sym_paths.add(_path_key)
+                                            _round_hits.append((_fname_r, _label, _sym_numbered))
+                                        break
+
+                        # Pass 2: keyword grep, expanded to enclosing AST symbol
+                        for _term_r in _new_terms:
+                            _tl = _term_r.lower()
+                            for _li, _ln in enumerate(_file_lines_r):
+                                if _tl not in _ln.lower():
+                                    continue
+                                _lineno_r = _li + 1
+                                _enc = None
+                                if _smap_r:
+                                    _best_size = float("inf")
+                                    for _sym_r in _smap_r.symbols:
+                                        if _sym_r.start_line <= _lineno_r <= _sym_r.end_line:
+                                            _sz = _sym_r.end_line - _sym_r.start_line
+                                            if _sz < _best_size:
+                                                _best_size = _sz
+                                                _enc = _sym_r
+                                if _enc:
+                                    _path_key = f"{_fname_r}::{_enc.full_path}"
+                                    if _path_key not in _seen_sym_paths:
+                                        _seen_sym_paths.add(_path_key)
+                                        _enc_lines = _enc.code.splitlines()
+                                        _enc_numbered = "\n".join(
+                                            f"{_enc.start_line + j:5d}: {_enc_lines[j]}"
+                                            for j in range(len(_enc_lines))
+                                        )
+                                        _label = (
+                                            f"GREP MATCH ('{_term_r}') [{_fname_r} :: "
+                                            f"{_enc.full_path} ({_enc.symbol_type.value}, "
+                                            f"L{_enc.start_line}–{_enc.end_line})]"
+                                        )
+                                        _round_hits.append((_fname_r, _label, _enc_numbered))
+                                else:
+                                    _path_key = f"{_fname_r}::L{_lineno_r}"
+                                    if _path_key not in _seen_sym_paths:
+                                        _seen_sym_paths.add(_path_key)
+                                        _ws = max(0, _li - 15)
+                                        _we = min(len(_file_lines_r), _li + 16)
+                                        _raw = "\n".join(
+                                            f"{_ws + j + 1:5d}: {_file_lines_r[_ws + j]}"
+                                            for j in range(_we - _ws)
+                                        )
+                                        _label = f"GREP MATCH ('{_term_r}') [{_fname_r} L{_lineno_r}]"
+                                        _round_hits.append((_fname_r, _label, _raw))
+                                break
+
+                    _round_text = ""
+                    for _rh_fname, _rh_label, _rh_code in _round_hits:
+                        _block = f"\n{_rh_label}:\n{_rh_code}"
+                        _round_text += _block
+                        _react_budget_lines += _block.count("\n")
+                        if _react_budget_lines >= _REACT_BUDGET:
+                            break
+                    if _round_text:
+                        _react_accumulated += _round_text
+
                     _react_searched_terms.extend(_new_terms)
-                    # Emit found line ranges so user can see what was found
-                    _found_line_nums = re.findall(r'Lines (\d+)-\d+:', _grep_r) if _grep_r else []
-                    if _found_line_nums:
+
+                    if _round_hits:
+                        _hit_names = ", ".join(
+                            h[1].split("::")[1].split("(")[0].strip()
+                            if "::" in h[1] else h[1]
+                            for h in _round_hits[:3]
+                        )
                         yield sse({"type": "progress", "content":
-                                   "Found matches at: {}".format(
-                                       ", ".join("L{}".format(l) for l in _found_line_nums[:4])
-                                   )})
+                                   f"Found: {_hit_names}"
+                                   + (f" +{len(_round_hits)-3} more" if len(_round_hits) > 3 else "")})
                     elif _react_round > 1:
                         yield sse({"type": "progress", "content":
-                                   "Round {}: no new matches for: {}".format(
+                                   "Round {}: no matches for: {}".format(
                                        _react_round, ", ".join(_new_terms[:3])
                                    )})
-                    # Persist to session cache for follow-up edits
+
                     _react_grep_cache[_react_cache_key] = _react_accumulated
 
                 # If budget was exceeded, the warning is injected at top of next round;
@@ -3347,6 +3489,7 @@ USER REQUEST:
                 confidence=target.get("confidence", 7),
                 import_changes=target.get("import_changes", []),
                 context_needs=target.get("context_needs", []),
+                surgeon_context=target.get("surgeon_context", []),
             )
 
             # ── Oversized symbol guardrail ──
@@ -3413,35 +3556,52 @@ USER REQUEST:
                     )
                     yield sse({"type": "progress", "content": f"Focused window: L{window_start}-{window_end} ({window_end - window_start + 1} lines)"})
 
-            # ── v3.10.0: Surgeon retry loop with linter feedback ────────────────
-            # Max 2 attempts. On attempt 2 the Surgeon receives the exact tsc /
-            # pyflakes errors it introduced so it can fix them directly.
-            # The loop only retries when (a) verdict is blocked AND (b) the block
-            # is specifically caused by linter errors — not by other QA failures.
+            # ── v3.10.0: Resolve Claude's surgeon_context before Surgeon runs ─
+            _resolved_surgeon_ctx = ""
+            _surgeon_context_reqs = change_target.surgeon_context
+            if _surgeon_context_reqs:
+                try:
+                    from services.context_resolver import (
+                        resolve_context_requests as _resolve_ctx,
+                        describe_requests as _describe_ctx,
+                    )
+                    _desc = _describe_ctx(_surgeon_context_reqs)
+                    yield sse({"type": "progress", "content": f"📦 Resolving Surgeon context: {_desc}"})
+                    _resolved_surgeon_ctx = _resolve_ctx(
+                        requests=_surgeon_context_reqs,
+                        symbol_maps_by_name=symbol_maps_by_name,
+                        requesting_file=matched_name,
+                    )
+                    if _resolved_surgeon_ctx:
+                        _n = len(_resolved_surgeon_ctx.splitlines())
+                        yield sse({"type": "progress", "content": f"✅ Surgeon context ready ({_n} lines injected)"})
+                    else:
+                        yield sse({"type": "progress", "content": "⚠️ surgeon_context items not found — proceeding without them"})
+                except Exception as _ctx_exc:
+                    print(f"[CONTEXT_RESOLVER] Failed: {_ctx_exc}")
+
+            # ── Surgeon retry loop (linter feedback on compile errors) ─────────
             _linter_feedback_for_retry: list = []
-            _full_after_lint: str = ""       # reconstructed file after ops (reused below)
+            _full_after_lint: str = ""
             _MAX_SURGEON_ATTEMPTS = 2
 
             for _surgeon_attempt in range(_MAX_SURGEON_ATTEMPTS):
 
                 new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(
                     symbol, change_target, sf["content"], user_id=user_id,
-                    linter_feedback=_linter_feedback_for_retry if _surgeon_attempt > 0 else None,
+                    extra_context=_resolved_surgeon_ctx,
+                    linter_feedback=_linter_feedback_for_retry if _linter_feedback_for_retry else None,
                 )
-                # Trace: operations applied (visible in Railway logs only)
                 _is_changed = new_code.rstrip() != symbol.code.rstrip()
-                print(
-                    f"[PIPELINE] attempt={_surgeon_attempt+1} {len(_operations)} ops applied, "
-                    f"changed={_is_changed}, new={len(new_code)}, orig={len(symbol.code)}"
-                )
+                _attempt_label = f" (attempt {_surgeon_attempt+1})" if _surgeon_attempt > 0 else ""
+                print(f"[PIPELINE] attempt={_surgeon_attempt+1} {len(_operations)} ops, changed={_is_changed}, new={len(new_code)}, orig={len(symbol.code)}")
                 diff = _make_diff(symbol.code, new_code, symbol_path)
 
-                # ── QA Agent: verify Surgeon output before showing to user ────
+                # ── QA Agent ──────────────────────────────────────────────────
                 _other_ctx_for_qa = "\n\n".join(
                     p for p in _qa_other_context_parts
                     if not p.startswith(f"FILE: {matched_name}")
                 )
-                # v3.4.0: use file-window original if Tier 4 matching was used
                 _effective_original = getattr(symbol, "_file_window_original", None) or symbol.code
 
                 _qa_result = await run_qa_agent(
@@ -3456,18 +3616,16 @@ USER REQUEST:
                     user_id=user_id,
                     architect_risks=plan.get("risks", []),
                 )
-                # Emit QA progress to user
                 _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫", "skipped": "⏭"}.get(
                     _qa_result.get("verdict", "skipped"), "⏭"
                 )
-                _attempt_label = f" (attempt {_surgeon_attempt+1})" if _surgeon_attempt > 0 else ""
                 yield sse({"type": "progress", "content": f"QA {_qa_icon} {_qa_result.get('summary', '')} (score: {_qa_result.get('qa_score', '?')}){_attempt_label}"})
                 _qa_ran = _qa_result.get("status") not in ("timeout", "error")
                 compliance.mark("qa_review", ran=_qa_ran,
                                 reason=(None if _qa_ran else _qa_result.get("status")),
                                 output_summary=f"verdict={_qa_result.get('verdict')} score={_qa_result.get('qa_score')}")
 
-                # ── v3.9.2: Compile-time syntax validation (tree-sitter) ──────
+                # ── Tree-sitter syntax check ───────────────────────────────────
                 try:
                     from services.syntax_validator import validate_syntax as _validate_syntax
                     from services.syntax_validator import count_errors as _count_errors
@@ -3488,7 +3646,7 @@ USER REQUEST:
                             _qa_result["risk_verdicts"].append({
                                 "risk": _serr["message"],
                                 "status": "blocked",
-                                "reason": f"Compile error at line {_serr['line']}: {_serr['detail']}"
+                                "reason": f"Compile error at line {_serr['line']}: {_serr['detail']}",
                             })
                         _qa_result["verdict"] = "blocked"
                         _qa_result["summary"] = f"Syntax error — {_syntax_errors[0]['message']}"
@@ -3501,8 +3659,7 @@ USER REQUEST:
                 except Exception as _sv_exc:
                     print(f"[SYNTAX_VALIDATOR] Skipped: {_sv_exc}")
 
-                # ── v3.10.0: pyflakes / tsc static linting ───────────────────
-                # Uses delta approach: only flag errors the Surgeon introduced.
+                # ── pyflakes / tsc linting ────────────────────────────────────
                 _linter_introduced_errors: list = []
                 try:
                     from services.linter_validator import (
@@ -3512,28 +3669,16 @@ USER REQUEST:
                     )
                     _lint_tool = _lint_tool_name(matched_name)
                     _lint_orig_count = _count_lint(sf["content"], matched_name)
-
-                    # Reconstruct full file after Surgeon ops (reuse _full_after_ops
-                    # from tree-sitter block above when available)
                     _full_after_lint = sf["content"]
                     for _lop in _operations:
                         _lfind = _lop.get("find", "")
                         _lrepl = _lop.get("replace", "")
                         if _lfind and _lfind in _full_after_lint:
                             _full_after_lint = _full_after_lint.replace(_lfind, _lrepl, 1)
-
                     _lint_new_count = _count_lint(_full_after_lint, matched_name)
-
                     if _lint_new_count > _lint_orig_count:
-                        # Surgeon introduced new linter errors
                         _linter_introduced_errors = _validate_lint(_full_after_lint, matched_name)
-                        yield sse({
-                            "type": "progress",
-                            "content": (
-                                f"🔴 {_lint_tool}: {_linter_introduced_errors[0]['message']} "
-                                f"(line {_linter_introduced_errors[0]['line']})"
-                            ),
-                        })
+                        yield sse({"type": "progress", "content": f"🔴 {_lint_tool}: {_linter_introduced_errors[0]['message']} (line {_linter_introduced_errors[0]['line']})"})
                         if not isinstance(_qa_result.get("risk_verdicts"), list):
                             _qa_result["risk_verdicts"] = []
                         for _lerr in _linter_introduced_errors:
@@ -3543,47 +3688,29 @@ USER REQUEST:
                                 "reason": f"{_lint_tool} error — {_lerr['detail']}",
                             })
                         _qa_result["verdict"] = "blocked"
-                        _qa_result["summary"] = (
-                            f"{_lint_tool} error — {_linter_introduced_errors[0]['message']}"
-                        )
+                        _qa_result["summary"] = f"{_lint_tool} error — {_linter_introduced_errors[0]['message']}"
                         if (_qa_result.get("qa_score") or 10) > 3:
                             _qa_result["qa_score"] = 3
-
                     elif _lint_new_count == 0 and _lint_orig_count == 0:
                         yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean"})
                     else:
-                        yield sse({
-                            "type": "progress",
-                            "content": (
-                                f"⏭ {_lint_tool} skipped "
-                                f"(file has {_lint_orig_count} pre-existing issue(s))"
-                            ),
-                        })
+                        yield sse({"type": "progress", "content": f"⏭ {_lint_tool} skipped (file has {_lint_orig_count} pre-existing issue(s))"})
                 except Exception as _lint_exc:
                     print(f"[LINTER_VALIDATOR] Skipped: {_lint_exc}")
 
-                # ── Retry decision ────────────────────────────────────────────
-                # Only retry if: verdict is blocked, linter is the cause, and
-                # we have not exhausted attempts.
-                _is_linter_blocked = bool(_linter_introduced_errors)
+                # ── Retry decision ─────────────────────────────────────────────
                 _can_retry = (
-                    _is_linter_blocked
+                    bool(_linter_introduced_errors)
                     and _surgeon_attempt < _MAX_SURGEON_ATTEMPTS - 1
+                    and not _linter_feedback_for_retry
                 )
                 if _can_retry:
                     _linter_feedback_for_retry = _linter_introduced_errors
-                    yield sse({
-                        "type": "progress",
-                        "content": (
-                            f"🔁 Surgeon retry ({_surgeon_attempt+2}/{_MAX_SURGEON_ATTEMPTS}): "
-                            f"fixing {len(_linter_introduced_errors)} compile error(s)..."
-                        ),
-                    })
-                    continue  # ← back to top of for _surgeon_attempt loop
+                    yield sse({"type": "progress", "content": f"🔁 Surgeon retry ({_surgeon_attempt+2}/{_MAX_SURGEON_ATTEMPTS}): fixing {len(_linter_introduced_errors)} compile error(s)..."})
+                    continue
 
-                # Clean pass, non-linter block, or max attempts — exit loop
-                break  # ← out of for _surgeon_attempt loop
-            # ── end Surgeon retry loop ────────────────────────────────────────
+                break  # clean pass or max attempts
+            # ── end Surgeon retry loop ─────────────────────────────────────────
 
             # v3.4.0: operations-based apply (search-and-replace)
             from models.schemas import SurgicalOperation as _SO

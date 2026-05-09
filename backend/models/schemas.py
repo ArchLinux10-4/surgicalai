@@ -152,7 +152,8 @@ class ChangeTarget(BaseModel):
     dependencies: List[str] = []
     confidence: int = 8
     import_changes: List[str] = []    # per-target imports (threaded from Architect plan)
-    context_needs: List[str] = []     # semantic sections Architect needs Surgeon to see
+    context_needs: List[str] = []     # semantic sections: "style_block" | "state_declarations" | etc.
+    surgeon_context: List[dict] = []  # v3.10: rich context requests resolved before Surgeon runs
 
 
 class ArchitectPlan(BaseModel):
