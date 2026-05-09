@@ -2881,10 +2881,9 @@ USER REQUEST:
                     yield sse({"type": "progress", "content": f"Focused window: L{window_start}-{window_end} ({window_end - window_start + 1} lines)"})
 
             new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, change_target, sf["content"], user_id=user_id)
-            # Debug: trace operations and matching result
+            # Trace: operations applied (visible in Railway logs only)
             _is_changed = new_code.rstrip() != symbol.code.rstrip()
-            _eff_orig = getattr(symbol, "_file_window_original", None)
-            yield sse({"type": "progress", "content": f"DBG: {len(_operations)} ops, changed={_is_changed}, has_eff_orig={_eff_orig is not None}, newcode_len={len(new_code)}, orig_len={len(symbol.code)}"})
+            print(f"[PIPELINE] {len(_operations)} ops applied, changed={_is_changed}, new={len(new_code)}, orig={len(symbol.code)}")
             diff = _make_diff(symbol.code, new_code, symbol_path)
 
             # ── QA Agent: verify Surgeon output before showing to user ──
