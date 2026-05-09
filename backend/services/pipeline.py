@@ -3019,13 +3019,47 @@ USER REQUEST:
         # On the next turn, conversation history carries the Q&A context
         # and the Architect will proceed with a real plan.
         # Safety: 'search' intent should be consumed inside the ReAct loop.
-        # If it leaks through (OpenAI path), convert to needs_clarification.
+        # If it leaks through (OpenAI/GPT path), run ONE grep round then re-call.
         if intent == "search":
-            intent = "needs_clarification"
-            plan.setdefault("clarification_response",
-                "I need to look for more code context. Could you paste a snippet "
-                "of the code you want to change, or give me the exact element ID "
-                "or function name?")
+            _leak_search_terms = plan.get("search_terms", [])
+            _leak_grep_result = ""
+            for _sfname, (_sm, _sf) in symbol_maps_by_name.items():
+                _sfcontent = _sf.get("content", "")
+                if not _sfcontent:
+                    continue
+                for _st in _leak_search_terms[:6]:
+                    _lines = _sfcontent.split("\n")
+                    for _li, _ln in enumerate(_lines):
+                        if _st.lower() in _ln.lower():
+                            start = max(0, _li - 15)
+                            end = min(len(_lines), _li + 25)
+                            _window = "\n".join(f"L{start+i+1}: {_lines[start+i]}" for i in range(end - start))
+                            if _window not in _leak_grep_result:
+                                _leak_grep_result += f"\n--- {_sfname}: matches for '{_st}' ---\n{_window}\n"
+                            break
+            if _leak_grep_result:
+                # Re-call architect with grep results
+                _leak_context = context_msg + f"\n\n=== SEARCH RESULTS ===\n{_leak_grep_result[:3000]}"
+                _leak_msgs = [
+                    {"role": "system", "content": _architect_system},
+                    {"role": "user", "content": _leak_context}
+                ]
+                _leak_resp = await asyncio.to_thread(
+                    lambda: _chat_create(_get_client(user_id), model=arch_model,
+                                         messages=_leak_msgs, temperature=0.3,
+                                         response_format={"type": "json_object"})
+                )
+                try:
+                    plan = json.loads(_leak_resp.choices[0].message.content)
+                    intent = plan.get("intent", "chat")
+                except Exception:
+                    pass
+            if intent == "search":
+                # Still search after one round — give up gracefully
+                intent = "needs_clarification"
+                plan.setdefault("clarification_response",
+                    "I searched the file but need a bit more context. "
+                    "Could you paste the function or element name you'd like to change?")
             compliance.set_intent(intent)
 
         if intent == "needs_clarification":
