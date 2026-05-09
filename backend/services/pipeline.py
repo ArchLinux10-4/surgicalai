@@ -808,21 +808,69 @@ Return JSON with search-and-replace operations."""
 
     # ---- Compute new_code from operations (backward compat: diff display + QA) ----
     new_code = symbol.code
+    _ops_applied = 0
     for op in operations:
         find_text = op.get("find", "")
         replace_text = op.get("replace", "")
         if not find_text:
             continue
+
+        matched = False
+        # Tier 1: exact string match
         idx = new_code.find(find_text)
         if idx != -1:
             new_code = new_code[:idx] + replace_text + new_code[idx + len(find_text):]
-        else:
-            # find_text targets outside the symbol window (e.g. </script> anchor)
-            # For display purposes, append the newly added code
-            if find_text.strip() in file_content:
-                added = replace_text.replace(find_text, "").strip()
-                if added:
-                    new_code = new_code.rstrip() + "\n\n// --- New code (applied to " + find_text.strip()[:30] + ") ---\n" + added
+            matched = True
+            _ops_applied += 1
+
+        # Tier 2: normalized line-endings + stripped trailing whitespace
+        if not matched:
+            norm_code = new_code.replace("\r\n", "\n").replace("\r", "\n")
+            norm_find = find_text.replace("\r\n", "\n").replace("\r", "\n")
+            idx2 = norm_code.find(norm_find)
+            if idx2 != -1:
+                new_code = norm_code[:idx2] + replace_text + norm_code[idx2 + len(norm_find):]
+                matched = True
+                _ops_applied += 1
+
+        # Tier 3: line-by-line match with rstripped lines
+        if not matched and "\n" in find_text:
+            find_lines = [l.rstrip() for l in find_text.splitlines()]
+            code_lines_raw = new_code.splitlines(keepends=True)
+            code_lines_stripped = [l.rstrip() for l in code_lines_raw]
+            for si in range(len(code_lines_stripped) - len(find_lines) + 1):
+                if all(code_lines_stripped[si + j] == find_lines[j] for j in range(len(find_lines))):
+                    before = "".join(code_lines_raw[:si])
+                    after = "".join(code_lines_raw[si + len(find_lines):])
+                    new_code = before + replace_text + ("\n" if not replace_text.endswith("\n") else "") + after
+                    matched = True
+                    _ops_applied += 1
+                    break
+
+        # Tier 4: find targets text outside the symbol window — apply to file_content window
+        if not matched and file_content:
+            fc_norm = file_content.replace("\r\n", "\n")
+            ft_norm = find_text.replace("\r\n", "\n").strip()
+            fc_idx = fc_norm.find(ft_norm)
+            if fc_idx != -1:
+                # Apply the operation to file_content and extract a window
+                fc_new = fc_norm[:fc_idx] + replace_text + fc_norm[fc_idx + len(ft_norm):]
+                # Find line number of change
+                change_line = fc_norm[:fc_idx].count("\n")
+                # Extract +/- 15 lines around the change as new_code context
+                fc_new_lines = fc_new.splitlines()
+                win_start = max(0, change_line - 15)
+                win_end = min(len(fc_new_lines), change_line + 20)
+                window_new = "\n".join(fc_new_lines[win_start:win_end])
+                # Also update original_code window so QA can diff properly
+                fc_orig_lines = fc_norm.splitlines()
+                window_orig = "\n".join(fc_orig_lines[win_start:min(len(fc_orig_lines), win_end)])
+                # For new_code, replace symbol.code with the file-level window
+                new_code = window_new
+                # Replace the base for comparison too (stored on symbol temporarily)
+                symbol._file_window_original = window_orig
+                matched = True
+                _ops_applied += 1
 
     # Confidence: empty operations = already correct
     if not operations:
@@ -2825,8 +2873,11 @@ USER REQUEST:
                 p for p in _qa_other_context_parts
                 if not p.startswith(f"FILE: {matched_name}")
             )
+            # v3.4.0: use file-window original if Tier 4 matching was used
+            _effective_original = getattr(symbol, "_file_window_original", None) or symbol.code
+
             _qa_result = await run_qa_agent(
-                original_code=symbol.code,
+                original_code=_effective_original,
                 new_code=new_code,
                 change_description=change_target.description,
                 new_logic=change_target.new_logic,
@@ -2846,15 +2897,14 @@ USER REQUEST:
                             reason=(None if _qa_ran else _qa_result.get("status")),
                             output_summary=f"verdict={_qa_result.get('verdict')} score={_qa_result.get('qa_score')}")
 
-            # v3.3.1: detect script injection truncation / phantom </script>
-                        # v3.4.0: operations-based apply (search-and-replace)
+            # v3.4.0: operations-based apply (search-and-replace)
             from models.schemas import SurgicalOperation as _SO
             _ops = [_SO(find=op.get("find",""), replace=op.get("replace","")) for op in _operations] if _operations else []
 
             change = SurgicalChange(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
-                original_code=symbol.code,
+                original_code=_effective_original,
                 new_code=new_code,
                 diff=diff,
                 confidence=confidence,
