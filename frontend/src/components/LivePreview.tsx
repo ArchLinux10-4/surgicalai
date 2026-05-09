@@ -67,20 +67,45 @@ function wrapReturnsInFragments(code: string): string {
   return result.join('\n')
 }
 
-/** Strip relative imports (can't load ../stores/x in sandbox) and replace with stubs */
+/**
+ * Strip relative imports and replace with safe deep-proxy stubs.
+ *
+ * The stub is callable (returns proxy), and every property access also returns
+ * the same callable proxy.  This prevents TypeError crashes from patterns like:
+ *   const { login, user } = useAuthStore()       ← hook destructure
+ *   apiClient.get('/path').then(cb)              ← chained calls
+ */
 function stubRelativeImports(code: string): string {
-  return code.replace(
+  // Universal deep-proxy stub injected once at the top
+  const STUB_HELPER = [
+    'var __sp=new Proxy({},{get:function(_,k){if(typeof k==="symbol")return undefined;',
+    'if(k==="__esModule"||k==="default"||k==="then")return undefined;', // ← don't make it a thenable
+    'return __sf;}});',
+    'var __sf=new Proxy(function(){return __sp;},{',
+    'get:function(_,k){if(typeof k==="symbol")return undefined;',
+    'if(k==="__esModule")return true;if(k==="default")return __sf;',
+    'if(k==="then")return undefined;', // ← prevent Promise.resolve() auto-unwrapping
+    'return __sf;},',
+    'apply:function(){return __sp;}',
+    '});',
+  ].join('')
+
+  let hasStubs = false
+  const processed = code.replace(
     /^import\s+(.+?)\s+from\s+['"](\.[^'"]+)['"]\s*;?\s*$/gm,
     (_, spec) => {
+      hasStubs = true
       const names = spec
         .replace(/\*\s+as\s+(\w+)/, '$1')
         .replace(/[{}]/g, '')
         .split(',')
         .map((s: string) => s.trim().split(/\s+as\s+/).pop()?.trim())
         .filter(Boolean) as string[]
-      return names.map(n => `var ${n} = function(){return null;};`).join(' ')
+      return names.map(n => `var ${n} = __sf;`).join(' ')
     }
   )
+
+  return hasStubs ? STUB_HELPER + '\n' + processed : processed
 }
 
 function buildHtml(compiledJs: string, component: string): string {
