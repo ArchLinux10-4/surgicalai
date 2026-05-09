@@ -22,7 +22,7 @@ from crypto_utils import decrypt_api_key
 from models.schemas import (
     SurgicalOperation,
     ArchitectPlan, ChangeTarget, ChangeType, SurgicalChange,
-    SurgicalAnalyzeResponse, SymbolMap, SymbolInfo
+    SurgicalAnalyzeResponse, SymbolMap, SymbolInfo, SymbolType
 )
 from services.ast_parser import ASTParser
 
@@ -784,7 +784,8 @@ def run_surgeon(
     target: ChangeTarget,
     file_content: str,
     model: Optional[str] = None,
-    user_id: str = ""
+    user_id: str = "",
+    architect_risks: list = None
 ) -> tuple:
     """
     GPT-4.1 (Surgeon): receives ONE code chunk + plan, returns search-and-replace operations.
@@ -1038,6 +1039,9 @@ async def run_chat_stream(
     all_messages = [{"role": "system", "content": system_prompt}] + messages
 
     try:
+        def sse(obj):
+            return f"data: {json.dumps(obj)}\n\n"
+
         if _is_gemini_model(chat_model) and HAS_GOOGLE_GENAI:
             # ── Gemini streaming with native thinking blocks ──
             gemini_key = _get_gemini_key(user_id)
@@ -1856,6 +1860,8 @@ async def run_qa_agent(
     Returns a dict matching QAResult schema.
     Guaranteed to return a result — never raises (skipped verdict on error).
     """
+    _risks_list = architect_risks or []
+    _risks_block = "\n".join(f"- {r}" for r in _risks_list) if _risks_list else "(none — skip risk_verdicts)"
     import asyncio
 
     qa_model = "gpt-4.1-mini"

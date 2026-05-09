@@ -4,7 +4,7 @@ import json
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from models.schemas import ChatRequest, NewSessionRequest, ChatSession
-from database import get_db, get_setting
+from database import get_db, get_setting, get_user_api_key
 from services.pipeline import run_chat, run_chat_stream
 
 router = APIRouter()
@@ -234,7 +234,7 @@ def send_message(req: ChatRequest):
     messages = [{"role": r["role"], "content": r["content"]} for r in history]
 
     # Get pinned context and project memory
-    workspace = session_id  # Use session_id as workspace for per-session memory
+    workspace = req.session_id  # Use session_id as workspace for per-session memory
     pinned_rows = conn.execute(
         "SELECT * FROM pinned_context WHERE workspace_path = ?", (workspace,)
     ).fetchall() if workspace else []
@@ -311,7 +311,7 @@ async def stream_message(req: ChatRequest):
     messages = [{"role": r["role"], "content": r["content"]} for r in history]
 
     # Get pinned context and memory
-    workspace = session_id  # Use session_id as workspace for per-session memory
+    workspace = req.session_id  # Use session_id as workspace for per-session memory
     pinned_rows = conn.execute(
         "SELECT * FROM pinned_context WHERE workspace_path = ?", (workspace,)
     ).fetchall() if workspace else []
