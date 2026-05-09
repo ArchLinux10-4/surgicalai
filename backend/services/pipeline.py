@@ -3205,6 +3205,43 @@ USER REQUEST:
                             reason=(None if _qa_ran else _qa_result.get("status")),
                             output_summary=f"verdict={_qa_result.get('verdict')} score={_qa_result.get('qa_score')}")
 
+            # ── v3.9.2: Compile-time syntax validation (tree-sitter) ──
+            try:
+                from services.syntax_validator import validate_syntax as _validate_syntax
+                from services.syntax_validator import count_errors as _count_errors
+                # Compare error count before/after surgeon's operations
+                # This avoids false positives from pre-existing issues in the file
+                _orig_err_count = _count_errors(sf["content"], matched_name)
+                _full_after_ops = sf["content"]
+                for _sop in _operations:
+                    _sfind = _sop.get("find", "")
+                    _srepl = _sop.get("replace", "")
+                    if _sfind and _sfind in _full_after_ops:
+                        _full_after_ops = _full_after_ops.replace(_sfind, _srepl, 1)
+                _new_err_count = _count_errors(_full_after_ops, matched_name)
+                if _new_err_count > _orig_err_count:
+                    # Surgeon introduced NEW syntax errors
+                    _syntax_errors = _validate_syntax(_full_after_ops, matched_name)
+                    yield sse({"type": "progress", "content": f"🔴 Compile check: {_syntax_errors[0]['message']} (line {_syntax_errors[0]['line']})"})
+                    if not isinstance(_qa_result.get("risk_verdicts"), list):
+                        _qa_result["risk_verdicts"] = []
+                    for _serr in _syntax_errors:
+                        _qa_result["risk_verdicts"].append({
+                            "risk": _serr["message"],
+                            "status": "blocked",
+                            "reason": f"Compile error at line {_serr['line']}: {_serr['detail']}"
+                        })
+                    _qa_result["verdict"] = "blocked"
+                    _qa_result["summary"] = f"Syntax error — {_syntax_errors[0]['message']}"
+                    if (_qa_result.get("qa_score") or 10) > 3:
+                        _qa_result["qa_score"] = 3
+                elif _new_err_count == 0 and _orig_err_count == 0:
+                    yield sse({"type": "progress", "content": "✅ Compile check passed"})
+                else:
+                    yield sse({"type": "progress", "content": f"⏭ Compile check skipped (file has {_orig_err_count} pre-existing issues)"})
+            except Exception as _sv_exc:
+                print(f"[SYNTAX_VALIDATOR] Skipped: {_sv_exc}")
+
             # v3.4.0: operations-based apply (search-and-replace)
             from models.schemas import SurgicalOperation as _SO
             _ops = [_SO(find=op.get("find",""), replace=op.get("replace","")) for op in _operations] if _operations else []

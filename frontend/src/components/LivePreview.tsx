@@ -85,8 +85,57 @@ async function compileJsx(
       return { js: result.code, component: componentName }
     }
   } catch (e: any) {
+    // Auto-recovery: wrap adjacent JSX in return() blocks with <> fragments
+    if (e.message?.includes('Adjacent JSX elements')) {
+      const fixed = wrapReturnsInFragments(rawCode)
+      try {
+        const Babel = await loadBabel()
+        const result = Babel.transform(fixed, {
+          presets: [
+            'react',
+            ['typescript', { isTSX: true, allExtensions: true }]
+          ],
+          plugins: ['transform-modules-commonjs'],
+          filename: filename || 'component.tsx',
+        })
+        return { js: result.code, component: componentName }
+      } catch {
+        // Fall through to original error
+      }
+    }
     return { js: '', component: null, error: e.message || String(e) }
   }
+}
+
+/* Wrap contents of multi-line return() statements in <> fragments
+   to fix "Adjacent JSX elements" errors in preview (code still works in Vite) */
+function wrapReturnsInFragments(code: string): string {
+  const lines = code.split('\n')
+  const result: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    const m = lines[i].match(/^(\s*)return\s*\(\s*$/)
+    if (m) {
+      const indent = m[1]
+      result.push(lines[i])              // keep "return ("
+      result.push(`${indent}  <>`)       // insert opening fragment
+      i++
+      while (i < lines.length) {
+        if (/^\s*\);\s*$/.test(lines[i])) {
+          result.push(`${indent}  </>`)  // insert closing fragment
+          result.push(lines[i])          // keep ");"
+          i++
+          break
+        }
+        result.push(lines[i])
+        i++
+      }
+    } else {
+      result.push(lines[i])
+      i++
+    }
+  }
+  return result.join('\n')
 }
 
 /* ─── require() shim + mocks for iframe ──────────────────────── */
