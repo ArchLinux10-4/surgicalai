@@ -32,8 +32,8 @@ interface AppState {
   setSurgicalPanelOpen: (v: boolean) => void
 
   // UI
-  sidebarTab: 'files' | 'sessions' | 'context'
-  setSidebarTab: (t: 'files' | 'sessions' | 'context') => void
+  sidebarTab: 'files' | 'sessions' | 'context' | 'github'
+  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github') => void
   rightTab: 'editor' | 'diff' | 'git'
   setRightTab: (t: 'editor' | 'diff' | 'git') => void
   workspacePath: string

@@ -179,6 +179,7 @@ export interface SessionFile {
   updated_at?: string  // set on every code edit — always fresh
   content?: string  // only present when explicitly fetched
   file_type?: string  // 'code' | 'image' | 'pdf' | 'csv' | 'excel' | 'text'
+  github_meta?: string  // JSON string with owner/repo/branch/path/sha
 }
 
 export interface SmartResult {

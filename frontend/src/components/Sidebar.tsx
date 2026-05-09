@@ -7,9 +7,10 @@ import { toast } from '../lib/toast'
 import {
   Settings, MessageSquare, FolderOpen, RefreshCw, Plus,
   Search, Trash2, Pencil, Check, X, ChevronRight, ChevronDown,
-  Pin, BookOpen, Zap, MoreHorizontal, Upload, FileCode, File, LogOut, Sun, Moon,
+  Pin, BookOpen, Zap, MoreHorizontal, Upload, FileCode, File, LogOut, Sun, Moon, Github,
 } from 'lucide-react'
 import { ContextPanel } from './ContextPanel'
+import { GitHubPanel } from './GitHubPanel'
 import { useThemeStore } from '../stores/themeStore'
 
 // ── File icon helper ────────────────────────────────
@@ -553,6 +554,7 @@ export function Sidebar() {
     { id: 'files' as const, icon: FileCode, label: fileCount > 0 ? `Files (${fileCount})` : 'Files' },
     { id: 'sessions' as const, icon: MessageSquare, label: 'Chats' },
     { id: 'context' as const, icon: Pin, label: 'Pinned' },
+    { id: 'github' as const, icon: Github, label: 'GitHub' },
   ]
 
   return (
@@ -595,6 +597,7 @@ export function Sidebar() {
         {sidebarTab === 'files' && <SessionFilesPanel />}
         {sidebarTab === 'sessions' && <SessionList />}
         {sidebarTab === 'context' && <ContextPanel />}
+        {sidebarTab === 'github' && <GitHubPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />}
       </div>
     </div>
   )

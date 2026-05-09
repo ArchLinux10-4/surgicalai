@@ -13,7 +13,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from database import init_db
 from auth_utils import decode_token
-from routers import settings, chat, files, surgical, git, context, session_files
+from routers import settings, chat, files, surgical, git, context, session_files, github as github_router
 from routers import auth as auth_router
 
 app = FastAPI(
@@ -109,6 +109,7 @@ app.include_router(surgical.router, prefix="/api/surgical", tags=["surgical"])
 app.include_router(git.router, prefix="/api/git", tags=["git"])
 app.include_router(context.router, prefix="/api/context", tags=["context"])
 app.include_router(session_files.router, prefix="/api/chat", tags=["session-files"])
+app.include_router(github_router.router, prefix="/api/github", tags=["github"])
 
 
 @app.on_event("startup")
@@ -119,7 +120,7 @@ async def startup():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "3.6.0"}
+    return {"status": "ok", "version": "3.7.0"}
 
 
 # Serve React frontend (built files)

@@ -2,16 +2,17 @@ import React, { useState, useEffect } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
-import { X, Eye, EyeOff, CheckCircle, Key, Brain, FolderOpen, Code, Cpu, Sliders, Users, Sun, Moon } from 'lucide-react'
+import { X, Eye, EyeOff, CheckCircle, Key, Brain, FolderOpen, Code, Cpu, Sliders, Users, Sun, Moon, Github, ExternalLink, AlertCircle } from 'lucide-react'
 import { AdminUsersPanel } from './AdminUsersPanel'
 import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
 
-type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'local' | 'users'
+type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'local' | 'users' | 'github'
 
 const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'api',       icon: <Key size={14} />,       label: 'API Keys' },
   { id: 'models',    icon: <Brain size={14} />,      label: 'Models' },
+  { id: 'github',    icon: <Github size={14} />,     label: 'GitHub' },
   { id: 'workspace', icon: <FolderOpen size={14} />, label: 'Workspace' },
   { id: 'editor',    icon: <Code size={14} />,       label: 'Editor' },
   { id: 'local',     icon: <Cpu size={14} />,        label: 'Local AI' },
@@ -31,6 +32,11 @@ export function SettingsModal() {
   const [anthropicVerifying, setAnthropicVerifying] = useState(false)
   const [anthropicStatus, setAnthropicStatus] = useState<'idle' | 'ok' | 'error'>('idle')
   const [anthropicMessage, setAnthropicMessage] = useState('')
+  const [githubPat, setGithubPat] = useState('')
+  const [showGithubPat, setShowGithubPat] = useState(false)
+  const [githubConnecting, setGithubConnecting] = useState(false)
+  const [githubStatus, setGithubStatus] = useState<any>(null)
+  const [githubStatusMsg, setGithubStatusMsg] = useState('')
   const [models, setModels] = useState<any[]>([])
   const [form, setForm] = useState({
     architect_model: 'gpt-5',
@@ -65,7 +71,34 @@ export function SettingsModal() {
       })
     }
     api.settings.getModels().then((d) => setModels(d.models || [])).catch(() => {})
+    ;(api as any).github.status().then((s: any) => setGithubStatus(s)).catch(() => {})
   }, [settings, settingsOpen])
+
+  const handleConnectGithub = async () => {
+    if (!githubPat.trim()) return
+    setGithubConnecting(true)
+    setGithubStatusMsg('')
+    try {
+      const res: any = await (api as any).github.connect(githubPat.trim())
+      setGithubStatus({ connected: true, username: res.username, avatar_url: res.avatar_url })
+      setGithubStatusMsg('Connected successfully!')
+      setGithubPat('')
+    } catch (e: any) {
+      setGithubStatusMsg(e.message || 'Connection failed')
+    } finally {
+      setGithubConnecting(false)
+    }
+  }
+
+  const handleDisconnectGithub = async () => {
+    try {
+      await (api as any).github.disconnect()
+      setGithubStatus({ connected: false })
+      setGithubStatusMsg('Disconnected')
+    } catch (e: any) {
+      setGithubStatusMsg(e.message || 'Failed to disconnect')
+    }
+  }
 
   if (!settingsOpen) return null
 

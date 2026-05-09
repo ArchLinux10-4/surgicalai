@@ -498,6 +498,9 @@ def _init_postgres():
         conn.execute("""
             ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS is_compacted INTEGER DEFAULT 0
         """)
+        conn.execute("""
+            ALTER TABLE session_files ADD COLUMN IF NOT EXISTS github_meta TEXT
+        """)
         conn.commit()
 
         _seed_defaults_postgres(conn)

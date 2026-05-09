@@ -19,3 +19,4 @@ pdfplumber
 pandas
 openpyxl
 tabulate
+PyGithub==2.3.0

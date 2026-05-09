@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react'
+import { Github } from 'lucide-react'
 import { api } from '../api/client'
 import type { SessionFile } from '../types'
+import { GitHubCommitModal } from './GitHubCommitModal'
 
 interface SessionFilesTrayProps {
   sessionId: string
@@ -40,6 +42,7 @@ function langColor(lang: string): string {
 export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayProps) {
   const [collapsed, setCollapsed] = useState(false)
   const [downloading, setDownloading] = useState<string | null>(null)
+  const [showCommitModal, setShowCommitModal] = useState(false)
 
   const handleDownload = useCallback(async (file: SessionFile) => {
     setDownloading(file.id)
@@ -57,6 +60,7 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
   const modifiedFiles = sessionFiles.filter(f => f.updated_at && f.updated_at !== f.created_at)
 
   return (
+    <>
     <div className="border border-border/60 rounded-xl bg-surface/50 overflow-hidden mb-2 mx-1 backdrop-blur-sm">
       {/* Header row */}
       <button
@@ -78,6 +82,16 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
           )}
         </div>
         <div className="flex items-center gap-2">
+          {modifiedFiles.some(f => f.github_meta) && (
+            <button
+              onClick={e => { e.stopPropagation(); setShowCommitModal(true) }}
+              className="flex items-center gap-1 px-2 py-0.5 rounded-md bg-gray-700/60 hover:bg-gray-700 text-white text-[10px] font-semibold border border-gray-600/50 transition-colors"
+              title="Push changes to GitHub"
+            >
+              <Github size={10} />
+              Push
+            </button>
+          )}
           <span className="text-[10px] text-muted/50">Download any file below</span>
           <svg
             className={`w-3.5 h-3.5 text-muted/50 transition-transform ${collapsed ? '' : 'rotate-180'}`}
@@ -167,5 +181,13 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
         </div>
       )}
     </div>
+      {showCommitModal && (
+        <GitHubCommitModal
+          sessionFiles={sessionFiles}
+          onClose={() => setShowCommitModal(false)}
+          onSuccess={() => setShowCommitModal(false)}
+        />
+      )}
+    </>
   )
 }

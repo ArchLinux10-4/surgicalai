@@ -291,4 +291,16 @@ export const api = {
     getImpact: (symbolPath: string, filePath: string, workspacePath?: string) => request<ImpactAnalysis>(`/context/impact?symbol_path=${encodeURIComponent(symbolPath)}&file_path=${encodeURIComponent(filePath)}${workspacePath ? `&workspace_path=${encodeURIComponent(workspacePath)}` : ''}`),
     multiAnalyze: (data: any) => request<MultiFileAnalysis>('/context/multi-analyze', { method: 'POST', body: JSON.stringify(data) }),
   },
+
+  github: {
+    status: () => request<any>('/github/status'),
+    connect: (pat: string) => request<any>('/github/connect', { method: 'POST', body: JSON.stringify({ pat }) }),
+    disconnect: () => request<any>('/github/disconnect', { method: 'DELETE' }),
+    repos: () => request<any>('/github/repos'),
+    branches: (owner: string, repo: string) => request<any>(`/github/repos/${owner}/${repo}/branches`),
+    tree: (owner: string, repo: string, branch: string, path = '') =>
+      request<any>(`/github/repos/${owner}/${repo}/tree?branch=${encodeURIComponent(branch)}&path=${encodeURIComponent(path)}`),
+    load: (body: any) => request<any>('/github/load', { method: 'POST', body: JSON.stringify(body) }),
+    commit: (body: any) => request<any>('/github/commit', { method: 'POST', body: JSON.stringify(body) }),
+  },
 }
