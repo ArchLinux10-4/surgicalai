@@ -1722,9 +1722,22 @@ async def run_qa_agent(
 
     qa_model = "gpt-4.1-mini"
 
-    # Trim inputs to avoid huge context
-    orig_trimmed = original_code[:3000] + ("\n... [truncated]" if len(original_code) > 3000 else "")
-    new_trimmed  = new_code[:3000]      + ("\n... [truncated]" if len(new_code) > 3000 else "")
+    # v3.4.0: Send DIFF to QA instead of truncated code blocks.
+    # The change may be deep in a large window — truncating at 3000 chars can hide it entirely.
+    _diff_lines = list(difflib.unified_diff(
+        original_code.splitlines(keepends=True),
+        new_code.splitlines(keepends=True),
+        fromfile="original",
+        tofile="modified",
+        n=5  # 5 lines of context around each change
+    ))
+    _diff_text = "".join(_diff_lines)[:4000]
+    if not _diff_text.strip():
+        _diff_text = "(no visible changes — code is identical)"
+
+    # Also include a small focused snippet: first 1500 chars of original + new for structure context
+    _orig_snippet = original_code[:1500] + ("\n... [truncated]" if len(original_code) > 1500 else "")
+    _new_snippet  = new_code[:1500]      + ("\n... [truncated]" if len(new_code) > 1500 else "")
     other_ctx    = other_files_context[:2000] + ("\n... [truncated]" if len(other_files_context) > 2000 else "")
 
     user_msg = f"""CHANGE PLAN:
@@ -1733,15 +1746,19 @@ File: {filename}
 Description: {change_description}
 Expected behavior: {new_logic}
 
-ORIGINAL CODE:
-{orig_trimmed}
+UNIFIED DIFF (what actually changed):
+{_diff_text}
 
-NEW CODE (Surgeon output):
-{new_trimmed}
+ORIGINAL CODE (first 1500 chars for structure context):
+{_orig_snippet}
+
+NEW CODE (first 1500 chars for structure context):
+{_new_snippet}
 
 OTHER FILES IN SESSION (for cross-file checking):
 {other_ctx if other_ctx.strip() else "(no other files uploaded)"}
 
+IMPORTANT: Focus on the DIFF above — it shows exactly what lines were added/removed.
 Run all 6 checks and return the JSON verdict."""
 
     try:
