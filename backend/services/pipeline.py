@@ -2864,14 +2864,10 @@ USER REQUEST:
                     yield sse({"type": "progress", "content": f"Focused window: L{window_start}-{window_end} ({window_end - window_start + 1} lines)"})
 
             new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, change_target, sf["content"], user_id=user_id)
-            # Debug: trace operations for diagnosis
-            if _operations:
-                _dbg_op = _operations[0]
-                _dbg_f = _dbg_op.get("find","")[:50]
-                _dbg_r = _dbg_op.get("replace","")[:50]
-                _has_lit_n = "\\n" in _dbg_op.get("replace","")
-                _has_real_n = "\n" in _dbg_op.get("replace","")
-                yield sse({"type": "progress", "content": f"DEBUG ops[0]: find={repr(_dbg_f)} | replace_has_literal_backslash_n={_has_lit_n} replace_has_real_newline={_has_real_n} | new==orig={new_code.rstrip() == symbol.code.rstrip()}"})
+            # Debug: trace operations and matching result
+            _is_changed = new_code.rstrip() != symbol.code.rstrip()
+            _eff_orig = getattr(symbol, "_file_window_original", None)
+            yield sse({"type": "progress", "content": f"DBG: {len(_operations)} ops, changed={_is_changed}, has_eff_orig={_eff_orig is not None}, newcode_len={len(new_code)}, orig_len={len(symbol.code)}"})
             diff = _make_diff(symbol.code, new_code, symbol_path)
 
             # ── QA Agent: verify Surgeon output before showing to user ──
