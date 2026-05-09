@@ -151,6 +151,8 @@ class ChangeTarget(BaseModel):
     new_logic: str
     dependencies: List[str] = []
     confidence: int = 8
+    import_changes: List[str] = []    # per-target imports (threaded from Architect plan)
+    context_needs: List[str] = []     # semantic sections Architect needs Surgeon to see
 
 
 class ArchitectPlan(BaseModel):

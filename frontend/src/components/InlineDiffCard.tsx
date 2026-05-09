@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { useThemeStore } from '../stores/themeStore'
-import { CheckCircle, XCircle, Download, ChevronDown, ChevronUp, AlertTriangle, FileCode, RotateCcw, SkipForward } from 'lucide-react'
+import { CheckCircle, XCircle, Download, ChevronDown, ChevronUp, AlertTriangle, FileCode, RotateCcw, SkipForward, Eye } from 'lucide-react'
 import { api } from '../api/client'
 import { TestRunnerPanel } from './TestRunnerPanel'
 import { toast } from '../lib/toast'
@@ -388,6 +388,9 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   // Diff expand/collapse per change — collapsed by default
   const [diffExpanded, setDiffExpanded] = useState<Record<string, boolean>>({})
 
+  // Preview toggle per change — hidden by default, shown on click
+  const [showPreview, setShowPreview] = useState<Record<string, boolean>>({})
+
   const [applying, setApplying] = useState(false)
   const [undoing, setUndoing] = useState<Record<string, boolean>>({})
   const [applied, setApplied] = useState<Record<string, boolean>>(() =>
@@ -641,7 +644,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 )}
               </div>
 
-              {/* Right controls: Undo (if applied) + Preview + Diff toggle */}
+              {/* Right controls: Undo (if applied) + Preview button + Diff toggle */}
               <div className="flex items-center gap-1.5 flex-shrink-0">
                 {isApplied && (
                   <button
@@ -655,15 +658,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                   </button>
                 )}
                 {isVisualFile(filename) && (
-                  <LivePreview
-                    code={originalCode || '// Loading...'}
-                    filename={filename}
-                    modifiedCode={
-                      isApplied
-                        ? modifiedCode
-                        : getProposedCode(change)
-                    }
-                  />
+                  <button
+                    onClick={() => setShowPreview(p => ({ ...p, [change.id]: !p[change.id] }))}
+                    className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
+                    title={showPreview[change.id] ? 'Hide live preview' : 'Show live preview'}
+                  >
+                    <Eye size={11} />
+                    {showPreview[change.id] ? 'Hide' : 'Preview'}
+                  </button>
                 )}
                 <button
                   onClick={() => toggleDiff(change.id)}
@@ -675,6 +677,17 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 </button>
               </div>
             </div>
+
+            {/* Live preview panel — rendered below header row, only when toggled */}
+            {isVisualFile(filename) && showPreview[change.id] && (
+              <div className="border-t border-border">
+                <LivePreview
+                  code={originalCode || '// Loading...'}
+                  filename={filename}
+                  modifiedCode={isApplied ? modifiedCode : getProposedCode(change)}
+                />
+              </div>
+            )}
 
             {/* Expandable diff — only shown when toggled */}
             {isExpanded && (

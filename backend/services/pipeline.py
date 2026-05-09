@@ -630,7 +630,9 @@ Produce the surgical change plan as JSON."""
             description=t.get("description", ""),
             new_logic=t.get("new_logic", ""),
             dependencies=t.get("dependencies", []),
-            confidence=t.get("confidence", 7)
+            confidence=t.get("confidence", 7),
+            import_changes=t.get("import_changes", []),
+            context_needs=t.get("context_needs", []),
         )
         validated_targets.append(target)
 
@@ -663,7 +665,9 @@ Produce the surgical change plan as JSON."""
                             description=target.description,
                             new_logic=target.new_logic,
                             dependencies=target.dependencies,
-                            confidence=target.confidence
+                            confidence=target.confidence,
+                            import_changes=target.import_changes,
+                            context_needs=target.context_needs,
                         )
                     elif not best_sym:
                         # No symbol contains this line — create a virtual window
@@ -689,7 +693,9 @@ Produce the surgical change plan as JSON."""
                             description=target.description,
                             new_logic=target.new_logic,
                             dependencies=target.dependencies,
-                            confidence=target.confidence
+                            confidence=target.confidence,
+                            import_changes=target.import_changes,
+                            context_needs=target.context_needs,
                         )
 
     return ArchitectPlan(
@@ -790,6 +796,147 @@ def _find_script_close_line(file_content: str, hint_line: int) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _fetch_semantic_context(file_content: str, context_needs: list, symbol: "SymbolInfo") -> str:
+    """
+    Semantic context harvester — extracts specific code sections the Surgeon actually needs.
+
+    Called by run_surgeon() when Architect specifies context_needs.
+    Returns a formatted multi-section string to inject into the Surgeon prompt.
+    Only returns sections OUTSIDE the symbol's own line range (no duplicates).
+
+    Available context types:
+      "style_block"        — full <style> tag or CSS-in-JS block
+      "state_declarations" — all useState/useReducer/useRef declarations
+      "hooks"              — all React hook call lines
+      "css_vars"           — CSS custom property declarations (--var-name: value)
+      "imports_block"      — full import section (comprehensive, beyond the 40-line header)
+      "type_declarations"  — TypeScript interface/type definitions
+      "constants"          — module-level const/let export declarations
+    """
+    if not context_needs:
+        return ""
+
+    all_lines = file_content.splitlines()
+    sym_start = getattr(symbol, "start_line", 1)
+    sym_end = getattr(symbol, "end_line", len(all_lines))
+    sections: list = []
+
+    def outside(lineno: int) -> bool:
+        return lineno < sym_start or lineno > sym_end
+
+    for need in context_needs:
+
+        if need == "style_block":
+            # Locate <style> block
+            in_style = False
+            style_lines: list = []
+            style_start = -1
+            for i, ln in enumerate(all_lines):
+                if not in_style and re.search(r"<style[\s>]", ln):
+                    in_style = True
+                    style_start = i + 1
+                    style_lines = [ln]
+                elif in_style:
+                    style_lines.append(ln)
+                    if "</style>" in ln:
+                        break
+            if style_lines and style_start > 0 and outside(style_start):
+                cap = 120
+                body = style_lines[:cap]
+                if len(style_lines) > cap:
+                    body.append(f"  ... ({len(style_lines) - cap} more lines) ...")
+                sections.append(
+                    f"STYLE BLOCK (L{style_start}–L{style_start + len(style_lines) - 1})"
+                    f" — reference only, match these exact colors/classes:\n"
+                    + "\n".join(body)
+                )
+
+        elif need == "state_declarations":
+            state_lines: list = []
+            for i, ln in enumerate(all_lines):
+                lineno = i + 1
+                if outside(lineno) and re.search(r"\buse(?:State|Reducer|Ref)\s*[<(]", ln):
+                    state_lines.append(f"  L{lineno}: {ln.rstrip()}")
+            if state_lines:
+                sections.append(
+                    "STATE DECLARATIONS (reference only — all useState/useReducer/useRef in file):\n"
+                    + "\n".join(state_lines[:40])
+                )
+
+        elif need == "hooks":
+            hook_lines: list = []
+            for i, ln in enumerate(all_lines):
+                lineno = i + 1
+                if outside(lineno) and re.search(r"\buse[A-Z]\w*\s*\(", ln):
+                    hook_lines.append(f"  L{lineno}: {ln.rstrip()}")
+            if hook_lines:
+                sections.append(
+                    "HOOK DECLARATIONS (reference only — all React hook calls):\n"
+                    + "\n".join(hook_lines[:30])
+                )
+
+        elif need == "css_vars":
+            css_lines: list = []
+            for i, ln in enumerate(all_lines):
+                lineno = i + 1
+                if outside(lineno) and (re.search(r"--[\w-]+\s*:", ln) or "var(--" in ln):
+                    css_lines.append(f"  L{lineno}: {ln.rstrip()}")
+            if css_lines:
+                sections.append(
+                    "CSS CUSTOM PROPERTIES (reference only — use these exact variable names for colors/spacing):\n"
+                    + "\n".join(css_lines[:50])
+                )
+
+        elif need == "imports_block":
+            import_lines: list = []
+            for i, ln in enumerate(all_lines):
+                stripped = ln.strip()
+                if stripped.startswith("import ") or stripped.startswith("from "):
+                    import_lines.append(f"  L{i + 1}: {ln.rstrip()}")
+                elif import_lines and not stripped:
+                    pass  # blank line between imports — keep scanning
+                elif import_lines:
+                    break  # first non-import, non-blank line = end of block
+            if import_lines:
+                sections.append(
+                    "IMPORTS BLOCK (reference only — full list of imports):\n"
+                    + "\n".join(import_lines[:60])
+                )
+
+        elif need == "type_declarations":
+            type_lines: list = []
+            for i, ln in enumerate(all_lines):
+                lineno = i + 1
+                stripped = ln.strip()
+                if outside(lineno) and re.match(
+                    r"^(?:export\s+)?(?:interface|type)\s+[A-Z]", stripped
+                ):
+                    type_lines.append(f"  L{lineno}: {ln.rstrip()}")
+            if type_lines:
+                sections.append(
+                    "TYPE DECLARATIONS (reference only — TypeScript interfaces and types):\n"
+                    + "\n".join(type_lines[:40])
+                )
+
+        elif need == "constants":
+            const_lines: list = []
+            for i, ln in enumerate(all_lines):
+                lineno = i + 1
+                indent_len = len(ln) - len(ln.lstrip())
+                stripped = ln.strip()
+                if (outside(lineno)
+                        and indent_len < 2
+                        and re.match(r"^(?:export\s+)?const\s+[A-Z_]", stripped)):
+                    const_lines.append(f"  L{lineno}: {ln.rstrip()}")
+            if const_lines:
+                sections.append(
+                    "MODULE CONSTANTS (reference only — export const values):\n"
+                    + "\n".join(const_lines[:30])
+                )
+
+    return "\n\n".join(sections)
+
+
 def run_surgeon(
     symbol: SymbolInfo,
     target: ChangeTarget,
@@ -810,11 +957,15 @@ def run_surgeon(
     temp = float(get_setting("temperature_surgeon", "0.1"))
     client = _get_client_for_model(surg_model, user_id)
 
-    # Context around the symbol (reference only)
-    # Use ±50 lines so Surgeon sees enough of the file for complex multi-part changes
+    # ── Symbol-proportional context window ───────────────────────────────────────────────
+    # Window size = max(50, 40% of symbol size), capped at 300.
+    # A 300-line component gets ~120 lines of surround; a 10-line function still gets ±50.
+    # This replaces the old fixed ±50 constant.
     all_lines = file_content.splitlines()
-    context_start = max(0, symbol.start_line - 51)
-    context_end = min(len(all_lines), symbol.end_line + 50)
+    _symbol_lines = symbol.end_line - symbol.start_line + 1
+    _window = min(max(50, int(_symbol_lines * 0.4)), 300)
+    context_start = max(0, symbol.start_line - _window - 1)
+    context_end = min(len(all_lines), symbol.end_line + _window)
     before_context = "\n".join(all_lines[context_start:symbol.start_line - 1])
     after_context = "\n".join(all_lines[symbol.end_line:context_end])
 
@@ -823,19 +974,35 @@ def run_surgeon(
     _file_header = ""
     if symbol.start_line > 50:
         header_lines = all_lines[:40]
-        _file_header = f"\nFILE HEADER (imports + key declarations — read-only, do NOT include in operations):\n" + "\n".join(header_lines) + "\n"
+        _file_header = (
+            "\nFILE HEADER (imports + key declarations — read-only, do NOT include in operations):\n"
+            + "\n".join(header_lines) + "\n"
+        )
 
     # Thread import_changes from Architect plan if present
     _import_hint = ""
-    if hasattr(target, "import_changes") and target.import_changes:
-        _import_hint = "\nREQUIRED IMPORT CHANGES (include in imports_needed):\n" + "\n".join(f"  {ic}" for ic in target.import_changes)
+    if target.import_changes:
+        _import_hint = "\nREQUIRED IMPORT CHANGES (include in imports_needed):\n" + "\n".join(
+            f"  {ic}" for ic in target.import_changes
+        )
+
+    # ── Architect-directed semantic context ───────────────────────────────────────────────
+    # Architect specifies which OTHER file regions the Surgeon needs (e.g. style_block,
+    # state_declarations). These are fetched by semantic TYPE — not by line proximity —
+    # so a <style> block 200 lines away is still shown when the change needs it.
+    _semantic_ctx = _fetch_semantic_context(file_content, target.context_needs or [], symbol)
+    _semantic_section = (
+        "\n\nSEMANTIC CONTEXT (requested by Architect — reference only; "
+        "do NOT use these lines as find strings unless you are explicitly modifying that section):\n"
+        + _semantic_ctx
+    ) if _semantic_ctx else ""
 
     _risks_list = architect_risks or []
     _risks_block = "\n".join(f"- {r}" for r in _risks_list) if _risks_list else "(none — skip risk_verdicts)"
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
-New logic required: {target.new_logic}{_import_hint}{_file_header}
+New logic required: {target.new_logic}{_import_hint}{_file_header}{_semantic_section}
 
 CONTEXT BEFORE (read-only reference, do NOT include in operations):
 {before_context}
@@ -1360,7 +1527,9 @@ Add "file_path" to each target object."""
             description=t.get("description", ""),
             new_logic=t.get("new_logic", ""),
             dependencies=t.get("dependencies", []),
-            confidence=t.get("confidence", 7)
+            confidence=t.get("confidence", 7),
+            import_changes=t.get("import_changes", []),
+            context_needs=t.get("context_needs", []),
         )
         changes_by_file[fp].append(target)
 
@@ -1715,6 +1884,13 @@ IF edit:
       "description": "what changes in this symbol",
       "new_logic": "precise description of the new behavior — the Surgeon will implement exactly this. QUALITY RULE: Reference ACTUAL variable/function names from the code. Be specific: 'After const fee = calcFee(), add: if (fee < 0) throw new Error()'. Never say just 'add error handling' — always say WHAT, WHERE, and HOW.",
       "import_changes": ["add: import uuid", "remove: from datetime import date"],
+      "context_needs": [],
+      // OPTIONAL — semantic sections the Surgeon needs from OUTSIDE the target symbol.
+      // Use when the change spans multiple file regions (e.g. add animation CSS + add useState + modify JSX).
+      // Available values: "style_block" | "state_declarations" | "hooks" | "css_vars"
+      //                   | "imports_block" | "type_declarations" | "constants"
+      // Rule: only include what the Surgeon genuinely needs to write correct code.
+      // Leave empty [] for simple single-location edits.
       "confidence": 9
     // Score guide: 9-10=clear isolated change no side effects; 7-8=touches shared logic has deps;
     // 5-6=ambiguous multiple interpretations → MUST use needs_clarification; <5=missing files → ask
@@ -3122,6 +3298,7 @@ USER REQUEST:
                 dependencies=[],
                 confidence=target.get("confidence", 7),
                 import_changes=target.get("import_changes", []),
+                context_needs=target.get("context_needs", []),
             )
 
             # ── Oversized symbol guardrail ──
