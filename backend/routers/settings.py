@@ -179,7 +179,6 @@ def verify_anthropic_key(body: dict, request: Request):
 def gemini_status(request: Request):
     """Check if user has Gemini API key configured."""
     user_id = get_current_user_id(request)
-    from crypto_utils import _resolve_api_key
     key = _resolve_api_key(user_id, "gemini")
     return {"connected": bool(key)}
 
