@@ -37,6 +37,36 @@ function detectComponent(code: string): string {
   )
 }
 
+/** Wrap every return() block in a <> fragment — fixes adjacent JSX element errors */
+function wrapReturnsInFragments(code: string): string {
+  const lines = code.split('\n')
+  const result: string[] = []
+  let i = 0
+  while (i < lines.length) {
+    const m = lines[i].match(/^(\s*)return\s*\(\s*$/)
+    if (m) {
+      const indent = m[1]
+      result.push(lines[i])
+      result.push(`${indent}  <>`)
+      i++
+      while (i < lines.length) {
+        if (/^\s*\);\s*$/.test(lines[i])) {
+          result.push(`${indent}  </>`)
+          result.push(lines[i])
+          i++
+          break
+        }
+        result.push(lines[i])
+        i++
+      }
+    } else {
+      result.push(lines[i])
+      i++
+    }
+  }
+  return result.join('\n')
+}
+
 /** Strip relative imports (can't load ../stores/x in sandbox) and replace with stubs */
 function stubRelativeImports(code: string): string {
   return code.replace(
@@ -132,17 +162,17 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
             filename,
           }).code
         } catch (e1: any) {
-          // Auto-fix: adjacent JSX → wrap in fragment
-          if (String(e1.message).includes('Adjacent JSX')) {
-            prepared = prepared.replace(/(return\s*\()\s*\n/g, '$1\n  <>\n')
-              .replace(/(\n\s*\);\s*)$/, '\n  </>\n$1')
-            compiled = B.transform(prepared, {
+          // Auto-fix: wrap every return() block in <> fragment and retry
+          // Handles both "Adjacent JSX elements" and related parse errors
+          const wrapped = wrapReturnsInFragments(prepared)
+          try {
+            compiled = B.transform(wrapped, {
               presets: ['react', ['typescript', { isTSX: true, allExtensions: true }]],
               plugins: ['transform-modules-commonjs'],
               filename,
             }).code
-          } else {
-            throw e1
+          } catch {
+            throw e1  // both attempts failed — show original error
           }
         }
         const component = detectComponent(src)
