@@ -190,6 +190,7 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
             presets: ['react', ['typescript', { isTSX: true, allExtensions: true }]],
             plugins: ['transform-modules-commonjs'],
             filename,
+            sourceType: 'module',
           }).code
         } catch (e1: any) {
           // Auto-fix: wrap every return() block in <> fragment and retry
@@ -200,6 +201,7 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
               presets: ['react', ['typescript', { isTSX: true, allExtensions: true }]],
               plugins: ['transform-modules-commonjs'],
               filename,
+              sourceType: 'module',
             }).code
           } catch {
             throw e1  // both attempts failed — show original error

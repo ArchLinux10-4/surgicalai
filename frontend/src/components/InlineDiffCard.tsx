@@ -684,7 +684,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 <LivePreview
                   code={originalCode || '// Loading...'}
                   filename={filename}
-                  modifiedCode={isApplied ? modifiedCode : getProposedCode(change)}
+                  modifiedCode={isApplied ? modifiedCode : undefined}
                 />
               </div>
             )}
