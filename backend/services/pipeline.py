@@ -752,6 +752,8 @@ def run_surgeon(
     if hasattr(target, "import_changes") and target.import_changes:
         _import_hint = "\nREQUIRED IMPORT CHANGES (include in imports_needed):\n" + "\n".join(f"  {ic}" for ic in target.import_changes)
 
+    _risks_list = architect_risks or []
+    _risks_block = "\n".join(f"- {r}" for r in _risks_list) if _risks_list else "(none — skip risk_verdicts)"
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
@@ -1677,6 +1679,7 @@ Check for ALL of the following:
 4. PLAN DEVIATION — does new code do something OTHER than what the plan says? (adding/removing unasked features)
 5. DUPLICATION — is any code duplicated (same function defined twice, same block copy-pasted)?
 6. ALREADY CORRECT — if new code is identical to original, flag it
+7. ARCHITECT RISKS — if architect_risks are provided, evaluate each one against the actual diff and mark whether it truly applies to THIS specific change
 
 Respond with ONLY valid JSON — no explanation outside the JSON:
 {
@@ -1686,8 +1689,13 @@ Respond with ONLY valid JSON — no explanation outside the JSON:
   "import_issues": ["<issue>"],
   "downstream_risks": ["<risk>"],
   "type_errors": ["<error>"],
-  "plan_deviation": "<empty string if none, or description of deviation>"
+  "plan_deviation": "<empty string if none, or description of deviation>",
+  "risk_verdicts": [
+    {"risk": "<exact text from architect_risks>", "status": "verified_safe|warning|blocked", "reason": "<one sentence why>"}
+  ]
 }
+Note: risk_verdicts should have one entry per item in architect_risks. If architect_risks is empty, return [].
+status meanings: verified_safe=does not apply to this change, warning=possibly relevant, blocked=confirmed real risk.
 
 Score guide (ENFORCE STRICTLY):
 9-10 → safe:    Change exactly matches plan, no issues, all imports present
@@ -1711,6 +1719,7 @@ async def run_qa_agent(
     other_files_context: str,
     session_id: str = "",
     user_id: str = "",
+    architect_risks: list = None,
 ) -> dict:
     """
     QA agent: verifies Surgeon output before showing diff card to user.
@@ -1759,7 +1768,10 @@ OTHER FILES IN SESSION (for cross-file checking):
 {other_ctx if other_ctx.strip() else "(no other files uploaded)"}
 
 IMPORTANT: Focus on the DIFF above — it shows exactly what lines were added/removed.
-Run all 6 checks and return the JSON verdict."""
+Run all 6 checks and return the JSON verdict.
+
+ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
+{_risks_block}"""
 
     try:
         client = _get_client(user_id)
@@ -1782,6 +1794,7 @@ Run all 6 checks and return the JSON verdict."""
 
         result = {
             "verdict":          data.get("verdict", "warning"),
+            "risk_verdicts":    data.get("risk_verdicts", []),
             "qa_score":         int(data.get("qa_score", 7)),
             "summary":          data.get("summary", ""),
             "import_issues":    data.get("import_issues", []),
@@ -2909,6 +2922,7 @@ USER REQUEST:
                 other_files_context=_other_ctx_for_qa,
                 session_id=session_id or "",
                 user_id=user_id,
+                architect_risks=plan.get("risks", []),
             )
             # Emit QA progress to user
             _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫", "skipped": "⏭"}.get(

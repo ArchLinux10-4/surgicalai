@@ -47,6 +47,12 @@ export interface SymbolInfo {
   full_path?: string
 }
 
+export interface RiskVerdict {
+  risk: string
+  status: 'verified_safe' | 'warning' | 'blocked'
+  reason: string
+}
+
 export interface QAResult {
   verdict: 'safe' | 'warning' | 'blocked' | 'skipped'
   qa_score: number | null
@@ -56,6 +62,7 @@ export interface QAResult {
   type_errors: string[]
   plan_deviation: string
   skipped_reason?: string | null
+  risk_verdicts?: RiskVerdict[]
 }
 
 export interface SurgicalChange {

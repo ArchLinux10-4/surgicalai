@@ -799,22 +799,69 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
       )}
 
       {/* Risks alert — hidden (not removed) once all changes applied */}
-      {result.risks && result.risks.length > 0 && (
-        <div className={`mt-2 flex items-start gap-2 px-3 py-2 bg-warning/10 border border-warning/25 rounded-lg transition-opacity duration-300 ${allApplied ? 'hidden' : ''}`}>
-          <AlertTriangle size={13} className="text-warning mt-0.5 flex-shrink-0" />
-          <div className="text-[12px] text-warning">
-            <strong>Risks:</strong>
-            <ul className="mt-1 space-y-0.5 list-none">
-              {result.risks.map((r: string, i: number) => (
-                <li key={i} className="flex items-start gap-1.5">
-                  <span className="mt-0.5 text-warning/70">•</span>
-                  <span>{r}</span>
-                </li>
-              ))}
+      {result.risks && result.risks.length > 0 && (() => {
+        // Merge risk_verdicts from all changes in this file
+        const allVerdicts: Record<string, { status: string; reason: string }> = {}
+        Object.values(result.changes_by_file || {}).forEach((fd: any) => {
+          (fd.changes || []).forEach((ch: any) => {
+            (ch.qa?.risk_verdicts || []).forEach((rv: any) => {
+              allVerdicts[rv.risk] = { status: rv.status, reason: rv.reason }
+            })
+          })
+        })
+        const hasVerdicts = Object.keys(allVerdicts).length > 0
+        const resolvedCount = hasVerdicts
+          ? result.risks.filter((r: string) => allVerdicts[r]?.status === 'verified_safe').length
+          : 0
+        const allResolved = hasVerdicts && resolvedCount === result.risks.length
+        const statusIcon: Record<string, string> = {
+          verified_safe: '✅',
+          warning: '⚠️',
+          blocked: '🚫',
+        }
+        const statusColor: Record<string, string> = {
+          verified_safe: 'text-success',
+          warning: 'text-warning',
+          blocked: 'text-danger',
+        }
+        return (
+          <div className={`mt-2 px-3 py-2 bg-warning/10 border border-warning/25 rounded-lg transition-opacity duration-300 ${allApplied ? 'hidden' : ''}`}>
+            <div className="flex items-center gap-2 mb-1.5">
+              <AlertTriangle size={13} className="text-warning flex-shrink-0" />
+              <span className="text-[12px] font-semibold text-warning">
+                {hasVerdicts
+                  ? allResolved
+                    ? `✅ All ${result.risks.length} risks reviewed — safe to apply`
+                    : `Risks: ${resolvedCount}/${result.risks.length} verified safe`
+                  : `Risks:`}
+              </span>
+            </div>
+            <ul className="space-y-1.5 list-none">
+              {result.risks.map((r: string, i: number) => {
+                const verdict = allVerdicts[r]
+                return (
+                  <li key={i} className="text-[11.5px]">
+                    {verdict ? (
+                      <div className="flex flex-col gap-0.5">
+                        <div className={`flex items-start gap-1.5 font-medium ${statusColor[verdict.status] || 'text-warning'}`}>
+                          <span className="flex-shrink-0">{statusIcon[verdict.status] || '•'}</span>
+                          <span className={verdict.status === 'verified_safe' ? 'line-through opacity-60' : ''}>{r}</span>
+                        </div>
+                        <div className="ml-5 text-[11px] text-muted italic">{verdict.reason}</div>
+                      </div>
+                    ) : (
+                      <div className="flex items-start gap-1.5 text-warning">
+                        <span className="mt-0.5 text-warning/70">•</span>
+                        <span>{r}</span>
+                      </div>
+                    )}
+                  </li>
+                )
+              })}
             </ul>
           </div>
-        </div>
-      )}
+        )
+      })()}
     </div>
   )
 }
