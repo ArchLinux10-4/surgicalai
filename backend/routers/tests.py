@@ -204,7 +204,6 @@ async def run_tests(body: dict, request: Request):
 @router.get("/detect/{session_id}")
 def detect_framework(session_id: str, request: Request):
     """Detect test framework from files uploaded in a session."""
-    from database import get_db_conn
     try:
         conn = get_db_connection()
         rows = conn.execute(
