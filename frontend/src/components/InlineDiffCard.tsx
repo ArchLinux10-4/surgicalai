@@ -160,8 +160,42 @@ function collapseDiff(diff: string): { display: string; hiddenCount: number } {
   return { display: result.join('\n'), hiddenCount }
 }
 
-// ── DiffBlock: single SyntaxHighlighter per change with per-line colors ──────
-function DiffBlock({ diff, language }: { diff: string; language: string }) {
+// ── DiffBlock: GitHub-style dual-gutter diff renderer ─────────────────────
+type DiffRowType = 'add' | 'remove' | 'context' | 'hunk' | 'header'
+interface DiffRow {
+  type: DiffRowType
+  oldLine: number | null
+  newLine: number | null
+  code: string
+}
+
+function parseDiffRows(raw: string): DiffRow[] {
+  const rows: DiffRow[] = []
+  let oldLine = 0
+  let newLine = 0
+  for (const line of raw.split('\n')) {
+    if (line.startsWith('---') || line.startsWith('+++')) {
+      rows.push({ type: 'header', oldLine: null, newLine: null, code: line })
+    } else if (line.startsWith('@@')) {
+      const m = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/)
+      if (m) { oldLine = parseInt(m[1], 10); newLine = parseInt(m[2], 10) }
+      rows.push({ type: 'hunk', oldLine: null, newLine: null, code: line })
+    } else if (line.startsWith('+')) {
+      rows.push({ type: 'add', oldLine: null, newLine: newLine, code: line.slice(1) })
+      newLine++
+    } else if (line.startsWith('-')) {
+      rows.push({ type: 'remove', oldLine: oldLine, newLine: null, code: line.slice(1) })
+      oldLine++
+    } else {
+      if (line === '' && rows.length > 0 && rows[rows.length - 1].code === '') continue
+      rows.push({ type: 'context', oldLine: oldLine, newLine: newLine, code: line })
+      oldLine++; newLine++
+    }
+  }
+  return rows
+}
+
+function DiffBlock({ diff, language: _language }: { diff: string; language: string }) {
   const { theme } = useThemeStore()
   const isLight = theme === 'light'
   const [showAll, setShowAll] = useState(false)
@@ -170,69 +204,111 @@ function DiffBlock({ diff, language }: { diff: string; language: string }) {
     ? { display: diff, hiddenCount: 0 }
     : collapseDiff(diff)
 
-  const rawLines = displayDiff.split('\n')
-  type Prefix = 'add' | 'remove' | 'hunk' | 'header' | 'context'
-  const prefixes: Prefix[] = []
-  const codeLines: string[] = []
+  const rows = parseDiffRows(displayDiff)
 
-  for (const line of rawLines) {
-    if (line.startsWith('+++') || line.startsWith('---')) {
-      prefixes.push('header'); codeLines.push(line)
-    } else if (line.startsWith('@@')) {
-      prefixes.push('hunk'); codeLines.push(line)
-    } else if (line.startsWith('+')) {
-      prefixes.push('add'); codeLines.push(line)
-    } else if (line.startsWith('-')) {
-      prefixes.push('remove'); codeLines.push(line)
-    } else {
-      prefixes.push('context'); codeLines.push(line)
-    }
+  const tk = {
+    add: {
+      rowBg:    isLight ? 'rgba(26,127,55,0.10)'   : 'rgba(74,222,128,0.09)',
+      gutterBg: isLight ? 'rgba(26,127,55,0.18)'   : 'rgba(74,222,128,0.16)',
+      numClr:   isLight ? '#16a34a'                : '#4ade80',
+      codeClr:  isLight ? '#14532d'                : '#bbf7d0',
+      marker:   isLight ? '#16a34a'                : '#4ade80',
+    },
+    remove: {
+      rowBg:    isLight ? 'rgba(207,34,46,0.09)'   : 'rgba(248,113,113,0.09)',
+      gutterBg: isLight ? 'rgba(207,34,46,0.17)'   : 'rgba(248,113,113,0.16)',
+      numClr:   isLight ? '#dc2626'                : '#f87171',
+      codeClr:  isLight ? '#7f1d1d'                : '#fecaca',
+      marker:   isLight ? '#dc2626'                : '#f87171',
+    },
+    hunk: {
+      rowBg:    isLight ? 'rgba(9,105,218,0.07)'   : 'rgba(96,165,250,0.07)',
+      gutterBg: isLight ? 'rgba(9,105,218,0.13)'   : 'rgba(96,165,250,0.13)',
+      numClr:   isLight ? '#0969da'                : '#60a5fa',
+      codeClr:  isLight ? '#0969da'                : '#93c5fd',
+      marker:   '' as string,
+    },
+    context: {
+      rowBg:    'transparent' as string,
+      gutterBg: isLight ? 'rgba(0,0,0,0.03)'       : 'rgba(255,255,255,0.03)',
+      numClr:   isLight ? '#94a3b8'                : '#475569',
+      codeClr:  isLight ? '#1e293b'                : '#e2e8f0',
+      marker:   'transparent' as string,
+    },
+    header: {
+      rowBg:    isLight ? 'rgba(0,0,0,0.04)'       : 'rgba(255,255,255,0.04)',
+      gutterBg: isLight ? 'rgba(0,0,0,0.04)'       : 'rgba(255,255,255,0.04)',
+      numClr:   isLight ? '#94a3b8'                : '#475569',
+      codeClr:  isLight ? '#64748b'                : '#94a3b8',
+      marker:   'transparent' as string,
+    },
   }
 
-  const code = codeLines.join('\n')
-
-  // Row highlight colors — stronger in light mode for visibility
-  const addBg    = isLight ? 'rgba(26,  127, 55,  0.14)' : 'rgba(74,  222, 128, 0.12)'
-  const removeBg = isLight ? 'rgba(207, 34,  46,  0.12)' : 'rgba(248, 113, 113, 0.12)'
-  const hunkBg   = isLight ? 'rgba(9,   105, 218, 0.08)' : 'rgba(96,  165, 250, 0.08)'
+  const mono: React.CSSProperties = {
+    fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+    fontSize: '12px',
+    lineHeight: '1.65',
+  }
 
   return (
-    <div>
-      <SyntaxHighlighter
-        language={language === 'text' ? 'text' : language}
-        style={isLight ? oneLight : vscDarkPlus}
-        wrapLines={true}
-        wrapLongLines={false}
-        lineProps={(lineNumber: number) => {
-          const p = prefixes[lineNumber - 1]
-          const s: React.CSSProperties = { display: 'block', width: '100%' }
-          if (p === 'add')    s.backgroundColor = addBg
-          if (p === 'remove') s.backgroundColor = removeBg
-          if (p === 'hunk')   s.backgroundColor = hunkBg
-          return { style: s }
-        }}
-        customStyle={{
-          background: 'transparent',
-          padding: '0',
-          margin: '0',
-          fontSize: '12px',
-          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-          lineHeight: '1.6',
-        }}
-        codeTagProps={{ style: {
-          fontSize: '12px',
-          fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
-        }}}
-        PreTag="div"
-      >
-        {code}
-      </SyntaxHighlighter>
+    <div style={{ overflowX: 'auto' }}>
+      <div style={{ ...mono, minWidth: 0 }}>
+        {rows.map((row, i) => {
+          const t = tk[row.type]
+          const marker = row.type === 'add' ? '+' : row.type === 'remove' ? '-' : ' '
+
+          if (row.type === 'hunk') {
+            const ctxMatch = row.code.match(/@@ [^@]+ @@ (.+)/)
+            const ctx = ctxMatch?.[1]?.trim()
+            return (
+              <div key={i} style={{ display: 'flex', backgroundColor: t.rowBg }}>
+                <span style={{ width: 44, minWidth: 44, textAlign: 'right', padding: '0 8px', backgroundColor: t.gutterBg, color: t.numClr, userSelect: 'none' }}>...</span>
+                <span style={{ width: 44, minWidth: 44, textAlign: 'right', padding: '0 8px', backgroundColor: t.gutterBg, color: t.numClr, userSelect: 'none' }}>...</span>
+                <span style={{ width: 18, minWidth: 18, textAlign: 'center', padding: '0 2px', userSelect: 'none' }} />
+                <span style={{ flex: 1, padding: '0 10px', color: t.codeClr, whiteSpace: 'pre' }}>
+                  {row.code}
+                  {ctx && <span style={{ color: isLight ? '#94a3b8' : '#64748b', fontStyle: 'italic', marginLeft: 8 }}>{ctx}</span>}
+                </span>
+              </div>
+            )
+          }
+
+          if (row.type === 'header') {
+            return (
+              <div key={i} style={{ display: 'flex', backgroundColor: t.rowBg }}>
+                <span style={{ width: 44, minWidth: 44, backgroundColor: t.gutterBg }} />
+                <span style={{ width: 44, minWidth: 44, backgroundColor: t.gutterBg }} />
+                <span style={{ width: 18, minWidth: 18 }} />
+                <span style={{ flex: 1, padding: '0 10px', color: t.codeClr, whiteSpace: 'pre', fontStyle: 'italic' }}>{row.code}</span>
+              </div>
+            )
+          }
+
+          return (
+            <div key={i} style={{ display: 'flex', backgroundColor: t.rowBg }}>
+              <span style={{ width: 44, minWidth: 44, textAlign: 'right', padding: '0 8px', backgroundColor: t.gutterBg, color: t.numClr, userSelect: 'none' }}>
+                {row.oldLine !== null ? row.oldLine : ''}
+              </span>
+              <span style={{ width: 44, minWidth: 44, textAlign: 'right', padding: '0 8px', backgroundColor: t.gutterBg, color: t.numClr, userSelect: 'none' }}>
+                {row.newLine !== null ? row.newLine : ''}
+              </span>
+              <span style={{ width: 18, minWidth: 18, textAlign: 'center', padding: '0 2px', color: t.marker, userSelect: 'none', fontWeight: 700 }}>
+                {marker}
+              </span>
+              <span style={{ flex: 1, padding: '0 10px', color: t.codeClr, whiteSpace: 'pre' }}>
+                {row.code}
+              </span>
+            </div>
+          )
+        })}
+      </div>
+
       {!showAll && hiddenLineCount > DIFF_CONTEXT_LINES && (
         <button
           onClick={() => setShowAll(true)}
           className="w-full text-center text-xs py-1 text-muted hover:text-foreground border-t border-border/30 hover:bg-surface/50 transition-colors"
         >
-          Show {hiddenLineCount} unchanged lines &darr;
+          Show {hiddenLineCount} unchanged lines &#x2193;
         </button>
       )}
       {showAll && hiddenLineCount > DIFF_CONTEXT_LINES && (
@@ -240,14 +316,13 @@ function DiffBlock({ diff, language }: { diff: string; language: string }) {
           onClick={() => setShowAll(false)}
           className="w-full text-center text-xs py-1 text-muted hover:text-foreground border-t border-border/30 hover:bg-surface/50 transition-colors"
         >
-          Collapse unchanged lines &uarr;
+          Collapse unchanged lines &#x2191;
         </button>
       )}
     </div>
   )
 }
 
-// ── FileChangeCard: redesigned with checkbox-per-change + single action bar ──
 function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeApplied }: {
   filename: string
   fileData: { filename: string; file_id: string; changes: any[] }
