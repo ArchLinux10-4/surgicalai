@@ -816,12 +816,14 @@ Return JSON with search-and-replace operations."""
             continue
 
         matched = False
+        _find_debug = find_text[:60].replace('\n', '\\n')
         # Tier 1: exact string match
         idx = new_code.find(find_text)
         if idx != -1:
             new_code = new_code[:idx] + replace_text + new_code[idx + len(find_text):]
             matched = True
             _ops_applied += 1
+            logger.info(f"Op match Tier 1 (exact): {_find_debug}")
 
         # Tier 1.5: stripped-line match (handles LLM whitespace imprecision)
         if not matched:
@@ -832,6 +834,7 @@ Return JSON with search-and-replace operations."""
                 if "\n" not in find_stripped:
                     for li, raw_line in enumerate(code_lines_raw):
                         if find_stripped in raw_line.strip() or raw_line.strip() == find_stripped:
+                            logger.info(f"Op match Tier 1.5 (stripped): line {li}, find={_find_debug}")
                             # Preserve original indentation in replacement
                             indent = raw_line[:len(raw_line) - len(raw_line.lstrip())]
                             before = "".join(code_lines_raw[:li])
@@ -893,6 +896,9 @@ Return JSON with search-and-replace operations."""
                     matched = True
                     _ops_applied += 1
                     break
+
+        if not matched:
+            logger.warning(f"Op NO MATCH any tier: find={_find_debug} find_len={len(find_text)} code_len={len(new_code)} stripped_in_code={find_text.strip()[:40] in new_code}")
 
         # Tier 4: find targets text outside the symbol window — apply to file_content window
         if not matched and file_content:
