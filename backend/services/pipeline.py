@@ -800,7 +800,15 @@ Return JSON with search-and-replace operations."""
         for _op in operations:
             for _key in ("find", "replace"):
                 if _key in _op and isinstance(_op[_key], str):
-                    _op[_key] = _op[_key].replace("\\n", "\n").replace("\\t", "\t")
+                    _val = _op[_key]
+                    # Debug: log what we see before processing
+                    if "\\n" in _val or "\\t" in _val:
+                        print(f"[ESCAPE-FIX] {_key} has literal backslash-n, converting ({len(_val)} chars)")
+                    _op[_key] = _val.replace("\\n", "\n").replace("\\t", "\t")
+                    # Check if there are still escaped sequences (triple-escape)
+                    if "\\n" in _op[_key]:
+                        print(f"[ESCAPE-FIX] Still has \\\\n after first pass, doing second pass")
+                        _op[_key] = _op[_key].replace("\\n", "\n")
     except json.JSONDecodeError:
         # Fallback: treat as old-style code block (pre-v3.4.0 model behavior)
         if raw.lstrip().startswith("```"):
@@ -2856,6 +2864,14 @@ USER REQUEST:
                     yield sse({"type": "progress", "content": f"Focused window: L{window_start}-{window_end} ({window_end - window_start + 1} lines)"})
 
             new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, change_target, sf["content"], user_id=user_id)
+            # Debug: trace operations for diagnosis
+            if _operations:
+                _dbg_op = _operations[0]
+                _dbg_f = _dbg_op.get("find","")[:50]
+                _dbg_r = _dbg_op.get("replace","")[:50]
+                _has_lit_n = "\\n" in _dbg_op.get("replace","")
+                _has_real_n = "\n" in _dbg_op.get("replace","")
+                yield sse({"type": "progress", "content": f"DEBUG ops[0]: find={repr(_dbg_f)} | replace_has_literal_backslash_n={_has_lit_n} replace_has_real_newline={_has_real_n} | new==orig={new_code.rstrip() == symbol.code.rstrip()}"})
             diff = _make_diff(symbol.code, new_code, symbol_path)
 
             # ── QA Agent: verify Surgeon output before showing to user ──
