@@ -813,135 +813,55 @@ Return JSON with search-and-replace operations."""
             new_code = new_code[1:]
         return new_code, confidence, surgeon_notes, import_needed_lines, []
 
-    # ---- Compute new_code from operations (backward compat: diff display + QA) ----
+    # ---- Compute new_code by applying operations to full file (same as apply path) ----
+    # This guarantees QA/diff sees the same result the user would get after applying.
+    _original_for_qa = symbol.code
     new_code = symbol.code
-    _ops_applied = 0
     try:
-      _ops_loop_ran = True
-      for op in operations:
-        find_text = op.get("find", "")
-        replace_text = op.get("replace", "")
-        if not find_text:
-            continue
-
-        matched = False
-        _find_debug = find_text[:60].replace('\n', '\\n')
-        # Tier 1: exact string match
-        idx = new_code.find(find_text)
-        if idx != -1:
-            new_code = new_code[:idx] + replace_text + new_code[idx + len(find_text):]
-            matched = True
-            _ops_applied += 1
-            print(f"[MATCH] Op match Tier 1 (exact): {_find_debug}")
-
-        # Tier 1.5: stripped-line match (handles LLM whitespace imprecision)
-        if not matched:
-            find_stripped = find_text.strip()
-            if find_stripped:
-                code_lines_raw = new_code.splitlines(keepends=True)
-                # Single-line find: match any line that contains the stripped find text
-                if "\n" not in find_stripped:
-                    for li, raw_line in enumerate(code_lines_raw):
-                        if find_stripped in raw_line.strip() or raw_line.strip() == find_stripped:
-                            print(f"[MATCH] Op match Tier 1.5 (stripped): line {li}, find={_find_debug}")
-                            # Preserve original indentation in replacement
+        if operations and file_content:
+            from services.surgical_editor import apply_operations as _apply_ops
+            ops_dicts = [{"find": op.get("find",""), "replace": op.get("replace","")} for op in operations]
+            modified_file = _apply_ops(file_content, ops_dicts, hint_line=symbol.start_line)
+            # Extract the window around the symbol for QA/diff
+            mod_lines = modified_file.splitlines()
+            orig_lines = file_content.splitlines()
+            # Use symbol line range with ±5 padding
+            win_start = max(0, symbol.start_line - 6)  # start_line is 1-indexed
+            win_end = min(len(mod_lines), symbol.end_line + 5)
+            new_code = "\n".join(mod_lines[win_start:win_end])
+            _original_for_qa = "\n".join(orig_lines[win_start:min(len(orig_lines), win_end)])
+            print(f"[MATCH] apply_operations OK: {len(operations)} ops, window L{win_start+1}-L{win_end}")
+    except (ValueError, Exception) as _apply_err:
+        # Operations couldn't be applied to full file — fall back to symbol.code matching
+        print(f"[MATCH] apply_operations failed ({_apply_err}), falling back to symbol.code")
+        new_code = symbol.code
+        for op in operations:
+            find_text = op.get("find", "")
+            replace_text = op.get("replace", "")
+            if not find_text:
+                continue
+            idx = new_code.find(find_text)
+            if idx != -1:
+                new_code = new_code[:idx] + replace_text + new_code[idx + len(find_text):]
+            else:
+                # Try stripped match
+                ft = find_text.strip()
+                if ft:
+                    for li, raw_line in enumerate(new_code.splitlines(keepends=True)):
+                        if ft in raw_line.strip():
+                            lines = new_code.splitlines(keepends=True)
                             indent = raw_line[:len(raw_line) - len(raw_line.lstrip())]
-                            before = "".join(code_lines_raw[:li])
-                            after = "".join(code_lines_raw[li + 1:])
-                            # Re-indent the replacement text
-                            rep_lines = replace_text.splitlines(keepends=True)
-                            if rep_lines:
-                                reindented = indent + rep_lines[0].lstrip()
-                                for rl in rep_lines[1:]:
-                                    reindented += indent + rl.lstrip() if rl.strip() else rl
-                                new_code = before + reindented + ("\n" if not reindented.endswith("\n") else "") + after
-                            else:
-                                new_code = before + after
-                            matched = True
-                            _ops_applied += 1
+                            before = "".join(lines[:li])
+                            after = "".join(lines[li + 1:])
+                            new_code = before + indent + replace_text.lstrip() + "\n" + after
                             break
-                else:
-                    # Multi-line stripped find: match line-by-line with stripped comparison
-                    find_lines_s = [l.strip() for l in find_stripped.splitlines() if l.strip()]
-                    if find_lines_s:
-                        code_lines_s = [l.strip() for l in code_lines_raw]
-                        for si in range(len(code_lines_s) - len(find_lines_s) + 1):
-                            if all(code_lines_s[si + j] == find_lines_s[j] for j in range(len(find_lines_s))):
-                                indent = code_lines_raw[si][:len(code_lines_raw[si]) - len(code_lines_raw[si].lstrip())]
-                                before = "".join(code_lines_raw[:si])
-                                after = "".join(code_lines_raw[si + len(find_lines_s):])
-                                rep_lines = replace_text.splitlines(keepends=True)
-                                if rep_lines:
-                                    reindented = indent + rep_lines[0].lstrip()
-                                    for rl in rep_lines[1:]:
-                                        reindented += indent + rl.lstrip() if rl.strip() else rl
-                                    new_code = before + reindented + ("\n" if not reindented.endswith("\n") else "") + after
-                                else:
-                                    new_code = before + after
-                                matched = True
-                                _ops_applied += 1
-                                break
 
-        # Tier 2: normalized line-endings
-        if not matched:
-            norm_code = new_code.replace("\r\n", "\n").replace("\r", "\n")
-            norm_find = find_text.replace("\r\n", "\n").replace("\r", "\n")
-            idx2 = norm_code.find(norm_find)
-            if idx2 != -1:
-                new_code = norm_code[:idx2] + replace_text + norm_code[idx2 + len(norm_find):]
-                matched = True
-                _ops_applied += 1
+    # Store effective original for QA (Pydantic-safe)
+    try:
+        object.__setattr__(symbol, '_file_window_original', _original_for_qa)
+    except Exception:
+        pass
 
-        # Tier 3: line-by-line match with rstripped lines
-        if not matched and "\n" in find_text:
-            find_lines = [l.rstrip() for l in find_text.splitlines()]
-            code_lines_raw = new_code.splitlines(keepends=True)
-            code_lines_stripped = [l.rstrip() for l in code_lines_raw]
-            for si in range(len(code_lines_stripped) - len(find_lines) + 1):
-                if all(code_lines_stripped[si + j] == find_lines[j] for j in range(len(find_lines))):
-                    before = "".join(code_lines_raw[:si])
-                    after = "".join(code_lines_raw[si + len(find_lines):])
-                    new_code = before + replace_text + ("\n" if not replace_text.endswith("\n") else "") + after
-                    matched = True
-                    _ops_applied += 1
-                    break
-
-        if not matched:
-            print(f"[MATCH] Op NO MATCH any tier: find={_find_debug} find_len={len(find_text)} code_len={len(new_code)} stripped_in_code={find_text.strip()[:40] in new_code}")
-
-        # Tier 4: find targets text outside the symbol window — apply to file_content window
-        if not matched and file_content:
-            fc_norm = file_content.replace("\r\n", "\n")
-            ft_norm = find_text.replace("\r\n", "\n").strip()
-            fc_idx = fc_norm.find(ft_norm)
-            if fc_idx != -1:
-                # Apply the operation to file_content and extract a window
-                fc_new = fc_norm[:fc_idx] + replace_text + fc_norm[fc_idx + len(ft_norm):]
-                # Find line number of change
-                change_line = fc_norm[:fc_idx].count("\n")
-                # Extract +/- 15 lines around the change as new_code context
-                fc_new_lines = fc_new.splitlines()
-                win_start = max(0, change_line - 15)
-                win_end = min(len(fc_new_lines), change_line + 20)
-                window_new = "\n".join(fc_new_lines[win_start:win_end])
-                # Also update original_code window so QA can diff properly
-                fc_orig_lines = fc_norm.splitlines()
-                window_orig = "\n".join(fc_orig_lines[win_start:min(len(fc_orig_lines), win_end)])
-                # For new_code, replace symbol.code with the file-level window
-                new_code = window_new
-                # Store the original window for QA comparison (avoid Pydantic setattr issues)
-                try:
-                    object.__setattr__(symbol, '_file_window_original', window_orig)
-                except Exception:
-                    pass  # Pydantic may not allow; _effective_original falls back to symbol.code
-                matched = True
-                _ops_applied += 1
-                print(f"[MATCH] Op match Tier 4 (file_content): {_find_debug}")
-
-    except Exception as _match_err:
-      print(f"[MATCH] ERROR in operations matching: {_match_err}")
-      import traceback; traceback.print_exc()
-      new_code = symbol.code  # fallback: keep original
     # Confidence: empty operations = already correct
     if not operations:
         confidence = 10
