@@ -120,7 +120,7 @@ async def startup():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "3.7.0"}
+    return {"status": "ok", "version": "3.7.1"}
 
 
 # Serve React frontend (built files)
