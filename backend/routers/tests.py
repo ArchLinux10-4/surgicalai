@@ -206,7 +206,7 @@ def detect_framework(session_id: str, request: Request):
     """Detect test framework from files uploaded in a session."""
     from database import get_db_conn
     try:
-        conn = get_db_conn()
+        conn = get_db_connection()
         rows = conn.execute(
             "SELECT filename FROM session_files WHERE session_id=?",
             (session_id,)
