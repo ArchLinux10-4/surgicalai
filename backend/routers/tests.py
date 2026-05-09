@@ -205,12 +205,11 @@ async def run_tests(body: dict, request: Request):
 def detect_framework(session_id: str, request: Request):
     """Detect test framework from files uploaded in a session."""
     from database import get_db_conn
-    user_id = _get_user_id(request)
     try:
         conn = get_db_conn()
         rows = conn.execute(
-            "SELECT filename FROM session_files WHERE session_id=? AND user_id=?",
-            (session_id, user_id)
+            "SELECT filename FROM session_files WHERE session_id=?",
+            (session_id,)
         ).fetchall()
         conn.close()
         filenames = [r[0].lower() for r in rows]

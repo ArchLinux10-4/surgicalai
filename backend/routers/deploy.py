@@ -211,4 +211,4 @@ def deploy_config(request: Request):
 @router.get("/poll")
 def poll_deploy_status(request: Request):
     """Poll for latest deploy status — alias to /status, client-friendly for polling loops."""
-    return get_deploy_status(request)
+    return deploy_status(request)
