@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from models.schemas import SurgicalChange, SurgicalApplyResponse
+from models.schemas import SurgicalChange, SurgicalApplyResponse, SurgicalOperation
 from database import get_setting
 
 
@@ -61,6 +61,98 @@ def _extract_core_diff(original_code: str, new_code: str):
     return orig_core, new_core, top, len(orig_lines) - bot_orig - 1
 
 
+def _find_nearest(file_content: str, find_text: str, hint_line: int) -> int:
+    """
+    Find the character index of `find_text` in `file_content`, preferring
+    the occurrence nearest to `hint_line`.  Returns -1 if not found.
+    """
+    if not find_text:
+        return -1
+
+    # Collect ALL occurrences
+    occurrences = []
+    start = 0
+    while True:
+        idx = file_content.find(find_text, start)
+        if idx == -1:
+            break
+        occurrences.append(idx)
+        start = idx + 1
+
+    if not occurrences:
+        return -1
+    if len(occurrences) == 1:
+        return occurrences[0]
+
+    # Pick the occurrence whose line number is closest to hint_line
+    def _line_of(char_idx):
+        return file_content[:char_idx].count("\n") + 1
+
+    return min(occurrences, key=lambda idx: abs(_line_of(idx) - hint_line))
+
+
+def apply_operations(
+    file_content: str,
+    operations: list,
+    hint_line: int = 1
+) -> str:
+    """
+    v3.4.0: Apply search-and-replace operations mechanically.
+
+    Each operation is {"find": "...", "replace": "..."}.
+    The find text is located in the FULL file (not just a window),
+    preferring matches near hint_line for disambiguation.
+
+    This is the Tasklet pattern: the LLM decides WHAT to change,
+    the machine does the actual editing.  Zero truncation risk.
+    """
+    result = file_content
+
+    for op in operations:
+        find_text = op.get("find", "") if isinstance(op, dict) else op.find
+        replace_text = op.get("replace", "") if isinstance(op, dict) else op.replace
+
+        if not find_text:
+            continue
+
+        idx = _find_nearest(result, find_text, hint_line)
+        if idx == -1:
+            # Try whitespace-normalized match as fallback
+            norm_find = " ".join(find_text.split())
+            # Rebuild file with normalized whitespace for matching
+            lines = result.splitlines(keepends=True)
+            found_range = None
+            find_lines = find_text.splitlines()
+            for i in range(len(lines)):
+                if i + len(find_lines) > len(lines):
+                    break
+                match = True
+                for j, fl in enumerate(find_lines):
+                    if " ".join(lines[i + j].split()) != " ".join(fl.split()):
+                        match = False
+                        break
+                if match:
+                    found_range = (i, i + len(find_lines))
+                    break
+
+            if found_range:
+                # Replace the matched lines
+                before = "".join(lines[:found_range[0]])
+                after = "".join(lines[found_range[1]:])
+                result = before + replace_text + ("\n" if replace_text and not replace_text.endswith("\n") else "") + after
+                continue
+
+            raise ValueError(
+                f"Cannot find target text in file (search-and-replace failed). "
+                f"Text not found: {find_text[:120]}..."
+            )
+
+        # Apply the replacement
+        result = result[:idx] + replace_text + result[idx + len(find_text):]
+
+    return result
+
+
 def apply_change(
     file_path: str,
     file_content: str,
@@ -69,14 +161,21 @@ def apply_change(
     """
     Apply a single surgical change to file content.
 
-    4-tier matching strategy (most specific to least specific):
-      Tier 0: target_element  -- match only the changed lines (no overlap possible)
-      Tier 1: exact window    -- full original_code at expected line numbers
-      Tier 2: fuzzy scan      -- full original_code found anywhere in file
-      Tier 3: core-diff scan  -- compute changed lines on the fly, search near target_line
+    v3.4.0 primary path: operations-based search-and-replace.
+    Legacy fallback: 4-tier matching strategy for pre-v3.4.0 changes.
 
     Returns the new file content.
     """
+    # ── v3.4.0: Operations-based apply (primary path) ──────────────────────
+    if change.operations:
+        hint = getattr(change.symbol, 'target_line', None) or change.symbol.start_line
+        return apply_operations(
+            file_content,
+            change.operations,
+            hint_line=hint
+        )
+
+    # ── Legacy path (v3.3.x and earlier changes) ──────────────────────────
     lines = file_content.splitlines(keepends=True)
     symbol = change.symbol
     hint_line = getattr(symbol, 'target_line', None) or symbol.start_line

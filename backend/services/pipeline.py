@@ -20,6 +20,7 @@ import httpx
 from database import get_setting, get_user_api_key
 from crypto_utils import decrypt_api_key
 from models.schemas import (
+    SurgicalOperation,
     ArchitectPlan, ChangeTarget, ChangeType, SurgicalChange,
     SurgicalAnalyzeResponse, SymbolMap, SymbolInfo
 )
@@ -432,73 +433,49 @@ Output format (JSON only):
 
 SURGEON_SYSTEM = """You are the SURGEON in a two-model coding system.
 
-The ARCHITECT (a separate model) has already:
-1. Read the symbol map — never the raw file
-2. Identified exactly which symbol needs to change
-3. Written a precise plan describing the new behavior
+The ARCHITECT has already analyzed the codebase and created a precise change plan.
+Your job: produce EXACT search-and-replace operations that implement the plan.
 
-Your ONLY job: implement that plan on the specific code block you receive. Nothing more.
+You will receive a TARGET CODE window for context. Return JSON operations that find
+specific text in that code and replace it.
 
-━━━ CLARIFICATION LOOP PREVENTION — CRITICAL ━━━
+OUTPUT FORMAT (return ONLY this JSON, nothing else):
+{
+  "operations": [
+    {"find": "exact text from the code", "replace": "replacement text"}
+  ],
+  "confidence": 8,
+  "reasoning": "one-line explanation",
+  "imports_needed": ["import xyz"]
+}
 
-Look at the RECENT CONVERSATION section above BEFORE deciding to use needs_clarification.
+HARD RULES:
+1. "find" MUST be an EXACT substring of the TARGET CODE or a well-known anchor (</script>, </body>, etc).
+   Copy it character-for-character, including whitespace and indentation.
+2. "find" should be the MINIMUM text needed to UNIQUELY identify the location. Usually 1-5 lines.
+   If a short string like </div> could match many places, include the line above it too.
+3. "replace" is the new text for that exact location. Preserve original indentation style.
+4. Each operation = ONE logical change. Multiple changes = multiple operations.
+5. Do NOT include unchanged surrounding code in your operations.
 
-- If you previously asked questions AND the user has answered them → USE those answers to plan the edit NOW.
-  Do NOT ask the same questions again. The user has already given you the information.
-- Only use needs_clarification for GENUINELY NEW unknowns that the conversation didn't address.
-- If the user's answer gives you enough to locate the code (e.g. they named an element, ID, or section),
-  treat that as sufficient — grep/scan the file and proceed with an edit plan.
-- Pattern to avoid: asking "what is the ID of the input?" when the user already said "it's effDate" in a prior turn.
+CHANGE TYPES:
+- MODIFY/WRAP: find = the element to change, replace = the modified version.
+  Example wrapping an input: find the <input> tag, replace with <div><input><button></div>
+- ADD/INSERT: find = an anchor line (like </script> or a closing tag), replace = new code + that anchor.
+  Example: find "</script>", replace "function newFunc(){...}\n</script>"
+- DELETE: find = the lines to remove, replace = "" (empty string).
 
-━━━ HARD RULES ━━━
-- Return ONLY the replacement code — no explanation, no markdown fences, no preamble
-- Implement EXACTLY what the Architect's plan says. No improvisation.
-- Preserve EXACT indentation of the original
-- Preserve ALL functionality NOT mentioned in the plan
-- Do NOT change function signatures unless the plan explicitly says to
-- Do NOT add features, error handling, logging, or comments that weren't asked for
-- Do NOT remove existing error handling unless explicitly requested
-- If you genuinely cannot implement part of the plan, add a comment: # SURGEON NOTE: [specific concern]
+ALREADY CORRECT RULE:
+If the TARGET CODE already implements what the plan describes, return:
+{"operations": [], "confidence": 10, "reasoning": "already implemented"}
 
-━━━ IMPORT HANDLING ━━━
-- If the new code requires an import that isn't already present, add a comment on the FIRST LINE of your output:
-  # IMPORT_NEEDED: import uuid  (or whatever the import is)
-- Use one # IMPORT_NEEDED: comment per missing import
-- The system will extract these and add them to the file top automatically
-- Do NOT add the import inline inside a function or class body
+CRITICAL - NO EXTRA STRUCTURE:
+- When wrapping an HTML element, wrap ONLY the exact element specified.
+  Do NOT add extra labels, divs, aria attributes, or any structure not in the plan.
+- When adding a script function, write ONLY the function. Do NOT duplicate existing code.
+- Count the elements in the plan. Your operations should produce exactly that many changes.
 
-━━━ ALREADY CORRECT RULE ━━━
-- If the TARGET CODE already implements what the plan describes — return it UNCHANGED.
-- Do NOT invent changes. The diff between original and your output should be empty if the code already matches.
-- Signal this by returning the original code exactly as-is (no comments added).
-
-━━━ CRITICAL: NO DUPLICATION ━━━
-- The CONTEXT BEFORE and CONTEXT AFTER blocks are shown for your reference ONLY — do NOT include them in your output
-- Do NOT repeat function declarations, type annotations, closing braces, or ANY line that appears in CONTEXT BEFORE
-- If the target starts with a function/class declaration, output that declaration ONCE and only once
-
-Minimal footprint. The diff between original and your output should contain ONLY the requested change.
-
-CRITICAL HTML WRAP RULE:
-When wrapping an HTML element (adding an icon button, container div, date picker trigger, etc.):
-- Replace ONLY the exact specified element. Your output = original element + the wrapping described in the plan. Nothing more.
-- Do NOT add: label elements, title divs, aria-label wrappers, tooltip text, or ANY structure not explicitly in the plan.
-- Do NOT convert a single self-closing tag into a multi-line block with extra children unless the plan explicitly lists those children.
-- Count the elements described in the plan. Put exactly that many in your output. One wrapper + the original = two elements total.
-- Each Architect target covers exactly ONE element instance. Do not attempt to modify other instances.
-
-CRITICAL HTML SCRIPT INJECTION RULE:
-When the plan says to add a JavaScript helper function to an HTML file:
-- Write your function and add it into the focused window you received, near the end of the last visible script block.
-- If you CAN see a </script> closing tag in the window: inject your function just before it.
-- If you CANNOT see a </script> closing tag (the script block extends beyond the window you were given):
-  DO NOT fabricate a </script> tag. DO NOT truncate or shorten the window.
-  Add your function at the very end of the provided window — the system will place it in the right closing position.
-- CRITICAL OUTPUT RULE: Your output line count must be >= the input window line count. You may add lines but must NEVER remove or shorten existing lines.
-- Do NOT create a new <script> tag unless zero <script> tags exist anywhere in the window.
-- Preserve ALL existing code in the script block. Only add. Never remove or truncate.
-
-Start your response with the first line of code. End with the last line of code."""
+Return ONLY the JSON object. No markdown fences, no preamble, no explanation outside the JSON."""
 
 
 def run_architect(
@@ -751,110 +728,113 @@ def run_surgeon(
     file_content: str,
     model: Optional[str] = None,
     user_id: str = ""
-) -> tuple[str, int]:
+) -> tuple:
     """
-    GPT-4.1 (Surgeon): receives ONE code chunk + plan → returns minimal replacement.
-    Returns (new_code, confidence_score).
+    GPT-4.1 (Surgeon): receives ONE code chunk + plan, returns search-and-replace operations.
+    Returns (new_code, confidence, surgeon_notes, import_needed, operations).
+
+    v3.4.0: Surgeon returns JSON operations [{find, replace}] instead of rewriting code blocks.
+    The LLM decides WHAT to change; the backend applies changes mechanically. Zero truncation risk.
     """
     client = _get_client(user_id)
     surg_model = model or get_setting("surgeon_model", "gpt-4.1")
     temp = float(get_setting("temperature_surgeon", "0.1"))
 
-    # Give surgeon 10 lines of context before and after the symbol
+    # Context around the symbol (reference only)
     all_lines = file_content.splitlines()
     context_start = max(0, symbol.start_line - 11)
     context_end = min(len(all_lines), symbol.end_line + 10)
-
     before_context = "\n".join(all_lines[context_start:symbol.start_line - 1])
     after_context = "\n".join(all_lines[symbol.end_line:context_end])
 
     # Thread import_changes from Architect plan if present
     _import_hint = ""
     if hasattr(target, "import_changes") and target.import_changes:
-        _import_hint = "\nREQUIRED IMPORT CHANGES (add # IMPORT_NEEDED: comments for any that need adding):\n" + "\n".join(f"  {ic}" for ic in target.import_changes)
+        _import_hint = "\nREQUIRED IMPORT CHANGES (include in imports_needed):\n" + "\n".join(f"  {ic}" for ic in target.import_changes)
 
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
 New logic required: {target.new_logic}{_import_hint}
 
-CONTEXT BEFORE (do not modify, reference only):
+CONTEXT BEFORE (read-only reference, do NOT include in operations):
 {before_context}
 
-TARGET CODE TO REWRITE (lines {symbol.start_line}-{symbol.end_line}):
+TARGET CODE (lines {symbol.start_line}-{symbol.end_line}) -- your "find" text should come from here:
 {symbol.code}
 
-CONTEXT AFTER (do not modify, reference only):
+CONTEXT AFTER (read-only reference, do NOT include in operations):
 {after_context}
 
-Write the replacement for the TARGET CODE ONLY. Preserve exact indentation.
-If any imports are needed, add # IMPORT_NEEDED: <import statement> as the first line(s) of your output."""
+Return JSON with search-and-replace operations."""
 
-    response = _chat_create(client, 
+    response = _chat_create(client,
         model=surg_model,
         messages=[
             {"role": "system", "content": SURGEON_SYSTEM},
             {"role": "user", "content": user_msg}
         ],
-        temperature=temp
+        temperature=temp,
+        response_format={"type": "json_object"}
     )
 
     raw = response.choices[0].message.content
 
-    # Remove accidental markdown fences if surgeon wrapped it
-    if raw.lstrip().startswith("```"):
-        fence_lines = raw.split("\n")
-        # Find first ``` and strip it; strip trailing ``` too
-        start = next((i for i, l in enumerate(fence_lines) if l.strip().startswith("```")), 0) + 1
-        end = len(fence_lines) - 1 if fence_lines[-1].strip() == "```" else len(fence_lines)
-        raw = "\n".join(fence_lines[start:end])
-
-    # Extract # IMPORT_NEEDED: lines before stripping
-    import_needed_lines = []
-    remaining_lines = []
-    for _ln in raw.splitlines():
-        if _ln.strip().startswith("# IMPORT_NEEDED:"):
-            import_needed_lines.append(_ln.strip()[len("# IMPORT_NEEDED:"):].strip())
-        else:
-            remaining_lines.append(_ln)
-    if import_needed_lines:
-        raw = "\n".join(remaining_lines)
-
-    # Extract # SURGEON NOTE: comments (surface to caller)
-    surgeon_notes = []
-    clean_lines = []
-    for _ln in raw.splitlines():
-        if "# SURGEON NOTE:" in _ln:
-            surgeon_notes.append(_ln.strip())
-        else:
-            clean_lines.append(_ln)
-    if surgeon_notes:
-        raw = "\n".join(clean_lines)
-
-    # Strip trailing whitespace only — preserve leading indentation
-    new_code = raw.rstrip()
-    # Remove any leading blank lines only (surgeon sometimes adds a blank line before code)
-    while new_code.startswith("\n"):
-        new_code = new_code[1:]
-
-    # Re-apply indentation if surgeon dropped leading spaces (common with some models)
-    if symbol.indentation > 0 and new_code and not new_code[0].isspace():
-        indent_str = " " * symbol.indentation
-        new_code = "\n".join(
-            indent_str + line if line.strip() else line
-            for line in new_code.splitlines()
-        )
-
-    # Confidence: use target confidence but reduce if code is suspiciously short/long
+    # Parse JSON response
+    operations = []
     confidence = target.confidence
-    orig_lines = len(symbol.code.splitlines())
-    new_lines = len(new_code.splitlines())
-    if new_lines < orig_lines * 0.3:  # suspicious shrinkage
-        confidence = min(confidence, 5)
-    if new_lines > orig_lines * 5:  # suspicious bloat
-        confidence = min(confidence, 6)
+    surgeon_notes = []
+    import_needed_lines = []
 
-    return new_code, confidence, surgeon_notes, import_needed_lines
+    try:
+        data = json.loads(raw)
+        operations = data.get("operations", [])
+        confidence = data.get("confidence", target.confidence)
+        reasoning = data.get("reasoning", "")
+        import_needed_lines = data.get("imports_needed", [])
+        if reasoning:
+            surgeon_notes.append(f"Surgeon: {reasoning}")
+    except json.JSONDecodeError:
+        # Fallback: treat as old-style code block (pre-v3.4.0 model behavior)
+        if raw.lstrip().startswith("```"):
+            fence_lines = raw.split("\n")
+            start_i = next((i for i, l in enumerate(fence_lines) if l.strip().startswith("```")), 0) + 1
+            end_i = len(fence_lines) - 1 if fence_lines[-1].strip() == "```" else len(fence_lines)
+            raw = "\n".join(fence_lines[start_i:end_i])
+        new_code = raw.rstrip()
+        while new_code.startswith("\n"):
+            new_code = new_code[1:]
+        return new_code, confidence, surgeon_notes, import_needed_lines, []
+
+    # ---- Compute new_code from operations (backward compat: diff display + QA) ----
+    new_code = symbol.code
+    for op in operations:
+        find_text = op.get("find", "")
+        replace_text = op.get("replace", "")
+        if not find_text:
+            continue
+        idx = new_code.find(find_text)
+        if idx != -1:
+            new_code = new_code[:idx] + replace_text + new_code[idx + len(find_text):]
+        else:
+            # find_text targets outside the symbol window (e.g. </script> anchor)
+            # For display purposes, append the newly added code
+            if find_text.strip() in file_content:
+                added = replace_text.replace(find_text, "").strip()
+                if added:
+                    new_code = new_code.rstrip() + "\n\n// --- New code (applied to " + find_text.strip()[:30] + ") ---\n" + added
+
+    # Confidence: empty operations = already correct
+    if not operations:
+        confidence = 10
+
+    # Confidence reduction for suspicious results
+    orig_line_count = len(symbol.code.splitlines())
+    new_line_count = len(new_code.splitlines())
+    if new_line_count < orig_line_count * 0.3:
+        confidence = min(confidence, 5)
+
+    return new_code, confidence, surgeon_notes, import_needed_lines, operations
 
 
 # DEPRECATED: Use run_chat_stream() instead. This sync version is kept for backward compat only.
@@ -1027,7 +1007,7 @@ async def analyze_and_plan_stream(
                                 parent_symbol = sym
                                 break
                     if parent_symbol is not None:
-                        new_code, confidence, _surg_notes, _needed_imports = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
+                        new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                         diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
                         _tgt_elem, _replacement = _compute_target_element(parent_symbol.code, new_code)
                         # v3.3.1: injection guard
@@ -1070,7 +1050,7 @@ async def analyze_and_plan_stream(
                 changes.append(change)
                 continue
 
-            new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, target, file_content, user_id=user_id)
+            new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, target, file_content, user_id=user_id)
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
             _tgt_elem, _replacement = _compute_target_element(symbol.code, new_code)
 
@@ -1201,7 +1181,7 @@ Add "file_path" to each target object."""
                     break
             if symbol is None:
                 continue
-            new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, target, content, user_id=user_id)
+            new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, target, content, user_id=user_id)
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
             _tgt_elem, _replacement = _compute_target_element(symbol.code, new_code)
 
@@ -1343,7 +1323,7 @@ def analyze_and_plan(
                             parent_symbol = sym
                             break
                 if parent_symbol is not None:
-                    new_code, confidence, _surg_notes, _needed_imports = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
+                    new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                     diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
                     _tgt_elem, _replacement = _compute_target_element(parent_symbol.code, new_code)
                     # v3.3.1: injection guard
@@ -1388,7 +1368,7 @@ def analyze_and_plan(
             continue
 
         # Run surgeon to get replacement code
-        new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, target, file_content, user_id=user_id)
+        new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, target, file_content, user_id=user_id)
         diff = _make_diff(symbol.code, new_code, target.symbol_path)
         _tgt_elem3, _replacement3 = _compute_target_element(symbol.code, new_code)
 
@@ -2837,7 +2817,7 @@ USER REQUEST:
                     )
                     yield sse({"type": "progress", "content": f"Focused window: L{window_start}-{window_end} ({window_end - window_start + 1} lines)"})
 
-            new_code, confidence, _surg_notes, _needed_imports = run_surgeon(symbol, change_target, sf["content"], user_id=user_id)
+            new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, change_target, sf["content"], user_id=user_id)
             diff = _make_diff(symbol.code, new_code, symbol_path)
 
             # ── QA Agent: verify Surgeon output before showing to user ──
@@ -2867,32 +2847,22 @@ USER REQUEST:
                             output_summary=f"verdict={_qa_result.get('verdict')} score={_qa_result.get('qa_score')}")
 
             # v3.3.1: detect script injection truncation / phantom </script>
-            _tgt_elem_sm, _replacement_sm = _compute_target_element(symbol.code, new_code)
-            _inject_issue_sm, _injected_fn_sm = _is_script_injection_issue(symbol.code, new_code)
-            _insert_mode_sm = False
-            _insert_anchor_sm = None
-            if _inject_issue_sm and _injected_fn_sm:
-                _insert_anchor_sm = _find_script_close_line(sf["content"], symbol.end_line)
-                _insert_mode_sm = True
-                _tgt_elem_sm = None
-                _replacement_sm = _injected_fn_sm
-                new_code = symbol.code
+                        # v3.4.0: operations-based apply (search-and-replace)
+            from models.schemas import SurgicalOperation as _SO
+            _ops = [_SO(find=op.get("find",""), replace=op.get("replace","")) for op in _operations] if _operations else []
 
             change = SurgicalChange(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
                 original_code=symbol.code,
-                new_code=new_code if not _insert_mode_sm else symbol.code + "\n" + _injected_fn_sm,
+                new_code=new_code,
                 diff=diff,
                 confidence=confidence,
                 description=target.get("description", ""),
                 applied=False,
                 surgeon_notes=_surg_notes if _surg_notes else [],
                 qa_result=_qa_result,
-                target_element=_tgt_elem_sm,
-                replacement=_replacement_sm,
-                insert_mode=_insert_mode_sm,
-                insert_anchor=_insert_anchor_sm,
+                operations=_ops,
             )
 
             if matched_name not in changes_by_file:

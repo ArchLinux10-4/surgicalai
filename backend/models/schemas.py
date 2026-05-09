@@ -183,6 +183,12 @@ class QAResult(BaseModel):
     skipped_reason: Optional[str] = None
 
 
+class SurgicalOperation(BaseModel):
+    """A single search-and-replace operation. The backend applies these mechanically."""
+    find: str       # exact text to locate in the file (character-for-character)
+    replace: str    # replacement text
+
+
 class SurgicalChange(BaseModel):
     id: str
     symbol: SymbolInfo
@@ -194,12 +200,11 @@ class SurgicalChange(BaseModel):
     applied: bool = False
     surgeon_notes: List[str] = []
     qa_result: Optional[QAResult] = None
-    # Surgical apply targets — just the lines that actually change (not the full window).
-    # Used by apply_change() as primary match path — eliminates overlapping-window errors.
+    # v3.4.0: search-and-replace operations (primary apply path)
+    operations: List[SurgicalOperation] = []
+    # Legacy fields kept for backward compat (v3.3.x sessions still in DB)
     target_element: Optional[str] = None
     replacement: Optional[str] = None
-    # INSERT mode — used for safe script injection (avoids truncation of large blocks).
-    # When True, apply_change finds insert_anchor in the file and inserts replacement before it.
     insert_mode: bool = False
     insert_anchor: Optional[str] = None
 
