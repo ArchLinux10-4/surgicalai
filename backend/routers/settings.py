@@ -175,12 +175,7 @@ def verify_anthropic_key(body: dict, request: Request):
 
 
 
-@router.get("/gemini-status")
-def gemini_status(request: Request):
-    """Check if user has Gemini API key configured."""
-    user_id = get_current_user_id(request)
-    key = _resolve_api_key(user_id, "gemini")
-    return {"connected": bool(key)}
+# gemini-status endpoint defined below after verify-gemini-key
 
 @router.post("/verify-gemini-key")
 def verify_gemini_key(body: dict, request: Request):
