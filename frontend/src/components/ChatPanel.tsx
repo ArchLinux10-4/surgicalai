@@ -116,6 +116,17 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
     ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : ''
 
+  // Compact marker chip
+  if (msg.message_type === 'compact_marker') {
+    return (
+      <div className="flex items-center justify-center py-2 px-4">
+        <div className="flex items-center gap-1.5 px-3 py-1 bg-surface/60 border border-border/50 rounded-full">
+          <span className="text-[11px] text-muted/70">📦 Earlier conversation compacted</span>
+        </div>
+      </div>
+    )
+  }
+
   let surgicalResult: SmartResult | null = null
   if (isSurgical && msg.surgical_data) {
     try { surgicalResult = JSON.parse(msg.surgical_data) } catch {}
@@ -363,7 +374,7 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
       <div className="mt-6 w-full space-y-1.5 text-left">
         <div className="text-[10px] text-faint uppercase tracking-wider font-semibold mb-1">Keyboard shortcuts</div>
         {[
-          ['⌘↵', 'Send'], ['⌘K', 'Focus input'], ['⌘N', 'New chat'], ['Esc', 'Stop'],
+          ['⌘↵', 'Send'], ['⌘K', 'Focus input'], ['⌘N', 'New chat'], ['⌘P', 'Upload files'], ['Esc', 'Stop'],
         ].map(([key, desc]) => (
           <div key={key} className="flex items-center gap-2">
             <kbd className="px-1.5 py-0.5 rounded bg-surface border border-border text-[10px] font-mono text-muted">{key}</kbd>
@@ -393,6 +404,7 @@ export function ChatPanel() {
   const [progressHistory, setProgressHistory] = useState<string[]>([])
   const [thinkingText, setThinkingText] = useState('')
   const [isThinking, setIsThinking] = useState(false)
+  const [isCompacting, setIsCompacting] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -419,6 +431,7 @@ export function ChatPanel() {
     const handler = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); textareaRef.current?.focus() }
       if ((e.ctrlKey || e.metaKey) && e.key === 'n') { e.preventDefault(); newChat() }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'p') { e.preventDefault(); fileInputRef.current?.click() }
       if (e.key === 'Escape' && isStreaming) { abortRef.current?.abort(); stopStream() }
     }
     window.addEventListener('keydown', handler)
@@ -679,6 +692,22 @@ export function ChatPanel() {
         if (phase === 'start') { setIsThinking(true); setThinkingText('') }
         else if (phase === 'delta') { setThinkingText(prev => prev + text) }
         else if (phase === 'end') { setIsThinking(false) }
+      },
+      // onCompacting — rolling history compaction
+      (phase) => {
+        if (phase === 'start') {
+          setIsCompacting(true)
+        } else {
+          setIsCompacting(false)
+          addMessage({
+            id: Date.now().toString() + '_compact',
+            session_id: sessionId,
+            role: 'system' as any,
+            message_type: 'compact_marker',
+            content: '',
+            created_at: new Date().toISOString(),
+          })
+        }
       }
     )
 
@@ -746,6 +775,14 @@ export function ChatPanel() {
           </button>
         </div>
       </div>
+
+      {/* Compacting banner */}
+      {isCompacting && (
+        <div className="flex items-center justify-center gap-2 px-4 py-2 bg-blue-500/10 border-b border-blue-500/20 flex-shrink-0">
+          <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+          <span className="text-[12px] text-blue-400 font-medium">Compacting conversation history…</span>
+        </div>
+      )}
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto">
@@ -829,6 +866,27 @@ export function ChatPanel() {
           </div>
         )}
 
+        {/* Prompt templates — quick-start chips */}
+        {!isStreaming && (
+          <div className="mb-2.5 flex flex-wrap gap-1.5">
+            {[
+              { label: '🔍 Explain this', prompt: 'Explain what this code does in detail. Cover the logic, patterns used, and any potential issues.' },
+              { label: '🐛 Find bugs', prompt: 'Review this code for bugs, edge cases, and potential runtime errors. List each issue found.' },
+              { label: '🛡 Error handling', prompt: 'Add comprehensive error handling. Use specific exception types and handle edge cases.' },
+              { label: '🧪 Write tests', prompt: 'Write unit tests for this code. Cover happy path, edge cases, and error cases.' },
+              { label: '♻️ Refactor', prompt: 'Refactor this code for readability and maintainability. Improve naming and reduce complexity.' },
+            ].map(({ label, prompt }) => (
+              <button
+                key={label}
+                onClick={() => { setInput(prompt); textareaRef.current?.focus() }}
+                className="px-2.5 py-1 rounded-lg bg-surface/60 border border-border/60 text-[11px] text-muted hover:text-ink hover:border-border transition-colors"
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        )}
+
         {/* Unified input pill — Claude/Tasklet style */}
         <div className="relative bg-surface/80 border border-border/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-border focus-within:shadow-blue-500/5 transition-all">
           <textarea
@@ -836,10 +894,13 @@ export function ChatPanel() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKey}
+            disabled={isCompacting}
             placeholder={
-              hasFiles
-                ? `Ask about your ${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} — "Add X", "Fix Y", "Explain Z"…`
-                : 'Ask anything, or drop files here to edit code…'
+              isCompacting
+                ? 'Compacting history, please wait…'
+                : hasFiles
+                  ? `Ask about your ${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} — "Add X", "Fix Y", "Explain Z"…`
+                  : 'Ask anything, or drop files here to edit code…'
             }
             rows={1}
             onInput={(e) => {
@@ -875,9 +936,9 @@ export function ChatPanel() {
               ) : (
                 <button
                   onClick={handleSend}
-                  disabled={!input.trim()}
+                  disabled={!input.trim() || isCompacting}
                   className={`h-8 w-8 rounded-lg flex items-center justify-center transition-all ${
-                    !input.trim()
+                    !input.trim() || isCompacting
                       ? 'text-faint cursor-not-allowed'
                       : 'bg-blue-500 text-white hover:bg-blue-400 active:scale-95 shadow-sm shadow-blue-500/25'
                   }`}

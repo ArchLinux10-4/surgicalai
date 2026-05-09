@@ -84,6 +84,42 @@ function QABadge({ qa }: { qa: QAResult }) {
   )
 }
 
+function BlastRadius({ change }: { change: any }) {
+  const [open, setOpen] = useState(false)
+  const risks: string[] = [
+    ...(change.qa?.downstream_risks || []),
+    ...(change.qa?.import_issues || []),
+    ...(change.qa?.type_errors || []),
+  ].filter(Boolean)
+  if (!risks.length) return null
+  return (
+    <span className="relative">
+      <button
+        onClick={() => setOpen(o => !o)}
+        className="text-[11px] font-semibold px-2 py-0.5 rounded-full border text-amber-400 bg-amber-500/10 border-amber-500/30 cursor-pointer"
+        title="Blast radius"
+      >
+        🎯 {risks.length} risk{risks.length !== 1 ? 's' : ''}
+      </button>
+      {open && (
+        <div className="absolute left-0 top-6 z-50 w-72 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-xl p-3 text-[12px]">
+          <div className="flex items-center justify-between mb-2">
+            <span className="font-semibold text-amber-400">🎯 Blast Radius</span>
+            <button onClick={() => setOpen(false)} className="text-muted hover:text-ink">×</button>
+          </div>
+          <ul className="space-y-1">
+            {risks.map((r, i) => (
+              <li key={i} className="flex gap-1.5 text-amber-300/90 text-[11px]">
+                <span>•</span><span>{r}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </span>
+  )
+}
+
 function ConfidenceBadge({ score }: { score: number }) {
   const color = score >= 8 ? 'text-success bg-success/15 border-success/30'
     : score >= 6 ? 'text-warning bg-warning/15 border-warning/30'
@@ -387,6 +423,19 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     return originalCode.slice(0, idx) + next + originalCode.slice(idx + orig.length)
   }
 
+  // Cmd+Y: apply selected
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'y') {
+        e.preventDefault()
+        const btn = document.querySelector<HTMLButtonElement>('[data-apply-btn]')
+        if (btn && !btn.disabled) btn.click()
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [])
+
   const markApplied = (changeId: string) => {
     saveApplied(sessionId, changeId)
     setApplied(p => ({ ...p, [changeId]: true }))
@@ -583,6 +632,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 </span>
                 <ConfidenceBadge score={change.confidence} />
                 {change.qa_result && <QABadge qa={change.qa_result} />}
+                {change.qa_result && <BlastRadius change={{ qa: change.qa_result }} />}
                 {change.confidence < 7 && !isBlocked && (
                   <span className="flex items-center gap-1 text-[10px] text-warning">
                     <AlertTriangle size={10} /> Review
@@ -678,6 +728,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             {/* Apply Selected */}
             <button
               onClick={handleApplySelected}
+              data-apply-btn
               disabled={selectedChanges.length === 0 || applying}
               className="flex items-center gap-1.5 px-4 py-1.5 bg-success/15 text-success border border-success/30 rounded-lg text-[12px] font-semibold hover:bg-success/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               title={selectedChanges.length === 0 ? 'No changes selected — check at least one above' : `Apply ${selectedChanges.length} selected change${selectedChanges.length !== 1 ? 's' : ''}`}

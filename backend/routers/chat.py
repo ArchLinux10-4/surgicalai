@@ -83,6 +83,88 @@ def search_chats(request: Request, q: str):
     return list(results_dict.values())
 
 
+
+# ---------------------------------------------------------------------------
+# Rolling compaction helper
+# ---------------------------------------------------------------------------
+import openai as _openai_mod
+
+async def _compact_session(session_id: str, user_id: str) -> str:
+    """
+    Compact oldest 14 uncompacted messages into session_summary.
+    Uses GPT-4.1-mini (fast + cheap).
+    Returns the new summary string.
+    """
+    db = get_db()
+    try:
+        to_compact = db.execute(
+            "SELECT id, role, content FROM chat_messages "
+            "WHERE session_id = ? AND is_compacted = 0 "
+            "ORDER BY created_at ASC LIMIT 14",
+            (session_id,)
+        ).fetchall()
+        if not to_compact:
+            db.close()
+            return ""
+
+        session_row = db.execute(
+            "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        existing = (session_row["session_summary"] if session_row and session_row["session_summary"] else "") or ""
+
+        turns_text = "\n".join([
+            f"{dict(r).get('role','user').upper()}: {str(dict(r).get('content',''))[:600]}"
+            for r in to_compact
+        ])
+        prompt_parts = []
+        if existing:
+            prompt_parts.append(f"Previous summary:\n{existing}\n")
+        prompt_parts.append(f"New conversation turns to add:\n{turns_text}")
+
+        openai_key = get_setting("openai_api_key") or (get_user_api_key(user_id, "openai") if user_id else "")
+        if not openai_key:
+            db.close()
+            return existing
+
+        client = _openai_mod.AsyncOpenAI(api_key=openai_key)
+        resp = await client.chat.completions.create(
+            model="gpt-4.1-mini",
+            messages=[
+                {"role": "system", "content": (
+                    "Summarize this coding assistant conversation history. "
+                    "Focus on: what files were discussed, what code changes were made or planned, "
+                    "key decisions, and any patterns or conventions established. "
+                    "Be concise but complete. Under 400 words. Use bullet points."
+                )},
+                {"role": "user", "content": "\n".join(prompt_parts)}
+            ],
+            max_tokens=500,
+        )
+        new_summary = resp.choices[0].message.content or ""
+
+        ids = [dict(r)["id"] for r in to_compact]
+        placeholders = ",".join(["?" for _ in ids])
+        db.execute(
+            f"UPDATE chat_messages SET is_compacted = 1 WHERE id IN ({placeholders})",
+            ids
+        )
+        db.execute(
+            "UPDATE chat_sessions SET session_summary = ? WHERE id = ?",
+            (new_summary, session_id)
+        )
+        db.commit()
+        db.close()
+        return new_summary
+    except Exception as exc:
+        try:
+            db.rollback()
+            db.close()
+        except Exception:
+            pass
+        print(f"[compact] Error: {exc}")
+        return ""
+
+
 @router.get("/sessions")
 def list_sessions(request: Request):
     user_id = getattr(request.state, "user_id", None)
@@ -152,7 +234,7 @@ def send_message(req: ChatRequest):
     messages = [{"role": r["role"], "content": r["content"]} for r in history]
 
     # Get pinned context and project memory
-    workspace = get_setting("workspace_path", "")
+    workspace = session_id  # Use session_id as workspace for per-session memory
     pinned_rows = conn.execute(
         "SELECT * FROM pinned_context WHERE workspace_path = ?", (workspace,)
     ).fetchall() if workspace else []
@@ -229,7 +311,7 @@ async def stream_message(req: ChatRequest):
     messages = [{"role": r["role"], "content": r["content"]} for r in history]
 
     # Get pinned context and memory
-    workspace = get_setting("workspace_path", "")
+    workspace = session_id  # Use session_id as workspace for per-session memory
     pinned_rows = conn.execute(
         "SELECT * FROM pinned_context WHERE workspace_path = ?", (workspace,)
     ).fetchall() if workspace else []
@@ -341,9 +423,22 @@ async def smart_stream(req: dict, request: Request):
         (msg_id, session_id, "user", message)
     )
 
-    # Get conversation history
+    # Check if compaction is needed (>= 20 uncompacted messages)
+    uc_count = conn.execute(
+        "SELECT COUNT(*) FROM chat_messages WHERE session_id = ? AND is_compacted = 0",
+        (session_id,)
+    ).fetchone()
+    needs_compaction = int(list(uc_count.values())[0] if hasattr(uc_count, 'values') else uc_count[0]) >= 20
+
+    # Load session_summary
+    sess_row = conn.execute(
+        "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
+
+    # Get conversation history — only uncompacted messages
     history = conn.execute(
-        "SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
+        "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 ORDER BY created_at ASC",
         (session_id,)
     ).fetchall()
     conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
@@ -355,11 +450,10 @@ async def smart_stream(req: dict, request: Request):
     ).fetchall()
     session_files = [dict(r) for r in file_rows]
 
-    # Project memory
-    workspace = get_setting("workspace_path", "")
+    # Project memory — keyed by session_id for cloud users (workspacePath is per-session)
     memory_row = conn.execute(
-        "SELECT content FROM project_memory WHERE workspace_path = ? LIMIT 1", (workspace,)
-    ).fetchone() if workspace else None
+        "SELECT content FROM project_memory WHERE workspace_path = ? LIMIT 1", (session_id,)
+    ).fetchone() if session_id else None
     project_memory = memory_row["content"] if memory_row else None
 
     conn.commit()
@@ -368,6 +462,18 @@ async def smart_stream(req: dict, request: Request):
     async def stream_and_save():
         collected_tokens = []
         result_content = None
+        current_summary = session_summary
+
+        # --- Rolling compaction ---
+        if needs_compaction:
+            yield "data: " + __import__("json").dumps({"type": "compacting", "content": "Compacting conversation history..."}) + "\n\n"
+            try:
+                new_sum = await _compact_session(session_id, current_user_id)
+                if new_sum:
+                    current_summary = new_sum
+            except Exception as _ce:
+                print(f"[compact] failed: {_ce}")
+            yield "data: " + __import__("json").dumps({"type": "compacting_done", "content": "History compacted"}) + "\n\n"
 
         async for chunk in run_smart_pipeline_stream(
             session_files=session_files,
@@ -375,6 +481,7 @@ async def smart_stream(req: dict, request: Request):
             conversation_history=conversation_history,
             session_id=session_id,
             project_memory=project_memory,
+            session_summary=current_summary,
             user_id=current_user_id,
         ):
             if chunk.startswith("data: "):

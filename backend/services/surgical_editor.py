@@ -143,8 +143,10 @@ def apply_operations(
                 continue
 
             raise ValueError(
-                f"Cannot find target text in file (search-and-replace failed). "
-                f"Text not found: {find_text[:120]}..."
+                f"Couldn't find the exact code to modify. This usually means the file was "
+                f"edited since it was uploaded, or there's a minor whitespace difference. "
+                f"Looking for: `{find_text[:80].strip()}...` "
+                f"Try re-uploading the latest version of the file and asking again."
             )
 
         # Apply the replacement

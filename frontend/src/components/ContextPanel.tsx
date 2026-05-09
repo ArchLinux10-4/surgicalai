@@ -6,7 +6,7 @@ import { Pin, Trash2, Save, Check, BookOpen } from 'lucide-react'
 import type { PinnedContext } from '../types'
 
 export function ContextPanel() {
-  const { workspacePath, activeFile } = useAppStore()
+  const { activeSessions, activeFile } = useAppStore()
   const [pins, setPins] = useState<PinnedContext[]>([])
   const [memory, setMemory] = useState('')
   const [savedMemory, setSavedMemory] = useState('')
@@ -15,18 +15,18 @@ export function ContextPanel() {
   const [saveDone, setSaveDone] = useState(false)
 
   useEffect(() => {
-    if (!workspacePath) return
-    api.context.getPins(workspacePath).then(setPins).catch(() => {})
-    api.context.getMemory(workspacePath).then((m) => {
+    if (!activeSessions) return
+    api.context.getPins(activeSessions).then(setPins).catch(() => {})
+    api.context.getMemory(activeSessions).then((m) => {
       setMemory(m.content); setSavedMemory(m.content)
     }).catch(() => {})
-  }, [workspacePath])
+  }, [activeSessions])
 
   const pinCurrentFile = async () => {
-    if (!activeFile || !workspacePath) return
+    if (!activeFile || !activeSessions) return
     try {
-      await api.context.addPin({ workspace_path: workspacePath, file_path: activeFile.path })
-      api.context.getPins(workspacePath).then(setPins)
+      await api.context.addPin({ workspace_path: activeSessions, file_path: activeFile.path })
+      api.context.getPins(activeSessions).then(setPins)
       toast.success('File pinned to context')
     } catch (e: any) {
       toast.error('Pin failed', e.message)
@@ -39,10 +39,10 @@ export function ContextPanel() {
   }
 
   const saveMemory = async () => {
-    if (!workspacePath) return
+    if (!activeSessions) return
     setSaving(true)
     try {
-      await api.context.saveMemory({ workspace_path: workspacePath, content: memory })
+      await api.context.saveMemory({ workspace_path: activeSessions, content: memory })
       setSavedMemory(memory); setSaveDone(true)
       setTimeout(() => setSaveDone(false), 2500)
       toast.success('Project memory saved')

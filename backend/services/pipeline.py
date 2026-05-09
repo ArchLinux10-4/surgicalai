@@ -38,7 +38,7 @@ parser = ASTParser()
 NO_TEMPERATURE_MODELS = {"gpt-5", "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"}
 
 # ── Prompt engineering constants ──────────────────────────────────────────────
-HISTORY_WINDOW       = 10   # turns of conversation history passed to every prompt
+HISTORY_WINDOW       = 20   # turns of conversation history passed to every prompt
 TEXT_SEARCH_WINDOW   = 75   # ±lines around a text hit when no symbol contains the line
 SYMBOL_FOCUS_WINDOW  = 100  # ±lines to slice when a symbol is huge but text is inside it
 
@@ -1969,6 +1969,7 @@ async def run_smart_pipeline_stream(
     conversation_history: list,
     session_id: str = None,
     project_memory: str = None,
+    session_summary: str = "",
     user_id: str = "",
 ):
     """
@@ -2017,6 +2018,8 @@ When you DO generate code:
 Be warm, friendly, and encouraging. You're helping a person build something real."""
             if project_memory:
                 system += f"\n\n## Project Memory\n{project_memory}"
+            if session_summary:
+                system += f"\n\n## Earlier Conversation Summary\n{session_summary}"
             msgs = [{"role": "system", "content": system}] + conversation_history[-HISTORY_WINDOW:] + [{"role": "user", "content": user_request}]
 
             if _is_claude_model(chat_model):
@@ -2163,7 +2166,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
             _hrole = _hmsg.get("role", "user")
             if _hrole not in ("user", "assistant"):
                 _hrole = "user"
-            _hcontent = str(_hmsg.get("content", ""))[:2000]
+            _hcontent = str(_hmsg.get("content", ""))[:4000]
             if _hcontent.strip():
                 _arch_history_msgs.append({"role": _hrole, "content": _hcontent})
 
@@ -2176,6 +2179,8 @@ USER REQUEST:
 
         if project_memory:
             context_msg = f"PROJECT MEMORY:\n{project_memory}\n\n" + context_msg
+        if session_summary:
+            context_msg = f"EARLIER CONVERSATION SUMMARY (compacted history before recent turns):\n{session_summary}\n\n" + context_msg
 
         arch_model = get_setting("architect_model", "gpt-4.1")
 

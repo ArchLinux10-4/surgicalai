@@ -160,7 +160,8 @@ export const api = {
       onResult: (result: any) => void,
       onDone: (fullText: string) => void,
       onError: (err: string) => void,
-      onThinking?: (text: string, phase: 'start' | 'delta' | 'end') => void
+      onThinking?: (text: string, phase: 'start' | 'delta' | 'end') => void,
+      onCompacting?: (phase: 'start' | 'done') => void
     ): AbortController => {
       const controller = new AbortController()
       const tokens: string[] = []
@@ -189,6 +190,8 @@ export const api = {
             else if (chunk.type === 'thinking_start') onThinking?.('', 'start')
             else if (chunk.type === 'thinking') onThinking?.(chunk.content, 'delta')
             else if (chunk.type === 'thinking_end') onThinking?.('', 'end')
+            else if (chunk.type === 'compacting') onCompacting?.('start')
+            else if (chunk.type === 'compacting_done') onCompacting?.('done')
           } catch {}
         }
 

@@ -176,6 +176,7 @@ def _init_sqlite():
             title TEXT NOT NULL DEFAULT 'New Chat',
             file_path TEXT,
             model TEXT DEFAULT 'gpt-4.1',
+            session_summary TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -187,6 +188,7 @@ def _init_sqlite():
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             metadata TEXT DEFAULT '{}',
+            is_compacted INTEGER DEFAULT 0,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
         )
@@ -270,6 +272,13 @@ def _init_sqlite():
     existing_cols = [row[1] for row in cur.execute("PRAGMA table_info(chat_sessions)").fetchall()]
     if "user_id" not in existing_cols:
         cur.execute("ALTER TABLE chat_sessions ADD COLUMN user_id TEXT REFERENCES users(id) ON DELETE SET NULL")
+    if "session_summary" not in existing_cols:
+        cur.execute("ALTER TABLE chat_sessions ADD COLUMN session_summary TEXT DEFAULT ''")
+
+    # Migration: add is_compacted to chat_messages if missing
+    cm_cols = [row[1] for row in cur.execute("PRAGMA table_info(chat_messages)").fetchall()]
+    if "is_compacted" not in cm_cols:
+        cur.execute("ALTER TABLE chat_messages ADD COLUMN is_compacted INTEGER DEFAULT 0")
 
     # Migration: add file_type to session_files if missing
     sf_cols = [row[1] for row in cur.execute("PRAGMA table_info(session_files)").fetchall()]
@@ -370,6 +379,7 @@ def _init_postgres():
                 file_path TEXT,
                 model TEXT DEFAULT 'gpt-4.1',
                 user_id TEXT,
+                session_summary TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -382,6 +392,7 @@ def _init_postgres():
                 role TEXT NOT NULL,
                 content TEXT NOT NULL,
                 metadata TEXT DEFAULT '{}',
+                is_compacted INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (session_id) REFERENCES chat_sessions(id) ON DELETE CASCADE
             )
@@ -480,6 +491,12 @@ def _init_postgres():
         """)
         conn.execute("""
             ALTER TABLE session_files ADD COLUMN IF NOT EXISTS updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        """)
+        conn.execute("""
+            ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS session_summary TEXT DEFAULT ''
+        """)
+        conn.execute("""
+            ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS is_compacted INTEGER DEFAULT 0
         """)
         conn.commit()
 
