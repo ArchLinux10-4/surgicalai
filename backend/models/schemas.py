@@ -278,7 +278,8 @@ class PinnedContext(BaseModel):
     created_at: str
 
 class PinRequest(BaseModel):
-    workspace_path: str
+    session_id: Optional[str] = None
+    workspace_path: Optional[str] = None
     file_path: str
     symbol_path: Optional[str] = None
     label: Optional[str] = None

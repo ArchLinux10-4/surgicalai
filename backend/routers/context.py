@@ -17,11 +17,14 @@ router = APIRouter()
 # ─── Context Pinning ──────────────────────────────────────────────────────────
 
 @router.get("/pins")
-def get_pins(workspace_path: str):
+def get_pins(session_id: str = None, workspace_path: str = None):
+    key = session_id or workspace_path
+    if not key:
+        raise HTTPException(status_code=422, detail="session_id or workspace_path required")
     conn = get_db()
     rows = conn.execute(
         "SELECT * FROM pinned_context WHERE workspace_path = ? ORDER BY created_at DESC",
-        (workspace_path,)
+        (key,)
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -35,11 +38,12 @@ def add_pin(req: PinRequest):
     except Exception as e:
         raise HTTPException(status_code=404, detail=f"Cannot read file: {e}")
 
+    key = req.session_id or req.workspace_path or ""
     pin_id = str(uuid.uuid4())
     conn = get_db()
     conn.execute(
         "INSERT INTO pinned_context (id, workspace_path, file_path, symbol_path, label) VALUES (?, ?, ?, ?, ?)",
-        (pin_id, req.workspace_path, req.file_path, req.symbol_path, req.label or req.file_path.split('/')[-1])
+        (pin_id, key, req.file_path, req.symbol_path, req.label or req.file_path.split('/')[-1])
     )
     conn.commit()
     conn.close()
@@ -56,34 +60,38 @@ def remove_pin(pin_id: str):
 # ─── Project Memory ───────────────────────────────────────────────────────────
 
 @router.get("/memory")
-def get_memory(workspace_path: str):
+def get_memory(session_id: str = None, workspace_path: str = None):
+    key = session_id or workspace_path
+    if not key:
+        raise HTTPException(status_code=422, detail="session_id or workspace_path required")
     conn = get_db()
     row = conn.execute(
         "SELECT * FROM project_memory WHERE workspace_path = ? ORDER BY updated_at DESC LIMIT 1",
-        (workspace_path,)
+        (key,)
     ).fetchone()
     conn.close()
     if not row:
-        return {"workspace_path": workspace_path, "content": "", "id": None}
+        return {"workspace_path": key, "content": "", "id": None}
     return dict(row)
 
 @router.post("/memory")
 def save_memory(req: ProjectMemory):
+    key = req.session_id or req.workspace_path or ""
     conn = get_db()
     existing = conn.execute(
         "SELECT id FROM project_memory WHERE workspace_path = ?",
-        (req.workspace_path,)
+        (key,)
     ).fetchone()
 
     if existing:
         conn.execute(
             "UPDATE project_memory SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE workspace_path = ?",
-            (req.content, req.workspace_path)
+            (req.content, key)
         )
     else:
         conn.execute(
             "INSERT INTO project_memory (id, workspace_path, content) VALUES (?, ?, ?)",
-            (str(uuid.uuid4()), req.workspace_path, req.content)
+            (str(uuid.uuid4()), key, req.content)
         )
     conn.commit()
     conn.close()
