@@ -81,6 +81,14 @@ def get_available_models(request: Request):
             {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "role": "architect", "description": "Most capable Claude — deep reasoning with extended thinking", "provider": "anthropic"},
         ]
 
+    gemini_models = []
+    if _resolve_api_key(user_id, "gemini"):
+        gemini_models = [
+            {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro", "role": "architect", "description": "1M context window — best for huge files, with visible thinking", "provider": "gemini"},
+            {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "role": "architect", "description": "Fast + affordable — great for large files with thinking", "provider": "gemini"},
+            {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash", "role": "surgeon", "description": "Fastest Gemini — great for quick edits", "provider": "gemini"},
+        ]
+
     ollama_models = []
     if get_setting("ollama_enabled", "false") == "true":
         try:
@@ -96,7 +104,7 @@ def get_available_models(request: Request):
             pass
 
     return {
-        "models": openai_models + claude_models + ollama_models,
+        "models": openai_models + claude_models + gemini_models + ollama_models,
         "pipeline_modes": [
             {"id": "auto", "name": "Auto Pipeline", "description": "Architect plans, Surgeon executes (recommended)"},
             {"id": "single", "name": "Single Model", "description": "Use one model for everything"},
@@ -164,6 +172,42 @@ def verify_anthropic_key(body: dict, request: Request):
         if "authentication" in err_msg.lower() or "api key" in err_msg.lower() or "401" in err_msg:
             raise HTTPException(status_code=401, detail="Invalid Anthropic API key")
         raise HTTPException(status_code=500, detail=f"Verification failed: {err_msg}")
+
+
+@router.post("/verify-gemini-key")
+def verify_gemini_key(body: dict, request: Request):
+    """Test Google Gemini API key, encrypt + store per-user."""
+    key = body.get("key", "")
+    if not key:
+        raise HTTPException(status_code=400, detail="No key provided")
+    try:
+        import httpx
+        # Quick test call using OpenAI-compat endpoint
+        from openai import OpenAI
+        gclient = OpenAI(
+            api_key=key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+        gclient.models.list()
+        user_id = _get_user_id(request)
+        if user_id:
+            encrypted = encrypt_api_key(key)
+            set_user_api_key(user_id, "gemini", encrypted)
+        set_setting("gemini_api_key", key)
+        return {"ok": True, "message": "Gemini API key verified and saved"}
+    except Exception as e:
+        err = str(e).lower()
+        if "401" in str(e) or "invalid" in err or "api_key" in err:
+            raise HTTPException(status_code=401, detail="Invalid Gemini API key")
+        raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)[:200]}")
+
+
+@router.get("/gemini-status")
+def gemini_status(request: Request):
+    """Check if Gemini API key is configured for this user."""
+    user_id = _get_user_id(request)
+    key = _resolve_api_key(user_id, "gemini")
+    return {"configured": bool(key)}
 
 
 @router.post("/test-ollama")

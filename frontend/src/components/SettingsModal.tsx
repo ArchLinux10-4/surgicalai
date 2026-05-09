@@ -32,6 +32,12 @@ export function SettingsModal() {
   const [anthropicVerifying, setAnthropicVerifying] = useState(false)
   const [anthropicStatus, setAnthropicStatus] = useState<'idle' | 'ok' | 'error'>('idle')
   const [anthropicMessage, setAnthropicMessage] = useState('')
+  const [geminiKey, setGeminiKey] = useState('')
+  const [showGeminiKey, setShowGeminiKey] = useState(false)
+  const [geminiVerifying, setGeminiVerifying] = useState(false)
+  const [geminiStatus, setGeminiStatus] = useState<'idle' | 'ok' | 'error'>('idle')
+  const [geminiMessage, setGeminiMessage] = useState('')
+  const [geminiConnected, setGeminiConnected] = useState(false)
   const [githubPat, setGithubPat] = useState('')
   const [showGithubPat, setShowGithubPat] = useState(false)
   const [githubConnecting, setGithubConnecting] = useState(false)
@@ -72,7 +78,27 @@ export function SettingsModal() {
     }
     api.settings.getModels().then((d) => setModels(d.models || [])).catch(() => {})
     ;(api as any).github.status().then((s: any) => setGithubStatus(s)).catch(() => {})
+    ;(api as any).settings.geminiStatus().then((s: any) => setGeminiConnected(s?.connected || false)).catch(() => {})
   }, [settings, settingsOpen])
+
+  const handleVerifyGeminiKey = async () => {
+    if (!geminiKey.trim()) return
+    setGeminiVerifying(true)
+    setGeminiStatus('idle')
+    setGeminiMessage('')
+    try {
+      const res: any = await (api as any).settings.verifyGeminiKey(geminiKey.trim())
+      setGeminiStatus('ok')
+      setGeminiMessage(res.message || 'Gemini API key verified!')
+      setGeminiConnected(true)
+      setGeminiKey('')
+    } catch (e: any) {
+      setGeminiStatus('error')
+      setGeminiMessage(e.message || 'Invalid Gemini API key')
+    } finally {
+      setGeminiVerifying(false)
+    }
+  }
 
   const handleConnectGithub = async () => {
     if (!githubPat.trim()) return
@@ -316,6 +342,59 @@ export function SettingsModal() {
                         console.anthropic.com
                       </a>
                       {' '}— enables Claude Sonnet 4 & Opus 4 with visible thinking
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── Google Gemini Key ── */}
+                <div className="mt-6 pt-5 border-t border-border">
+                  <SectionHeader title="Google Gemini API Key" subtitle="Enables Gemini 2.5 Pro/Flash — 1M context window with visible thinking" />
+                  <div className="mt-3">
+                    <div className="flex gap-2">
+                      <div className="relative flex-1">
+                        <input
+                          type={showGeminiKey ? 'text' : 'password'}
+                          value={geminiKey}
+                          onChange={(e) => { setGeminiKey(e.target.value); setGeminiStatus('idle') }}
+                          onPaste={(e) => {
+                            e.preventDefault()
+                            const pasted = e.clipboardData.getData('text').trim()
+                            if (pasted) { setGeminiKey(pasted); setGeminiStatus('idle') }
+                          }}
+                          placeholder={geminiConnected ? '••••••••••••••••••' : 'AIza…'}
+                          className={`input pr-10 ${geminiStatus === 'ok' ? 'border-success focus:border-success' : geminiStatus === 'error' ? 'border-danger' : ''}`}
+                          onKeyDown={(e) => e.key === 'Enter' && handleVerifyGeminiKey()}
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                        <button
+                          onClick={() => setShowGeminiKey(!showGeminiKey)}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-faint hover:text-muted"
+                        >
+                          {showGeminiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                        </button>
+                      </div>
+                      <button
+                        onClick={handleVerifyGeminiKey}
+                        disabled={geminiVerifying || !geminiKey.trim()}
+                        className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {geminiVerifying ? '…' : 'Verify'}
+                      </button>
+                    </div>
+                    {geminiConnected && geminiStatus === 'idle' && (
+                      <div className="flex items-center gap-1.5 mt-2 text-success text-xs">
+                        <CheckCircle size={12} /> Gemini API key configured
+                      </div>
+                    )}
+                    {geminiStatus === 'ok' && <div className="text-success text-xs mt-2">{geminiMessage}</div>}
+                    {geminiStatus === 'error' && <div className="text-danger text-xs mt-2">{geminiMessage}</div>}
+                    <div className="text-[11px] text-faint mt-2">
+                      Get your key at{' '}
+                      <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener" className="text-accent hover:underline">
+                        aistudio.google.com
+                      </a>
+                      {' '}— enables Gemini 2.5 Pro (1M context) and Gemini 2.5 Flash
                     </div>
                   </div>
                 </div>

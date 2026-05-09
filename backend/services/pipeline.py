@@ -32,6 +32,15 @@ try:
 except ImportError:
     HAS_ANTHROPIC = False
 
+try:
+    from google import genai as _google_genai
+    from google.genai import types as _google_types
+    HAS_GOOGLE_GENAI = True
+except ImportError:
+    _google_genai = None
+    _google_types = None
+    HAS_GOOGLE_GENAI = False
+
 parser = ASTParser()
 
 # Models that do NOT accept a temperature parameter (reasoning / latest-gen models)
@@ -54,6 +63,11 @@ CHAT_PERSONA = (
 def _is_claude_model(model: str) -> bool:
     """Check if a model ID is a Claude/Anthropic model."""
     return bool(model and model.startswith("claude-"))
+
+
+def _is_gemini_model(model: str) -> bool:
+    """Check if a model ID is a Gemini/Google model."""
+    return bool(model and (model.startswith("gemini-") or model.startswith("models/gemini")))
 
 
 # Models confirmed to support extended thinking (budget_tokens).
@@ -210,10 +224,13 @@ def _grep_relevant_sections(
     return header + "\n\n".join(output_parts)
 
 def _supports_thinking(model: str) -> bool:
-    """Return True only for Claude models that support extended thinking."""
-    if not _is_claude_model(model):
-        return False
-    return any(model.startswith(p) or p in model for p in _THINKING_CAPABLE_PATTERNS)
+    """Return True for models that support extended thinking blocks."""
+    if _is_claude_model(model):
+        return any(model.startswith(p) or p in model for p in _THINKING_CAPABLE_PATTERNS)
+    if _is_gemini_model(model):
+        # Gemini 2.5+ models support thinking
+        return "gemini-2.5" in model
+    return False
 
 
 def _resolve_key(user_id: str, key_type: str) -> str:
@@ -257,6 +274,17 @@ def _friendly_error(e: Exception) -> str:
         if "invalid" in low and "key" in low:
             return "Your Anthropic API key appears to be invalid. Check **Settings → API Keys**."
 
+    # Gemini-specific errors
+    if "google" in cls or "gemini" in low or "generativelanguage" in low:
+        if "api_key" in low or "invalid" in low or "401" in msg:
+            return "Your Google Gemini API key appears to be invalid. Check **Settings → API Keys**."
+        if "quota" in low or "429" in msg:
+            return "You've hit the Gemini API quota. Wait a moment and try again."
+        if "safety" in low or "blocked" in low:
+            return "Gemini blocked this request due to safety filters. Try rephrasing your request."
+        if "not found" in low or "404" in msg:
+            return "This Gemini model isn't available. Try a different model in Settings."
+
     # OpenAI-specific errors
     if "openai" in cls or ("openai" in low and ("error" in low or "429" in msg or "500" in msg)):
         if "rate_limit" in low or "429" in msg:
@@ -297,6 +325,35 @@ def _get_client(user_id: str = "") -> OpenAI:
     if not key:
         raise ValueError("OpenAI API key not configured. Go to Settings to add your key.")
     return OpenAI(api_key=key)
+
+
+def _get_gemini_key(user_id: str = "") -> str:
+    """Resolve Gemini/Google API key for user."""
+    if user_id:
+        encrypted = get_user_api_key(user_id, "gemini")
+        if encrypted:
+            try:
+                return decrypt_api_key(encrypted)
+            except Exception:
+                pass
+    key = get_setting("gemini_api_key", "")
+    if not key:
+        raise ValueError("Google Gemini API key not configured. Go to Settings → API Keys to add it.")
+    return key
+
+
+def _get_client_for_model(model: str, user_id: str = "") -> OpenAI:
+    """Return an OpenAI-compatible client for the given model.
+    Gemini models use Google's OpenAI-compat endpoint.
+    All other models use the standard OpenAI endpoint.
+    """
+    if _is_gemini_model(model):
+        key = _get_gemini_key(user_id)
+        return OpenAI(
+            api_key=key,
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+        )
+    return _get_client(user_id)
 
 
 def _compute_target_element(original: str, new_code: str):
@@ -489,9 +546,9 @@ def run_architect(
     GPT-5 (Architect): reads symbol map + request → produces structured change plan.
     Never sees raw code — works from the symbol map for efficiency and accuracy.
     """
-    client = _get_client(user_id)
     arch_model = model or get_setting("architect_model", "gpt-4.1")
     temp = float(get_setting("temperature_architect", "0.3"))
+    client = _get_client_for_model(arch_model, user_id)
 
     # Build a compact symbol map summary (not the raw code)
     symbol_summary = []
@@ -739,6 +796,7 @@ def run_surgeon(
     client = _get_client(user_id)
     surg_model = model or get_setting("surgeon_model", "gpt-4.1")
     temp = float(get_setting("temperature_surgeon", "0.1"))
+    client = _get_client_for_model(surg_model, user_id)
 
     # Context around the symbol (reference only)
     all_lines = file_content.splitlines()
@@ -980,23 +1038,94 @@ async def run_chat_stream(
     all_messages = [{"role": "system", "content": system_prompt}] + messages
 
     try:
-        if _should_use_ollama(chat_model):
-            # Ollama streaming
+        if _is_gemini_model(chat_model) and HAS_GOOGLE_GENAI:
+            # ── Gemini streaming with native thinking blocks ──
+            gemini_key = _get_gemini_key(user_id)
+            gclient = _google_genai.Client(api_key=gemini_key)
+            system_text = next((m["content"] for m in all_messages if m["role"] == "system"), "")
+            gemini_contents = [
+                {"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]}
+                for m in all_messages if m["role"] != "system"
+            ]
+            thinking_cfg = None
+            if _supports_thinking(chat_model):
+                thinking_cfg = _google_types.ThinkingConfig(thinking_budget=10000)
+            gcfg = _google_types.GenerateContentConfig(
+                system_instruction=system_text or None,
+                thinking_config=thinking_cfg,
+            )
+            in_thinking = False
+            async for gchunk in await gclient.aio.models.generate_content_stream(
+                model=chat_model, contents=gemini_contents, config=gcfg
+            ):
+                for gpart in (gchunk.candidates or [{}])[0].content.parts if (gchunk.candidates and gchunk.candidates[0].content) else []:
+                    is_thought = getattr(gpart, "thought", False)
+                    if is_thought:
+                        if not in_thinking:
+                            yield sse({"type": "thinking_start", "content": ""})
+                            in_thinking = True
+                        if gpart.text:
+                            yield sse({"type": "thinking", "content": gpart.text})
+                    else:
+                        if in_thinking:
+                            yield sse({"type": "thinking_end", "content": ""})
+                            in_thinking = False
+                        if gpart.text:
+                            yield f"data: {json.dumps({'type': 'token', 'content': gpart.text})}\n\n"
+            if in_thinking:
+                yield sse({"type": "thinking_end", "content": ""})
+        elif _is_gemini_model(chat_model):
+            # Fallback: Gemini via OpenAI-compat (no native thinking)
+            gclient_oai = _get_client_for_model(chat_model, user_id)
+            stream = _chat_create(gclient_oai, model=chat_model, messages=all_messages,
+                                  temperature=float(get_setting("temperature_architect", "0.3")), stream=True)
+            for chunk in stream:
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    yield f"data: {json.dumps({'type': 'token', 'content': delta.content})}\n\n"
+        elif _should_use_ollama(chat_model):
+            # ── Ollama streaming with <think> tag parsing for reasoning models ──
             base_url = get_setting("ollama_base_url", "http://localhost:11434")
             ollama_model = chat_model.replace("ollama:", "") if chat_model.startswith("ollama:") else get_setting("ollama_model", "qwen2.5-coder:7b")
+            in_thinking = False
             with httpx.stream("POST", f"{base_url}/api/chat", json={"model": ollama_model, "messages": all_messages, "stream": True}, timeout=120) as resp:
                 for line in resp.iter_lines():
                     if line:
                         try:
                             data = json.loads(line)
                             token = data.get("message", {}).get("content", "")
-                            if token:
-                                yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                            while token:
+                                if not in_thinking:
+                                    ts = token.find("<think>")
+                                    if ts != -1:
+                                        before = token[:ts]
+                                        if before:
+                                            yield f"data: {json.dumps({'type': 'token', 'content': before})}\n\n"
+                                        yield sse({"type": "thinking_start", "content": ""})
+                                        in_thinking = True
+                                        token = token[ts + 7:]
+                                    else:
+                                        yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+                                        token = ""
+                                else:
+                                    te = token.find("</think>")
+                                    if te != -1:
+                                        tc = token[:te]
+                                        if tc:
+                                            yield sse({"type": "thinking", "content": tc})
+                                        yield sse({"type": "thinking_end", "content": ""})
+                                        in_thinking = False
+                                        token = token[te + 8:]
+                                    else:
+                                        yield sse({"type": "thinking", "content": token})
+                                        token = ""
                         except Exception:
                             pass
+            if in_thinking:
+                yield sse({"type": "thinking_end", "content": ""})
         else:
             client = _get_client(user_id)
-            stream = _chat_create(client, 
+            stream = _chat_create(client,
                 model=chat_model,
                 messages=all_messages,
                 temperature=float(get_setting("temperature_architect", "0.3")),
@@ -2042,7 +2171,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 async with aclient.messages.stream(
                     model=chat_model,
                     max_tokens=16000,
-                    **({"thinking": {"type": "enabled", "budget_tokens": 10000}} if _supports_thinking(chat_model) else {}),
+                    **(({"thinking": {"type": "enabled", "budget_tokens": 10000}}) if _supports_thinking(chat_model) else {}),
                     system=system,
                     messages=claude_msgs,
                 ) as astream:
@@ -2060,6 +2189,85 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                         elif event.type == "content_block_stop":
                             if current_block == "thinking":
                                 yield sse({"type": "thinking_end", "content": ""})
+                yield sse({"type": "done", "content": ""})
+                return
+            elif _is_gemini_model(chat_model) and HAS_GOOGLE_GENAI:
+                # ── Gemini streaming with thinking blocks ──
+                gemini_key = _get_gemini_key(user_id)
+                gclient = _google_genai.Client(api_key=gemini_key)
+                gemini_msgs = [
+                    {"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]}
+                    for m in msgs if m["role"] != "system"
+                ]
+                thinking_cfg = _google_types.ThinkingConfig(thinking_budget=10000) if _supports_thinking(chat_model) else None
+                gcfg = _google_types.GenerateContentConfig(
+                    system_instruction=system or None,
+                    thinking_config=thinking_cfg,
+                )
+                in_thinking = False
+                async for gchunk in await gclient.aio.models.generate_content_stream(
+                    model=chat_model, contents=gemini_msgs, config=gcfg
+                ):
+                    for gpart in (gchunk.candidates or [{}])[0].content.parts if (gchunk.candidates and gchunk.candidates[0].content) else []:
+                        is_thought = getattr(gpart, "thought", False)
+                        if is_thought:
+                            if not in_thinking:
+                                yield sse({"type": "thinking_start", "content": ""})
+                                in_thinking = True
+                            if gpart.text:
+                                yield sse({"type": "thinking", "content": gpart.text})
+                        else:
+                            if in_thinking:
+                                yield sse({"type": "thinking_end", "content": ""})
+                                in_thinking = False
+                            if gpart.text:
+                                yield sse({"type": "token", "content": gpart.text})
+                if in_thinking:
+                    yield sse({"type": "thinking_end", "content": ""})
+                yield sse({"type": "done", "content": ""})
+                return
+            elif _should_use_ollama(chat_model):
+                # ── Ollama streaming with <think> tag parsing ──
+                base_url = get_setting("ollama_base_url", "http://localhost:11434")
+                ollama_model = chat_model.replace("ollama:", "") if chat_model.startswith("ollama:") else get_setting("ollama_model", "qwen2.5-coder:7b")
+                in_thinking = False
+                with httpx.stream("POST", f"{base_url}/api/chat",
+                                  json={"model": ollama_model, "messages": msgs[-HISTORY_WINDOW:], "stream": True},
+                                  timeout=120) as resp:
+                    for line in resp.iter_lines():
+                        if line:
+                            try:
+                                data = json.loads(line)
+                                token = data.get("message", {}).get("content", "")
+                                while token:
+                                    if not in_thinking:
+                                        ts = token.find("<think>")
+                                        if ts != -1:
+                                            before = token[:ts]
+                                            if before:
+                                                yield sse({"type": "token", "content": before})
+                                            yield sse({"type": "thinking_start", "content": ""})
+                                            in_thinking = True
+                                            token = token[ts + 7:]
+                                        else:
+                                            yield sse({"type": "token", "content": token})
+                                            token = ""
+                                    else:
+                                        te = token.find("</think>")
+                                        if te != -1:
+                                            tc = token[:te]
+                                            if tc:
+                                                yield sse({"type": "thinking", "content": tc})
+                                            yield sse({"type": "thinking_end", "content": ""})
+                                            in_thinking = False
+                                            token = token[te + 8:]
+                                        else:
+                                            yield sse({"type": "thinking", "content": token})
+                                            token = ""
+                            except Exception:
+                                pass
+                if in_thinking:
+                    yield sse({"type": "thinking_end", "content": ""})
                 yield sse({"type": "done", "content": ""})
                 return
 
@@ -2462,6 +2670,63 @@ USER REQUEST:
                 # the loop naturally exits when _react_round hits _REACT_MAX_ROUNDS.
 
             # End of ReAct while loop -- plan is now set to a non-search intent
+        elif _is_gemini_model(arch_model):
+            # ── Gemini Architect — native thinking, 1M context window ──
+            yield sse({"type": "progress", "content": "Sending to Gemini Architect..."})
+            if HAS_GOOGLE_GENAI:
+                gemini_key = _get_gemini_key(user_id)
+                gclient = _google_genai.Client(api_key=gemini_key)
+                thinking_cfg = _google_types.ThinkingConfig(thinking_budget=12000) if _supports_thinking(arch_model) else None
+                gcfg = _google_types.GenerateContentConfig(
+                    system_instruction=_architect_system,
+                    thinking_config=thinking_cfg,
+                    response_mime_type="application/json",
+                )
+                gemini_arch_msgs = (
+                    [{"role": "user" if m["role"] == "user" else "model", "parts": [{"text": m["content"]}]}
+                     for m in _arch_history_msgs if m["role"] != "system"]
+                    + [{"role": "user", "parts": [{"text": context_msg}]}]
+                )
+                thinking_chunks = []
+                response_text_chunks = []
+                in_thinking = False
+                async for gchunk in await gclient.aio.models.generate_content_stream(
+                    model=arch_model, contents=gemini_arch_msgs, config=gcfg
+                ):
+                    for gpart in (gchunk.candidates or [{}])[0].content.parts if (gchunk.candidates and gchunk.candidates[0].content) else []:
+                        is_thought = getattr(gpart, "thought", False)
+                        if is_thought:
+                            if not in_thinking:
+                                yield sse({"type": "thinking_start", "content": ""})
+                                in_thinking = True
+                            if gpart.text:
+                                yield sse({"type": "thinking", "content": gpart.text})
+                                thinking_chunks.append(gpart.text)
+                        else:
+                            if in_thinking:
+                                yield sse({"type": "thinking_end", "content": ""})
+                                in_thinking = False
+                            if gpart.text:
+                                response_text_chunks.append(gpart.text)
+                if in_thinking:
+                    yield sse({"type": "thinking_end", "content": ""})
+                raw_gemini = "".join(response_text_chunks).strip()
+                # Strip markdown code fences if Gemini wrapped response
+                if raw_gemini.startswith("```"):
+                    raw_gemini = re.sub(r"^```[a-z]*\n?", "", raw_gemini).rstrip("`").strip()
+                plan = json.loads(raw_gemini)
+            else:
+                # Fallback: OpenAI-compat endpoint
+                gclient_oai = _get_client_for_model(arch_model, user_id)
+                arch_msgs_oai = [
+                    {"role": "system", "content": _architect_system},
+                    {"role": "user", "content": context_msg},
+                ]
+                resp_oai = await asyncio.to_thread(
+                    lambda: _chat_create(gclient_oai, model=arch_model, messages=arch_msgs_oai,
+                                        temperature=0.3, response_format={"type": "json_object"})
+                )
+                plan = json.loads(resp_oai.choices[0].message.content)
         else:
             # ── OpenAI Architect (original logic) ──
             client = _get_client(user_id)

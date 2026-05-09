@@ -292,6 +292,31 @@ export const api = {
     multiAnalyze: (data: any) => request<MultiFileAnalysis>('/context/multi-analyze', { method: 'POST', body: JSON.stringify(data) }),
   },
 
+  linear: {
+    status: () => request<any>('/linear/status'),
+    connect: (token: string) => request<any>('/linear/connect', { method: 'POST', body: JSON.stringify({ token }) }),
+    disconnect: () => request<any>('/linear/disconnect', { method: 'DELETE' }),
+    teams: () => request<any>('/linear/teams'),
+    issues: (params?: { team_id?: string; state?: string; limit?: number }) => {
+      const q = new URLSearchParams()
+      if (params?.team_id) q.set('team_id', params.team_id)
+      if (params?.state) q.set('state', params.state)
+      if (params?.limit) q.set('limit', String(params.limit))
+      return request<any>(`/linear/issues?${q}`)
+    },
+    issue: (id: string) => request<any>(`/linear/issues/${id}`),
+    complete: (id: string, comment?: string) => request<any>(`/linear/issues/${id}/complete`, { method: 'POST', body: JSON.stringify({ comment }) }),
+  },
+  deploy: {
+    status: () => request<any>('/deploy/status'),
+    poll: () => request<any>('/deploy/poll'),
+  },
+  tests: {
+    detect: (sessionId: string) => request<any>(`/tests/detect/${sessionId}`),
+    run: (sessionId: string, fileId?: string) => request<any>('/tests/run', { method: 'POST', body: JSON.stringify({ session_id: sessionId, file_id: fileId }) }),
+    status: (runId: string) => request<any>(`/tests/status/${runId}`),
+  },
+
   github: {
     status: () => request<any>('/github/status'),
     connect: (pat: string) => request<any>('/github/connect', { method: 'POST', body: JSON.stringify({ pat }) }),

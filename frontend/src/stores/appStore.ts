@@ -32,8 +32,10 @@ interface AppState {
   setSurgicalPanelOpen: (v: boolean) => void
 
   // UI
-  sidebarTab: 'files' | 'sessions' | 'context' | 'github'
-  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github') => void
+  sidebarTab: 'files' | 'sessions' | 'context' | 'github' | 'linear'
+  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear') => void
+  sendLinearIssue: ((issue: any) => void) | null
+  setSendLinearIssue: (fn: ((issue: any) => void) | null) => void
   rightTab: 'editor' | 'diff' | 'git'
   setRightTab: (t: 'editor' | 'diff' | 'git') => void
   workspacePath: string
@@ -107,6 +109,8 @@ export const useAppStore = create<AppState>((set) => ({
 
   sidebarTab: 'files',
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
+  sendLinearIssue: null,
+  setSendLinearIssue: (fn) => set({ sendLinearIssue: fn }),
   rightTab: 'editor',
   setRightTab: (rightTab) => set({ rightTab }),
   workspacePath: '',

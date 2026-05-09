@@ -11,6 +11,7 @@ import {
 } from 'lucide-react'
 import { ContextPanel } from './ContextPanel'
 import { GitHubPanel } from './GitHubPanel'
+import { LinearPanel } from './LinearPanel'
 import { useThemeStore } from '../stores/themeStore'
 
 // ── File icon helper ─────────────────────────────────────────────────────────
@@ -449,15 +450,25 @@ function SessionFilesPanel() {
 }
 
 // ── Rail items config ─────────────────────────────────────────────────────────
-type TabId = 'sessions' | 'files' | 'github' | 'context'
+type TabId = 'sessions' | 'files' | 'github' | 'context' | 'linear'
 const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
   { id: 'sessions', icon: MessageSquare, label: 'Chats',  tooltip: 'Chats' },
   { id: 'files',    icon: FileCode,      label: 'Files',  tooltip: 'Session Files' },
   { id: 'github',   icon: Github,        label: 'GitHub', tooltip: 'GitHub' },
+  { id: 'linear',   icon: LinearIcon,    label: 'Linear', tooltip: 'Linear Issues' },
   { id: 'context',  icon: Pin,           label: 'Pinned', tooltip: 'Pinned & Memory' },
 ]
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
+// Linear icon (inline SVG)
+function LinearIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 100 100" fill="currentColor">
+      <path d="M1.22541 61.5228c-.2225-.9485.90748-1.5459 1.59638-.857L39.3342 97.1782c.6889.6889.0915 1.8189-.857 1.5964C20.0515 94.2409 5.75949 79.9489 1.22541 61.5228zM.00189135 46.8891c-.01764375.2833.08887225.5599.28957985.7606L52.3503 99.7085c.2007.2007.4773.3072.7606.2896 2.3692-.1476 4.6938-.46 6.9624-.9259.7645-.157 1.0301-1.0963.4782-1.6481L2.57595 39.4485c-.55186-.5519-1.49117-.2863-1.648174.4782-.465666 2.2686-.77832 4.5932-.92588 6.9624zM4.21111 32.217c-.16499.3086-.10307.6839.15059.9278L66.8827 95.7893c.2439.2537.6192.3156.9278.1506 1.8364-.9832 3.6014-2.0639 5.2888-3.2349.5151-.3631.5636-1.0957.1024-1.5569L9.97262 30.8852c-.46113-.4612-1.19376-.4127-1.55688.1024-1.17101 1.6874-2.25171 3.4524-3.23463 5.2294zM12.6587 22.2145c-.3762-.3762-.3762-.9864 0-1.3625C23.1581 10.3514 37.4823 3.48085 53.3921 2.67806c.7845-.04036 1.4361.59114 1.4321 1.37753l-.1701 34.69671c-.0027.5533-.3462 1.0452-.8675 1.2518l-1.7984.7013c-.4897.191-1.0527.0861-1.4368-.2981L12.6587 22.2145zM29.8038 86.8099 13.1901 70.1962c-.5145-.5145-.3991-1.3745.2381-1.7235l18.8163-10.5469c.5501-.3082 1.2311-.1673 1.624.3368l13.2584 17.0328c.3929.5041.3241 1.2137-.1594 1.6327l-15.5549 13.4605c-.4998.4325-1.2729.3819-1.7088-.1287z"/>
+    </svg>
+  )
+}
+
 export function Sidebar() {
   const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles } = useAppStore()
   const { theme, toggleTheme } = useThemeStore()
@@ -606,6 +617,9 @@ export function Sidebar() {
           {sidebarTab === 'context'  && <ContextPanel />}
           {sidebarTab === 'github'   && (
             <GitHubPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
+          )}
+          {sidebarTab === 'linear'   && (
+            <LinearPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
           )}
         </div>
       </div>

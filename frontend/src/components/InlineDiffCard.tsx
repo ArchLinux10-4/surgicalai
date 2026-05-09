@@ -4,6 +4,7 @@ import { vscDarkPlus, oneLight } from 'react-syntax-highlighter/dist/esm/styles/
 import { useThemeStore } from '../stores/themeStore'
 import { CheckCircle, XCircle, Download, ChevronDown, ChevronUp, AlertTriangle, FileCode, RotateCcw, SkipForward } from 'lucide-react'
 import { api } from '../api/client'
+import { TestRunnerPanel } from './TestRunnerPanel'
 import { toast } from '../lib/toast'
 import type { SmartResult, QAResult } from '../types'
 import { LivePreview, isVisualFile } from './LivePreview'
@@ -749,6 +750,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 }
 
 export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
+  const [showTestRunner, setShowTestRunner] = useState(false)
   const fileEntries = Object.entries(result.changes_by_file)
   const totalChanges = fileEntries.reduce((sum, [, v]) => sum + v.changes.length, 0)
 
@@ -775,7 +777,7 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
           fileData={fileData}
           sessionId={sessionId}
           onApplied={onApplied}
-          onChangeApplied={(delta = 1) => setAppliedCount(n => Math.max(0, n + delta))}
+          onChangeApplied={(delta = 1) => { setAppliedCount(n => Math.max(0, n + delta)); setShowTestRunner(true) }}
         />
       ))}
 
@@ -796,6 +798,11 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
             ))}
           </div>
         </div>
+      )}
+
+      {/* Test runner — shown after apply */}
+      {showTestRunner && (
+        <TestRunnerPanel inline={true} onClose={() => setShowTestRunner(false)} />
       )}
 
       {/* Risks alert — hidden (not removed) once all changes applied */}

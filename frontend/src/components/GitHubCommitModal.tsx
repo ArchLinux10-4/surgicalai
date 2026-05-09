@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react'
 import { X, Github, GitBranch, GitPullRequest, Check, Loader2, ExternalLink, AlertCircle } from 'lucide-react'
 import { api } from '../api/client'
+import { DeployStatusPanel } from './DeployStatusPanel'
 import { toast } from '../lib/toast'
 import type { SessionFile } from '../types'
 
@@ -169,6 +170,10 @@ export function GitHubCommitModal({ sessionFiles, onClose, onSuccess }: GitHubCo
               <button onClick={onClose} className="px-3 py-1.5 rounded-lg text-[12px] font-medium text-muted border border-border hover:bg-overlay transition-colors">
                 Close
               </button>
+            </div>
+            {/* Deploy status auto-polls after commit */}
+            <div className="w-full px-1">
+              <DeployStatusPanel autoStart={true} />
             </div>
           </div>
         ) : (
