@@ -33,100 +33,189 @@ function loadBabel(): Promise<any> {
   return _babelPromise
 }
 
-/* ─── JSX → plain JS compilation (runs on the MAIN page) ─────── */
-async function compileJsx(rawCode: string, filename: string): Promise<{ js: string; component: string | null; error?: string }> {
+/* ─── Detect main component name from source ─────────────────── */
+function detectComponentName(code: string): string | null {
+  // Priority 1: export default function/class Name
+  const defaultFn = code.match(/export\s+default\s+(?:function|class)\s+([A-Z]\w*)/)
+  if (defaultFn) return defaultFn[1]
+  // Priority 2: export default Name (reference)
+  const defaultRef = code.match(/export\s+default\s+([A-Z]\w*)/)
+  if (defaultRef) return defaultRef[1]
+  // Priority 3: last PascalCase function/const in file
+  const fnMatches = [...code.matchAll(/(?:function|const)\s+([A-Z][a-zA-Z0-9]*)\s*[=(]/g)]
+  return fnMatches.length > 0 ? fnMatches[fnMatches.length - 1][1] : null
+}
+
+/* ─── Compile TSX → JS — Babel handles ALL TypeScript (no regex hacks) ── */
+async function compileJsx(
+  rawCode: string,
+  filename: string
+): Promise<{ js: string; component: string | null; error?: string }> {
   const isHtml = /\.(html|htm)$/i.test(filename)
   if (isHtml) return { js: rawCode, component: null }
 
-  // Strip imports, exports, TS types — same logic as before
-  let cleaned = rawCode
-    .replace(/^import\s+.*?from\s+['"][^'"]+['"]\s*;?\s*$/gm, '')
-    .replace(/^export\s+default\s+/gm, '')
-    .replace(/^export\s+(?:const|function|class|type|interface)\s+/gm, (m) => m.replace('export ', ''))
-    .replace(/^type\s+\w+\s*=[\s\S]*?(?=\n(?:const|function|class|export|interface|type|\s*$))/gm, '')
-    .replace(/^interface\s+\w+\s*\{[\s\S]*?\n\}/gm, '')
-
-  // Detect component name
-  const defaultMatch = rawCode.match(/export\s+default\s+(?:function\s+)?(\w+)/)
-  const fnMatches = [...rawCode.matchAll(/(?:function|const)\s+([A-Z][a-zA-Z0-9]*)\s*[=(]/g)]
-  const componentName = defaultMatch?.[1] || (fnMatches.length > 0 ? fnMatches[fnMatches.length - 1][1] : null)
-
-  const mountCall = componentName
-    ? `\ntry {\n  var __root = ReactDOM.createRoot(document.getElementById('root'));\n  __root.render(React.createElement(${componentName}));\n} catch(__e) {\n  var __b = document.getElementById('error-banner');\n  if (__b) { __b.style.display='block'; __b.textContent = 'Render error: ' + (__e && __e.message ? __e.message : String(__e)); }\n}`
-    : '\n// Could not detect a React component to render'
-
-  const fullSource = `
-var { useState, useEffect, useRef, useCallback, useMemo, useContext, createContext, forwardRef, memo, Fragment } = React;
-${cleaned}
-${mountCall}
-`
+  const componentName = detectComponentName(rawCode)
 
   try {
     const Babel = await loadBabel()
-    const result = Babel.transform(fullSource, {
-      presets: ['react', ['typescript', { isTSX: true, allExtensions: true }]],
-      filename: filename || 'component.tsx',
-    })
-    return { js: result.code, component: componentName }
+
+    // Strategy 1: react + typescript presets with CommonJS module transform plugin
+    // Babel handles ALL TypeScript stripping (types, interfaces, generics, annotations)
+    // and converts ES imports → require() calls that our iframe shim handles
+    try {
+      const result = Babel.transform(rawCode, {
+        presets: [
+          'react',
+          ['typescript', { isTSX: true, allExtensions: true }]
+        ],
+        plugins: ['transform-modules-commonjs'],
+        filename: filename || 'component.tsx',
+      })
+      return { js: result.code, component: componentName }
+    } catch {
+      // Strategy 2: fall back to env preset (includes module transform)
+      const result = Babel.transform(rawCode, {
+        presets: [
+          ['env', { modules: 'commonjs', targets: { esmodules: true } }],
+          'react',
+          ['typescript', { isTSX: true, allExtensions: true }]
+        ],
+        filename: filename || 'component.tsx',
+      })
+      return { js: result.code, component: componentName }
+    }
   } catch (e: any) {
     return { js: '', component: null, error: e.message || String(e) }
   }
 }
 
-/* ─── Mock block — same as before, just extracted for clarity ──── */
-const MOCK_BLOCK = `
-// react-router-dom mocks
-var useNavigate = function() { return function() {}; };
-var useLocation = function() { return { pathname: '/preview', search: '', hash: '', state: null }; };
-var useParams = function() { return {}; };
-var useSearchParams = function() { return [new URLSearchParams(), function() {}]; };
-var Link = function(p) { return React.createElement('a', { href: p.to || '#', onClick: function(e){ e.preventDefault(); } }, p.children); };
-var Navigate = function() { return null; };
-var Outlet = function() { return null; };
-var BrowserRouter = function(p) { return React.createElement(React.Fragment, null, p.children); };
-var Routes = function(p) { return React.createElement(React.Fragment, null, p.children); };
-var Route = function() { return null; };
-
-// Store/api/toast mocks
-var create = function() { return function() { return {}; }; };
-var api = {};
-var toast = { success: function() {}, error: function() {}, info: function() {}, warning: function() {} };
-var apiClient = {
-  get: function() { return Promise.reject(new Error('preview-offline')); },
-  post: function() { return Promise.reject(new Error('preview-offline')); },
-  put: function() { return Promise.reject(new Error('preview-offline')); },
-  patch: function() { return Promise.reject(new Error('preview-offline')); },
-  delete: function() { return Promise.reject(new Error('preview-offline')); },
-};
-var useAuthStore = function() { return { login: function() {}, logout: function() {}, currentUser: { username: 'preview', role: 'admin' }, token: null, isAuthenticated: true }; };
-var useAppStore = function() { return { sessions: [], currentSessionId: null, setCurrentSession: function() {}, createSession: function() {}, deleteSession: function() {} }; };
-
-// Lucide icon mock factory
+/* ─── require() shim + mocks for iframe ──────────────────────── */
+const REQUIRE_SHIM = `
+// Icon mock factory
 var __icon = function(name) {
   return function(props) {
     var sz = (props && props.size) || 16;
     return React.createElement('span', {
       style: { display:'inline-block', width:sz, height:sz, background:'currentColor',
-        borderRadius:2, opacity:0.6, verticalAlign:'middle', flexShrink:0 }, title:name });
+        borderRadius:2, opacity:0.6, verticalAlign:'middle', flexShrink:0 },
+      title: name
+    });
   };
 };
-var Eye=__icon('Eye'),EyeOff=__icon('EyeOff'),Shield=__icon('Shield'),Zap=__icon('Zap'),Lock=__icon('Lock'),Code=__icon('Code');
-var User=__icon('User'),Key=__icon('Key'),AlertTriangle=__icon('AlertTriangle'),Check=__icon('Check'),X=__icon('X');
-var ChevronRight=__icon('ChevronRight'),ChevronDown=__icon('ChevronDown'),ChevronUp=__icon('ChevronUp');
-var ArrowRight=__icon('ArrowRight'),ArrowLeft=__icon('ArrowLeft'),Settings=__icon('Settings');
-var LogOut=__icon('LogOut'),LogIn=__icon('LogIn'),Plus=__icon('Plus'),Trash=__icon('Trash'),Edit=__icon('Edit');
-var Search=__icon('Search'),Menu=__icon('Menu'),Home=__icon('Home'),File=__icon('File'),Folder=__icon('Folder');
-var Save=__icon('Save'),Download=__icon('Download'),Upload=__icon('Upload'),Copy=__icon('Copy');
-var ExternalLink=__icon('ExternalLink'),Info=__icon('Info'),CheckCircle=__icon('CheckCircle'),XCircle=__icon('XCircle');
-var Circle=__icon('Circle'),Star=__icon('Star'),Heart=__icon('Heart'),Bell=__icon('Bell'),Send=__icon('Send');
-var MessageSquare=__icon('MessageSquare'),FileCode=__icon('FileCode'),Terminal=__icon('Terminal');
-var Loader=__icon('Loader'),Loader2=__icon('Loader2'),RefreshCw=__icon('RefreshCw');
-var Paperclip=__icon('Paperclip'),Sparkles=__icon('Sparkles'),Maximize2=__icon('Maximize2'),Minimize2=__icon('Minimize2');
-var MoreHorizontal=__icon('MoreHorizontal'),MoreVertical=__icon('MoreVertical'),Cpu=__icon('Cpu');
-var Database=__icon('Database'),Server=__icon('Server'),Globe=__icon('Globe'),Mail=__icon('Mail'),Phone=__icon('Phone');
-var Camera=__icon('Camera'),Image=__icon('Image'),Video=__icon('Video'),Music=__icon('Music');
-var Play=__icon('Play'),Pause=__icon('Pause'),Square=__icon('Square'),Triangle=__icon('Triangle');
-var Slash=__icon('Slash'),Hash=__icon('Hash'),AtSign=__icon('AtSign');
+
+// Module cache
+var __moduleCache = {};
+
+// CommonJS require() shim — returns mock modules for all imports
+function require(id) {
+  if (__moduleCache[id]) return __moduleCache[id];
+
+  // ── React ──
+  if (id === 'react') {
+    return __moduleCache[id] = Object.assign({}, React, { default: React, __esModule: true });
+  }
+  if (id === 'react-dom' || id === 'react-dom/client') {
+    return __moduleCache[id] = Object.assign({}, ReactDOM, { default: ReactDOM, __esModule: true });
+  }
+
+  // ── Lucide icons ──
+  if (id === 'lucide-react') {
+    var icons = { __esModule: true };
+    var names = [
+      'Eye','EyeOff','Shield','Zap','Lock','Code','User','Key','AlertTriangle','Check','X',
+      'ChevronRight','ChevronDown','ChevronUp','ChevronLeft',
+      'ArrowRight','ArrowLeft','Settings','LogOut','LogIn','Plus','Trash','Trash2','Edit',
+      'Search','Menu','Home','File','Folder','Save','Download','Upload','Copy',
+      'ExternalLink','Info','CheckCircle','XCircle','Circle','Star','Heart','Bell','Send',
+      'MessageSquare','FileCode','Terminal','Loader','Loader2','RefreshCw',
+      'Paperclip','Sparkles','Maximize2','Minimize2','MoreHorizontal','MoreVertical','Cpu',
+      'Database','Server','Globe','Mail','Phone','Camera','Image','Video','Music',
+      'Play','Pause','Square','Triangle','Slash','Hash','AtSign','Monitor',
+      'Smartphone','Tablet','Wifi','WifiOff','Battery','BatteryCharging',
+      'Sun','Moon','Cloud','CloudRain','Thermometer','Wind',
+      'Github','Gitlab','Twitter','Linkedin','Facebook','Instagram',
+      'Activity','Bookmark','Calendar','Clock','Compass','Disc',
+      'Flag','Gift','Map','Package','Percent','Power','Printer','Share','Tag',
+      'Target','Unlock','Voicemail','Watch','Crosshair','Feather','Hexagon','Layers',
+      'LifeBuoy','PenTool','Repeat','RotateCcw','RotateCw','Scissors','ShoppingCart',
+      'Sidebar','SkipBack','SkipForward','Sliders','Aperture','Award','BarChart',
+      'Bold','Italic','Underline','Type','AlignLeft','AlignCenter','AlignRight',
+      'Columns','Layout','Grid','List','Mic','MicOff','Volume','Volume1','Volume2','VolumeX',
+      'ZoomIn','ZoomOut','Maximize','Minimize','Move','Navigation','Octagon',
+      'PanelLeft','PanelRight','FilePlus','FolderOpen','GitBranch','GitCommit','GitPullRequest',
+      'Braces','Binary','Bug','Workflow','Wrench','Plug','PlugZap','Brain','Flame','Rocket'
+    ];
+    names.forEach(function(n) { icons[n] = __icon(n); });
+    icons.default = icons;
+    return __moduleCache[id] = icons;
+  }
+
+  // ── react-router-dom ──
+  if (id === 'react-router-dom' || id === 'react-router') {
+    return __moduleCache[id] = {
+      __esModule: true,
+      useNavigate: function() { return function() {}; },
+      useLocation: function() { return { pathname: '/preview', search: '', hash: '', state: null }; },
+      useParams: function() { return {}; },
+      useSearchParams: function() { return [new URLSearchParams(), function() {}]; },
+      Link: function(p) { return React.createElement('a', { href: p.to || '#', onClick: function(e){ e.preventDefault(); } }, p.children); },
+      Navigate: function() { return null; },
+      Outlet: function() { return null; },
+      BrowserRouter: function(p) { return React.createElement(React.Fragment, null, p.children); },
+      Routes: function(p) { return React.createElement(React.Fragment, null, p.children); },
+      Route: function() { return null; },
+    };
+  }
+
+  // ── Zustand ──
+  if (id === 'zustand' || id === 'zustand/middleware') {
+    var createStore = function(fn) {
+      var state = {};
+      try { state = fn(function(){}, function(){ return state; }, {}) || {}; } catch(e) {}
+      return function(sel) { return sel ? sel(state) : state; };
+    };
+    return __moduleCache[id] = {
+      __esModule: true, default: createStore, create: createStore,
+      persist: function(fn) { return fn; },
+      devtools: function(fn) { return fn; },
+    };
+  }
+
+  // ── Toast libraries ──
+  if (id === 'react-hot-toast' || id === 'sonner') {
+    var t = Object.assign(function(){}, { success:function(){}, error:function(){}, info:function(){}, warning:function(){} });
+    return __moduleCache[id] = { __esModule: true, default: t, toast: t, Toaster: function() { return null; } };
+  }
+
+  // ── Axios ──
+  if (id === 'axios') {
+    var noop = function() { return Promise.resolve({ data: {} }); };
+    var inst = { get: noop, post: noop, put: noop, patch: noop, delete: noop,
+      interceptors: { request: { use: function(){} }, response: { use: function(){} } },
+      defaults: { headers: { common: {} } }
+    };
+    inst.create = function() { return Object.assign({}, inst); };
+    return __moduleCache[id] = Object.assign(inst, { __esModule: true, default: inst });
+  }
+
+  // ── Catch-all: Proxy that gracefully stubs ANY import ──
+  try {
+    return __moduleCache[id] = new Proxy({ __esModule: true }, {
+      get: function(target, prop) {
+        if (prop === '__esModule') return true;
+        if (prop === 'default') return function(props) {
+          return props && props.children ? React.createElement(React.Fragment, null, props.children) : null;
+        };
+        if (typeof prop === 'symbol') return undefined;
+        if (typeof prop === 'string' && prop.length > 0 && prop[0] === prop[0].toUpperCase()) return __icon(prop);
+        if (typeof prop === 'string') return function() { return {}; };
+        return undefined;
+      }
+    });
+  } catch(e) {
+    return __moduleCache[id] = { __esModule: true, default: function() { return null; } };
+  }
+}
 `
 
 /* ─── Build final iframe HTML ─────────────────────────────────── */
@@ -134,6 +223,7 @@ function buildIframeHtml(
   compiledJs: string,
   filename: string,
   rawCode: string,
+  componentName: string | null,
   error?: string,
   extraStubs?: string,
   stubbedVars?: string[]
@@ -149,10 +239,7 @@ function buildIframeHtml(
   }
 
   const hasTailwind = /className=["'][^"']*(?:flex|grid|text-|bg-|p-|m-|w-|h-|rounded|border|shadow)/i.test(rawCode)
-  const twTag = hasTailwind ? '<script crossorigin="anonymous" src="https://cdn.tailwindcss.com"><\/script>' : ''
-
-  // Escape </script> inside compiled JS to prevent breaking the HTML
-  const safeJs = compiledJs.replace(/<\/script>/gi, '<\\/script>')
+  const twTag = hasTailwind ? '<script crossorigin="anonymous" src="https://cdn.tailwindcss.com"></script>' : ''
 
   if (error) {
     const safeErr = error.replace(/&/g, '&amp;').replace(/</g, '&lt;')
@@ -160,9 +247,35 @@ function buildIframeHtml(
 <body style="margin:0;padding:20px;font-family:'SF Mono',Menlo,monospace;background:#1a1a2e;color:#fca5a5;font-size:13px;white-space:pre-wrap;line-height:1.6;">
 <div style="color:#ef4444;font-weight:bold;margin-bottom:8px;">⚠ Compilation Error</div>
 ${safeErr}
-<div style="margin-top:16px;color:#6b7280;font-size:11px;">This usually means the component uses syntax or patterns that the preview can't handle. The diff is still valid — you can Apply it normally.</div>
+<div style="margin-top:16px;color:#6b7280;font-size:11px;">This usually means the component uses syntax the preview can't handle. The diff is still valid — you can Apply it normally.</div>
 </body></html>`
   }
+
+  // Escape </script> inside compiled JS
+  const safeJs = compiledJs.replace(/<\/script>/gi, '<\\/script>')
+
+  // Mount block: use CommonJS exports set by Babel's module transform
+  const mountBlock = componentName
+    ? `
+try {
+  var __C = module.exports.default || module.exports['${componentName}'];
+  if (typeof __C === 'function') {
+    ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(__C));
+  } else {
+    var __b = document.getElementById('error-banner');
+    if (__b) { __b.style.display='block'; __b.textContent = 'Could not find component "${componentName}" in exports: ' + Object.keys(module.exports).join(', '); }
+  }
+} catch(__e) {
+  var __b = document.getElementById('error-banner');
+  if (__b) { __b.style.display='block'; __b.textContent = 'Render error: ' + (__e && __e.message ? __e.message : String(__e)); }
+}`
+    : `
+var __b = document.getElementById('error-banner');
+if (__b) { __b.style.display='block'; __b.textContent = 'No React component detected in file.'; }`
+
+  const stubBannerDisplay = stubbedVars && stubbedVars.length ? 'block' : 'none'
+  const stubBannerText = stubbedVars && stubbedVars.length ? '⚠ Partial preview — stubbed: ' + stubbedVars.join(', ') : ''
+  const rootPadding = stubbedVars && stubbedVars.length ? 'padding-top:30px' : ''
 
   return `<!DOCTYPE html>
 <html>
@@ -170,21 +283,20 @@ ${safeErr}
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 ${twTag}
-<script crossorigin="anonymous" src="https://unpkg.com/react@18/umd/react.development.js"><\/script>
-<script crossorigin="anonymous" src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"><\/script>
+<script crossorigin="anonymous" src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script crossorigin="anonymous" src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
 <style>
 body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}
 #root{min-height:100vh;}
 #error-banner{display:none;position:fixed;top:0;left:0;right:0;background:#7f1d1d;color:#fca5a5;
 padding:8px 12px;font-size:11px;font-family:monospace;z-index:9999;white-space:pre-wrap;word-break:break-all;}
-#stub-banner{display:${stubbedVars && stubbedVars.length ? 'block' : 'none'};position:fixed;top:0;left:0;right:0;
+#stub-banner{display:${stubBannerDisplay};position:fixed;top:0;left:0;right:0;
 background:#78350f;color:#fcd34d;padding:7px 12px;font-size:11px;font-family:monospace;z-index:9998;
 white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 </style>
 <script>
 window.onerror = function(msg, src, line, col, err) {
   var str = err && err.message ? err.message : String(msg);
-  // Detect missing variable → ask parent to inject a stub and retry
   var mv = str.match(/Can't find variable[:\\s]+(\\w+)/i) || str.match(/(\\w+) is not defined/i);
   if (mv) {
     try { window.parent.postMessage({ type: 'sai_missing_var', name: mv[1] }, '*'); } catch(_) {}
@@ -193,22 +305,29 @@ window.onerror = function(msg, src, line, col, err) {
   if (b) { b.style.display = 'block'; b.textContent = 'Runtime error: ' + str; }
   return true;
 };
-<\/script>
+</script>
 </head>
 <body>
-<div id="stub-banner">${stubbedVars && stubbedVars.length ? '⚠ Partial preview — stubbed from other files: ' + stubbedVars.join(', ') : ''}</div>
+<div id="stub-banner">${stubBannerText}</div>
 <div id="error-banner"></div>
-<div id="root" style="${stubbedVars && stubbedVars.length ? 'padding-top:30px' : ''}"></div>
-<script>${MOCK_BLOCK}<\/script>
-<script>${extraStubs || ''}<\/script>
+<div id="root" style="${rootPadding}"></div>
 <script>
+${REQUIRE_SHIM}
+</script>
+<script>
+${extraStubs || ''}
+</script>
+<script>
+var module = { exports: {} };
+var exports = module.exports;
 try {
 ${safeJs}
 } catch(__e) {
   var __b = document.getElementById('error-banner');
-  if (__b) { __b.style.display='block'; __b.textContent = 'Runtime error: ' + (__e && __e.message ? __e.message : String(__e)); }
+  if (__b) { __b.style.display='block'; __b.textContent = 'Load error: ' + (__e && __e.message ? __e.message : String(__e)); }
 }
-<\/script>
+${mountBlock}
+</script>
 </body>
 </html>`
 }
@@ -229,13 +348,13 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
 
   const displayCode = modifiedCode || code
 
-  // Compile JSX → JS on the main page, then build iframe HTML
+  // Compile TSX → JS on the main page, then build iframe HTML
   const compile = useCallback(async (extraStubs = '', extraStubbedVars: string[] = []) => {
     setLoading(true)
     setCompileError(null)
     try {
-      const { js, error } = await compileJsx(displayCode, filename)
-      const html = buildIframeHtml(js, filename, displayCode, error || undefined, extraStubs, extraStubbedVars)
+      const { js, component, error } = await compileJsx(displayCode, filename)
+      const html = buildIframeHtml(js, filename, displayCode, component, error || undefined, extraStubs, extraStubbedVars)
 
       // Revoke old blob URL
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current)
@@ -249,7 +368,7 @@ export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) 
     } catch (e: any) {
       const msg = e.message || 'Unknown compilation error'
       setCompileError(msg)
-      const html = buildIframeHtml('', filename, displayCode, msg, extraStubs, extraStubbedVars)
+      const html = buildIframeHtml('', filename, displayCode, null, msg, extraStubs, extraStubbedVars)
       if (blobUrlRef.current) URL.revokeObjectURL(blobUrlRef.current)
       const blob = new Blob([html], { type: 'text/html' })
       blobUrlRef.current = URL.createObjectURL(blob)
