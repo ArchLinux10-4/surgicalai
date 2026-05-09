@@ -101,7 +101,7 @@ if (typeof __C === 'function') {
 }
 
 /* ─── Component ────────────────────────────────────────────────── */
-export default function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) {
+export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) {
   const [srcdoc, setSrcdoc] = useState('')
   const [error, setError] = useState('')
   const [expanded, setExpanded] = useState(false)
