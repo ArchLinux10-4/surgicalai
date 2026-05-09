@@ -7,6 +7,7 @@ import { toast } from '../lib/toast'
 import { InlineDiffCard } from './InlineDiffCard'
 import { NewFileCard } from './NewFileCard'
 import { MarkdownCode } from './CodeBlock'
+import { MermaidDiagram } from './MermaidDiagram'
 import { SessionFilesTray } from './SessionFilesTray'
 import {
   Send, X, Plus, Paperclip, FileCode, AlertTriangle, Zap, Trash2, Brain
@@ -15,7 +16,13 @@ import type { SessionFile, SmartResult } from '../types'
 
 // ── Markdown component overrides ──────────────────────────
 const mdComponents = {
-  code: MarkdownCode as any,
+  code: (({ className, children, ...props }: any) => {
+    const lang = /language-(\w+)/.exec(className || '')?.[1] || ''
+    if (lang === 'mermaid') {
+      return <MermaidDiagram chart={String(children).replace(/\n$/, '')} />
+    }
+    return <MarkdownCode className={className} {...props}>{children}</MarkdownCode>
+  }) as any,
   // Beautiful prose overrides
   h1: ({ children }: any) => (
     <h1 className="text-lg font-bold text-ink mt-5 mb-2 border-b border-border/50 pb-1.5">{children}</h1>
