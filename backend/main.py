@@ -22,7 +22,7 @@ from routers import tests as tests_router
 app = FastAPI(
     title="SurgicalAI",
     description="Local AI coding assistant with surgical precision",
-    version="3.4.0"
+    version="3.9.0"
 )
 
 # CORS — allow local dev + any cloud origins set via ALLOWED_ORIGINS env var
@@ -126,7 +126,7 @@ async def startup():
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "version": "3.7.2"}
+    return {"status": "ok", "version": "3.9.0"}
 
 
 # Serve React frontend (built files)
