@@ -79,7 +79,7 @@ function QABadge({ qa }: { qa: QAResult }) {
         QA {icon}{score}
       </button>
       {expanded && (
-        <div className="absolute left-0 top-7 z-[200] w-72 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-xl p-3 text-[12px]">
+        <div className="absolute left-0 top-7 z-[200] w-72 bg-surface border border-border rounded-lg shadow-xl p-3 text-[12px]">
           <div className="flex items-center justify-between mb-2">
             <span className="font-semibold">QA Report</span>
             <button onClick={() => setExpanded(false)} className="text-muted hover:text-ink">✕</button>
@@ -121,7 +121,7 @@ function BlastRadius({ change }: { change: any }) {
         🎯 {risks.length} risk{risks.length !== 1 ? 's' : ''}
       </button>
       {open && (
-        <div className="absolute left-0 top-7 z-[200] w-72 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-xl p-3 text-[12px]">
+        <div className="absolute left-0 top-7 z-[200] w-72 bg-surface border border-border rounded-lg shadow-xl p-3 text-[12px]">
           <div className="flex items-center justify-between mb-2">
             <span className="font-semibold text-amber-400">🎯 Blast Radius</span>
             <button onClick={() => setOpen(false)} className="text-muted hover:text-ink">×</button>

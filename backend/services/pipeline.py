@@ -2438,6 +2438,45 @@ def _build_codebase_context_for_creator(symbol_maps_by_name: dict) -> str:
     return "\n\n" + ("─" * 60) + "\n\n".join(parts) if parts else "(no uploaded files)"
 
 
+def _extract_json_from_text(text: str) -> str:
+    """
+    Robustly extract a JSON object from a string that may have:
+    - Markdown code fences (```json ... ```)
+    - Preamble text before the JSON
+    - Trailing explanation after the JSON
+    Returns the raw JSON string, or the original text if no {} found.
+    """
+    if not text:
+        return text
+    # Strip markdown fences first
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.split("\n")
+        # Drop first line (```json or ```) and last line if it's a closing fence
+        inner_lines = lines[1:]
+        if inner_lines and inner_lines[-1].strip() == "```":
+            inner_lines = inner_lines[:-1]
+        stripped = "\n".join(inner_lines).strip()
+    # Find the outermost { ... } block
+    start = stripped.find("{")
+    if start == -1:
+        return stripped  # Let json.loads fail naturally with a clear error
+    # Find matching closing brace
+    depth = 0
+    end = -1
+    for i, ch in enumerate(stripped[start:], start=start):
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                end = i
+                break
+    if end == -1:
+        return stripped[start:]  # Best effort: return from first { to end
+    return stripped[start:end + 1]
+
+
 QA_SYSTEM = """You are the QA agent in a two-model coding pipeline.
 The Surgeon has just produced a code replacement. Your job: verify it is correct, complete, and safe.
 
@@ -2590,11 +2629,9 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
                 system=QA_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
             )
-            raw = _qa_msg.content[0].text.strip()
-            # Strip markdown fences if Claude wraps output despite instructions
-            if raw.startswith("```"):
-                lines = raw.split("\n")
-                raw = "\n".join(lines[1:] if lines[-1].strip() != "```" else lines[1:-1])
+            raw = (_qa_msg.content[0].text or "").strip()
+            # Robust JSON extraction — Claude sometimes adds preamble or markdown fences
+            raw = _extract_json_from_text(raw)
         else:
             client = _get_client(user_id)
 
