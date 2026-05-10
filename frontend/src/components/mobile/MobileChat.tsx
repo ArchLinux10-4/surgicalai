@@ -424,7 +424,7 @@ export function MobileChat({ onOpenFiles }: Props) {
   const isEmpty = messages.length === 0 && !isStreaming
 
   return (
-    <div className="flex flex-col h-full bg-base">
+    <div className="flex flex-col flex-1 min-h-0 bg-base">
       {/* Hidden file input */}
       <input
         ref={fileInputRef}
@@ -529,10 +529,10 @@ export function MobileChat({ onOpenFiles }: Props) {
         </div>
       )}
 
-      {/* Bottom input area */}
+      {/* Bottom input area — owns the bottom safe-area inset (MobileLayout root does NOT set paddingBottom) */}
       <div
         className="border-t border-border bg-base flex-shrink-0"
-        style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
+        style={{ paddingBottom: 'max(env(safe-area-inset-bottom), 8px)' }}
       >
         {/* File chips bar */}
         {(hasFiles || uploadingFiles) && (

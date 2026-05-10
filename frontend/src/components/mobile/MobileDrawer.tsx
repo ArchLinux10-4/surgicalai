@@ -30,11 +30,10 @@ export function MobileDrawer({ open, onClose, onOpenFiles }: Props) {
   const [editValue, setEditValue] = useState('')
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
 
-  // Lock body scroll when drawer is open
+  // Re-fetch sessions every time the drawer opens so the list is always fresh
   useEffect(() => {
     if (open) {
-      document.body.style.overflow = 'hidden'
-      return () => { document.body.style.overflow = '' }
+      api.chat.getSessions().then(setSessions).catch(() => {})
     }
   }, [open])
 
@@ -269,10 +268,25 @@ export function MobileDrawer({ open, onClose, onOpenFiles }: Props) {
           )}
 
           {section === 'github' && (
-            <div className="flex flex-col items-center justify-center h-full px-8 text-center text-muted gap-2 py-12">
-              <Github size={28} className="opacity-40" />
-              <p className="text-[13px]">GitHub integration</p>
-              <p className="text-[11px] text-faint">Connect from desktop to browse repos</p>
+            <div className="flex flex-col items-center justify-center h-full px-8 text-center gap-4 py-12">
+              <div className="w-12 h-12 rounded-2xl bg-surface border border-border flex items-center justify-center">
+                <Github size={24} className="text-muted" />
+              </div>
+              <div>
+                <p className="text-[14px] font-semibold text-ink mb-1">GitHub</p>
+                <p className="text-[12px] text-muted leading-relaxed">
+                  Add your GitHub Personal Access Token in Settings to browse repos, load files, and sync changes.
+                </p>
+              </div>
+              <button
+                onClick={() => { setSettingsOpen(true); onClose() }}
+                className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-accent text-white text-[13px] font-semibold active:scale-95 transition-transform"
+              >
+                Open Settings
+              </button>
+              <p className="text-[11px] text-faint max-w-[220px]">
+                Needs a Classic PAT with <code className="bg-overlay px-1 rounded">repo</code> + <code className="bg-overlay px-1 rounded">read:user</code> scopes
+              </p>
             </div>
           )}
 

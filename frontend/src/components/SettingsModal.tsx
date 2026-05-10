@@ -248,11 +248,11 @@ export function SettingsModal() {
 
   return (
     <div
-      className="fixed inset-0 bg-black/70 z-[100] flex items-center justify-center backdrop-blur-sm"
+      className="fixed inset-0 bg-black/70 z-[100] flex sm:items-center items-end justify-center backdrop-blur-sm"
       onClick={() => setSettingsOpen(false)}
     >
       <div
-        className="bg-surface border border-border rounded-2xl w-[580px] max-h-[85vh] flex flex-col shadow-modal animate-slide-up"
+        className="bg-surface border border-border rounded-t-2xl sm:rounded-2xl w-full sm:w-[580px] max-h-[92dvh] sm:max-h-[85vh] flex flex-col shadow-modal animate-slide-up"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
