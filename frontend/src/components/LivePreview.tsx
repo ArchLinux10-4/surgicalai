@@ -63,7 +63,7 @@ function stubRelativeImports(code: string): string {
             //   Top-level export: then=undefined → NOT thenable (await proxy returns proxy)
             //   Call/property result: then=function → IS thenable (apiClient.get('/x').then(cb) works)
             //   Both tiers: apply fires → returns tier-2 proxy (useAuthStore() → destructurable)
-            `const ${n}: any = (() => { const mk=(t)=>new Proxy(function(){},{get:(_,k)=>{if(typeof k==='symbol')return undefined;if(k==='__esModule')return undefined;if(k==='then'){if(!t)return undefined;return function(r){try{r&&r({data:{}});}catch(e){}return mk(true);};}return mk(true);},apply:()=>mk(true),construct:()=>({})});return mk(false); })();`
+            `const ${n}: any = (() => { const DATA=/^(user|loading|isLoading|error|data|status|count|list|items|token|id|name|email|value|config|options|state|type|mode|size|length|theme|session|message|result|response|success|ready|open|visible|active|enabled|disabled|selected|checked|collapsed|expanded|setupRequired|isAuthenticated|isAdmin|isDark|isLight|isOpen|isMobile|isDesktop)$/;const mk=(t)=>new Proxy(function(){},{get:(_,k)=>{if(typeof k==='symbol')return undefined;if(k==='__esModule')return undefined;if(k==='then'){if(!t)return undefined;return function(r){try{r&&r({data:{}});}catch(e){}return mk(true);};}if(DATA.test(String(k)))return undefined;return mk(true);},apply:()=>mk(true),construct:()=>({})});return mk(false); })();`
         )
         .join('\n')
     }
