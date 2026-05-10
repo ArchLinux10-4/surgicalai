@@ -778,6 +778,7 @@ export function SettingsModal() {
                   {/[0-9]/.test(pwNew) ? '✓' : '·'} One number
                 </div>
               </div>
+            </div>
             )}
           </div>
         </div>
