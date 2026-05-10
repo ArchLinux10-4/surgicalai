@@ -1,5 +1,5 @@
 """Pydantic schemas for all API requests and responses."""
-from pydantic import BaseModel, Field, computed_field
+from pydantic import BaseModel, Field, computed_field, validator
 from typing import Optional, List, Any
 from enum import Enum
 
@@ -154,6 +154,13 @@ class ChangeTarget(BaseModel):
     import_changes: List[str] = []    # per-target imports (threaded from Architect plan)
     context_needs: List[str] = []     # semantic sections: "style_block" | "state_declarations" | etc.
     surgeon_context: List[dict] = []  # v3.10: rich context requests resolved before Surgeon runs
+
+    @validator('context_needs', each_item=True, pre=True)
+    def coerce_context_needs(cls, v):
+        """Architect sometimes returns {type, name} objects instead of plain strings — flatten them."""
+        if isinstance(v, dict):
+            return v.get('name') or v.get('type') or str(v)
+        return str(v)
 
 
 class ArchitectPlan(BaseModel):
