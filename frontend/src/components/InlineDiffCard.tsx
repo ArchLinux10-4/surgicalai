@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { useThemeStore } from '../stores/themeStore'
@@ -53,6 +54,9 @@ const saveSkipped = (sessionId: string, changeId: string) => {
 
 function QABadge({ qa }: { qa: QAResult }) {
   const [expanded, setExpanded] = useState(false)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const popupRef = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState({ top: 0, left: 0 })
   const styles: Record<string, string> = {
     safe:    'text-success bg-success/15 border-success/30',
     warning: 'text-warning bg-warning/15 border-warning/30',
@@ -69,19 +73,45 @@ function QABadge({ qa }: { qa: QAResult }) {
     ...qa.type_errors,
     ...(qa.plan_deviation ? [qa.plan_deviation] : []),
   ].filter(Boolean)
+
+  const handleToggle = () => {
+    if (!expanded && btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect()
+      setPos({ top: rect.bottom + 6, left: rect.left })
+    }
+    setExpanded(e => !e)
+  }
+
+  useEffect(() => {
+    if (!expanded) return
+    const handler = (e: MouseEvent) => {
+      if (
+        btnRef.current && !btnRef.current.contains(e.target as Node) &&
+        popupRef.current && !popupRef.current.contains(e.target as Node)
+      ) setExpanded(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [expanded])
+
   return (
-    <span className="relative">
+    <span>
       <button
-        onClick={() => setExpanded(e => !e)}
+        ref={btnRef}
+        onClick={handleToggle}
         className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border cursor-pointer ${color}`}
         title={qa.summary}
       >
         QA {icon}{score}
       </button>
-      {expanded && (
-        <div className="absolute left-0 top-7 z-[200] w-72 bg-surface border border-border rounded-lg shadow-xl p-3 text-[12px]">
+      {expanded && createPortal(
+        <div
+          ref={popupRef}
+          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 288 }}
+          className="border border-border rounded-lg shadow-2xl p-3 text-[12px]"
+        >
           <div className="flex items-center justify-between mb-2">
-            <span className="font-semibold">QA Report</span>
+            <span className="font-semibold text-ink">QA Report</span>
             <button onClick={() => setExpanded(false)} className="text-muted hover:text-ink">✕</button>
           </div>
           <p className="text-muted mb-2">{qa.summary || 'No summary'}</p>
@@ -97,7 +127,8 @@ function QABadge({ qa }: { qa: QAResult }) {
           {qa.skipped_reason && (
             <p className="text-muted mt-1 italic">Skipped: {qa.skipped_reason}</p>
           )}
-        </div>
+        </div>,
+        document.body
       )}
     </span>
   )
@@ -105,23 +136,52 @@ function QABadge({ qa }: { qa: QAResult }) {
 
 function BlastRadius({ change }: { change: any }) {
   const [open, setOpen] = useState(false)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const popupRef = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState({ top: 0, left: 0 })
   const risks: string[] = [
     ...(change.qa_result?.downstream_risks || []),
     ...(change.qa_result?.import_issues || []),
     ...(change.qa_result?.type_errors || []),
   ].filter(Boolean)
   if (!risks.length) return null
+
+  const handleToggle = () => {
+    if (!open && btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect()
+      setPos({ top: rect.bottom + 6, left: rect.left })
+    }
+    setOpen(o => !o)
+  }
+
+  useEffect(() => {
+    if (!open) return
+    const handler = (e: MouseEvent) => {
+      if (
+        btnRef.current && !btnRef.current.contains(e.target as Node) &&
+        popupRef.current && !popupRef.current.contains(e.target as Node)
+      ) setOpen(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [open])
+
   return (
-    <span className="relative">
+    <span>
       <button
-        onClick={() => setOpen(o => !o)}
+        ref={btnRef}
+        onClick={handleToggle}
         className="text-[11px] font-semibold px-2 py-0.5 rounded-full border text-amber-400 bg-amber-500/10 border-amber-500/30 cursor-pointer"
         title="Blast radius"
       >
         🎯 {risks.length} risk{risks.length !== 1 ? 's' : ''}
       </button>
-      {open && (
-        <div className="absolute left-0 top-7 z-[200] w-72 bg-surface border border-border rounded-lg shadow-xl p-3 text-[12px]">
+      {open && createPortal(
+        <div
+          ref={popupRef}
+          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 288 }}
+          className="border border-border rounded-lg shadow-2xl p-3 text-[12px]"
+        >
           <div className="flex items-center justify-between mb-2">
             <span className="font-semibold text-amber-400">🎯 Blast Radius</span>
             <button onClick={() => setOpen(false)} className="text-muted hover:text-ink">×</button>
@@ -133,7 +193,8 @@ function BlastRadius({ change }: { change: any }) {
               </li>
             ))}
           </ul>
-        </div>
+        </div>,
+        document.body
       )}
     </span>
   )
