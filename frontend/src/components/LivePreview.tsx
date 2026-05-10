@@ -59,7 +59,11 @@ function stubRelativeImports(code: string): string {
       return names
         .map(
           (n) =>
-            `const ${n}: any = (() => { const __s: any = new Proxy(function(){} as any, { get: (_: any, k: any) => { if (typeof k === 'symbol') return undefined; if (k === 'then' || k === '__esModule') return undefined; return __s; }, apply: () => __s, construct: () => ({}) }); return __s; })();`
+            // Two-tier proxy:
+            //   Top-level export: then=undefined → NOT thenable (await proxy returns proxy)
+            //   Call/property result: then=function → IS thenable (apiClient.get('/x').then(cb) works)
+            //   Both tiers: apply fires → returns tier-2 proxy (useAuthStore() → destructurable)
+            `const ${n}: any = (() => { const mk=(t)=>new Proxy(function(){},{get:(_,k)=>{if(typeof k==='symbol')return undefined;if(k==='__esModule')return undefined;if(k==='then'){if(!t)return undefined;return function(r){try{r&&r({data:{}});}catch(e){}return mk(true);};}return mk(true);},apply:()=>mk(true),construct:()=>({})});return mk(false); })();`
         )
         .join('\n')
     }
