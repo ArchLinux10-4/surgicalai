@@ -77,7 +77,13 @@ function QABadge({ qa }: { qa: QAResult }) {
   const handleToggle = () => {
     if (!expanded && btnRef.current) {
       const rect = btnRef.current.getBoundingClientRect()
-      setPos({ top: rect.bottom + 6, left: rect.left })
+      const POPUP_W = 300
+      const MARGIN = 12
+      // Prefer aligning to button's left; if that would clip the right edge, shift left
+      const rawLeft = rect.left
+      const clampedLeft = Math.min(rawLeft, window.innerWidth - POPUP_W - MARGIN)
+      const left = Math.max(MARGIN, clampedLeft)
+      setPos({ top: rect.bottom + 6, left })
     }
     setExpanded(e => !e)
   }
@@ -107,8 +113,8 @@ function QABadge({ qa }: { qa: QAResult }) {
       {expanded && createPortal(
         <div
           ref={popupRef}
-          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 288 }}
-          className="border border-border rounded-lg shadow-2xl p-3 text-[12px]"
+          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 300, maxHeight: 'calc(100vh - 80px)', overflowY: 'auto' }}
+          className="border border-border rounded-lg shadow-2xl p-4 text-[12px]"
         >
           <div className="flex items-center justify-between mb-2">
             <span className="font-semibold text-ink">QA Report</span>
@@ -149,7 +155,12 @@ function BlastRadius({ change }: { change: any }) {
   const handleToggle = () => {
     if (!open && btnRef.current) {
       const rect = btnRef.current.getBoundingClientRect()
-      setPos({ top: rect.bottom + 6, left: rect.left })
+      const POPUP_W = 300
+      const MARGIN = 12
+      const rawLeft = rect.left
+      const clampedLeft = Math.min(rawLeft, window.innerWidth - POPUP_W - MARGIN)
+      const left = Math.max(MARGIN, clampedLeft)
+      setPos({ top: rect.bottom + 6, left })
     }
     setOpen(o => !o)
   }
@@ -179,8 +190,8 @@ function BlastRadius({ change }: { change: any }) {
       {open && createPortal(
         <div
           ref={popupRef}
-          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 288 }}
-          className="border border-border rounded-lg shadow-2xl p-3 text-[12px]"
+          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 300, maxHeight: 'calc(100vh - 80px)', overflowY: 'auto' }}
+          className="border border-border rounded-lg shadow-2xl p-4 text-[12px]"
         >
           <div className="flex items-center justify-between mb-2">
             <span className="font-semibold text-amber-400">🎯 Blast Radius</span>
