@@ -48,7 +48,8 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
   const theme = useThemeStore(s => s.theme)
   const [collapsed, setCollapsed] = useState(index > 0) // first file expanded
   const [saving, setSaving] = useState(false)
-  const [saved, setSaved] = useState(false)
+  const savedKey = `sai-added:${sessionId}:${file.filename}`
+  const [saved, setSaved] = useState(() => localStorage.getItem(savedKey) === '1')
   const [copied, setCopied] = useState(false)
 
   const lang = detectLang(file.filename, file.language)
@@ -68,6 +69,7 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
         language: lang,
       })
       setSaved(true)
+      localStorage.setItem(savedKey, '1')
       onSaved(file.filename)
       // Immediately refresh the session file list in the store so the Files tray updates
       try {
