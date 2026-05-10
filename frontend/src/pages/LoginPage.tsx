@@ -28,6 +28,9 @@ function CodeRain() {
     let drops: number[];
     const fontSize = 18;
 
+    const FRAME_INTERVAL = 27;
+    let lastTime = 0;
+
     const handleResize = () => {
       canvas.width = window.innerWidth;
       canvas.height = window.innerHeight;
@@ -36,7 +39,9 @@ function CodeRain() {
     };
     handleResize();
 
-    const draw = () => {
+    const draw = (timestamp: number) => {
+      if (timestamp - lastTime < FRAME_INTERVAL) { animFrameId = requestAnimationFrame(draw); return; }
+      lastTime = timestamp;
       ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
       ctx.font = '14px monospace';
