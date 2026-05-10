@@ -117,25 +117,26 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
     return (
       <div className={containerCls}>
         {toolbar}
-        {previewUrl ? (
-          <iframe
-            key={`${refreshKey}-url`}
-            src={previewUrl}
-            // allow-same-origin lets relative sub-resources (CSS/JS in same origin) load
-            sandbox="allow-scripts allow-same-origin"
-            style={{ ...previewStyle, border: 'none', background: 'transparent', display: 'block' }}
-            title={`Preview: ${filename}`}
-          />
-        ) : (
-          /* Fallback: srcdoc (no IDs — e.g. preview before file is uploaded) */
-          <iframe
-            key={`${refreshKey}-doc`}
-            sandbox="allow-scripts"
-            srcDoc={src}
-            style={{ ...previewStyle, border: 'none', background: 'transparent', display: 'block' }}
-            title={`Preview: ${filename}`}
-          />
-        )}
+        {/* Wrapper div is the actual flex child that grows — iframe fills it with h/w 100% */}
+        <div style={previewStyle}>
+          {previewUrl ? (
+            <iframe
+              key={`${refreshKey}-url`}
+              src={previewUrl}
+              sandbox="allow-scripts allow-same-origin"
+              style={{ width: '100%', height: '100%', border: 'none', background: 'transparent', display: 'block' }}
+              title={`Preview: ${filename}`}
+            />
+          ) : (
+            <iframe
+              key={`${refreshKey}-doc`}
+              sandbox="allow-scripts"
+              srcDoc={src}
+              style={{ width: '100%', height: '100%', border: 'none', background: 'transparent', display: 'block' }}
+              title={`Preview: ${filename}`}
+            />
+          )}
+        </div>
       </div>
     )
   }
@@ -152,9 +153,12 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
   return (
     <div className={containerCls}>
       {toolbar}
+      {/* Wrapper div is the actual flex:1 child — SandpackProvider + Preview fill it 100% */}
+      <div style={previewStyle}>
       <SandpackProvider
         key={refreshKey}
         template="react-ts"
+        style={{ height: '100%', width: '100%' }}
         files={{
           '/App.tsx': appCode,
           // Reset browser defaults so the component's own background fills the iframe
@@ -183,11 +187,12 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
         }}
       >
         <SandpackPreview
-          style={previewStyle}
+          style={{ height: '100%', width: '100%' }}
           showOpenInCodeSandbox={false}
           showRefreshButton={false}
         />
       </SandpackProvider>
+      </div>
     </div>
   )
 }
