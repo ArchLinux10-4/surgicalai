@@ -1112,6 +1112,13 @@ Return JSON with search-and-replace operations."""
             new_code = new_code[1:]
         return new_code, confidence, surgeon_notes, import_needed_lines, []
 
+    # ── Mechanical trailing-context rescue ──────────────────────────────────────────────
+    # Must run BEFORE apply so QA + diff both see the corrected ops.
+    # Detects 'find' strings that captured structural lines after the change target
+    # (closing tags, sibling divs, next functions) and rescues them back into 'replace'.
+    _ct_str = target.change_type.value if hasattr(target, "change_type") and target.change_type else "modify"
+    operations = _rescue_trailing_context(operations, change_type=_ct_str)
+
     # ---- Compute new_code by applying operations to full file (same as apply path) ----
     # This guarantees QA/diff sees the same result the user would get after applying.
     _original_for_qa = symbol.code
@@ -2447,6 +2454,87 @@ def _build_codebase_context_for_creator(symbol_maps_by_name: dict) -> str:
         parts.append("\n".join(section))
 
     return "\n\n" + ("─" * 60) + "\n\n".join(parts) if parts else "(no uploaded files)"
+
+
+def _rescue_trailing_context(operations: list, change_type: str = "modify") -> list:
+    """
+    Mechanical guard against Surgeon 'find' string context leakage.
+
+    Root cause: Surgeon writes a 'find' string that extends past the actual change
+    target — capturing trailing structural lines (closing tags, sibling divs, next
+    functions, etc.).  Because those lines are absent from 'replace', they get
+    permanently deleted on apply.
+
+    Algorithm (language-agnostic — works for HTML, Python, JS/TS, Go, Rust, etc.):
+      1. Walk backward through 'find' lines.
+      2. Use fuzzy matching (SequenceMatcher ≥ 0.60) to detect the first 'find' line
+         (from the end) that has a counterpart in 'replace'.  That line is the real
+         change boundary — everything AFTER it is trailing context leakage.
+      3. Rescue those trailing lines: trim from 'find', append to 'replace'.
+
+    Skips pure DELETE operations (replace is empty — intentional full removal).
+    """
+    from difflib import SequenceMatcher
+
+    if change_type == "delete":
+        return operations
+
+    def _fuzzy_has_match(line: str, candidates: list, threshold: float = 0.60) -> bool:
+        stripped = line.strip()
+        if not stripped:
+            return True  # blank lines always considered "matched"
+        for c in candidates:
+            c_stripped = c.strip()
+            if not c_stripped:
+                continue
+            if SequenceMatcher(None, stripped, c_stripped).ratio() >= threshold:
+                return True
+        return False
+
+    for op in operations:
+        find    = op.get("find", "")
+        replace = op.get("replace", "")
+        if not find or not replace:
+            continue  # empty replace = intentional full deletion → skip
+
+        find_lines    = find.split("\n")
+        replace_lines = replace.split("\n")
+
+        if len(find_lines) <= 1:
+            continue  # single-line find: no trailing context possible
+
+        # Walk backward to find the rescue boundary
+        rescue_start = len(find_lines)  # index where trailing context begins
+
+        for i in range(len(find_lines) - 1, -1, -1):
+            line = find_lines[i]
+            if not line.strip():
+                rescue_start = i   # blank: tentatively include in rescue zone
+                continue
+            if _fuzzy_has_match(line, replace_lines):
+                rescue_start = i + 1  # boundary found — everything after is leakage
+                break
+            rescue_start = i
+
+        if rescue_start >= len(find_lines):
+            continue  # nothing to rescue
+
+        trailing = find_lines[rescue_start:]
+        new_find = "\n".join(find_lines[:rescue_start])
+
+        # Safety: don't create a trivial / empty find string
+        if not new_find.strip() or len(new_find.strip()) < 5:
+            continue
+
+        n_rescued = len([l for l in trailing if l.strip()])
+        if n_rescued == 0:
+            continue  # only blank lines — skip
+
+        op["find"]    = new_find
+        op["replace"] = replace.rstrip("\n") + "\n" + "\n".join(trailing)
+        print(f"[RESCUE-GUARD] Rescued {n_rescued} trailing lines from find → appended to replace")
+
+    return operations
 
 
 def _extract_json_from_text(text: str) -> str:
