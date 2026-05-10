@@ -79,7 +79,10 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
   const src = modifiedCode ?? code
   const isHtml = /\.html?$/i.test(filename)
   const apiBase = (import.meta as any).env?.VITE_API_URL || ''
-  const frameHeight = expanded ? '100%' : '440px'
+  // flex:1 + minHeight:0 fills the fixed overlay correctly (height:'100%' overshoots)
+  const previewStyle: React.CSSProperties = expanded
+    ? { flex: 1, minHeight: 0, width: '100%' }
+    : { height: '440px', width: '100%' }
   const containerCls = `flex flex-col rounded-lg border border-border overflow-hidden${expanded ? ' fixed inset-4 z-50 bg-base' : ''}`
 
   const toolbar = (
@@ -120,7 +123,7 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
             src={previewUrl}
             // allow-same-origin lets relative sub-resources (CSS/JS in same origin) load
             sandbox="allow-scripts allow-same-origin"
-            style={{ width: '100%', height: frameHeight, border: 'none', background: '#fff', display: 'block' }}
+            style={{ ...previewStyle, border: 'none', background: 'transparent', display: 'block' }}
             title={`Preview: ${filename}`}
           />
         ) : (
@@ -129,7 +132,7 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
             key={`${refreshKey}-doc`}
             sandbox="allow-scripts"
             srcDoc={src}
-            style={{ width: '100%', height: frameHeight, border: 'none', background: '#fff', display: 'block' }}
+            style={{ ...previewStyle, border: 'none', background: 'transparent', display: 'block' }}
             title={`Preview: ${filename}`}
           />
         )}
@@ -152,7 +155,23 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
       <SandpackProvider
         key={refreshKey}
         template="react-ts"
-        files={{ '/App.tsx': appCode }}
+        files={{
+          '/App.tsx': appCode,
+          // Reset browser defaults so the component's own background fills the iframe
+          // (without this, body has margin:8px and a white background that bleeds through)
+          '/index.css': [
+            '*, *::before, *::after { box-sizing: border-box; }',
+            'html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; }',
+            '#root { width: 100%; height: 100%; }',
+          ].join(' '),
+          '/index.tsx': [
+            "import React from 'react';",
+            "import { createRoot } from 'react-dom/client';",
+            "import './index.css';",
+            "import App from './App';",
+            "createRoot(document.getElementById('root')!).render(<App />);",
+          ].join('\n'),
+        }}
         theme={theme === 'dark' ? 'dark' : 'light'}
         customSetup={{
           dependencies: {
@@ -164,7 +183,7 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
         }}
       >
         <SandpackPreview
-          style={{ height: frameHeight, width: '100%' }}
+          style={previewStyle}
           showOpenInCodeSandbox={false}
           showRefreshButton={false}
         />
