@@ -52,6 +52,12 @@ class ChangePasswordRequest(BaseModel):
     new_password: str
 
 
+class SelfChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
+    confirm_password: str
+
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _require_admin(request: Request):
@@ -256,6 +262,65 @@ def change_password(user_id: str, req: ChangePasswordRequest, request: Request):
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
     conn = get_db()
+    hashed = hash_password(req.new_password)
+    conn.execute("UPDATE users SET hashed_password = ? WHERE id = ?", (hashed, user_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@router.post("/change-password")
+def self_change_password(req: SelfChangePasswordRequest, request: Request):
+    """
+    Self-service password change.
+
+    InfoSec requirements enforced:
+    - Current password verified (constant-time bcrypt) before any change
+    - New password must differ from current
+    - New password must match confirmation
+    - Complexity: ≥8 chars, ≥1 upper, ≥1 lower, ≥1 digit
+    - No information leakage — wrong current password returns 401, not 404
+    """
+    import re
+
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Confirmation match (fast check first — no DB round-trip needed)
+    if req.new_password != req.confirm_password:
+        raise HTTPException(status_code=400, detail="New passwords do not match")
+
+    # Complexity requirements
+    if len(req.new_password) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+    if not re.search(r'[A-Z]', req.new_password):
+        raise HTTPException(status_code=400, detail="Password must include at least one uppercase letter")
+    if not re.search(r'[a-z]', req.new_password):
+        raise HTTPException(status_code=400, detail="Password must include at least one lowercase letter")
+    if not re.search(r'[0-9]', req.new_password):
+        raise HTTPException(status_code=400, detail="Password must include at least one number")
+
+    # Fetch current hash
+    conn = get_db()
+    row = conn.execute(
+        "SELECT hashed_password FROM users WHERE id = ? AND is_active = 1", (user_id,)
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Verify current password (constant-time bcrypt)
+    if not verify_password(req.current_password, row["hashed_password"]):
+        conn.close()
+        raise HTTPException(status_code=401, detail="Current password is incorrect")
+
+    # Reject reuse
+    if verify_password(req.new_password, row["hashed_password"]):
+        conn.close()
+        raise HTTPException(status_code=400, detail="New password must be different from your current password")
+
+    # Commit
     hashed = hash_password(req.new_password)
     conn.execute("UPDATE users SET hashed_password = ? WHERE id = ?", (hashed, user_id))
     conn.commit()

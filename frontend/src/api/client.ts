@@ -279,6 +279,15 @@ export const api = {
     getUsers: () => request<any[]>('/auth/users'),
     createUser: (data: any) => request<any>('/auth/users', { method: 'POST', body: JSON.stringify(data) }),
     deleteUser: (id: string) => request<any>(`/auth/users/${id}`, { method: 'DELETE' }),
+    changePassword: (currentPassword: string, newPassword: string, confirmPassword: string) =>
+      request<any>('/auth/change-password', {
+        method: 'POST',
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword,
+          confirm_password: confirmPassword,
+        }),
+      }),
   },
 
   context: {

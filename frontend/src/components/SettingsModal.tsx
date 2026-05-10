@@ -2,12 +2,12 @@ import React, { useState, useEffect } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
-import { X, Eye, EyeOff, CheckCircle, Key, Brain, FolderOpen, Code, Cpu, Sliders, Users, Sun, Moon, Github, ExternalLink, AlertCircle } from 'lucide-react'
+import { X, Eye, EyeOff, CheckCircle, Key, Brain, FolderOpen, Code, Cpu, Sliders, Users, Sun, Moon, Github, ExternalLink, AlertCircle, Lock } from 'lucide-react'
 import { AdminUsersPanel } from './AdminUsersPanel'
 import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
 
-type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'local' | 'users' | 'github'
+type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'local' | 'users' | 'github' | 'security'
 
 const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'api',       icon: <Key size={14} />,       label: 'API Keys' },
@@ -16,7 +16,8 @@ const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'workspace', icon: <FolderOpen size={14} />, label: 'Workspace' },
   { id: 'editor',    icon: <Code size={14} />,       label: 'Editor' },
   { id: 'local',     icon: <Cpu size={14} />,        label: 'Local AI' },
-  { id: 'users',    icon: <Users size={14} />,     label: 'Users' },
+  { id: 'users',     icon: <Users size={14} />,      label: 'Users' },
+  { id: 'security',  icon: <Lock size={14} />,       label: 'Security' },
 ]
 
 export function SettingsModal() {
@@ -44,6 +45,16 @@ export function SettingsModal() {
   const [githubStatus, setGithubStatus] = useState<any>(null)
   const [githubStatusMsg, setGithubStatusMsg] = useState('')
   const [models, setModels] = useState<any[]>([])
+
+  // Security tab — change password
+  const [pwCurrent, setPwCurrent]         = useState('')
+  const [pwNew, setPwNew]                 = useState('')
+  const [pwConfirm, setPwConfirm]         = useState('')
+  const [showPwCurrent, setShowPwCurrent] = useState(false)
+  const [showPwNew, setShowPwNew]         = useState(false)
+  const [showPwConfirm, setShowPwConfirm] = useState(false)
+  const [pwSaving, setPwSaving]           = useState(false)
+  const [pwResult, setPwResult]           = useState<{ ok: boolean; msg: string } | null>(null)
   const [form, setForm] = useState({
     architect_model: 'gpt-5',
     surgeon_model: 'gpt-4.1',
@@ -201,6 +212,39 @@ export function SettingsModal() {
   }
 
   const upd = (k: string) => (v: any) => setForm((s) => ({ ...s, [k]: v }))
+
+  // Password strength — 0-4 based on criteria met
+  const pwStrength = (pw: string): number => {
+    if (!pw) return 0
+    let score = 0
+    if (pw.length >= 8)                    score++
+    if (/[A-Z]/.test(pw))                  score++
+    if (/[a-z]/.test(pw) && /[0-9]/.test(pw)) score++
+    if (/[^A-Za-z0-9]/.test(pw))           score++
+    return score
+  }
+  const pwStrengthLabel = ['', 'Weak', 'Fair', 'Good', 'Strong']
+  const pwStrengthColor = ['', 'bg-red-500', 'bg-yellow-400', 'bg-green-400', 'bg-emerald-500']
+  const pwStrengthText  = ['', 'text-red-400', 'text-yellow-400', 'text-green-400', 'text-emerald-400']
+
+  const handleChangePassword = async () => {
+    setPwResult(null)
+    if (!pwCurrent || !pwNew || !pwConfirm) {
+      setPwResult({ ok: false, msg: 'All three fields are required' })
+      return
+    }
+    setPwSaving(true)
+    try {
+      await (api as any).auth.changePassword(pwCurrent, pwNew, pwConfirm)
+      setPwResult({ ok: true, msg: 'Password updated successfully' })
+      setPwCurrent(''); setPwNew(''); setPwConfirm('')
+    } catch (err: any) {
+      const detail = err?.detail || err?.message || 'Something went wrong — please try again'
+      setPwResult({ ok: false, msg: detail })
+    } finally {
+      setPwSaving(false)
+    }
+  }
 
   return (
     <div
@@ -596,13 +640,152 @@ export function SettingsModal() {
                 )}
               </div>
             )}
+
+            {tab === 'security' && (
+              <div className="space-y-6 max-w-sm">
+              <SectionHeader
+                title="Change Password"
+                subtitle="Enter your current password to set a new one"
+              />
+
+              {/* Current password */}
+              <div>
+                <div className="text-xs text-muted mb-1.5 font-medium">Current Password</div>
+                <div className="relative">
+                  <input
+                    type={showPwCurrent ? 'text' : 'password'}
+                    className="input pr-10 w-full"
+                    placeholder="Your current password"
+                    value={pwCurrent}
+                    onChange={(e) => { setPwCurrent(e.target.value); setPwResult(null) }}
+                    autoComplete="current-password"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPwCurrent(v => !v)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink"
+                  >
+                    {showPwCurrent ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </button>
+                </div>
+              </div>
+
+              {/* New password */}
+              <div>
+                <div className="text-xs text-muted mb-1.5 font-medium">New Password</div>
+                <div className="relative">
+                  <input
+                    type={showPwNew ? 'text' : 'password'}
+                    className="input pr-10 w-full"
+                    placeholder="At least 8 chars, upper, lower, digit"
+                    value={pwNew}
+                    onChange={(e) => { setPwNew(e.target.value); setPwResult(null) }}
+                    autoComplete="new-password"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPwNew(v => !v)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink"
+                  >
+                    {showPwNew ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </button>
+                </div>
+                {/* Strength meter */}
+                {pwNew && (() => {
+                  const s = pwStrength(pwNew)
+                  return (
+                    <div className="mt-2 space-y-1">
+                      <div className="flex gap-1">
+                        {[1,2,3,4].map(i => (
+                          <div
+                            key={i}
+                            className={`h-1 flex-1 rounded-full transition-colors ${i <= s ? pwStrengthColor[s] : 'bg-border'}`}
+                          />
+                        ))}
+                      </div>
+                      <div className={`text-[11px] font-medium ${pwStrengthText[s]}`}>
+                        {pwStrengthLabel[s]}
+                        {s < 3 && <span className="text-faint ml-1">— add uppercase, numbers, or symbols</span>}
+                      </div>
+                    </div>
+                  )
+                })()}
+              </div>
+
+              {/* Confirm password */}
+              <div>
+                <div className="text-xs text-muted mb-1.5 font-medium">Confirm New Password</div>
+                <div className="relative">
+                  <input
+                    type={showPwConfirm ? 'text' : 'password'}
+                    className="input pr-10 w-full"
+                    placeholder="Repeat your new password"
+                    value={pwConfirm}
+                    onChange={(e) => { setPwConfirm(e.target.value); setPwResult(null) }}
+                    autoComplete="new-password"
+                    onKeyDown={(e) => e.key === 'Enter' && handleChangePassword()}
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPwConfirm(v => !v)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink"
+                  >
+                    {showPwConfirm ? <EyeOff size={14} /> : <Eye size={14} />}
+                  </button>
+                </div>
+                {/* Match indicator */}
+                {pwConfirm && pwNew && (
+                  <div className={`text-[11px] mt-1 font-medium ${pwConfirm === pwNew ? 'text-green-400' : 'text-red-400'}`}>
+                    {pwConfirm === pwNew ? '✓ Passwords match' : '✗ Passwords do not match'}
+                  </div>
+                )}
+              </div>
+
+              {/* Result banner */}
+              {pwResult && (
+                <div className={`flex items-start gap-2 px-3 py-2.5 rounded-lg text-xs ${
+                  pwResult.ok
+                    ? 'bg-green-500/10 border border-green-500/30 text-green-400'
+                    : 'bg-red-500/10 border border-red-500/30 text-red-400'
+                }`}>
+                  {pwResult.ok ? <CheckCircle size={13} className="mt-px shrink-0" /> : <AlertCircle size={13} className="mt-px shrink-0" />}
+                  {pwResult.msg}
+                </div>
+              )}
+
+              {/* Submit */}
+              <button
+                onClick={handleChangePassword}
+                disabled={pwSaving || !pwCurrent || !pwNew || !pwConfirm}
+                className="btn-primary w-full disabled:opacity-50"
+              >
+                {pwSaving ? 'Updating…' : 'Update Password'}
+              </button>
+
+              {/* Requirements callout */}
+              <div className="text-[11px] text-faint space-y-0.5 p-3 rounded-lg bg-surface border border-border">
+                <div className="font-medium text-muted mb-1">Requirements</div>
+                <div className={`flex items-center gap-1.5 ${/^.{8,}$/.test(pwNew) ? 'text-green-400' : ''}`}>
+                  {/^.{8,}$/.test(pwNew) ? '✓' : '·'} At least 8 characters
+                </div>
+                <div className={`flex items-center gap-1.5 ${/[A-Z]/.test(pwNew) ? 'text-green-400' : ''}`}>
+                  {/[A-Z]/.test(pwNew) ? '✓' : '·'} One uppercase letter
+                </div>
+                <div className={`flex items-center gap-1.5 ${/[a-z]/.test(pwNew) ? 'text-green-400' : ''}`}>
+                  {/[a-z]/.test(pwNew) ? '✓' : '·'} One lowercase letter
+                </div>
+                <div className={`flex items-center gap-1.5 ${/[0-9]/.test(pwNew) ? 'text-green-400' : ''}`}>
+                  {/[0-9]/.test(pwNew) ? '✓' : '·'} One number
+                </div>
+              </div>
+            )}
           </div>
         </div>
 
         {/* Footer */}
         <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-border flex-shrink-0">
           <button onClick={() => setSettingsOpen(false)} className="btn-ghost border border-border px-5 py-2 text-sm">Cancel</button>
-          {tab !== 'users' && <button onClick={handleSave} className="btn-primary px-6">Save Settings</button>}
+          {tab !== 'users' && tab !== 'security' && <button onClick={handleSave} className="btn-primary px-6">Save Settings</button>}
         </div>
       </div>
     </div>
