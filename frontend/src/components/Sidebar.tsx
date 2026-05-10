@@ -470,12 +470,20 @@ function LinearIcon({ size = 16 }: { size?: number }) {
 }
 
 export function Sidebar() {
-  const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles } = useAppStore()
+  const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, sidebarPanelOpen, setSidebarPanelOpen } = useAppStore()
   const { theme, toggleTheme } = useThemeStore()
   const { user, logout } = useAuthStore()
   const [panelOpen, setPanelOpen] = useState(true)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
   const userMenuRef = useRef<HTMLDivElement>(null)
+
+  // Sync external open requests (e.g. from NewFileCard "Add to session")
+  useEffect(() => {
+    if (sidebarPanelOpen) {
+      setPanelOpen(true)
+      setSidebarPanelOpen(false)
+    }
+  }, [sidebarPanelOpen, setSidebarPanelOpen])
 
   // Close user menu on outside click
   useEffect(() => {

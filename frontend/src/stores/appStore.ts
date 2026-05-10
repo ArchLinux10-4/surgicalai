@@ -34,6 +34,8 @@ interface AppState {
   // UI
   sidebarTab: 'files' | 'sessions' | 'context' | 'github' | 'linear'
   setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear') => void
+  sidebarPanelOpen: boolean
+  setSidebarPanelOpen: (open: boolean) => void
   sendLinearIssue: ((issue: any) => void) | null
   setSendLinearIssue: (fn: ((issue: any) => void) | null) => void
   rightTab: 'editor' | 'diff' | 'git'
@@ -109,6 +111,8 @@ export const useAppStore = create<AppState>((set) => ({
 
   sidebarTab: 'files',
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
+  sidebarPanelOpen: false,
+  setSidebarPanelOpen: (sidebarPanelOpen) => set({ sidebarPanelOpen }),
   sendLinearIssue: null,
   setSendLinearIssue: (fn) => set({ sendLinearIssue: fn }),
   rightTab: 'editor',

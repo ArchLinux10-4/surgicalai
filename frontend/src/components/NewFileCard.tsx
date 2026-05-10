@@ -241,7 +241,12 @@ export function NewFileCard({ result, sessionId }: NewFileCardProps) {
           file={file}
           sessionId={sessionId}
           index={i}
-          onSaved={(fname) => setSavedFiles(prev => new Set([...prev, fname]))}
+          onSaved={(fname) => {
+        setSavedFiles(prev => new Set([...prev, fname]))
+        // Auto-open Files panel so user can see the file was added
+        useAppStore.getState().setSidebarTab('files')
+        useAppStore.getState().setSidebarPanelOpen(true)
+      }}
         />
       ))}
 
