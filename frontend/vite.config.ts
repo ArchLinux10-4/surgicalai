@@ -19,6 +19,7 @@ export default defineConfig({
         manualChunks: {
           'monaco': ['monaco-editor'],
           'react-vendor': ['react', 'react-dom'],
+          'sandpack': ['@codesandbox/sandpack-react'],
         }
       }
     }

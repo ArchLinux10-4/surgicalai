@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@codesandbox/sandpack-react": "^2.19.9",
     "@monaco-editor/react": "^4.6.0",
     "@types/react-syntax-highlighter": "^15.5.13",
     "clsx": "^2.1.1",

@@ -808,6 +808,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                   code={originalCode || '// Loading...'}
                   filename={filename}
                   modifiedCode={isApplied ? modifiedCode : undefined}
+                  sessionId={sessionId}
+                  fileId={fileData.file_id}
                 />
               </div>
             )}

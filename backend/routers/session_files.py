@@ -5,7 +5,9 @@ import uuid
 import base64
 import io
 from pathlib import Path
+import mimetypes
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
 from database import get_db
 from services.ast_parser import ASTParser
 
@@ -308,3 +310,30 @@ def delete_session_file(session_id: str, file_id: str):
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+@router.get("/{session_id}/files/{file_id}/preview")
+def preview_session_file(session_id: str, file_id: str):
+    """Serve file content for live preview with correct Content-Type.
+    No auth required — session_id + file_id are UUIDs (unguessable).
+    Used by the frontend LivePreview iframe so HTML assets resolve correctly."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT filename, content FROM session_files WHERE id = ? AND session_id = ?",
+        (file_id, session_id),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if hasattr(row, "__getitem__"):
+        filename, content = row["filename"], row["content"]
+    else:
+        filename, content = row[0], row[1]
+
+    content_type = mimetypes.guess_type(filename)[0] or "text/plain"
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Access-Control-Allow-Origin": "*"},
+    )

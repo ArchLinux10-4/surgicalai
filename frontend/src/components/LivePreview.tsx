@@ -1,5 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react'
-import { Eye, EyeOff, RefreshCw, Maximize2, Minimize2 } from 'lucide-react'
+import React, { useState } from 'react'
+import { RefreshCw, Maximize2, Minimize2 } from 'lucide-react'
+import { SandpackProvider, SandpackPreview } from '@codesandbox/sandpack-react'
+import { useThemeStore } from '../stores/themeStore'
 
 /* ─── Public API ───────────────────────────────────────────────── */
 export function isVisualFile(filename: string): boolean {
@@ -10,23 +12,12 @@ interface LivePreviewProps {
   code: string
   filename: string
   modifiedCode?: string
+  /** Optional — enables backend-served HTML preview (resolves relative paths) */
+  sessionId?: string
+  fileId?: string
 }
 
 /* ─── Helpers ──────────────────────────────────────────────────── */
-let _babelReady: Promise<void> | null = null
-function ensureBabel(): Promise<void> {
-  if ((window as any).Babel) return Promise.resolve()
-  if (_babelReady) return _babelReady
-  _babelReady = new Promise((resolve, reject) => {
-    const s = document.createElement('script')
-    s.src = 'https://unpkg.com/@babel/standalone@7/babel.min.js'
-    s.crossOrigin = 'anonymous'
-    s.onload = () => (window as any).Babel ? resolve() : reject(new Error('Babel not found after load'))
-    s.onerror = () => { _babelReady = null; reject(new Error('Could not load Babel from CDN')) }
-    document.head.appendChild(s)
-  })
-  return _babelReady
-}
 
 function detectComponent(code: string): string {
   return (
@@ -34,219 +25,139 @@ function detectComponent(code: string): string {
     code.match(/export\s+default\s+(?:function|class)\s+([A-Z]\w*)/)?.[1] ||
     // 2. export default Foo
     code.match(/export\s+default\s+([A-Z]\w*)/)?.[1] ||
-    // 3. named export: export function/class FooBar (PascalCase only)
+    // 3. named export: export function FooBar (PascalCase only)
     code.match(/export\s+(?:function|class)\s+([A-Z][a-z]\w*)/)?.[1] ||
-    // 4. last PascalCase const/function (excludes ALL_CAPS like DURATION, W, H)
+    // 4. last PascalCase const/function
     [...code.matchAll(/(?:function|const)\s+([A-Z][a-z][a-zA-Z0-9]*)\s*[=(]/g)].pop()?.[1] ||
     'App'
   )
 }
 
-/** Wrap every return() block in a <> fragment — fixes adjacent JSX element errors */
-function wrapReturnsInFragments(code: string): string {
-  const lines = code.split('\n')
-  const result: string[] = []
-  let i = 0
-  while (i < lines.length) {
-    const m = lines[i].match(/^(\s*)return\s*\(\s*$/)
-    if (m) {
-      const indent = m[1]
-      result.push(lines[i])
-      result.push(`${indent}  <>`)
-      i++
-      while (i < lines.length) {
-        if (/^\s*\);\s*$/.test(lines[i])) {
-          result.push(`${indent}  </>`)
-          result.push(lines[i])
-          i++
-          break
-        }
-        result.push(lines[i])
-        i++
-      }
-    } else {
-      result.push(lines[i])
-      i++
-    }
-  }
-  return result.join('\n')
-}
-
 /**
- * Strip relative imports and replace with safe deep-proxy stubs.
- *
- * The stub is callable (returns proxy), and every property access also returns
- * the same callable proxy.  This prevents TypeError crashes from patterns like:
- *   const { login, user } = useAuthStore()       ← hook destructure
- *   apiClient.get('/path').then(cb)              ← chained calls
+ * Replace relative imports with lightweight stubs so Sandpack doesn't throw
+ * on missing local files. Package imports (react, lucide-react, etc.) are left
+ * untouched and resolved by Sandpack's bundler.
  */
 function stubRelativeImports(code: string): string {
-  // Universal deep-proxy stub injected once at the top
-  const STUB_HELPER = [
-    'var __sp=new Proxy({},{get:function(_,k){if(typeof k==="symbol")return undefined;',
-    'if(k==="__esModule"||k==="default"||k==="then")return undefined;', // ← don't make it a thenable
-    'return __sf;}});',
-    'var __sf=new Proxy(function(){return __sp;},{',
-    'get:function(_,k){if(typeof k==="symbol")return undefined;',
-    'if(k==="__esModule")return true;if(k==="default")return __sf;',
-    'if(k==="then")return undefined;', // ← prevent Promise.resolve() auto-unwrapping
-    'return __sf;},',
-    'apply:function(){return __sp;}',
-    '});',
-  ].join('')
-
-  let hasStubs = false
-  const processed = code.replace(
-    /^import\s+(.+?)\s+from\s+['"](\.[^'"]+)['"]\s*;?\s*$/gm,
+  return code.replace(
+    /^import\s+(.+?)\s+from\s+['"](\.{1,2}[^'"]+)['"]\s*;?\s*$/gm,
     (_, spec) => {
-      hasStubs = true
       const names = spec
         .replace(/\*\s+as\s+(\w+)/, '$1')
         .replace(/[{}]/g, '')
         .split(',')
         .map((s: string) => s.trim().split(/\s+as\s+/).pop()?.trim())
         .filter(Boolean) as string[]
-      return names.map(n => `var ${n} = __sf;`).join(' ')
+      // Each stub is a Proxy that returns a resolved-promise for any call/access
+      return names
+        .map(
+          (n) =>
+            `const ${n}: any = new Proxy(function(){} as any, { get: (_:any,k:any) => typeof k==='symbol'?undefined:(..._a:any[])=>Promise.resolve({}) });`
+        )
+        .join('\n')
     }
   )
-
-  return hasStubs ? STUB_HELPER + '\n' + processed : processed
-}
-
-function buildHtml(compiledJs: string, component: string): string {
-  // The compiled JS uses require() for all package imports.
-  // We load React + ReactDOM as UMD globals from CDN, then provide a tiny shim.
-  const shim = `
-<script>
-var module = { exports: {} }; var exports = module.exports;
-function require(id) {
-  var u = id.toLowerCase();
-  if (u === 'react') return Object.assign({ default: React, __esModule: true }, React);
-  if (u === 'react-dom' || u === 'react-dom/client') return Object.assign({ default: ReactDOM, createRoot: ReactDOM.createRoot, __esModule: true }, ReactDOM);
-  // Lucide + anything else: return a Proxy of no-op components
-  return new Proxy({}, { get: function(_, k) {
-    if (k === '__esModule' || k === 'default') return true;
-    return function(){ return null; };
-  }});
-}
-<\/script>`
-
-  return `<!DOCTYPE html>
-<html>
-<head>
-<meta charset="utf-8">
-<style>*{box-sizing:border-box}body{margin:0;padding:12px;font-family:system-ui,sans-serif;background:#fff;color:#111}</style>
-<script src="https://unpkg.com/react@18/umd/react.development.js"><\/script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"><\/script>
-${shim}
-</head>
-<body>
-<div id="root"></div>
-<div id="__err" style="display:none;color:#c00;background:#fee;padding:8px;border-radius:4px;font-size:12px;white-space:pre-wrap;margin:4px"></div>
-<script>
-window.onerror = function(msg,_,__,___,e){ var el=document.getElementById('__err'); el.style.display='block'; el.textContent=(e&&e.message)||msg; };
-try {
-${compiledJs}
-
-var __C = module.exports['default'] || module.exports['${component}'];
-if (typeof __C === 'function') {
-  ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(__C));
-} else {
-  document.getElementById('root').textContent = 'No renderable component found (looked for: ${component})';
-}
-} catch(e) { var el=document.getElementById('__err'); el.style.display='block'; el.textContent=e.message||String(e); }
-<\/script>
-</body>
-</html>`
 }
 
 /* ─── Component ────────────────────────────────────────────────── */
-export function LivePreview({ code, filename, modifiedCode }: LivePreviewProps) {
-  const [srcdoc, setSrcdoc] = useState('')
-  const [error, setError] = useState('')
+export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }: LivePreviewProps) {
+  const { theme } = useThemeStore()
   const [expanded, setExpanded] = useState(false)
-  const [key, setKey] = useState(0)
+  const [refreshKey, setRefreshKey] = useState(0)
+
   const src = modifiedCode ?? code
+  const isHtml = /\.html?$/i.test(filename)
+  const apiBase = (import.meta as any).env?.VITE_API_URL || ''
+  const frameHeight = expanded ? '100%' : '440px'
+  const containerCls = `flex flex-col rounded-lg border border-border overflow-hidden${expanded ? ' fixed inset-4 z-50 bg-base' : ''}`
 
-  useEffect(() => {
-    setError('')
-    setSrcdoc('')
+  const toolbar = (
+    <div className="flex items-center justify-between px-3 py-1.5 bg-surface border-b border-border flex-shrink-0">
+      <span className="text-[11px] text-muted font-mono truncate">👁 {filename}</span>
+      <div className="flex gap-1">
+        <button
+          onClick={() => setRefreshKey((k) => k + 1)}
+          className="p-1 rounded hover:bg-hover text-muted hover:text-fg"
+          title="Reload"
+        >
+          <RefreshCw size={11} />
+        </button>
+        <button
+          onClick={() => setExpanded((e) => !e)}
+          className="p-1 rounded hover:bg-hover text-muted hover:text-fg"
+          title={expanded ? 'Collapse' : 'Expand'}
+        >
+          {expanded ? <Minimize2 size={11} /> : <Maximize2 size={11} />}
+        </button>
+      </div>
+    </div>
+  )
 
-    // Plain HTML — pass through as-is
-    if (/\.html?$/i.test(filename)) {
-      setSrcdoc(src)
-      return
-    }
+  /* ── Option A: HTML via backend URL ─────────────────────────── */
+  if (isHtml) {
+    const previewUrl =
+      sessionId && fileId
+        ? `${apiBase}/api/chat/${sessionId}/files/${fileId}/preview`
+        : null
 
-    let cancelled = false
-    ensureBabel()
-      .then(() => {
-        if (cancelled) return
-        const B = (window as any).Babel
-        let prepared = stubRelativeImports(src)
-        let compiled: string
-        try {
-          compiled = B.transform(prepared, {
-            presets: ['react', ['typescript', { isTSX: true, allExtensions: true }]],
-            plugins: ['transform-modules-commonjs'],
-            filename,
-            sourceType: 'module',
-          }).code
-        } catch (e1: any) {
-          // Auto-fix: wrap every return() block in <> fragment and retry
-          // Handles both "Adjacent JSX elements" and related parse errors
-          const wrapped = wrapReturnsInFragments(prepared)
-          try {
-            compiled = B.transform(wrapped, {
-              presets: ['react', ['typescript', { isTSX: true, allExtensions: true }]],
-              plugins: ['transform-modules-commonjs'],
-              filename,
-              sourceType: 'module',
-            }).code
-          } catch {
-            throw e1  // both attempts failed — show original error
-          }
-        }
-        const component = detectComponent(src)
-        setSrcdoc(buildHtml(compiled, component))
-      })
-      .catch((e: any) => {
-        if (!cancelled) setError(e.message || 'Preview failed')
-      })
+    return (
+      <div className={containerCls}>
+        {toolbar}
+        {previewUrl ? (
+          <iframe
+            key={`${refreshKey}-url`}
+            src={previewUrl}
+            // allow-same-origin lets relative sub-resources (CSS/JS in same origin) load
+            sandbox="allow-scripts allow-same-origin"
+            style={{ width: '100%', height: frameHeight, border: 'none', background: '#fff', display: 'block' }}
+            title={`Preview: ${filename}`}
+          />
+        ) : (
+          /* Fallback: srcdoc (no IDs — e.g. preview before file is uploaded) */
+          <iframe
+            key={`${refreshKey}-doc`}
+            sandbox="allow-scripts"
+            srcDoc={src}
+            style={{ width: '100%', height: frameHeight, border: 'none', background: '#fff', display: 'block' }}
+            title={`Preview: ${filename}`}
+          />
+        )}
+      </div>
+    )
+  }
 
-    return () => { cancelled = true }
-  }, [src, filename])
+  /* ── Option B: TSX/JSX via Sandpack ─────────────────────────── */
+  const componentName = detectComponent(src)
+  const hasDefault = /export\s+default\s+/.test(src)
+  const processedCode = stubRelativeImports(src)
+  // Ensure Sandpack's default index.tsx can do `import App from './App'`
+  const appCode = hasDefault
+    ? processedCode
+    : `${processedCode}\nexport default ${componentName}`
 
   return (
-    <div className={`flex flex-col rounded-lg border border-border overflow-hidden ${expanded ? 'fixed inset-4 z-50 bg-base' : ''}`}>
-      {/* Toolbar */}
-      <div className="flex items-center justify-between px-3 py-1.5 bg-surface border-b border-border">
-        <span className="text-[11px] text-muted font-mono truncate">👁 {filename}</span>
-        <div className="flex gap-1">
-          <button onClick={() => setKey(k => k + 1)} className="p-1 rounded hover:bg-hover text-muted hover:text-fg" title="Reload">
-            <RefreshCw size={11} />
-          </button>
-          <button onClick={() => setExpanded(e => !e)} className="p-1 rounded hover:bg-hover text-muted hover:text-fg" title={expanded ? 'Collapse' : 'Expand'}>
-            {expanded ? <Minimize2 size={11} /> : <Maximize2 size={11} />}
-          </button>
-        </div>
-      </div>
-
-      {error ? (
-        <div className="p-3 text-xs text-red-400 bg-red-500/5 font-mono whitespace-pre-wrap">{error}</div>
-      ) : srcdoc ? (
-        <iframe
-          key={key}
-          sandbox="allow-scripts"
-          srcDoc={srcdoc}
-          className={`w-full bg-white border-none ${expanded ? 'flex-1' : 'h-[440px]'}`}
-          title={`Preview: ${filename}`}
+    <div className={containerCls}>
+      {toolbar}
+      <SandpackProvider
+        key={refreshKey}
+        template="react-ts"
+        files={{ '/App.tsx': appCode }}
+        theme={theme === 'dark' ? 'dark' : 'light'}
+        customSetup={{
+          dependencies: {
+            'lucide-react': 'latest',
+          },
+        }}
+        options={{
+          externalResources: ['https://cdn.tailwindcss.com'],
+        }}
+      >
+        <SandpackPreview
+          style={{ height: frameHeight, width: '100%' }}
+          showOpenInCodeSandbox={false}
+          showRefreshButton={false}
         />
-      ) : (
-        <div className={`flex items-center justify-center text-xs text-muted ${expanded ? 'flex-1' : 'h-[440px]'}`}>
-          Compiling preview…
-        </div>
-      )}
+      </SandpackProvider>
     </div>
   )
 }
