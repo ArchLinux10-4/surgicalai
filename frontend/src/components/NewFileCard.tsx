@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useState, useCallback } from 'react'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { useThemeStore } from '../stores/themeStore'
@@ -69,6 +69,14 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
       })
       setSaved(true)
       onSaved(file.filename)
+      // Immediately refresh the session file list in the store so the Files tray updates
+      try {
+        const files = await api.sessionFiles.list(sessionId)
+        useAppStore.getState().setSessionFiles(files)
+      } catch (_) {}
+      // Open Files panel so user can see the file immediately
+      useAppStore.getState().setSidebarTab('files')
+      useAppStore.getState().setSidebarPanelOpen(true)
       toast.success(`${file.filename} added to session`)
     } catch (e: any) {
       toast.error(`Failed to save: ${e.message}`)
@@ -243,9 +251,6 @@ export function NewFileCard({ result, sessionId }: NewFileCardProps) {
           index={i}
           onSaved={(fname) => {
         setSavedFiles(prev => new Set([...prev, fname]))
-        // Auto-open Files panel so user can see the file was added
-        useAppStore.getState().setSidebarTab('files')
-        useAppStore.getState().setSidebarPanelOpen(true)
       }}
         />
       ))}
