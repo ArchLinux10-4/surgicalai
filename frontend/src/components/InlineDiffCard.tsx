@@ -79,7 +79,7 @@ function QABadge({ qa }: { qa: QAResult }) {
         QA {icon}{score}
       </button>
       {expanded && (
-        <div className="absolute left-0 top-6 z-50 w-72 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-xl p-3 text-[12px]">
+        <div className="absolute left-0 top-7 z-[200] w-72 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-xl p-3 text-[12px]">
           <div className="flex items-center justify-between mb-2">
             <span className="font-semibold">QA Report</span>
             <button onClick={() => setExpanded(false)} className="text-muted hover:text-ink">✕</button>
@@ -121,7 +121,7 @@ function BlastRadius({ change }: { change: any }) {
         🎯 {risks.length} risk{risks.length !== 1 ? 's' : ''}
       </button>
       {open && (
-        <div className="absolute left-0 top-6 z-50 w-72 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-xl p-3 text-[12px]">
+        <div className="absolute left-0 top-7 z-[200] w-72 bg-[var(--color-surface)] border border-[var(--color-border)] rounded-lg shadow-xl p-3 text-[12px]">
           <div className="flex items-center justify-between mb-2">
             <span className="font-semibold text-amber-400">🎯 Blast Radius</span>
             <button onClick={() => setOpen(false)} className="text-muted hover:text-ink">×</button>
@@ -602,9 +602,9 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   }
 
   return (
-    <div className="border border-border rounded-xl overflow-hidden mb-3">
+    <div className="border border-border rounded-xl mb-3">
       {/* ── File header ─────────────────────────────────────────────────── */}
-      <div className="flex items-center gap-2.5 px-4 py-2.5 bg-surface/80">
+      <div className="flex items-center gap-2.5 px-4 py-2.5 bg-surface/80 rounded-t-xl">
         <FileCode size={14} className="text-accent flex-shrink-0" />
         <span className="text-sm font-semibold text-ink">{filename}</span>
         <span className="text-[11px] text-muted/70 ml-1">
@@ -768,7 +768,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 
       {/* ── Single action bar ──────────────────────────────────────────── */}
       {!allApplied && (
-        <div className="flex items-center gap-2 px-4 py-3 bg-surface/60 border-t border-border">
+        <div className="flex items-center gap-2 px-4 py-3 bg-surface/60 border-t border-border rounded-b-xl">
           {/* Download selected changes */}
           <button
             onClick={handleDownload}

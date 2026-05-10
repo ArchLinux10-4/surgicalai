@@ -2107,7 +2107,7 @@ async def _run_qa_for_new_file(file_result: dict, codebase_context: str, user_id
     try:
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _use_claude = True
-        _model = "claude-sonnet-4-20250514"
+        _model = "claude-sonnet-4-6"
     except Exception:
         _qa_aclient = None
         _use_claude = False
@@ -2351,9 +2351,9 @@ async def run_file_creator(
         return json.loads(raw)
 
     # Prefer Claude for file creation — it generates better structured code
-    creator_model = get_setting("architect_model", "claude-sonnet-4-20250514")
+    creator_model = get_setting("architect_model", "claude-sonnet-4-6")
     if not _is_claude_model(creator_model):
-        creator_model = "claude-sonnet-4-20250514"
+        creator_model = "claude-sonnet-4-6"
 
     user_msg = _build_creator_user_msg(file_spec, codebase_context)
 
@@ -2513,7 +2513,7 @@ async def run_qa_agent(
     try:
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _qa_use_claude = True
-        _qa_model = "claude-sonnet-4-20250514"
+        _qa_model = "claude-sonnet-4-6"
     except Exception:
         _qa_aclient = None
         _qa_use_claude = False
