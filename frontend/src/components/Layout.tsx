@@ -2,18 +2,27 @@ import React from 'react'
 import { Sidebar } from './Sidebar'
 import { ChatPanel } from './ChatPanel'
 import { CodePanel } from './CodePanel'
+import { MobileLayout } from './mobile/MobileLayout'
 import { useAppStore } from '../stores/appStore'
 import { useAuthStore } from '../stores/authStore'
+import { useIsMobile } from '../hooks/useIsMobile'
 import { LoginPage } from '../pages/LoginPage'
 
 export function Layout() {
   const activeFile = useAppStore(s => s.activeFile)
   const { isAuthenticated } = useAuthStore()
+  const isMobile = useIsMobile()
 
   if (!isAuthenticated) {
     return <LoginPage />
   }
 
+  // Mobile: render dedicated mobile experience
+  if (isMobile) {
+    return <MobileLayout />
+  }
+
+  // Desktop: untouched
   return (
     <div className="flex flex-1 overflow-hidden">
       {/* Sidebar — self-sizing: rail (44px always) + panel (220px when open) */}
