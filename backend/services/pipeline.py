@@ -519,12 +519,23 @@ HARD RULES:
 1. "find" MUST be an EXACT substring of the TARGET CODE or a well-known anchor (</script>, </body>, etc).
    Copy it character-for-character, including all whitespace and indentation.
 2. "find" should be the MINIMUM text needed to UNIQUELY identify the location. Usually 2-6 lines.
-   If a short string like </div> could match many places, include the surrounding 2-3 lines.
+   If a short string like </div> could match many places, include the surrounding 2-3 lines BEFORE it for uniqueness.
 3. "replace" is the new text for that exact location. Preserve original indentation style.
 4. Each operation = ONE logical change. Multiple changes = multiple operations.
 5. Do NOT include unchanged surrounding code in your operations.
 6. MULTI-PART CHANGES: if the plan requires changes in multiple locations (e.g. add CSS + add state + modify JSX),
    produce one operation per location. Verify each "find" string is unique in the file.
+
+⚠️  FIND STRING LENGTH — MOST CRITICAL RULE ⚠️
+- Your "find" string must contain ONLY the specific code you are changing, plus at most 1-2 lines
+  IMMEDIATELY BEFORE the change for uniqueness anchoring.
+- NEVER include lines that appear AFTER the element you are modifying.
+- If you are wrapping an <input>, your find = that <input> line only. NOT the closing </div> below it.
+  NOT the buttons that follow it. NOT the next sibling element.
+- REASON: Every line in "find" that is ABSENT from "replace" gets permanently DELETED from the file.
+  Including trailing context lines is the #1 cause of unintended deletions.
+- If you need to anchor against something unique, use the 1-2 lines BEFORE the target, not after.
+- Maximum practical find length: ~10 lines. If you think you need more, split into multiple operations.
 
 CHANGE TYPES:
 - MODIFY/WRAP: find = the element to change, replace = the modified version.
@@ -2486,11 +2497,18 @@ You receive:
 - CHANGE PLAN: what was asked for
 - OTHER FILES CONTEXT: symbol maps of other uploaded files (for cross-file checks)
 
+⚠️  DIFF IS THE ONLY SOURCE OF TRUTH FOR WHAT CHANGED ⚠️
+The UNIFIED DIFF shows exactly what was added (+) and removed (-).
+The ORIGINAL CODE and NEW CODE snippets are TRUNCATED WINDOWS — they may cut off mid-file.
+NEVER infer that code was deleted because it appears in ORIGINAL but not in NEW CODE.
+ONLY flag a deletion if it appears as a "-" line in the UNIFIED DIFF.
+
 Check for ALL of the following:
 1. IMPORT ISSUES — does new code call/use anything that needs an import not in the file?
 2. DOWNSTREAM RISKS — does this change affect function signatures, types, or constants that other files depend on?
 3. TYPE ERRORS — obvious type mismatches, wrong argument counts, wrong return types
 4. PLAN DEVIATION — does new code do something OTHER than what the plan says? (adding/removing unasked features)
+   When checking for unasked deletions: ONLY flag lines that appear as "-" in the DIFF. Do not flag truncation.
 5. DUPLICATION — is any code duplicated (same function defined twice, same block copy-pasted)?
 6. ALREADY CORRECT — if new code is identical to original, flag it
 7. ARCHITECT RISKS — if architect_risks are provided, evaluate each one against the actual diff and mark whether it truly applies to THIS specific change
@@ -2603,20 +2621,22 @@ File: {filename}
 Description: {change_description}
 Expected behavior: {new_logic}
 
-UNIFIED DIFF (what actually changed):
+UNIFIED DIFF (the authoritative record — ONLY trust this for what was added/removed):
 {_diff_text}
 
-ORIGINAL CODE (structure context):
+ORIGINAL CODE (truncated window for structural context only — do NOT use to infer deletions):
 {_orig_snippet}
 
-NEW CODE (structure context):
+NEW CODE (truncated window for structural context only — do NOT use to infer deletions):
 {_new_snippet}
+
+REMINDER: If something appears in ORIGINAL but not in NEW CODE, that does NOT mean it was deleted
+unless it also appears as a "-" line in the UNIFIED DIFF above. Truncation is common in large files.
 
 OTHER FILES IN SESSION (for cross-file checking):
 {other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_qa_feedback_block}
 
-IMPORTANT: Focus on the DIFF above — it shows exactly what lines were added/removed.
-Run all 6 checks and return the JSON verdict.
+Focus on the DIFF above as the ground truth. Run all 7 checks and return the JSON verdict.
 
 ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 {_risks_block}"""
