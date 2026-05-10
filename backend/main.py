@@ -3,7 +3,6 @@ SurgicalAI — Local AI coding assistant.
 FastAPI app entry point.
 """
 import os
-import sys
 from pathlib import Path
 import re as _re
 from fastapi import FastAPI, Request
@@ -46,6 +45,13 @@ _OPEN_PATHS = {
     "/api/auth/setup-required",
 }
 
+# Path patterns that bypass auth (used for iframe-loaded preview resources
+# where the browser cannot attach an Authorization header).
+# Safety: relies on session_id + file_id both being unguessable UUIDs.
+_OPEN_PATH_PATTERNS = [
+    _re.compile(r"^/api/chat/[\w-]+/files/[\w-]+/preview$"),
+]
+
 def _get_cors_headers(request: Request) -> dict:
     """
     Auth middleware runs OUTSIDE CORSMiddleware (added later = outermost).
@@ -75,6 +81,8 @@ async def auth_middleware(request: Request, call_next):
     if not path.startswith("/api/"):
         return await call_next(request)
     if path in _OPEN_PATHS:
+        return await call_next(request)
+    if any(p.match(path) for p in _OPEN_PATH_PATTERNS):
         return await call_next(request)
 
     # Extract Bearer token

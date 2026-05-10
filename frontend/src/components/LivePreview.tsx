@@ -48,11 +48,18 @@ function stubRelativeImports(code: string): string {
         .split(',')
         .map((s: string) => s.trim().split(/\s+as\s+/).pop()?.trim())
         .filter(Boolean) as string[]
-      // Each stub is a Proxy that returns a resolved-promise for any call/access
+      // Each stub is a self-referential Proxy: calling, destructuring, or accessing
+      // any property all return the same proxy. This handles every realistic pattern:
+      //   useAuthStore()                   → returns proxy (apply trap)
+      //   const { x, y } = useAuthStore()  → x and y are proxies (get trap)
+      //   apiClient.get('/x').then(...)    → chained calls all return proxy
+      //   <Component />                    → renders nothing (proxy as component)
+      // Symbols and special keys (then/Symbol.iterator) return undefined so the
+      // proxy isn't mistaken for a thenable or iterable by React/JS internals.
       return names
         .map(
           (n) =>
-            `const ${n}: any = new Proxy(function(){} as any, { get: (_:any,k:any) => typeof k==='symbol'?undefined:(..._a:any[])=>Promise.resolve({}) });`
+            `const ${n}: any = (() => { const __s: any = new Proxy(function(){} as any, { get: (_: any, k: any) => { if (typeof k === 'symbol') return undefined; if (k === 'then' || k === '__esModule') return undefined; return __s; }, apply: () => __s, construct: () => ({}) }); return __s; })();`
         )
         .join('\n')
     }
