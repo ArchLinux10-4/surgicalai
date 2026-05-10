@@ -24,7 +24,7 @@ export function MobileTopBar({ onMenuClick, onNewChat }: Props) {
   })()
 
   return (
-    <header className="flex items-center gap-2 h-14 px-3 border-b border-border bg-base/95 backdrop-blur supports-[backdrop-filter]:bg-base/80 flex-shrink-0">
+    <header className="flex items-center gap-2 h-14 px-3 border-b border-border bg-base flex-shrink-0 relative z-10">
       <button
         onClick={onMenuClick}
         className="flex items-center justify-center w-10 h-10 -ml-1 rounded-lg text-ink hover:bg-overlay active:bg-overlay/80 transition-colors"

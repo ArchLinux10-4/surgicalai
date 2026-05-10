@@ -7,7 +7,7 @@ import {
 import { useAppStore } from '../../stores/appStore'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
-import { InlineDiffCard } from '../InlineDiffCard'
+import { MobileDiffCard } from './MobileDiffCard'
 import { NewFileCard } from '../NewFileCard'
 import { MarkdownCode } from '../CodeBlock'
 import { MermaidDiagram } from '../MermaidDiagram'
@@ -175,7 +175,7 @@ function MobileMessage({ msg, sessionId }: { msg: any; sessionId: string }) {
         {result.intent === 'create' ? (
           <NewFileCard result={result} sessionId={sessionId} />
         ) : (
-          <InlineDiffCard result={result} sessionId={sessionId} />
+          <MobileDiffCard result={result} sessionId={sessionId} />
         )}
       </div>
     )
@@ -450,7 +450,7 @@ export function MobileChat({ onOpenFiles }: Props) {
       )}
 
       {/* Messages scroll area */}
-      <div className="flex-1 overflow-y-auto overscroll-contain">
+      <div className="flex-1 overflow-y-auto overscroll-contain" style={{ WebkitOverflowScrolling: 'touch', isolation: 'isolate' }}>
         {isEmpty ? (
           <MobileEmptyState
             onChip={(p) => { setInput(p); setTimeout(() => textareaRef.current?.focus(), 50) }}
