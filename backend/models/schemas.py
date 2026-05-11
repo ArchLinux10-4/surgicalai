@@ -154,6 +154,7 @@ class ChangeTarget(BaseModel):
     import_changes: List[str] = []    # per-target imports (threaded from Architect plan)
     context_needs: List[str] = []     # semantic sections: "style_block" | "state_declarations" | etc.
     surgeon_context: List[dict] = []  # v3.10: rich context requests resolved before Surgeon runs
+    target_line: Optional[int] = None  # v3.11.1: Architect-provided line number for containment validation
 
     @validator('context_needs', each_item=True, pre=True)
     def coerce_context_needs(cls, v):

@@ -628,6 +628,7 @@ Produce the surgical change plan as JSON."""
             confidence=t.get("confidence", 7),
             import_changes=t.get("import_changes", []),
             context_needs=t.get("context_needs", []),
+            target_line=t.get("target_line"),  # v3.11.1
         )
         validated_targets.append(target)
 
@@ -663,6 +664,7 @@ Produce the surgical change plan as JSON."""
                             confidence=target.confidence,
                             import_changes=target.import_changes,
                             context_needs=target.context_needs,
+                            target_line=target.target_line,  # v3.11.1
                         )
                     elif not best_sym:
                         # No symbol contains this line — create a virtual window
@@ -691,7 +693,47 @@ Produce the surgical change plan as JSON."""
                             confidence=target.confidence,
                             import_changes=target.import_changes,
                             context_needs=target.context_needs,
+                            target_line=target.target_line,  # v3.11.1
                         )
+
+    # ── v3.11.1: Containment validation ──────────────────────────────────────
+    # If the Architect named a symbol (e.g. hook "useCountUp") whose line range
+    # does NOT contain target_line (e.g. L301), redirect to the symbol that
+    # actually CONTAINS that line (e.g. "LoginPage" L124-506).
+    # This catches LLM reasoning errors where a helper/hook is named instead of
+    # the enclosing component, causing the Surgeon to operate on wrong code.
+    for _cv_i, _cv_target in enumerate(validated_targets):
+        if _cv_target.target_line is not None:
+            _cv_sym = next(
+                (s for s in symbol_map.symbols
+                 if s.full_path == _cv_target.symbol_path or s.name == _cv_target.symbol_path),
+                None
+            )
+            if _cv_sym and not (_cv_sym.start_line <= _cv_target.target_line <= _cv_sym.end_line):
+                _cv_containing = next(
+                    (s for s in symbol_map.symbols
+                     if s.start_line <= _cv_target.target_line <= s.end_line),
+                    None
+                )
+                if _cv_containing:
+                    print(
+                        f"[ARCHITECT] v3.11.1 containment fix: '{_cv_target.symbol_path}' "
+                        f"(L{_cv_sym.start_line}–{_cv_sym.end_line}) does not contain "
+                        f"target_line {_cv_target.target_line} → redirecting to "
+                        f"'{_cv_containing.full_path}' (L{_cv_containing.start_line}–{_cv_containing.end_line})"
+                    )
+                    validated_targets[_cv_i] = ChangeTarget(
+                        symbol_path=_cv_containing.full_path,
+                        change_type=_cv_target.change_type,
+                        description=_cv_target.description,
+                        new_logic=_cv_target.new_logic,
+                        dependencies=_cv_target.dependencies,
+                        confidence=_cv_target.confidence,
+                        import_changes=_cv_target.import_changes,
+                        context_needs=_cv_target.context_needs,
+                        surgeon_context=_cv_target.surgeon_context,
+                        target_line=_cv_target.target_line,
+                    )
 
     return ArchitectPlan(
         summary=data.get("summary", ""),
@@ -2074,9 +2116,14 @@ NEVER invent function signatures for files you haven't seen. One clarification q
   Look at the line counts in the symbol map — prefer symbols under 200 lines.
 - NEVER touch symbols that weren't asked about
 - For Python/Go/JS/TS/Rust files: use the exact function/class name from the symbol map as symbol_path
-- For TSX/JSX/HTML/CSS files: use the component function or export name as symbol_path (e.g. "LoginPage", "App", "Header").
-  Inner elements like divs/spans are NOT symbols — but that's OK. Set symbol_path to the containing component
-  and use description + new_logic to precisely identify the inner element to change.
+- For TSX/JSX/HTML/CSS files: symbol_path MUST be the component that RENDERS the UI being changed —
+  the default export or a named component function (e.g. "LoginPage", "App", "Header").
+  ⚠️  HOOKS AND UTILITY FUNCTIONS ARE NEVER VALID TARGETS FOR UI CHANGES.
+  If the file has hooks like "useCountUp", "useAnimation", or ANY function whose name starts with "use",
+  do NOT use them as symbol_path when the change is to rendered JSX/UI. Use the enclosing component instead.
+  Inner elements like divs/spans are NOT symbols — set symbol_path to the containing component and use
+  description + new_logic to precisely identify the inner element to change.
+  EXCEPTION: Target a hook/utility ONLY when the user explicitly asks to modify that hook's own logic, not its visual output.
   IMPORTANT FOR LARGE HTML FILES: When a SEARCH RESULT or KEYWORD MATCH section shows the exact line of
   an element (e.g. "rsp-eff-date at L9318"), set target_line to that line number (e.g. 9318).
   This lets the pipeline create a focused edit window exactly where needed — not 500 lines away.
@@ -4162,6 +4209,24 @@ USER REQUEST:
                 if sym.full_path == symbol_path or sym.name == symbol_path:
                     symbol = sym
                     break
+
+            # v3.11.1: Containment validation for dict-based targets (run_pipeline_stream path)
+            # If the found symbol doesn't contain target_line, use the one that does.
+            _tline_cv = target.get("target_line")
+            if _tline_cv and symbol is not None:
+                if not (symbol.start_line <= _tline_cv <= symbol.end_line):
+                    _cv_containing = next(
+                        (s for s in smap.symbols if s.start_line <= _tline_cv <= s.end_line),
+                        None
+                    )
+                    if _cv_containing:
+                        print(
+                            f"[PIPELINE] v3.11.1 containment fix: '{symbol_path}' "
+                            f"(L{symbol.start_line}–{symbol.end_line}) does not contain "
+                            f"target_line {_tline_cv} → '{_cv_containing.full_path}' "
+                            f"(L{_cv_containing.start_line}–{_cv_containing.end_line})"
+                        )
+                        symbol = _cv_containing
 
             ct = ChangeType(ct_str) if ct_str in ("modify", "add", "delete", "refactor") else ChangeType.MODIFY
 
