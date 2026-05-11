@@ -113,7 +113,7 @@ function QABadge({ qa }: { qa: QAResult }) {
       {expanded && createPortal(
         <div
           ref={popupRef}
-          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 300, maxHeight: 'calc(100vh - 80px)', overflowY: 'auto' }}
+          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 420, maxHeight: `calc(100vh - ${pos.top + 16}px)`, overflowY: 'scroll' }}
           className="border border-border rounded-lg shadow-2xl p-4 text-[12px]"
         >
           <div className="flex items-center justify-between mb-2">
@@ -190,7 +190,7 @@ function BlastRadius({ change }: { change: any }) {
       {open && createPortal(
         <div
           ref={popupRef}
-          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 300, maxHeight: 'calc(100vh - 80px)', overflowY: 'auto' }}
+          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 420, maxHeight: `calc(100vh - ${pos.top + 16}px)`, overflowY: 'scroll' }}
           className="border border-border rounded-lg shadow-2xl p-4 text-[12px]"
         >
           <div className="flex items-center justify-between mb-2">

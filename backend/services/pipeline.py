@@ -2716,6 +2716,7 @@ async def run_qa_agent(
     architect_risks: list = None,
     targeted_context: str = "",
     qa_feedback: dict = None,
+    same_run_context: str = "",
 ) -> dict:
     """
     QA agent: verifies Surgeon output before showing diff card to user.
@@ -2790,7 +2791,7 @@ NEW CODE (complete — this is what the Surgeon produced):
 OTHER FILES IN SESSION (for cross-file checking):
 {other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_qa_feedback_block}
 
-Compare ORIGINAL CODE → NEW CODE directly. Run all 8 checks and return the JSON verdict.
+{("\n\nOTHER CHANGES IN THIS SAME REQUEST (planned but reviewed separately — cross-symbol deps covered by these should be scored as warnings, not blocks):\n" + same_run_context + "\n") if same_run_context else ""}Compare ORIGINAL CODE → NEW CODE directly. Run all 8 checks and return the JSON verdict.
 
 ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 {_risks_block}"""
@@ -4525,6 +4526,14 @@ USER REQUEST:
                 except Exception as _tqe:
                     print(f"[QA_CONTEXT] Skipped: {_tqe}")
 
+                # Build context for QA about other changes in this same request
+                _same_run_ctx = ""
+                if len(targets) > 1:
+                    _other_descs = [_ot.description for _oj, _ot in enumerate(targets)
+                                    if _oj != i and getattr(_ot, "description", "")]
+                    if _other_descs:
+                        _same_run_ctx = "\n".join(f"  \u2022 {_d}" for _d in _other_descs[:6])
+
                 _qa_result = await run_qa_agent(
                     original_code=_effective_original,
                     new_code=new_code,
@@ -4538,6 +4547,7 @@ USER REQUEST:
                     architect_risks=plan.get("risks", []),
                     targeted_context=_targeted_qa_ctx,
                     qa_feedback=_qa_feedback_for_retry if _qa_feedback_for_retry else None,
+                    same_run_context=_same_run_ctx,
                 )
                 _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫", "skipped": "⏭"}.get(
                     _qa_result.get("verdict", "skipped"), "⏭"
