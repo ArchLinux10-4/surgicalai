@@ -13,6 +13,7 @@ import re
 import uuid
 import difflib
 import time
+import asyncio
 from pathlib import Path
 from typing import Optional
 from openai import OpenAI
@@ -1461,7 +1462,18 @@ async def analyze_and_plan_stream(
 
         yield f"data: {json.dumps({'type': 'progress', 'content': f'Found {len(symbol_map.symbols)} symbols. Running Architect...'})}\n\n"
 
-        plan = run_architect(symbol_map, user_request, file_content, user_id=user_id)
+        # v3.11.2: run blocking Architect in thread + yield keepalives every 5s
+        # so Railway proxy never sees an idle SSE connection.
+        _arch_task = asyncio.create_task(
+            asyncio.to_thread(run_architect, symbol_map, user_request, file_content, user_id=user_id)
+        )
+        while not _arch_task.done():
+            yield f": keepalive\n\n"
+            try:
+                await asyncio.wait_for(asyncio.shield(_arch_task), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+        plan = _arch_task.result()
 
         yield f"data: {json.dumps({'type': 'progress', 'content': f'Plan: {len(plan.targets)} changes identified. Running Surgeon...'})}\n\n"
 
@@ -1486,7 +1498,17 @@ async def analyze_and_plan_stream(
                                 parent_symbol = sym
                                 break
                     if parent_symbol is not None:
-                        new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
+                        # v3.11.2: keepalive wrap — ADD case
+                        _surg_add_task = asyncio.create_task(
+                            asyncio.to_thread(run_surgeon, parent_symbol, target, file_content, user_id=user_id)
+                        )
+                        while not _surg_add_task.done():
+                            yield f": keepalive\n\n"
+                            try:
+                                await asyncio.wait_for(asyncio.shield(_surg_add_task), timeout=5.0)
+                            except asyncio.TimeoutError:
+                                pass
+                        new_code, confidence, _surg_notes, _needed_imports, _operations = _surg_add_task.result()
                         diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
                         _tgt_elem, _replacement = _compute_target_element(parent_symbol.code, new_code)
                         # v3.3.1: injection guard
@@ -1529,7 +1551,17 @@ async def analyze_and_plan_stream(
                 changes.append(change)
                 continue
 
-            new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, target, file_content, user_id=user_id)
+            # v3.11.2: keepalive wrap — MODIFY case (main path, most common)
+            _surg_task = asyncio.create_task(
+                asyncio.to_thread(run_surgeon, symbol, target, file_content, user_id=user_id)
+            )
+            while not _surg_task.done():
+                yield f": keepalive\n\n"
+                try:
+                    await asyncio.wait_for(asyncio.shield(_surg_task), timeout=5.0)
+                except asyncio.TimeoutError:
+                    pass
+            new_code, confidence, _surg_notes, _needed_imports, _operations = _surg_task.result()
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
             _tgt_elem, _replacement = _compute_target_element(symbol.code, new_code)
 
