@@ -507,6 +507,8 @@ You will receive:
 - CONTEXT AFTER: lines just after the target symbol
 
 OUTPUT FORMAT (return ONLY this JSON, nothing else):
+
+For TARGETED changes (< ~30% of symbol changing — bug fixes, adding a field, changing a color):
 {
   "operations": [
     {"find": "exact text from the code", "replace": "replacement text"}
@@ -515,6 +517,19 @@ OUTPUT FORMAT (return ONLY this JSON, nothing else):
   "reasoning": "one-line explanation",
   "imports_needed": ["import xyz"]
 }
+
+For REDESIGN / RESTYLE / COMPLETE REWRITE (> ~30% of symbol changing — redesign, modernize, refactor whole component):
+Use "full_replacement" instead of operations. Put the ENTIRE new symbol body there.
+{
+  "full_replacement": "the entire new code for this symbol, from first line to last",
+  "operations": [],
+  "confidence": 8,
+  "reasoning": "one-line explanation",
+  "imports_needed": ["import xyz"]
+}
+
+Use full_replacement when: redesign, restyle, modernize, overhaul, complete refactor.
+Use operations when: small targeted fix, add one field, change one value, wrap one element.
 
 HARD RULES:
 1. "find" MUST be an EXACT substring of the TARGET CODE or a well-known anchor (</script>, </body>, etc).
@@ -1083,11 +1098,22 @@ Return JSON with search-and-replace operations."""
     try:
         data = json.loads(raw)
         operations = data.get("operations", [])
+        _full_replacement = data.get("full_replacement", "")
         confidence = data.get("confidence", target.confidence)
         reasoning = data.get("reasoning", "")
         import_needed_lines = data.get("imports_needed", [])
         if reasoning:
             surgeon_notes.append(f"Surgeon: {reasoning}")
+
+        # ── Full-replacement shortcut for redesigns ──────────────────────────
+        # Surgeon outputs full_replacement when >30% of the symbol changes.
+        # Convert to a single guaranteed-match operation using symbol.code as
+        # the find text (symbol.code is always an exact substring of file_content).
+        if _full_replacement and not operations:
+            _fr_clean = _full_replacement.strip("\n")
+            if _fr_clean and _fr_clean.rstrip() != symbol.code.rstrip():
+                operations = [{"find": symbol.code, "replace": _fr_clean}]
+                print(f"[SURGEON] full_replacement mode: {len(symbol.code)} → {len(_fr_clean)} chars")
 
         # Fix double-escaped newlines: GPT often returns \\n in JSON strings
         # instead of \n, resulting in literal backslash-n after json.loads
