@@ -170,3 +170,54 @@ def get_compliance_log(session_id: str = None, limit: int = 50):
         ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+@router.post("/applied/{session_id}/{change_id}")
+def mark_change_applied(session_id: str, change_id: str):
+    """Persist that a user applied a change — survives page refresh."""
+    conn = get_db()
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS applied_changes
+           (session_id TEXT NOT NULL, change_id TEXT NOT NULL,
+            applied_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (session_id, change_id))"""
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO applied_changes (session_id, change_id) VALUES (?, ?)",
+        (session_id, change_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@router.delete("/applied/{session_id}/{change_id}")
+def unmark_change_applied(session_id: str, change_id: str):
+    """Remove applied state (undo support)."""
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM applied_changes WHERE session_id = ? AND change_id = ?",
+        (session_id, change_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@router.get("/applied/{session_id}")
+def get_applied_changes(session_id: str):
+    """Return all applied change IDs for a session — used on page load."""
+    conn = get_db()
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS applied_changes
+           (session_id TEXT NOT NULL, change_id TEXT NOT NULL,
+            applied_at TEXT DEFAULT (datetime('now')),
+            PRIMARY KEY (session_id, change_id))"""
+    )
+    rows = conn.execute(
+        "SELECT change_id FROM applied_changes WHERE session_id = ?",
+        (session_id,)
+    ).fetchall()
+    conn.close()
+    return {"applied_ids": [r["change_id"] for r in rows]}
+

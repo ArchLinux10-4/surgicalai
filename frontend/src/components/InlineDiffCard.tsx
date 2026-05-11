@@ -501,6 +501,22 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       .catch(() => {})
   }, [sessionId, fileData.file_id, filename])
 
+  // Load applied state from backend DB on mount (survives page refresh, cross-browser)
+  useEffect(() => {
+    if (!sessionId) return
+    api.surgical.getApplied(sessionId)
+      .then(({ applied_ids }) => {
+        const fromDB: Record<string, boolean> = {}
+        for (const id of applied_ids) {
+          if (changeIds.includes(id)) fromDB[id] = true
+        }
+        if (Object.keys(fromDB).length > 0) {
+          setApplied(prev => ({ ...fromDB, ...prev }))
+        }
+      })
+      .catch(() => {})
+  }, [sessionId]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const langFromFilename = getLangFromFilename(filename)
 
   if (realChanges.length === 0) return null
@@ -538,6 +554,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     saveApplied(sessionId, changeId)
     setApplied(p => ({ ...p, [changeId]: true }))
     setSkipped(p => { const n = { ...p }; delete n[changeId]; return n })
+    // Persist to backend DB so applied state survives page refresh
+    if (sessionId) api.surgical.markApplied(sessionId, changeId).catch(() => {})
     onChangeApplied?.()
   }
 
@@ -614,6 +632,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       const result = await api.sessionFiles.undo(sessionId, fileData.file_id)
       try { localStorage.removeItem(appliedKey(sessionId, change.id)) } catch {}
       try { localStorage.removeItem(skippedKey(sessionId, change.id)) } catch {}
+      // Remove from backend DB too
+      if (sessionId) api.surgical.unmarkApplied(sessionId, change.id).catch(() => {})
       setApplied(p => { const next = { ...p }; delete next[change.id]; return next })
       setSkipped(p => { const next = { ...p }; delete next[change.id]; return next })
       setModifiedCode(undefined)
