@@ -77,9 +77,9 @@ function QABadge({ qa }: { qa: QAResult }) {
   const handleToggle = () => {
     if (!expanded && btnRef.current) {
       const rect = btnRef.current.getBoundingClientRect()
-      const POPUP_W = 300
+      const POPUP_W = 420
       const MARGIN = 12
-      // Prefer aligning to button's left; if that would clip the right edge, shift left
+      // Prefer aligning to button's left; if that would clip the right edge, flip leftward
       const rawLeft = rect.left
       const clampedLeft = Math.min(rawLeft, window.innerWidth - POPUP_W - MARGIN)
       const left = Math.max(MARGIN, clampedLeft)
@@ -155,7 +155,7 @@ function BlastRadius({ change }: { change: any }) {
   const handleToggle = () => {
     if (!open && btnRef.current) {
       const rect = btnRef.current.getBoundingClientRect()
-      const POPUP_W = 300
+      const POPUP_W = 420
       const MARGIN = 12
       const rawLeft = rect.left
       const clampedLeft = Math.min(rawLeft, window.innerWidth - POPUP_W - MARGIN)
