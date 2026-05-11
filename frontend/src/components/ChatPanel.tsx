@@ -167,6 +167,14 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
           <span className="text-[10px] text-faint opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
         </div>
 
+        {/* Persistent thinking trail — shown after streaming completes */}
+        {(msg._thinking || (msg._steps && msg._steps.filter((s: string) => s !== 'Thinking...').length > 0)) && (
+          <div className="mb-3 space-y-1">
+            {msg._steps && <PersistentSteps steps={msg._steps} />}
+            {msg._thinking && <ThinkingBlock text={msg._thinking} isStreaming={false} />}
+          </div>
+        )}
+
         {isSurgical && surgicalResult ? (
           <DiffCardBoundary>
             {surgicalResult.intent === 'create' ? (
@@ -218,6 +226,34 @@ function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boole
         <div className="mt-2 ml-5 pl-3 border-l-2 border-violet-500/30 text-[12px] text-muted/90 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed font-mono">
           {text}
           {isStreaming && <span className="inline-block w-1.5 h-3 bg-violet-400/60 rounded-sm ml-0.5 animate-pulse" />}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Persistent steps trail (shown on completed messages) ────────────────
+function PersistentSteps({ steps }: { steps: string[] }) {
+  const [expanded, setExpanded] = useState(false)
+  const allSteps = steps.filter(s => s !== 'Thinking...')
+  if (!allSteps.length) return null
+  return (
+    <div className="mb-2">
+      <button
+        onClick={() => setExpanded(e => !e)}
+        className="text-[11px] text-muted/70 hover:text-ink/80 flex items-center gap-1 transition-colors"
+      >
+        <span>{expanded ? '▾' : '▸'}</span>
+        <span>{allSteps.length} step{allSteps.length !== 1 ? 's' : ''} completed</span>
+      </button>
+      {expanded && (
+        <div className="mt-1.5 pl-3 border-l-2 border-border/60 space-y-1">
+          {allSteps.map((step, i) => (
+            <div key={i} className="text-[11px] text-muted/70 flex items-center gap-1.5">
+              <span className="text-green-400/80">✓</span>
+              <span>{step}</span>
+            </div>
+          ))}
         </div>
       )}
     </div>
@@ -421,6 +457,8 @@ export function ChatPanel() {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const thinkingTextRef = useRef('')
+  const progressHistoryRef = useRef<string[]>([])
 
   // Scroll to bottom on new messages
   useEffect(() => {
@@ -649,6 +687,8 @@ export function ChatPanel() {
     setProgressHistory(['Thinking...'])
     setThinkingText('')
     setIsThinking(false)
+    thinkingTextRef.current = ''
+    progressHistoryRef.current = ['Thinking...']
 
     let accumulated = ''
     let gotResult = false
@@ -658,7 +698,11 @@ export function ChatPanel() {
       (progress) => {
         setStreamProgress(progress)
         setProgressHistory(prev => {
-          if (prev[prev.length - 1] !== progress) return [...prev, progress]
+          if (prev[prev.length - 1] !== progress) {
+            const next = [...prev, progress]
+            progressHistoryRef.current = next
+            return next
+          }
           return prev
         })
       },
@@ -666,6 +710,8 @@ export function ChatPanel() {
       (result) => {
         // Surgical result — show inline diff card
         gotResult = true
+        const _thinking = thinkingTextRef.current
+        const _steps = [...progressHistoryRef.current]
         stopStream()
         addMessage({
           id: Date.now().toString() + '_ai',
@@ -675,6 +721,8 @@ export function ChatPanel() {
           surgical_data: JSON.stringify(result),
           content: '',
           created_at: new Date().toISOString(),
+          _thinking,
+          _steps,
         })
         if (isFirstMessage) autoNameSession()
         else api.chat.getSessions().then(setSessions).catch(() => {})
@@ -683,6 +731,8 @@ export function ChatPanel() {
       },
       (fullText) => {
         if (gotResult) return
+        const _thinking = thinkingTextRef.current
+        const _steps = [...progressHistoryRef.current]
         stopStream()
         if (fullText.trim()) {
           addMessage({
@@ -691,6 +741,8 @@ export function ChatPanel() {
             role: 'assistant',
             content: fullText,
             created_at: new Date().toISOString(),
+            _thinking,
+            _steps,
           })
         }
         if (isFirstMessage) autoNameSession()
@@ -701,8 +753,8 @@ export function ChatPanel() {
       (err) => { setError(err); stopStream() },
       // onThinking — Claude's extended thinking
       (text, phase) => {
-        if (phase === 'start') { setIsThinking(true); setThinkingText('') }
-        else if (phase === 'delta') { setThinkingText(prev => prev + text) }
+        if (phase === 'start') { setIsThinking(true); setThinkingText(''); thinkingTextRef.current = '' }
+        else if (phase === 'delta') { setThinkingText(prev => { const next = prev + text; thinkingTextRef.current = next; return next }) }
         else if (phase === 'end') { setIsThinking(false) }
       },
       // onCompacting — rolling history compaction
