@@ -7,6 +7,7 @@ Best Practice #1: Read the map before touching the territory (AST-first)
 Best Practice #2: Minimal footprint (surgeon only touches requested symbol)
 Best Practice #3: Verify before commit (confidence scoring + diff)
 """
+import ast
 import json
 import re
 import uuid
@@ -2573,7 +2574,21 @@ def _extract_json_from_text(text: str) -> str:
                 break
     if end == -1:
         return stripped[start:]  # Best effort: return from first { to end
-    return stripped[start:end + 1]
+    extracted = stripped[start:end + 1]
+    # Fast path: already valid JSON
+    try:
+        json.loads(extracted)
+        return extracted
+    except json.JSONDecodeError:
+        pass
+    # Fallback: handle Python-style dicts (single-quoted keys/values, unquoted keys)
+    # ast.literal_eval handles {'key': 'val'} which json.loads rejects
+    try:
+        obj = ast.literal_eval(extracted)
+        return json.dumps(obj)
+    except Exception:
+        pass
+    return extracted  # Return as-is and let caller surface the error
 
 
 QA_SYSTEM = """You are the QA agent in a two-model coding pipeline.
