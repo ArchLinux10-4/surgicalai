@@ -212,8 +212,10 @@ class ASTParser:
             re.MULTILINE,
         )
         # Arrow functions assigned to const/let/var
+        # FIX v3.11.3: Added (?:\s*:\s*[^=\n]+?)? to handle TypeScript type annotations
+        # e.g. `export const LoginPage: React.FC = () => {` was previously invisible
         arrow_re = re.compile(
-            r"^(export\s+)?(const|let|var)\s+(\w+)\s*=\s*(async\s+)?\(.*?\)\s*=>",
+            r"^(export\s+)?(const|let|var)\s+(\w+)(?:\s*:\s*[^=\n]+?)?\s*=\s*(async\s+)?\(.*?\)\s*=>",
             re.MULTILINE,
         )
         # Class methods (indented) — handles TS modifiers + return type annotations
