@@ -3581,6 +3581,38 @@ class ComplianceTracker:
             pass  # Never let compliance logging kill the pipeline
 
 
+def _repair_json(text: str) -> str:
+    """
+    Repair common JSON issues from LLM output.
+    The most frequent failure: Claude writes a large string value (e.g. chat_response
+    containing full markdown) with LITERAL newline/tab/carriage-return characters
+    inside the JSON string — which is invalid per RFC 8259.
+    This function escapes those control characters so json.loads() can succeed.
+    """
+    result = []
+    in_string = False
+    escape_next = False
+    for ch in text:
+        if escape_next:
+            result.append(ch)
+            escape_next = False
+        elif ch == '\\':
+            result.append(ch)
+            escape_next = True
+        elif ch == '"':
+            in_string = not in_string
+            result.append(ch)
+        elif in_string and ch == '\n':
+            result.append('\\n')
+        elif in_string and ch == '\r':
+            result.append('\\r')
+        elif in_string and ch == '\t':
+            result.append('\\t')
+        else:
+            result.append(ch)
+    return ''.join(result)
+
+
 async def run_smart_pipeline_stream(
     session_files: list,
     user_request: str,
@@ -4106,22 +4138,41 @@ USER REQUEST:
                 try:
                     plan = json.loads(raw_text)
                 except json.JSONDecodeError:
-                    # Try to extract JSON object from the text
-                    # Manual JSON extraction (avoids 're' module scoping issues)
-                    _brace_start = raw_text.find('{')
-                    _brace_end = raw_text.rfind('}')
-                    json_match = (raw_text[_brace_start:_brace_end + 1]
-                                  if _brace_start >= 0 and _brace_end > _brace_start
-                                  else None)
-                    if json_match:
-                        try:
-                            plan = json.loads(json_match)
-                        except json.JSONDecodeError:
-                            # Last resort: treat entire response as chat
+                    # Attempt 2: repair literal control chars inside string values
+                    # (Claude sometimes writes actual newlines inside a JSON string value)
+                    try:
+                        plan = json.loads(_repair_json(raw_text))
+                    except json.JSONDecodeError:
+                        # Attempt 3: extract JSON object from surrounding text
+                        _brace_start = raw_text.find('{')
+                        _brace_end = raw_text.rfind('}')
+                        json_match = (raw_text[_brace_start:_brace_end + 1]
+                                      if _brace_start >= 0 and _brace_end > _brace_start
+                                      else None)
+                        if json_match:
+                            try:
+                                plan = json.loads(json_match)
+                            except json.JSONDecodeError:
+                                try:
+                                    plan = json.loads(_repair_json(json_match))
+                                except json.JSONDecodeError:
+                                    # Last resort: treat entire response as chat
+                                    # Note: raw_text here IS the JSON string from Claude —
+                                    # streaming it directly would show the user raw JSON.
+                                    # Instead, try to salvage chat_response with a targeted search.
+                                    import re as _re_fallback
+                                    _cr_search = _re_fallback.search(
+                                        r'"chat_response"\s*:\s*"((?:[^"\\]|\\.)*)"',
+                                        raw_text, _re_fallback.DOTALL
+                                    )
+                                    if _cr_search:
+                                        _salvaged = _cr_search.group(1).replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+                                        plan = {"intent": "chat", "chat_response": _salvaged}
+                                    else:
+                                        plan = {"intent": "chat", "chat_response": raw_text}
+                        else:
+                            # No JSON found at all -- Claude gave a plain text answer
                             plan = {"intent": "chat", "chat_response": raw_text}
-                    else:
-                        # No JSON found at all -- Claude gave a plain text answer
-                        plan = {"intent": "chat", "chat_response": raw_text}
 
                 # -- ReAct: check if Claude wants to search for more context --
                 _this_intent = plan.get("intent", "chat")
