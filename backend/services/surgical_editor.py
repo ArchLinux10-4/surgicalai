@@ -346,7 +346,7 @@ def apply_changes_to_file(
 
     for change in to_apply_sorted:
         try:
-            current_content = apply_change(file_path, current_content, change)
+            current_content = apply_change(current_content, change)
             applied_count += 1
         except ValueError as e:
             # Restore from backup if partial failure
