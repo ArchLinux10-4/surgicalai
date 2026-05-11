@@ -490,6 +490,8 @@ async def smart_stream(req: dict, request: Request):
                     data = _json.loads(chunk[6:])
                     if data.get("type") == "token":
                         collected_tokens.append(data.get("content", ""))
+                    elif data.get("type") == "chat":
+                        collected_tokens.append(data.get("content", ""))
                     elif data.get("type") == "smart_result":
                         result_content = data.get("content", "")
                     elif data.get("type") == "done":
