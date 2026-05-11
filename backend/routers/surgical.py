@@ -14,11 +14,20 @@ from services.surgical_editor import apply_changes_to_file
 router = APIRouter()
 
 
+def _any_ai_key_configured() -> bool:
+    """Return True if at least one AI provider API key is set."""
+    return bool(
+        get_setting("openai_api_key")
+        or get_setting("anthropic_api_key")
+        or get_setting("gemini_api_key")
+    )
+
+
 @router.post("/analyze", response_model=SurgicalAnalyzeResponse)
 def analyze(req: SurgicalAnalyzeRequest):
     """Run the Architect + Surgeon pipeline on a file."""
-    if not get_setting("openai_api_key"):
-        raise HTTPException(status_code=401, detail="OpenAI API key not set.")
+    if not _any_ai_key_configured():
+        raise HTTPException(status_code=401, detail="No AI API key configured. Go to Settings to add your OpenAI, Anthropic, or Gemini key.")
 
     try:
         result = analyze_and_plan(
@@ -37,8 +46,8 @@ def analyze(req: SurgicalAnalyzeRequest):
 @router.post("/analyze-stream")
 async def analyze_stream(req: SurgicalAnalyzeRequest):
     """Streaming surgical analysis with progress updates."""
-    if not get_setting("openai_api_key"):
-        raise HTTPException(status_code=401, detail="API key not set.")
+    if not _any_ai_key_configured():
+        raise HTTPException(status_code=401, detail="No AI API key configured. Go to Settings to add your OpenAI, Anthropic, or Gemini key.")
 
     workspace = get_setting("workspace_path", "")
     conn = get_db()
