@@ -1149,11 +1149,20 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
         return symbol.code, 10, ["Surgeon: already implemented"], [], []
 
     # Extract all <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks
-    _sr_pattern = re.compile(r"<{7} SEARCH\n(.*?)\n={7}\n(.*?)\n>{7} REPLACE", re.DOTALL)
+    _sr_pattern = re.compile(r"<{7} SEARCH\r?\n(.*?)\r?\n={7}\r?\n(.*?)\r?\n>{7} REPLACE", re.DOTALL)
     _matches = _sr_pattern.findall(raw)
 
     if not _matches:
-        # Fallback: no blocks found — treat whole raw as full replacement
+        # If the raw output contains SEARCH/REPLACE markers the regex didn't match,
+        # the Surgeon tried to use the format but produced malformed blocks.
+        # NEVER inject raw output containing those markers — it would write
+        # <<<<<<< SEARCH / ======= / >>>>>>> REPLACE directly into the file.
+        _has_sr_markers = ("<<<<<<< SEARCH" in raw or ">>>>>>> REPLACE" in raw
+                           or ("=======" in raw and "SEARCH" in raw))
+        if _has_sr_markers:
+            print("[SURGEON] Malformed SEARCH/REPLACE blocks detected — refusing raw fallback to avoid injecting markers")
+            return symbol.code, 0, ["Surgeon: malformed SEARCH/REPLACE output — retry"], [], []
+        # Safe: no markers present — treat whole raw as full symbol replacement
         print("[SURGEON] No SEARCH/REPLACE blocks found — using raw as full replacement")
         _clean = raw.strip("\n")
         if _clean:
@@ -1190,14 +1199,19 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
             ops_dicts = [{"find": op.get("find",""), "replace": op.get("replace","")} for op in operations]
             modified_file = _apply_ops(file_content, ops_dicts, hint_line=symbol.start_line)
             # Extract the window around the symbol for QA/diff
-            mod_lines = modified_file.splitlines()
-            orig_lines = file_content.splitlines()
-            # Use symbol line range with ±5 padding
-            win_start = max(0, symbol.start_line - 6)  # start_line is 1-indexed
-            win_end = min(len(mod_lines), symbol.end_line + 5)
-            new_code = "\n".join(mod_lines[win_start:win_end])
-            _original_for_qa = "\n".join(orig_lines[win_start:min(len(orig_lines), win_end)])
-            print(f"[MATCH] apply_operations OK: {len(operations)} ops, window L{win_start+1}-L{win_end}")
+            # QA always gets the full original symbol vs full new symbol — no windowing.
+            # Windowing by original end_line truncates the new code when the Surgeon
+            # expands a small symbol (e.g. 2-line LiveDot → 60-line component).
+            # Instead: apply ops directly to symbol.code to get the exact new symbol content.
+            _original_for_qa = symbol.code
+            _qa_code = symbol.code
+            for _qa_op in ops_dicts:
+                _qf = _qa_op.get("find", "")
+                _qr = _qa_op.get("replace", "")
+                if _qf and _qf in _qa_code:
+                    _qa_code = _qa_code.replace(_qf, _qr, 1)
+            new_code = _qa_code
+            print(f"[MATCH] apply_operations OK: {len(operations)} ops, QA gets full symbol ({len(new_code)} chars)")
     except (ValueError, Exception) as _apply_err:
         # Operations couldn't be applied to full file — fall back to symbol.code matching
         print(f"[MATCH] apply_operations failed ({_apply_err}), falling back to symbol.code")
