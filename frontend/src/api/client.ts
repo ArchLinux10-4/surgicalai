@@ -107,6 +107,12 @@ export const api = {
     apply: (data: any) => request<any>('/surgical/apply', { method: 'POST', body: JSON.stringify(data) }),
     applyAll: (data: any) => request<any>('/surgical/apply-all', { method: 'POST', body: JSON.stringify(data) }),
     getHistory: (filePath?: string) => request<any[]>(`/surgical/history${filePath ? `?file_path=${encodeURIComponent(filePath)}` : ''}`),
+    markApplied: (sessionId: string, changeId: string) =>
+      request<any>(`/surgical/applied/${sessionId}/${encodeURIComponent(changeId)}`, { method: 'POST' }),
+    unmarkApplied: (sessionId: string, changeId: string) =>
+      request<any>(`/surgical/applied/${sessionId}/${encodeURIComponent(changeId)}`, { method: 'DELETE' }),
+    getApplied: (sessionId: string) =>
+      request<{ applied_ids: string[] }>(`/surgical/applied/${sessionId}`),
   },
   git: {
     status: (repoPath: string) => request<any>(`/git/status?repo_path=${encodeURIComponent(repoPath)}`),
