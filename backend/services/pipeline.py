@@ -1083,8 +1083,7 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
             {"role": "system", "content": SURGEON_SYSTEM},
             {"role": "user", "content": user_msg}
         ],
-        temperature=temp,
-        response_format={"type": "json_object"}
+        temperature=temp
     )
 
     raw = response.choices[0].message.content
