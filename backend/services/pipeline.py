@@ -941,6 +941,8 @@ def run_surgeon(
     architect_risks: list = None,
     linter_feedback: list = None,    # linter error dicts — injected on compile-error retry
     extra_context: str = "",         # resolved surgeon_context from context_resolver
+    qa_feedback: dict = None,        # QA verdict from previous attempt — injected on semantic retry
+    forbid_noop: bool = False,       # if True, reject the empty "already correct" escape hatch
 ) -> tuple:
     """
     GPT-4.1 (Surgeon): receives ONE code chunk + plan, returns search-and-replace operations.
@@ -952,6 +954,8 @@ def run_surgeon(
 
     v3.4.0:  Returns JSON operations [{find, replace}].
     v3.10.0: extra_context injects Claude-resolved code; linter_feedback injects compile errors.
+    v3.11.0: qa_feedback closes the coordination loop — when QA rejects an attempt, the
+             Surgeon now sees the verdict on retry instead of receiving identical inputs.
     """
     client = _get_client(user_id)
     surg_model = model or get_setting("surgeon_model", "gpt-4.1")
@@ -1021,10 +1025,48 @@ def run_surgeon(
         else ""
     )
 
+    # ── v3.11.0: QA feedback block (the missing coordination link) ───────────
+    # Previously the Surgeon retried with byte-identical inputs because QA's
+    # verdict went only to the QA agent, never back to the Surgeon. Now we
+    # surface the rejection so the Surgeon knows what to fix.
+    _qa_feedback_block = ""
+    if qa_feedback:
+        _qa_lines: list = []
+        _summary = (qa_feedback.get("summary") or "").strip()
+        if _summary:
+            _qa_lines.append(f"QA summary: {_summary[:300]}")
+        _plan_dev = (qa_feedback.get("plan_deviation") or "").strip()
+        if _plan_dev:
+            _qa_lines.append(f"Plan deviation: {_plan_dev[:400]}")
+        for _qk in ("import_issues", "type_errors", "downstream_risks"):
+            for _qi in (qa_feedback.get(_qk) or [])[:3]:
+                _qa_lines.append(f"  - {_qk.replace('_', ' ')}: {str(_qi)[:200]}")
+        # risk_verdicts is a list of dicts; surface blocked ones
+        for _rv in (qa_feedback.get("risk_verdicts") or [])[:3]:
+            if isinstance(_rv, dict) and _rv.get("status") in ("blocked", "warning"):
+                _qa_lines.append(
+                    f"  - {_rv.get('status', 'risk')}: "
+                    f"{str(_rv.get('reason') or _rv.get('risk') or '')[:200]}"
+                )
+        if _qa_lines:
+            _noop_clause = (
+                "Do NOT emit the empty 'already correct' SEARCH/REPLACE block — "
+                "QA has just rejected this exact code, so changes are required.\n"
+                if forbid_noop else ""
+            )
+            _qa_feedback_block = (
+                "\n\nPREVIOUS ATTEMPT WAS REJECTED BY QA. "
+                "Re-read the CHANGE PLAN above and address EVERY item below in this attempt. "
+                "Pay special attention to identifier names called out — those constants/"
+                "tokens/symbols must be modified.\n"
+                + _noop_clause
+                + "\n".join(_qa_lines)
+            )
+
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
-New logic required: {target.new_logic}{_import_hint}{_file_header}{_semantic_section}{_linter_block}{_extra_ctx_block}
+New logic required: {target.new_logic}{_import_hint}{_file_header}{_semantic_section}{_linter_block}{_extra_ctx_block}{_qa_feedback_block}
 
 CONTEXT BEFORE (read-only reference, do NOT include in operations):
 {before_context}
@@ -1056,8 +1098,12 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
 
     raw = raw.strip()
 
-    # Already-correct shortcut
+    # Already-correct shortcut — but if QA just rejected this exact code,
+    # "already correct" is a lie. Force a retry instead of silently passing.
     if raw.startswith("ALREADY_CORRECT"):
+        if forbid_noop:
+            print("[SURGEON] Rejected ALREADY_CORRECT after QA failure — Surgeon must produce real edits")
+            return symbol.code, 0, ["Surgeon: refused noop after QA rejection"], [], []
         return symbol.code, 10, ["Surgeon: already implemented"], [], []
 
     # Extract all <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks
@@ -1074,6 +1120,17 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
         for _find, _replace in _matches:
             operations.append({"find": _find, "replace": _replace})
         print(f"[SURGEON] Parsed {len(_matches)} SEARCH/REPLACE block(s)")
+
+    # v3.11.0: If QA just rejected and Surgeon only produced empty blocks, refuse.
+    # An empty SEARCH/REPLACE pair is the same noop escape hatch as ALREADY_CORRECT.
+    if forbid_noop and operations:
+        _all_empty = all(
+            not (op.get("find", "") or "").strip() and not (op.get("replace", "") or "").strip()
+            for op in operations
+        )
+        if _all_empty:
+            print("[SURGEON] Rejected all-empty SEARCH/REPLACE after QA failure")
+            return symbol.code, 0, ["Surgeon: refused empty-block noop after QA rejection"], [], []
     # ── Mechanical trailing-context rescue ──────────────────────────────────────────────
     # Must run BEFORE apply so QA + diff both see the corrected ops.
     # Detects 'find' strings that captured structural lines after the change target
@@ -4158,9 +4215,37 @@ USER REQUEST:
             )
 
             # ── Oversized symbol guardrail ──
-            # If symbol is >500 lines, try to find a more specific child symbol
+            # If symbol is >500 lines, try to find a more specific child symbol.
+            #
+            # v3.11.0: tightened heuristic. Previously a child <100 lines got +3
+            # for being small, so any tiny irrelevant subcomponent (e.g. StatPill)
+            # could win against the actual edit target with best_score=3 from
+            # smallness alone. That misrouted the Surgeon to code that didn't
+            # contain the tokens the plan asked for, and it emitted the empty
+            # "already correct" block, producing the "no changes whatsoever" QA.
+            #
+            # New rules:
+            #   - A child must meet MIN_NARROW_SCORE on keyword match alone.
+            #     Smallness no longer counts toward the threshold — it only
+            #     breaks ties between otherwise-qualifying candidates.
+            #   - If the architect supplied target_line, a child whose range
+            #     contains that line is decisively preferred (large bonus).
+            #   - "redesign / restyle / rewrite" descriptions skip narrowing
+            #     entirely: those changes are component-wide by definition.
             symbol_size = symbol.end_line - symbol.start_line + 1
-            if symbol_size > 500:
+            MIN_NARROW_SCORE = 10  # one name-match (+10) or two code-matches (+5+5)
+            _REDESIGN_KEYWORDS = ("redesign", "restyle", "rewrite", "modernize",
+                                  "overhaul", "revamp", "refactor")
+            _desc_combined = (target.get("description", "") + " "
+                              + target.get("new_logic", "")).lower()
+            _is_redesign = any(k in _desc_combined for k in _REDESIGN_KEYWORDS)
+            _target_line_hint = target.get("target_line")
+            try:
+                _target_line_hint = int(_target_line_hint) if _target_line_hint else None
+            except (ValueError, TypeError):
+                _target_line_hint = None
+
+            if symbol_size > 500 and not _is_redesign:
                 # Look for child symbols within this symbol's range
                 child_candidates = [
                     s for s in smap.symbols
@@ -4170,14 +4255,14 @@ USER REQUEST:
                     and (s.end_line - s.start_line + 1) < symbol_size
                 ]
                 # Try to find a child that matches the target description
-                desc_lower = (target.get("description", "") + " " + target.get("new_logic", "")).lower()
+                desc_lower = _desc_combined
                 best_child = None
                 best_score = 0
                 for child in child_candidates:
                     child_size = child.end_line - child.start_line + 1
                     if child_size > 500:
                         continue  # Skip huge children too
-                    # Score by keyword match in symbol name/code
+                    # Score by keyword match in symbol name/code only — NOT by size.
                     score = 0
                     child_name_lower = child.full_path.lower()
                     for keyword in desc_lower.split():
@@ -4185,14 +4270,20 @@ USER REQUEST:
                             score += 10
                         if len(keyword) > 3 and keyword in child.code[:500].lower():
                             score += 5
-                    # Prefer smaller symbols (more surgical)
-                    if child_size < 100:
-                        score += 3
-                    if score > best_score:
+                    # Architect target_line containment is decisive
+                    if (_target_line_hint is not None
+                            and child.start_line <= _target_line_hint <= child.end_line):
+                        score += 25
+                    # Below threshold → not a real match, don't narrow into it
+                    if score < MIN_NARROW_SCORE:
+                        continue
+                    # Tie-break by smallness (more surgical) only after threshold passes
+                    if score > best_score or (score == best_score and best_child
+                                              and child_size < (best_child.end_line - best_child.start_line + 1)):
                         best_score = score
                         best_child = child
                 if best_child:
-                    yield sse({"type": "progress", "content": f"Narrowing: {symbol.full_path} ({symbol_size}L) → {best_child.full_path} ({best_child.end_line - best_child.start_line + 1}L)"})
+                    yield sse({"type": "progress", "content": f"Narrowing: {symbol.full_path} ({symbol_size}L) → {best_child.full_path} ({best_child.end_line - best_child.start_line + 1}L) [score={best_score}]"})
                     symbol = best_child
                 elif symbol_size > 1000:
                     # No good child found — create a focused window (±100 lines around midpoint of description keywords)
@@ -4220,48 +4311,121 @@ USER REQUEST:
                         signature=f"Focused window L{window_start}-{window_end} of {symbol.full_path}",
                     )
                     yield sse({"type": "progress", "content": f"Focused window: L{window_start}-{window_end} ({window_end - window_start + 1} lines)"})
+            elif symbol_size > 500 and _is_redesign:
+                # Redesign-class request: don't narrow — the Surgeon needs the whole component.
+                yield sse({"type": "progress", "content": f"Redesign mode: keeping full symbol {symbol.full_path} ({symbol_size}L), narrowing skipped"})
 
             # ── v3.10.0: Resolve Claude's surgeon_context before Surgeon runs ─
-            _resolved_surgeon_ctx = ""
-            _surgeon_context_reqs = change_target.surgeon_context
-            if _surgeon_context_reqs:
-                try:
-                    from services.context_resolver import (
-                        resolve_context_requests as _resolve_ctx,
-                        describe_requests as _describe_ctx,
+            # v3.11.0: resolution moved INSIDE the retry loop so QA-flagged
+            # identifiers can be added on retry. The architect's plan only
+            # knows what it knew at planning time; if QA later reports
+            # "you missed scanColor, badgeBg, …", we resolve those symbols
+            # too and inject them on the next attempt.
+            try:
+                from services.context_resolver import (
+                    resolve_context_requests as _resolve_ctx,
+                    describe_requests as _describe_ctx,
+                )
+                _have_resolver = True
+            except Exception as _ctx_imp_exc:
+                print(f"[CONTEXT_RESOLVER] Import failed: {_ctx_imp_exc}")
+                _have_resolver = False
+
+            def _build_surgeon_context_for_attempt(
+                base_requests: list,
+                qa_verdict: dict,
+            ) -> str:
+                """Resolve architect's surgeon_context plus QA-derived symbol/grep
+                requests mined from the previous QA verdict's text fields."""
+                if not _have_resolver:
+                    return ""
+                _reqs = list(base_requests or [])
+                if qa_verdict:
+                    import re as _re_local
+                    _qa_text_parts = [
+                        qa_verdict.get("summary", "") or "",
+                        qa_verdict.get("plan_deviation", "") or "",
+                    ]
+                    for _qk in ("import_issues", "type_errors", "downstream_risks"):
+                        _qa_text_parts.extend(str(x) for x in (qa_verdict.get(_qk) or []))
+                    for _rv in (qa_verdict.get("risk_verdicts") or []):
+                        if isinstance(_rv, dict):
+                            _qa_text_parts.append(str(_rv.get("reason", "") or ""))
+                            _qa_text_parts.append(str(_rv.get("risk", "") or ""))
+                    _qa_text = " ".join(_qa_text_parts)
+                    # Identifier-shaped tokens: camelCase, PascalCase, SNAKE_CASE.
+                    # Length ≥ 4 avoids matching English noise like "the", "and".
+                    _ident_re = _re_local.compile(
+                        r"\b(?:[A-Z][A-Z0-9_]{3,}|[a-z][a-zA-Z0-9]{3,}|[A-Z][a-zA-Z0-9]{3,})\b"
                     )
-                    _desc = _describe_ctx(_surgeon_context_reqs)
-                    yield sse({"type": "progress", "content": f"📦 Resolving Surgeon context: {_desc}"})
-                    _resolved_surgeon_ctx = _resolve_ctx(
-                        requests=_surgeon_context_reqs,
+                    # Stopwords likely to slip through — common QA-verdict English.
+                    _STOP = {
+                        "true", "false", "null", "none", "this", "that", "with", "from",
+                        "into", "have", "been", "were", "will", "would", "should", "could",
+                        "missing", "missed", "added", "added.", "removed", "change", "changes",
+                        "changed", "expected", "actual", "should.", "code", "file", "files",
+                        "symbol", "symbols", "function", "functions", "method", "methods",
+                        "value", "values", "field", "fields", "property", "properties",
+                    }
+                    _seen_idents: set = set()
+                    for _tok in _ident_re.findall(_qa_text):
+                        _tl = _tok.lower()
+                        if _tl in _STOP or _tl in _seen_idents:
+                            continue
+                        _seen_idents.add(_tl)
+                        _reqs.append({"type": "symbol", "name": _tok})
+                        _reqs.append({"type": "grep",   "pattern": _tok})
+                        if len(_seen_idents) >= 8:  # cap to protect context window
+                            break
+                if not _reqs:
+                    return ""
+                try:
+                    return _resolve_ctx(
+                        requests=_reqs,
                         symbol_maps_by_name=symbol_maps_by_name,
                         requesting_file=matched_name,
-                    )
-                    if _resolved_surgeon_ctx:
-                        _n = len(_resolved_surgeon_ctx.splitlines())
-                        yield sse({"type": "progress", "content": f"✅ Surgeon context ready ({_n} lines injected)"})
-                    else:
-                        yield sse({"type": "progress", "content": "⚠️ surgeon_context items not found — proceeding without them"})
-                except Exception as _ctx_exc:
-                    print(f"[CONTEXT_RESOLVER] Failed: {_ctx_exc}")
+                    ) or ""
+                except Exception as _resolve_exc:
+                    print(f"[CONTEXT_RESOLVER] Resolve failed: {_resolve_exc}")
+                    return ""
 
             # ── Surgeon retry loop (linter + QA feedback) ───────────────────
             _linter_feedback_for_retry: list = []
             _qa_feedback_for_retry: dict = {}       # QA verdict injected on semantic retry
             _full_after_lint: str = ""
             _MAX_SURGEON_ATTEMPTS = 3               # +1 for QA semantic retry
+            _surgeon_context_reqs = change_target.surgeon_context
+            _original_symbol_code = symbol.code     # preserve for v3.11.0 fix (a)
 
             for _surgeon_attempt in range(_MAX_SURGEON_ATTEMPTS):
+                # Re-resolve context every attempt; expands with QA-flagged symbols on retry.
+                _resolved_surgeon_ctx = _build_surgeon_context_for_attempt(
+                    _surgeon_context_reqs, _qa_feedback_for_retry,
+                )
+                if _surgeon_context_reqs or _qa_feedback_for_retry:
+                    if _resolved_surgeon_ctx:
+                        _n = len(_resolved_surgeon_ctx.splitlines())
+                        _label = " (with QA-flagged symbols)" if _qa_feedback_for_retry else ""
+                        try:
+                            _desc = _describe_ctx(_surgeon_context_reqs) if _have_resolver else "context"
+                        except Exception:
+                            _desc = "context"
+                        yield sse({"type": "progress", "content": f"📦 Resolving Surgeon context{_label}: {_desc}"})
+                        yield sse({"type": "progress", "content": f"✅ Surgeon context ready ({_n} lines injected)"})
+                    elif _surgeon_context_reqs:
+                        yield sse({"type": "progress", "content": "⚠️ surgeon_context items not found — proceeding without them"})
 
                 new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(
                     symbol, change_target, sf["content"], user_id=user_id,
                     extra_context=_resolved_surgeon_ctx,
                     linter_feedback=_linter_feedback_for_retry if _linter_feedback_for_retry else None,
+                    qa_feedback=_qa_feedback_for_retry if _qa_feedback_for_retry else None,
+                    forbid_noop=bool(_qa_feedback_for_retry),
                 )
                 _is_changed = new_code.rstrip() != symbol.code.rstrip()
                 _attempt_label = f" (attempt {_surgeon_attempt+1})" if _surgeon_attempt > 0 else ""
                 print(f"[PIPELINE] attempt={_surgeon_attempt+1} {len(_operations)} ops, changed={_is_changed}, new={len(new_code)}, orig={len(symbol.code)}")
-                diff = _make_diff(symbol.code, new_code, symbol_path)
+                diff = _make_diff(_original_symbol_code, new_code, symbol_path)
 
                 # ── QA Agent ──────────────────────────────────────────────────
                 _other_ctx_for_qa = "\n\n".join(
