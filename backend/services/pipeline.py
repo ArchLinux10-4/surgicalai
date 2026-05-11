@@ -1457,6 +1457,435 @@ async def run_chat_stream(
     yield f"data: {json.dumps({'type': 'done', 'content': ''})}\n\n"
 
 
+
+# ─────────────────────────────────────────────────────────────
+# CLAUDE-FIRST PIPELINE (v4) — replaces old Architect+Surgeon
+# Single Claude call: analyzes + writes complete symbol replacements
+# Apply: exact original symbol code → reliable find-and-replace
+# Keepalive: Claude streaming thinking blocks keep connection alive
+# ─────────────────────────────────────────────────────────────
+
+import uuid
+from typing import Optional
+
+
+# ---------------------------------------------------------------------------
+# System prompt
+# ---------------------------------------------------------------------------
+
+CLAUDE_EDITOR_SYSTEM = """You are SurgicalAI — a precise AI code editor powered by Claude.
+
+You analyze code and write complete symbol replacements. You do NOT write SEARCH/REPLACE fragments — you write the ENTIRE new version of each symbol that needs to change.
+
+━━━ YOUR JOB ━━━
+1. Read the file structure (symbol map) and code provided
+2. Understand exactly what the user wants
+3. Identify the minimum set of symbols to change
+4. Write the COMPLETE new code for each changed symbol
+
+━━━ DECISION TREE ━━━
+
+Choose ONE intent:
+
+"edit" — when you can identify exactly which symbol(s) need to change AND you have seen their code
+"chat" — questions, explanations, no code change needed
+"needs_clarification" — genuinely ambiguous, multiple valid interpretations
+"search" — you need to see a specific symbol's code before you can write the replacement
+
+━━━ OUTPUT FORMAT ━━━
+
+Output ONLY valid JSON. No markdown fences, no preamble.
+
+IF edit:
+{
+  "intent": "edit",
+  "summary": "one sentence describing what changes",
+  "reasoning": "your analysis — what you read, what you identified, why",
+  "changes": [
+    {
+      "symbol_path": "exact symbol name from the SYMBOL MAP (e.g. LoginPage, handleSubmit)",
+      "description": "what changed in this symbol and why",
+      "new_code": "THE COMPLETE NEW CODE — entire symbol from first line to last, nothing omitted",
+      "confidence": 9
+    }
+  ],
+  "risks": ["any side effects or things to verify"]
+}
+
+IF chat:
+{
+  "intent": "chat",
+  "chat_response": "full markdown answer here"
+}
+
+IF needs_clarification:
+{
+  "intent": "needs_clarification",
+  "clarification_response": "friendly message with 1-2 specific questions. End with: Once you answer, I will plan the exact changes.",
+  "questions": ["specific question"]
+}
+
+IF search (need to see a symbol's code first):
+{
+  "intent": "search",
+  "reasoning": "what you found so far and what you still need",
+  "search_terms": ["ExactSymbolName", "another_symbol"]
+}
+
+━━━ RULES FOR new_code ━━━
+- Include the COMPLETE symbol: opening declaration, full body, closing bracket/brace
+- Preserve ALL unchanged lines exactly — copy them character-for-character from the original
+- Only modify the specific lines that need to change
+- Match the original indentation exactly (same spaces/tabs)
+- new_code REPLACES the entire original symbol line-for-line — if you omit lines, they get deleted
+- If LoginPage is 400 lines and you change 1 line, new_code is still 400 lines (with 1 different line)
+
+━━━ SYMBOL TARGETING RULES ━━━
+- symbol_path MUST exactly match a name from the SYMBOL MAP
+- For React/TSX files: always target the COMPONENT that renders the UI (e.g. LoginPage) — NEVER use hooks (useXxx) as symbol_path for UI changes
+- Only change symbols explicitly asked about — minimal footprint
+- confidence < 7 → use needs_clarification instead of guessing"""
+
+
+# ---------------------------------------------------------------------------
+# Helper: _build_claude_context
+# ---------------------------------------------------------------------------
+
+def _build_claude_context(
+    symbol_map,
+    file_content: str,
+    file_path: str,
+    user_request: str,
+    project_memory: Optional[str] = None,
+    search_results=None,
+) -> str:
+    """
+    Build the context string to include in the Claude user message.
+
+    Parameters
+    ----------
+    symbol_map      : SymbolMap from the AST parser
+    file_content    : raw file text
+    file_path       : path shown to Claude
+    user_request    : the user's natural-language request
+    project_memory  : optional project-level memory string
+    search_results  : optional list of resolved search result dicts
+    """
+    lines = file_content.splitlines()
+    total_lines = len(lines)
+
+    # Determine language from extension
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else "unknown"
+    lang_map = {
+        "py": "Python", "js": "JavaScript", "jsx": "JavaScript (JSX)",
+        "ts": "TypeScript", "tsx": "TypeScript (TSX)", "go": "Go",
+        "rs": "Rust", "java": "Java", "rb": "Ruby", "php": "PHP",
+        "cpp": "C++", "c": "C", "cs": "C#", "swift": "Swift",
+        "kt": "Kotlin", "vue": "Vue", "html": "HTML", "css": "CSS",
+        "scss": "SCSS", "json": "JSON", "yaml": "YAML", "yml": "YAML",
+        "md": "Markdown",
+    }
+    language = lang_map.get(ext, ext.upper() if ext else "Unknown")
+
+    parts = []
+
+    # Header
+    parts.append(f"FILE: {file_path}")
+    parts.append(f"LANGUAGE: {language}")
+    parts.append(f"TOTAL LINES: {total_lines}")
+    parts.append("")
+
+    # Symbol map
+    parts.append("SYMBOL MAP:")
+    if hasattr(symbol_map, "symbols") and symbol_map.symbols:
+        for sym in symbol_map.symbols:
+            sym_type = getattr(sym, "type", "symbol")
+            sym_name = getattr(sym, "full_path", None) or getattr(sym, "name", "?")
+            start = getattr(sym, "start_line", "?")
+            end = getattr(sym, "end_line", "?")
+            sig = getattr(sym, "signature", None)
+            if sig:
+                parts.append(f"  [{sym_type}] {sym_name} (lines {start}-{end}) — {sig}")
+            else:
+                parts.append(f"  [{sym_type}] {sym_name} (lines {start}-{end})")
+    else:
+        parts.append("  (no symbols found)")
+    parts.append("")
+
+    # Imports (up to 40 lines)
+    import_lines = []
+    for line in lines[:40]:
+        stripped = line.strip()
+        if (
+            stripped.startswith("import ")
+            or stripped.startswith("from ")
+            or stripped.startswith("#include")
+            or stripped.startswith("require(")
+            or stripped.startswith("use ")
+        ):
+            import_lines.append(line)
+        elif import_lines and not stripped:
+            # blank line after imports — keep scanning
+            pass
+    if import_lines:
+        parts.append("IMPORTS:")
+        parts.extend(import_lines[:40])
+        parts.append("")
+
+    # File content
+    if total_lines <= 400:
+        parts.append("FILE CONTENT:")
+        parts.append(file_content)
+    else:
+        parts.append("FILE CONTENT (partial — first 80 lines):")
+        parts.append("\n".join(lines[:80]))
+        parts.append("")
+        # Grep relevant sections using the existing helper from pipeline.py
+        try:
+            grep_sections = _grep_relevant_sections(
+                user_request, file_path, file_content, window=60, max_lines=200
+            )
+            if grep_sections:
+                parts.append("RELEVANT SECTIONS (grep):")
+                parts.append(grep_sections)
+        except Exception:
+            pass  # _grep_relevant_sections not available yet — skip silently
+
+    parts.append("")
+
+    # Search results from previous rounds
+    if search_results:
+        for sr in search_results:
+            term = sr.get("term", "")
+            found = sr.get("found", False)
+            code = sr.get("code", "")
+            start = sr.get("start_line", "?")
+            end = sr.get("end_line", "?")
+            if found and code:
+                parts.append(f"SYMBOL CODE REQUESTED:")
+                parts.append(f"symbol: {term} (lines {start}-{end})")
+                parts.append(code)
+                parts.append("")
+            else:
+                parts.append(f"SYMBOL CODE REQUESTED: {term} — NOT FOUND in file")
+                parts.append("")
+
+    # Project memory
+    if project_memory:
+        parts.append("PROJECT MEMORY:")
+        parts.append(project_memory)
+        parts.append("")
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Helper: _resolve_search_terms
+# ---------------------------------------------------------------------------
+
+def _resolve_search_terms(terms: list, symbol_map, file_content: str) -> list:
+    """
+    Given a list of search terms (symbol names or text strings), return a list
+    of dicts with resolved code snippets.
+
+    Each result dict:
+      {"term": str, "found": bool, "code": str, "start_line": int, "end_line": int}
+    """
+    results = []
+    content_lines = file_content.splitlines()
+    symbols = getattr(symbol_map, "symbols", []) or []
+
+    for term in terms:
+        # 1. Exact AST symbol lookup
+        matched_sym = None
+        for sym in symbols:
+            if getattr(sym, "name", None) == term or getattr(sym, "full_path", None) == term:
+                matched_sym = sym
+                break
+
+        if matched_sym is not None:
+            results.append({
+                "term": term,
+                "found": True,
+                "code": getattr(matched_sym, "code", ""),
+                "start_line": getattr(matched_sym, "start_line", 0),
+                "end_line": getattr(matched_sym, "end_line", 0),
+            })
+            continue
+
+        # 2. Grep fallback — case-insensitive search
+        match_line_idx = None
+        term_lower = term.lower()
+        for idx, line in enumerate(content_lines):
+            if term_lower in line.lower():
+                match_line_idx = idx
+                break
+
+        if match_line_idx is not None:
+            start_idx = max(0, match_line_idx - 30)
+            end_idx = min(len(content_lines), match_line_idx + 31)
+            snippet = "\n".join(content_lines[start_idx:end_idx])
+            results.append({
+                "term": term,
+                "found": True,
+                "code": snippet,
+                "start_line": start_idx + 1,  # 1-indexed
+                "end_line": end_idx,
+            })
+            continue
+
+        # 3. Not found
+        results.append({"term": term, "found": False, "code": "", "start_line": 0, "end_line": 0})
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Helper: _extract_json_from_text
+# ---------------------------------------------------------------------------
+
+def _extract_json_from_text(text: str) -> dict:
+    """
+    Extract and parse JSON from Claude's response text.
+
+    Tries:
+    1. Direct parse
+    2. Slice from first '{' to last '}'
+    3. ```json ... ``` fenced block
+    """
+    stripped = text.strip()
+
+    # 1. Direct parse
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. First '{' to last '}'
+    first_brace = stripped.find("{")
+    last_brace = stripped.rfind("}")
+    if first_brace != -1 and last_brace != -1 and last_brace > first_brace:
+        try:
+            return json.loads(stripped[first_brace : last_brace + 1])
+        except json.JSONDecodeError:
+            pass
+
+    # 3. ```json ... ``` fenced block
+    fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", stripped, re.DOTALL)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    raise ValueError(f"Could not parse JSON from response: {text[:300]}")
+
+
+# ---------------------------------------------------------------------------
+# Helper: run_qa_for_changes
+# ---------------------------------------------------------------------------
+
+async def run_qa_for_changes(
+    changes,
+    file_content: str,
+    user_request: str,
+    anthropic_key: str,
+    model: str,
+) -> dict:
+    """
+    Run a QA review of all proposed changes via a single non-streaming Claude call.
+
+    Returns a dict with keys: verdict, qa_score, summary, issues, risks.
+    On any error, returns a safe fallback dict.
+    """
+    _QA_SYSTEM = (
+        "You are a code reviewer. Review the proposed code changes and verify they "
+        "correctly implement the request.\n"
+        "For each change, check:\n"
+        "1. Does new_code correctly implement what was requested?\n"
+        "2. Does new_code preserve all unchanged parts of the original?\n"
+        "3. Are there any obvious bugs, syntax errors, or missing logic?\n"
+        "4. Are there risks (side effects, other files that might need updating)?\n\n"
+        "Return ONLY valid JSON:\n"
+        "{\n"
+        '  "verdict": "safe" | "warning" | "blocked",\n'
+        '  "qa_score": <integer 1-10>,\n'
+        '  "summary": "one sentence",\n'
+        '  "issues": ["any issues found"],\n'
+        '  "risks": ["any risks"]\n'
+        "}\n\n"
+        "Score: 9-10=safe, 7-8=minor notes, 5-6=warning, <=4=blocked."
+    )
+
+    _FALLBACK = {
+        "verdict": "warning",
+        "qa_score": 7,
+        "summary": "QA skipped due to error",
+        "issues": [],
+        "risks": [],
+    }
+
+    try:
+        user_parts = [f"USER REQUEST:\n{user_request}\n"]
+
+        for ch in changes:
+            symbol_path = getattr(ch, "symbol", None)
+            if symbol_path is not None:
+                symbol_name = getattr(symbol_path, "full_path", None) or getattr(symbol_path, "name", "unknown")
+            else:
+                symbol_name = "unknown"
+
+            original = getattr(ch, "original_code", "") or ""
+            new_code = getattr(ch, "new_code", "") or ""
+
+            # Truncate very long code to 200 lines
+            orig_lines = original.splitlines()
+            new_lines = new_code.splitlines()
+            if len(orig_lines) > 200:
+                original = "\n".join(orig_lines[:200]) + "\n... (truncated)"
+            if len(new_lines) > 200:
+                new_code = "\n".join(new_lines[:200]) + "\n... (truncated)"
+
+            user_parts.append(
+                f"--- CHANGE: {symbol_name} ---\n"
+                f"ORIGINAL:\n{original}\n\n"
+                f"NEW CODE:\n{new_code}\n"
+            )
+
+        user_message = "\n".join(user_parts)
+
+        aclient = AsyncAnthropic(api_key=anthropic_key)
+        response = await aclient.messages.create(
+            model=model,
+            max_tokens=1000,
+            system=_QA_SYSTEM,
+            messages=[{"role": "user", "content": user_message}],
+        )
+
+        raw_text = ""
+        for block in response.content:
+            if hasattr(block, "text"):
+                raw_text += block.text
+
+        result = _extract_json_from_text(raw_text)
+
+        # Normalise keys
+        return {
+            "verdict": result.get("verdict", "safe"),
+            "qa_score": result.get("qa_score", 8),
+            "summary": result.get("summary", ""),
+            "issues": result.get("issues", []),
+            "risks": result.get("risks", []),
+        }
+
+    except Exception:
+        return _FALLBACK
+
+
+# ---------------------------------------------------------------------------
+# Main entry point: analyze_and_plan_stream
+# ---------------------------------------------------------------------------
+
 async def analyze_and_plan_stream(
     file_path: str,
     file_content: str,
@@ -1464,126 +1893,267 @@ async def analyze_and_plan_stream(
     session_id: Optional[str] = None,
     project_memory: Optional[str] = None,
     pinned_context: Optional[list] = None,
-    user_id: str = ""
+    user_id: str = "",
 ):
     """
-    Streaming surgical analysis. Yields SSE progress events then final result.
+    Claude-first async generator that replaces the old Architect+Surgeon pipeline.
+
+    Yields SSE strings ("data: {...}\\n\\n").
+
+    Flow:
+      1. Parse file symbols
+      2. Call Claude (streaming) with file context + user request
+      3. Handle search loop (Claude may request more symbol code)
+      4. Build SurgicalChange objects
+      5. Run QA
+      6. Yield final result
     """
+    # Lazy imports from the parent pipeline module context
+    # (these will be resolved at call time from the merged module namespace)
+    from models.schemas import SurgicalChange, SurgicalAnalyzeResponse, ArchitectPlan  # noqa: F401
+
     try:
-        yield f"data: {json.dumps({'type': 'progress', 'content': 'Parsing file structure...'})}\n\n"
+        def sse(obj: dict) -> str:
+            return f"data: {json.dumps(obj)}\n\n"
+
+        # ------------------------------------------------------------------
+        # Step 1: Parse file
+        # ------------------------------------------------------------------
+        yield sse({"type": "progress", "content": "Parsing file structure..."})
         symbol_map = parser.parse(file_content, file_path)
+        n_sym = len(symbol_map.symbols) if hasattr(symbol_map, "symbols") and symbol_map.symbols else 0
+        yield sse({"type": "progress", "content": f"Found {n_sym} symbols. Claude is analyzing..."})
 
-        yield f"data: {json.dumps({'type': 'progress', 'content': f'Found {len(symbol_map.symbols)} symbols. Running Architect...'})}\n\n"
+        # ------------------------------------------------------------------
+        # Step 2: Get Anthropic key and model
+        # ------------------------------------------------------------------
+        anthropic_key = _get_anthropic_key(user_id)
+        architect_model = get_setting("architect_model", "claude-sonnet-4-5")
+        # Ensure we're using a Claude model (user might have set a GPT model)
+        if not _is_claude_model(architect_model):
+            architect_model = "claude-sonnet-4-5"
 
-        plan = run_architect(symbol_map, user_request, file_content, user_id=user_id)
+        aclient = AsyncAnthropic(api_key=anthropic_key)
 
-        yield f"data: {json.dumps({'type': 'progress', 'content': f'Plan: {len(plan.targets)} changes identified. Running Surgeon...'})}\n\n"
+        # ------------------------------------------------------------------
+        # Step 3: Search loop — Claude can request symbols via "search" intent
+        # ------------------------------------------------------------------
+        MAX_SEARCH_ROUNDS = 4
+        search_results = []
+        plan_data = None
+
+        for round_num in range(MAX_SEARCH_ROUNDS + 1):
+            context = _build_claude_context(
+                symbol_map,
+                file_content,
+                file_path,
+                user_request,
+                project_memory=project_memory,
+                search_results=search_results if search_results else None,
+            )
+
+            user_message = f"{context}\n\nUSER REQUEST:\n{user_request}"
+
+            messages = [{"role": "user", "content": user_message}]
+
+            model_kwargs = {
+                "model": architect_model,
+                "max_tokens": 16000,
+                "system": CLAUDE_EDITOR_SYSTEM,
+                "messages": messages,
+            }
+            if _supports_thinking(architect_model):
+                model_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+
+            full_text = ""
+            in_thinking = False
+
+            async with aclient.messages.stream(**model_kwargs) as stream:
+                async for event in stream:
+                    event_type = getattr(event, "type", None)
+
+                    if event_type == "content_block_start":
+                        block = getattr(event, "content_block", None)
+                        if block and getattr(block, "type", "") == "thinking":
+                            in_thinking = True
+                            yield sse({"type": "thinking_start", "content": ""})
+
+                    elif event_type == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta:
+                            thinking_chunk = getattr(delta, "thinking", None)
+                            text_chunk = getattr(delta, "text", None)
+                            if thinking_chunk:
+                                yield sse({"type": "thinking", "content": thinking_chunk})
+                            elif text_chunk:
+                                full_text += text_chunk
+
+                    elif event_type == "content_block_stop":
+                        if in_thinking:
+                            yield sse({"type": "thinking_end", "content": ""})
+                            in_thinking = False
+
+            # Parse JSON from response
+            try:
+                plan_data = _extract_json_from_text(full_text)
+            except ValueError as parse_err:
+                yield sse({
+                    "type": "error",
+                    "content": (
+                        f"Claude returned unexpected output. Please try again.\n\n"
+                        f"Detail: {str(parse_err)[:200]}"
+                    ),
+                })
+                return
+
+            intent = plan_data.get("intent", "edit")
+
+            if intent == "search":
+                terms = plan_data.get("search_terms", [])
+                if not terms or round_num >= MAX_SEARCH_ROUNDS:
+                    # Out of search budget — treat as needs_clarification
+                    plan_data = {
+                        "intent": "needs_clarification",
+                        "clarification_response": plan_data.get(
+                            "reasoning",
+                            "I need more information to make this change. Could you tell me "
+                            "the exact function name or paste the relevant code section?",
+                        ),
+                    }
+                    break
+
+                yield sse({"type": "progress", "content": f"Looking up: {', '.join(terms[:3])}..."})
+                new_results = _resolve_search_terms(terms, symbol_map, file_content)
+                search_results.extend(new_results)
+                continue  # loop again with expanded search_results
+
+            # Got a final (non-search) response
+            break
+
+        if plan_data is None:
+            yield sse({"type": "error", "content": "No response from Claude. Please try again."})
+            return
+
+        intent = plan_data.get("intent", "edit")
+
+        # ------------------------------------------------------------------
+        # Handle chat / clarification intents
+        # ------------------------------------------------------------------
+        if intent in ("chat", "needs_clarification"):
+            response_text = plan_data.get("chat_response") or plan_data.get(
+                "clarification_response", ""
+            )
+            yield sse({"type": "chat", "content": response_text})
+            yield sse({"type": "done", "content": ""})
+            return
+
+        if intent != "edit":
+            yield sse({"type": "error", "content": f"Unexpected intent '{intent}' from Claude."})
+            return
+
+        # ------------------------------------------------------------------
+        # Build SurgicalChange objects
+        # ------------------------------------------------------------------
+        changes_data = plan_data.get("changes", [])
+        if not changes_data:
+            response = plan_data.get(
+                "reasoning", "No changes needed — the code already satisfies your request."
+            )
+            yield sse({"type": "chat", "content": response})
+            yield sse({"type": "done", "content": ""})
+            return
+
+        yield sse({"type": "progress", "content": f"Running QA on {len(changes_data)} change(s)..."})
 
         changes = []
+        for ch in changes_data:
+            symbol_path = ch.get("symbol_path", "")
+            new_code = ch.get("new_code", "")
+            description = ch.get("description", "")
+            confidence = ch.get("confidence", 9)
 
-        for i, target in enumerate(plan.targets):
-            yield f"data: {json.dumps({'type': 'progress', 'content': f'Surgeon working on {target.symbol_path} ({i+1}/{len(plan.targets)})...'})}\n\n"
+            if not symbol_path or not new_code:
+                continue
 
+            # Find symbol in AST map — exact match first
             symbol = None
-            for sym in symbol_map.symbols:
-                if sym.full_path == target.symbol_path or sym.name == target.symbol_path:
-                    symbol = sym
+            for s in symbol_map.symbols:
+                if getattr(s, "full_path", None) == symbol_path or getattr(s, "name", None) == symbol_path:
+                    symbol = s
                     break
 
             if symbol is None:
-                if target.change_type == ChangeType.ADD:
-                    parent_path = ".".join(target.symbol_path.split(".")[:-1])
-                    parent_symbol = None
-                    if parent_path:
-                        for sym in symbol_map.symbols:
-                            if sym.full_path == parent_path or sym.name == parent_path:
-                                parent_symbol = sym
-                                break
-                    if parent_symbol is not None:
-                        new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
-                        diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
-                        _tgt_elem, _replacement = _compute_target_element(parent_symbol.code, new_code)
-                        # v3.3.1: injection guard
-                        _inj_iss_add, _inj_fn_add = _is_script_injection_issue(parent_symbol.code, new_code)
-                        _ins_mode_add = False
-                        _ins_anc_add = None
-                        if _inj_iss_add and _inj_fn_add:
-                            _ins_anc_add = _find_script_close_line(file_content, parent_symbol.end_line)
-                            _ins_mode_add = True
-                            _tgt_elem = None
-                            _replacement = _inj_fn_add
-                            new_code = parent_symbol.code
-                        changes.append(SurgicalChange(
-                            id=str(uuid.uuid4()),
-                            symbol=parent_symbol,
-                            original_code=parent_symbol.code,
-                            new_code=new_code if not _ins_mode_add else parent_symbol.code + "\n" + _inj_fn_add,
-                            diff=diff,
-                            confidence=confidence,
-                            description=target.description,
-                            applied=False,
-                            target_element=_tgt_elem,
-                            replacement=_replacement,
-                            insert_mode=_ins_mode_add,
-                            insert_anchor=_ins_anc_add
-                        ))
+                # Partial match fallback
+                for s in symbol_map.symbols:
+                    s_fp = getattr(s, "full_path", "") or ""
+                    s_name = getattr(s, "name", "") or ""
+                    if symbol_path in s_fp or s_name in symbol_path:
+                        symbol = s
+                        break
+
+            if symbol is None:
+                yield sse({
+                    "type": "progress",
+                    "content": f"Warning: symbol '{symbol_path}' not found in file map — skipping",
+                })
                 continue
 
-            if target.change_type == ChangeType.DELETE:
-                change = SurgicalChange(
-                    id=str(uuid.uuid4()),
-                    symbol=symbol,
-                    original_code=symbol.code,
-                    new_code="",
-                    diff=_make_diff(symbol.code, "", target.symbol_path),
-                    confidence=target.confidence,
-                    description=target.description,
-                    applied=False
-                )
-                changes.append(change)
-                continue
-
-            new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, target, file_content, user_id=user_id)
-            diff = _make_diff(symbol.code, new_code, target.symbol_path)
-            _tgt_elem, _replacement = _compute_target_element(symbol.code, new_code)
-
-            # v3.3.1: detect script injection truncation / phantom </script>
-            _inject_issue, _injected_fn = _is_script_injection_issue(symbol.code, new_code)
-            _insert_mode = False
-            _insert_anchor = None
-            if _inject_issue and _injected_fn:
-                _insert_anchor_line = _find_script_close_line(file_content, symbol.end_line)
-                _insert_mode = True
-                _insert_anchor = _insert_anchor_line
-                _tgt_elem = None
-                _replacement = _injected_fn
-                new_code = symbol.code  # keep original for display; diff will show only additions
+            diff = _make_diff(symbol.code, new_code, symbol_path)
+            _tgt, _repl = _compute_target_element(symbol.code, new_code)
 
             change = SurgicalChange(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
                 original_code=symbol.code,
-                new_code=new_code if not _insert_mode else symbol.code + "\n" + _injected_fn,
+                new_code=new_code,
                 diff=diff,
                 confidence=confidence,
-                description=target.description,
+                description=description,
                 applied=False,
-                target_element=_tgt_elem,
-                replacement=_replacement,
-                insert_mode=_insert_mode,
-                insert_anchor=_insert_anchor
+                # KEY: symbol.code is extracted directly from the file by the AST parser
+                # so it is GUARANTEED to be an exact substring — always reliable.
+                operations=[{"find": symbol.code, "replace": new_code}],
+                target_element=_tgt,
+                replacement=_repl,
             )
             changes.append(change)
 
-        result = SurgicalAnalyzeResponse(
-            session_id=session_id or str(uuid.uuid4()),
-            plan=plan,
-            changes=changes,
-            tokens_used=0
+        if not changes:
+            yield sse({
+                "type": "chat",
+                "content": (
+                    "I analyzed the file but couldn't map the change to a specific symbol. "
+                    "Please re-upload the file and try again."
+                ),
+            })
+            yield sse({"type": "done", "content": ""})
+            return
+
+        # ------------------------------------------------------------------
+        # QA check
+        # ------------------------------------------------------------------
+        qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model)
+
+        qa_risks = qa.get("risks", [])
+
+        # ------------------------------------------------------------------
+        # Build final response object and yield
+        # ------------------------------------------------------------------
+        plan_obj = ArchitectPlan(
+            summary=plan_data.get("summary", ""),
+            targets=[],
+            risks=plan_data.get("risks", []) + qa_risks,
         )
 
-        yield f"data: {json.dumps({'type': 'result', 'content': result.model_dump_json()})}\n\n"
-        yield f"data: {json.dumps({'type': 'done', 'content': ''})}\n\n"
+        result_obj = SurgicalAnalyzeResponse(
+            session_id=session_id or str(uuid.uuid4()),
+            plan=plan_obj,
+            changes=changes,
+            tokens_used=0,
+        )
+
+        yield sse({"type": "result", "content": result_obj.model_dump_json()})
+        yield sse({"type": "done", "content": ""})
 
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'content': _friendly_error(e)})}\n\n"
