@@ -26,8 +26,8 @@
   --c-border: 208 215 222;     /* #d0d7de */
   --c-border-sub: 216 222 228; /* #d8dee4 */
   --c-ink: 31 35 40;           /* #1f2328 */
-  --c-muted: 101 109 118;      /* #656d76 */
-  --c-faint: 175 184 193;      /* #afb8c1 */
+  --c-muted: 72 80 91;         /* #48505b — 7.2:1 on white, readable even at /70 */
+  --c-faint: 107 114 128;      /* #6b7280 — 4.6:1 on white, WCAG AA */
   --c-accent: 9 105 218;       /* #0969da */
   --c-accent-dark: 9 105 218;  /* #0969da */
   --c-success: 26 127 55;      /* #1a7f37 */

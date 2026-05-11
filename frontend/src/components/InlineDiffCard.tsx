@@ -77,7 +77,7 @@ function QABadge({ qa }: { qa: QAResult }) {
   const handleToggle = () => {
     if (!expanded && btnRef.current) {
       const rect = btnRef.current.getBoundingClientRect()
-      const POPUP_W = 420
+      const POPUP_W = 300
       const MARGIN = 12
       // Prefer aligning to button's left; if that would clip the right edge, shift left
       const rawLeft = rect.left
@@ -155,7 +155,7 @@ function BlastRadius({ change }: { change: any }) {
   const handleToggle = () => {
     if (!open && btnRef.current) {
       const rect = btnRef.current.getBoundingClientRect()
-      const POPUP_W = 420
+      const POPUP_W = 300
       const MARGIN = 12
       const rawLeft = rect.left
       const clampedLeft = Math.min(rawLeft, window.innerWidth - POPUP_W - MARGIN)
@@ -182,7 +182,7 @@ function BlastRadius({ change }: { change: any }) {
       <button
         ref={btnRef}
         onClick={handleToggle}
-        className="text-[11px] font-semibold px-2 py-0.5 rounded-full border text-amber-400 bg-amber-500/10 border-amber-500/30 cursor-pointer"
+        className="text-[11px] font-semibold px-2 py-0.5 rounded-full border text-warning bg-warning/10 border-warning/30 cursor-pointer"
         title="Blast radius"
       >
         🎯 {risks.length} risk{risks.length !== 1 ? 's' : ''}
@@ -194,12 +194,12 @@ function BlastRadius({ change }: { change: any }) {
           className="border border-border rounded-lg shadow-2xl p-4 text-[12px]"
         >
           <div className="flex items-center justify-between mb-2">
-            <span className="font-semibold text-amber-400">🎯 Blast Radius</span>
+            <span className="font-semibold text-warning">🎯 Blast Radius</span>
             <button onClick={() => setOpen(false)} className="text-muted hover:text-ink">×</button>
           </div>
           <ul className="space-y-1">
             {risks.map((r, i) => (
-              <li key={i} className="flex gap-1.5 text-amber-300/90 text-[11px]">
+              <li key={i} className="flex gap-1.5 text-warning text-[11px]">
                 <span>•</span><span>{r}</span>
               </li>
             ))}
@@ -990,7 +990,7 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
                       <div className="flex flex-col gap-0.5">
                         <div className={`flex items-start gap-1.5 font-medium ${statusColor[verdict.status] || 'text-warning'}`}>
                           <span className="flex-shrink-0">{statusIcon[verdict.status] || '•'}</span>
-                          <span className={verdict.status === 'verified_safe' ? 'line-through opacity-60' : ''}>{r}</span>
+                          <span className={verdict.status === 'verified_safe' ? 'line-through opacity-80' : ''}>{r}</span>
                         </div>
                         <div className="ml-5 text-[11px] text-muted italic">{verdict.reason}</div>
                       </div>
