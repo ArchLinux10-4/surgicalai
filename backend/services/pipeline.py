@@ -1089,58 +1089,32 @@ Return JSON with search-and-replace operations."""
 
     raw = response.choices[0].message.content
 
-    # Parse JSON response
+    # Parse Aider-style SEARCH/REPLACE blocks
     operations = []
     confidence = target.confidence
     surgeon_notes = []
     import_needed_lines = []
 
-    try:
-        data = json.loads(raw)
-        operations = data.get("operations", [])
-        _full_replacement = data.get("full_replacement", "")
-        confidence = data.get("confidence", target.confidence)
-        reasoning = data.get("reasoning", "")
-        import_needed_lines = data.get("imports_needed", [])
-        if reasoning:
-            surgeon_notes.append(f"Surgeon: {reasoning}")
+    raw = raw.strip()
 
-        # ── Full-replacement shortcut for redesigns ──────────────────────────
-        # Surgeon outputs full_replacement when >30% of the symbol changes.
-        # Convert to a single guaranteed-match operation using symbol.code as
-        # the find text (symbol.code is always an exact substring of file_content).
-        if _full_replacement and not operations:
-            _fr_clean = _full_replacement.strip("\n")
-            if _fr_clean and _fr_clean.rstrip() != symbol.code.rstrip():
-                operations = [{"find": symbol.code, "replace": _fr_clean}]
-                print(f"[SURGEON] full_replacement mode: {len(symbol.code)} → {len(_fr_clean)} chars")
+    # Already-correct shortcut
+    if raw.startswith("ALREADY_CORRECT"):
+        return symbol.code, 10, ["Surgeon: already implemented"], [], []
 
-        # Fix double-escaped newlines: GPT often returns \\n in JSON strings
-        # instead of \n, resulting in literal backslash-n after json.loads
-        for _op in operations:
-            for _key in ("find", "replace"):
-                if _key in _op and isinstance(_op[_key], str):
-                    _val = _op[_key]
-                    # Debug: log what we see before processing
-                    if "\\n" in _val or "\\t" in _val:
-                        print(f"[ESCAPE-FIX] {_key} has literal backslash-n, converting ({len(_val)} chars)")
-                    _op[_key] = _val.replace("\\n", "\n").replace("\\t", "\t")
-                    # Check if there are still escaped sequences (triple-escape)
-                    if "\\n" in _op[_key]:
-                        print(f"[ESCAPE-FIX] Still has \\\\n after first pass, doing second pass")
-                        _op[_key] = _op[_key].replace("\\n", "\n")
-    except json.JSONDecodeError:
-        # Fallback: treat as old-style code block (pre-v3.4.0 model behavior)
-        if raw.lstrip().startswith("```"):
-            fence_lines = raw.split("\n")
-            start_i = next((i for i, l in enumerate(fence_lines) if l.strip().startswith("```")), 0) + 1
-            end_i = len(fence_lines) - 1 if fence_lines[-1].strip() == "```" else len(fence_lines)
-            raw = "\n".join(fence_lines[start_i:end_i])
-        new_code = raw.rstrip()
-        while new_code.startswith("\n"):
-            new_code = new_code[1:]
-        return new_code, confidence, surgeon_notes, import_needed_lines, []
+    # Extract all <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks
+    _sr_pattern = re.compile(r"<{7} SEARCH\n(.*?)\n={7}\n(.*?)\n>{7} REPLACE", re.DOTALL)
+    _matches = _sr_pattern.findall(raw)
 
+    if not _matches:
+        # Fallback: no blocks found — treat whole raw as full replacement
+        print("[SURGEON] No SEARCH/REPLACE blocks found — using raw as full replacement")
+        _clean = raw.strip("\n")
+        if _clean:
+            operations = [{"find": symbol.code, "replace": _clean}]
+    else:
+        for _find, _replace in _matches:
+            operations.append({"find": _find, "replace": _replace})
+        print(f"[SURGEON] Parsed {len(_matches)} SEARCH/REPLACE block(s)")
     # ── Mechanical trailing-context rescue ──────────────────────────────────────────────
     # Must run BEFORE apply so QA + diff both see the corrected ops.
     # Detects 'find' strings that captured structural lines after the change target

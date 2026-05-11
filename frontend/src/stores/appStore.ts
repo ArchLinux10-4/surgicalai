@@ -109,7 +109,7 @@ export const useAppStore = create<AppState>((set) => ({
   surgicalPanelOpen: false,
   setSurgicalPanelOpen: (surgicalPanelOpen) => set({ surgicalPanelOpen }),
 
-  sidebarTab: 'files',
+  sidebarTab: 'sessions',
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
   sidebarPanelOpen: false,
   setSidebarPanelOpen: (sidebarPanelOpen) => set({ sidebarPanelOpen }),
