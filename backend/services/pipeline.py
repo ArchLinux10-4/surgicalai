@@ -1075,7 +1075,7 @@ TARGET CODE (lines {symbol.start_line}-{symbol.end_line}) -- your "find" text sh
 CONTEXT AFTER (read-only reference, do NOT include in operations):
 {after_context}
 
-Return JSON with search-and-replace operations."""
+Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
 
     response = _chat_create(client,
         model=surg_model,
