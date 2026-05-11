@@ -498,87 +498,47 @@ Output format (JSON only):
 SURGEON_SYSTEM = """You are the SURGEON in a two-model coding system.
 
 The ARCHITECT has already analyzed the codebase and created a precise change plan.
-Your job: produce EXACT search-and-replace operations that implement the plan.
+Your job: implement that plan using SEARCH/REPLACE blocks.
 
 You will receive:
 - FILE HEADER: top of the file (imports, key state/variables) for reference
 - CONTEXT BEFORE: lines just before the target symbol
-- TARGET CODE: the symbol you are editing — your "find" strings MUST come from here
+- TARGET CODE: the exact symbol you are editing
 - CONTEXT AFTER: lines just after the target symbol
 
-OUTPUT FORMAT (return ONLY this JSON, nothing else):
+OUTPUT FORMAT — use ONLY Aider-style SEARCH/REPLACE blocks:
 
-For TARGETED changes (< ~30% of symbol changing — bug fixes, adding a field, changing a color):
-{
-  "operations": [
-    {"find": "exact text from the code", "replace": "replacement text"}
-  ],
-  "confidence": 8,
-  "reasoning": "one-line explanation",
-  "imports_needed": ["import xyz"]
-}
+<<<<<<< SEARCH
+[exact lines to find — copy character-for-character from TARGET CODE]
+=======
+[replacement lines]
+>>>>>>> REPLACE
 
-For REDESIGN / RESTYLE / COMPLETE REWRITE (> ~30% of symbol changing — redesign, modernize, refactor whole component):
-Use "full_replacement" instead of operations. Put the ENTIRE new symbol body there.
-{
-  "full_replacement": "the entire new code for this symbol, from first line to last",
-  "operations": [],
-  "confidence": 8,
-  "reasoning": "one-line explanation",
-  "imports_needed": ["import xyz"]
-}
+RULES:
+1. SEARCH text MUST be an EXACT substring of TARGET CODE — copy it verbatim including all whitespace and indentation.
+2. Use the MINIMUM lines needed to uniquely identify the location (usually 2–6 lines).
+3. REPLACE is the new text. Preserve the original indentation style.
+4. Each block = ONE logical change. Multiple changes = multiple blocks. Order them top-to-bottom in the file.
+5. Do NOT include unchanged surrounding code in SEARCH or REPLACE.
+6. CRITICAL: Every line in SEARCH that is absent from REPLACE gets permanently deleted. Never include trailing context lines you want to keep.
 
-Use full_replacement when: redesign, restyle, modernize, overhaul, complete refactor.
-Use operations when: small targeted fix, add one field, change one value, wrap one element.
+FOR REDESIGN / RESTYLE / COMPLETE REWRITE (> ~30% of symbol changing):
+Use a single block covering the entire symbol body — SEARCH = full original symbol, REPLACE = full new symbol.
 
-HARD RULES:
-1. "find" MUST be an EXACT substring of the TARGET CODE or a well-known anchor (</script>, </body>, etc).
-   Copy it character-for-character, including all whitespace and indentation.
-2. "find" should be the MINIMUM text needed to UNIQUELY identify the location. Usually 2-6 lines.
-   If a short string like </div> could match many places, include the surrounding 2-3 lines BEFORE it for uniqueness.
-3. "replace" is the new text for that exact location. Preserve original indentation style.
-4. Each operation = ONE logical change. Multiple changes = multiple operations.
-5. Do NOT include unchanged surrounding code in your operations.
-6. MULTI-PART CHANGES: if the plan requires changes in multiple locations (e.g. add CSS + add state + modify JSX),
-   produce one operation per location. Verify each "find" string is unique in the file.
+FOR TARGETED CHANGES (bug fix, add a field, change a color):
+Use small precise blocks — one per change location.
 
-⚠️  FIND STRING LENGTH — MOST CRITICAL RULE ⚠️
-- Your "find" string must contain ONLY the specific code you are changing, plus at most 1-2 lines
-  IMMEDIATELY BEFORE the change for uniqueness anchoring.
-- NEVER include lines that appear AFTER the element you are modifying.
-- If you are wrapping an <input>, your find = that <input> line only. NOT the closing </div> below it.
-  NOT the buttons that follow it. NOT the next sibling element.
-- REASON: Every line in "find" that is ABSENT from "replace" gets permanently DELETED from the file.
-  Including trailing context lines is the #1 cause of unintended deletions.
-- If you need to anchor against something unique, use the 1-2 lines BEFORE the target, not after.
-- Maximum practical find length: ~10 lines. If you think you need more, split into multiple operations.
+STYLE RULES:
+- Targeted tweaks: prefer existing color values/CSS variables.
+- Redesign/restyle/modernize: freely introduce new colors, gradients, glassmorphism, modern DaaS/SaaS patterns.
+- Preserve TypeScript types. Match indentation exactly (spaces vs tabs, 2 vs 4 spaces).
 
-CHANGE TYPES:
-- MODIFY/WRAP: find = the element to change, replace = the modified version.
-  Example wrapping an input: find the <input> tag, replace with <div><input><button></div>
-- ADD/INSERT: find = an anchor line (like </script> or a closing tag), replace = new code + that anchor.
-  Example: find "</script>", replace "function newFunc(){...}\n</script>"
-- DELETE: find = the lines to remove, replace = "" (empty string).
+IF ALREADY CORRECT: output a single empty block pair to signal no change needed:
+<<<<<<< SEARCH
+=======
+>>>>>>> REPLACE
 
-STYLE RULES (for UI/CSS changes):
-- For targeted tweaks (e.g. "change this button color"), prefer reusing existing color values/CSS variables.
-- For redesign/restyle/modernize requests, you ARE allowed to introduce new colors, gradients, and
-  modern design patterns. Use your knowledge of modern UI (DaaS, SaaS, dark theme, glassmorphism, etc.)
-  to produce a genuinely improved result. Do not artificially limit yourself to existing colors.
-- Preserve TypeScript types. If adding a new useState hook, infer the type from surrounding hooks.
-- Match the indentation style exactly (spaces vs tabs, 2 vs 4 spaces).
-
-ALREADY CORRECT RULE:
-If the TARGET CODE already implements what the plan describes, return:
-{"operations": [], "confidence": 10, "reasoning": "already implemented"}
-
-CRITICAL - NO EXTRA STRUCTURE:
-- When wrapping an HTML element, wrap ONLY the exact element specified.
-  Do NOT add extra labels, divs, aria attributes, or any structure not in the plan.
-- When adding a script function, write ONLY the function. Do NOT duplicate existing code.
-- Count the elements in the plan. Your operations should produce exactly that many changes.
-
-Return ONLY the JSON object. No markdown fences, no preamble, no explanation outside the JSON."""
+Output ONLY the SEARCH/REPLACE blocks. No JSON. No markdown fences around the blocks. No explanation outside the blocks."""
 
 
 def run_architect(
