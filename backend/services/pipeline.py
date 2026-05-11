@@ -1473,78 +1473,122 @@ from typing import Optional
 # System prompt
 # ---------------------------------------------------------------------------
 
-CLAUDE_EDITOR_SYSTEM = """You are SurgicalAI — a precise AI code editor powered by Claude.
+CLAUDE_EDITOR_SYSTEM = """You are SurgicalAI — a precise AI code editor.
 
-You analyze code and write complete symbol replacements. You do NOT write SEARCH/REPLACE fragments — you write the ENTIRE new version of each symbol that needs to change.
+You MUST call the `submit_code_changes` tool to respond. Do NOT write any text outside the tool call.
 
 ━━━ YOUR JOB ━━━
 1. Read the file structure (symbol map) and code provided
 2. Understand exactly what the user wants
 3. Identify the minimum set of symbols to change
-4. Write the COMPLETE new code for each changed symbol
+4. Write the COMPLETE new code for each changed symbol — full symbol from first to last line
 
-━━━ DECISION TREE ━━━
+━━━ INTENT OPTIONS ━━━
 
-Choose ONE intent:
-
-"edit" — when you can identify exactly which symbol(s) need to change AND you have seen their code
-"chat" — questions, explanations, no code change needed
-"needs_clarification" — genuinely ambiguous, multiple valid interpretations
-"search" — you need to see a specific symbol's code before you can write the replacement
-
-━━━ OUTPUT FORMAT ━━━
-
-Output ONLY valid JSON. No markdown fences, no preamble.
-
-IF edit:
-{
-  "intent": "edit",
-  "summary": "one sentence describing what changes",
-  "reasoning": "your analysis — what you read, what you identified, why",
-  "changes": [
-    {
-      "symbol_path": "exact symbol name from the SYMBOL MAP (e.g. LoginPage, handleSubmit)",
-      "description": "what changed in this symbol and why",
-      "new_code": "THE COMPLETE NEW CODE — entire symbol from first line to last, nothing omitted",
-      "confidence": 9
-    }
-  ],
-  "risks": ["any side effects or things to verify"]
-}
-
-IF chat:
-{
-  "intent": "chat",
-  "chat_response": "full markdown answer here"
-}
-
-IF needs_clarification:
-{
-  "intent": "needs_clarification",
-  "clarification_response": "friendly message with 1-2 specific questions. End with: Once you answer, I will plan the exact changes.",
-  "questions": ["specific question"]
-}
-
-IF search (need to see a symbol's code first):
-{
-  "intent": "search",
-  "reasoning": "what you found so far and what you still need",
-  "search_terms": ["ExactSymbolName", "another_symbol"]
-}
+"edit"             — you have seen the symbol code and can write the complete replacement
+"chat"             — question or explanation, no code change
+"needs_clarification" — genuinely ambiguous with multiple valid interpretations
+"search"           — you need to see a specific symbol's code before writing the replacement
 
 ━━━ RULES FOR new_code ━━━
-- Include the COMPLETE symbol: opening declaration, full body, closing bracket/brace
-- Preserve ALL unchanged lines exactly — copy them character-for-character from the original
-- Only modify the specific lines that need to change
-- Match the original indentation exactly (same spaces/tabs)
-- new_code REPLACES the entire original symbol line-for-line — if you omit lines, they get deleted
-- If LoginPage is 400 lines and you change 1 line, new_code is still 400 lines (with 1 different line)
+- The ENTIRE symbol from opening declaration to closing brace — nothing omitted
+- Copy all unchanged lines character-for-character from the original
+- Match original indentation exactly (spaces/tabs)
+- new_code replaces the symbol completely — if you omit lines they get deleted
+- A 400-line component that changes 1 line still requires 400 lines in new_code
 
-━━━ SYMBOL TARGETING RULES ━━━
-- symbol_path MUST exactly match a name from the SYMBOL MAP
-- For React/TSX files: always target the COMPONENT that renders the UI (e.g. LoginPage) — NEVER use hooks (useXxx) as symbol_path for UI changes
-- Only change symbols explicitly asked about — minimal footprint
+━━━ SYMBOL TARGETING ━━━
+- symbol_path MUST exactly match a name from the SYMBOL MAP provided
+- For React/TSX: target the COMPONENT (e.g. LoginPage) — NEVER a hook (useXxx) for UI changes
+- Minimal footprint — only change symbols explicitly asked about
 - confidence < 7 → use needs_clarification instead of guessing"""
+
+
+# ---------------------------------------------------------------------------
+# Tool schema — forces structured output. Claude MUST call this tool.
+# ---------------------------------------------------------------------------
+SURGICAL_TOOL = {
+    "name": "submit_code_changes",
+    "description": (
+        "Submit your analysis and code changes. You MUST call this tool to respond. "
+        "Never write a plain-text response."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "intent": {
+                "type": "string",
+                "enum": ["edit", "chat", "needs_clarification", "search"],
+                "description": "What action to take",
+            },
+            "summary": {
+                "type": "string",
+                "description": "One-line summary of the changes (edit intent only)",
+            },
+            "reasoning": {
+                "type": "string",
+                "description": "Your analysis: what you read, what you identified, why",
+            },
+            "changes": {
+                "type": "array",
+                "description": "List of symbol changes to apply (edit intent only)",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "symbol_path": {
+                            "type": "string",
+                            "description": "Exact symbol name from the SYMBOL MAP",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "What changed in this symbol and why",
+                        },
+                        "new_code": {
+                            "type": "string",
+                            "description": (
+                                "THE COMPLETE NEW CODE — entire symbol from first line to "
+                                "last, nothing omitted. Preserves all unchanged lines exactly."
+                            ),
+                        },
+                        "confidence": {
+                            "type": "integer",
+                            "description": "Confidence 1-10. Use needs_clarification if < 7.",
+                        },
+                    },
+                    "required": ["symbol_path", "new_code"],
+                },
+            },
+            "risks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Any side effects or things to verify",
+            },
+            "chat_response": {
+                "type": "string",
+                "description": "Full markdown answer (chat intent only)",
+            },
+            "clarification_response": {
+                "type": "string",
+                "description": (
+                    "Friendly message with 1-2 specific questions ending with "
+                    "'Once you answer, I will plan the exact changes.' "
+                    "(needs_clarification intent only)"
+                ),
+            },
+            "questions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Specific questions (needs_clarification intent only)",
+            },
+            "search_terms": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Exact symbol names to look up (search intent only)",
+            },
+        },
+        "required": ["intent"],
+    },
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1961,12 +2005,15 @@ async def analyze_and_plan_stream(
                 "max_tokens": 16000,
                 "system": CLAUDE_EDITOR_SYSTEM,
                 "messages": messages,
+                "tools": [SURGICAL_TOOL],
+                "tool_choice": {"type": "tool", "name": "submit_code_changes"},
             }
             if _supports_thinking(architect_model):
                 model_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
 
-            full_text = ""
             in_thinking = False
+            tool_input_parts: list[str] = []
+            final_message = None
 
             async with aclient.messages.stream(**model_kwargs) as stream:
                 async for event in stream:
@@ -1974,37 +2021,53 @@ async def analyze_and_plan_stream(
 
                     if event_type == "content_block_start":
                         block = getattr(event, "content_block", None)
-                        if block and getattr(block, "type", "") == "thinking":
+                        btype = getattr(block, "type", "") if block else ""
+                        if btype == "thinking":
                             in_thinking = True
                             yield sse({"type": "thinking_start", "content": ""})
 
                     elif event_type == "content_block_delta":
                         delta = getattr(event, "delta", None)
                         if delta:
-                            thinking_chunk = getattr(delta, "thinking", None)
-                            text_chunk = getattr(delta, "text", None)
-                            if thinking_chunk:
-                                yield sse({"type": "thinking", "content": thinking_chunk})
-                            elif text_chunk:
-                                full_text += text_chunk
+                            dtype = getattr(delta, "type", "")
+                            if dtype == "thinking_delta":
+                                thinking_chunk = getattr(delta, "thinking", "")
+                                if thinking_chunk:
+                                    yield sse({"type": "thinking", "content": thinking_chunk})
+                            elif dtype == "input_json_delta":
+                                # Tool input streaming — accumulate + keepalive
+                                partial = getattr(delta, "partial_json", "")
+                                if partial:
+                                    tool_input_parts.append(partial)
+                                    # Yield heartbeat so SSE connection stays alive
+                                    yield sse({"type": "heartbeat", "content": ""})
 
                     elif event_type == "content_block_stop":
                         if in_thinking:
                             yield sse({"type": "thinking_end", "content": ""})
                             in_thinking = False
 
-            # Parse JSON from response
-            try:
-                plan_data = _extract_json_from_text(full_text)
-            except ValueError as parse_err:
-                yield sse({
-                    "type": "error",
-                    "content": (
-                        f"Claude returned unexpected output. Please try again.\n\n"
-                        f"Detail: {str(parse_err)[:200]}"
-                    ),
-                })
-                return
+                # Get the final message from the stream (contains tool input as clean dict)
+                final_message = await stream.get_final_message()
+
+            # Extract tool input — Anthropic SDK returns it as a dict, already parsed
+            tool_block = next(
+                (b for b in (final_message.content if final_message else [])
+                 if getattr(b, "type", "") == "tool_use"),
+                None,
+            )
+            if tool_block is None:
+                # Fallback: try to parse accumulated parts if SDK didn't give tool_use block
+                raw_json = "".join(tool_input_parts)
+                try:
+                    plan_data = _extract_json_from_text(raw_json) if raw_json else None
+                except ValueError:
+                    plan_data = None
+                if not plan_data:
+                    yield sse({"type": "error", "content": "Claude did not return a structured response. Please try again."})
+                    return
+            else:
+                plan_data = tool_block.input  # already a dict — no JSON parsing needed
 
             intent = plan_data.get("intent", "edit")
 
