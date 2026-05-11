@@ -642,142 +642,21 @@ export function SettingsModal() {
             )}
 
             {tab === 'security' && (
-              <div className="space-y-6 max-w-sm">
-              <SectionHeader
-                title="Change Password"
-                subtitle="Enter your current password to set a new one"
+              <SecurityPanel
+                pwCurrent={pwCurrent} setPwCurrent={setPwCurrent}
+                pwNew={pwNew} setPwNew={setPwNew}
+                pwConfirm={pwConfirm} setPwConfirm={setPwConfirm}
+                showPwCurrent={showPwCurrent} setShowPwCurrent={setShowPwCurrent}
+                showPwNew={showPwNew} setShowPwNew={setShowPwNew}
+                showPwConfirm={showPwConfirm} setShowPwConfirm={setShowPwConfirm}
+                pwResult={pwResult} setPwResult={setPwResult}
+                pwSaving={pwSaving}
+                onChangePassword={handleChangePassword}
+                pwStrength={pwStrength}
+                pwStrengthLabel={pwStrengthLabel}
+                pwStrengthColor={pwStrengthColor}
+                pwStrengthText={pwStrengthText}
               />
-
-              {/* Current password */}
-              <div>
-                <div className="text-xs text-muted mb-1.5 font-medium">Current Password</div>
-                <div className="relative">
-                  <input
-                    type={showPwCurrent ? 'text' : 'password'}
-                    className="input pr-10 w-full"
-                    placeholder="Your current password"
-                    value={pwCurrent}
-                    onChange={(e) => { setPwCurrent(e.target.value); setPwResult(null) }}
-                    autoComplete="current-password"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPwCurrent(v => !v)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink"
-                  >
-                    {showPwCurrent ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
-                </div>
-              </div>
-
-              {/* New password */}
-              <div>
-                <div className="text-xs text-muted mb-1.5 font-medium">New Password</div>
-                <div className="relative">
-                  <input
-                    type={showPwNew ? 'text' : 'password'}
-                    className="input pr-10 w-full"
-                    placeholder="At least 8 chars, upper, lower, digit"
-                    value={pwNew}
-                    onChange={(e) => { setPwNew(e.target.value); setPwResult(null) }}
-                    autoComplete="new-password"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPwNew(v => !v)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink"
-                  >
-                    {showPwNew ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
-                </div>
-                {/* Strength meter */}
-                {pwNew && (() => {
-                  const s = pwStrength(pwNew)
-                  return (
-                    <div className="mt-2 space-y-1">
-                      <div className="flex gap-1">
-                        {[1,2,3,4].map(i => (
-                          <div
-                            key={i}
-                            className={`h-1 flex-1 rounded-full transition-colors ${i <= s ? pwStrengthColor[s] : 'bg-border'}`}
-                          />
-                        ))}
-                      </div>
-                      <div className={`text-[11px] font-medium ${pwStrengthText[s]}`}>
-                        {pwStrengthLabel[s]}
-                        {s < 3 && <span className="text-faint ml-1">— add uppercase, numbers, or symbols</span>}
-                      </div>
-                    </div>
-                  )
-                })()}
-              </div>
-
-              {/* Confirm password */}
-              <div>
-                <div className="text-xs text-muted mb-1.5 font-medium">Confirm New Password</div>
-                <div className="relative">
-                  <input
-                    type={showPwConfirm ? 'text' : 'password'}
-                    className="input pr-10 w-full"
-                    placeholder="Repeat your new password"
-                    value={pwConfirm}
-                    onChange={(e) => { setPwConfirm(e.target.value); setPwResult(null) }}
-                    autoComplete="new-password"
-                    onKeyDown={(e) => e.key === 'Enter' && handleChangePassword()}
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowPwConfirm(v => !v)}
-                    className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink"
-                  >
-                    {showPwConfirm ? <EyeOff size={14} /> : <Eye size={14} />}
-                  </button>
-                </div>
-                {/* Match indicator */}
-                {pwConfirm && pwNew && (
-                  <div className={`text-[11px] mt-1 font-medium ${pwConfirm === pwNew ? 'text-green-400' : 'text-red-400'}`}>
-                    {pwConfirm === pwNew ? '✓ Passwords match' : '✗ Passwords do not match'}
-                  </div>
-                )}
-              </div>
-
-              {/* Result banner */}
-              {pwResult && (
-                <div className={`flex items-start gap-2 px-3 py-2.5 rounded-lg text-xs ${
-                  pwResult.ok
-                    ? 'bg-green-500/10 border border-green-500/30 text-green-400'
-                    : 'bg-red-500/10 border border-red-500/30 text-red-400'
-                }`}>
-                  {pwResult.ok ? <CheckCircle size={13} className="mt-px shrink-0" /> : <AlertCircle size={13} className="mt-px shrink-0" />}
-                  {pwResult.msg}
-                </div>
-              )}
-
-              {/* Submit */}
-              <button
-                onClick={handleChangePassword}
-                disabled={pwSaving || !pwCurrent || !pwNew || !pwConfirm}
-                className="btn-primary w-full disabled:opacity-50"
-              >
-                {pwSaving ? 'Updating…' : 'Update Password'}
-              </button>
-
-              {/* Requirements callout */}
-              <div className="text-[11px] text-faint space-y-0.5 p-3 rounded-lg bg-surface border border-border">
-                <div className="font-medium text-muted mb-1">Requirements</div>
-                <div className={`flex items-center gap-1.5 ${/^.{8,}$/.test(pwNew) ? 'text-green-400' : ''}`}>
-                  {/^.{8,}$/.test(pwNew) ? '✓' : '·'} At least 8 characters
-                </div>
-                <div className={`flex items-center gap-1.5 ${/[A-Z]/.test(pwNew) ? 'text-green-400' : ''}`}>
-                  {/[A-Z]/.test(pwNew) ? '✓' : '·'} One uppercase letter
-                </div>
-                <div className={`flex items-center gap-1.5 ${/[a-z]/.test(pwNew) ? 'text-green-400' : ''}`}>
-                  {/[a-z]/.test(pwNew) ? '✓' : '·'} One lowercase letter
-                </div>
-                <div className={`flex items-center gap-1.5 ${/[0-9]/.test(pwNew) ? 'text-green-400' : ''}`}>
-                  {/[0-9]/.test(pwNew) ? '✓' : '·'} One number
-                </div>
-              </div>
             )}
           </div>
         </div>
@@ -786,6 +665,153 @@ export function SettingsModal() {
         <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-border flex-shrink-0">
           <button onClick={() => setSettingsOpen(false)} className="btn-ghost border border-border px-5 py-2 text-sm">Cancel</button>
           {tab !== 'users' && tab !== 'security' && <button onClick={handleSave} className="btn-primary px-6">Save Settings</button>}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ── Security / Change Password panel ─────────────────────────────────────────
+// Extracted into its own component to avoid esbuild 0.25.x JSX nesting bugs
+// (IIFE-in-JSX and regex-in-template-literals both misparse at this nesting depth)
+interface SecurityPanelProps {
+  pwCurrent: string; setPwCurrent: (v: string) => void
+  pwNew: string; setPwNew: (v: string) => void
+  pwConfirm: string; setPwConfirm: (v: string) => void
+  showPwCurrent: boolean; setShowPwCurrent: (fn: (v: boolean) => boolean) => void
+  showPwNew: boolean; setShowPwNew: (fn: (v: boolean) => boolean) => void
+  showPwConfirm: boolean; setShowPwConfirm: (fn: (v: boolean) => boolean) => void
+  pwResult: { ok: boolean; msg: string } | null; setPwResult: (v: { ok: boolean; msg: string } | null) => void
+  pwSaving: boolean
+  onChangePassword: () => void
+  pwStrength: (pw: string) => number
+  pwStrengthLabel: string[]
+  pwStrengthColor: string[]
+  pwStrengthText: string[]
+}
+
+function SecurityPanel(props: SecurityPanelProps) {
+  const {
+    pwCurrent, setPwCurrent, pwNew, setPwNew, pwConfirm, setPwConfirm,
+    showPwCurrent, setShowPwCurrent, showPwNew, setShowPwNew,
+    showPwConfirm, setShowPwConfirm, pwResult, setPwResult,
+    pwSaving, onChangePassword, pwStrength, pwStrengthLabel, pwStrengthColor, pwStrengthText,
+  } = props
+
+  const pwHas8     = pwNew.length >= 8
+  const pwHasUpper = /[A-Z]/.test(pwNew)
+  const pwHasLower = /[a-z]/.test(pwNew)
+  const pwHasDigit = /[0-9]/.test(pwNew)
+
+  const s = pwNew ? pwStrength(pwNew) : 0
+  const pwResultCls = pwResult
+    ? (pwResult.ok ? 'bg-green-500/10 border border-green-500/30 text-green-400' : 'bg-red-500/10 border border-red-500/30 text-red-400')
+    : ''
+
+  return (
+    <div className="space-y-6 max-w-sm">
+      <SectionHeader title="Change Password" subtitle="Enter your current password to set a new one" />
+
+      {/* Current password */}
+      <div>
+        <div className="text-xs text-muted mb-1.5 font-medium">Current Password</div>
+        <div className="relative">
+          <input
+            type={showPwCurrent ? 'text' : 'password'}
+            className="input pr-10 w-full"
+            placeholder="Your current password"
+            value={pwCurrent}
+            onChange={(e) => { setPwCurrent(e.target.value); setPwResult(null) }}
+            autoComplete="current-password"
+          />
+          <button type="button" onClick={() => setShowPwCurrent(v => !v)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink">
+            {showPwCurrent ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+        </div>
+      </div>
+
+      {/* New password */}
+      <div>
+        <div className="text-xs text-muted mb-1.5 font-medium">New Password</div>
+        <div className="relative">
+          <input
+            type={showPwNew ? 'text' : 'password'}
+            className="input pr-10 w-full"
+            placeholder="At least 8 chars, upper, lower, digit"
+            value={pwNew}
+            onChange={(e) => { setPwNew(e.target.value); setPwResult(null) }}
+            autoComplete="new-password"
+          />
+          <button type="button" onClick={() => setShowPwNew(v => !v)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink">
+            {showPwNew ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+        </div>
+        {pwNew && (
+          <div className="mt-2 space-y-1">
+            <div className="flex gap-1">
+              {[1,2,3,4].map(i => (
+                <div key={i} className={`h-1 flex-1 rounded-full transition-colors ${i <= s ? pwStrengthColor[s] : 'bg-border'}`} />
+              ))}
+            </div>
+            <div className={`text-[11px] font-medium ${pwStrengthText[s]}`}>
+              {pwStrengthLabel[s]}
+              {s < 3 && <span className="text-faint ml-1">&mdash; add uppercase, numbers, or symbols</span>}
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Confirm password */}
+      <div>
+        <div className="text-xs text-muted mb-1.5 font-medium">Confirm New Password</div>
+        <div className="relative">
+          <input
+            type={showPwConfirm ? 'text' : 'password'}
+            className="input pr-10 w-full"
+            placeholder="Repeat your new password"
+            value={pwConfirm}
+            onChange={(e) => { setPwConfirm(e.target.value); setPwResult(null) }}
+            autoComplete="new-password"
+            onKeyDown={(e) => e.key === 'Enter' && onChangePassword()}
+          />
+          <button type="button" onClick={() => setShowPwConfirm(v => !v)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink">
+            {showPwConfirm ? <EyeOff size={14} /> : <Eye size={14} />}
+          </button>
+        </div>
+        {pwConfirm && pwNew && (
+          <div className={`text-[11px] mt-1 font-medium ${pwConfirm === pwNew ? 'text-green-400' : 'text-red-400'}`}>
+            {pwConfirm === pwNew ? '\u2713 Passwords match' : '\u2717 Passwords do not match'}
+          </div>
+        )}
+      </div>
+
+      {/* Result banner */}
+      {pwResult && (
+        <div className={`flex items-start gap-2 px-3 py-2.5 rounded-lg text-xs ${pwResultCls}`}>
+          {pwResult.ok ? <CheckCircle size={13} className="mt-px shrink-0" /> : <AlertCircle size={13} className="mt-px shrink-0" />}
+          {pwResult.msg}
+        </div>
+      )}
+
+      {/* Submit */}
+      <button onClick={onChangePassword} disabled={pwSaving || !pwCurrent || !pwNew || !pwConfirm} className="btn-primary w-full disabled:opacity-50">
+        {pwSaving ? 'Updating\u2026' : 'Update Password'}
+      </button>
+
+      {/* Requirements callout */}
+      <div className="text-[11px] text-faint space-y-0.5 p-3 rounded-lg bg-surface border border-border">
+        <div className="font-medium text-muted mb-1">Requirements</div>
+        <div className={`flex items-center gap-1.5 ${pwHas8 ? 'text-green-400' : ''}`}>
+          {pwHas8 ? '\u2713' : '\u00B7'} At least 8 characters
+        </div>
+        <div className={`flex items-center gap-1.5 ${pwHasUpper ? 'text-green-400' : ''}`}>
+          {pwHasUpper ? '\u2713' : '\u00B7'} One uppercase letter
+        </div>
+        <div className={`flex items-center gap-1.5 ${pwHasLower ? 'text-green-400' : ''}`}>
+          {pwHasLower ? '\u2713' : '\u00B7'} One lowercase letter
+        </div>
+        <div className={`flex items-center gap-1.5 ${pwHasDigit ? 'text-green-400' : ''}`}>
+          {pwHasDigit ? '\u2713' : '\u00B7'} One number
         </div>
       </div>
     </div>
