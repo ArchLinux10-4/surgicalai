@@ -13,7 +13,6 @@ import re
 import uuid
 import difflib
 import time
-import asyncio
 from pathlib import Path
 from typing import Optional
 from openai import OpenAI
@@ -1462,18 +1461,7 @@ async def analyze_and_plan_stream(
 
         yield f"data: {json.dumps({'type': 'progress', 'content': f'Found {len(symbol_map.symbols)} symbols. Running Architect...'})}\n\n"
 
-        # v3.11.2: run blocking Architect in thread + yield keepalives every 5s
-        # so Railway proxy never sees an idle SSE connection.
-        _arch_task = asyncio.create_task(
-            asyncio.to_thread(run_architect, symbol_map, user_request, file_content, user_id=user_id)
-        )
-        while not _arch_task.done():
-            yield f": keepalive\n\n"
-            try:
-                await asyncio.wait_for(asyncio.shield(_arch_task), timeout=5.0)
-            except asyncio.TimeoutError:
-                pass
-        plan = _arch_task.result()
+        plan = run_architect(symbol_map, user_request, file_content, user_id=user_id)
 
         yield f"data: {json.dumps({'type': 'progress', 'content': f'Plan: {len(plan.targets)} changes identified. Running Surgeon...'})}\n\n"
 
@@ -1498,17 +1486,7 @@ async def analyze_and_plan_stream(
                                 parent_symbol = sym
                                 break
                     if parent_symbol is not None:
-                        # v3.11.2: keepalive wrap — ADD case
-                        _surg_add_task = asyncio.create_task(
-                            asyncio.to_thread(run_surgeon, parent_symbol, target, file_content, user_id=user_id)
-                        )
-                        while not _surg_add_task.done():
-                            yield f": keepalive\n\n"
-                            try:
-                                await asyncio.wait_for(asyncio.shield(_surg_add_task), timeout=5.0)
-                            except asyncio.TimeoutError:
-                                pass
-                        new_code, confidence, _surg_notes, _needed_imports, _operations = _surg_add_task.result()
+                        new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(parent_symbol, target, file_content, user_id=user_id)
                         diff = _make_diff(parent_symbol.code, new_code, f"{target.symbol_path} (added to {parent_path})")
                         _tgt_elem, _replacement = _compute_target_element(parent_symbol.code, new_code)
                         # v3.3.1: injection guard
@@ -1551,17 +1529,7 @@ async def analyze_and_plan_stream(
                 changes.append(change)
                 continue
 
-            # v3.11.2: keepalive wrap — MODIFY case (main path, most common)
-            _surg_task = asyncio.create_task(
-                asyncio.to_thread(run_surgeon, symbol, target, file_content, user_id=user_id)
-            )
-            while not _surg_task.done():
-                yield f": keepalive\n\n"
-                try:
-                    await asyncio.wait_for(asyncio.shield(_surg_task), timeout=5.0)
-                except asyncio.TimeoutError:
-                    pass
-            new_code, confidence, _surg_notes, _needed_imports, _operations = _surg_task.result()
+            new_code, confidence, _surg_notes, _needed_imports, _operations = run_surgeon(symbol, target, file_content, user_id=user_id)
             diff = _make_diff(symbol.code, new_code, target.symbol_path)
             _tgt_elem, _replacement = _compute_target_element(symbol.code, new_code)
 
@@ -2678,7 +2646,9 @@ You receive:
 
 ⚠️  DIFF IS THE ONLY SOURCE OF TRUTH FOR WHAT CHANGED ⚠️
 The UNIFIED DIFF shows exactly what was added (+) and removed (-).
-The ORIGINAL CODE and NEW CODE snippets are TRUNCATED WINDOWS — they may cut off mid-file.
+ORIGINAL CODE and NEW CODE are SYMBOL-SCOPED — they are the exact function/component being changed,
+not a window into the whole file. For very large symbols they may be truncated at the end (marked).
+This truncation is NOT a deletion — only flag deletions if they appear as "-" lines in the UNIFIED DIFF.
 NEVER infer that code was deleted because it appears in ORIGINAL but not in NEW CODE.
 ONLY flag a deletion if it appears as a "-" line in the UNIFIED DIFF.
 
@@ -2764,13 +2734,13 @@ async def run_qa_agent(
         tofile="modified",
         n=5  # 5 lines of context around each change
     ))
-    _diff_text = "".join(_diff_lines)[:4000]
+    _diff_text = "".join(_diff_lines)[:8000]
     if not _diff_text.strip():
         _diff_text = "(no visible changes — code is identical)"
 
     # Expanded snippets — 4000 chars each matches the diff cap so QA sees full context
-    _orig_snippet = original_code[:4000] + ("\n... [truncated]" if len(original_code) > 4000 else "")
-    _new_snippet  = new_code[:4000]      + ("\n... [truncated]" if len(new_code) > 4000 else "")
+    _orig_snippet = original_code[:12000] + ("\n... [symbol truncated — very large component]" if len(original_code) > 12000 else "")
+    _new_snippet  = new_code[:12000]     + ("\n... [symbol truncated — very large component]" if len(new_code) > 12000 else "")
     other_ctx    = other_files_context[:3000] + ("\n... [truncated]" if len(other_files_context) > 3000 else "")
 
     # Targeted cross-file context: actual callers/usages of changed symbol
@@ -2809,8 +2779,9 @@ ORIGINAL CODE (truncated window for structural context only — do NOT use to in
 NEW CODE (truncated window for structural context only — do NOT use to infer deletions):
 {_new_snippet}
 
-REMINDER: If something appears in ORIGINAL but not in NEW CODE, that does NOT mean it was deleted
-unless it also appears as a "-" line in the UNIFIED DIFF above. Truncation is common in large files.
+REMINDER: ORIGINAL CODE and NEW CODE are SYMBOL-SCOPED — they contain the COMPLETE function/component
+being changed (not the whole file). Only flag something as deleted if it appears as a "-" line in the
+UNIFIED DIFF. If truncation is marked above, it means the symbol is very large — not that code was lost.
 
 OTHER FILES IN SESSION (for cross-file checking):
 {other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_qa_feedback_block}
