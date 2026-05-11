@@ -2635,59 +2635,58 @@ def _extract_json_from_text(text: str) -> str:
     return extracted  # Return as-is and let caller surface the error
 
 
-QA_SYSTEM = """You are the QA agent in a two-model coding pipeline.
-The Surgeon has just produced a code replacement. Your job: verify it is correct, complete, and safe.
+QA_SYSTEM = """You are the QA agent in a surgical code editing pipeline.
+The Surgeon has produced a code change. Your job: verify the new code is correct, complete, and safe.
 
 You receive:
-- ORIGINAL: the code being replaced
-- NEW CODE: what the Surgeon produced
-- CHANGE PLAN: what was asked for
-- OTHER FILES CONTEXT: symbol maps of other uploaded files (for cross-file checks)
+- CHANGE PLAN: what was requested (description + expected behavior)
+- ORIGINAL CODE: the complete, untruncated code block before the change
+- NEW CODE: the complete, untruncated code block after the change
+- OTHER FILES CONTEXT: symbol maps of other files for cross-file checks
 
-⚠️  DIFF IS THE ONLY SOURCE OF TRUTH FOR WHAT CHANGED ⚠️
-The UNIFIED DIFF shows exactly what was added (+) and removed (-).
-ORIGINAL CODE and NEW CODE are SYMBOL-SCOPED — they are the exact function/component being changed,
-not a window into the whole file. For very large symbols they may be truncated at the end (marked).
-This truncation is NOT a deletion — only flag deletions if they appear as "-" lines in the UNIFIED DIFF.
-NEVER infer that code was deleted because it appears in ORIGINAL but not in NEW CODE.
-ONLY flag a deletion if it appears as a "-" line in the UNIFIED DIFF.
+IMPORTANT: You have the FULL original and FULL new code — there is no truncation.
+Compare them directly, like a real code reviewer would. Do NOT ask for a diff or complain
+about missing context — everything you need is in ORIGINAL CODE and NEW CODE.
 
-Check for ALL of the following:
-1. IMPORT ISSUES — does new code call/use anything that needs an import not in the file?
-2. DOWNSTREAM RISKS — does this change affect function signatures, types, or constants that other files depend on?
-3. TYPE ERRORS — obvious type mismatches, wrong argument counts, wrong return types
-4. PLAN DEVIATION — does new code do something OTHER than what the plan says? (adding/removing unasked features)
-   When checking for unasked deletions: ONLY flag lines that appear as "-" in the DIFF. Do not flag truncation.
-5. DUPLICATION — is any code duplicated (same function defined twice, same block copy-pasted)?
-6. ALREADY CORRECT — if new code is identical to original, flag it
-7. ARCHITECT RISKS — if architect_risks are provided, evaluate each one against the actual diff and mark whether it truly applies to THIS specific change
+Check ALL of the following by comparing ORIGINAL → NEW:
+1. COMPLETENESS — does NEW CODE contain everything it should? Flag anything dropped that wasn't part of the plan.
+2. PLAN COMPLIANCE — does NEW CODE implement exactly what was asked? No more, no less.
+3. SYNTAX — unclosed brackets, missing semicolons, malformed JSX/TSX tags, broken template literals.
+4. IMPORT ISSUES — does new code use anything that needs an import not already present in the file?
+5. TYPE ERRORS — obvious type mismatches, wrong argument counts, wrong return types.
+6. DUPLICATION — is any function, component, or block defined twice?
+7. DOWNSTREAM RISKS — does this change break signatures, exported types, or constants other files depend on?
+8. ARCHITECT RISKS — evaluate each provided risk against actual code changes.
 
-Respond with ONLY valid JSON — no explanation outside the JSON:
+SCORING RULES (ENFORCE STRICTLY):
+9-10 → safe:    Change exactly matches plan, no issues, all imports present
+7-8  → safe:    Minor style notes but nothing breaking
+5-6  → warning: Potential issue user should review (unclear import, subtle type change, minor scope creep)
+3-4  → blocked: Likely broken — missing critical imports, wrong signature, obvious logic error
+1-2  → blocked: Severely wrong — duplicated code, plan not implemented, syntax errors
+
+verdict MUST match score:
+  score 7-10 → "safe"
+  score 5-6  → "warning"
+  score 1-4  → "blocked"
+
+A "warning" verdict allows Apply but shows a yellow banner.
+A "blocked" verdict disables Apply until the user overrides.
+
+Respond with ONLY valid JSON — no text outside the JSON object:
 {
   "verdict": "safe" | "warning" | "blocked",
   "qa_score": <integer 1-10>,
-  "summary": "<one sentence>",
+  "summary": "<one sentence — what the change does and any key finding>",
   "import_issues": ["<issue>"],
   "downstream_risks": ["<risk>"],
   "type_errors": ["<error>"],
-  "plan_deviation": "<empty string if none, or description of deviation>",
+  "plan_deviation": "<empty string if none, or exact description of deviation>",
   "risk_verdicts": [
-    {"risk": "<exact text from architect_risks>", "status": "verified_safe|warning|blocked", "reason": "<one sentence why>"}
+    {"risk": "<exact text from architect_risks>", "status": "verified_safe|warning|blocked", "reason": "<one sentence>"}
   ]
 }
-Note: risk_verdicts should have one entry per item in architect_risks. If architect_risks is empty, return [].
-status meanings: verified_safe=does not apply to this change, warning=possibly relevant, blocked=confirmed real risk.
-
-Score guide (ENFORCE STRICTLY):
-9-10 → safe:    Change exactly matches plan, no issues, all imports present
-7-8  → safe:    Minor notes but nothing breaking
-5-6  → warning: Potential issue user should review — imports unclear, subtle signature change, minor scope creep
-3-4  → blocked: Likely broken — missing critical imports, wrong function signature, obvious logic error
-1-2  → blocked: Severely wrong — duplicated code, completely wrong output, plan not implemented at all
-
-verdict MUST match score: score ≥6 = safe or warning, score ≤5 = blocked.
-A warning verdict means Apply is allowed but user sees a yellow banner.
-A blocked verdict means Apply is disabled until user overrides."""
+risk_verdicts must have one entry per item in architect_risks. If architect_risks is empty, return []."""
 
 
 async def run_qa_agent(
@@ -2725,23 +2724,20 @@ async def run_qa_agent(
         _qa_use_claude = False
         _qa_model = "gpt-4.1"  # full GPT-4.1, not mini — QA must not be weakest link
 
-    # v3.4.0: Send DIFF to QA instead of truncated code blocks.
-    # The change may be deep in a large window — truncating at 3000 chars can hide it entirely.
-    _diff_lines = list(difflib.unified_diff(
-        original_code.splitlines(keepends=True),
-        new_code.splitlines(keepends=True),
-        fromfile="original",
-        tofile="modified",
-        n=5  # 5 lines of context around each change
-    ))
-    _diff_text = "".join(_diff_lines)[:8000]
-    if not _diff_text.strip():
-        _diff_text = "(no visible changes — code is identical)"
-
-    # Expanded snippets — 4000 chars each matches the diff cap so QA sees full context
-    _orig_snippet = original_code[:12000] + ("\n... [symbol truncated — very large component]" if len(original_code) > 12000 else "")
-    _new_snippet  = new_code[:12000]     + ("\n... [symbol truncated — very large component]" if len(new_code) > 12000 else "")
-    other_ctx    = other_files_context[:3000] + ("\n... [truncated]" if len(other_files_context) > 3000 else "")
+    # v3.11.4: QA receives FULL code — no truncation, no diff confusion.
+    # Claude Sonnet has 200K context. A full symbol is typically <20KB (~5K tokens).
+    # Sending full original + full new lets QA compare directly, like a real code reviewer.
+    # Hard cap at 60K chars per block to guard against pathological files (still ~15K tokens each).
+    _MAX_CODE_CHARS = 60_000
+    _orig_snippet = original_code if len(original_code) <= _MAX_CODE_CHARS else (
+        original_code[:_MAX_CODE_CHARS] + f"\n... [hard cap: file exceeds {_MAX_CODE_CHARS} chars — review manually]"
+    )
+    _new_snippet = new_code if len(new_code) <= _MAX_CODE_CHARS else (
+        new_code[:_MAX_CODE_CHARS] + f"\n... [hard cap: file exceeds {_MAX_CODE_CHARS} chars — review manually]"
+    )
+    other_ctx = other_files_context[:8000] + ("\n... [truncated]" if len(other_files_context) > 8000 else "")
+    # Unchanged flag for QA awareness
+    _no_change = _orig_snippet.strip() == _new_snippet.strip()
 
     # Targeted cross-file context: actual callers/usages of changed symbol
     _targeted_block = ""
@@ -2769,24 +2765,18 @@ Symbol: {symbol_path}
 File: {filename}
 Description: {change_description}
 Expected behavior: {new_logic}
+{"⚠️ NOTE: No code changes detected — original and new are identical." if _no_change else ""}
 
-UNIFIED DIFF (the authoritative record — ONLY trust this for what was added/removed):
-{_diff_text}
-
-ORIGINAL CODE (truncated window for structural context only — do NOT use to infer deletions):
+ORIGINAL CODE (complete — compare this directly against NEW CODE):
 {_orig_snippet}
 
-NEW CODE (truncated window for structural context only — do NOT use to infer deletions):
+NEW CODE (complete — this is what the Surgeon produced):
 {_new_snippet}
-
-REMINDER: ORIGINAL CODE and NEW CODE are SYMBOL-SCOPED — they contain the COMPLETE function/component
-being changed (not the whole file). Only flag something as deleted if it appears as a "-" line in the
-UNIFIED DIFF. If truncation is marked above, it means the symbol is very large — not that code was lost.
 
 OTHER FILES IN SESSION (for cross-file checking):
 {other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_qa_feedback_block}
 
-Focus on the DIFF above as the ground truth. Run all 7 checks and return the JSON verdict.
+Compare ORIGINAL CODE → NEW CODE directly. Run all 8 checks and return the JSON verdict.
 
 ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 {_risks_block}"""
