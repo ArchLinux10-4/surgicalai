@@ -252,10 +252,12 @@ def apply_change(file_content: str, change) -> str:
                 # Check for the sentinel pattern: single operation whose "find"
                 # is the original symbol code (set by analyze_and_plan_stream)
                 sym_code = getattr(symbol, "code", None) or original_code
+                def _op_field(op, key, default=""):
+                    return op.get(key, default) if isinstance(op, dict) else getattr(op, key, default)
                 if (
                     len(operations) == 1
-                    and operations[0].get("find", "").strip() == sym_code.strip()
-                    and operations[0].get("replace", "").strip() == new_code.strip()
+                    and _op_field(operations[0], "find", "").strip() == sym_code.strip()
+                    and _op_field(operations[0], "replace", "").strip() == new_code.strip()
                 ):
                     can_use_line_replace = True
 
@@ -279,8 +281,8 @@ def apply_change(file_content: str, change) -> str:
         any_applied = False
 
         for op in operations:
-            find_text = op.get("find", "")
-            replace_text = op.get("replace", "")
+            find_text = op.get("find", "") if isinstance(op, dict) else getattr(op, "find", "")
+            replace_text = op.get("replace", "") if isinstance(op, dict) else getattr(op, "replace", "")
             if not find_text:
                 continue
             if find_text in result:
