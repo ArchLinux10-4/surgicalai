@@ -546,8 +546,10 @@ CHANGE TYPES:
 - DELETE: find = the lines to remove, replace = "" (empty string).
 
 STYLE RULES (for UI/CSS changes):
-- Use ONLY colors and CSS variables that already exist in the FILE HEADER or TARGET CODE.
-  Do NOT invent new color values. If in doubt, reuse an existing color exactly as written.
+- For targeted tweaks (e.g. "change this button color"), prefer reusing existing color values/CSS variables.
+- For redesign/restyle/modernize requests, you ARE allowed to introduce new colors, gradients, and
+  modern design patterns. Use your knowledge of modern UI (DaaS, SaaS, dark theme, glassmorphism, etc.)
+  to produce a genuinely improved result. Do not artificially limit yourself to existing colors.
 - Preserve TypeScript types. If adding a new useState hook, infer the type from surrounding hooks.
 - Match the indentation style exactly (spaces vs tabs, 2 vs 4 spaces).
 
@@ -4159,7 +4161,30 @@ USER REQUEST:
                     symbol = next((s for s in smap.symbols if s.symbol_type.value == "class"), smap.symbols[0])
 
             if symbol is None:
-                continue
+                # Fuzzy fallback: try partial name match (e.g. Architect said "LeftPanel" but
+                # TSX only has "LoginPage" — find any symbol whose name contains the requested
+                # name as a substring, or whose range contains the target_line if provided)
+                _tline_fb = target.get("target_line")
+                if _tline_fb:
+                    symbol = next(
+                        (s for s in smap.symbols
+                         if s.start_line <= _tline_fb <= s.end_line),
+                        None
+                    )
+                if symbol is None:
+                    # Partial name match
+                    sp_lower = symbol_path.lower().split(".")[-1]
+                    symbol = next(
+                        (s for s in smap.symbols
+                         if sp_lower in s.full_path.lower() or s.full_path.lower() in sp_lower),
+                        None
+                    )
+                if symbol is None and smap.symbols:
+                    # Last resort: use the largest symbol (most likely the main component)
+                    symbol = max(smap.symbols, key=lambda s: s.end_line - s.start_line)
+                    print(f"[PIPELINE] symbol '{symbol_path}' not found — falling back to largest symbol '{symbol.full_path}'")
+                if symbol is None:
+                    continue
 
             change_target = ChangeTarget(
                 symbol_path=symbol_path,
