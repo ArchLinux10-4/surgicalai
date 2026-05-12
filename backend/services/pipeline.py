@@ -521,6 +521,7 @@ RULES:
 4. Each block = ONE logical change. Multiple changes = multiple blocks. Order them top-to-bottom in the file.
 5. Do NOT include unchanged surrounding code in SEARCH or REPLACE.
 6. CRITICAL: Every line in SEARCH that is absent from REPLACE gets permanently deleted. Never include trailing context lines you want to keep.
+7. TO DELETE a symbol or block entirely: SEARCH = the exact code to remove, REPLACE = empty (no lines). Use this when asked to "remove", "delete", or eliminate "unused" code. This is NOT the same as "already correct" — a deletion requires a non-empty SEARCH block.
 
 FOR REDESIGN / RESTYLE / COMPLETE REWRITE (> ~30% of symbol changing):
 Use a single block covering the entire symbol body — SEARCH = full original symbol, REPLACE = full new symbol.
@@ -533,10 +534,11 @@ STYLE RULES:
 - Redesign/restyle/modernize: freely introduce new colors, gradients, glassmorphism, modern DaaS/SaaS patterns.
 - Preserve TypeScript types. Match indentation exactly (spaces vs tabs, 2 vs 4 spaces).
 
-IF ALREADY CORRECT: output a single empty block pair to signal no change needed:
+IF ALREADY CORRECT (the code already does exactly what was requested AND nothing should be deleted): output a single empty block pair:
 <<<<<<< SEARCH
 =======
 >>>>>>> REPLACE
+NEVER use this for deletions — if the task says "remove", "delete", or "unused", you MUST emit a non-empty SEARCH block.
 
 Output ONLY the SEARCH/REPLACE blocks. No JSON. No markdown fences around the blocks. No explanation outside the blocks."""
 
@@ -5081,6 +5083,30 @@ USER REQUEST:
                 except Exception as _resolve_exc:
                     print(f"[CONTEXT_RESOLVER] Resolve failed: {_resolve_exc}")
                     return ""
+
+            # ── DELETE fast-path: bypass Surgeon entirely ─────────────────────────────
+            # Architect marked this symbol for pure removal. No need to invoke Claude.
+            # Create a SurgicalChange with new_code="" — _has_real_diff() will accept
+            # it (has removes, no adds) and the apply engine will wipe the symbol.
+            if ct == ChangeType.DELETE:
+                yield sse({"type": "progress", "content": f"🗑️ Removing `{symbol.name}`..."})
+                _del_change = SurgicalChange(
+                    id=str(uuid.uuid4()),
+                    symbol=symbol,
+                    original_code=symbol.code,
+                    new_code="",
+                    diff=_make_diff(symbol.code, "", symbol_path),
+                    confidence=change_target.confidence,
+                    description=change_target.description,
+                    applied=False,
+                    surgeon_notes=["Deletion — Surgeon bypassed"],
+                    qa_result={"verdict": "safe", "summary": "Symbol deleted as requested", "qa_score": 10},
+                    operations=[],
+                )
+                if matched_name not in changes_by_file:
+                    changes_by_file[matched_name] = {"file": sf, "changes": []}
+                changes_by_file[matched_name]["changes"].append(_del_change)
+                continue
 
             # ── Surgeon retry loop (linter + QA feedback) ───────────────────
             _linter_feedback_for_retry: list = []
