@@ -5,7 +5,7 @@
 import React, { useState, useEffect } from 'react'
 import { useAuthStore } from '../stores/authStore'
 import { api } from '../api/client'
-import { Plus, Trash2, Shield, User, RefreshCw } from 'lucide-react'
+import { Add, Delete, Person, Refresh, Security } from '@mui/icons-material';
 
 interface UserRecord {
   id: string
@@ -97,13 +97,13 @@ export function AdminUsersPanel() {
         </div>
         <div className="flex gap-2">
           <button onClick={loadUsers} className="btn-icon" title="Refresh">
-            <RefreshCw size={13} className={loading ? 'animate-spin' : ''} />
+            <Refresh sx={{ fontSize: 13 }} className={loading ? 'animate-spin' : ''} />
           </button>
           <button
             onClick={() => setShowForm(!showForm)}
             className="flex items-center gap-1.5 text-xs bg-accent text-white px-3 py-1.5 rounded-lg hover:bg-accent/80 transition font-medium"
           >
-            <Plus size={13} />
+            <Add sx={{ fontSize: 13 }} />
             New User
           </button>
         </div>
@@ -176,7 +176,7 @@ export function AdminUsersPanel() {
               disabled={creating}
               className="flex items-center gap-1.5 text-xs bg-accent text-white px-3 py-1.5 rounded-lg hover:bg-accent/80 disabled:opacity-50 transition font-medium"
             >
-              {creating ? <RefreshCw size={11} className="animate-spin" /> : <Plus size={11} />}
+              {creating ? <Refresh sx={{ fontSize: 11 }} className="animate-spin" /> : <Add sx={{ fontSize: 11 }} />}
               Create User
             </button>
           </div>
@@ -187,7 +187,7 @@ export function AdminUsersPanel() {
       <div className="space-y-1.5">
         {loading ? (
           <div className="flex items-center justify-center h-16">
-            <RefreshCw size={14} className="animate-spin text-faint" />
+            <Refresh sx={{ fontSize: 14 }} className="animate-spin text-faint" />
           </div>
         ) : users.length === 0 ? (
           <p className="text-xs text-faint text-center py-4">No users found.</p>
@@ -206,7 +206,7 @@ export function AdminUsersPanel() {
                     <span className="text-xs font-medium text-ink">{u.username}</span>
                     {Boolean(u.is_admin) && (
                       <span className="flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 font-medium">
-                        <Shield size={9} />
+                        <Security sx={{ fontSize: 9 }} />
                         Admin
                       </span>
                     )}
@@ -231,7 +231,7 @@ export function AdminUsersPanel() {
                     className="btn-icon text-faint hover:text-red-400 transition"
                     title="Delete user"
                   >
-                    {deletingId === u.id ? <RefreshCw size={13} className="animate-spin" /> : <Trash2 size={13} />}
+                    {deletingId === u.id ? <Refresh sx={{ fontSize: 13 }} className="animate-spin" /> : <Delete sx={{ fontSize: 13 }} />}
                   </button>
                 )}
               </div>

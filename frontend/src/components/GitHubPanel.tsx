@@ -1,12 +1,8 @@
 import React, { useState, useEffect, useCallback } from 'react'
-import {
-  Github, RefreshCw, ChevronRight, ChevronDown, GitBranch,
-  FolderOpen, Folder, FileCode, Download, CheckCircle2, Loader2,
-  ChevronLeft, Search, Lock, Star, Settings, AlertCircle,
-} from 'lucide-react'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/appStore'
 import { toast } from '../lib/toast'
+import { AccountTree, Description, ErrorOutline, FileDownload, Folder, FolderOpen, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, Lock, Refresh, Search, Settings, Star, Sync, TaskAlt } from '@mui/icons-material';
 
 interface GHRepo {
   id: number
@@ -242,7 +238,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
   if (loadingStatus) {
     return (
       <div className="flex items-center justify-center h-20">
-        <Loader2 size={16} className="animate-spin text-faint" />
+        <Sync sx={{ fontSize: 16 }} className="animate-spin text-faint" />
       </div>
     )
   }
@@ -252,7 +248,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
     return (
       <div className="flex flex-col items-center justify-center h-full gap-4 px-5 py-8 text-center">
         <div className="w-14 h-14 rounded-2xl bg-surface-alt border border-border flex items-center justify-center">
-          <Github size={26} className="text-muted/70" />
+          <GitHub sx={{ fontSize: 26 }} className="text-muted/70" />
         </div>
         <div>
           <p className="text-[14px] font-semibold text-ink mb-1">Connect GitHub</p>
@@ -264,7 +260,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
           onClick={onOpenSettings}
           className="flex items-center gap-2 px-4 py-2 rounded-lg bg-accent text-white text-[13px] font-semibold hover:bg-accent/90 transition-colors"
         >
-          <Settings size={13} />
+          <Settings sx={{ fontSize: 13 }} />
           Add Token in Settings
         </button>
         <p className="text-[11px] text-faint">
@@ -291,7 +287,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
           <img src={status.avatar_url} alt="" className="w-6 h-6 rounded-full" />
         ) : (
           <div className="w-6 h-6 rounded-full bg-accent/20 flex items-center justify-center">
-            <Github size={12} className="text-accent" />
+            <GitHub sx={{ fontSize: 12 }} className="text-accent" />
           </div>
         )}
         <div className="flex-1 min-w-0">
@@ -309,7 +305,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
         <div className="flex flex-col flex-1 overflow-hidden">
           <div className="px-2 pt-2 pb-1">
             <div className="relative">
-              <Search size={12} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
+              <Search sx={{ fontSize: 12 }} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-faint" />
               <input
                 type="text"
                 placeholder="Search repositories…"
@@ -322,7 +318,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
           <div className="flex-1 overflow-y-auto">
             {loadingRepos ? (
               <div className="flex items-center justify-center h-20">
-                <Loader2 size={14} className="animate-spin text-faint" />
+                <Sync sx={{ fontSize: 14 }} className="animate-spin text-faint" />
               </div>
             ) : filteredRepos.length === 0 ? (
               <div className="flex flex-col items-center justify-center h-24 text-faint">
@@ -338,10 +334,10 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
                   >
                     <div className="flex items-center gap-2 min-w-0">
                       <span className="text-[12px] font-semibold text-ink truncate flex-1">{repo.name}</span>
-                      {repo.private && <Lock size={10} className="text-faint flex-shrink-0" />}
+                      {repo.private && <Lock sx={{ fontSize: 10 }} className="text-faint flex-shrink-0" />}
                       {repo.stars > 0 && (
                         <span className="flex items-center gap-0.5 text-[10px] text-faint flex-shrink-0">
-                          <Star size={9} />
+                          <Star sx={{ fontSize: 9 }} />
                           {repo.stars}
                         </span>
                       )}
@@ -375,14 +371,14 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
               className="p-1 rounded hover:bg-overlay transition-colors"
               title="Back to repos"
             >
-              <ChevronLeft size={13} className="text-muted" />
+              <KeyboardArrowLeft sx={{ fontSize: 13 }} className="text-muted" />
             </button>
             <span className="text-[12px] font-semibold text-ink truncate flex-1">{selectedRepo.name}</span>
             {/* Branch dropdown */}
             {branches.length > 0 && (
               <div className="relative">
                 <div className="flex items-center gap-1 px-2 py-1 rounded-md bg-surface border border-border cursor-pointer hover:border-accent/50 transition-colors">
-                  <GitBranch size={11} className="text-faint" />
+                  <AccountTree sx={{ fontSize: 11 }} className="text-faint" />
                   <select
                     value={selectedBranch}
                     onChange={e => setSelectedBranch(e.target.value)}
@@ -395,7 +391,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
                 </div>
               </div>
             )}
-            {loadingBranches && <Loader2 size={11} className="animate-spin text-faint" />}
+            {loadingBranches && <Sync sx={{ fontSize: 11 }} className="animate-spin text-faint" />}
           </div>
 
           {/* Breadcrumb */}
@@ -409,7 +405,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
               </button>
               {breadcrumbParts.map((part, i) => (
                 <React.Fragment key={i}>
-                  <ChevronRight size={10} className="text-faint flex-shrink-0" />
+                  <KeyboardArrowRight sx={{ fontSize: 10 }} className="text-faint flex-shrink-0" />
                   <button
                     onClick={() => {
                       const path = breadcrumbParts.slice(0, i + 1).join('/')
@@ -431,7 +427,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
               onClick={navigateBack}
               className="flex items-center gap-1.5 px-3 py-1.5 text-[12px] text-muted hover:text-ink hover:bg-overlay transition-colors"
             >
-              <ChevronLeft size={12} /> ..
+              <KeyboardArrowLeft sx={{ fontSize: 12 }} /> ..
             </button>
           )}
 
@@ -439,7 +435,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
           <div className="flex-1 overflow-y-auto">
             {loadingTree ? (
               <div className="flex items-center justify-center h-20">
-                <Loader2 size={14} className="animate-spin text-faint" />
+                <Sync sx={{ fontSize: 14 }} className="animate-spin text-faint" />
               </div>
             ) : (
               <div className="py-1">
@@ -481,14 +477,14 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
                             className="p-1 rounded text-faint hover:text-ink transition-colors"
                             title="Open folder"
                           >
-                            <ChevronRight size={11} />
+                            <KeyboardArrowRight sx={{ fontSize: 11 }} />
                           </button>
                           <button
                             onClick={() => loadFolder(item.path)}
                             className="flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-accent/10 text-accent hover:bg-accent/20 transition-colors"
                             title="Load all files in folder"
                           >
-                            <Download size={9} />
+                            <FileDownload sx={{ fontSize: 9 }} />
                             All
                           </button>
                         </div>
@@ -496,17 +492,17 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
                         <div className="flex-shrink-0">
                           {isLoaded ? (
                             <span className="flex items-center gap-1 text-[10px] text-emerald-400 font-medium">
-                              <CheckCircle2 size={11} />
+                              <TaskAlt sx={{ fontSize: 11 }} />
                               In chat
                             </span>
                           ) : isLoading ? (
-                            <Loader2 size={12} className="animate-spin text-accent" />
+                            <Sync sx={{ fontSize: 12 }} className="animate-spin text-accent" />
                           ) : (
                             <button
                               onClick={() => loadFile(item)}
                               className="opacity-0 group-hover:opacity-100 flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-semibold bg-accent/10 text-accent hover:bg-accent/20 border border-accent/20 transition-all"
                             >
-                              <Download size={9} />
+                              <FileDownload sx={{ fontSize: 9 }} />
                               Load
                             </button>
                           )}
@@ -529,7 +525,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
           {!activeSessions && (
             <div className="px-3 py-2 border-t border-border bg-amber-500/5">
               <div className="flex items-center gap-1.5 text-[11px] text-amber-400">
-                <AlertCircle size={11} />
+                <ErrorOutline sx={{ fontSize: 11 }} />
                 Open a chat to load files
               </div>
             </div>

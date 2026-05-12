@@ -1,12 +1,12 @@
 import React, { useState, useEffect } from 'react'
 import { useToastStore } from '../lib/toast'
-import { CheckCircle, XCircle, Info, AlertTriangle, X } from 'lucide-react'
+import { Cancel, CheckCircle, Close, Info, Warning } from '@mui/icons-material';
 
 const ICONS = {
-  success: <CheckCircle size={16} className="text-success flex-shrink-0" />,
-  error:   <XCircle    size={16} className="text-danger  flex-shrink-0" />,
-  info:    <Info       size={16} className="text-accent  flex-shrink-0" />,
-  warning: <AlertTriangle size={16} className="text-warning flex-shrink-0" />,
+  success: <CheckCircle sx={{ fontSize: 16 }} className="text-success flex-shrink-0" />,
+  error:   <Cancel    sx={{ fontSize: 16 }} className="text-danger  flex-shrink-0" />,
+  info:    <Info       sx={{ fontSize: 16 }} className="text-accent  flex-shrink-0" />,
+  warning: <Warning sx={{ fontSize: 16 }} className="text-warning flex-shrink-0" />,
 }
 const BORDER = {
   success: 'border-success/30',
@@ -34,7 +34,7 @@ function ToastItem({ id, type, title, message }: { id: string; type: string; tit
         {message && <div className="text-xs text-muted mt-0.5 leading-relaxed">{message}</div>}
       </div>
       <button onClick={dismiss} className="btn-icon w-5 h-5 flex-shrink-0 -mr-1 -mt-0.5">
-        <X size={12} />
+        <Close sx={{ fontSize: 12 }} />
       </button>
     </div>
   )

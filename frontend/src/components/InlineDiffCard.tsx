@@ -3,13 +3,13 @@ import { createPortal } from 'react-dom'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { useThemeStore } from '../stores/themeStore'
-import { CheckCircle, XCircle, Download, ChevronDown, ChevronUp, AlertTriangle, FileCode, RotateCcw, SkipForward, Eye } from 'lucide-react'
 import { api } from '../api/client'
 import { TestRunnerPanel } from './TestRunnerPanel'
 import { toast } from '../lib/toast'
 import type { SmartResult, QAResult } from '../types'
 import { LivePreview, isVisualFile } from './LivePreview'
 import { useAppStore } from '../stores/appStore'
+import { Cancel, CheckCircle, Description, FileDownload, KeyboardArrowDown, KeyboardArrowUp, Replay, SkipNext, Visibility, Warning } from '@mui/icons-material';
 
 interface Props {
   result: SmartResult
@@ -698,14 +698,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     <div className="border border-border rounded-xl mb-3">
       {/* ── File header ─────────────────────────────────────────────────── */}
       <div className="flex items-center gap-2.5 px-4 py-2.5 bg-surface/80 rounded-t-xl">
-        <FileCode size={14} className="text-accent flex-shrink-0" />
+        <Description sx={{ fontSize: 14 }} className="text-accent flex-shrink-0" />
         <span className="text-sm font-semibold text-ink">{filename}</span>
         <span className="text-[11px] text-muted/70 ml-1">
           {realChanges.length} change{realChanges.length !== 1 ? 's' : ''}
         </span>
         {allApplied && (
           <span className="ml-auto flex items-center gap-1.5 text-[12px] text-success font-semibold">
-            <CheckCircle size={13} /> All applied
+            <CheckCircle sx={{ fontSize: 13 }} /> All applied
           </span>
         )}
       </div>
@@ -731,7 +731,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               {/* Checkbox OR applied checkmark */}
               <div className="flex-shrink-0 w-5 flex items-center justify-center">
                 {isApplied ? (
-                  <CheckCircle size={16} className="text-success" />
+                  <CheckCircle sx={{ fontSize: 16 }} className="text-success" />
                 ) : (
                   <input
                     type="checkbox"
@@ -778,7 +778,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 {change.qa_result && <BlastRadius change={{ qa: change.qa_result }} />}
                 {change.confidence < 7 && !isBlocked && (
                   <span className="flex items-center gap-1 text-[10px] text-warning">
-                    <AlertTriangle size={10} /> Review
+                    <Warning sx={{ fontSize: 10 }} /> Review
                   </span>
                 )}
               </div>
@@ -787,7 +787,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               <div className="flex items-center gap-1.5 flex-shrink-0">
                 {isSkipped && !isApplied && (
                   <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-muted/20 text-muted/70 text-[10px] font-semibold border border-border/50">
-                    <XCircle size={9} /> Skipped
+                    <Cancel sx={{ fontSize: 9 }} /> Skipped
                   </span>
                 )}
                 {isApplied && (
@@ -797,7 +797,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors disabled:opacity-50"
                     title="Revert this change"
                   >
-                    <RotateCcw size={11} />
+                    <Replay sx={{ fontSize: 11 }} />
                     {undoing[change.id] ? 'Reverting...' : 'Undo'}
                   </button>
                 )}
@@ -807,7 +807,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
                     title={showPreview[change.id] ? 'Hide live preview' : 'Show live preview'}
                   >
-                    <Eye size={11} />
+                    <Visibility sx={{ fontSize: 11 }} />
                     {showPreview[change.id] ? 'Hide' : 'Preview'}
                   </button>
                 )}
@@ -816,7 +816,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                   className="flex items-center gap-1 px-2.5 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
                   title={isExpanded ? 'Collapse diff' : 'View diff'}
                 >
-                  {isExpanded ? <ChevronUp size={12} /> : <ChevronDown size={12} />}
+                  {isExpanded ? <KeyboardArrowUp sx={{ fontSize: 12 }} /> : <KeyboardArrowDown sx={{ fontSize: 12 }} />}
                   <span>Diff</span>
                 </button>
               </div>
@@ -870,7 +870,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors"
             title="Download file with selected changes applied"
           >
-            <Download size={12} /> Download
+            <FileDownload sx={{ fontSize: 12 }} /> Download
           </button>
 
           <div className="ml-auto flex items-center gap-2">
@@ -881,7 +881,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors"
                 title="Uncheck all pending changes"
               >
-                <XCircle size={12} /> Skip All
+                <Cancel sx={{ fontSize: 12 }} /> Skip All
               </button>
             )}
 
@@ -893,7 +893,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               className="flex items-center gap-1.5 px-4 py-1.5 bg-success/15 text-success border border-success/30 rounded-lg text-[12px] font-semibold hover:bg-success/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               title={selectedChanges.length === 0 ? 'No changes selected — check at least one above' : `Apply ${selectedChanges.length} selected change${selectedChanges.length !== 1 ? 's' : ''}`}
             >
-              <CheckCircle size={12} />
+              <CheckCircle sx={{ fontSize: 12 }} />
               {applying
                 ? 'Applying...'
                 : selectedChanges.length === 0
@@ -943,7 +943,7 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
       {/* Skipped changes notice */}
       {result.skipped_changes && result.skipped_changes.length > 0 && (
         <div className="mt-2 flex items-start gap-2 px-3 py-2 bg-surface/60 border border-border/50 rounded-lg">
-          <SkipForward size={13} className="text-muted/60 mt-0.5 flex-shrink-0" />
+          <SkipNext sx={{ fontSize: 13 }} className="text-muted/60 mt-0.5 flex-shrink-0" />
           <div className="text-[12px] text-muted/80">
             <strong className="text-ink/60">Skipped {result.skipped_changes.length} symbol{result.skipped_changes.length !== 1 ? 's' : ''}:</strong>{' '}
             {result.skipped_changes.map((s: any, i: number) => (
@@ -993,7 +993,7 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
         return (
           <div className={`mt-2 px-3 py-2 bg-warning/10 border border-warning/25 rounded-lg transition-opacity duration-300 ${allApplied ? 'hidden' : ''}`}>
             <div className="flex items-center gap-2 mb-1.5">
-              <AlertTriangle size={13} className="text-warning flex-shrink-0" />
+              <Warning sx={{ fontSize: 13 }} className="text-warning flex-shrink-0" />
               <span className="text-[12px] font-semibold text-warning">
                 {hasVerdicts
                   ? allResolved

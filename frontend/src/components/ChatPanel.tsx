@@ -9,10 +9,8 @@ import { NewFileCard } from './NewFileCard'
 import { MarkdownCode } from './CodeBlock'
 import { MermaidDiagram } from './MermaidDiagram'
 import { SessionFilesTray } from './SessionFilesTray'
-import {
-  Send, X, Plus, Paperclip, FileCode, AlertTriangle, Zap, Trash2, Brain
-} from 'lucide-react'
 import type { SessionFile, SmartResult } from '../types'
+import { Add, AttachFile, Bolt, Close, Delete, Description, Psychology, Send, Warning } from '@mui/icons-material';
 
 // ── Markdown component overrides ──────────────────────────
 const mdComponents = {
@@ -89,7 +87,7 @@ function getLanguage(filename: string): string {
 function AIAvatar() {
   return (
     <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center flex-shrink-0 shadow-md shadow-blue-500/20">
-      <Zap size={14} className="text-white" />
+      <Bolt sx={{ fontSize: 14 }} className="text-white" />
     </div>
   )
 }
@@ -213,7 +211,7 @@ function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boole
         className="flex items-center gap-2 text-xs text-violet-400 hover:text-violet-300 transition-colors"
       >
         <span className={`transform transition-transform duration-200 ${expanded ? 'rotate-90' : ''}`}>▶</span>
-        <Brain size={12} />
+        <Psychology sx={{ fontSize: 12 }} />
         {isStreaming ? (
           <span className="flex items-center gap-1.5">
             Thinking<span className="animate-pulse">…</span>
@@ -278,7 +276,7 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
     <div className="flex items-start gap-3 px-4 py-4">
       {/* Pulsing avatar while streaming */}
       <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center flex-shrink-0 shadow-md shadow-blue-500/20 animate-pulse">
-        <Zap size={14} className="text-white" />
+        <Bolt sx={{ fontSize: 14 }} className="text-white" />
       </div>
 
       <div className="flex-1 min-w-0">
@@ -367,7 +365,7 @@ function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void 
       {emojiIcon ? (
         <span className="text-[11px] leading-none">{emojiIcon}</span>
       ) : (
-        <FileCode size={11} className={color} />
+        <Description sx={{ fontSize: 11 }} className={color} />
       )}
       <span className="text-[12px] font-medium text-ink">{file.filename}</span>
       <span className="text-[10px] text-muted/70">{file.lines}L</span>
@@ -378,7 +376,7 @@ function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void 
         onClick={onRemove}
         className="ml-0.5 opacity-0 group-hover:opacity-100 transition-opacity text-muted/70 hover:text-red-400"
       >
-        <X size={10} />
+        <Close sx={{ fontSize: 10 }} />
       </button>
     </div>
   )
@@ -389,7 +387,7 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
   return (
     <div className="flex flex-col items-center justify-center h-full px-8 py-12 text-center">
       <div className="w-16 h-16 rounded-2xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center mb-5">
-        <Zap size={28} className="text-blue-400" />
+        <Bolt sx={{ fontSize: 28 }} className="text-blue-400" />
       </div>
       <h2 className="text-base font-bold text-ink mb-2">SurgicalAI</h2>
       <p className="text-sm text-muted leading-relaxed mb-6 max-w-xs">
@@ -400,7 +398,7 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
         onClick={onUpload}
         className="flex items-center gap-2 px-4 py-2.5 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded-xl text-sm font-semibold hover:bg-blue-500/30 transition-colors mb-6"
       >
-        <Paperclip size={15} /> Upload files to get started
+        <AttachFile sx={{ fontSize: 15 }} /> Upload files to get started
       </button>
 
       <div className="w-full space-y-2 text-left">
@@ -410,7 +408,7 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
           { ex: 'Upload any code file', desc: 'then ask anything — edit, explain, review' },
         ].map(({ ex, desc }) => (
           <div key={ex} className="flex items-start gap-2.5 px-3 py-2 bg-surface/50 rounded-lg border border-border/50">
-            <FileCode size={12} className="text-blue-400 mt-0.5 flex-shrink-0" />
+            <Description sx={{ fontSize: 12 }} className="text-blue-400 mt-0.5 flex-shrink-0" />
             <div>
               <div className="text-[12px] font-semibold text-ink/80">{ex}</div>
               <div className="text-[11px] text-muted/70">{desc}</div>
@@ -795,7 +793,7 @@ export function ChatPanel() {
       {isDragging && (
         <div className="absolute inset-0 z-50 bg-blue-500/10 border-2 border-dashed border-blue-400 rounded-xl flex items-center justify-center pointer-events-none">
           <div className="text-center">
-            <Paperclip size={32} className="text-blue-400 mx-auto mb-2" />
+            <AttachFile sx={{ fontSize: 32 }} className="text-blue-400 mx-auto mb-2" />
             <p className="text-blue-300 font-semibold text-sm">Drop files here</p>
             <p className="text-blue-400/60 text-xs mt-1">py, ts, js, go, rs, and more</p>
           </div>
@@ -815,7 +813,7 @@ export function ChatPanel() {
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-base/50 flex-shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <Zap size={13} className="text-blue-400 flex-shrink-0" />
+          <Bolt sx={{ fontSize: 13 }} className="text-blue-400 flex-shrink-0" />
           <span className="text-sm font-semibold text-ink">
             {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} in context` : 'SurgicalAI'}
           </span>
@@ -832,10 +830,10 @@ export function ChatPanel() {
             return m
           })()}</span>
           <button onClick={() => fileInputRef.current?.click()} className="p-1.5 rounded-lg hover:bg-overlay text-muted hover:text-ink transition-colors" title="Upload files">
-            <Paperclip size={13} />
+            <AttachFile sx={{ fontSize: 13 }} />
           </button>
           <button onClick={newChat} className="p-1.5 rounded-lg hover:bg-overlay text-muted hover:text-ink transition-colors" title="New chat (⌘N)">
-            <Plus size={14} />
+            <Add sx={{ fontSize: 14 }} />
           </button>
         </div>
       </div>
@@ -862,10 +860,10 @@ export function ChatPanel() {
             )}
             {error && (
               <div className="mx-4 my-3 flex items-start gap-2.5 px-3.5 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-sm text-red-400">
-                <AlertTriangle size={15} className="flex-shrink-0 mt-0.5" />
+                <Warning sx={{ fontSize: 15 }} className="flex-shrink-0 mt-0.5" />
                 <span>{error}</span>
                 <button onClick={() => setError(null)} className="ml-auto p-0.5 hover:text-red-300">
-                  <X size={11} />
+                  <Close sx={{ fontSize: 11 }} />
                 </button>
               </div>
             )}
@@ -983,7 +981,7 @@ export function ChatPanel() {
                 className="h-8 w-8 rounded-lg text-muted/70 hover:text-ink/80 hover:bg-overlay/60 transition-colors flex items-center justify-center"
                 title="Attach files"
               >
-                <Paperclip size={15} />
+                <AttachFile sx={{ fontSize: 15 }} />
               </button>
               <span className="text-[11px] text-faint ml-1 select-none">
                 {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} attached` : ''}
@@ -996,7 +994,7 @@ export function ChatPanel() {
                   onClick={() => { abortRef.current?.abort(); stopStream() }}
                   className="h-8 px-3 rounded-lg bg-red-500/15 text-red-400 text-xs font-semibold flex items-center gap-1.5 hover:bg-red-500/25 transition-colors"
                 >
-                  <X size={13} /> Stop
+                  <Close sx={{ fontSize: 13 }} /> Stop
                 </button>
               ) : (
                 <button
@@ -1008,7 +1006,7 @@ export function ChatPanel() {
                       : 'bg-blue-500 text-white hover:bg-blue-400 active:scale-95 shadow-sm shadow-blue-500/25'
                   }`}
                 >
-                  <Send size={14} />
+                  <Send sx={{ fontSize: 14 }} />
                 </button>
               )}
             </div>

@@ -3,7 +3,7 @@ import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { useThemeStore } from '../stores/themeStore'
-import { Copy, Check, ChevronDown, ChevronUp, Download } from 'lucide-react'
+import { Check, ContentCopy, FileDownload, KeyboardArrowDown, KeyboardArrowUp } from '@mui/icons-material';
 
 const COLLAPSE_LINES = 8
 
@@ -113,7 +113,7 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
             className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
             title="Download file"
           >
-            <Download size={12} />
+            <FileDownload sx={{ fontSize: 12 }} />
           </button>
 
           {/* Copy */}
@@ -123,9 +123,9 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
             title="Copy code"
           >
             {copied ? (
-              <><Check size={12} className="text-green-400" /><span className="text-green-400">Copied!</span></>
+              <><Check sx={{ fontSize: 12 }} className="text-green-400" /><span className="text-green-400">Copied!</span></>
             ) : (
-              <><Copy size={12} /><span>Copy</span></>
+              <><ContentCopy sx={{ fontSize: 12 }} /><span>Copy</span></>
             )}
           </button>
 
@@ -136,7 +136,7 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
               className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
               title={collapsed ? 'Expand' : 'Collapse'}
             >
-              {collapsed ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
+              {collapsed ? <KeyboardArrowDown sx={{ fontSize: 12 }} /> : <KeyboardArrowUp sx={{ fontSize: 12 }} />}
               <span>{collapsed ? `Expand ${lines.length - COLLAPSE_LINES} more` : 'Collapse'}</span>
             </button>
           )}
@@ -181,7 +181,7 @@ export function CodeBlock({ code, language = 'text', filename }: CodeBlockProps)
           onClick={() => setCollapsed(false)}
           className="w-full py-2 text-[12px] text-muted hover:text-ink hover:bg-surface/60 transition-colors border-t border-border/60 flex items-center justify-center gap-1.5"
         >
-          <ChevronDown size={13} />
+          <KeyboardArrowDown sx={{ fontSize: 13 }} />
           Show {lines.length - COLLAPSE_LINES} more lines
         </button>
       )}

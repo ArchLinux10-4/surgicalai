@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useThemeStore } from '../stores/themeStore'
-import { Copy, Check, Download } from 'lucide-react'
+import { Check, ContentCopy, FileDownload } from '@mui/icons-material';
 
 interface Props {
   chart: string
@@ -153,15 +153,15 @@ export function MermaidDiagram({ chart }: Props) {
             className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
           >
             {copied
-              ? <><Check size={12} className="text-success" /><span className="text-success">Copied</span></>
-              : <><Copy size={12} /><span>Copy source</span></>}
+              ? <><Check sx={{ fontSize: 12 }} className="text-success" /><span className="text-success">Copied</span></>
+              : <><ContentCopy sx={{ fontSize: 12 }} /><span>Copy source</span></>}
           </button>
           {ready && (
             <button
               onClick={download}
               className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
             >
-              <Download size={12} /><span>SVG</span>
+              <FileDownload sx={{ fontSize: 12 }} /><span>SVG</span>
             </button>
           )}
         </div>
