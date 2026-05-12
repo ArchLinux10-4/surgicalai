@@ -5,9 +5,9 @@ import { useThemeStore } from '../stores/themeStore'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
-import { ChevronDown, ChevronUp, Download, Plus, Copy, Check, FileCode } from 'lucide-react'
 import type { SmartResult, NewFile } from '../types'
 import { InlineDiffCard } from './InlineDiffCard'
+import { Add, Check, ContentCopy, Description, FileDownload, KeyboardArrowDown, KeyboardArrowUp } from '@mui/icons-material';
 
 const LANG_LABELS: Record<string, string> = {
   typescript: 'TypeScript', tsx: 'TSX', javascript: 'JavaScript',
@@ -115,7 +115,7 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
             <span className="w-3 h-3 rounded-full bg-yellow-500/60" />
             <span className="w-3 h-3 rounded-full bg-green-500/60" />
           </div>
-          <FileCode size={13} className="text-muted flex-shrink-0" />
+          <Description sx={{ fontSize: 13 }} className="text-muted flex-shrink-0" />
           <span className="text-[12px] font-mono text-ink truncate">{file.filename}</span>
           <span className={`flex-shrink-0 text-[10px] font-semibold px-1.5 py-0.5 rounded border ${colorClass}`}>
             {label}
@@ -128,19 +128,19 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
             onClick={handleCopy}
             className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
           >
-            {copied ? <><Check size={12} className="text-success" /><span className="text-success">Copied</span></> : <><Copy size={12} /><span>Copy</span></>}
+            {copied ? <><Check sx={{ fontSize: 12 }} className="text-success" /><span className="text-success">Copied</span></> : <><ContentCopy sx={{ fontSize: 12 }} /><span>Copy</span></>}
           </button>
           <button
             onClick={handleDownload}
             className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
           >
-            <Download size={12} /><span>Download</span>
+            <FileDownload sx={{ fontSize: 12 }} /><span>Download</span>
           </button>
           <button
             onClick={() => setCollapsed(c => !c)}
             className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
           >
-            {collapsed ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
+            {collapsed ? <KeyboardArrowDown sx={{ fontSize: 12 }} /> : <KeyboardArrowUp sx={{ fontSize: 12 }} />}
             <span>{collapsed ? `Expand` : 'Collapse'}</span>
           </button>
         </div>
@@ -176,7 +176,7 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
           onClick={() => setCollapsed(false)}
           className="w-full py-2 text-[12px] text-muted hover:text-ink hover:bg-surface/60 transition-colors border-t border-border/60 flex items-center justify-center gap-1.5"
         >
-          <ChevronDown size={13} />
+          <KeyboardArrowDown sx={{ fontSize: 13 }} />
           Show {lines.length - PREVIEW} more lines
         </button>
       )}
@@ -198,11 +198,11 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
           }`}
         >
           {saved ? (
-            <><Check size={13} /> Saved</>
+            <><Check sx={{ fontSize: 13 }} /> Saved</>
           ) : saving ? (
             <>Saving...</>
           ) : (
-            <><Plus size={13} /> Add to session</>
+            <><Add sx={{ fontSize: 13 }} /> Add to session</>
           )}
         </button>
       </div>

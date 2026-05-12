@@ -4,15 +4,11 @@ import { useAuthStore } from '../stores/authStore'
 import { api } from '../api/client'
 import { FileNode } from '../types'
 import { toast } from '../lib/toast'
-import {
-  Settings, MessageSquare, Plus, Search, Trash2, Pencil,
-  X, ChevronRight, ChevronDown, ChevronLeft, Pin, Zap,
-  Upload, FileCode, LogOut, Sun, Moon, Github,
-} from 'lucide-react'
 import { ContextPanel } from './ContextPanel'
 import { GitHubPanel } from './GitHubPanel'
 import { LinearPanel } from './LinearPanel'
 import { useThemeStore } from '../stores/themeStore'
+import { Add, Bolt, Chat, Close, DarkMode, Delete, Description, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, PushPin, Search, Settings } from '@mui/icons-material';
 
 // ── File icon helper ─────────────────────────────────────────────────────────
 const FILE_ICONS: Record<string, string> = {
@@ -54,7 +50,7 @@ function FileTreeNode({ node, depth = 0 }: { node: FileNode; depth?: number }) {
       >
         {isDir ? (
           <span className="text-faint w-3 flex-shrink-0">
-            {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+            {expanded ? <KeyboardArrowDown sx={{ fontSize: 11 }} /> : <KeyboardArrowRight sx={{ fontSize: 11 }} />}
           </span>
         ) : (
           <span className="w-3 flex-shrink-0" />
@@ -111,7 +107,7 @@ function SessionItem({ session, active, onLoad, onDelete, onRename }: {
       }`}
       onClick={() => !editing && onLoad()}
     >
-      <MessageSquare size={13} className={`flex-shrink-0 mt-0.5 ${active ? 'text-accent' : 'text-faint'}`} />
+      <Chat sx={{ fontSize: 13 }} className={`flex-shrink-0 mt-0.5 ${active ? 'text-accent' : 'text-faint'}`} />
       <div className="flex-1 min-w-0">
         {editing ? (
           <input
@@ -137,11 +133,11 @@ function SessionItem({ session, active, onLoad, onDelete, onRename }: {
           <button
             onClick={(e) => { e.stopPropagation(); setEditing(true) }}
             className="btn-icon w-6 h-6" title="Rename"
-          ><Pencil size={11} /></button>
+          ><Edit sx={{ fontSize: 11 }} /></button>
           <button
             onClick={(e) => { e.stopPropagation(); onDelete() }}
             className="btn-icon w-6 h-6 hover:text-danger" title="Delete"
-          ><Trash2 size={11} /></button>
+          ><Delete sx={{ fontSize: 11 }} /></button>
         </div>
       )}
     </div>
@@ -235,13 +231,13 @@ function SessionList() {
     <div className="flex flex-col h-full">
       <div className="p-2 border-b border-border">
         <button onClick={newSession} className="btn-primary w-full gap-2">
-          <Plus size={14} /> New Chat
+          <Add sx={{ fontSize: 14 }} /> New Chat
           <kbd className="ml-auto text-[10px] opacity-50 font-mono bg-accent-dark/30 px-1 rounded">⌘N</kbd>
         </button>
       </div>
       <div className="relative px-2 py-1.5">
         <span className="absolute left-4 top-1/2 -translate-y-1/2 text-muted-foreground">
-          <Search size={13} className="opacity-60" />
+          <Search sx={{ fontSize: 13 }} className="opacity-60" />
         </span>
         <input
           type="text"
@@ -256,7 +252,7 @@ function SessionList() {
             className="absolute right-4 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
             onClick={() => setSearchQuery('')}
             tabIndex={-1}
-          ><X size={13} /></button>
+          ><Close sx={{ fontSize: 13 }} /></button>
         )}
       </div>
       <div className="flex-1 overflow-y-auto py-1">
@@ -266,7 +262,7 @@ function SessionList() {
           </div>
         ) : filteredSessions.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-32 gap-2 text-faint">
-            <MessageSquare size={24} className="opacity-40" />
+            <Chat sx={{ fontSize: 24 }} className="opacity-40" />
             <span className="text-xs">No chats yet</span>
           </div>
         ) : (
@@ -307,8 +303,8 @@ function SessionList() {
           <div className="bg-surface border border-border rounded-2xl shadow-2xl shadow-black/40 p-6 w-full max-w-sm mx-4">
             <div className="flex items-start gap-3 mb-4">
               <div className="shrink-0 w-10 h-10 rounded-full bg-red-500/15 border border-red-500/25 flex items-center justify-center">
-                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
                 </svg>
               </div>
               <div>
@@ -391,7 +387,7 @@ function SessionFilesPanel() {
           className="flex items-center gap-1 px-2 py-1 rounded-lg bg-accent/10 text-accent text-[11px] font-semibold hover:bg-accent/20 transition-colors"
           title="Upload files"
         >
-          <Upload size={11} /> Add
+          <FileUpload sx={{ fontSize: 11 }} /> Add
         </button>
         <input
           ref={fileInputRef}
@@ -406,7 +402,7 @@ function SessionFilesPanel() {
         {sessionFiles.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full gap-3 px-4 text-center pb-8">
             <div className="w-12 h-12 rounded-2xl bg-surface flex items-center justify-center">
-              <FileCode size={22} className="text-muted/70" />
+              <Description sx={{ fontSize: 22 }} className="text-muted/70" />
             </div>
             <div>
               <p className="text-[13px] font-semibold text-muted">No files in this chat</p>
@@ -418,7 +414,7 @@ function SessionFilesPanel() {
               onClick={() => fileInputRef.current?.click()}
               className="mt-1 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent/10 text-accent text-[12px] font-semibold hover:bg-accent/20 transition-colors border border-accent/20"
             >
-              <Upload size={12} /> Upload files
+              <FileUpload sx={{ fontSize: 12 }} /> Upload files
             </button>
           </div>
         ) : (
@@ -439,7 +435,7 @@ function SessionFilesPanel() {
                   onClick={() => removeSessionFile(file.id)}
                   className="opacity-0 group-hover:opacity-100 text-faint hover:text-red-400 transition-all flex-shrink-0"
                   title="Remove from chat"
-                ><X size={13} /></button>
+                ><Close sx={{ fontSize: 13 }} /></button>
               </div>
             ))}
           </div>
@@ -518,7 +514,7 @@ export function Sidebar() {
 
         {/* Logo mark */}
         <div className="mb-2 flex items-center justify-center w-8 h-8">
-          <Zap size={16} className="text-accent" />
+          <Bolt sx={{ fontSize: 16 }} className="text-accent" />
         </div>
 
         {/* Nav icons */}
@@ -536,7 +532,7 @@ export function Sidebar() {
                   : 'text-muted hover:text-ink hover:bg-overlay'
               }`}
             >
-              <Icon size={17} strokeWidth={isActive ? 2 : 1.5} />
+              <Icon sx={{ fontSize: 17 }} />
               {badge !== null && (
                 <span className="absolute -top-0.5 -right-0.5 min-w-[14px] h-[14px] flex items-center justify-center rounded-full bg-accent text-white text-[9px] font-bold px-0.5 leading-none">
                   {badge > 99 ? '99+' : badge}
@@ -556,8 +552,8 @@ export function Sidebar() {
           className="flex items-center justify-center w-8 h-8 rounded-lg text-muted hover:text-ink hover:bg-overlay transition-all"
         >
           {theme === 'dark'
-            ? <Sun size={16} strokeWidth={1.5} />
-            : <Moon size={16} strokeWidth={1.5} />}
+            ? <LightMode sx={{ fontSize: 16 }} />
+            : <DarkMode sx={{ fontSize: 16 }} />}
         </button>
 
         {/* Settings */}
@@ -566,7 +562,7 @@ export function Sidebar() {
           title="Settings"
           className="flex items-center justify-center w-8 h-8 rounded-lg text-muted hover:text-ink hover:bg-overlay transition-all"
         >
-          <Settings size={16} strokeWidth={1.5} />
+          <Settings sx={{ fontSize: 16 }} />
         </button>
 
         {/* Avatar + user menu */}
@@ -591,7 +587,7 @@ export function Sidebar() {
                 onClick={() => { logout(); setUserMenuOpen(false) }}
                 className="w-full flex items-center gap-2 px-3 py-2 text-xs text-red-400 hover:bg-overlay transition"
               >
-                <LogOut size={13} /> Sign out
+                <Logout sx={{ fontSize: 13 }} /> Sign out
               </button>
             </div>
           )}
@@ -614,7 +610,7 @@ export function Sidebar() {
             className="flex items-center justify-center w-5 h-5 rounded text-faint hover:text-ink hover:bg-overlay transition"
             title="Collapse panel"
           >
-            <ChevronLeft size={13} />
+            <KeyboardArrowLeft sx={{ fontSize: 13 }} />
           </button>
         </div>
 

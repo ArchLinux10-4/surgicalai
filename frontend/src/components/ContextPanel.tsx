@@ -2,8 +2,8 @@ import React, { useState, useEffect } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
-import { Pin, Trash2, Save, Check, BookOpen } from 'lucide-react'
 import type { PinnedContext } from '../types'
+import { Check, Delete, MenuBook, PushPin, Save } from '@mui/icons-material';
 
 export function ContextPanel() {
   const { activeSessions, activeFile } = useAppStore()
@@ -77,13 +77,13 @@ export function ContextPanel() {
                 onClick={pinCurrentFile}
                 className="w-full flex items-center justify-center gap-2 py-1.5 rounded-lg bg-accent/10 border border-accent/30 text-accent text-xs font-semibold hover:bg-accent/20 transition-colors"
               >
-                <Pin size={11} /> Pin current file
+                <PushPin sx={{ fontSize: 11 }} /> Pin current file
               </button>
             </div>
           )}
           {pins.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-32 gap-2 px-4 text-center">
-              <Pin size={22} className="text-faint opacity-40" />
+              <PushPin sx={{ fontSize: 22 }} className="text-faint opacity-40" />
               <span className="text-xs text-faint leading-relaxed">
                 No pinned files.<br />Pin files to keep them always in context.
               </span>
@@ -91,7 +91,7 @@ export function ContextPanel() {
           ) : (
             pins.map((pin) => (
               <div key={pin.id} className="flex items-center gap-2 px-3 py-2 border-b border-border/50 group">
-                <Pin size={11} className="text-accent flex-shrink-0" />
+                <PushPin sx={{ fontSize: 11 }} className="text-accent flex-shrink-0" />
                 <div className="flex-1 min-w-0">
                   <div className="text-xs text-ink truncate">
                     {pin.label || pin.file_path.split('/').pop()}
@@ -104,7 +104,7 @@ export function ContextPanel() {
                   onClick={() => removePin(pin.id)}
                   className="btn-icon w-5 h-5 opacity-0 group-hover:opacity-100 hover:text-danger"
                 >
-                  <Trash2 size={11} />
+                  <Delete sx={{ fontSize: 11 }} />
                 </button>
               </div>
             ))
@@ -133,7 +133,7 @@ export function ContextPanel() {
                   : 'bg-accent text-base hover:bg-accent/90'
             }`}
           >
-            {saveDone ? <><Check size={12} /> Saved!</> : <><Save size={12} /> Save Memory</>}
+            {saveDone ? <><Check sx={{ fontSize: 12 }} /> Saved!</> : <><Save sx={{ fontSize: 12 }} /> Save Memory</>}
           </button>
         </div>
       )}

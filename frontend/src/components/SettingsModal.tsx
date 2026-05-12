@@ -2,22 +2,22 @@ import React, { useState, useEffect } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
-import { X, Eye, EyeOff, CheckCircle, Key, Brain, FolderOpen, Code, Cpu, Sliders, Users, Sun, Moon, Github, ExternalLink, AlertCircle, Lock } from 'lucide-react'
 import { AdminUsersPanel } from './AdminUsersPanel'
 import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
+import { CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
 type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'local' | 'users' | 'github' | 'security'
 
 const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
-  { id: 'api',       icon: <Key size={14} />,       label: 'API Keys' },
-  { id: 'models',    icon: <Brain size={14} />,      label: 'Models' },
-  { id: 'github',    icon: <Github size={14} />,     label: 'GitHub' },
-  { id: 'workspace', icon: <FolderOpen size={14} />, label: 'Workspace' },
-  { id: 'editor',    icon: <Code size={14} />,       label: 'Editor' },
-  { id: 'local',     icon: <Cpu size={14} />,        label: 'Local AI' },
-  { id: 'users',     icon: <Users size={14} />,      label: 'Users' },
-  { id: 'security',  icon: <Lock size={14} />,       label: 'Security' },
+  { id: 'api',       icon: <VpnKey sx={{ fontSize: 14 }} />,       label: 'API Keys' },
+  { id: 'models',    icon: <Psychology sx={{ fontSize: 14 }} />,      label: 'Models' },
+  { id: 'github',    icon: <GitHub sx={{ fontSize: 14 }} />,     label: 'GitHub' },
+  { id: 'workspace', icon: <FolderOpen sx={{ fontSize: 14 }} />, label: 'Workspace' },
+  { id: 'editor',    icon: <Code sx={{ fontSize: 14 }} />,       label: 'Editor' },
+  { id: 'local',     icon: <Memory sx={{ fontSize: 14 }} />,        label: 'Local AI' },
+  { id: 'users',     icon: <Group sx={{ fontSize: 14 }} />,      label: 'Users' },
+  { id: 'security',  icon: <Lock sx={{ fontSize: 14 }} />,       label: 'Security' },
 ]
 
 export function SettingsModal() {
@@ -261,7 +261,7 @@ export function SettingsModal() {
             <div className="text-base font-bold text-ink">Settings</div>
             <div className="text-xs text-muted mt-0.5">All data stored locally — nothing leaves your machine</div>
           </div>
-          <button onClick={() => setSettingsOpen(false)} className="btn-icon"><X size={18} /></button>
+          <button onClick={() => setSettingsOpen(false)} className="btn-icon"><Close sx={{ fontSize: 18 }} /></button>
         </div>
 
         <div className="flex flex-1 min-h-0 overflow-hidden">
@@ -311,7 +311,7 @@ export function SettingsModal() {
                         onClick={() => setShowKey(!showKey)}
                         className="absolute right-3 top-1/2 -translate-y-1/2 text-faint hover:text-muted"
                       >
-                        {showKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                        {showKey ? <VisibilityOff sx={{ fontSize: 14 }} /> : <Visibility sx={{ fontSize: 14 }} />}
                       </button>
                     </div>
                     <button
@@ -324,7 +324,7 @@ export function SettingsModal() {
                   </div>
                   {settings?.openai_api_key_set && keyStatus === 'idle' && (
                     <div className="flex items-center gap-1.5 mt-2 text-success text-xs">
-                      <CheckCircle size={12} /> API key configured
+                      <CheckCircle sx={{ fontSize: 12 }} /> API key configured
                     </div>
                   )}
                   {keyStatus === 'ok' && <div className="text-success text-xs mt-2">{keyMessage}</div>}
@@ -362,7 +362,7 @@ export function SettingsModal() {
                           onClick={() => setShowAnthropicKey(!showAnthropicKey)}
                           className="absolute right-3 top-1/2 -translate-y-1/2 text-faint hover:text-muted"
                         >
-                          {showAnthropicKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                          {showAnthropicKey ? <VisibilityOff sx={{ fontSize: 14 }} /> : <Visibility sx={{ fontSize: 14 }} />}
                         </button>
                       </div>
                       <button
@@ -375,7 +375,7 @@ export function SettingsModal() {
                     </div>
                     {settings?.anthropic_api_key_set && anthropicStatus === 'idle' && (
                       <div className="flex items-center gap-1.5 mt-2 text-success text-xs">
-                        <CheckCircle size={12} /> Claude API key configured
+                        <CheckCircle sx={{ fontSize: 12 }} /> Claude API key configured
                       </div>
                     )}
                     {anthropicStatus === 'ok' && <div className="text-success text-xs mt-2">{anthropicMessage}</div>}
@@ -415,7 +415,7 @@ export function SettingsModal() {
                           onClick={() => setShowGeminiKey(!showGeminiKey)}
                           className="absolute right-3 top-1/2 -translate-y-1/2 text-faint hover:text-muted"
                         >
-                          {showGeminiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                          {showGeminiKey ? <VisibilityOff sx={{ fontSize: 14 }} /> : <Visibility sx={{ fontSize: 14 }} />}
                         </button>
                       </div>
                       <button
@@ -428,7 +428,7 @@ export function SettingsModal() {
                     </div>
                     {geminiConnected && geminiStatus === 'idle' && (
                       <div className="flex items-center gap-1.5 mt-2 text-success text-xs">
-                        <CheckCircle size={12} /> Gemini API key configured
+                        <CheckCircle sx={{ fontSize: 12 }} /> Gemini API key configured
                       </div>
                     )}
                     {geminiStatus === 'ok' && <div className="text-success text-xs mt-2">{geminiMessage}</div>}
@@ -506,7 +506,7 @@ export function SettingsModal() {
                           : 'border-border bg-surface text-muted hover:text-ink'
                       }`}
                     >
-                      <Moon size={14} /> Dark
+                      <DarkMode sx={{ fontSize: 14 }} /> Dark
                     </button>
                     <button
                       onClick={() => setTheme('light')}
@@ -516,7 +516,7 @@ export function SettingsModal() {
                           : 'border-border bg-surface text-muted hover:text-ink'
                       }`}
                     >
-                      <Sun size={14} /> Light
+                      <LightMode sx={{ fontSize: 14 }} /> Light
                     </button>
                   </div>
                 </div>
@@ -725,7 +725,7 @@ function SecurityPanel(props: SecurityPanelProps) {
             autoComplete="current-password"
           />
           <button type="button" onClick={() => setShowPwCurrent(v => !v)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink">
-            {showPwCurrent ? <EyeOff size={14} /> : <Eye size={14} />}
+            {showPwCurrent ? <VisibilityOff sx={{ fontSize: 14 }} /> : <Visibility sx={{ fontSize: 14 }} />}
           </button>
         </div>
       </div>
@@ -743,7 +743,7 @@ function SecurityPanel(props: SecurityPanelProps) {
             autoComplete="new-password"
           />
           <button type="button" onClick={() => setShowPwNew(v => !v)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink">
-            {showPwNew ? <EyeOff size={14} /> : <Eye size={14} />}
+            {showPwNew ? <VisibilityOff sx={{ fontSize: 14 }} /> : <Visibility sx={{ fontSize: 14 }} />}
           </button>
         </div>
         {pwNew && (
@@ -775,7 +775,7 @@ function SecurityPanel(props: SecurityPanelProps) {
             onKeyDown={(e) => e.key === 'Enter' && onChangePassword()}
           />
           <button type="button" onClick={() => setShowPwConfirm(v => !v)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted hover:text-ink">
-            {showPwConfirm ? <EyeOff size={14} /> : <Eye size={14} />}
+            {showPwConfirm ? <VisibilityOff sx={{ fontSize: 14 }} /> : <Visibility sx={{ fontSize: 14 }} />}
           </button>
         </div>
         {pwConfirm && pwNew && (
@@ -788,7 +788,7 @@ function SecurityPanel(props: SecurityPanelProps) {
       {/* Result banner */}
       {pwResult && (
         <div className={`flex items-start gap-2 px-3 py-2.5 rounded-lg text-xs ${pwResultCls}`}>
-          {pwResult.ok ? <CheckCircle size={13} className="mt-px shrink-0" /> : <AlertCircle size={13} className="mt-px shrink-0" />}
+          {pwResult.ok ? <CheckCircle sx={{ fontSize: 13 }} className="mt-px shrink-0" /> : <ErrorOutline sx={{ fontSize: 13 }} className="mt-px shrink-0" />}
           {pwResult.msg}
         </div>
       )}

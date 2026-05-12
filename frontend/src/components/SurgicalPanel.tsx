@@ -2,9 +2,9 @@ import React, { useState } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { SurgicalChange, ImpactAnalysis } from '../types'
-import { CheckCircle, XCircle, AlertTriangle, ChevronDown, ChevronRight, Zap } from 'lucide-react'
 import { toast } from '../lib/toast'
 import { DiffView } from './DiffView'
+import { Bolt, Cancel, CheckCircle, KeyboardArrowDown, KeyboardArrowRight, Warning } from '@mui/icons-material';
 
 const C = {
   bg: 'rgb(var(--c-base))', aiBg: 'rgb(var(--c-surface))', border: 'rgb(var(--c-border))',
@@ -88,7 +88,7 @@ function ChangeCard({ change, onApply, onReject, applied }: {
         onClick={() => setExpanded(!expanded)}
         style={{ padding: '12px', cursor: 'pointer', display: 'flex', alignItems: 'flex-start', gap: '10px' }}
       >
-        {expanded ? <ChevronDown size={16} color={C.muted} style={{ marginTop: '2px', flexShrink: 0 }} /> : <ChevronRight size={16} color={C.muted} style={{ marginTop: '2px', flexShrink: 0 }} />}
+        {expanded ? <KeyboardArrowDown sx={{ fontSize: 16 }} color={C.muted} style={{ marginTop: '2px', flexShrink: 0 }} /> : <KeyboardArrowRight sx={{ fontSize: 16 }} color={C.muted} style={{ marginTop: '2px', flexShrink: 0 }} />}
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '4px', flexWrap: 'wrap' }}>
             <span style={{ fontSize: '13px', fontWeight: 600, color: C.text, fontFamily: 'monospace' }}>
@@ -153,7 +153,7 @@ export function SurgicalPanel() {
   if (!surgicalAnalysis) {
     return (
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', color: C.muted, padding: '40px' }}>
-        <Zap size={32} color={C.border} style={{ marginBottom: '12px' }} />
+        <Bolt sx={{ fontSize: 32 }} color={C.border} style={{ marginBottom: '12px' }} />
         <div style={{ fontSize: '14px', fontWeight: 600, color: C.text, marginBottom: '8px' }}>No surgical analysis yet</div>
         <div style={{ fontSize: '13px', textAlign: 'center', lineHeight: '1.6' }}>
           Switch to <strong style={{ color: C.accent }}>✂️ Surgical</strong> mode in the chat,<br />
@@ -244,7 +244,7 @@ export function SurgicalPanel() {
       {/* Plan summary */}
       <div style={{ background: C.aiBg, border: `1px solid ${C.border}`, borderRadius: '8px', padding: '14px', marginBottom: '16px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
-          <Zap size={14} color={C.accent} />
+          <Bolt sx={{ fontSize: 14 }} color={C.accent} />
           <span style={{ fontSize: '13px', fontWeight: 700, color: C.text }}>Architect Plan</span>
           <span style={{ fontSize: '11px', color: C.muted, background: C.border, padding: '1px 6px', borderRadius: '4px' }}>
             {changes.length} changes
@@ -276,7 +276,7 @@ export function SurgicalPanel() {
               display: 'flex', alignItems: 'center', gap: '6px'
             }}
           >
-            <Zap size={13} /> Apply All {pendingChanges.length} Changes
+            <Bolt sx={{ fontSize: 13 }} /> Apply All {pendingChanges.length} Changes
           </button>
         )}
       </div>

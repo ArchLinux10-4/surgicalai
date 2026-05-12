@@ -1,7 +1,7 @@
 import React, { useState } from 'react'
-import { RefreshCw, Maximize2, Minimize2 } from 'lucide-react'
 import { SandpackProvider, SandpackPreview } from '@codesandbox/sandpack-react'
 import { useThemeStore } from '../stores/themeStore'
+import { Fullscreen, FullscreenExit, Refresh } from '@mui/icons-material';
 
 /* ─── Public API ───────────────────────────────────────────────── */
 export function isVisualFile(filename: string): boolean {
@@ -94,14 +94,14 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
           className="p-1 rounded hover:bg-hover text-muted hover:text-fg"
           title="Reload"
         >
-          <RefreshCw size={11} />
+          <Refresh sx={{ fontSize: 11 }} />
         </button>
         <button
           onClick={() => setExpanded((e) => !e)}
           className="p-1 rounded hover:bg-hover text-muted hover:text-fg"
           title={expanded ? 'Collapse' : 'Expand'}
         >
-          {expanded ? <Minimize2 size={11} /> : <Maximize2 size={11} />}
+          {expanded ? <FullscreenExit sx={{ fontSize: 11 }} /> : <Fullscreen sx={{ fontSize: 11 }} />}
         </button>
       </div>
     </div>

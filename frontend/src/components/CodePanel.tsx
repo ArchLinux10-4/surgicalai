@@ -5,10 +5,7 @@ import { toast } from '../lib/toast'
 import { SurgicalPanel } from './SurgicalPanel'
 import { DiffView } from './DiffView'
 import Editor from '@monaco-editor/react'
-import {
-  Save, GitBranch, Scissors, RefreshCw, Upload, FolderOpen,
-  ChevronDown, Check, History,
-} from 'lucide-react'
+import { AccountTree, Check, ContentCut, FileUpload, FolderOpen, History, KeyboardArrowDown, Refresh, Save } from '@mui/icons-material';
 
 // ── File Upload Drop Zone ───────────────────────────
 function useFileDrop(onFile: (name: string, content: string, language: string) => void) {
@@ -83,7 +80,7 @@ function OpenFileButton({ onFile }: { onFile: (name: string, content: string, la
         className="btn-ghost gap-1.5 text-[12px]"
         title="Open local file"
       >
-        <Upload size={13} /> Upload File
+        <FileUpload sx={{ fontSize: 13 }} /> Upload File
       </button>
     </>
   )
@@ -122,8 +119,8 @@ function NoFileState({ onFile }: { onFile: (name: string, content: string, lang:
         dragOver ? 'border-accent bg-accent/10' : 'border-border'
       }`}>
         {dragOver
-          ? <Upload size={32} className="text-accent" />
-          : <FolderOpen size={32} className="text-faint" />
+          ? <FileUpload sx={{ fontSize: 32 }} className="text-accent" />
+          : <FolderOpen sx={{ fontSize: 32 }} className="text-faint" />
         }
       </div>
       <div className="text-center">
@@ -138,7 +135,7 @@ function NoFileState({ onFile }: { onFile: (name: string, content: string, lang:
         onClick={() => inputRef.current?.click()}
         className="btn-md bg-overlay border border-border text-ink hover:bg-surface gap-2"
       >
-        <Upload size={15} /> Open Local File
+        <FileUpload sx={{ fontSize: 15 }} /> Open Local File
       </button>
       <p className="text-[11px] text-faint">All edits stay local — nothing leaves your machine</p>
     </div>
@@ -236,7 +233,7 @@ export function CodePanel() {
           <OpenFileButton onFile={handleLocalFile} />
           {isServerFile && (
             <button onClick={handleReload} className="btn-icon" title="Reload from disk">
-              <RefreshCw size={13} />
+              <Refresh sx={{ fontSize: 13 }} />
             </button>
           )}
           <button
@@ -245,7 +242,7 @@ export function CodePanel() {
               saved ? 'bg-success/10 text-success border border-success/30' : 'bg-accent text-base'
             }`}
           >
-            {saved ? <><Check size={12} /> Saved</> : <><Save size={12} /> {saving ? '…' : 'Save'}</>}
+            {saved ? <><Check sx={{ fontSize: 12 }} /> Saved</> : <><Save sx={{ fontSize: 12 }} /> {saving ? '…' : 'Save'}</>}
           </button>
         </div>
       </div>
@@ -296,7 +293,7 @@ export function CodePanel() {
       {dragOver && (
         <div className="absolute inset-0 bg-accent/10 flex items-center justify-center pointer-events-none z-10">
           <div className="bg-surface border-2 border-accent border-dashed rounded-2xl px-12 py-8 text-center">
-            <Upload size={36} className="text-accent mx-auto mb-3" />
+            <FileUpload sx={{ fontSize: 36 }} className="text-accent mx-auto mb-3" />
             <div className="text-lg font-bold text-ink">Drop to open file</div>
             <div className="text-sm text-muted mt-1">Opens in editor (read-only from disk)</div>
           </div>
@@ -340,7 +337,7 @@ function GitPanel() {
   if (loading) return <div className="flex items-center justify-center h-32 text-faint text-sm">Loading git status…</div>
   if (!status?.is_repo) return (
     <div className="flex flex-col items-center justify-center h-32 text-faint text-sm gap-2">
-      <GitBranch size={24} className="opacity-40" />
+      <AccountTree sx={{ fontSize: 24 }} className="opacity-40" />
       {error ? `Error: ${error}` : 'Not a git repository'}
     </div>
   )
@@ -348,9 +345,9 @@ function GitPanel() {
   return (
     <div className="p-4 h-full overflow-y-auto text-sm text-ink">
       <div className="flex items-center gap-2 mb-4">
-        <GitBranch size={14} className="text-success" />
+        <AccountTree sx={{ fontSize: 14 }} className="text-success" />
         <strong className="text-ink">{status.branch}</strong>
-        <button onClick={loadGit} className="btn-icon ml-auto"><RefreshCw size={13} /></button>
+        <button onClick={loadGit} className="btn-icon ml-auto"><Refresh sx={{ fontSize: 13 }} /></button>
       </div>
 
       {(status.staged.length > 0 || status.unstaged.length > 0 || status.untracked.length > 0) && (
