@@ -205,6 +205,7 @@ def apply_change(file_content: str, change) -> str:
     2. Operations path (SEARCH/REPLACE):
        Used when change.operations is non-empty and the sentinel pattern is NOT detected.
        Iterates change.operations and performs exact text find-and-replace.
+       Raises ValueError if NO operations matched — prevents silent no-op returns.
 
     3. Fallback:
        If neither path produces a change, returns file_content unchanged.
@@ -279,6 +280,7 @@ def apply_change(file_content: str, change) -> str:
     if operations:
         result = file_content
         any_applied = False
+        failed_finds = []
 
         for op in operations:
             find_text = op.get("find", "") if isinstance(op, dict) else getattr(op, "find", "")
@@ -288,10 +290,25 @@ def apply_change(file_content: str, change) -> str:
             if find_text in result:
                 result = result.replace(find_text, replace_text, 1)
                 any_applied = True
+            else:
+                # Track which find strings failed for a useful error message
+                failed_finds.append(find_text[:120].strip())
 
         if any_applied:
             change.applied = True
             return result
+
+        # No operations matched at all — raise so the pipeline knows this failed
+        # and can report a real error instead of silently returning no-op output.
+        previews = "; ".join(f"`{f[:60]}...`" if len(f) > 60 else f"`{f}`" for f in failed_finds[:3])
+        raise ValueError(
+            f"SEARCH/REPLACE failed: none of the {len(operations)} operation(s) matched the file. "
+            f"The find strings did not appear verbatim in the current file content. "
+            f"Unmatched find strings: {previews}. "
+            f"This usually means the file changed between when the focused window was extracted "
+            f"and when the edit was applied, or there is a whitespace/encoding mismatch. "
+            f"Re-read the current file and retry with exact text from it."
+        )
 
     # ------------------------------------------------------------------
     # Path 3: Direct new_code replacement using original_code as anchor
