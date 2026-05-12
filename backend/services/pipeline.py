@@ -1107,10 +1107,22 @@ def run_surgeon(
                 + "\n".join(_qa_lines)
             )
 
+    # For DELETE operations, new_logic is typically empty — make the instruction explicit
+    # so the Surgeon doesn't misread "nothing to add" as "already correct".
+    _ct_val = target.change_type.value if hasattr(target, "change_type") and target.change_type else "modify"
+    if _ct_val == "delete":
+        _new_logic_display = (
+            "[DELETE OPERATION — remove the TARGET CODE lines shown below entirely from the file. "
+            "Your SEARCH block must contain those exact lines; your REPLACE block must be completely empty. "
+            "This is NOT 'already correct' — the TARGET CODE must be deleted.]"
+        )
+    else:
+        _new_logic_display = target.new_logic
+
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
-New logic required: {target.new_logic}{_import_hint}{_file_header}{_semantic_section}{_linter_block}{_extra_ctx_block}{_qa_feedback_block}
+New logic required: {_new_logic_display}{_import_hint}{_file_header}{_semantic_section}{_linter_block}{_extra_ctx_block}{_qa_feedback_block}
 
 CONTEXT BEFORE (read-only reference, do NOT include in operations):
 {before_context}
