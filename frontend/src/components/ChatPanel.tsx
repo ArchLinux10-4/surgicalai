@@ -7,7 +7,6 @@ import { toast } from '../lib/toast'
 import { InlineDiffCard } from './InlineDiffCard'
 import { NewFileCard } from './NewFileCard'
 import { MarkdownCode } from './CodeBlock'
-import { MermaidDiagram } from './MermaidDiagram'
 import { SessionFilesTray } from './SessionFilesTray'
 import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
@@ -16,9 +15,6 @@ import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Cl
 const mdComponents = {
   code: (({ className, children, ...props }: any) => {
     const lang = /language-(\w+)/.exec(className || '')?.[1] || ''
-    if (lang === 'mermaid') {
-      return <MermaidDiagram chart={String(children).replace(/\n$/, '')} />
-    }
     return <MarkdownCode className={className} {...props}>{children}</MarkdownCode>
   }) as any,
   // Beautiful prose overrides
@@ -937,7 +933,7 @@ export function ChatPanel() {
               { Icon: Security, label: 'Error handling', prompt: 'Add comprehensive error handling. Use specific exception types and handle edge cases.' },
               { Icon: Biotech, label: 'Write tests', prompt: 'Write unit tests for this code. Cover happy path, edge cases, and error cases.' },
               { Icon: AutoFixHigh, label: 'Refactor', prompt: 'Refactor this code for readability and maintainability. Improve naming and reduce complexity.' },
-              { Icon: AccountTree, label: 'Project Structure', prompt: 'Analyze all the uploaded files and generate a visual project structure diagram. Show files and modules as nodes, draw arrows for imports and key dependencies, and label important data flows or relationships. Output the diagram inside a ```mermaid code block using flowchart TD syntax.' },
+              { Icon: AccountTree, label: 'Project Structure', prompt: 'Analyze the uploaded files and produce a clean markdown outline of the project architecture. Use 3–4 top-level sections (e.g. Frontend, Backend, Services, Data). Under each section list the key modules/files with a one-line description. Keep it under 20 lines total. Use plain markdown — no diagrams, no code blocks.' },
             ].map(({ Icon, label, prompt }) => (
               <button
                 key={label}
