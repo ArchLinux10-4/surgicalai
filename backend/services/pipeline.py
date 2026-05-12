@@ -4964,6 +4964,7 @@ USER REQUEST:
                 import_changes=target.get("import_changes", []),
                 context_needs=target.get("context_needs", []),
                 surgeon_context=target.get("surgeon_context", []),
+                target_line=target.get("target_line"),  # v3.11.2: pass through for deterministic delete
             )
 
             # ── Oversized symbol guardrail ──
