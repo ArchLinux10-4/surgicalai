@@ -939,6 +939,7 @@ export function ChatPanel() {
               { label: '🛡 Error handling', prompt: 'Add comprehensive error handling. Use specific exception types and handle edge cases.' },
               { label: '🧪 Write tests', prompt: 'Write unit tests for this code. Cover happy path, edge cases, and error cases.' },
               { label: '♻️ Refactor', prompt: 'Refactor this code for readability and maintainability. Improve naming and reduce complexity.' },
+              { label: '🗺️ Project Structure', prompt: 'Analyze all the uploaded files and generate a visual project structure diagram. Show files and modules as nodes, draw arrows for imports and key dependencies, and label important data flows or relationships. Output the diagram inside a ```mermaid code block using flowchart TD syntax.' },
             ].map(({ label, prompt }) => (
               <button
                 key={label}
