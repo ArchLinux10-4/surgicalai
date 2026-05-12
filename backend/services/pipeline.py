@@ -3752,14 +3752,28 @@ async def _run_claude_direct_rewrite(
         f"Rewrite the file. Output the COMPLETE new file via submit_file_rewrite."
     )
 
-    _dr_resp = _da_client.messages.create(
-        model=model,
-        max_tokens=32000,
-        system=_dr_system,
-        messages=[{"role": "user", "content": _dr_user}],
-        tools=_dr_tools,
-        tool_choice={"type": "tool", "name": "submit_file_rewrite"},
-    )
+    import time as _time_dr
+    _dr_max_attempts = 3
+    _dr_delay = 10  # seconds between 529 retries
+    for _dr_attempt in range(_dr_max_attempts):
+        try:
+            _dr_resp = _da_client.messages.create(
+                model=model,
+                max_tokens=32000,
+                system=_dr_system,
+                messages=[{"role": "user", "content": _dr_user}],
+                tools=_dr_tools,
+                tool_choice={"type": "tool", "name": "submit_file_rewrite"},
+            )
+            break  # success
+        except Exception as _dr_e:
+            _dr_msg = str(_dr_e)
+            if ("529" in _dr_msg or "overloaded" in _dr_msg.lower()) and _dr_attempt < _dr_max_attempts - 1:
+                print(f"[DIRECT_REWRITE] 529 overloaded (attempt {_dr_attempt+1}/{_dr_max_attempts}), retrying in {_dr_delay}s...")
+                _time_dr.sleep(_dr_delay)
+                _dr_delay = min(_dr_delay * 2, 60)
+                continue
+            raise  # non-529 or final attempt
 
     for _blk in _dr_resp.content:
         if getattr(_blk, "type", None) == "tool_use" and getattr(_blk, "name", None) == "submit_file_rewrite":
@@ -5088,6 +5102,7 @@ USER REQUEST:
             #   - "redesign / restyle / rewrite" descriptions skip narrowing
             #     entirely: those changes are component-wide by definition.
             symbol_size = symbol.end_line - symbol.start_line + 1
+            _original_symbol_size = symbol_size  # v3.12: save before any narrowing
             MIN_NARROW_SCORE = 10  # one name-match (+10) or two code-matches (+5+5)
             _REDESIGN_KEYWORDS = ("redesign", "restyle", "rewrite", "modernize",
                                   "overhaul", "revamp", "refactor",
@@ -5180,8 +5195,9 @@ USER REQUEST:
             # rewrites that span 800+ lines across 4+ non-contiguous blocks.
             _surg_model_route = get_setting("surgeon_model", "gpt-4.1")
             _symbol_size_route = symbol.end_line - symbol.start_line + 1
+            # v3.12: use original (pre-narrowing) size — narrowing must not defeat routing
             _use_direct_rewrite = (
-                (_is_redesign or _symbol_size_route > 300)
+                (_is_redesign or _original_symbol_size > 250)
                 and _is_claude_model(_surg_model_route)
             )
 
