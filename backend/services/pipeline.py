@@ -1109,34 +1109,58 @@ def run_surgeon(
 
     # For DELETE operations, new_logic is typically empty — make the instruction explicit
     # so the Surgeon doesn't misread "nothing to add" as "already correct".
-    # Branch on whether `symbol` is a real AST symbol vs. a virtual context window
-    # (`_focused_L*`, `_text_region_L*`, or `*_window`) — for windows, deleting the
-    # entire TARGET CODE would wipe out imports/unrelated code, so the Surgeon needs
-    # to be told to delete ONLY the specific element described in new_logic.
     _ct_val = target.change_type.value if hasattr(target, "change_type") and target.change_type else "modify"
-    if _ct_val == "delete":
-        _is_focus_window = (
+
+    # ── DETERMINISTIC DELETE for focused-window targets ──────────────────────────
+    # When the Architect targeted a specific line inside a large context window
+    # (symbol.name starts with _focused_L / _text_region_L / ends with _window),
+    # the Surgeon cannot reliably identify which lines to delete — the window is too
+    # large and the task description too vague.  Instead we extract the exact
+    # declaration boundaries ourselves using brace-depth scanning and short-circuit
+    # the LLM call entirely.  This is deterministic, zero-latency, and zero-hallucination.
+    _is_focus_window = bool(
+        symbol.name and (
             symbol.name.startswith("_focused_L")
             or symbol.name.startswith("_text_region_L")
             or symbol.name.endswith("_window")
         )
-        if _is_focus_window:
-            _orig_logic = (target.new_logic or "").strip() or target.description or ""
-            _new_logic_display = (
-                f"{_orig_logic}\n\n"
-                "[PARTIAL DELETE WITHIN A CONTEXT WINDOW — the TARGET CODE below is a "
-                "reference window, NOT a deletion target. Emit ONE SEARCH/REPLACE block "
-                "where SEARCH contains ONLY the specific declaration/block described above "
-                "(typically 1–10 lines copied verbatim from the window) and REPLACE is empty. "
-                "Do NOT put the entire window in SEARCH — you would erase imports and unrelated code. "
-                "This is NOT 'already correct'; you must emit a non-empty SEARCH block."
-            )
-        else:
-            _new_logic_display = (
-                "[DELETE OPERATION — remove the TARGET CODE lines shown below entirely from the file. "
-                "Your SEARCH block must contain those exact lines; your REPLACE block must be completely empty. "
-                "This is NOT 'already correct' — the TARGET CODE must be deleted.]"
-            )
+    )
+    if _ct_val == "delete" and _is_focus_window and target.target_line and file_content:
+        _fc_lines = file_content.splitlines()
+        _tl0 = target.target_line - 1                    # 0-indexed
+        if 0 <= _tl0 < len(_fc_lines):
+            # Walk forward through the declaration using simple brace-depth counting.
+            # Works for: object literals, function bodies, class declarations.
+            # Single-line declarations (depth stays 0) are handled as a 1-line slice.
+            _depth = sum(1 if c == "{" else -1 if c == "}" else 0 for c in _fc_lines[_tl0])
+            _end0 = _tl0
+            if _depth > 0:
+                while _end0 + 1 < len(_fc_lines) and _depth > 0:
+                    _end0 += 1
+                    for c in _fc_lines[_end0]:
+                        if c == "{":
+                            _depth += 1
+                        elif c == "}":
+                            _depth -= 1
+            # Absorb one trailing blank line so we don't leave a double-blank gap
+            if _end0 + 1 < len(_fc_lines) and not _fc_lines[_end0 + 1].strip():
+                _end0 += 1
+            _find_text = "\n".join(_fc_lines[_tl0 : _end0 + 1])
+            if _find_text and _find_text in symbol.code:
+                import re as _re_det
+                _new_sym = symbol.code.replace(_find_text, "", 1)
+                # Collapse any triple-blank runs left behind
+                _new_sym = _re_det.sub(r"\n{3,}", "\n\n", _new_sym)
+                _det_ops = [{"find": _find_text, "replace": ""}]
+                print(f"[SURGEON] Deterministic delete: removed L{target.target_line}–{_end0 + 1} ({_end0 - _tl0 + 1} lines)")
+                return _new_sym, 9, [f"Deterministic delete at L{target.target_line}"], [], _det_ops
+
+    if _ct_val == "delete":
+        _new_logic_display = (
+            "[DELETE OPERATION — remove the TARGET CODE lines shown below entirely from the file. "
+            "Your SEARCH block must contain those exact lines; your REPLACE block must be completely empty. "
+            "This is NOT 'already correct' — the TARGET CODE must be deleted.]"
+        )
     else:
         _new_logic_display = target.new_logic
 
