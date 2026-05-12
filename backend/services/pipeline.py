@@ -5503,25 +5503,99 @@ USER REQUEST:
                         if _lfind and _lfind in _full_after_lint:
                             _full_after_lint = _full_after_lint.replace(_lfind, _lrepl, 1)
                     _lint_new_count = _count_lint(_full_after_lint, matched_name)
-                    if _lint_new_count > _lint_orig_count:
+                    if _lint_new_count > 0:
+                        # Absolute check: ANY TS errors in output → attempt Claude auto-fix first
                         _linter_introduced_errors = _validate_lint(_full_after_lint, matched_name)
-                        yield sse({"type": "progress", "content": f"🔴 {_lint_tool}: {_linter_introduced_errors[0]['message']} (line {_linter_introduced_errors[0]['line']})"})
-                        if not isinstance(_qa_result.get("risk_verdicts"), list):
-                            _qa_result["risk_verdicts"] = []
-                        for _lerr in _linter_introduced_errors:
-                            _qa_result["risk_verdicts"].append({
-                                "risk": _lerr["message"],
-                                "status": "blocked",
-                                "reason": f"{_lint_tool} error — {_lerr['detail']}",
-                            })
-                        _qa_result["verdict"] = "blocked"
-                        _qa_result["summary"] = f"{_lint_tool} error — {_linter_introduced_errors[0]['message']}"
-                        if (_qa_result.get("qa_score") or 10) > 3:
-                            _qa_result["qa_score"] = 3
-                    elif _lint_new_count == 0 and _lint_orig_count == 0:
+                        yield sse({"type": "progress", "content": f"🔧 {_lint_tool}: {_lint_new_count} error(s) — asking Claude to auto-fix..."})
+                        # ── Lint self-heal: send errors back to Claude ────────
+                        _lint_fixed = False
+                        try:
+                            _lint_fix_client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
+                            _lint_surg_model = get_setting("surgeon_model", "claude-sonnet-4-5")
+                            if not _is_claude_model(_lint_surg_model):
+                                _lint_surg_model = "claude-sonnet-4-5"
+                            _lint_err_lines = "\n".join(
+                                f"  {e.get('file',matched_name)}({e['line']},{e.get('col',1)}): error {e.get('code','TS0000')}: {e['message']}"
+                                for e in _linter_introduced_errors
+                            )
+                            _lint_fix_resp = await _lint_fix_client.messages.create(
+                                model=_lint_surg_model,
+                                max_tokens=8192,
+                                tools=[{
+                                    "name": "fix_lint_errors",
+                                    "description": "Return SEARCH/REPLACE pairs to eliminate TypeScript lint errors. Each find must match the file exactly.",
+                                    "input_schema": {
+                                        "type": "object",
+                                        "properties": {
+                                            "fixes": {
+                                                "type": "array",
+                                                "items": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "find": {"type": "string", "description": "Exact text to remove or replace"},
+                                                        "replace": {"type": "string", "description": "Replacement text (empty string to delete the line)"}
+                                                    },
+                                                    "required": ["find", "replace"]
+                                                }
+                                            }
+                                        },
+                                        "required": ["fixes"]
+                                    }
+                                }],
+                                tool_choice={"type": "tool", "name": "fix_lint_errors"},
+                                messages=[{
+                                    "role": "user",
+                                    "content": (
+                                        f"You are a TypeScript lint fixer. Fix EVERY listed error in `{matched_name}`.\n"
+                                        f"Rules:\n"
+                                        f"- TS6133 (declared but never read): delete the ENTIRE line — the full import statement or the full const/let declaration block.\n"
+                                        f"- TS2305 / TS2307 (module not found): fix the import path or remove if unused.\n"
+                                        f"- TS2304 (cannot find name): add the correct import or remove the reference if unused.\n"
+                                        f"- Do NOT comment out lines. Do NOT change logic, JSX, hooks, types, or business rules.\n"
+                                        f"- Your `find` strings must match the file EXACTLY (including whitespace/indentation).\n"
+                                        f"- Fix ALL {len(_linter_introduced_errors)} errors listed — return one fix per error.\n\n"
+                                        f"Errors to fix:\n{_lint_err_lines}\n\n"
+                                        f"Full file content:\n```typescript\n{_full_after_lint}\n```"
+                                    )
+                                }]
+                            )
+                            # Apply fixes from tool_use response
+                            _lint_patched = _full_after_lint
+                            for _lblock in _lint_fix_resp.content:
+                                if hasattr(_lblock, "type") and _lblock.type == "tool_use":
+                                    for _lfix in (_lblock.input or {}).get("fixes", []):
+                                        _lf = _lfix.get("find", "")
+                                        _lr = _lfix.get("replace", "")
+                                        if _lf and _lf in _lint_patched:
+                                            _lint_patched = _lint_patched.replace(_lf, _lr, 1)
+                            # Re-run linter on patched content
+                            _lint_retry_count = _count_lint(_lint_patched, matched_name)
+                            if _lint_retry_count == 0:
+                                _full_after_lint = _lint_patched  # propagate fix to test runner
+                                _linter_introduced_errors = []
+                                _lint_fixed = True
+                                yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean (auto-fixed {_lint_new_count} error(s))"})
+                            else:
+                                yield sse({"type": "progress", "content": f"⚠️ {_lint_tool}: {_lint_retry_count} error(s) remain after auto-fix attempt"})
+                        except Exception as _lint_fix_exc:
+                            yield sse({"type": "progress", "content": f"⚠️ Lint auto-fix exception: {_lint_fix_exc}"})
+                        # Hard-fail if errors remain after fix attempt
+                        if not _lint_fixed:
+                            yield sse({"type": "progress", "content": f"🔴 {_lint_tool}: {_linter_introduced_errors[0]['message']} (line {_linter_introduced_errors[0]['line']})"})
+                            if not isinstance(_qa_result.get("risk_verdicts"), list):
+                                _qa_result["risk_verdicts"] = []
+                            for _lerr in _linter_introduced_errors:
+                                _qa_result["risk_verdicts"].append({
+                                    "risk": _lerr["message"],
+                                    "status": "blocked",
+                                    "reason": f"{_lint_tool} error — {_lerr['detail']}",
+                                })
+                            _qa_result["verdict"] = "blocked"
+                            _qa_result["summary"] = f"{_lint_tool} error — {_linter_introduced_errors[0]['message']}"
+                            if (_qa_result.get("qa_score") or 10) > 3:
+                                _qa_result["qa_score"] = 3
+                    elif _lint_new_count == 0:
                         yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean"})
-                    else:
-                        yield sse({"type": "progress", "content": f"⏭ {_lint_tool} skipped (file has {_lint_orig_count} pre-existing issue(s))"})
                 except Exception as _lint_exc:
                     print(f"[LINTER_VALIDATOR] Skipped: {_lint_exc}")
 
