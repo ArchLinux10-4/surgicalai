@@ -10,7 +10,7 @@ import { MarkdownCode } from './CodeBlock'
 import { MermaidDiagram } from './MermaidDiagram'
 import { SessionFilesTray } from './SessionFilesTray'
 import type { SessionFile, SmartResult } from '../types'
-import { Add, AttachFile, Bolt, Close, Delete, Description, Psychology, Send, Warning } from '@mui/icons-material';
+import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
 
 // ── Markdown component overrides ──────────────────────────
 const mdComponents = {
@@ -932,18 +932,19 @@ export function ChatPanel() {
         {!isStreaming && (
           <div className="mb-2.5 flex flex-wrap gap-1.5">
             {[
-              { label: '🔍 Explain this', prompt: 'Explain what this code does in detail. Cover the logic, patterns used, and any potential issues.' },
-              { label: '🐛 Find bugs', prompt: 'Review this code for bugs, edge cases, and potential runtime errors. List each issue found.' },
-              { label: '🛡 Error handling', prompt: 'Add comprehensive error handling. Use specific exception types and handle edge cases.' },
-              { label: '🧪 Write tests', prompt: 'Write unit tests for this code. Cover happy path, edge cases, and error cases.' },
-              { label: '♻️ Refactor', prompt: 'Refactor this code for readability and maintainability. Improve naming and reduce complexity.' },
-              { label: '🗺️ Project Structure', prompt: 'Analyze all the uploaded files and generate a visual project structure diagram. Show files and modules as nodes, draw arrows for imports and key dependencies, and label important data flows or relationships. Output the diagram inside a ```mermaid code block using flowchart TD syntax.' },
-            ].map(({ label, prompt }) => (
+              { Icon: LightbulbOutlined, label: 'Explain this', prompt: 'Explain what this code does in detail. Cover the logic, patterns used, and any potential issues.' },
+              { Icon: BugReport, label: 'Find bugs', prompt: 'Review this code for bugs, edge cases, and potential runtime errors. List each issue found.' },
+              { Icon: Security, label: 'Error handling', prompt: 'Add comprehensive error handling. Use specific exception types and handle edge cases.' },
+              { Icon: Biotech, label: 'Write tests', prompt: 'Write unit tests for this code. Cover happy path, edge cases, and error cases.' },
+              { Icon: AutoFixHigh, label: 'Refactor', prompt: 'Refactor this code for readability and maintainability. Improve naming and reduce complexity.' },
+              { Icon: AccountTree, label: 'Project Structure', prompt: 'Analyze all the uploaded files and generate a visual project structure diagram. Show files and modules as nodes, draw arrows for imports and key dependencies, and label important data flows or relationships. Output the diagram inside a ```mermaid code block using flowchart TD syntax.' },
+            ].map(({ Icon, label, prompt }) => (
               <button
                 key={label}
                 onClick={() => { setInput(prompt); textareaRef.current?.focus() }}
-                className="px-2.5 py-1 rounded-lg bg-surface/60 border border-border/60 text-[11px] text-muted hover:text-ink hover:border-border transition-colors"
+                className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-surface/60 border border-border/60 text-[11px] text-muted hover:text-ink hover:border-border transition-colors"
               >
+                <Icon sx={{ fontSize: 13 }} />
                 {label}
               </button>
             ))}
