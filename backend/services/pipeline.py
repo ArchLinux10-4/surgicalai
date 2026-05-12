@@ -5115,7 +5115,7 @@ USER REQUEST:
                     extra_context=_resolved_surgeon_ctx,
                     linter_feedback=_linter_feedback_for_retry if _linter_feedback_for_retry else None,
                     qa_feedback=_qa_feedback_for_retry if _qa_feedback_for_retry else None,
-                    forbid_noop=bool(_qa_feedback_for_retry),
+                    forbid_noop=bool(_qa_feedback_for_retry) or ct == ChangeType.DELETE,
                 )
                 _is_changed = new_code.rstrip() != symbol.code.rstrip()
                 _attempt_label = f" (attempt {_surgeon_attempt+1})" if _surgeon_attempt > 0 else ""
