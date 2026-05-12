@@ -3683,6 +3683,96 @@ def _repair_json(text: str) -> str:
     return ''.join(result)
 
 
+async def _run_claude_direct_rewrite(
+    file_content: str,
+    filename: str,
+    change_description: str,
+    new_logic: str,
+    architect_plan: dict,
+    anthropic_key: str,
+    model: str,
+) -> dict:
+    """
+    Size-based routing: when the change is a large/multi-region rewrite and the Surgeon
+    is Claude, skip SEARCH/REPLACE entirely. Claude receives the FULL file and uses
+    tool_use to output the COMPLETE new file — no truncation, no focused window needed.
+    Returns {"new_file_content": str, "confidence": int, "notes": list}
+    """
+    from anthropic import Anthropic as _DirectAnthropic
+    _da_client = _DirectAnthropic(api_key=anthropic_key)
+
+    _dr_tools = [{
+        "name": "submit_file_rewrite",
+        "description": (
+            "Submit the COMPLETE rewritten file content. "
+            "You MUST output every line from the first import to the last closing brace. "
+            "No ellipsis, no truncation, no 'rest unchanged' comments."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "new_file_content": {
+                    "type": "string",
+                    "description": "The complete new file — every line from top to bottom"
+                },
+                "confidence": {
+                    "type": "integer",
+                    "description": "Confidence 1-10",
+                    "minimum": 1,
+                    "maximum": 10
+                },
+                "notes": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Short notes about major changes made"
+                }
+            },
+            "required": ["new_file_content", "confidence"]
+        }
+    }]
+
+    _dr_system = (
+        "You are a senior software engineer performing a large-scale code rewrite. "
+        "You will receive the CURRENT file and a description of what must change. "
+        "Output the COMPLETE new file using the submit_file_rewrite tool. "
+        "CRITICAL: Output EVERY line. Do NOT skip, truncate, or use ellipsis. "
+        "The file must be syntactically valid and complete."
+    )
+
+    _architect_risks = architect_plan.get("risks", [])
+    _risks_block = "\n".join(f"- {r}" for r in _architect_risks) if _architect_risks else "(none)"
+
+    _dr_user = (
+        f"FILE: {filename}\n\n"
+        f"CHANGE REQUIRED:\n{change_description}\n\n"
+        f"{'ADDITIONAL DETAILS:\n' + new_logic + chr(10) * 2 if new_logic and new_logic.strip() else ''}"
+        f"ARCHITECT RISKS TO ADDRESS:\n{_risks_block}\n\n"
+        f"CURRENT FILE CONTENT ({len(file_content.splitlines())} lines):\n"
+        f"```\n{file_content}\n```\n\n"
+        f"Rewrite the file. Output the COMPLETE new file via submit_file_rewrite."
+    )
+
+    _dr_resp = _da_client.messages.create(
+        model=model,
+        max_tokens=32000,
+        system=_dr_system,
+        messages=[{"role": "user", "content": _dr_user}],
+        tools=_dr_tools,
+        tool_choice={"type": "tool", "name": "submit_file_rewrite"},
+    )
+
+    for _blk in _dr_resp.content:
+        if getattr(_blk, "type", None) == "tool_use" and getattr(_blk, "name", None) == "submit_file_rewrite":
+            _inp = _blk.input if isinstance(_blk.input, dict) else {}
+            return {
+                "new_file_content": _inp.get("new_file_content", ""),
+                "confidence": _inp.get("confidence", 8),
+                "notes": _inp.get("notes", []),
+            }
+
+    raise RuntimeError("[DIRECT_REWRITE] Claude did not call submit_file_rewrite — check model/key")
+
+
 async def run_smart_pipeline_stream(
     session_files: list,
     user_request: str,
@@ -5000,7 +5090,9 @@ USER REQUEST:
             symbol_size = symbol.end_line - symbol.start_line + 1
             MIN_NARROW_SCORE = 10  # one name-match (+10) or two code-matches (+5+5)
             _REDESIGN_KEYWORDS = ("redesign", "restyle", "rewrite", "modernize",
-                                  "overhaul", "revamp", "refactor")
+                                  "overhaul", "revamp", "refactor",
+                                  "full redesign", "complete redesign", "entire panel",
+                                  "whole panel", "new design", "fresh design")
             _desc_combined = (target.get("description", "") + " "
                               + target.get("new_logic", "")).lower()
             _is_redesign = any(k in _desc_combined for k in _REDESIGN_KEYWORDS)
@@ -5079,6 +5171,95 @@ USER REQUEST:
             elif symbol_size > 500 and _is_redesign:
                 # Redesign-class request: don't narrow — the Surgeon needs the whole component.
                 yield sse({"type": "progress", "content": f"Redesign mode: keeping full symbol {symbol.full_path} ({symbol_size}L), narrowing skipped"})
+
+            # ── Size-based routing: large rewrites or redesigns → Claude direct ─
+            # When the Surgeon is Claude and the target symbol is large (>300L) or
+            # is a redesign-class request, skip SEARCH/REPLACE entirely. Claude
+            # receives the full file and outputs a complete new file via tool_use.
+            # This eliminates the focused-window truncation problem for multi-region
+            # rewrites that span 800+ lines across 4+ non-contiguous blocks.
+            _surg_model_route = get_setting("surgeon_model", "gpt-4.1")
+            _symbol_size_route = symbol.end_line - symbol.start_line + 1
+            _use_direct_rewrite = (
+                (_is_redesign or _symbol_size_route > 300)
+                and _is_claude_model(_surg_model_route)
+            )
+
+            _dr_new_code = None
+            _dr_confidence = None
+            _dr_surg_notes = None
+            _dr_operations = None
+            _dr_diff = None
+            _dr_qa_result = None
+            _dr_effective_original = None
+            _dr_full_after_lint = None
+
+            if _use_direct_rewrite:
+                yield sse({"type": "progress", "content": f"Full-file rewrite: Claude writing complete {matched_name} ({_symbol_size_route}L symbol)..."})
+                _dr_ok = False
+                try:
+                    _dr = await _run_claude_direct_rewrite(
+                        file_content=sf["content"],
+                        filename=matched_name,
+                        change_description=change_target.description,
+                        new_logic=change_target.new_logic,
+                        architect_plan=plan,
+                        anthropic_key=_get_anthropic_key(user_id),
+                        model=_surg_model_route,
+                    )
+                    _dr_new_code = _dr["new_file_content"]
+                    _dr_confidence = _dr.get("confidence", 8)
+                    _dr_surg_notes = _dr.get("notes", [])
+                    _dr_operations = [{"find": sf["content"], "replace": _dr_new_code}]
+                    _dr_diff = _make_diff(sf["content"], _dr_new_code, matched_name)
+                    _dr_effective_original = sf["content"]
+                    _dr_full_after_lint = _dr_new_code
+                    _dr_ok = True
+                except Exception as _dr_exc:
+                    print(f"[DIRECT_REWRITE] Failed: {_dr_exc} — falling back to Surgeon")
+                    _use_direct_rewrite = False
+
+                if _dr_ok:
+                    _dr_qa_result = await run_qa_agent(
+                        original_code=sf["content"],
+                        new_code=_dr_new_code,
+                        change_description=change_target.description,
+                        new_logic=change_target.new_logic,
+                        symbol_path=symbol_path,
+                        filename=matched_name,
+                        other_files_context="",
+                        session_id=session_id or "",
+                        user_id=user_id,
+                        architect_risks=plan.get("risks", []),
+                        targeted_context="",
+                    )
+                    _dr_qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫", "skipped": "⏭"}.get(
+                        _dr_qa_result.get("verdict", "skipped"), "⏭"
+                    )
+                    yield sse({"type": "progress", "content": f"QA {_dr_qa_icon} {_dr_qa_result.get('summary', '')} (score: {_dr_qa_result.get('qa_score', '?')})"})
+                    compliance.mark("qa_review", ran=True,
+                                    output_summary=f"direct-rewrite QA: {_dr_qa_result.get('verdict', 'skipped')}")
+
+                    # ── Assemble SurgicalChange and skip Surgeon ──────────────
+                    from models.schemas import SurgicalOperation as _SO_DR
+                    _dr_ops = [_SO_DR(find=op.get("find",""), replace=op.get("replace","")) for op in _dr_operations]
+                    _dr_change = SurgicalChange(
+                        id=str(uuid.uuid4()),
+                        symbol=symbol,
+                        original_code=_dr_effective_original,
+                        new_code=_dr_new_code,
+                        diff=_dr_diff,
+                        confidence=_dr_confidence,
+                        description=target.get("description", ""),
+                        applied=False,
+                        surgeon_notes=_dr_surg_notes or [],
+                        qa_result=_dr_qa_result,
+                        operations=_dr_ops,
+                    )
+                    if matched_name not in changes_by_file:
+                        changes_by_file[matched_name] = {"file": sf, "changes": []}
+                    changes_by_file[matched_name]["changes"].append(_dr_change)
+                    continue  # skip Surgeon retry loop for this target
 
             # ── v3.10.0: Resolve Claude's surgeon_context before Surgeon runs ─
             # v3.11.0: resolution moved INSIDE the retry loop so QA-flagged
