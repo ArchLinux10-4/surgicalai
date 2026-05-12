@@ -937,7 +937,7 @@ export function ChatPanel() {
               { Icon: Security, label: 'Error handling', prompt: 'Add comprehensive error handling. Use specific exception types and handle edge cases.' },
               { Icon: Biotech, label: 'Write tests', prompt: 'Write unit tests for this code. Cover happy path, edge cases, and error cases.' },
               { Icon: AutoFixHigh, label: 'Refactor', prompt: 'Refactor this code for readability and maintainability. Improve naming and reduce complexity.' },
-              { Icon: AccountTree, label: 'Project Structure', prompt: 'Analyze all the uploaded files and generate a visual project structure diagram. Show files and modules as nodes, draw arrows for imports and key dependencies, and label important data flows or relationships. Output the diagram inside a ```mermaid code block using flowchart TD syntax.' },
+              { Icon: AccountTree, label: 'Project Structure', prompt: 'Generate a clean high-level architecture diagram for the uploaded project. Use Mermaid flowchart TD syntax. Rules: (1) Show major layers and modules only — aim for 10-15 nodes max. (2) Group related components into labeled subgraphs (e.g., Frontend, Backend, Database, Auth). (3) Label arrows with the key data flow or relationship. (4) Do NOT map individual files — show architectural concepts. (5) Output ONLY a single ```mermaid code block, no prose.' },
             ].map(({ Icon, label, prompt }) => (
               <button
                 key={label}

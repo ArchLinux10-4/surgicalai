@@ -90,12 +90,15 @@ export function MermaidDiagram({ chart }: Props) {
         // Make SVG fill its container width
         const svgEl = ref.current.querySelector('svg')
         if (svgEl) {
+          // Keep natural dimensions — container scrolls; don't compress wide diagrams
+          svgEl.removeAttribute('width')
           svgEl.removeAttribute('height')
-          svgEl.style.width = '100%'
-          svgEl.style.maxWidth = '100%'
+          svgEl.style.minWidth = '400px'
         }
         setReady(true)
       } catch (e: any) {
+        // Clear any error SVG mermaid injected into the DOM (bomb emojis)
+        if (ref.current) ref.current.innerHTML = ''
         if (!cancelled) setErr(e?.message || 'Render failed')
       }
     }
@@ -170,8 +173,8 @@ export function MermaidDiagram({ chart }: Props) {
       {/* Diagram output */}
       <div
         ref={ref}
-        className="p-4 overflow-x-auto"
-        style={{ minHeight: ready ? undefined : '60px' }}
+        className="p-4 overflow-auto"
+        style={{ minHeight: ready ? undefined : '60px', maxHeight: '72vh' }}
       />
 
       {!ready && !err && (
