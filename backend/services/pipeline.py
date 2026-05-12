@@ -4207,9 +4207,10 @@ USER REQUEST:
                 response_text_chunks = []
                 claude_failed = False
 
-                # -- Retry loop: up to 2 attempts for transient 500/529 errors --
+                # -- Retry loop: up to 3 attempts for transient 500/529 errors --
                 _claude_attempt = 0
-                while _claude_attempt < 2:
+                _claude_retry_delay = 10
+                while _claude_attempt < 3:
                     _claude_attempt += 1
                     thinking_chunks = []
                     response_text_chunks = []
@@ -4251,10 +4252,11 @@ USER REQUEST:
                             or "overloaded" in err_low
                             or "internal_server_error" in err_low
                         )
-                        if _is_transient and _claude_attempt < 2:
+                        if _is_transient and _claude_attempt < 3:
                             yield sse({"type": "progress",
-                                       "content": "AI service hiccup -- retrying once..."})
-                            await asyncio.sleep(2)
+                                       "content": f"AI service busy (attempt {_claude_attempt}/3) -- retrying in {_claude_retry_delay}s..."})
+                            await asyncio.sleep(_claude_retry_delay)
+                            _claude_retry_delay = min(_claude_retry_delay * 2, 60)
                             continue  # retry
                         if image_files and ("image" in err_low or "unsupported" in err_low):
                             yield sse({"type": "progress",
