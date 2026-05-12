@@ -5507,78 +5507,94 @@ USER REQUEST:
                         # Absolute check: ANY TS errors in output → attempt Claude auto-fix first
                         _linter_introduced_errors = _validate_lint(_full_after_lint, matched_name)
                         yield sse({"type": "progress", "content": f"🔧 {_lint_tool}: {_lint_new_count} error(s) — asking Claude to auto-fix..."})
-                        # ── Lint self-heal: send errors back to Claude ────────
+                        # ── Lint self-heal: up to 3 Claude attempts ───────────
                         _lint_fixed = False
-                        try:
-                            _lint_fix_client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
-                            _lint_surg_model = get_setting("surgeon_model", "claude-sonnet-4-5")
-                            if not _is_claude_model(_lint_surg_model):
-                                _lint_surg_model = "claude-sonnet-4-5"
-                            _lint_err_lines = "\n".join(
-                                f"  {e.get('file',matched_name)}({e['line']},{e.get('col',1)}): error {e.get('code','TS0000')}: {e['message']}"
-                                for e in _linter_introduced_errors
-                            )
-                            _lint_fix_resp = await _lint_fix_client.messages.create(
-                                model=_lint_surg_model,
-                                max_tokens=8192,
-                                tools=[{
-                                    "name": "fix_lint_errors",
-                                    "description": "Return SEARCH/REPLACE pairs to eliminate TypeScript lint errors. Each find must match the file exactly.",
-                                    "input_schema": {
-                                        "type": "object",
-                                        "properties": {
-                                            "fixes": {
-                                                "type": "array",
-                                                "items": {
-                                                    "type": "object",
-                                                    "properties": {
-                                                        "find": {"type": "string", "description": "Exact text to remove or replace"},
-                                                        "replace": {"type": "string", "description": "Replacement text (empty string to delete the line)"}
-                                                    },
-                                                    "required": ["find", "replace"]
+                        _MAX_LINT_ATTEMPTS = 3
+                        _lint_fix_client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
+                        _lint_surg_model = get_setting("surgeon_model", "claude-sonnet-4-5")
+                        if not _is_claude_model(_lint_surg_model):
+                            _lint_surg_model = "claude-sonnet-4-5"
+                        _lint_working = _full_after_lint          # updated each attempt
+                        _lint_remaining = _linter_introduced_errors  # refreshed each attempt
+                        for _lint_attempt in range(_MAX_LINT_ATTEMPTS):
+                            try:
+                                _lint_err_lines = "\n".join(
+                                    f"  {e.get('file',matched_name)}({e['line']},{e.get('col',1)}): error {e.get('code','TS0000')}: {e['message']}"
+                                    for e in _lint_remaining
+                                )
+                                _attempt_label = f"attempt {_lint_attempt+1}/{_MAX_LINT_ATTEMPTS}"
+                                yield sse({"type": "progress", "content": f"🔧 Lint auto-fix {_attempt_label}: {len(_lint_remaining)} error(s) → Claude..."})
+                                _lint_fix_resp = await _lint_fix_client.messages.create(
+                                    model=_lint_surg_model,
+                                    max_tokens=8192,
+                                    tools=[{
+                                        "name": "fix_lint_errors",
+                                        "description": "Return SEARCH/REPLACE pairs to eliminate TypeScript lint errors. Each find must match the file exactly.",
+                                        "input_schema": {
+                                            "type": "object",
+                                            "properties": {
+                                                "fixes": {
+                                                    "type": "array",
+                                                    "items": {
+                                                        "type": "object",
+                                                        "properties": {
+                                                            "find": {"type": "string", "description": "Exact text to remove or replace (must match file exactly, including indentation)"},
+                                                            "replace": {"type": "string", "description": "Replacement text — use empty string \"\" to delete the line entirely"}
+                                                        },
+                                                        "required": ["find", "replace"]
+                                                    }
                                                 }
-                                            }
-                                        },
-                                        "required": ["fixes"]
-                                    }
-                                }],
-                                tool_choice={"type": "tool", "name": "fix_lint_errors"},
-                                messages=[{
-                                    "role": "user",
-                                    "content": (
-                                        f"You are a TypeScript lint fixer. Fix EVERY listed error in `{matched_name}`.\n"
-                                        f"Rules:\n"
-                                        f"- TS6133 (declared but never read): delete the ENTIRE line — the full import statement or the full const/let declaration block.\n"
-                                        f"- TS2305 / TS2307 (module not found): fix the import path or remove if unused.\n"
-                                        f"- TS2304 (cannot find name): add the correct import or remove the reference if unused.\n"
-                                        f"- Do NOT comment out lines. Do NOT change logic, JSX, hooks, types, or business rules.\n"
-                                        f"- Your `find` strings must match the file EXACTLY (including whitespace/indentation).\n"
-                                        f"- Fix ALL {len(_linter_introduced_errors)} errors listed — return one fix per error.\n\n"
-                                        f"Errors to fix:\n{_lint_err_lines}\n\n"
-                                        f"Full file content:\n```typescript\n{_full_after_lint}\n```"
-                                    )
-                                }]
-                            )
-                            # Apply fixes from tool_use response
-                            _lint_patched = _full_after_lint
-                            for _lblock in _lint_fix_resp.content:
-                                if hasattr(_lblock, "type") and _lblock.type == "tool_use":
-                                    for _lfix in (_lblock.input or {}).get("fixes", []):
-                                        _lf = _lfix.get("find", "")
-                                        _lr = _lfix.get("replace", "")
-                                        if _lf and _lf in _lint_patched:
-                                            _lint_patched = _lint_patched.replace(_lf, _lr, 1)
-                            # Re-run linter on patched content
-                            _lint_retry_count = _count_lint(_lint_patched, matched_name)
-                            if _lint_retry_count == 0:
-                                _full_after_lint = _lint_patched  # propagate fix to test runner
-                                _linter_introduced_errors = []
-                                _lint_fixed = True
-                                yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean (auto-fixed {_lint_new_count} error(s))"})
-                            else:
-                                yield sse({"type": "progress", "content": f"⚠️ {_lint_tool}: {_lint_retry_count} error(s) remain after auto-fix attempt"})
-                        except Exception as _lint_fix_exc:
-                            yield sse({"type": "progress", "content": f"⚠️ Lint auto-fix exception: {_lint_fix_exc}"})
+                                            },
+                                            "required": ["fixes"]
+                                        }
+                                    }],
+                                    tool_choice={"type": "tool", "name": "fix_lint_errors"},
+                                    messages=[{
+                                        "role": "user",
+                                        "content": (
+                                            f"You are a TypeScript lint fixer. This is attempt {_lint_attempt+1} of {_MAX_LINT_ATTEMPTS}.\n"
+                                            f"Fix EVERY listed error in `{matched_name}`. There are {len(_lint_remaining)} errors remaining.\n\n"
+                                            f"Rules:\n"
+                                            f"- TS6133 (declared but never read): delete the ENTIRE line — the full import statement or the full const/let/var declaration. Do not leave a blank import {{}} line.\n"
+                                            f"- TS2305 / TS2307 (module not found): fix the import path or remove if unused.\n"
+                                            f"- TS2304 (cannot find name): add the correct import or remove the reference if unused.\n"
+                                            f"- TS2345 / TS2322 (type mismatch): cast or coerce the value to the expected type.\n"
+                                            f"- Do NOT comment out lines. Do NOT change logic, JSX, hooks, types, or business rules.\n"
+                                            f"- `find` must match the file EXACTLY — copy the line character-for-character including leading spaces/tabs.\n"
+                                            f"- `replace` must be empty string \"\" to delete a line, NOT whitespace.\n"
+                                            f"- Return exactly one fix object per error. All {len(_lint_remaining)} errors must be addressed.\n\n"
+                                            f"Errors to fix (line, column, TS code, message):\n{_lint_err_lines}\n\n"
+                                            f"Current file content (this is the LIVE file — use exact text from here for your `find` strings):\n```typescript\n{_lint_working}\n```"
+                                        )
+                                    }]
+                                )
+                                # Apply fixes from tool_use response
+                                _lint_patched = _lint_working
+                                _fixes_applied = 0
+                                for _lblock in _lint_fix_resp.content:
+                                    if hasattr(_lblock, "type") and _lblock.type == "tool_use":
+                                        for _lfix in (_lblock.input or {}).get("fixes", []):
+                                            _lf = _lfix.get("find", "")
+                                            _lr = _lfix.get("replace", "")
+                                            if _lf and _lf in _lint_patched:
+                                                _lint_patched = _lint_patched.replace(_lf, _lr, 1)
+                                                _fixes_applied += 1
+                                # Re-run linter on patched content to get fresh error list
+                                _lint_retry_count = _count_lint(_lint_patched, matched_name)
+                                _lint_working = _lint_patched  # always advance, even if errors remain
+                                if _lint_retry_count == 0:
+                                    _full_after_lint = _lint_working
+                                    _linter_introduced_errors = []
+                                    _lint_fixed = True
+                                    yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean (auto-fixed {_lint_new_count} error(s) in {_lint_attempt+1} attempt(s))"})
+                                    break
+                                else:
+                                    # Refresh error list for next attempt so Claude sees only what remains
+                                    _lint_remaining = _validate_lint(_lint_working, matched_name)
+                                    yield sse({"type": "progress", "content": f"⚠️ {_lint_tool}: {_lint_retry_count} error(s) remain after {_attempt_label} ({_fixes_applied} fix(es) applied)"})
+                            except Exception as _lint_fix_exc:
+                                yield sse({"type": "progress", "content": f"⚠️ Lint auto-fix exception ({_attempt_label}): {_lint_fix_exc}"})
+                                break  # don't retry on unexpected error
                         # Hard-fail if errors remain after fix attempt
                         if not _lint_fixed:
                             yield sse({"type": "progress", "content": f"🔴 {_lint_tool}: {_linter_introduced_errors[0]['message']} (line {_linter_introduced_errors[0]['line']})"})
