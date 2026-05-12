@@ -448,7 +448,7 @@ function SessionFilesPanel() {
 // ── Rail items config ─────────────────────────────────────────────────────────
 type TabId = 'sessions' | 'files' | 'github' | 'context' | 'linear'
 const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
-  { id: 'sessions', icon: MessageSquare, label: 'Chats',  tooltip: 'Chats' },
+  { id: 'sessions', icon: Chat, label: 'Chats',  tooltip: 'Chats' },
   { id: 'files',    icon: FileCode,      label: 'Files',  tooltip: 'Session Files' },
   { id: 'github',   icon: Github,        label: 'GitHub', tooltip: 'GitHub' },
   { id: 'linear',   icon: LinearIcon,    label: 'Linear', tooltip: 'Linear Issues' },
