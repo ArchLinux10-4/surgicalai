@@ -1180,16 +1180,28 @@ CONTEXT AFTER (read-only reference, do NOT include in operations):
 
 Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
 
-    response = _chat_create(client,
-        model=surg_model,
-        messages=[
-            {"role": "system", "content": SURGEON_SYSTEM},
-            {"role": "user", "content": user_msg}
-        ],
-        temperature=temp
-    )
-
-    raw = response.choices[0].message.content
+    if _is_claude_model(surg_model):
+        # Claude Surgeon path — Anthropic SDK (OpenAI client cannot call Claude models)
+        _anthropic_key = _get_anthropic_key(user_id)
+        from anthropic import Anthropic as _AnthropicSync
+        _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
+        _claude_surgeon_resp = _sync_aclient.messages.create(
+            model=surg_model,
+            max_tokens=8192,
+            system=SURGEON_SYSTEM,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = _claude_surgeon_resp.content[0].text
+    else:
+        response = _chat_create(client,
+            model=surg_model,
+            messages=[
+                {"role": "system", "content": SURGEON_SYSTEM},
+                {"role": "user", "content": user_msg}
+            ],
+            temperature=temp
+        )
+        raw = response.choices[0].message.content
 
     # Parse Aider-style SEARCH/REPLACE blocks
     operations = []

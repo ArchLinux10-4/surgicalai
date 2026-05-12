@@ -79,6 +79,7 @@ def get_available_models(request: Request):
         claude_models = [
             {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "role": "architect", "description": "Fast, intelligent — great Architect with visible thinking", "provider": "anthropic"},
             {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "role": "architect", "description": "Most capable Claude — deep reasoning with extended thinking", "provider": "anthropic"},
+            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (Surgeon)", "role": "surgeon", "description": "Precise multi-block edits — best Claude model for complex rewrites", "provider": "anthropic"},
         ]
 
     gemini_models = []
