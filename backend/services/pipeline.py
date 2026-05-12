@@ -5084,30 +5084,6 @@ USER REQUEST:
                     print(f"[CONTEXT_RESOLVER] Resolve failed: {_resolve_exc}")
                     return ""
 
-            # ── DELETE fast-path: bypass Surgeon entirely ─────────────────────────────
-            # Architect marked this symbol for pure removal. No need to invoke Claude.
-            # Create a SurgicalChange with new_code="" — _has_real_diff() will accept
-            # it (has removes, no adds) and the apply engine will wipe the symbol.
-            if ct == ChangeType.DELETE:
-                yield sse({"type": "progress", "content": f"🗑️ Removing `{symbol.name}`..."})
-                _del_change = SurgicalChange(
-                    id=str(uuid.uuid4()),
-                    symbol=symbol,
-                    original_code=symbol.code,
-                    new_code="",
-                    diff=_make_diff(symbol.code, "", symbol_path),
-                    confidence=change_target.confidence,
-                    description=change_target.description,
-                    applied=False,
-                    surgeon_notes=["Deletion — Surgeon bypassed"],
-                    qa_result={"verdict": "safe", "summary": "Symbol deleted as requested", "qa_score": 10},
-                    operations=[],
-                )
-                if matched_name not in changes_by_file:
-                    changes_by_file[matched_name] = {"file": sf, "changes": []}
-                changes_by_file[matched_name]["changes"].append(_del_change)
-                continue
-
             # ── Surgeon retry loop (linter + QA feedback) ───────────────────
             _linter_feedback_for_retry: list = []
             _qa_feedback_for_retry: dict = {}       # QA verdict injected on semantic retry
