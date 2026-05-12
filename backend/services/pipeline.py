@@ -3698,7 +3698,7 @@ async def _run_claude_direct_rewrite(
     tool_use to output the COMPLETE new file — no truncation, no focused window needed.
     Returns {"new_file_content": str, "confidence": int, "notes": list}
     """
-    from anthropic import Anthropic as _DirectAnthropic
+    from anthropic import AsyncAnthropic as _DirectAnthropic
     _da_client = _DirectAnthropic(api_key=anthropic_key)
 
     _dr_tools = [{
@@ -3757,7 +3757,7 @@ async def _run_claude_direct_rewrite(
     _dr_delay = 10  # seconds between 529 retries
     for _dr_attempt in range(_dr_max_attempts):
         try:
-            _dr_resp = _da_client.messages.create(
+            _dr_resp = await _da_client.messages.create(
                 model=model,
                 max_tokens=32000,
                 system=_dr_system,
@@ -3770,7 +3770,7 @@ async def _run_claude_direct_rewrite(
             _dr_msg = str(_dr_e)
             if ("529" in _dr_msg or "overloaded" in _dr_msg.lower()) and _dr_attempt < _dr_max_attempts - 1:
                 print(f"[DIRECT_REWRITE] 529 overloaded (attempt {_dr_attempt+1}/{_dr_max_attempts}), retrying in {_dr_delay}s...")
-                _time_dr.sleep(_dr_delay)
+                await asyncio.sleep(_dr_delay)
                 _dr_delay = min(_dr_delay * 2, 60)
                 continue
             raise  # non-529 or final attempt
@@ -5234,7 +5234,9 @@ USER REQUEST:
                     _dr_full_after_lint = _dr_new_code
                     _dr_ok = True
                 except Exception as _dr_exc:
+                    _dr_err_msg = str(_dr_exc)[:160]
                     print(f"[DIRECT_REWRITE] Failed: {_dr_exc} — falling back to Surgeon")
+                    yield sse({"type": "progress", "content": f"⚠️ Direct rewrite failed ({type(_dr_exc).__name__}: {_dr_err_msg}) — falling back to Surgeon"})
                     _use_direct_rewrite = False
 
                 if _dr_ok:
