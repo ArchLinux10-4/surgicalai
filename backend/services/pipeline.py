@@ -591,7 +591,7 @@ USER REQUEST:
 
 Produce the surgical change plan as JSON."""
 
-    response = _chat_create(client, 
+    response = _chat_create(client,
         model=arch_model,
         messages=[
             {"role": "system", "content": ARCHITECT_SYSTEM},
@@ -1109,13 +1109,34 @@ def run_surgeon(
 
     # For DELETE operations, new_logic is typically empty — make the instruction explicit
     # so the Surgeon doesn't misread "nothing to add" as "already correct".
+    # Branch on whether `symbol` is a real AST symbol vs. a virtual context window
+    # (`_focused_L*`, `_text_region_L*`, or `*_window`) — for windows, deleting the
+    # entire TARGET CODE would wipe out imports/unrelated code, so the Surgeon needs
+    # to be told to delete ONLY the specific element described in new_logic.
     _ct_val = target.change_type.value if hasattr(target, "change_type") and target.change_type else "modify"
     if _ct_val == "delete":
-        _new_logic_display = (
-            "[DELETE OPERATION — remove the TARGET CODE lines shown below entirely from the file. "
-            "Your SEARCH block must contain those exact lines; your REPLACE block must be completely empty. "
-            "This is NOT 'already correct' — the TARGET CODE must be deleted.]"
+        _is_focus_window = (
+            symbol.name.startswith("_focused_L")
+            or symbol.name.startswith("_text_region_L")
+            or symbol.name.endswith("_window")
         )
+        if _is_focus_window:
+            _orig_logic = (target.new_logic or "").strip() or target.description or ""
+            _new_logic_display = (
+                f"{_orig_logic}\n\n"
+                "[PARTIAL DELETE WITHIN A CONTEXT WINDOW — the TARGET CODE below is a "
+                "reference window, NOT a deletion target. Emit ONE SEARCH/REPLACE block "
+                "where SEARCH contains ONLY the specific declaration/block described above "
+                "(typically 1–10 lines copied verbatim from the window) and REPLACE is empty. "
+                "Do NOT put the entire window in SEARCH — you would erase imports and unrelated code. "
+                "This is NOT 'already correct'; you must emit a non-empty SEARCH block."
+            )
+        else:
+            _new_logic_display = (
+                "[DELETE OPERATION — remove the TARGET CODE lines shown below entirely from the file. "
+                "Your SEARCH block must contain those exact lines; your REPLACE block must be completely empty. "
+                "This is NOT 'already correct' — the TARGET CODE must be deleted.]"
+            )
     else:
         _new_logic_display = target.new_logic
 
@@ -1315,7 +1336,7 @@ def run_chat(
         return _ollama_chat(all_messages, chat_model)
 
     client = _get_client(user_id)
-    response = _chat_create(client, 
+    response = _chat_create(client,
         model=chat_model,
         messages=all_messages,
         temperature=float(get_setting("temperature_architect", "0.3")),
@@ -2210,7 +2231,7 @@ USER REQUEST:
 Produce the surgical change plan. For each target, include the file_path field to indicate which file it belongs to.
 Add "file_path" to each target object."""
 
-    response = _chat_create(client, 
+    response = _chat_create(client,
         model=arch_model,
         messages=[
             {"role": "system", "content": ARCHITECT_SYSTEM + '\nIMPORTANT: Add "file_path" field to each target indicating which file the change belongs to.'},
