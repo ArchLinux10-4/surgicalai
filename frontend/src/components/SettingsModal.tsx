@@ -450,10 +450,10 @@ export function SettingsModal() {
                 <SectionHeader title="Model Configuration" subtitle="Architect plans the change · Surgeon writes the code" />
 
                 <Field label="Architect Model (planning & analysis)">
-                  <Select value={form.architect_model} onChange={upd('architect_model')} options={models.map((m) => ({ value: m.id, label: `${m.name} — ${m.description}` }))} />
+                  <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect').map((m) => ({ value: m.id, label: `${m.name} — ${m.description}` }))} />
                 </Field>
                 <Field label="Surgeon Model (code writing)">
-                  <Select value={form.surgeon_model} onChange={upd('surgeon_model')} options={models.map((m) => ({ value: m.id, label: `${m.name} — ${m.description}` }))} />
+                  <Select value={form.surgeon_model} onChange={upd('surgeon_model')} options={models.filter((m) => m.role === 'surgeon' || m.role === 'fast').map((m) => ({ value: m.id, label: `${m.name} — ${m.description}` }))} />
                 </Field>
 
                 <div className="grid grid-cols-2 gap-4">
