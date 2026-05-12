@@ -3757,14 +3757,15 @@ async def _run_claude_direct_rewrite(
     _dr_delay = 10  # seconds between 529 retries
     for _dr_attempt in range(_dr_max_attempts):
         try:
-            _dr_resp = await _da_client.messages.create(
+            async with _da_client.messages.stream(
                 model=model,
                 max_tokens=32000,
                 system=_dr_system,
                 messages=[{"role": "user", "content": _dr_user}],
                 tools=_dr_tools,
                 tool_choice={"type": "tool", "name": "submit_file_rewrite"},
-            )
+            ) as _dr_stream:
+                _dr_resp = await _dr_stream.get_final_message()
             break  # success
         except Exception as _dr_e:
             _dr_msg = str(_dr_e)
