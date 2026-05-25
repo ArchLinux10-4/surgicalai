@@ -7102,7 +7102,155 @@ async def run_natural_pipeline_stream(
                     "plan_deviation": "", "risk_verdicts": [],
                 })
 
-        # Assemble SurgicalChange objects from results
+        # ── QA retry loop — fix blocked changes before showing to user ────────
+        # If QA scores ≤ 4 (blocked), send the issues back to Claude and ask it
+        # to rewrite the code. Re-run QA on the fix. Max 2 attempts per change.
+        # "warning" (5-6) is shown to user as-is — they can decide.
+        # "blocked" (1-4) means the code is broken and must be fixed first.
+
+        MAX_QA_RETRIES = 2
+
+        for _qa_retry_round in range(MAX_QA_RETRIES):
+            # Find all still-blocked changes
+            blocked_indices = [
+                i for i, qd in enumerate(qa_results)
+                if qd.get("verdict") == "blocked" and (qd.get("qa_score") or 10) <= 4
+            ]
+            if not blocked_indices:
+                break
+
+            yield sse({"type": "progress",
+                       "content": f"🔁 Fixing {len(blocked_indices)} blocked change(s) — "
+                                  f"attempt {_qa_retry_round + 1}/{MAX_QA_RETRIES}..."})
+
+            # Build correction calls for all blocked changes
+            correction_tasks = []
+            for idx in blocked_indices:
+                cs     = change_shells[idx]
+                qa_d   = qa_results[idx]
+                symbol = cs["symbol"]
+
+                # Summarise every issue QA found
+                issue_lines = []
+                if qa_d.get("summary"):
+                    issue_lines.append(f"Summary: {qa_d['summary']}")
+                for issue in qa_d.get("import_issues", []):
+                    issue_lines.append(f"Import issue: {issue}")
+                for err in qa_d.get("type_errors", []):
+                    issue_lines.append(f"Type error: {err}")
+                if qa_d.get("plan_deviation"):
+                    issue_lines.append(f"Plan deviation: {qa_d['plan_deviation']}")
+                for risk in qa_d.get("downstream_risks", []):
+                    issue_lines.append(f"Downstream risk: {risk}")
+
+                issues_block = "\n".join(f"  • {l}" for l in issue_lines) or "  • See QA summary above."
+
+                correction_prompt = (
+                    f"QA reviewed your <surgical_edit> for `{symbol.name}` in "
+                    f"`{cs['filename']}` and found it BLOCKED (score "
+                    f"{qa_d.get('qa_score', '?')}/10). You must fix all issues "
+                    f"before this can be applied.\n\n"
+                    f"Issues to fix:\n{issues_block}\n\n"
+                    f"ORIGINAL CODE (what the symbol looks like NOW — before your change):\n"
+                    f"```\n{symbol.code}\n```\n\n"
+                    f"YOUR BROKEN CODE (what you wrote — DO NOT reuse this verbatim):\n"
+                    f"```\n{cs['new_code']}\n```\n\n"
+                    f"Write a corrected <surgical_edit> block that:\n"
+                    f"1. Fixes every issue listed above\n"
+                    f"2. Still implements the original request: {cs['description']}\n"
+                    f"3. Contains the COMPLETE symbol code — nothing omitted\n"
+                    f"4. Uses the exact symbol name: `{symbol.name}`\n\n"
+                    f"Return ONLY the <surgical_edit> block, nothing else."
+                )
+
+                correction_messages = current_messages + [
+                    {"role": "assistant", "content": full_response or "(writing code...)"},
+                    {"role": "user",      "content": correction_prompt},
+                ]
+
+                correction_tasks.append((
+                    idx,
+                    asyncio.create_task(aclient.messages.create(
+                        model=arch_model,
+                        max_tokens=16000,
+                        system=system_prompt,
+                        messages=correction_messages,
+                    ))
+                ))
+
+            # Wait for all correction calls with keepalives
+            pending_corr = {t for _, t in correction_tasks}
+            while pending_corr:
+                done_corr, pending_corr = await asyncio.wait(pending_corr, timeout=20.0)
+                if pending_corr:
+                    yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+
+            # Parse corrected edit blocks and update change_shells
+            fixed_indices = []
+            for idx, task in correction_tasks:
+                try:
+                    corr_resp = task.result()
+                    corr_text = "".join(
+                        b.text for b in corr_resp.content if hasattr(b, "text")
+                    )
+                    # Extract first <surgical_edit> block from response
+                    ei = corr_text.find(EDIT_OPEN)
+                    ec = corr_text.find(EDIT_CLOSE, ei) if ei != -1 else -1
+                    if ei != -1 and ec != -1:
+                        raw_edit = corr_text[ei + len(EDIT_OPEN):ec]
+                        try:
+                            edit_data = json.loads(raw_edit.strip())
+                        except json.JSONDecodeError:
+                            edit_data = json.loads(_repair_json(raw_edit.strip()))
+                        corrected_code = edit_data.get("new_code", "")
+                        if corrected_code and corrected_code != change_shells[idx]["new_code"]:
+                            change_shells[idx]["new_code"] = corrected_code
+                            fixed_indices.append(idx)
+                except Exception:
+                    pass  # keep original if correction call fails
+
+            if not fixed_indices:
+                break  # No code actually changed — stop retrying
+
+            # Re-run QA on all fixed changes in parallel
+            reqa_tasks = [
+                (idx, asyncio.create_task(run_qa_agent(
+                    original_code=change_shells[idx]["symbol"].code,
+                    new_code=change_shells[idx]["new_code"],
+                    change_description=change_shells[idx]["description"],
+                    new_logic=change_shells[idx]["description"],
+                    symbol_path=change_shells[idx]["symbol"].name,
+                    filename=change_shells[idx]["filename"],
+                    other_files_context=_qa_other_context,
+                    session_id=session_id or "",
+                    user_id=user_id,
+                    architect_risks=all_qa_risks,
+                    targeted_context=change_shells[idx]["targeted_ctx"],
+                    qa_feedback=qa_results[idx],   # pass prior QA so it knows what to watch for
+                    same_run_context=change_shells[idx]["same_run"],
+                )))
+                for idx in fixed_indices
+            ]
+
+            pending_reqa = {t for _, t in reqa_tasks}
+            while pending_reqa:
+                done_reqa, pending_reqa = await asyncio.wait(pending_reqa, timeout=20.0)
+                if pending_reqa:
+                    yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+
+            for idx, task in reqa_tasks:
+                try:
+                    qa_results[idx] = task.result()
+                    new_verdict = qa_results[idx].get("verdict", "?")
+                    new_score   = qa_results[idx].get("qa_score", "?")
+                    icon = "✅" if new_verdict == "safe" else "⚠️" if new_verdict == "warning" else "🚫"
+                    yield sse({"type": "progress",
+                               "content": f"Re-QA {icon} {change_shells[idx]['symbol'].name}: "
+                                          f"{qa_results[idx].get('summary', '')} (score: {new_score})"})
+                except Exception:
+                    pass  # keep prior result if re-QA fails
+
+        # ── Assemble SurgicalChange objects from results
         for i, (cs, qa_dict) in enumerate(zip(change_shells, qa_results)):
             symbol = cs["symbol"]
             filename = cs["filename"]
