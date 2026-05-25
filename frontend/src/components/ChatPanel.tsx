@@ -70,6 +70,10 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
             if (applied.modified_content) {
               await api.sessionFiles.update(sessionId, fd.file_id, applied.modified_content)
               appliedFiles++
+              // Track every applied change in DB so state survives refresh
+              for (const ch of fd.changes) {
+                if (ch?.id) api.surgical.markApplied(sessionId, ch.id).catch(() => {})
+              }
             }
           } catch { failed++ }
         }

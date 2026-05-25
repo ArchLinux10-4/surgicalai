@@ -3,8 +3,9 @@
  * Simplified vs desktop InlineDiffCard: no line-level checkboxes,
  * large touch targets, swipeable before/after view, single Apply All tap.
  * Uses same API calls as InlineDiffCard — no new backend needed.
+ * Apply state persisted to both localStorage AND backend DB (survives refresh).
  */
-import React, { useState } from 'react'
+import React, { useState, useEffect } from 'react'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import type { SmartResult, SessionFile } from '../../types'
@@ -14,6 +15,19 @@ interface Props {
   sessionId: string
   sessionFiles: SessionFile[]
   setSessionFiles: (f: SessionFile[]) => void
+}
+
+// ── localStorage helpers — mirrors InlineDiffCard exactly ────────────────────
+const appliedKey  = (sid: string, cid: string) => `sai-applied:${sid}:${cid}`
+const saveApplied = (sid: string, cid: string) => {
+  try { localStorage.setItem(appliedKey(sid, cid), '1') } catch {}
+}
+const loadApplied = (sid: string, ids: string[]): Record<string, boolean> => {
+  const out: Record<string, boolean> = {}
+  for (const id of ids) {
+    try { if (localStorage.getItem(appliedKey(sid, id)) === '1') out[id] = true } catch {}
+  }
+  return out
 }
 
 // ── Mini diff renderer — shows +/- lines with color ──────────────────────────
@@ -60,15 +74,40 @@ function FileCard({
 }) {
   const [expanded, setExpanded]     = useState(false)
   const [applying, setApplying]     = useState(false)
-  const [applied, setApplied]       = useState(false)
+  const [undoing, setUndoing]       = useState(false)
   const [activeChange, setActive]   = useState(0)
+  // Per-change applied state — keyed by change.id, same as InlineDiffCard
+  const [appliedMap, setAppliedMap] = useState<Record<string, boolean>>({})
 
-  const changes = fileData.changes || []
+  const changes    = fileData.changes || []
+  const changeIds  = changes.map((c: any) => c.id).filter(Boolean)
+  const allApplied = changeIds.length > 0 && changeIds.every((id: string) => appliedMap[id])
+
   const currentChange = changes[activeChange]
   const diff = currentChange?.diff || ''
 
+  // Load applied state from localStorage + backend DB on mount
+  useEffect(() => {
+    if (!sessionId || !changeIds.length) return
+    // 1. localStorage (instant, no network)
+    const local = loadApplied(sessionId, changeIds)
+    if (Object.keys(local).length > 0) setAppliedMap(prev => ({ ...local, ...prev }))
+    // 2. Backend DB (authoritative — survives clearing localStorage, cross-browser)
+    api.surgical.getApplied(sessionId)
+      .then(({ applied_ids }) => {
+        const fromDB: Record<string, boolean> = {}
+        for (const id of applied_ids) {
+          if (changeIds.includes(id)) fromDB[id] = true
+        }
+        if (Object.keys(fromDB).length > 0) {
+          setAppliedMap(prev => ({ ...fromDB, ...prev }))
+        }
+      })
+      .catch(() => {})
+  }, [sessionId]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleApply = async () => {
-    if (applying || applied) return
+    if (applying || allApplied) return
     setApplying(true)
     try {
       const current = await api.sessionFiles.get(sessionId, fileData.file_id)
@@ -80,25 +119,61 @@ function FileCard({
       if (result.modified_content) {
         await api.sessionFiles.update(sessionId, fileData.file_id, result.modified_content)
       }
-      setApplied(true)
+      // Mark every change as applied in localStorage + backend DB
+      const newApplied: Record<string, boolean> = {}
+      for (const ch of changes) {
+        if (ch?.id) {
+          saveApplied(sessionId, ch.id)
+          api.surgical.markApplied(sessionId, ch.id).catch(() => {})
+          newApplied[ch.id] = true
+        }
+      }
+      setAppliedMap(prev => ({ ...prev, ...newApplied }))
       toast.success(`Applied ${changes.length} change${changes.length !== 1 ? 's' : ''} to ${filename}`)
       onApplied()
     } catch (e: any) {
-      toast.error(e.message || 'Apply failed')
+      const msg = e?.message || 'Apply failed'
+      // If already applied (code not found), auto-mark as applied
+      if (msg.includes("Couldn't find") || msg.includes("could not find") || msg.includes("exact code")) {
+        const newApplied: Record<string, boolean> = {}
+        for (const ch of changes) {
+          if (ch?.id) { saveApplied(sessionId, ch.id); newApplied[ch.id] = true }
+        }
+        setAppliedMap(prev => ({ ...prev, ...newApplied }))
+        toast.success('Changes appear to already be applied ✓')
+      } else {
+        toast.error(msg)
+      }
     } finally {
       setApplying(false)
     }
   }
 
-  // QA verdict for current change
-  const qa = currentChange?.qa_result
-  const qaVerdict = qa?.verdict
-  const qaScore   = qa?.qa_score
-  const qaSummary = qa?.summary || ''
+  const handleUndo = async () => {
+    if (undoing) return
+    setUndoing(true)
+    try {
+      await api.sessionFiles.undo(sessionId, fileData.file_id)
+      // Unmark all changes for this file
+      for (const ch of changes) {
+        if (ch?.id) {
+          try { localStorage.removeItem(appliedKey(sessionId, ch.id)) } catch {}
+          api.surgical.unmarkApplied(sessionId, ch.id).catch(() => {})
+        }
+      }
+      setAppliedMap({})
+      toast.success(`Undone changes to ${filename}`)
+      onApplied()
+    } catch (e: any) {
+      toast.error(e?.message || 'Undo failed')
+    } finally {
+      setUndoing(false)
+    }
+  }
 
   return (
     <div className={`rounded-xl border overflow-hidden mb-2 ${
-      applied ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-border bg-surface/60'
+      allApplied ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-border bg-surface/60'
     }`}>
       {/* Header row */}
       <button
@@ -107,6 +182,7 @@ function FileCard({
       >
         <span className="text-[11px] font-mono text-ink/80 truncate flex-1">{filename}</span>
         <span className="text-[10px] text-muted/60 flex-shrink-0">{changes.length} change{changes.length !== 1 ? 's' : ''}</span>
+        {allApplied && <span className="text-emerald-400 text-[10px]">✓</span>}
         <span className={`text-[11px] transition-transform ${expanded ? 'rotate-90' : ''}`}>▶</span>
       </button>
 
@@ -126,6 +202,7 @@ function FileCard({
                   }`}
                 >
                   {changes[i]?.symbol?.name || `Change ${i + 1}`}
+                  {appliedMap[changes[i]?.id] && <span className="ml-1 text-emerald-400">✓</span>}
                 </button>
               ))}
             </div>
@@ -137,32 +214,38 @@ function FileCard({
           )}
 
           {/* QA badge */}
-          {qa && (
-            <div className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg border mb-2 text-[11px] ${
-              qaVerdict === 'safe'    ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-400' :
-              qaVerdict === 'warning' ? 'bg-amber-500/10 border-amber-500/25 text-amber-400'       :
-              qaVerdict === 'blocked' ? 'bg-red-500/10 border-red-500/25 text-red-400'             :
-              'bg-surface border-border text-muted/60'
-            }`}>
-              <span>{qaVerdict === 'safe' ? '✅' : qaVerdict === 'warning' ? '⚠️' : '🚫'}</span>
-              <span className="flex-1">{qaSummary}</span>
-              {qaScore && <span className="font-medium">{qaScore}/10</span>}
-            </div>
-          )}
+          {currentChange?.qa_result && (() => {
+            const qa = currentChange.qa_result
+            const verdict = qa?.verdict
+            const score   = qa?.qa_score
+            const summary = qa?.summary || ''
+            return (
+              <div className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg border mb-2 text-[11px] ${
+                verdict === 'safe'    ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-400' :
+                verdict === 'warning' ? 'bg-amber-500/10 border-amber-500/25 text-amber-400'       :
+                verdict === 'blocked' ? 'bg-red-500/10 border-red-500/25 text-red-400'             :
+                'bg-surface border-border text-muted/60'
+              }`}>
+                <span>{verdict === 'safe' ? '✅' : verdict === 'warning' ? '⚠️' : '🚫'}</span>
+                <span className="flex-1">{summary}</span>
+                {score && <span className="font-medium">{score}/10</span>}
+              </div>
+            )
+          })()}
 
           {/* Diff preview */}
           <DiffPreview diff={diff} />
         </div>
       )}
 
-      {/* Apply button */}
-      {!applied && (
-        <div className="px-3 pb-3 pt-1">
+      {/* Apply / Undo buttons */}
+      <div className="px-3 pb-3 pt-1 flex gap-2">
+        {!allApplied ? (
           <button
             onClick={handleApply}
-            disabled={applying || qaVerdict === 'blocked'}
-            className={`w-full py-2.5 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2 ${
-              qaVerdict === 'blocked'
+            disabled={applying || currentChange?.qa_result?.verdict === 'blocked'}
+            className={`flex-1 py-2.5 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2 ${
+              currentChange?.qa_result?.verdict === 'blocked'
                 ? 'bg-red-500/10 border border-red-500/25 text-red-400/60 cursor-not-allowed'
                 : applying
                   ? 'bg-orange/20 border border-orange/30 text-orange/60 cursor-wait'
@@ -174,24 +257,36 @@ function FileCard({
                 <span className="w-3.5 h-3.5 border-2 border-orange/40 border-t-orange rounded-full animate-spin" />
                 Applying...
               </>
-            ) : qaVerdict === 'blocked' ? (
+            ) : currentChange?.qa_result?.verdict === 'blocked' ? (
               <>🚫 Blocked by QA</>
             ) : (
               <>✓ Apply {changes.length > 1 ? `All ${changes.length} Changes` : 'Change'}</>
             )}
           </button>
-          {qaVerdict === 'blocked' && (
-            <p className="text-[10px] text-red-400/60 text-center mt-1">
-              QA blocked this change. Review on desktop for details.
-            </p>
-          )}
-        </div>
-      )}
+        ) : (
+          <>
+            <div className="flex-1 py-2.5 rounded-xl text-sm font-semibold text-center text-emerald-400 bg-emerald-500/10 border border-emerald-500/25">
+              ✓ Applied
+            </div>
+            <button
+              onClick={handleUndo}
+              disabled={undoing}
+              className="px-3 py-2.5 rounded-xl text-[12px] font-medium border border-border text-muted/60 hover:text-ink hover:border-border/80 transition-colors active:scale-95 disabled:opacity-50"
+            >
+              {undoing ? (
+                <span className="w-3 h-3 border-2 border-muted/40 border-t-muted rounded-full animate-spin block" />
+              ) : (
+                'Undo'
+              )}
+            </button>
+          </>
+        )}
+      </div>
 
-      {applied && (
-        <div className="px-3 pb-3 pt-1 text-center text-[11px] text-emerald-400">
-          ✓ Applied
-        </div>
+      {!allApplied && currentChange?.qa_result?.verdict === 'blocked' && (
+        <p className="text-[10px] text-red-400/60 text-center pb-2">
+          QA blocked this change. Review on desktop for details.
+        </p>
       )}
     </div>
   )
