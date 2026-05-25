@@ -121,26 +121,41 @@ async def _compact_session(session_id: str, user_id: str) -> str:
             prompt_parts.append(f"Previous summary:\n{existing}\n")
         prompt_parts.append(f"New conversation turns to add:\n{turns_text}")
 
+        compact_prompt = (
+            "Summarize this coding assistant conversation history. "
+            "Focus on: what files were discussed, what code changes were made or planned, "
+            "key decisions, and any patterns or conventions established. "
+            "Be concise but complete. Under 400 words. Use bullet points."
+        )
+
         openai_key = get_setting("openai_api_key") or (get_user_api_key(user_id, "openai") if user_id else "")
-        if not openai_key:
+        anthropic_key = get_setting("anthropic_api_key") or (get_user_api_key(user_id, "anthropic") if user_id else "")
+
+        new_summary = ""
+        if openai_key:
+            client = _openai_mod.AsyncOpenAI(api_key=openai_key)
+            resp = await client.chat.completions.create(
+                model="gpt-4.1-mini",
+                messages=[
+                    {"role": "system", "content": compact_prompt},
+                    {"role": "user", "content": "\n".join(prompt_parts)}
+                ],
+                max_tokens=500,
+            )
+            new_summary = resp.choices[0].message.content or ""
+        elif anthropic_key:
+            from anthropic import AsyncAnthropic as _AsyncAnthropic
+            aclient = _AsyncAnthropic(api_key=anthropic_key)
+            resp = await aclient.messages.create(
+                model="claude-haiku-4-5-20251001",
+                max_tokens=500,
+                system=compact_prompt,
+                messages=[{"role": "user", "content": "\n".join(prompt_parts)}],
+            )
+            new_summary = resp.content[0].text if resp.content else ""
+        else:
             db.close()
             return existing
-
-        client = _openai_mod.AsyncOpenAI(api_key=openai_key)
-        resp = await client.chat.completions.create(
-            model="gpt-4.1-mini",
-            messages=[
-                {"role": "system", "content": (
-                    "Summarize this coding assistant conversation history. "
-                    "Focus on: what files were discussed, what code changes were made or planned, "
-                    "key decisions, and any patterns or conventions established. "
-                    "Be concise but complete. Under 400 words. Use bullet points."
-                )},
-                {"role": "user", "content": "\n".join(prompt_parts)}
-            ],
-            max_tokens=500,
-        )
-        new_summary = resp.choices[0].message.content or ""
 
         ids = [dict(r)["id"] for r in to_compact]
         placeholders = ",".join(["?" for _ in ids])

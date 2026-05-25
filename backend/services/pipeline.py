@@ -5933,6 +5933,289 @@ Before including any block, verify:
 """
 
 
+def _score_symbol_relevance(sym, terms: list) -> int:
+    """
+    Score a symbol's relevance to a set of search terms.
+    Higher = more relevant. Used to rank which symbols to show Claude upfront.
+    """
+    score = 0
+    nm_lower = (getattr(sym, "name", "") or "").lower()
+    fp_lower = (getattr(sym, "full_path", "") or "").lower()
+    code_lower = (getattr(sym, "code", "") or "").lower()
+
+    for term in terms:
+        tl = term.lower()
+        if not tl:
+            continue
+        # Exact name match — highest signal
+        if tl == nm_lower or tl == fp_lower:
+            score += 20
+        # Name contains term or vice-versa
+        elif tl in nm_lower or nm_lower in tl:
+            score += 10
+        elif tl in fp_lower or fp_lower in tl:
+            score += 8
+        # Token overlap (split camelCase/snake_case)
+        nm_tokens = set(re.sub(r'([A-Z])', r'_\1', nm_lower).replace('-', '_').split('_'))
+        t_tokens = set(re.sub(r'([A-Z])', r'_\1', tl).replace('-', '_').split('_'))
+        overlap = nm_tokens & t_tokens - {'', 'the', 'a', 'an', 'is', 'of', 'in', 'to'}
+        score += len(overlap) * 5
+        # Code body contains term
+        if tl in code_lower:
+            score += 2
+
+    # Prefer smaller symbols (more precise targets)
+    size = getattr(sym, "end_line", 0) - getattr(sym, "start_line", 0) + 1
+    if size < 30:
+        score += 3
+    elif size < 100:
+        score += 1
+
+    return score
+
+
+def _smart_code_context(fname: str, content: str, smap, user_request: str,
+                        max_code_lines: int = 300) -> str:
+    """
+    Pick the most relevant symbols for a file and return their FULL code,
+    not grep window snippets. Claude gets complete functions, not partial code.
+
+    Strategy:
+    1. Score every symbol by relevance to user_request
+    2. Show full code for top-scoring symbols up to max_code_lines
+    3. Fall back to first-pass grep if scoring finds nothing
+    """
+    if not smap or not smap.symbols:
+        return ""
+
+    terms = _extract_search_terms(user_request)
+
+    # Also add any short words from the request that aren't stop words
+    # (catches "tax", "bug", "wrong" that _extract_search_terms skips as <7 chars)
+    _STOP = {'the', 'a', 'an', 'is', 'it', 'in', 'on', 'to', 'fix', 'bug',
+             'add', 'make', 'get', 'set', 'and', 'for', 'not', 'are', 'was',
+             'has', 'had', 'but', 'can', 'all', 'any'}
+    for word in re.findall(r'\b[a-zA-Z]{3,6}\b', user_request):
+        wl = word.lower()
+        if wl not in _STOP and wl not in {t.lower() for t in terms}:
+            terms.append(word)
+
+    if not terms:
+        # No extractable terms — show the first few symbols' full code
+        terms = []
+
+    # Score all symbols
+    scored = [(
+        _score_symbol_relevance(sym, terms),
+        sym.end_line - sym.start_line + 1,  # size (tiebreak: smaller first)
+        sym
+    ) for sym in smap.symbols]
+
+    # Sort: highest score first, then smallest size
+    scored.sort(key=lambda x: (-x[0], x[1]))
+
+    # Build output: full code for top symbols, up to max_code_lines
+    parts = []
+    total = 0
+    shown = set()
+
+    for score, size, sym in scored:
+        if score == 0 and parts:
+            break  # Nothing relevant beyond this
+        if total >= max_code_lines:
+            break
+        if sym.full_path in shown:
+            continue
+
+        sym_code_lines = (sym.code or "").splitlines()
+        sym_size = len(sym_code_lines)
+
+        # Skip if adding this would massively overflow; but always show at least 1
+        if parts and total + sym_size > max_code_lines + 50:
+            continue
+
+        shown.add(sym.full_path)
+        numbered = "\n".join(
+            f"{sym.start_line + i:5d}: {sym_code_lines[i]}"
+            for i in range(min(sym_size, max_code_lines - total))
+        )
+        truncated = sym_size > (max_code_lines - total)
+        suffix = f"\n  ... [{sym_size - (max_code_lines - total)} lines truncated]" if truncated else ""
+        parts.append(
+            f"[{sym.symbol_type.value}] {sym.full_path} "
+            f"(L{sym.start_line}–{sym.end_line}):\n{numbered}{suffix}"
+        )
+        total += min(sym_size, max_code_lines - total)
+
+    if not parts:
+        return ""
+
+    return (
+        f"\nRELEVANT CODE IN {fname} "
+        f"(showing {len(parts)} of {len(smap.symbols)} symbols by relevance):\n\n"
+        + "\n\n".join(parts)
+    )
+
+
+def _fuzzy_find_symbol(smap, symbol_name: str):
+    """
+    Comprehensive symbol finder — tries 6 strategies before giving up.
+    Returns (symbol, method_description) or (None, None).
+
+    Strategies (in order of confidence):
+    1. Exact full_path match
+    2. Exact name match
+    3. Case-insensitive match
+    4. Substring containment (either direction)
+    5. Token overlap (splits camelCase/snake_case and finds shared tokens)
+    6. Character-set similarity (shared chars ratio ≥ 0.70)
+    """
+    if not smap or not smap.symbols or not symbol_name:
+        return None, None
+
+    sn = symbol_name
+    sn_lower = sn.lower()
+
+    # 1. Exact full_path
+    for s in smap.symbols:
+        if getattr(s, "full_path", "") == sn:
+            return s, "exact"
+
+    # 2. Exact name
+    for s in smap.symbols:
+        if getattr(s, "name", "") == sn:
+            return s, "exact_name"
+
+    # 3. Case-insensitive
+    for s in smap.symbols:
+        if getattr(s, "full_path", "").lower() == sn_lower:
+            return s, "case_insensitive"
+        if getattr(s, "name", "").lower() == sn_lower:
+            return s, "case_insensitive"
+
+    # 4. Substring containment (prefer smallest match = most specific)
+    sub_candidates = []
+    for s in smap.symbols:
+        fp = getattr(s, "full_path", "").lower()
+        nm = getattr(s, "name", "").lower()
+        size = getattr(s, "end_line", 0) - getattr(s, "start_line", 0)
+        if sn_lower in fp or sn_lower in nm:
+            sub_candidates.append((size, s, "substring_in_symbol"))
+        elif fp in sn_lower or nm in sn_lower:
+            sub_candidates.append((size, s, "symbol_in_request"))
+    if sub_candidates:
+        sub_candidates.sort(key=lambda x: x[0])
+        _, sym, method = sub_candidates[0]
+        return sym, method
+
+    # 5. Token overlap — split camelCase/snake_case into tokens, score shared tokens
+    def _tokens(name: str) -> set:
+        # Split on capital letters and underscores
+        parts = re.sub(r'([A-Z])', r'_\1', name).replace('-', '_').lower().split('_')
+        return {p for p in parts if len(p) >= 3}
+
+    sn_tokens = _tokens(sn)
+    if sn_tokens:
+        token_candidates = []
+        for s in smap.symbols:
+            nm = getattr(s, "name", "")
+            sym_tokens = _tokens(nm)
+            overlap = sn_tokens & sym_tokens
+            if overlap:
+                size = getattr(s, "end_line", 0) - getattr(s, "start_line", 0)
+                token_candidates.append((len(overlap), -size, s))
+        if token_candidates:
+            token_candidates.sort(key=lambda x: (-x[0], x[1]))
+            _, _, sym = token_candidates[0]
+            return sym, "token_overlap"
+
+    # 6. Character-set similarity ≥ 70%
+    sn_chars = set(sn_lower)
+    best_ratio = 0.0
+    best_sym = None
+    for s in smap.symbols:
+        nm = getattr(s, "name", "").lower()
+        if len(nm) < 3:
+            continue
+        shared = len(sn_chars & set(nm))
+        ratio = shared / max(len(sn_lower), len(nm))
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_sym = s
+    if best_sym and best_ratio >= 0.70:
+        return best_sym, f"char_similarity({best_ratio:.0%})"
+
+    return None, None
+
+
+def _build_symbol_correction(
+    unresolved: list,
+    symbol_maps_by_name: dict,
+) -> str:
+    """
+    Build a correction message for Claude when it referenced symbols that don't exist.
+    Shows the actual available symbols with full code so Claude can revise precisely.
+
+    unresolved: list of dicts with keys: filename, symbol, new_code, description
+    """
+    parts = [
+        "Some of the symbols you referenced don't exist in the files. "
+        "Here are the ACTUAL symbols available — please revise your edits to use these exact names:\n"
+    ]
+
+    for item in unresolved:
+        filename = item.get("filename", "")
+        bad_name = item.get("symbol", "")
+        smap, _ = symbol_maps_by_name.get(filename, (None, None))
+
+        parts.append(f"\n❌ Symbol '{bad_name}' in {filename} — NOT FOUND.")
+
+        if not smap or not smap.symbols:
+            parts.append(f"   (Could not read symbol map for {filename})")
+            continue
+
+        # Find the 3 best candidates using token overlap + char similarity
+        def _tokens(name: str) -> set:
+            p = re.sub(r'([A-Z])', r'_\1', name).replace('-', '_').lower().split('_')
+            return {x for x in p if len(x) >= 3}
+
+        sn_tokens = _tokens(bad_name)
+        sn_chars = set(bad_name.lower())
+
+        scored = []
+        for s in smap.symbols:
+            nm = getattr(s, "name", "") or ""
+            sym_tokens = _tokens(nm)
+            token_score = len(sn_tokens & sym_tokens) * 3
+            char_score = len(sn_chars & set(nm.lower())) / max(len(bad_name), len(nm), 1)
+            total = token_score + char_score
+            scored.append((total, s))
+        scored.sort(key=lambda x: -x[0])
+        candidates = [s for _, s in scored[:3]]
+
+        parts.append(f"   Closest real symbols:")
+        for cand in candidates:
+            code_lines = (cand.code or "").splitlines()
+            # Show up to 60 lines of the candidate
+            preview_lines = code_lines[:60]
+            truncated = len(code_lines) > 60
+            numbered = "\n".join(
+                f"   {cand.start_line + i:5d}: {preview_lines[i]}"
+                for i in range(len(preview_lines))
+            )
+            suffix = f"\n   ... [{len(code_lines)-60} more lines]" if truncated else ""
+            parts.append(
+                f"\n   [{cand.symbol_type.value}] {cand.full_path} "
+                f"(L{cand.start_line}–{cand.end_line}):\n{numbered}{suffix}"
+            )
+
+    parts.append(
+        "\n\nPlease rewrite your <surgical_edit> blocks using the EXACT symbol names shown above. "
+        "Make sure new_code is the complete replacement for the symbol you choose."
+    )
+    return "\n".join(parts)
+
+
 def _build_natural_file_context(
     session_files: list,
     symbol_maps_by_name: dict,
@@ -5942,7 +6225,13 @@ def _build_natural_file_context(
 ) -> str:
     """
     Build the file context string for the natural pipeline.
-    Returns symbol maps + relevant code excerpts for each file.
+
+    For each file:
+    - Always shows the full symbol index (names + line ranges)
+    - For small files (≤300 lines): shows full content
+    - For larger files: shows FULL CODE for the most relevant symbols
+      (scored by name match + token overlap + code content match)
+      rather than grep window snippets — Claude gets complete functions, not partial code
     """
     parts = []
 
@@ -5975,7 +6264,7 @@ def _build_natural_file_context(
         smap, _ = symbol_maps_by_name.get(fname, (None, sf))
 
         if smap and smap.symbols:
-            # Full symbol index
+            # Full symbol index — always shown so Claude knows ALL symbol names
             sym_lines = []
             for s in smap.symbols:
                 size = s.end_line - s.start_line + 1
@@ -5988,17 +6277,22 @@ def _build_natural_file_context(
 
             file_header = (
                 f"FILE: {fname} ({lines_count} lines)\n"
-                f"SYMBOL INDEX:\n{sym_index}\n"
+                f"SYMBOL INDEX (use these EXACT names in surgical_edit):\n{sym_index}\n"
             )
 
-            # For large files, grep relevant sections so Claude can see the actual code
-            if len(smap.symbols) > 30 or lines_count > 300:
-                grep_hit = _grep_relevant_sections(user_request, fname, content)
-                if grep_hit:
-                    file_header += grep_hit + "\n"
-            else:
-                # Small file — show full content
+            if lines_count <= 300:
+                # Small file — show everything
                 file_header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
+            else:
+                # Larger file — show full code for most relevant symbols
+                smart_ctx = _smart_code_context(fname, content, smap, user_request, max_code_lines=350)
+                if smart_ctx:
+                    file_header += smart_ctx + "\n"
+                else:
+                    # Fallback: show first 3 symbols' full code + grep
+                    grep_hit = _grep_relevant_sections(user_request, fname, content)
+                    if grep_hit:
+                        file_header += grep_hit + "\n"
 
             parts.append(file_header)
         else:
@@ -6304,8 +6598,7 @@ async def run_natural_pipeline_stream(
             yield sse({"type": "done", "content": ""})
             return
 
-        total_blocks = len(edit_blocks_raw) + len(new_file_blocks_raw)
-        yield sse({"type": "progress", "content": f"Running QA on {total_blocks} change(s)..."})
+        yield sse({"type": "progress", "content": f"Resolving {len(edit_blocks_raw)} edit(s)..."})
 
         # Build file content lookup
         file_content_lookup: dict = {sf["filename"]: sf.get("content", "") for sf in session_files}
@@ -6314,54 +6607,123 @@ async def run_natural_pipeline_stream(
         all_qa_risks: list = []
         summary_parts: list = []
 
-        # ── Process surgical edits ────────────────────────────────────────
-        for edit_raw in edit_blocks_raw:
-            try:
-                edit_data = json.loads(edit_raw.strip())
-            except json.JSONDecodeError:
+        # ── Symbol resolution with retry loop ────────────────────────────
+        # Pass 1: try to resolve every edit block to a real symbol.
+        # Any that fail go to a silent correction call to Claude (max 2 rounds).
+
+        MAX_SYMBOL_RETRIES = 2
+        pending_edits = list(edit_blocks_raw)
+        resolved_edits: list = []
+        skipped_messages: list = []
+
+        for resolve_round in range(MAX_SYMBOL_RETRIES + 1):
+            still_unresolved = []
+
+            for edit_raw in pending_edits:
                 try:
-                    edit_data = json.loads(_repair_json(edit_raw.strip()))
-                except Exception:
+                    edit_data = json.loads(edit_raw.strip())
+                except json.JSONDecodeError:
+                    try:
+                        edit_data = json.loads(_repair_json(edit_raw.strip()))
+                    except Exception:
+                        continue
+
+                filename = edit_data.get("filename", "")
+                symbol_name = edit_data.get("symbol", "")
+                new_code = edit_data.get("new_code", "")
+                description = edit_data.get("description", "")
+
+                if not filename or not symbol_name or not new_code:
                     continue
 
-            filename = edit_data.get("filename", "")
-            symbol_name = edit_data.get("symbol", "")
+                file_content = file_content_lookup.get(filename, "")
+                smap, sf_entry = symbol_maps_by_name.get(filename, (None, None))
+
+                if not file_content or not smap:
+                    skipped_messages.append(f"File '{filename}' not found in session")
+                    continue
+
+                symbol, match_method = _fuzzy_find_symbol(smap, symbol_name)
+
+                if symbol:
+                    resolved_edits.append({
+                        "edit_data": edit_data,
+                        "symbol": symbol,
+                        "sf_entry": sf_entry,
+                        "file_content": file_content,
+                        "filename": filename,
+                    })
+                else:
+                    still_unresolved.append({
+                        "filename": filename,
+                        "symbol": symbol_name,
+                        "new_code": new_code,
+                        "description": description,
+                        "_raw": edit_raw,
+                    })
+
+            if not still_unresolved or resolve_round >= MAX_SYMBOL_RETRIES:
+                if still_unresolved:
+                    for item in still_unresolved:
+                        skipped_messages.append(
+                            f"Symbol '{item['symbol']}' not found in {item['filename']} after {MAX_SYMBOL_RETRIES} correction attempts"
+                        )
+                break
+
+            # ── Silent correction call ────────────────────────────────────
+            yield sse({"type": "progress",
+                       "content": f"Correcting symbol references ({resolve_round + 1}/{MAX_SYMBOL_RETRIES})..."})
+
+            correction_text = _build_symbol_correction(still_unresolved, symbol_maps_by_name)
+            correction_msgs = messages + [
+                {"role": "assistant", "content": full_response},
+                {"role": "user", "content": correction_text},
+            ]
+
+            try:
+                corr_resp = await aclient.messages.create(
+                    model=arch_model,
+                    max_tokens=8000,
+                    system=system_prompt,
+                    messages=correction_msgs,
+                )
+                corr_text = "".join(
+                    block.text for block in corr_resp.content if hasattr(block, "text")
+                )
+
+                # Extract new edit blocks from correction response
+                new_pending = []
+                _cs, _cb = "normal", ""
+                for char in corr_text:
+                    if _cs == "normal":
+                        _cb += char
+                        if _cb.endswith(EDIT_OPEN):
+                            _cb, _cs = "", "in_edit"
+                    else:
+                        _cb += char
+                        if _cb.endswith(EDIT_CLOSE):
+                            new_pending.append(_cb[:-len(EDIT_CLOSE)])
+                            _cb, _cs = "", "normal"
+                pending_edits = new_pending or []
+
+            except Exception:
+                for item in still_unresolved:
+                    skipped_messages.append(f"Symbol '{item['symbol']}' not found in {item['filename']} — skipped")
+                break
+
+        # ── Build SurgicalChange objects ──────────────────────────────────
+        yield sse({"type": "progress", "content": f"Running QA on {len(resolved_edits)} change(s)..."})
+
+        for resolved in resolved_edits:
+            edit_data = resolved["edit_data"]
+            symbol = resolved["symbol"]
+            sf_entry = resolved["sf_entry"]
+            file_content = resolved["file_content"]
+            filename = resolved["filename"]
             new_code = edit_data.get("new_code", "")
             description = edit_data.get("description", "")
 
-            if not filename or not symbol_name or not new_code:
-                continue
-
-            file_content = file_content_lookup.get(filename, "")
-            smap, sf_entry = symbol_maps_by_name.get(filename, (None, None))
-
-            if not file_content or not smap:
-                yield sse({"type": "progress",
-                           "content": f"Warning: file '{filename}' not found in session"})
-                continue
-
-            # Find the target symbol in the AST map
-            symbol = None
-            for s in smap.symbols:
-                if getattr(s, "full_path", "") == symbol_name or getattr(s, "name", "") == symbol_name:
-                    symbol = s
-                    break
-
-            # Fuzzy fallback
-            if symbol is None:
-                for s in smap.symbols:
-                    fp = getattr(s, "full_path", "") or ""
-                    nm = getattr(s, "name", "") or ""
-                    if symbol_name in fp or nm in symbol_name or fp in symbol_name:
-                        symbol = s
-                        break
-
-            if symbol is None:
-                yield sse({"type": "progress",
-                           "content": f"Warning: symbol '{symbol_name}' not found in {filename} — skipping"})
-                continue
-
-            diff = _make_diff(symbol.code, new_code, symbol_name)
+            diff = _make_diff(symbol.code, new_code, symbol.name)
             _tgt, _repl = _compute_target_element(symbol.code, new_code)
 
             change = SurgicalChange(
@@ -6394,7 +6756,7 @@ async def run_natural_pipeline_stream(
                     "changes": [],
                 }
             changes_by_file[filename]["changes"].append(change.model_dump())
-            summary_parts.append(description or f"Updated {symbol_name} in {filename}")
+            summary_parts.append(description or f"Updated {symbol.name} in {filename}")
 
         # ── Process new file blocks ───────────────────────────────────────
         new_files: list = []
