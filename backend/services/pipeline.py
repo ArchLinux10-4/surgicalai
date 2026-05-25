@@ -6953,10 +6953,39 @@ async def run_natural_pipeline_stream(
                     skipped_messages.append(f"Symbol '{item['symbol']}' not found in {item['filename']} — skipped")
                 break
 
-        # ── Build SurgicalChange objects ──────────────────────────────────
+        # ── Build SurgicalChange objects with full QA ─────────────────────
         yield sse({"type": "progress", "content": f"Running QA on {len(resolved_edits)} change(s)..."})
 
-        for resolved in resolved_edits:
+        # Build other-files context for QA — same symbol map data the architect saw.
+        # QA must have the same view as the architect (same files, same structure).
+        _qa_other_parts = []
+        for _fn, (_sm, _sf) in symbol_maps_by_name.items():
+            if _sm is None:
+                continue
+            _syms_brief = [
+                f"  [{s.symbol_type.value}] {s.full_path} (L{s.start_line}–{s.end_line}, {s.end_line-s.start_line+1}L)"
+                for s in _sm.symbols[:30]
+            ]
+            imports = getattr(_sm, "imports", [])[:15]
+            import_block = ("IMPORTS:\n" + "\n".join(f"  {i}" for i in imports) + "\n") if imports else ""
+            _qa_other_parts.append(f"FILE: {_fn}\n{import_block}SYMBOLS:\n" + "\n".join(_syms_brief))
+        _qa_other_context = "\n\n".join(_qa_other_parts)
+
+        # If search results were fetched during the architect phase, include them
+        # so QA has full visibility into any code that influenced the edit.
+        if accumulated_search_results:
+            _qa_other_context += "\n\n" + accumulated_search_results
+
+        # Build same-run context (descriptions of other changes in this request)
+        _all_descriptions = [
+            r["edit_data"].get("description", "")
+            for r in resolved_edits
+            if r["edit_data"].get("description")
+        ]
+
+        from models.schemas import QAResult as _QAResult
+
+        for i, resolved in enumerate(resolved_edits):
             edit_data = resolved["edit_data"]
             symbol = resolved["symbol"]
             sf_entry = resolved["sf_entry"]
@@ -6968,28 +6997,82 @@ async def run_natural_pipeline_stream(
             diff = _make_diff(symbol.code, new_code, symbol.name)
             _tgt, _repl = _compute_target_element(symbol.code, new_code)
 
+            # Other changes in this same request (so QA knows about cross-symbol deps)
+            _same_run = "\n".join(
+                f"  • {d}" for j, d in enumerate(_all_descriptions)
+                if j != i and d
+            )
+
+            # Targeted context: callers/usages of this symbol in other files
+            _targeted_ctx = ""
+            try:
+                from services.context_resolver import resolve_context_requests as _rcr
+                if symbol.name:
+                    _targeted_ctx = _rcr(
+                        requests=[
+                            {"type": "callers", "name": symbol.name},
+                            {"type": "usages",  "name": symbol.name},
+                        ],
+                        symbol_maps_by_name=symbol_maps_by_name,
+                        requesting_file=filename,
+                    )
+            except Exception:
+                pass
+
+            # ── Run full QA agent — same as old pipeline ──────────────────
+            qa_dict = await run_qa_agent(
+                original_code=symbol.code,
+                new_code=new_code,
+                change_description=description,
+                new_logic=description,
+                symbol_path=symbol.name,
+                filename=filename,
+                other_files_context=_qa_other_context,
+                session_id=session_id or "",
+                user_id=user_id,
+                architect_risks=all_qa_risks,
+                targeted_context=_targeted_ctx,
+                qa_feedback=None,
+                same_run_context=_same_run,
+            )
+
+            all_qa_risks.extend(qa_dict.get("downstream_risks", []))
+
+            # Attach full QAResult to the change so InlineDiffCard can render it
+            qa_result_obj = _QAResult(
+                verdict=qa_dict.get("verdict", "skipped"),
+                qa_score=qa_dict.get("qa_score"),
+                summary=qa_dict.get("summary", ""),
+                import_issues=qa_dict.get("import_issues", []),
+                downstream_risks=qa_dict.get("downstream_risks", []),
+                type_errors=qa_dict.get("type_errors", []),
+                plan_deviation=qa_dict.get("plan_deviation", ""),
+                risk_verdicts=qa_dict.get("risk_verdicts", []),
+            )
+
+            yield sse({
+                "type": "progress",
+                "content": (
+                    f"QA {'✅' if qa_dict.get('verdict') == 'safe' else '⚠️' if qa_dict.get('verdict') == 'warning' else '🚫'} "
+                    f"{qa_dict.get('summary', '')} "
+                    f"(score: {qa_dict.get('qa_score', '?')})"
+                ),
+            })
+
             change = SurgicalChange(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
                 original_code=symbol.code,
                 new_code=new_code,
                 diff=diff,
-                confidence=9,
+                confidence=qa_dict.get("qa_score") or 9,
                 description=description,
                 applied=False,
+                qa_result=qa_result_obj,
                 operations=[{"find": symbol.code, "replace": new_code}],
                 target_element=_tgt,
                 replacement=_repl,
             )
-
-            try:
-                qa = await run_qa_for_changes(
-                    [change], file_content, user_request, anthropic_key, arch_model
-                )
-                all_qa_risks.extend(qa.get("risks", []))
-                change.confidence = max(1, min(10, qa.get("qa_score", 9)))
-            except Exception:
-                pass
 
             if filename not in changes_by_file:
                 changes_by_file[filename] = {
