@@ -6236,22 +6236,124 @@ def _build_symbol_correction(
     return "\n".join(parts)
 
 
+def _score_file_relevance(
+    sf: dict,
+    smap,
+    user_request: str,
+    terms: list,
+) -> int:
+    """
+    Score a single file's relevance to user_request.
+    Higher = more relevant → gets full context.
+    Lower  = less relevant → gets lean index only.
+
+    Signals used (in rough priority order):
+      1. Filename contains a request term           (+15 per term)
+      2. File extension matches request domain      (+10)
+      3. Symbol name exact match to term            (+20 per match)
+      4. Symbol token overlap with terms            (+8 per overlap)
+      5. Imports reference a term                   (+6 per match)
+      6. File was recently modified (updated_at)    (+5)
+      7. Small file bonus (cheap to include)        (+3)
+    """
+    score = 0
+    fname = sf.get("filename", "").lower()
+    fname_base = re.sub(r"\.[^.]+$", "", fname.split("/")[-1])  # stem only
+    symbols = getattr(smap, "symbols", []) if smap else []
+    imports = getattr(smap, "imports", []) if smap else []
+    lines   = sf.get("lines", 0)
+
+    _STOP = {"the", "a", "an", "is", "it", "in", "on", "to", "fix", "bug",
+              "add", "make", "get", "set", "and", "for", "not", "are", "was",
+              "has", "had", "but", "can", "all", "any", "new", "use", "from",
+              "with", "that", "this", "will", "should", "need", "want"}
+
+    def _tok(name: str) -> set:
+        parts = re.sub(r"([A-Z])", r"_\1", name).replace("-", "_").lower().split("_")
+        return {p for p in parts if len(p) >= 3 and p not in _STOP}
+
+    req_tokens = _tok(user_request)
+
+    for term in terms:
+        tl = term.lower()
+        if not tl or tl in _STOP:
+            continue
+
+        # 1. Filename match
+        if tl == fname_base:
+            score += 15
+        elif tl in fname:
+            score += 10
+
+        # 3+4. Symbol matches
+        for sym in symbols:
+            nm = (getattr(sym, "name", "") or "").lower()
+            fp = (getattr(sym, "full_path", "") or "").lower()
+            if tl == nm or tl == fp:
+                score += 20
+            elif tl in nm or tl in fp:
+                score += 8
+            else:
+                overlap = req_tokens & _tok(nm)
+                if overlap:
+                    score += len(overlap) * 4
+
+        # 5. Import matches
+        for imp in imports:
+            if tl in imp.lower():
+                score += 6
+
+    # 2. Extension bonus — request mentions React/component/page → .tsx/.jsx scores higher
+    ext = fname.rsplit(".", 1)[-1] if "." in fname else ""
+    req_lower = user_request.lower()
+    if ext in ("tsx", "jsx") and any(w in req_lower for w in
+            ("component", "page", "button", "form", "modal", "ui", "style", "render")):
+        score += 10
+    if ext == "py" and any(w in req_lower for w in
+            ("api", "route", "endpoint", "server", "backend", "function", "service")):
+        score += 10
+    if ext in ("css", "scss", "sass") and any(w in req_lower for w in
+            ("style", "color", "layout", "design", "ui", "look", "theme")):
+        score += 10
+
+    # 6. Recency bonus
+    updated = sf.get("updated_at") or sf.get("created_at") or ""
+    if updated:
+        score += 5  # any recently-in-session file gets a small bump
+
+    # 7. Small file bonus — cheap to include, may be relevant glue code
+    if lines <= 100:
+        score += 3
+    elif lines <= 300:
+        score += 1
+
+    return score
+
+
 def _build_natural_file_context(
     session_files: list,
     symbol_maps_by_name: dict,
     user_request: str,
     project_memory: str = None,
     session_summary: str = "",
+    full_context_limit: int = 8,
 ) -> str:
     """
     Build the file context string for the natural pipeline.
 
-    For each file:
-    - Always shows the full symbol index (names + line ranges)
-    - For small files (≤300 lines): shows full content
-    - For larger files: shows FULL CODE for the most relevant symbols
-      (scored by name match + token overlap + code content match)
-      rather than grep window snippets — Claude gets complete functions, not partial code
+    Two-tier approach for projects with many files:
+
+    TIER 1 — Full context (top `full_context_limit` files by relevance score):
+      - Full symbol index + FULL CODE for most relevant symbols
+      - Claude can edit these directly
+
+    TIER 2 — Lean index (remaining files):
+      - Filename + symbol names + line ranges only (~3 lines per symbol)
+      - Zero code shown — keeps tokens low
+      - Claude can request any of these via <search_request> and get full code instantly
+
+    For small projects (≤ full_context_limit files) every file gets Tier 1.
+    This ensures "fix login button" doesn't flood Claude with 47 irrelevant files.
     """
     parts = []
 
@@ -6264,27 +6366,77 @@ def _build_natural_file_context(
     if not session_files:
         return "\n".join(parts) if parts else ""
 
-    parts.append("━━━ UPLOADED FILES ━━━\n")
+    # ── Score every file for relevance ───────────────────────────────────
+    terms = _extract_search_terms(user_request)
+    # Also add short meaningful words _extract_search_terms skips
+    _STOP_SHORT = {"the", "a", "an", "is", "it", "in", "on", "to", "fix", "bug",
+                   "add", "make", "get", "set", "and", "for", "not", "are", "was"}
+    for word in re.findall(r"\b[a-zA-Z]{3,6}\b", user_request):
+        wl = word.lower()
+        if wl not in _STOP_SHORT and wl not in {t.lower() for t in terms}:
+            terms.append(word)
 
+    scored_files = []
     for sf in session_files:
         fname = sf["filename"]
-        content = sf.get("content", "")
-        file_type = sf.get("file_type", "code")
+        smap, _ = symbol_maps_by_name.get(fname, (None, sf))
+        score = _score_file_relevance(sf, smap, user_request, terms)
+        scored_files.append((score, sf))
+
+    # Sort by score descending, stable (preserves upload order for ties)
+    scored_files.sort(key=lambda x: -x[0])
+
+    # Partition into full-context vs lean-index tiers.
+    # Rules:
+    #   - Always include at least 3 files in Tier 1 (never leave Claude with nothing)
+    #   - Include up to full_context_limit files that have score > 0
+    #   - Score-0 files only get Tier 1 if we haven't reached the minimum of 3
+    MIN_TIER1 = 3
+    positively_scored = [(sc, sf) for sc, sf in scored_files if sc > 0]
+    zero_scored       = [(sc, sf) for sc, sf in scored_files if sc == 0]
+
+    # Fill Tier 1: scored files first, up to the limit
+    tier1_scored = [sf for _, sf in positively_scored[:full_context_limit]]
+    # If we haven't hit MIN_TIER1, pad with zero-scored files
+    if len(tier1_scored) < MIN_TIER1:
+        pad_needed = MIN_TIER1 - len(tier1_scored)
+        tier1_scored += [sf for _, sf in zero_scored[:pad_needed]]
+
+    tier1 = tier1_scored
+    tier1_names = {sf["filename"] for sf in tier1}
+    tier2 = [sf for sf in session_files if sf["filename"] not in tier1_names]
+
+    # Keep original upload order within each tier (more intuitive for user)
+    original_order = {sf["filename"]: i for i, sf in enumerate(session_files)}
+    tier1.sort(key=lambda sf: original_order.get(sf["filename"], 999))
+    tier2.sort(key=lambda sf: original_order.get(sf["filename"], 999))
+
+    # ── Render Tier 1: full context ───────────────────────────────────────
+    parts.append("━━━ UPLOADED FILES ━━━\n")
+
+    if tier2:
+        parts.append(
+            f"ℹ️  {len(session_files)} files total. Showing full context for the "
+            f"{len(tier1)} most relevant. The other {len(tier2)} are listed below as "
+            f"lean indexes — use <search_request> to fetch their code if needed.\n"
+        )
+
+    def _render_full(sf: dict) -> str:
+        fname      = sf["filename"]
+        content    = sf.get("content", "")
+        file_type  = sf.get("file_type", "code")
         lines_count = sf.get("lines", len(content.splitlines()))
 
         if file_type == "image":
-            parts.append(f"FILE: {fname} [IMAGE]\n")
-            continue
+            return f"FILE: {fname} [IMAGE]\n"
 
         if file_type in ("pdf", "csv", "excel", "text"):
             preview = content[:2000] + (f"\n...[{len(content)-2000} chars]" if len(content) > 2000 else "")
-            parts.append(f"FILE: {fname} [{file_type.upper()}]\nCONTENT:\n{preview}\n")
-            continue
+            return f"FILE: {fname} [{file_type.upper()}]\nCONTENT:\n{preview}\n"
 
         smap, _ = symbol_maps_by_name.get(fname, (None, sf))
 
         if smap and smap.symbols:
-            # Full symbol index — always shown so Claude knows ALL symbol names
             sym_lines = []
             for s in smap.symbols:
                 size = s.end_line - s.start_line + 1
@@ -6294,31 +6446,57 @@ def _build_natural_file_context(
                     f"L{s.start_line}–{s.end_line}  ({size}L){flag}"
                 )
             sym_index = "\n".join(sym_lines)
-
-            file_header = (
+            header = (
                 f"FILE: {fname} ({lines_count} lines)\n"
                 f"SYMBOL INDEX (use these EXACT names in surgical_edit):\n{sym_index}\n"
             )
-
             if lines_count <= 300:
-                # Small file — show everything
-                file_header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
+                header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
             else:
-                # Larger file — show full code for most relevant symbols
                 smart_ctx = _smart_code_context(fname, content, smap, user_request, max_code_lines=350)
                 if smart_ctx:
-                    file_header += smart_ctx + "\n"
+                    header += smart_ctx + "\n"
                 else:
-                    # Fallback: show first 3 symbols' full code + grep
                     grep_hit = _grep_relevant_sections(user_request, fname, content)
                     if grep_hit:
-                        file_header += grep_hit + "\n"
-
-            parts.append(file_header)
+                        header += grep_hit + "\n"
+            return header
         else:
-            # No AST parse — show content preview
             preview = content[:1500] + (f"\n...[{len(content)-1500} chars]" if len(content) > 1500 else "")
-            parts.append(f"FILE: {fname} ({lines_count} lines)\nCONTENT:\n```\n{preview}\n```\n")
+            return f"FILE: {fname} ({lines_count} lines)\nCONTENT:\n```\n{preview}\n```\n"
+
+    def _render_lean(sf: dict) -> str:
+        fname       = sf["filename"]
+        file_type   = sf.get("file_type", "code")
+        lines_count = sf.get("lines", sf.get("content", "") and len(sf["content"].splitlines()) or 0)
+
+        if file_type in ("image", "pdf", "csv", "excel", "text"):
+            return f"  {fname} [{file_type.upper()}, {lines_count}L] — use <search_request> to view"
+
+        smap, _ = symbol_maps_by_name.get(fname, (None, sf))
+        symbols  = getattr(smap, "symbols", []) if smap else []
+
+        if symbols:
+            sym_names = ", ".join(
+                s.full_path or s.name
+                for s in symbols[:20]
+            )
+            suffix = f" +{len(symbols)-20} more" if len(symbols) > 20 else ""
+            return f"  {fname} ({lines_count}L, {len(symbols)} symbols) — {sym_names}{suffix}"
+        else:
+            return f"  {fname} ({lines_count}L)"
+
+    for sf in tier1:
+        parts.append(_render_full(sf))
+
+    # ── Render Tier 2: lean index ─────────────────────────────────────────
+    if tier2:
+        parts.append(
+            "\n━━━ OTHER UPLOADED FILES (lean index — search to get code) ━━━\n"
+            "Use <search_request> with a symbol name or keyword to fetch full code.\n"
+        )
+        for sf in tier2:
+            parts.append(_render_lean(sf))
 
     return "\n".join(parts)
 
