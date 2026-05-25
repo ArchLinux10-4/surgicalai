@@ -6616,8 +6616,10 @@ async def run_natural_pipeline_stream(
         searched_terms: list = []                # terms fetched so far (avoid re-fetching)
         accumulated_search_results = ""          # injected into context each round
         current_messages = list(messages)        # grows with search result turns
+        _forced_edit_round_done = False          # only one forced-edit round allowed
 
-        for search_round in range(MAX_SEARCH_ROUNDS + 1):
+        # +2: one extra slot for the forced-edit round when budget exhausted
+        for search_round in range(MAX_SEARCH_ROUNDS + 2):
 
             state = "normal"    # "normal" | "in_edit" | "in_file" | "in_search"
             normal_buf = ""
@@ -6775,21 +6777,45 @@ async def run_natural_pipeline_stream(
                 yield sse({"type": "token", "content": normal_buf})
 
             # ── Handle search request ─────────────────────────────────────
-            if search_requested is not None and search_round < MAX_SEARCH_ROUNDS:
+            if search_requested is not None:
                 raw_terms = search_requested.get("terms", [])
                 reason = search_requested.get("reason", "")
+
+                # Budget exhausted — do one forced-edit round, then stop
+                if search_round >= MAX_SEARCH_ROUNDS or _forced_edit_round_done:
+                    if not _forced_edit_round_done:
+                        _forced_edit_round_done = True
+                        yield sse({"type": "progress",
+                                   "content": "Search limit reached — writing edits now..."})
+                        forced_msg = (
+                            f"You have used all {MAX_SEARCH_ROUNDS} search rounds. "
+                            "You already have all the code you need from previous results. "
+                            "Write your complete <surgical_edit> or <new_file> blocks RIGHT NOW. "
+                            "Do NOT emit another <search_request> — there are no more search rounds. "
+                            "Use the exact symbol names from the search results you already received."
+                        )
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": full_response or "(analyzing gathered code...)"},
+                            {"role": "user", "content": forced_msg},
+                        ]
+                        full_response = ""
+                        search_requested = None
+                        continue  # One final forced-edit round
+                    else:
+                        # Already tried forced round and Claude still wants to search — give up
+                        break
 
                 # Filter out already-searched terms
                 new_terms = [t for t in raw_terms
                              if t.lower() not in {s.lower() for s in searched_terms}]
 
                 if not new_terms:
-                    # All requested terms already searched — tell Claude
+                    # All requested terms already searched — tell Claude to write edits
                     current_messages = current_messages + [
                         {"role": "assistant", "content": full_response},
                         {"role": "user", "content":
                             "All the terms you requested have already been searched. "
-                            "Please write your edits now using the information you have."},
+                            "Write your <surgical_edit> blocks now using the information you have."},
                     ]
                     full_response = ""
                     continue
@@ -6803,15 +6829,22 @@ async def run_natural_pipeline_stream(
                 searched_terms.extend(new_terms)
                 accumulated_search_results += search_results
 
-                # Build correction turn: Claude's response so far + search results
+                # On the last permitted search round, add a strong write-now warning
+                is_last_search_round = (search_round == MAX_SEARCH_ROUNDS - 1)
+                last_round_warning = (
+                    "\n\n⚠️ FINAL SEARCH ROUND: This is the last search available. "
+                    "After reading these results you MUST write your <surgical_edit> "
+                    "or <new_file> blocks immediately. Do NOT emit another <search_request>."
+                ) if is_last_search_round else ""
+
                 search_injection = (
                     "Here are the search results you requested"
                     + (f" ({reason})" if reason else "")
                     + ":\n"
                     + search_results
-                    + "\n\nNow continue your response and write the complete "
-                    "<surgical_edit> or <new_file> blocks. "
+                    + "\n\nWrite your complete <surgical_edit> or <new_file> blocks now. "
                     "Use the EXACT symbol names shown in the results above."
+                    + last_round_warning
                 )
 
                 current_messages = current_messages + [
