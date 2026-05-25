@@ -203,10 +203,23 @@ def get_messages(session_id: str):
     msgs = []
     for r in rows:
         d = dict(r)
-        if d.get("content", "").startswith("__SURGICAL_RESULT__:"):
+        content = d.get("content", "")
+        if content.startswith("__SURGICAL_RESULT__:"):
             d["message_type"] = "surgical_result"
-            d["surgical_data"] = d["content"][len("__SURGICAL_RESULT__:"):]
-            d["content"] = ""  # don't render the raw JSON as text
+            d["surgical_data"] = content[len("__SURGICAL_RESULT__:"):]
+            d["content"] = ""
+        elif content.startswith("__NATURAL_AND_RESULT__:"):
+            try:
+                import json as _j
+                payload = _j.loads(content[len("__NATURAL_AND_RESULT__:"):])
+                d["message_type"] = "natural_result"
+                d["content"] = payload.get("text", "")
+                # Pack the result back in surgical_data for the diff card renderer
+                d["surgical_data"] = _j.dumps(payload.get("result", {}))
+            except Exception:
+                d["message_type"] = "surgical_result"
+                d["surgical_data"] = content[len("__NATURAL_AND_RESULT__:"):]
+                d["content"] = ""
         msgs.append(d)
     return msgs
 
@@ -401,7 +414,7 @@ async def smart_stream(req: dict, request: Request):
     Loads session files from DB, auto-routes to surgical edit or chat response.
     """
     from fastapi.responses import StreamingResponse
-    from services.pipeline import run_smart_pipeline_stream
+    from services.pipeline import run_natural_pipeline_stream, run_smart_pipeline_stream
 
     session_id = req.get("session_id")
     message = req.get("message", "")
@@ -460,22 +473,32 @@ async def smart_stream(req: dict, request: Request):
     conn.close()
 
     async def stream_and_save():
+        import json as _json
+
         collected_tokens = []
         result_content = None
         current_summary = session_summary
 
         # --- Rolling compaction ---
         if needs_compaction:
-            yield "data: " + __import__("json").dumps({"type": "compacting", "content": "Compacting conversation history..."}) + "\n\n"
+            yield "data: " + _json.dumps({"type": "compacting", "content": "Compacting conversation history..."}) + "\n\n"
             try:
                 new_sum = await _compact_session(session_id, current_user_id)
                 if new_sum:
                     current_summary = new_sum
             except Exception as _ce:
                 print(f"[compact] failed: {_ce}")
-            yield "data: " + __import__("json").dumps({"type": "compacting_done", "content": "History compacted"}) + "\n\n"
+            yield "data: " + _json.dumps({"type": "compacting_done", "content": "History compacted"}) + "\n\n"
 
-        async for chunk in run_smart_pipeline_stream(
+        # Use natural pipeline (Claude talks naturally, embeds <surgical_edit> tags)
+        # Fall back to legacy pipeline for non-Claude models
+        from database import get_setting as _gs
+        _arch_model = _gs("architect_model", "gpt-4.1")
+        _use_natural = _arch_model.startswith("claude-")
+
+        _pipeline = run_natural_pipeline_stream if _use_natural else run_smart_pipeline_stream
+
+        async for chunk in _pipeline(
             session_files=session_files,
             user_request=message,
             conversation_history=conversation_history,
@@ -486,25 +509,28 @@ async def smart_stream(req: dict, request: Request):
         ):
             if chunk.startswith("data: "):
                 try:
-                    import json as _json
                     data = _json.loads(chunk[6:])
-                    if data.get("type") == "token":
+                    chunk_type = data.get("type", "")
+                    if chunk_type in ("token", "chat"):
                         collected_tokens.append(data.get("content", ""))
-                    elif data.get("type") == "chat":
-                        collected_tokens.append(data.get("content", ""))
-                    elif data.get("type") == "smart_result":
+                    elif chunk_type == "smart_result":
                         result_content = data.get("content", "")
-                    elif data.get("type") == "done":
-                        # Save assistant message
+                    elif chunk_type == "done":
+                        # Save assistant message — store both natural text AND result
                         db = get_db()
                         resp_id = str(uuid.uuid4())
+                        natural_text = "".join(collected_tokens).strip()
+
                         if result_content:
-                            # Store surgical result reference
-                            import json as _j
-                            res = _j.loads(result_content)
-                            saved_content = f"__SURGICAL_RESULT__:{result_content}"
+                            # New format: stores natural text + surgical result together
+                            # so conversation history replays naturally
+                            saved_content = "__NATURAL_AND_RESULT__:" + _json.dumps({
+                                "text": natural_text,
+                                "result": _json.loads(result_content),
+                            })
                         else:
-                            saved_content = "".join(collected_tokens)
+                            saved_content = natural_text
+
                         db.execute(
                             "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
                             (resp_id, session_id, "assistant", saved_content)

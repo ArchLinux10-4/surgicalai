@@ -6,6 +6,8 @@ export interface ChatMessage {
   created_at: string
   message_type?: string
   surgical_data?: string
+  _thinking?: string
+  _steps?: string[]
 }
 
 export interface ChatSession {

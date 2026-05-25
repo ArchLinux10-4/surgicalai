@@ -169,7 +169,9 @@ export const api = {
       onDone: (fullText: string) => void,
       onError: (err: string) => void,
       onThinking?: (text: string, phase: 'start' | 'delta' | 'end') => void,
-      onCompacting?: (phase: 'start' | 'done') => void
+      onCompacting?: (phase: 'start' | 'done') => void,
+      onEditStart?: () => void,
+      onEditEnd?: () => void
     ): AbortController => {
       const controller = new AbortController()
       const tokens: string[] = []
@@ -192,7 +194,11 @@ export const api = {
             const chunk = JSON.parse(line.slice(6))
             if (chunk.type === 'progress') onProgress(chunk.content)
             else if (chunk.type === 'token') { tokens.push(chunk.content); onToken(chunk.content) }
-            else if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
+            else if (chunk.type === 'smart_result') {
+              // Natural pipeline: result may include natural_text already streamed as tokens
+              const result = JSON.parse(chunk.content)
+              onResult(result)
+            }
             else if (chunk.type === 'chat') { tokens.push(chunk.content); onToken(chunk.content) }
             else if (chunk.type === 'done') fireDone()
             else if (chunk.type === 'error') onError(chunk.content)
@@ -201,6 +207,8 @@ export const api = {
             else if (chunk.type === 'thinking_end') onThinking?.('', 'end')
             else if (chunk.type === 'compacting') onCompacting?.('start')
             else if (chunk.type === 'compacting_done') onCompacting?.('done')
+            else if (chunk.type === 'edit_start') onEditStart?.()
+            else if (chunk.type === 'edit_end') onEditEnd?.()
           } catch {}
         }
 

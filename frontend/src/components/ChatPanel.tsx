@@ -114,6 +114,7 @@ class DiffCardBoundary extends Component<{ children: React.ReactNode }, { hasErr
 function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
   const isUser = msg.role === 'user'
   const isSurgical = msg.message_type === 'surgical_result'
+  const isNaturalResult = msg.message_type === 'natural_result'
   const time = msg.created_at
     ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : ''
@@ -130,7 +131,7 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
   }
 
   let surgicalResult: SmartResult | null = null
-  if (isSurgical && msg.surgical_data) {
+  if ((isSurgical || isNaturalResult) && msg.surgical_data) {
     try { surgicalResult = JSON.parse(msg.surgical_data) } catch {}
   }
 
@@ -177,6 +178,26 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
               <InlineDiffCard result={surgicalResult} sessionId={sessionId} />
             )}
           </DiffCardBoundary>
+        ) : isNaturalResult ? (
+          /* Natural result: show markdown text first, then diff card below */
+          <div className="space-y-3">
+            {msg.content && (
+              <div className="prose-ai">
+                <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                  {msg.content}
+                </ReactMarkdown>
+              </div>
+            )}
+            {surgicalResult && (
+              <DiffCardBoundary>
+                {surgicalResult.intent === 'create' ? (
+                  <NewFileCard result={surgicalResult} sessionId={sessionId} />
+                ) : (
+                  <InlineDiffCard result={surgicalResult} sessionId={sessionId} />
+                )}
+              </DiffCardBoundary>
+            )}
+          </div>
         ) : (
           <div className="prose-ai">
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
@@ -254,7 +275,7 @@ function PersistentSteps({ steps }: { steps: string[] }) {
   )
 }
 
-function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking }: { content: string; progress: string; progressHistory: string[]; thinkingText?: string; isThinking?: boolean }) {
+function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit }: { content: string; progress: string; progressHistory: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean }) {
   const [thinkingExpanded, setThinkingExpanded] = useState(true)
   const [elapsed, setElapsed] = useState(0)
 
@@ -317,6 +338,14 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
         {/* Claude thinking block */}
         {(thinkingText || isThinking) && (
           <ThinkingBlock text={thinkingText || ''} isStreaming={!!isThinking} />
+        )}
+
+        {/* Building edit indicator — shown while parsing a <surgical_edit> block */}
+        {isBuildingEdit && (
+          <div className="flex items-center gap-2 my-2 px-3 py-2 bg-amber-500/10 border border-amber-500/25 rounded-lg text-[12px] text-amber-300/90">
+            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse flex-shrink-0" />
+            Preparing code change...
+          </div>
         )}
 
         {content ? (
@@ -443,6 +472,7 @@ export function ChatPanel() {
   const [uploadingFiles, setUploadingFiles] = useState(false)
   const [showAllFiles, setShowAllFiles] = useState(false)
   const [filesCollapsed, setFilesCollapsed] = useState(false)
+  const [isBuildingEdit, setIsBuildingEdit] = useState(false)
   const [progressHistory, setProgressHistory] = useState<string[]>([])
   const [thinkingText, setThinkingText] = useState('')
   const [isThinking, setIsThinking] = useState(false)
@@ -681,6 +711,7 @@ export function ChatPanel() {
     setProgressHistory(['Thinking...'])
     setThinkingText('')
     setIsThinking(false)
+    setIsBuildingEdit(false)
     thinkingTextRef.current = ''
     progressHistoryRef.current = ['Thinking...']
 
@@ -702,25 +733,44 @@ export function ChatPanel() {
       },
       (token) => { accumulated += token; setStreamingMessage(accumulated) },
       (result) => {
-        // Surgical result — show inline diff card
+        // Result arrived — may come with natural text already streamed
         gotResult = true
         const _thinking = thinkingTextRef.current
         const _steps = [...progressHistoryRef.current]
+        const naturalText = result.natural_text || accumulated
+
         stopStream()
-        addMessage({
-          id: Date.now().toString() + '_ai',
-          session_id: sessionId,
-          role: 'assistant',
-          message_type: 'surgical_result',
-          surgical_data: JSON.stringify(result),
-          content: '',
-          created_at: new Date().toISOString(),
-          _thinking,
-          _steps,
-        })
+        setIsBuildingEdit(false)
+
+        if (naturalText.trim()) {
+          // Natural pipeline: show both the text and the diff card together
+          addMessage({
+            id: Date.now().toString() + '_ai',
+            session_id: sessionId,
+            role: 'assistant',
+            message_type: 'natural_result',
+            surgical_data: JSON.stringify(result),
+            content: naturalText.trim(),
+            created_at: new Date().toISOString(),
+            _thinking,
+            _steps,
+          })
+        } else {
+          // Legacy pipeline: show only diff card
+          addMessage({
+            id: Date.now().toString() + '_ai',
+            session_id: sessionId,
+            role: 'assistant',
+            message_type: 'surgical_result',
+            surgical_data: JSON.stringify(result),
+            content: '',
+            created_at: new Date().toISOString(),
+            _thinking,
+            _steps,
+          })
+        }
         if (isFirstMessage) autoNameSession()
         else api.chat.getSessions().then(setSessions).catch(() => {})
-        // Re-fetch session files to keep sidebar in sync
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
       (fullText) => {
@@ -728,6 +778,7 @@ export function ChatPanel() {
         const _thinking = thinkingTextRef.current
         const _steps = [...progressHistoryRef.current]
         stopStream()
+        setIsBuildingEdit(false)
         if (fullText.trim()) {
           addMessage({
             id: Date.now().toString() + '_ai',
@@ -741,17 +792,16 @@ export function ChatPanel() {
         }
         if (isFirstMessage) autoNameSession()
         else api.chat.getSessions().then(setSessions).catch(() => {})
-        // Re-fetch session files to keep sidebar in sync
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
-      (err) => { setError(err); stopStream() },
-      // onThinking — Claude's extended thinking
+      (err) => { setError(err); stopStream(); setIsBuildingEdit(false) },
+      // onThinking
       (text, phase) => {
         if (phase === 'start') { setIsThinking(true); setThinkingText(''); thinkingTextRef.current = '' }
         else if (phase === 'delta') { setThinkingText(prev => { const next = prev + text; thinkingTextRef.current = next; return next }) }
         else if (phase === 'end') { setIsThinking(false) }
       },
-      // onCompacting — rolling history compaction
+      // onCompacting
       (phase) => {
         if (phase === 'start') {
           setIsCompacting(true)
@@ -766,7 +816,11 @@ export function ChatPanel() {
             created_at: new Date().toISOString(),
           })
         }
-      }
+      },
+      // onEditStart — Claude is writing a <surgical_edit> block
+      () => { setIsBuildingEdit(true) },
+      // onEditEnd — block complete, QA running
+      () => { setIsBuildingEdit(false) }
     )
 
     abortRef.current = ctrl
@@ -852,7 +906,7 @@ export function ChatPanel() {
               <Message key={msg.id || i} msg={msg} sessionId={activeSessions || ''} />
             ))}
             {isStreaming && (streamingMessage || streamProgress) && (
-              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} />
+              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} />
             )}
             {error && (
               <div className="mx-4 my-3 flex items-start gap-2.5 px-3.5 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-sm text-red-400">

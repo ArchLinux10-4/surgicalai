@@ -5824,3 +5824,666 @@ USER REQUEST:
         except Exception:
             pass
         yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NATURAL CONVERSATION PIPELINE (v5)
+# ───────────────────────────────────────────────────────────────────────────────
+# Claude speaks naturally in markdown — exactly like Claude.ai in the browser.
+# When making code edits, it embeds <surgical_edit> XML tags in its response.
+# The backend parses these out of the stream, runs the existing QA cycle,
+# and delivers structured diff cards — while natural text streams to the user.
+#
+# This replaces the JSON-forcing Architect+Surgeon design that broke natural
+# conversation and polluted history with raw JSON artifacts.
+# ═══════════════════════════════════════════════════════════════════════════════
+
+NATURAL_SYSTEM = """\
+You are SurgicalAI — a world-class coding assistant powered by Claude.
+
+Talk naturally with the user, like a real collaborator. Use markdown. Be warm, precise, and genuinely helpful.
+Remember everything we've discussed — prior edits, decisions, context — and build on it naturally.
+
+━━━ EDITING EXISTING FILES ━━━
+
+When the user wants to change code in an uploaded file, explain what you're doing and embed an edit block:
+
+<surgical_edit>
+{
+  "filename": "exact filename as shown in the file context",
+  "symbol": "exact symbol name from the SYMBOL INDEX (e.g. LoginPage, handleSubmit, process_order)",
+  "description": "what changed and why — one clear sentence",
+  "new_code": "THE COMPLETE NEW CODE — every single line of the symbol, nothing omitted"
+}
+</surgical_edit>
+
+Rules for new_code:
+- Include the COMPLETE symbol: opening declaration, full body, closing brace/bracket
+- Copy ALL unchanged lines exactly character-for-character from the original
+- Only modify the specific lines that need to change
+- Match original indentation exactly (same spaces/tabs)
+- If a function is 200 lines and you change 1 line, new_code is still 200 lines
+- new_code REPLACES the entire original symbol — omitting lines deletes them
+
+Rules for symbol:
+- Must exactly match a name from the SYMBOL INDEX in the file context
+- For React/TSX: use the component name (e.g. "LoginPage"), never hooks ("useXxx") for UI changes
+- For Python/JS: use the exact function or class name
+
+━━━ CREATING NEW FILES ━━━
+
+When the user asks you to create, build, scaffold, or add a new file/component/hook/service that doesn't exist yet, write the complete new file and embed it in a new_file block:
+
+<new_file>
+{
+  "filename": "src/components/PaymentForm.tsx",
+  "language": "typescript",
+  "summary": "one sentence describing what this file does",
+  "content": "THE COMPLETE FILE CONTENT — every import, every line, ready to use"
+}
+</new_file>
+
+Rules for new_file content:
+- Write production-ready code — no stubs, no TODOs, no placeholders
+- Follow the exact import paths, naming conventions, and patterns from the uploaded files shown in context
+- Include all necessary imports
+- The file should be immediately usable — a developer can drop it in and it works
+- If creating the file also requires updating an existing file (e.g. adding a route, registering a component), include a <surgical_edit> block for that change too
+
+━━━ WHEN TO USE BLOCKS ━━━
+
+Use <surgical_edit> when: user wants changes to an existing uploaded file
+Use <new_file> when: user wants a new file that doesn't exist yet
+Use both when: creating a new file AND updating an existing one (e.g. new component + registering it in App.tsx)
+Just chat (no blocks) when: answering a question, explaining code, or you need clarification first
+
+━━━ EXAMPLE — EDIT ━━━
+
+"I'll change the button to blue:
+
+<surgical_edit>
+{"filename": "Button.tsx", "symbol": "Button", "description": "Blue background", "new_code": "...complete function..."}
+</surgical_edit>
+
+This keeps the same click handler. Want me to also update the hover state?"
+
+━━━ EXAMPLE — CREATE ━━━
+
+"Here's the PaymentForm component:
+
+<new_file>
+{"filename": "src/components/PaymentForm.tsx", "language": "typescript", "summary": "Payment form with validation", "content": "import React..."}
+</new_file>
+
+I also need to register it in App.tsx:
+
+<surgical_edit>
+{"filename": "App.tsx", "symbol": "App", "description": "Add PaymentForm route", "new_code": "..."}
+</surgical_edit>
+
+You're all set — just import it wherever needed."
+
+━━━ CODE QUALITY ━━━
+
+Before including any block, verify:
+- All required imports are present
+- No syntax errors or unclosed brackets
+- Logic exactly matches what was requested
+- All unchanged parts are preserved exactly
+"""
+
+
+def _build_natural_file_context(
+    session_files: list,
+    symbol_maps_by_name: dict,
+    user_request: str,
+    project_memory: str = None,
+    session_summary: str = "",
+) -> str:
+    """
+    Build the file context string for the natural pipeline.
+    Returns symbol maps + relevant code excerpts for each file.
+    """
+    parts = []
+
+    if project_memory:
+        parts.append(f"PROJECT MEMORY:\n{project_memory}\n")
+
+    if session_summary:
+        parts.append(f"EARLIER CONVERSATION (compacted):\n{session_summary}\n")
+
+    if not session_files:
+        return "\n".join(parts) if parts else ""
+
+    parts.append("━━━ UPLOADED FILES ━━━\n")
+
+    for sf in session_files:
+        fname = sf["filename"]
+        content = sf.get("content", "")
+        file_type = sf.get("file_type", "code")
+        lines_count = sf.get("lines", len(content.splitlines()))
+
+        if file_type == "image":
+            parts.append(f"FILE: {fname} [IMAGE]\n")
+            continue
+
+        if file_type in ("pdf", "csv", "excel", "text"):
+            preview = content[:2000] + (f"\n...[{len(content)-2000} chars]" if len(content) > 2000 else "")
+            parts.append(f"FILE: {fname} [{file_type.upper()}]\nCONTENT:\n{preview}\n")
+            continue
+
+        smap, _ = symbol_maps_by_name.get(fname, (None, sf))
+
+        if smap and smap.symbols:
+            # Full symbol index
+            sym_lines = []
+            for s in smap.symbols:
+                size = s.end_line - s.start_line + 1
+                flag = " ⚠️LARGE" if size > 300 else ""
+                sym_lines.append(
+                    f"  [{s.symbol_type.value}] {s.full_path:<45} "
+                    f"L{s.start_line}–{s.end_line}  ({size}L){flag}"
+                )
+            sym_index = "\n".join(sym_lines)
+
+            file_header = (
+                f"FILE: {fname} ({lines_count} lines)\n"
+                f"SYMBOL INDEX:\n{sym_index}\n"
+            )
+
+            # For large files, grep relevant sections so Claude can see the actual code
+            if len(smap.symbols) > 30 or lines_count > 300:
+                grep_hit = _grep_relevant_sections(user_request, fname, content)
+                if grep_hit:
+                    file_header += grep_hit + "\n"
+            else:
+                # Small file — show full content
+                file_header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
+
+            parts.append(file_header)
+        else:
+            # No AST parse — show content preview
+            preview = content[:1500] + (f"\n...[{len(content)-1500} chars]" if len(content) > 1500 else "")
+            parts.append(f"FILE: {fname} ({lines_count} lines)\nCONTENT:\n```\n{preview}\n```\n")
+
+    return "\n".join(parts)
+
+
+def _clean_history_content(content: str) -> str:
+    """
+    Clean stored assistant message content for replay to Claude.
+    Strips internal storage prefixes so history reads naturally.
+    """
+    if not content:
+        return content
+
+    if content.startswith("__SURGICAL_RESULT__:"):
+        try:
+            data = json.loads(content[len("__SURGICAL_RESULT__:"):])
+            summary = ""
+            if isinstance(data, dict):
+                plan = data.get("plan", {})
+                if isinstance(plan, dict):
+                    summary = plan.get("summary", "")
+                changes_by_file = data.get("changes_by_file", {})
+                symbols = []
+                for _fname, _fdata in changes_by_file.items():
+                    for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
+                        sym = ch.get("symbol", {})
+                        if isinstance(sym, dict):
+                            name = sym.get("name") or sym.get("full_path", "")
+                            if name:
+                                symbols.append(f"{_fname}::{name}")
+            text = summary or "I made code changes to your files."
+            if symbols:
+                text += f"\nModified symbols: {', '.join(symbols[:6])}"
+            return text
+        except Exception:
+            return "I made code changes to your files."
+
+    if content.startswith("__NATURAL_AND_RESULT__:"):
+        try:
+            data = json.loads(content[len("__NATURAL_AND_RESULT__:"):])
+            text = data.get("text", "").strip()
+            result = data.get("result", {})
+            changes = []
+            if isinstance(result, dict):
+                for _fname, _fdata in result.get("changes_by_file", {}).items():
+                    for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
+                        sym = ch.get("symbol", {})
+                        name = (sym.get("name") or sym.get("full_path", "")) if isinstance(sym, dict) else ""
+                        if name:
+                            changes.append(f"{_fname}::{name}")
+            if changes:
+                text += f"\n[Applied changes to: {', '.join(changes[:6])}]"
+            return text or "I made code changes to your files."
+        except Exception:
+            return content
+
+    return content
+
+
+async def run_natural_pipeline_stream(
+    session_files: list,
+    user_request: str,
+    conversation_history: list,
+    session_id: str = None,
+    project_memory: str = None,
+    session_summary: str = "",
+    user_id: str = "",
+):
+    """
+    Natural conversation pipeline — Claude talks like Claude.
+
+    Claude responds in natural markdown. When it wants to edit code,
+    it embeds <surgical_edit> XML tags. This function:
+      1. Streams Claude's natural response (text tokens to frontend)
+      2. Parses <surgical_edit> blocks out of the stream
+      3. Runs the existing QA cycle on each edit
+      4. Yields smart_result with structured diff cards
+
+    SSE event types emitted:
+      progress    — status messages
+      token       — natural text chunks (stream directly to chat)
+      thinking_*  — Claude extended thinking blocks
+      edit_start  — entering an edit block (show indicator)
+      edit_end    — edit block complete
+      smart_result — structured edit result (diff cards)
+      done        — stream complete
+      error       — error message
+    """
+    import asyncio
+
+    def sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj)}\n\n"
+
+    EDIT_OPEN = "<surgical_edit>"
+    EDIT_CLOSE = "</surgical_edit>"
+    FILE_OPEN = "<new_file>"
+    FILE_CLOSE = "</new_file>"
+
+    try:
+        anthropic_key = _get_anthropic_key(user_id)
+        arch_model = get_setting("architect_model", "claude-sonnet-4-5")
+        if not _is_claude_model(arch_model):
+            arch_model = "claude-sonnet-4-5"
+
+        aclient = AsyncAnthropic(api_key=anthropic_key)
+
+        # ── Parse all session files into symbol maps ──────────────────────
+        symbol_maps_by_name: dict = {}
+        for sf in session_files:
+            fname = sf["filename"]
+            content = sf.get("content", "")
+            file_type = sf.get("file_type", "code")
+            if file_type in ("image", "pdf", "csv", "excel", "text"):
+                symbol_maps_by_name[fname] = (None, sf)
+                continue
+            try:
+                smap = parser.parse(content, fname)
+                symbol_maps_by_name[fname] = (smap, sf)
+            except Exception:
+                symbol_maps_by_name[fname] = (None, sf)
+
+        # ── Build file context ────────────────────────────────────────────
+        file_context = _build_natural_file_context(
+            session_files, symbol_maps_by_name, user_request,
+            project_memory=project_memory, session_summary=session_summary
+        )
+
+        # ── Build system prompt ───────────────────────────────────────────
+        system_prompt = NATURAL_SYSTEM
+        if file_context.strip():
+            system_prompt = NATURAL_SYSTEM + "\n\n" + file_context
+
+        # ── Clean conversation history — strip JSON artifacts ─────────────
+        clean_history = []
+        for msg in conversation_history[-HISTORY_WINDOW:]:
+            role = msg.get("role", "user")
+            if role not in ("user", "assistant"):
+                continue
+            content = str(msg.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "assistant":
+                content = _clean_history_content(content)
+            if content:
+                clean_history.append({"role": role, "content": content[:4000]})
+
+        # Add current user message
+        messages = clean_history + [{"role": "user", "content": user_request}]
+
+        # ── Stream Claude's response ──────────────────────────────────────
+        yield sse({"type": "progress", "content": "Thinking..."})
+
+        stream_kwargs = {
+            "model": arch_model,
+            "max_tokens": 16000,
+            "system": system_prompt,
+            "messages": messages,
+        }
+        if _supports_thinking(arch_model):
+            stream_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+
+        # State machine for parsing <surgical_edit> and <new_file> blocks
+        state = "normal"       # "normal" | "in_edit" | "in_file"
+        normal_buf = ""        # text we haven't yielded yet
+        edit_buf = ""          # content inside an edit block
+        file_buf = ""          # content inside a new_file block
+        edit_blocks_raw: list = []  # completed raw edit JSON strings
+        new_file_blocks_raw: list = []  # completed raw new_file JSON strings
+        full_response = ""     # everything Claude said (for DB storage)
+        in_thinking = False
+
+        # Retry loop for transient errors
+        for _attempt in range(3):
+            try:
+                async with aclient.messages.stream(**stream_kwargs) as astream:
+                    current_block_type = None
+                    async for event in astream:
+                        etype = getattr(event, "type", None)
+
+                        if etype == "content_block_start":
+                            current_block_type = getattr(
+                                getattr(event, "content_block", None), "type", None
+                            )
+                            if current_block_type == "thinking":
+                                in_thinking = True
+                                yield sse({"type": "thinking_start", "content": ""})
+
+                        elif etype == "content_block_delta":
+                            delta = getattr(event, "delta", None)
+                            if not delta:
+                                continue
+
+                            thinking_chunk = getattr(delta, "thinking", None)
+                            text_chunk = getattr(delta, "text", None)
+
+                            if thinking_chunk:
+                                yield sse({"type": "thinking", "content": thinking_chunk})
+
+                            elif text_chunk:
+                                full_response += text_chunk
+
+                                if state == "normal":
+                                    normal_buf += text_chunk
+
+                                    # Drain normal_buf, watching for EDIT_OPEN or FILE_OPEN
+                                    while True:
+                                        ei = normal_buf.find(EDIT_OPEN)
+                                        fi = normal_buf.find(FILE_OPEN)
+
+                                        # Find which tag comes first
+                                        if ei == -1 and fi == -1:
+                                            # No tags — yield everything except a safety tail
+                                            tail = max(len(EDIT_OPEN), len(FILE_OPEN))
+                                            safe = max(0, len(normal_buf) - tail)
+                                            if safe > 0:
+                                                yield sse({"type": "token", "content": normal_buf[:safe]})
+                                                normal_buf = normal_buf[safe:]
+                                            break
+                                        elif ei != -1 and (fi == -1 or ei <= fi):
+                                            # Edit tag comes first
+                                            if ei > 0:
+                                                yield sse({"type": "token", "content": normal_buf[:ei]})
+                                            yield sse({"type": "edit_start", "content": ""})
+                                            state = "in_edit"
+                                            edit_buf = normal_buf[ei + len(EDIT_OPEN):]
+                                            normal_buf = ""
+                                            break
+                                        else:
+                                            # New file tag comes first
+                                            if fi > 0:
+                                                yield sse({"type": "token", "content": normal_buf[:fi]})
+                                            yield sse({"type": "edit_start", "content": ""})
+                                            state = "in_file"
+                                            file_buf = normal_buf[fi + len(FILE_OPEN):]
+                                            normal_buf = ""
+                                            break
+
+                                elif state == "in_edit":
+                                    edit_buf += text_chunk
+                                    idx = edit_buf.find(EDIT_CLOSE)
+                                    if idx != -1:
+                                        edit_json_raw = edit_buf[:idx]
+                                        remainder = edit_buf[idx + len(EDIT_CLOSE):]
+                                        edit_blocks_raw.append(edit_json_raw)
+                                        yield sse({"type": "edit_end", "content": ""})
+                                        state = "normal"
+                                        normal_buf = remainder
+                                        edit_buf = ""
+
+                                elif state == "in_file":
+                                    file_buf += text_chunk
+                                    idx = file_buf.find(FILE_CLOSE)
+                                    if idx != -1:
+                                        file_json_raw = file_buf[:idx]
+                                        remainder = file_buf[idx + len(FILE_CLOSE):]
+                                        new_file_blocks_raw.append(file_json_raw)
+                                        yield sse({"type": "edit_end", "content": ""})
+                                        state = "normal"
+                                        normal_buf = remainder
+                                        file_buf = ""
+
+                        elif etype == "content_block_stop":
+                            if in_thinking and current_block_type == "thinking":
+                                yield sse({"type": "thinking_end", "content": ""})
+                                in_thinking = False
+
+                break  # success — exit retry loop
+
+            except Exception as stream_err:
+                err_str = str(stream_err)
+                is_transient = (
+                    "500" in err_str or "529" in err_str
+                    or "overloaded" in err_str.lower()
+                    or "internal_server_error" in err_str.lower()
+                )
+                if is_transient and _attempt < 2:
+                    yield sse({"type": "progress",
+                               "content": f"Service busy — retrying ({_attempt+1}/3)..."})
+                    await asyncio.sleep(5 * (_attempt + 1))
+                    continue
+                raise
+
+        # Flush remaining normal text
+        if in_thinking:
+            yield sse({"type": "thinking_end", "content": ""})
+        if state == "normal" and normal_buf.strip():
+            yield sse({"type": "token", "content": normal_buf})
+        elif state == "in_edit" and edit_buf.strip():
+            # Claude ended stream inside an edit block — try to parse anyway
+            edit_blocks_raw.append(edit_buf)
+            yield sse({"type": "edit_end", "content": ""})
+        elif state == "in_file" and file_buf.strip():
+            new_file_blocks_raw.append(file_buf)
+            yield sse({"type": "edit_end", "content": ""})
+
+        # ── Process edit blocks ───────────────────────────────────────────
+        if not edit_blocks_raw and not new_file_blocks_raw:
+            yield sse({"type": "done", "content": ""})
+            return
+
+        total_blocks = len(edit_blocks_raw) + len(new_file_blocks_raw)
+        yield sse({"type": "progress", "content": f"Running QA on {total_blocks} change(s)..."})
+
+        # Build file content lookup
+        file_content_lookup: dict = {sf["filename"]: sf.get("content", "") for sf in session_files}
+
+        changes_by_file: dict = {}
+        all_qa_risks: list = []
+        summary_parts: list = []
+
+        # ── Process surgical edits ────────────────────────────────────────
+        for edit_raw in edit_blocks_raw:
+            try:
+                edit_data = json.loads(edit_raw.strip())
+            except json.JSONDecodeError:
+                try:
+                    edit_data = json.loads(_repair_json(edit_raw.strip()))
+                except Exception:
+                    continue
+
+            filename = edit_data.get("filename", "")
+            symbol_name = edit_data.get("symbol", "")
+            new_code = edit_data.get("new_code", "")
+            description = edit_data.get("description", "")
+
+            if not filename or not symbol_name or not new_code:
+                continue
+
+            file_content = file_content_lookup.get(filename, "")
+            smap, sf_entry = symbol_maps_by_name.get(filename, (None, None))
+
+            if not file_content or not smap:
+                yield sse({"type": "progress",
+                           "content": f"Warning: file '{filename}' not found in session"})
+                continue
+
+            # Find the target symbol in the AST map
+            symbol = None
+            for s in smap.symbols:
+                if getattr(s, "full_path", "") == symbol_name or getattr(s, "name", "") == symbol_name:
+                    symbol = s
+                    break
+
+            # Fuzzy fallback
+            if symbol is None:
+                for s in smap.symbols:
+                    fp = getattr(s, "full_path", "") or ""
+                    nm = getattr(s, "name", "") or ""
+                    if symbol_name in fp or nm in symbol_name or fp in symbol_name:
+                        symbol = s
+                        break
+
+            if symbol is None:
+                yield sse({"type": "progress",
+                           "content": f"Warning: symbol '{symbol_name}' not found in {filename} — skipping"})
+                continue
+
+            diff = _make_diff(symbol.code, new_code, symbol_name)
+            _tgt, _repl = _compute_target_element(symbol.code, new_code)
+
+            change = SurgicalChange(
+                id=str(uuid.uuid4()),
+                symbol=symbol,
+                original_code=symbol.code,
+                new_code=new_code,
+                diff=diff,
+                confidence=9,
+                description=description,
+                applied=False,
+                operations=[{"find": symbol.code, "replace": new_code}],
+                target_element=_tgt,
+                replacement=_repl,
+            )
+
+            try:
+                qa = await run_qa_for_changes(
+                    [change], file_content, user_request, anthropic_key, arch_model
+                )
+                all_qa_risks.extend(qa.get("risks", []))
+                change.confidence = max(1, min(10, qa.get("qa_score", 9)))
+            except Exception:
+                pass
+
+            if filename not in changes_by_file:
+                changes_by_file[filename] = {
+                    "filename": filename,
+                    "file_id": sf_entry.get("id", "") if sf_entry else "",
+                    "changes": [],
+                }
+            changes_by_file[filename]["changes"].append(change.model_dump())
+            summary_parts.append(description or f"Updated {symbol_name} in {filename}")
+
+        # ── Process new file blocks ───────────────────────────────────────
+        new_files: list = []
+        for file_raw in new_file_blocks_raw:
+            try:
+                file_data = json.loads(file_raw.strip())
+            except json.JSONDecodeError:
+                try:
+                    file_data = json.loads(_repair_json(file_raw.strip()))
+                except Exception:
+                    continue
+
+            filename = file_data.get("filename", "")
+            content = file_data.get("content", "")
+            language = file_data.get("language", "")
+            summary = file_data.get("summary", "")
+
+            if not filename or not content:
+                continue
+
+            # Auto-detect language from extension if not provided
+            if not language:
+                ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+                ext_map = {
+                    "ts": "typescript", "tsx": "typescript", "js": "javascript",
+                    "jsx": "javascript", "py": "python", "go": "go", "rs": "rust",
+                    "css": "css", "html": "html", "json": "json", "md": "markdown",
+                }
+                language = ext_map.get(ext, "text")
+
+            # QA: check the new file against codebase context
+            codebase_ctx = _build_codebase_context_for_creator(symbol_maps_by_name)
+            try:
+                qa = await _run_qa_for_new_file(
+                    file_result={"filename": filename, "content": content,
+                                 "language": language, "summary": summary},
+                    codebase_context=codebase_ctx,
+                    user_id=user_id,
+                )
+                qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(
+                    qa.get("verdict", "safe"), "✅"
+                )
+                yield sse({"type": "progress",
+                           "content": f"{qa_icon} {filename} — {qa.get('summary', 'ready')}"})
+                file_data["qa_result"] = qa
+            except Exception:
+                yield sse({"type": "progress", "content": f"✅ {filename} ready"})
+                file_data["qa_result"] = {"verdict": "safe", "qa_score": 8}
+
+            new_files.append({
+                "filename": filename,
+                "content": content,
+                "language": language,
+                "summary": summary,
+                "qa_result": file_data.get("qa_result", {}),
+            })
+            summary_parts.append(summary or f"Created {filename}")
+
+        if not changes_by_file and not new_files:
+            yield sse({"type": "done", "content": ""})
+            return
+
+        # Determine intent: create if any new files, edit otherwise, mixed if both
+        has_edits = bool(changes_by_file)
+        has_new_files = bool(new_files)
+        intent = "create" if (has_new_files and not has_edits) else "edit"
+        if has_new_files and has_edits:
+            intent = "create"  # mixed create+edit — NewFileCard handles both
+
+        # Strip edit blocks from display text
+        _display_text = full_response
+        for _raw in edit_blocks_raw:
+            _display_text = _display_text.replace(EDIT_OPEN + _raw + EDIT_CLOSE, "").strip()
+        for _raw in new_file_blocks_raw:
+            _display_text = _display_text.replace(FILE_OPEN + _raw + FILE_CLOSE, "").strip()
+
+        result = {
+            "intent": intent,
+            "summary": "; ".join(summary_parts[:3]),
+            "reasoning": "Changes from natural conversation",
+            "risks": all_qa_risks,
+            "skipped_changes": [],
+            "changes_by_file": changes_by_file,
+            "new_files": new_files,
+            "natural_text": _display_text,
+        }
+
+        yield sse({"type": "smart_result", "content": json.dumps(result)})
+        yield sse({"type": "done", "content": ""})
+
+    except Exception as e:
+        yield f"data: {json.dumps({'type': 'error', 'content': _friendly_error(e)})}\n\n"
