@@ -6951,17 +6951,25 @@ async def run_natural_pipeline_stream(
 
             correction_text = _build_symbol_correction(still_unresolved, symbol_maps_by_name)
             correction_msgs = messages + [
-                {"role": "assistant", "content": full_response},
+                {"role": "assistant", "content": full_response or "(analyzing code...)"},
                 {"role": "user", "content": correction_text},
             ]
 
             try:
-                corr_resp = await aclient.messages.create(
+                # Run non-streaming call with keepalive pings so proxy stays alive
+                _corr_task = asyncio.create_task(aclient.messages.create(
                     model=arch_model,
                     max_tokens=8000,
                     system=system_prompt,
                     messages=correction_msgs,
-                )
+                ))
+                while not _corr_task.done():
+                    try:
+                        await asyncio.wait_for(asyncio.shield(_corr_task), timeout=20.0)
+                    except asyncio.TimeoutError:
+                        yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+                corr_resp = _corr_task.result()
+
                 corr_text = "".join(
                     block.text for block in corr_resp.content if hasattr(block, "text")
                 )
@@ -6986,11 +6994,14 @@ async def run_natural_pipeline_stream(
                     skipped_messages.append(f"Symbol '{item['symbol']}' not found in {item['filename']} — skipped")
                 break
 
-        # ── Build SurgicalChange objects with full QA ─────────────────────
+        # ── Build SurgicalChange objects with parallel QA ────────────────────
+        # Run all QA checks concurrently (asyncio.gather) so 2 changes take the
+        # same time as 1. Send SSE keepalive pings every 20 s so Railway/Vercel
+        # doesn't kill the connection during long QA runs.
+
         yield sse({"type": "progress", "content": f"Running QA on {len(resolved_edits)} change(s)..."})
 
-        # Build other-files context for QA — same symbol map data the architect saw.
-        # QA must have the same view as the architect (same files, same structure).
+        # Build shared context once — same view the architect had
         _qa_other_parts = []
         for _fn, (_sm, _sf) in symbol_maps_by_name.items():
             if _sm is None:
@@ -7003,75 +7014,102 @@ async def run_natural_pipeline_stream(
             import_block = ("IMPORTS:\n" + "\n".join(f"  {i}" for i in imports) + "\n") if imports else ""
             _qa_other_parts.append(f"FILE: {_fn}\n{import_block}SYMBOLS:\n" + "\n".join(_syms_brief))
         _qa_other_context = "\n\n".join(_qa_other_parts)
-
-        # If search results were fetched during the architect phase, include them
-        # so QA has full visibility into any code that influenced the edit.
         if accumulated_search_results:
             _qa_other_context += "\n\n" + accumulated_search_results
 
-        # Build same-run context (descriptions of other changes in this request)
         _all_descriptions = [
             r["edit_data"].get("description", "")
-            for r in resolved_edits
-            if r["edit_data"].get("description")
+            for r in resolved_edits if r["edit_data"].get("description")
         ]
 
         from models.schemas import QAResult as _QAResult
 
+        # Pre-build diffs and change shells (no I/O — instant)
+        change_shells = []
         for i, resolved in enumerate(resolved_edits):
-            edit_data = resolved["edit_data"]
-            symbol = resolved["symbol"]
-            sf_entry = resolved["sf_entry"]
+            edit_data  = resolved["edit_data"]
+            symbol     = resolved["symbol"]
+            sf_entry   = resolved["sf_entry"]
             file_content = resolved["file_content"]
-            filename = resolved["filename"]
-            new_code = edit_data.get("new_code", "")
+            filename   = resolved["filename"]
+            new_code   = edit_data.get("new_code", "")
             description = edit_data.get("description", "")
 
-            diff = _make_diff(symbol.code, new_code, symbol.name)
+            diff  = _make_diff(symbol.code, new_code, symbol.name)
             _tgt, _repl = _compute_target_element(symbol.code, new_code)
 
-            # Other changes in this same request (so QA knows about cross-symbol deps)
             _same_run = "\n".join(
-                f"  • {d}" for j, d in enumerate(_all_descriptions)
-                if j != i and d
+                f"  • {d}" for j, d in enumerate(_all_descriptions) if j != i and d
             )
 
-            # Targeted context: callers/usages of this symbol in other files
             _targeted_ctx = ""
             try:
                 from services.context_resolver import resolve_context_requests as _rcr
                 if symbol.name:
                     _targeted_ctx = _rcr(
-                        requests=[
-                            {"type": "callers", "name": symbol.name},
-                            {"type": "usages",  "name": symbol.name},
-                        ],
+                        requests=[{"type": "callers", "name": symbol.name},
+                                  {"type": "usages",  "name": symbol.name}],
                         symbol_maps_by_name=symbol_maps_by_name,
                         requesting_file=filename,
                     )
             except Exception:
                 pass
 
-            # ── Run full QA agent — same as old pipeline ──────────────────
-            qa_dict = await run_qa_agent(
-                original_code=symbol.code,
-                new_code=new_code,
-                change_description=description,
-                new_logic=description,
-                symbol_path=symbol.name,
-                filename=filename,
+            change_shells.append({
+                "symbol": symbol, "sf_entry": sf_entry, "file_content": file_content,
+                "filename": filename, "new_code": new_code, "description": description,
+                "diff": diff, "_tgt": _tgt, "_repl": _repl,
+                "same_run": _same_run, "targeted_ctx": _targeted_ctx,
+            })
+
+        # Launch all QA calls concurrently
+        qa_tasks = [
+            asyncio.create_task(run_qa_agent(
+                original_code=cs["symbol"].code,
+                new_code=cs["new_code"],
+                change_description=cs["description"],
+                new_logic=cs["description"],
+                symbol_path=cs["symbol"].name,
+                filename=cs["filename"],
                 other_files_context=_qa_other_context,
                 session_id=session_id or "",
                 user_id=user_id,
                 architect_risks=all_qa_risks,
-                targeted_context=_targeted_ctx,
+                targeted_context=cs["targeted_ctx"],
                 qa_feedback=None,
-                same_run_context=_same_run,
-            )
+                same_run_context=cs["same_run"],
+            ))
+            for cs in change_shells
+        ]
+
+        # Wait for all QA to finish, sending keepalives every 20 s
+        pending = set(qa_tasks)
+        while pending:
+            done_set, pending = await asyncio.wait(pending, timeout=20.0)
+            if pending:
+                # SSE keepalive — keeps Railway/Vercel proxy alive, ignored by frontend
+                yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+
+        qa_results = []
+        for t in qa_tasks:
+            try:
+                qa_results.append(t.result())
+            except Exception:
+                qa_results.append({
+                    "verdict": "warning", "qa_score": 7,
+                    "summary": "QA could not run", "import_issues": [],
+                    "downstream_risks": [], "type_errors": [],
+                    "plan_deviation": "", "risk_verdicts": [],
+                })
+
+        # Assemble SurgicalChange objects from results
+        for i, (cs, qa_dict) in enumerate(zip(change_shells, qa_results)):
+            symbol = cs["symbol"]
+            filename = cs["filename"]
+            sf_entry = cs["sf_entry"]
 
             all_qa_risks.extend(qa_dict.get("downstream_risks", []))
 
-            # Attach full QAResult to the change so InlineDiffCard can render it
             qa_result_obj = _QAResult(
                 verdict=qa_dict.get("verdict", "skipped"),
                 qa_score=qa_dict.get("qa_score"),
@@ -7083,11 +7121,15 @@ async def run_natural_pipeline_stream(
                 risk_verdicts=qa_dict.get("risk_verdicts", []),
             )
 
+            verdict_icon = (
+                "\u2705" if qa_dict.get("verdict") == "safe"
+                else "\u26a0\ufe0f" if qa_dict.get("verdict") == "warning"
+                else "\U0001f6ab"
+            )
             yield sse({
                 "type": "progress",
                 "content": (
-                    f"QA {'✅' if qa_dict.get('verdict') == 'safe' else '⚠️' if qa_dict.get('verdict') == 'warning' else '🚫'} "
-                    f"{qa_dict.get('summary', '')} "
+                    f"QA {verdict_icon} {qa_dict.get('summary', '')} "
                     f"(score: {qa_dict.get('qa_score', '?')})"
                 ),
             })
@@ -7096,15 +7138,15 @@ async def run_natural_pipeline_stream(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
                 original_code=symbol.code,
-                new_code=new_code,
-                diff=diff,
+                new_code=cs["new_code"],
+                diff=cs["diff"],
                 confidence=qa_dict.get("qa_score") or 9,
-                description=description,
+                description=cs["description"],
                 applied=False,
                 qa_result=qa_result_obj,
-                operations=[{"find": symbol.code, "replace": new_code}],
-                target_element=_tgt,
-                replacement=_repl,
+                operations=[{"find": symbol.code, "replace": cs["new_code"]}],
+                target_element=cs["_tgt"],
+                replacement=cs["_repl"],
             )
 
             if filename not in changes_by_file:
@@ -7114,7 +7156,7 @@ async def run_natural_pipeline_stream(
                     "changes": [],
                 }
             changes_by_file[filename]["changes"].append(change.model_dump())
-            summary_parts.append(description or f"Updated {symbol.name} in {filename}")
+            summary_parts.append(cs["description"] or f"Updated {symbol.name} in {filename}")
 
         # ── Process new file blocks ───────────────────────────────────────
         new_files: list = []
