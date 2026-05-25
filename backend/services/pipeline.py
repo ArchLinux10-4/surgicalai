@@ -3295,7 +3295,7 @@ The Surgeon has produced a code change. Your job: verify the new code is correct
 You receive:
 - CHANGE PLAN: what was requested (description + expected behavior)
 - ORIGINAL CODE: the complete, untruncated code block before the change
-- NEW CODE: the complete, untruncated code block after the change
+- NEW CODE: the complete, untrancated code block after the change
 - OTHER FILES CONTEXT: symbol maps of other files for cross-file checks
 
 IMPORTANT: You have the FULL original and FULL new code — there is no truncation.
@@ -3311,12 +3311,19 @@ Check ALL of the following by comparing ORIGINAL → NEW:
 6. DUPLICATION — is any function, component, or block defined twice?
 7. DOWNSTREAM RISKS — does this change break signatures, exported types, or constants other files depend on?
 8. ARCHITECT RISKS — evaluate each provided risk against actual code changes.
+9. LOGIC CORRECTNESS — mentally trace through the NEW CODE with 1-2 concrete examples:
+   - Pick realistic input values and follow the execution path step by step
+   - Verify the output/behaviour matches what the CHANGE PLAN describes
+   - Flag any logic errors: wrong operator, off-by-one, inverted condition, missing edge case
+   - Example: if the plan says "calculate tax at 10%", trace: input=100 → tax=100*0.10=10 → total=110 ✓
+   - If you find a logic error that would produce wrong results in normal use, score ≤ 4 (blocked)
+   - If the logic looks correct for the described cases, note it as verified
 
 SCORING RULES (ENFORCE STRICTLY):
-9-10 → safe:    Change exactly matches plan, no issues, all imports present
+9-10 → safe:    Change exactly matches plan, logic verified, no issues, all imports present
 7-8  → safe:    Minor style notes but nothing breaking
 5-6  → warning: Potential issue user should review (unclear import, subtle type change, minor scope creep)
-3-4  → blocked: Likely broken — missing critical imports, wrong signature, obvious logic error
+3-4  → blocked: Likely broken — missing critical imports, wrong signature, obvious logic error, wrong formula
 1-2  → blocked: Severely wrong — duplicated code, plan not implemented, syntax errors
 
 verdict MUST match score:
@@ -3335,12 +3342,14 @@ Respond with ONLY valid JSON — no text outside the JSON object:
   "import_issues": ["<issue>"],
   "downstream_risks": ["<risk>"],
   "type_errors": ["<error>"],
+  "logic_errors": ["<describe any logic error found — empty array if logic verified correct>"],
   "plan_deviation": "<empty string if none, or exact description of deviation>",
   "risk_verdicts": [
     {"risk": "<exact text from architect_risks>", "status": "verified_safe|warning|blocked", "reason": "<one sentence>"}
   ]
 }
-risk_verdicts must have one entry per item in architect_risks. If architect_risks is empty, return []."""
+risk_verdicts must have one entry per item in architect_risks. If architect_risks is empty, return [].
+logic_errors must be present — use [] if no logic errors found."""
 
 
 async def run_qa_agent(
@@ -7214,20 +7223,38 @@ async def run_natural_pipeline_stream(
 
         # Pre-build diffs and change shells (no I/O — instant)
         change_shells = []
-        for i, resolved in enumerate(resolved_edits):
-            edit_data  = resolved["edit_data"]
-            symbol     = resolved["symbol"]
-            sf_entry   = resolved["sf_entry"]
-            file_content = resolved["file_content"]
-            filename   = resolved["filename"]
-            new_code   = edit_data.get("new_code", "")
-            description = edit_data.get("description", "")
 
-            diff  = _make_diff(symbol.code, new_code, symbol.name)
+        # ── Fix 1: cross-change ordering ─────────────────────────────────
+        # When multiple changes target the same file, QA must see the file
+        # state AFTER previous changes are applied — not the original.
+        # Example: change 1 adds a helper, change 2 calls it.
+        # QA for change 2 must see the helper already present.
+        # We apply each change to an in-memory copy sequentially so every
+        # QA call receives the correct intermediate "before" state.
+        from services.surgical_editor import apply_change as _apply_change_fn
+        _intermediate_contents: dict = {}   # fname -> content after prior changes
+
+        for i, resolved in enumerate(resolved_edits):
+            edit_data    = resolved["edit_data"]
+            symbol       = resolved["symbol"]
+            sf_entry     = resolved["sf_entry"]
+            file_content = resolved["file_content"]
+            filename     = resolved["filename"]
+            new_code     = edit_data.get("new_code", "")
+            description  = edit_data.get("description", "")
+
+            # Seed intermediate state on first touch for this file
+            if filename not in _intermediate_contents:
+                _intermediate_contents[filename] = file_content
+
+            # QA sees the file state AFTER all previous changes to this file
+            qa_original_content = _intermediate_contents[filename]
+
+            diff = _make_diff(symbol.code, new_code, symbol.name)
             _tgt, _repl = _compute_target_element(symbol.code, new_code)
 
             _same_run = "\n".join(
-                f"  • {d}" for j, d in enumerate(_all_descriptions) if j != i and d
+                f"  \u2022 {d}" for j, d in enumerate(_all_descriptions) if j != i and d
             )
 
             _targeted_ctx = ""
@@ -7243,17 +7270,40 @@ async def run_natural_pipeline_stream(
             except Exception:
                 pass
 
-            change_shells.append({
-                "symbol": symbol, "sf_entry": sf_entry, "file_content": file_content,
-                "filename": filename, "new_code": new_code, "description": description,
-                "diff": diff, "_tgt": _tgt, "_repl": _repl,
-                "same_run": _same_run, "targeted_ctx": _targeted_ctx,
-            })
+            # Advance the intermediate state so the NEXT change on this file
+            # sees this change already applied.
+            try:
+                _sc_proxy = type("_SC", (), {
+                    "new_code": new_code,
+                    "original_code": symbol.code,
+                    "symbol": symbol,
+                    "operations": [{"find": symbol.code, "replace": new_code}],
+                    "applied": False,
+                })()
+                _intermediate_contents[filename] = _apply_change_fn(
+                    _intermediate_contents[filename], _sc_proxy
+                )
+            except Exception:
+                pass  # keep current intermediate if apply fails; QA still runs
 
+            change_shells.append({
+                "symbol":              symbol,
+                "sf_entry":            sf_entry,
+                "file_content":        file_content,        # original file (for SurgicalChange)
+                "qa_original_content": qa_original_content, # intermediate (for QA)
+                "filename":            filename,
+                "new_code":            new_code,
+                "description":         description,
+                "diff":                diff,
+                "_tgt":                _tgt,
+                "_repl":               _repl,
+                "same_run":            _same_run,
+                "targeted_ctx":        _targeted_ctx,
+            })
         # Launch all QA calls concurrently
         qa_tasks = [
             asyncio.create_task(run_qa_agent(
-                original_code=cs["symbol"].code,
+                original_code=cs["qa_original_content"],  # intermediate state, not raw original
                 new_code=cs["new_code"],
                 change_description=cs["description"],
                 new_logic=cs["description"],
@@ -7326,6 +7376,8 @@ async def run_natural_pipeline_stream(
                     issue_lines.append(f"Import issue: {issue}")
                 for err in qa_d.get("type_errors", []):
                     issue_lines.append(f"Type error: {err}")
+                for lerr in qa_d.get("logic_errors", []):
+                    issue_lines.append(f"Logic error: {lerr}")
                 if qa_d.get("plan_deviation"):
                     issue_lines.append(f"Plan deviation: {qa_d['plan_deviation']}")
                 for risk in qa_d.get("downstream_risks", []):
@@ -7474,6 +7526,7 @@ async def run_natural_pipeline_stream(
                 import_issues=qa_dict.get("import_issues", []),
                 downstream_risks=qa_dict.get("downstream_risks", []),
                 type_errors=qa_dict.get("type_errors", []),
+                logic_errors=qa_dict.get("logic_errors", []),
                 plan_deviation=qa_dict.get("plan_deviation", ""),
                 risk_verdicts=qa_dict.get("risk_verdicts", []),
             )

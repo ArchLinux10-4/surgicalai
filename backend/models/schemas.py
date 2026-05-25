@@ -179,6 +179,7 @@ class QAResult(BaseModel):
     import_issues: List[str] = []
     downstream_risks: List[str] = []
     type_errors: List[str] = []
+    logic_errors: List[str] = []      # logic correctness issues found by mental tracing
     plan_deviation: str = ""
     skipped_reason: Optional[str] = None
     risk_verdicts: List[dict] = []     # v3.7.1: per-risk verdicts from QA
