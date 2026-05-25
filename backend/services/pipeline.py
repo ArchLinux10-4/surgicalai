@@ -7145,12 +7145,33 @@ async def run_natural_pipeline_stream(
 
                 issues_block = "\n".join(f"  • {l}" for l in issue_lines) or "  • See QA summary above."
 
+                # Include the diff so Claude sees exactly which lines it dropped.
+                # The #1 QA block cause is accidentally removing unchanged lines —
+                # the diff makes this immediately visible via the - markers.
+                diff_text = _make_diff(symbol.code, cs["new_code"], symbol.name)
+                removed_lines = [
+                    line[1:].rstrip()
+                    for line in diff_text.splitlines()
+                    if line.startswith("-") and not line.startswith("---") and line[1:].strip()
+                ]
+                diff_block = (
+                    f"\n\nDIFF (- = removed from original, + = added by you):\n"
+                    f"```diff\n{diff_text}\n```\n"
+                    + (
+                        f"\n⚠️ You removed {len(removed_lines)} line(s) from the original. "
+                        f"Only lines the user explicitly asked to change should be removed — "
+                        f"everything else must be preserved exactly.\n"
+                        if removed_lines else ""
+                    )
+                )
+
                 correction_prompt = (
                     f"QA reviewed your <surgical_edit> for `{symbol.name}` in "
                     f"`{cs['filename']}` and found it BLOCKED (score "
                     f"{qa_d.get('qa_score', '?')}/10). You must fix all issues "
                     f"before this can be applied.\n\n"
-                    f"Issues to fix:\n{issues_block}\n\n"
+                    f"Issues to fix:\n{issues_block}"
+                    f"{diff_block}\n\n"
                     f"ORIGINAL CODE (what the symbol looks like NOW — before your change):\n"
                     f"```\n{symbol.code}\n```\n\n"
                     f"YOUR BROKEN CODE (what you wrote — DO NOT reuse this verbatim):\n"
