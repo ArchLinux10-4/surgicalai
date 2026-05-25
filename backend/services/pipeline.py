@@ -6539,6 +6539,7 @@ def _clean_history_content(content: str) -> str:
             text = data.get("text", "").strip()
             result = data.get("result", {})
             changes = []
+            qa_flags = []
             if isinstance(result, dict):
                 for _fname, _fdata in result.get("changes_by_file", {}).items():
                     for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
@@ -6546,8 +6547,17 @@ def _clean_history_content(content: str) -> str:
                         name = (sym.get("name") or sym.get("full_path", "")) if isinstance(sym, dict) else ""
                         if name:
                             changes.append(f"{_fname}::{name}")
+                        # Change 2: carry QA warnings into history so Claude
+                        # self-corrects on the next turn without user prompting.
+                        qr = ch.get("qa_result") or {}
+                        verdict = qr.get("verdict", "")
+                        summary = (qr.get("summary") or "").strip()
+                        if verdict in ("warning", "blocked") and summary and name:
+                            qa_flags.append(f"{name}: {summary}")
             if changes:
                 text += f"\n[Applied changes to: {', '.join(changes[:6])}]"
+            if qa_flags:
+                text += f"\n[QA flagged: {'; '.join(qa_flags[:4])}]"
             return text or "I made code changes to your files."
         except Exception:
             return content

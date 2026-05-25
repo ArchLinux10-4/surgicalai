@@ -537,11 +537,35 @@ async def smart_stream(req: dict, request: Request):
                         natural_text = "".join(collected_tokens).strip()
 
                         if result_content:
-                            # New format: stores natural text + surgical result together
-                            # so conversation history replays naturally
+                            parsed_result = _json.loads(result_content)
+
+                            # Change 1: Surface QA warnings in the chat bubble text so
+                            # users see them in conversation flow, not only behind "Review".
+                            # Collect unique warning/blocked summaries from all changes.
+                            qa_warnings = []
+                            for _fdata in parsed_result.get("changes_by_file", {}).values():
+                                for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
+                                    qr = ch.get("qa_result") or {}
+                                    verdict = qr.get("verdict", "")
+                                    summary = (qr.get("summary") or "").strip()
+                                    score   = qr.get("qa_score")
+                                    if verdict in ("warning", "blocked") and summary:
+                                        icon = "⚠️" if verdict == "warning" else "🚫"
+                                        sym  = (ch.get("symbol") or {})
+                                        sym_name = sym.get("name") or sym.get("full_path", "change")
+                                        qa_warnings.append(f"{icon} **{sym_name}** (QA {score}/10): {summary}")
+
+                            if qa_warnings:
+                                natural_text = (
+                                    natural_text
+                                    + ("\n\n" if natural_text else "")
+                                    + "**QA Notes:**\n"
+                                    + "\n".join(f"- {w}" for w in qa_warnings)
+                                )
+
                             saved_content = "__NATURAL_AND_RESULT__:" + _json.dumps({
                                 "text": natural_text,
-                                "result": _json.loads(result_content),
+                                "result": parsed_result,
                             })
                         else:
                             saved_content = natural_text

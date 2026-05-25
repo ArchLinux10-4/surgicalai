@@ -9,7 +9,108 @@ import { NewFileCard } from './NewFileCard'
 import { MarkdownCode } from './CodeBlock'
 import { SessionFilesTray } from './SessionFilesTray'
 import type { SessionFile, SmartResult } from '../types'
-import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
+import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
+
+// ── Apply All Button — applies every unapplied change across all messages ─────
+function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: {
+  messages: any[]
+  sessionId: string
+  sessionFiles: SessionFile[]
+  setSessionFiles: (files: SessionFile[]) => void
+}) {
+  const [applying, setApplying] = useState(false)
+  const [done, setDone]         = useState(false)
+
+  // Collect all messages with unapplied changes
+  const pendingMessages = messages.filter(m =>
+    (m.message_type === 'natural_result' || m.message_type === 'surgical_result') &&
+    m.surgical_data
+  )
+
+  if (pendingMessages.length === 0) return null
+
+  // Count total changes across all pending messages
+  let totalChanges = 0
+  let totalFiles   = 0
+  for (const msg of pendingMessages) {
+    try {
+      const result: SmartResult = JSON.parse(msg.surgical_data)
+      const files = Object.keys(result.changes_by_file || {})
+      totalFiles   += files.length
+      totalChanges += files.reduce(
+        (acc, f) => acc + (result.changes_by_file[f]?.changes?.length || 0), 0
+      )
+      totalChanges += (result.new_files || []).length
+    } catch {}
+  }
+
+  if (totalChanges === 0) return null
+
+  const handleApplyAll = async () => {
+    setApplying(true)
+    let appliedFiles = 0
+    let failed       = 0
+
+    try {
+      for (const msg of pendingMessages) {
+        let result: SmartResult
+        try { result = JSON.parse(msg.surgical_data) } catch { continue }
+
+        // Apply edits per file
+        for (const [, fileData] of Object.entries(result.changes_by_file || {})) {
+          const fd = fileData as any
+          if (!fd?.file_id || !fd?.changes?.length) continue
+          try {
+            const current = await api.sessionFiles.get(sessionId, fd.file_id)
+            const applied = await api.surgical.applyAll({
+              file_path: fd.filename,
+              changes: fd.changes,
+              file_content: current.content,
+            })
+            if (applied.modified_content) {
+              await api.sessionFiles.update(sessionId, fd.file_id, applied.modified_content)
+              appliedFiles++
+            }
+          } catch { failed++ }
+        }
+      }
+
+      // Refresh file list
+      const fresh = await api.sessionFiles.list(sessionId)
+      setSessionFiles(fresh)
+
+      if (failed === 0) {
+        toast.success(`Applied all changes across ${appliedFiles} file${appliedFiles !== 1 ? 's' : ''}`)
+        setDone(true)
+      } else {
+        toast.error(`Applied ${appliedFiles} file(s) — ${failed} failed`)
+      }
+    } catch (e: any) {
+      toast.error(e.message || 'Apply all failed')
+    } finally {
+      setApplying(false)
+    }
+  }
+
+  if (done) return null
+
+  return (
+    <button
+      onClick={handleApplyAll}
+      disabled={applying}
+      className="flex items-center gap-2 px-3.5 py-2 rounded-xl border text-[12px] font-medium transition-all
+                 bg-emerald-500/10 border-emerald-500/30 text-emerald-400
+                 hover:bg-emerald-500/20 hover:border-emerald-500/50 hover:text-emerald-300
+                 disabled:opacity-50 disabled:cursor-wait"
+    >
+      <DoneAll sx={{ fontSize: 14 }} />
+      {applying
+        ? 'Applying…'
+        : `Apply All  ·  ${totalChanges} change${totalChanges !== 1 ? 's' : ''} across ${totalFiles} file${totalFiles !== 1 ? 's' : ''}`
+      }
+    </button>
+  )
+}
 
 // ── Markdown component overrides ──────────────────────────
 const mdComponents = {
@@ -921,6 +1022,18 @@ export function ChatPanel() {
         )}
         <div ref={bottomRef} />
       </div>
+
+      {/* Apply All — single click to apply every pending change across all files */}
+      {activeSessions && !isStreaming && (
+        <div className="px-3 pt-2 flex-shrink-0">
+          <ApplyAllButton
+            messages={messages}
+            sessionId={activeSessions}
+            sessionFiles={sessionFiles}
+            setSessionFiles={setSessionFiles}
+          />
+        </div>
+      )}
 
       {/* Session Files Tray — always-fresh download hub */}
       {activeSessions && sessionFiles.length > 0 && (
