@@ -55,8 +55,8 @@ export function SettingsModal() {
   const [pwSaving, setPwSaving]           = useState(false)
   const [pwResult, setPwResult]           = useState<{ ok: boolean; msg: string } | null>(null)
   const [form, setForm] = useState({
-    architect_model: 'gpt-5',
-    surgeon_model: 'gpt-4.1',
+    architect_model: 'claude-sonnet-4-6',
+    surgeon_model: 'claude-sonnet-4-6',
     confidence_threshold: 7,
     temperature_architect: 0.3,
     temperature_surgeon: 0.1,
@@ -467,16 +467,14 @@ export function SettingsModal() {
                 </Field>
                 )}
 
-                <div className="grid grid-cols-2 gap-4">
-                  <Field label={`Architect Temp: ${form.temperature_architect}`}>
-                    <input type="range" min="0" max="1" step="0.1" value={form.temperature_architect}
-                      onChange={(e) => upd('temperature_architect')(parseFloat(e.target.value))} className="w-full accent-accent" />
-                  </Field>
-                  <Field label={`Surgeon Temp: ${form.temperature_surgeon}`}>
-                    <input type="range" min="0" max="0.5" step="0.05" value={form.temperature_surgeon}
-                      onChange={(e) => upd('temperature_surgeon')(parseFloat(e.target.value))} className="w-full accent-success" />
-                  </Field>
-                </div>
+                {/* Surgeon temperature hidden — single Claude model pipeline */}
+                <Field label={`Temperature: ${form.temperature_architect}`}>
+                  <input type="range" min="0" max="1" step="0.1" value={form.temperature_architect}
+                    onChange={(e) => upd('temperature_architect')(parseFloat(e.target.value))} className="w-full accent-accent" />
+                  <div className="flex justify-between text-[10px] text-faint mt-0.5">
+                    <span>0 — precise</span><span>1 — creative</span>
+                  </div>
+                </Field>
 
                 <Field label={`Confidence Threshold: ${form.confidence_threshold}/10 (lower = more auto-applies)`}>
                   <input type="range" min="1" max="10" step="1" value={form.confidence_threshold}

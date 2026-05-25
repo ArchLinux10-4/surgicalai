@@ -38,8 +38,8 @@ def get_settings(request: Request):
     return SettingsResponse(
         openai_api_key_set=has_openai,
         anthropic_api_key_set=has_anthropic,
-        architect_model=s.get("architect_model", "gpt-5"),
-        surgeon_model=s.get("surgeon_model", "gpt-4.1"),
+        architect_model=s.get("architect_model", "claude-sonnet-4-6"),
+        surgeon_model=s.get("surgeon_model", "claude-sonnet-4-6"),
         temperature_architect=float(s.get("temperature_architect", "0.3")),
         temperature_surgeon=float(s.get("temperature_surgeon", "0.1")),
         confidence_threshold=int(s.get("confidence_threshold", "7")),
@@ -63,55 +63,27 @@ def update_settings(req: SettingsUpdate):
 
 @router.get("/models")
 def get_available_models(request: Request):
-    """Return the list of supported models, including Claude if Anthropic key is set."""
+    """Return only Claude models — SurgicalAI is optimised exclusively for Claude API."""
     user_id = _get_user_id(request)
 
-    openai_models = [
-        {"id": "gpt-4.1", "name": "GPT-4.1", "role": "surgeon", "description": "Low hallucination — best for writing code"},
-        {"id": "gpt-4.1-mini", "name": "GPT-4.1 Mini", "role": "fast", "description": "Fast and cheap for simple tasks"},
-        {"id": "gpt-4o", "name": "GPT-4o", "role": "architect", "description": "Strong reasoning for planning"},
-        {"id": "o4-mini", "name": "o4-mini", "role": "architect", "description": "Reasoning model — good for architecture"},
-        {"id": "gpt-5", "name": "GPT-5", "role": "architect", "description": "Most capable — best for complex architecture (no temperature control)", "no_temperature": True},
+    # SurgicalAI runs exclusively on Claude. All other model families are hidden.
+    # GPT, Gemini, and Ollama models are preserved in comments for future re-enabling.
+
+    claude_models = [
+        {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "role": "architect",
+         "description": "Fast, intelligent — recommended for most tasks", "provider": "anthropic"},
+        {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "role": "architect",
+         "description": "Most capable Claude — best for complex, multi-file changes", "provider": "anthropic"},
+        {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5", "role": "architect",
+         "description": "Fastest Claude — great for quick edits and simple changes", "provider": "anthropic"},
     ]
 
-    claude_models = []
-    if _resolve_api_key(user_id, "anthropic"):
-        claude_models = [
-            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "role": "architect", "description": "Fast, intelligent — great Architect with visible thinking", "provider": "anthropic"},
-            {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "role": "architect", "description": "Most capable Claude — deep reasoning with extended thinking", "provider": "anthropic"},
-            {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6 (Surgeon)", "role": "surgeon", "description": "Precise multi-block edits — best Claude model for complex rewrites", "provider": "anthropic"},
-        ]
-
-    gemini_models = []
-    if _resolve_api_key(user_id, "gemini"):
-        gemini_models = [
-            {"id": "gemini-2.5-pro", "name": "Gemini 2.5 Pro", "role": "architect", "description": "1M context window — best for huge files, with visible thinking", "provider": "gemini"},
-            {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "role": "architect", "description": "Fast + affordable — great for large files with thinking", "provider": "gemini"},
-            {"id": "gemini-2.0-flash", "name": "Gemini 2.0 Flash", "role": "surgeon", "description": "Fastest Gemini — great for quick edits", "provider": "gemini"},
-        ]
-
-    ollama_models = []
-    if get_setting("ollama_enabled", "false") == "true":
-        try:
-            base_url = get_setting("ollama_base_url", "http://localhost:11434")
-            resp = httpx.get(f"{base_url}/api/tags", timeout=3)
-            for m in resp.json().get("models", []):
-                ollama_models.append({
-                    "id": f"ollama:{m['name']}",
-                    "name": f"🦙 {m['name']}",
-                    "description": "Local Ollama model"
-                })
-        except Exception:
-            pass
-
     return {
-        "models": openai_models + claude_models + gemini_models + ollama_models,
+        "models": claude_models,
         "pipeline_modes": [
-            {"id": "auto", "name": "Auto Pipeline", "description": "Architect plans, Surgeon executes (recommended)"},
-            {"id": "single", "name": "Single Model", "description": "Use one model for everything"},
+            {"id": "auto", "name": "Auto", "description": "SurgicalAI natural pipeline (recommended)"},
         ]
     }
-
 
 @router.delete("/api-key")
 def clear_api_key(request: Request):
