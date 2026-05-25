@@ -5844,6 +5844,26 @@ You are SurgicalAI — a world-class coding assistant powered by Claude.
 Talk naturally with the user, like a real collaborator. Use markdown. Be warm, precise, and genuinely helpful.
 Remember everything we've discussed — prior edits, decisions, context — and build on it naturally.
 
+━━━ WHEN YOU NEED MORE CODE ━━━
+
+For large files you only see the most relevant symbols upfront. If you need to see a specific
+function, script block, or code section before you can write a correct edit, say so naturally
+and emit a search request:
+
+<search_request>
+{"terms": ["exactFunctionName", "XLSX.read", "#job-list", "Papa.parse"], "reason": "Need to see the CSV parser to match its data structure exactly"}
+</search_request>
+
+The system will find and show you the actual code. You can then write your <surgical_edit> blocks correctly.
+
+Rules for search_request:
+- Use exact symbol names from the SYMBOL INDEX when you can (most precise)
+- You can also search for string literals: "Papa.parse", "jl-count-badge", "mode-comm"
+- Max 5 terms per request, max 4 search rounds per response
+- Only request what you genuinely need — the code you're missing to write a correct edit
+- After receiving results, write your edits immediately
+- Do NOT search for things already shown in the context above
+
 ━━━ EDITING EXISTING FILES ━━━
 
 When the user wants to change code in an uploaded file, explain what you're doing and embed an edit block:
@@ -6357,6 +6377,122 @@ def _clean_history_content(content: str) -> str:
     return content
 
 
+def _resolve_search_multifile(
+    terms: list,
+    symbol_maps_by_name: dict,
+    file_content_lookup: dict,
+) -> str:
+    """
+    Resolve search terms across ALL session files.
+    For each term tries: exact AST symbol name → case-insensitive → grep with enclosing symbol.
+    Returns a formatted string ready to inject into Claude's context.
+    """
+    if not terms:
+        return ""
+
+    result_parts = []
+    seen_paths: set = set()
+
+    for term in terms[:8]:  # cap to avoid context explosion
+        term_lower = term.lower()
+        found_anything = False
+
+        for fname, (smap, _sf) in symbol_maps_by_name.items():
+            file_content = file_content_lookup.get(fname, "")
+            if not file_content:
+                continue
+            content_lines = file_content.splitlines()
+            symbols = getattr(smap, "symbols", []) if smap else []
+
+            # 1. Exact AST name match
+            for sym in symbols:
+                nm = getattr(sym, "name", "") or ""
+                fp = getattr(sym, "full_path", "") or ""
+                if nm == term or fp == term or nm.lower() == term_lower or fp.lower() == term_lower:
+                    path_key = f"{fname}::{fp}"
+                    if path_key in seen_paths:
+                        continue
+                    seen_paths.add(path_key)
+                    code = getattr(sym, "code", "") or ""
+                    code_lines = code.splitlines()
+                    # Show up to 120 lines of the symbol
+                    shown = code_lines[:120]
+                    trunc = f"\n  ... [{len(code_lines)-120} more lines]" if len(code_lines) > 120 else ""
+                    numbered = "\n".join(
+                        f"{sym.start_line + i:5d}: {shown[i]}"
+                        for i in range(len(shown))
+                    )
+                    result_parts.append(
+                        f"SYMBOL MATCH [{fname} :: {fp} "
+                        f"({sym.symbol_type.value}, L{sym.start_line}–{sym.end_line})]:\n"
+                        f"{numbered}{trunc}"
+                    )
+                    found_anything = True
+                    break
+
+            if found_anything:
+                break
+
+            # 2. Grep — find line containing term, expand to enclosing symbol
+            for line_idx, line in enumerate(content_lines):
+                if term_lower not in line.lower():
+                    continue
+                lineno = line_idx + 1
+
+                # Find the narrowest enclosing symbol
+                best_sym = None
+                best_size = float("inf")
+                for sym in symbols:
+                    if sym.start_line <= lineno <= sym.end_line:
+                        sz = sym.end_line - sym.start_line
+                        if sz < best_size:
+                            best_size, best_sym = sz, sym
+
+                if best_sym:
+                    path_key = f"{fname}::{best_sym.full_path}"
+                    if path_key in seen_paths:
+                        continue
+                    seen_paths.add(path_key)
+                    code = getattr(best_sym, "code", "") or ""
+                    code_lines_s = code.splitlines()
+                    shown = code_lines_s[:120]
+                    trunc = f"\n  ... [{len(code_lines_s)-120} more lines]" if len(code_lines_s) > 120 else ""
+                    numbered = "\n".join(
+                        f"{best_sym.start_line + i:5d}: {shown[i]}"
+                        for i in range(len(shown))
+                    )
+                    result_parts.append(
+                        f"GREP MATCH ('{term}') [{fname} :: {best_sym.full_path} "
+                        f"({best_sym.symbol_type.value}, L{best_sym.start_line}–{best_sym.end_line})]:\n"
+                        f"{numbered}{trunc}"
+                    )
+                else:
+                    # No enclosing symbol — show ±40 lines of raw context
+                    start = max(0, line_idx - 40)
+                    end = min(len(content_lines), line_idx + 41)
+                    snippet = "\n".join(
+                        f"{start + i + 1:5d}: {content_lines[start + i]}"
+                        for i in range(end - start)
+                    )
+                    result_parts.append(
+                        f"GREP MATCH ('{term}') [{fname} L{lineno}]:\n{snippet}"
+                    )
+                found_anything = True
+                break
+
+        if not found_anything:
+            result_parts.append(f"NOT FOUND: '{term}' — not in any uploaded file.")
+
+    if not result_parts:
+        return ""
+
+    return (
+        "\n\n=== SEARCH RESULTS ===\n"
+        + "\n\n".join(result_parts)
+        + "\n=== END SEARCH RESULTS ===\n"
+    )
+
+
 async def run_natural_pipeline_stream(
     session_files: list,
     user_request: str,
@@ -6395,6 +6531,8 @@ async def run_natural_pipeline_stream(
     EDIT_CLOSE = "</surgical_edit>"
     FILE_OPEN = "<new_file>"
     FILE_CLOSE = "</new_file>"
+    SEARCH_OPEN = "<search_request>"
+    SEARCH_CLOSE = "</search_request>"
 
     try:
         anthropic_key = _get_anthropic_key(user_id)
@@ -6459,134 +6597,238 @@ async def run_natural_pipeline_stream(
         if _supports_thinking(arch_model):
             stream_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
 
-        # State machine for parsing <surgical_edit> and <new_file> blocks
-        state = "normal"       # "normal" | "in_edit" | "in_file"
-        normal_buf = ""        # text we haven't yielded yet
-        edit_buf = ""          # content inside an edit block
-        file_buf = ""          # content inside a new_file block
-        edit_blocks_raw: list = []  # completed raw edit JSON strings
-        new_file_blocks_raw: list = []  # completed raw new_file JSON strings
-        full_response = ""     # everything Claude said (for DB storage)
+        # ── Streaming loop with ReAct search + edit/file/search tag parsing ─────
+        # Claude can emit <search_request>, <surgical_edit>, or <new_file> tags.
+        # Search tags trigger a silent code-fetch + re-call loop (max 4 rounds).
+        # Edit/file tags are buffered and processed after streaming completes.
+
+        edit_blocks_raw: list = []
+        new_file_blocks_raw: list = []
+        full_response = ""
         in_thinking = False
 
-        # Retry loop for transient errors
-        for _attempt in range(3):
-            try:
-                async with aclient.messages.stream(**stream_kwargs) as astream:
-                    current_block_type = None
-                    async for event in astream:
-                        etype = getattr(event, "type", None)
+        # Build the per-file content lookup once (reused across search rounds)
+        file_content_lookup_stream: dict = {
+            sf["filename"]: sf.get("content", "") for sf in session_files
+        }
 
-                        if etype == "content_block_start":
-                            current_block_type = getattr(
-                                getattr(event, "content_block", None), "type", None
-                            )
-                            if current_block_type == "thinking":
-                                in_thinking = True
-                                yield sse({"type": "thinking_start", "content": ""})
+        MAX_SEARCH_ROUNDS = 4
+        searched_terms: list = []                # terms fetched so far (avoid re-fetching)
+        accumulated_search_results = ""          # injected into context each round
+        current_messages = list(messages)        # grows with search result turns
 
-                        elif etype == "content_block_delta":
-                            delta = getattr(event, "delta", None)
-                            if not delta:
-                                continue
+        for search_round in range(MAX_SEARCH_ROUNDS + 1):
 
-                            thinking_chunk = getattr(delta, "thinking", None)
-                            text_chunk = getattr(delta, "text", None)
+            state = "normal"    # "normal" | "in_edit" | "in_file" | "in_search"
+            normal_buf = ""
+            edit_buf = ""
+            file_buf = ""
+            search_buf = ""
+            search_requested: dict | None = None  # set when a search block completes
 
-                            if thinking_chunk:
-                                yield sse({"type": "thinking", "content": thinking_chunk})
+            # Retry loop for transient API errors
+            for _attempt in range(3):
+                try:
+                    async with aclient.messages.stream(**{
+                        **stream_kwargs,
+                        "messages": current_messages,
+                    }) as astream:
+                        current_block_type = None
+                        async for event in astream:
+                            etype = getattr(event, "type", None)
 
-                            elif text_chunk:
-                                full_response += text_chunk
+                            if etype == "content_block_start":
+                                current_block_type = getattr(
+                                    getattr(event, "content_block", None), "type", None
+                                )
+                                if current_block_type == "thinking":
+                                    in_thinking = True
+                                    yield sse({"type": "thinking_start", "content": ""})
 
-                                if state == "normal":
-                                    normal_buf += text_chunk
+                            elif etype == "content_block_delta":
+                                delta = getattr(event, "delta", None)
+                                if not delta:
+                                    continue
 
-                                    # Drain normal_buf, watching for EDIT_OPEN or FILE_OPEN
-                                    while True:
-                                        ei = normal_buf.find(EDIT_OPEN)
-                                        fi = normal_buf.find(FILE_OPEN)
+                                thinking_chunk = getattr(delta, "thinking", None)
+                                text_chunk = getattr(delta, "text", None)
 
-                                        # Find which tag comes first
-                                        if ei == -1 and fi == -1:
-                                            # No tags — yield everything except a safety tail
-                                            tail = max(len(EDIT_OPEN), len(FILE_OPEN))
-                                            safe = max(0, len(normal_buf) - tail)
-                                            if safe > 0:
-                                                yield sse({"type": "token", "content": normal_buf[:safe]})
-                                                normal_buf = normal_buf[safe:]
+                                if thinking_chunk:
+                                    yield sse({"type": "thinking", "content": thinking_chunk})
+
+                                elif text_chunk:
+                                    full_response += text_chunk
+
+                                    if state == "normal":
+                                        normal_buf += text_chunk
+
+                                        # Drain buffer watching for any opening tag
+                                        while True:
+                                            ei = normal_buf.find(EDIT_OPEN)
+                                            fi = normal_buf.find(FILE_OPEN)
+                                            si = normal_buf.find(SEARCH_OPEN)
+
+                                            # Find which tag comes first
+                                            candidates = [
+                                                (i, tag) for i, tag in [
+                                                    (ei, "edit"), (fi, "file"), (si, "search")
+                                                ] if i != -1
+                                            ]
+
+                                            if not candidates:
+                                                # No tags — yield safely (keep tail in case tag is split)
+                                                tail = max(len(EDIT_OPEN), len(FILE_OPEN), len(SEARCH_OPEN))
+                                                safe = max(0, len(normal_buf) - tail)
+                                                if safe > 0:
+                                                    yield sse({"type": "token", "content": normal_buf[:safe]})
+                                                    normal_buf = normal_buf[safe:]
+                                                break
+
+                                            first_idx, first_tag = min(candidates, key=lambda x: x[0])
+
+                                            # Yield text before the tag
+                                            if first_idx > 0:
+                                                yield sse({"type": "token", "content": normal_buf[:first_idx]})
+
+                                            if first_tag == "edit":
+                                                yield sse({"type": "edit_start", "content": ""})
+                                                state = "in_edit"
+                                                edit_buf = normal_buf[first_idx + len(EDIT_OPEN):]
+                                                normal_buf = ""
+                                            elif first_tag == "file":
+                                                yield sse({"type": "edit_start", "content": ""})
+                                                state = "in_file"
+                                                file_buf = normal_buf[first_idx + len(FILE_OPEN):]
+                                                normal_buf = ""
+                                            else:  # search
+                                                # Show search indicator — don't stream the JSON to user
+                                                state = "in_search"
+                                                search_buf = normal_buf[first_idx + len(SEARCH_OPEN):]
+                                                normal_buf = ""
                                             break
-                                        elif ei != -1 and (fi == -1 or ei <= fi):
-                                            # Edit tag comes first
-                                            if ei > 0:
-                                                yield sse({"type": "token", "content": normal_buf[:ei]})
-                                            yield sse({"type": "edit_start", "content": ""})
-                                            state = "in_edit"
-                                            edit_buf = normal_buf[ei + len(EDIT_OPEN):]
-                                            normal_buf = ""
+
+                                    elif state == "in_edit":
+                                        edit_buf += text_chunk
+                                        idx = edit_buf.find(EDIT_CLOSE)
+                                        if idx != -1:
+                                            edit_blocks_raw.append(edit_buf[:idx])
+                                            yield sse({"type": "edit_end", "content": ""})
+                                            state = "normal"
+                                            normal_buf = edit_buf[idx + len(EDIT_CLOSE):]
+                                            edit_buf = ""
+
+                                    elif state == "in_file":
+                                        file_buf += text_chunk
+                                        idx = file_buf.find(FILE_CLOSE)
+                                        if idx != -1:
+                                            new_file_blocks_raw.append(file_buf[:idx])
+                                            yield sse({"type": "edit_end", "content": ""})
+                                            state = "normal"
+                                            normal_buf = file_buf[idx + len(FILE_CLOSE):]
+                                            file_buf = ""
+
+                                    elif state == "in_search":
+                                        search_buf += text_chunk
+                                        idx = search_buf.find(SEARCH_CLOSE)
+                                        if idx != -1:
+                                            search_json_raw = search_buf[:idx]
+                                            remainder = search_buf[idx + len(SEARCH_CLOSE):]
+                                            try:
+                                                search_data = json.loads(search_json_raw.strip())
+                                                search_requested = search_data
+                                            except Exception:
+                                                pass
+                                            # Put remainder back into normal stream
+                                            state = "normal"
+                                            normal_buf = remainder
+                                            search_buf = ""
+                                            # Stop streaming — we need to fetch code first
                                             break
-                                        else:
-                                            # New file tag comes first
-                                            if fi > 0:
-                                                yield sse({"type": "token", "content": normal_buf[:fi]})
-                                            yield sse({"type": "edit_start", "content": ""})
-                                            state = "in_file"
-                                            file_buf = normal_buf[fi + len(FILE_OPEN):]
-                                            normal_buf = ""
-                                            break
 
-                                elif state == "in_edit":
-                                    edit_buf += text_chunk
-                                    idx = edit_buf.find(EDIT_CLOSE)
-                                    if idx != -1:
-                                        edit_json_raw = edit_buf[:idx]
-                                        remainder = edit_buf[idx + len(EDIT_CLOSE):]
-                                        edit_blocks_raw.append(edit_json_raw)
-                                        yield sse({"type": "edit_end", "content": ""})
-                                        state = "normal"
-                                        normal_buf = remainder
-                                        edit_buf = ""
+                            elif etype == "content_block_stop":
+                                if in_thinking and current_block_type == "thinking":
+                                    yield sse({"type": "thinking_end", "content": ""})
+                                    in_thinking = False
 
-                                elif state == "in_file":
-                                    file_buf += text_chunk
-                                    idx = file_buf.find(FILE_CLOSE)
-                                    if idx != -1:
-                                        file_json_raw = file_buf[:idx]
-                                        remainder = file_buf[idx + len(FILE_CLOSE):]
-                                        new_file_blocks_raw.append(file_json_raw)
-                                        yield sse({"type": "edit_end", "content": ""})
-                                        state = "normal"
-                                        normal_buf = remainder
-                                        file_buf = ""
+                        # If a search was requested mid-stream, break out of the event loop
+                        if search_requested is not None:
+                            break
 
-                        elif etype == "content_block_stop":
-                            if in_thinking and current_block_type == "thinking":
-                                yield sse({"type": "thinking_end", "content": ""})
-                                in_thinking = False
+                    break  # success — exit transient-error retry loop
 
-                break  # success — exit retry loop
+                except Exception as stream_err:
+                    err_str = str(stream_err)
+                    is_transient = (
+                        "500" in err_str or "529" in err_str
+                        or "overloaded" in err_str.lower()
+                        or "internal_server_error" in err_str.lower()
+                    )
+                    if is_transient and _attempt < 2:
+                        yield sse({"type": "progress",
+                                   "content": f"Service busy — retrying ({_attempt+1}/3)..."})
+                        await asyncio.sleep(5 * (_attempt + 1))
+                        continue
+                    raise
 
-            except Exception as stream_err:
-                err_str = str(stream_err)
-                is_transient = (
-                    "500" in err_str or "529" in err_str
-                    or "overloaded" in err_str.lower()
-                    or "internal_server_error" in err_str.lower()
-                )
-                if is_transient and _attempt < 2:
-                    yield sse({"type": "progress",
-                               "content": f"Service busy — retrying ({_attempt+1}/3)..."})
-                    await asyncio.sleep(5 * (_attempt + 1))
+            # Flush any normal text buffered at end of this round
+            if state == "normal" and normal_buf.strip():
+                yield sse({"type": "token", "content": normal_buf})
+
+            # ── Handle search request ─────────────────────────────────────
+            if search_requested is not None and search_round < MAX_SEARCH_ROUNDS:
+                raw_terms = search_requested.get("terms", [])
+                reason = search_requested.get("reason", "")
+
+                # Filter out already-searched terms
+                new_terms = [t for t in raw_terms
+                             if t.lower() not in {s.lower() for s in searched_terms}]
+
+                if not new_terms:
+                    # All requested terms already searched — tell Claude
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": full_response},
+                        {"role": "user", "content":
+                            "All the terms you requested have already been searched. "
+                            "Please write your edits now using the information you have."},
+                    ]
+                    full_response = ""
                     continue
-                raise
 
-        # Flush remaining normal text
+                yield sse({"type": "progress",
+                           "content": f"Searching: {', '.join(new_terms[:3])}{'...' if len(new_terms)>3 else ''}"})
+
+                search_results = _resolve_search_multifile(
+                    new_terms, symbol_maps_by_name, file_content_lookup_stream
+                )
+                searched_terms.extend(new_terms)
+                accumulated_search_results += search_results
+
+                # Build correction turn: Claude's response so far + search results
+                search_injection = (
+                    "Here are the search results you requested"
+                    + (f" ({reason})" if reason else "")
+                    + ":\n"
+                    + search_results
+                    + "\n\nNow continue your response and write the complete "
+                    "<surgical_edit> or <new_file> blocks. "
+                    "Use the EXACT symbol names shown in the results above."
+                )
+
+                current_messages = current_messages + [
+                    {"role": "assistant", "content": full_response or "(searching for code...)"},
+                    {"role": "user", "content": search_injection},
+                ]
+                full_response = ""  # Reset for next round
+                search_requested = None
+                continue  # Next search round
+
+            # ── No search request — streaming is done ─────────────────────
+            break
+
+        # Final flush for edge cases (Claude ended inside a block)
         if in_thinking:
             yield sse({"type": "thinking_end", "content": ""})
-        if state == "normal" and normal_buf.strip():
-            yield sse({"type": "token", "content": normal_buf})
-        elif state == "in_edit" and edit_buf.strip():
-            # Claude ended stream inside an edit block — try to parse anyway
+        if state == "in_edit" and edit_buf.strip():
             edit_blocks_raw.append(edit_buf)
             yield sse({"type": "edit_end", "content": ""})
         elif state == "in_file" and file_buf.strip():
