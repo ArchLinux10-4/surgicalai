@@ -7,7 +7,7 @@ import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
 import { CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
-type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'local' | 'users' | 'github' | 'security'
+type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'security'
 
 const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'api',       icon: <VpnKey sx={{ fontSize: 14 }} />,       label: 'API Keys' },
@@ -15,7 +15,6 @@ const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'github',    icon: <GitHub sx={{ fontSize: 14 }} />,     label: 'GitHub' },
   { id: 'workspace', icon: <FolderOpen sx={{ fontSize: 14 }} />, label: 'Workspace' },
   { id: 'editor',    icon: <Code sx={{ fontSize: 14 }} />,       label: 'Editor' },
-  { id: 'local',     icon: <Memory sx={{ fontSize: 14 }} />,        label: 'Local AI' },
   { id: 'users',     icon: <Group sx={{ fontSize: 14 }} />,      label: 'Users' },
   { id: 'security',  icon: <Lock sx={{ fontSize: 14 }} />,       label: 'Security' },
 ]
@@ -292,7 +291,9 @@ export function SettingsModal() {
           <div className="flex-1 overflow-y-auto p-6 min-w-0">
             {tab === 'api' && (
               <div className="space-y-4">
-                <SectionHeader title="OpenAI API Key" subtitle="Required for all AI features" />
+                {/* OpenAI hidden — app is optimised for Claude API only */}
+              {false && <>
+              <SectionHeader title="OpenAI API Key" subtitle="Required for all AI features" />
                 <div>
                   <div className="flex gap-2">
                     <div className="relative flex-1">
@@ -341,10 +342,11 @@ export function SettingsModal() {
                     </a>
                   </div>
                 </div>
+              </>}
 
                 {/* ── Anthropic / Claude Key ── */}
-                <div className="mt-6 pt-5 border-t border-border">
-                  <SectionHeader title="Anthropic API Key (Claude)" subtitle="Enables Claude models as Architect — with visible thinking" />
+                <div>
+                  <SectionHeader title="Anthropic API Key" subtitle="Required — SurgicalAI runs on Claude" />
                   <div className="mt-3">
                     <div className="flex gap-2">
                       <div className="relative flex-1">
@@ -395,8 +397,8 @@ export function SettingsModal() {
                   </div>
                 </div>
 
-                {/* ── Google Gemini Key ── */}
-                <div className="mt-6 pt-5 border-t border-border">
+                {/* Google Gemini hidden — app is optimised for Claude API only */}
+                {false && <div className="mt-6 pt-5 border-t border-border">
                   <SectionHeader title="Google Gemini API Key" subtitle="Enables Gemini 2.5 Pro/Flash — 1M context window with visible thinking" />
                   <div className="mt-3">
                     <div className="flex gap-2">
@@ -446,20 +448,24 @@ export function SettingsModal() {
                       {' '}— enables Gemini 2.5 Pro (1M context) and Gemini 2.5 Flash
                     </div>
                   </div>
-                </div>
+                </div>}
               </div>
             )}
 
             {tab === 'models' && (
               <div className="space-y-5">
-                <SectionHeader title="Model Configuration" subtitle="Architect plans the change · Surgeon writes the code" />
+                <SectionHeader title="Model Configuration" subtitle="Select which Claude model powers SurgicalAI" />
 
-                <Field label="Architect Model (planning & analysis)">
+                <Field label="Claude Model">
                   <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect').map((m) => ({ value: m.id, label: `${m.name} — ${m.description}` }))} />
                 </Field>
+
+                {/* Surgeon model hidden — natural pipeline uses a single Claude model */}
+                {false && (
                 <Field label="Surgeon Model (code writing)">
                   <Select value={form.surgeon_model} onChange={upd('surgeon_model')} options={models.filter((m) => m.role === 'surgeon' || m.role === 'fast').map((m) => ({ value: m.id, label: `${m.name} — ${m.description}` }))} />
                 </Field>
+                )}
 
                 <div className="grid grid-cols-2 gap-4">
                   <Field label={`Architect Temp: ${form.temperature_architect}`}>
@@ -543,33 +549,7 @@ export function SettingsModal() {
               </div>
             )}
 
-            {tab === 'local' && (
-              <div className="space-y-5">
-                <SectionHeader title="Local AI via Ollama" subtitle="Run models locally — no OpenAI needed, full privacy" />
-                <label className="flex items-start gap-3 cursor-pointer">
-                  <input type="checkbox" checked={form.ollama_enabled || false} onChange={(e) => upd('ollama_enabled')(e.target.checked)} className="mt-0.5 accent-accent" />
-                  <div>
-                    <div className="text-sm font-medium text-ink">Enable Ollama (local models)</div>
-                    <div className="text-xs text-muted mt-0.5">Falls back to Ollama when OpenAI key is not set</div>
-                  </div>
-                </label>
-
-                {form.ollama_enabled && (
-                  <div className="space-y-4">
-                    <Field label="Ollama base URL">
-                      <input value={form.ollama_base_url || 'http://localhost:11434'} onChange={(e) => upd('ollama_base_url')(e.target.value)} className="input" />
-                    </Field>
-                    <Field label="Default model">
-                      <input value={form.ollama_model || 'qwen2.5-coder:7b'} onChange={(e) => upd('ollama_model')(e.target.value)} placeholder="qwen2.5-coder:7b" className="input" />
-                    </Field>
-                    <div className="p-3 bg-base rounded-lg border border-border text-xs text-muted leading-relaxed">
-                      Install Ollama at <a href="https://ollama.ai" target="_blank" rel="noopener" className="text-accent">ollama.ai</a>. 
-                      Recommended models: <code className="text-accent">qwen2.5-coder:7b</code>, <code className="text-accent">codellama:13b</code>, <code className="text-accent">deepseek-coder-v2</code>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )}
+            {/* Local AI tab hidden — app is optimised for Claude API only */}
             {tab === 'users' && (
               <div className="space-y-5">
                 <AdminUsersPanel />
