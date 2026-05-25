@@ -113,7 +113,7 @@ export function AdminUsersPanel() {
       {showForm && (
         <form onSubmit={handleCreate} className="bg-overlay border border-border rounded-xl p-4 space-y-3">
           <p className="text-xs font-semibold text-ink">Create New User</p>
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-2 gap-3 max-sm:grid-cols-1">
             <div>
               <label className="text-xs text-faint mb-1 block">Username *</label>
               <input
@@ -195,14 +195,14 @@ export function AdminUsersPanel() {
           users.map((u) => (
             <div
               key={u.id}
-              className="flex items-center justify-between px-3 py-2.5 rounded-xl bg-overlay border border-border hover:border-accent/30 transition"
+              className="flex items-center justify-between px-3 py-2.5 rounded-xl bg-overlay border border-border hover:border-accent/30 transition gap-2"
             >
-              <div className="flex items-center gap-2.5">
-                <div className="w-7 h-7 rounded-full bg-indigo-600/20 flex items-center justify-center text-indigo-400 text-[11px] font-bold">
+              <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                <div className="w-7 h-7 rounded-full bg-indigo-600/20 flex items-center justify-center text-indigo-400 text-[11px] font-bold flex-shrink-0">
                   {u.username.slice(0, 2).toUpperCase()}
                 </div>
-                <div>
-                  <div className="flex items-center gap-1.5">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-1.5 flex-wrap">
                     <span className="text-xs font-medium text-ink">{u.username}</span>
                     {Boolean(u.is_admin) && (
                       <span className="flex items-center gap-0.5 text-[10px] px-1.5 py-0.5 rounded-full bg-indigo-500/15 text-indigo-400 font-medium">
@@ -217,11 +217,11 @@ export function AdminUsersPanel() {
                       <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted/15 text-muted font-medium">Inactive</span>
                     )}
                   </div>
-                  {u.email && <p className="text-[11px] text-faint">{u.email}</p>}
+                  {u.email && <p className="text-[11px] text-faint truncate">{u.email}</p>}
                 </div>
               </div>
-              <div className="flex items-center gap-1">
-                <span className="text-[10px] text-faint mr-2">
+              <div className="flex items-center gap-1 flex-shrink-0">
+                <span className="text-[10px] text-faint mr-2 hidden sm:inline">
                   {u.last_login ? `Last login ${new Date(u.last_login).toLocaleDateString()}` : 'Never logged in'}
                 </span>
                 {u.id !== user?.id && (

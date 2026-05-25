@@ -252,7 +252,9 @@ export function SettingsModal() {
       onClick={() => setSettingsOpen(false)}
     >
       <div
-        className="bg-surface border border-border rounded-2xl w-[580px] max-h-[85vh] flex flex-col shadow-modal animate-slide-up"
+        className="bg-surface border border-border rounded-2xl flex flex-col shadow-modal animate-slide-up
+          w-[580px] max-h-[85vh]
+          max-sm:w-full max-sm:h-full max-sm:max-h-full max-sm:rounded-none max-sm:border-0"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
@@ -264,18 +266,21 @@ export function SettingsModal() {
           <button onClick={() => setSettingsOpen(false)} className="btn-icon"><Close sx={{ fontSize: 18 }} /></button>
         </div>
 
-        <div className="flex flex-1 min-h-0 overflow-hidden">
-          {/* Left tabs */}
-          <div className="w-36 flex-shrink-0 border-r border-border py-2">
+        <div className="flex flex-1 min-h-0 overflow-hidden max-sm:flex-col">
+          {/* Left tabs — sidebar on desktop, horizontal scroll strip on mobile */}
+          <div className="w-36 flex-shrink-0 border-r border-border py-2
+            max-sm:w-full max-sm:border-r-0 max-sm:border-b max-sm:border-border max-sm:py-0
+            max-sm:flex max-sm:flex-row max-sm:overflow-x-auto max-sm:flex-shrink-0">
             {TABS.map(({ id, icon, label }) => (
               <button
                 key={id}
                 onClick={() => setTab(id)}
-                className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-left transition-colors ${
-                  tab === id
-                    ? 'bg-overlay text-ink font-semibold border-r-2 border-accent'
+                className={`w-full flex items-center gap-2.5 px-4 py-2.5 text-sm text-left transition-colors
+                  max-sm:w-auto max-sm:flex-shrink-0 max-sm:flex-col max-sm:gap-1 max-sm:px-3 max-sm:py-2.5 max-sm:text-[10px] max-sm:items-center
+                  ${tab === id
+                    ? 'bg-overlay text-ink font-semibold border-r-2 border-accent max-sm:border-r-0 max-sm:border-b-2'
                     : 'text-muted hover:text-ink hover:bg-overlay/50'
-                }`}
+                  }`}
               >
                 <span className="flex-shrink-0">{icon}</span>
                 {label}
@@ -581,9 +586,9 @@ export function SettingsModal() {
                 {/* Connected state */}
                 {githubStatus?.connected ? (
                   <div className="space-y-4">
-                    <div className="flex items-center gap-3 p-3 rounded-lg border border-green-500/30 bg-green-500/10">
+                    <div className="flex items-center gap-3 p-3 rounded-lg border border-green-500/30 bg-green-500/10 flex-wrap">
                       {githubStatus.avatar_url && (
-                        <img src={githubStatus.avatar_url} alt="avatar" className="w-9 h-9 rounded-full border border-border" />
+                        <img src={githubStatus.avatar_url} alt="avatar" className="w-9 h-9 rounded-full border border-border flex-shrink-0" />
                       )}
                       <div className="flex-1 min-w-0">
                         <div className="text-sm font-semibold text-green-400">Connected as @{githubStatus.username}</div>
@@ -591,7 +596,7 @@ export function SettingsModal() {
                       </div>
                       <button
                         onClick={handleDisconnectGithub}
-                        className="text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded px-3 py-1.5 hover:bg-red-500/10 transition-colors"
+                        className="text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded px-3 py-1.5 hover:bg-red-500/10 transition-colors flex-shrink-0"
                       >
                         Disconnect
                       </button>
@@ -604,7 +609,7 @@ export function SettingsModal() {
                   /* Not connected state */
                   <div className="space-y-4">
                     <Field label="Personal Access Token (Classic)">
-                      <div className="flex gap-2">
+                      <div className="flex gap-2 max-sm:flex-col">
                         <input
                           type="password"
                           className="input flex-1"
@@ -616,7 +621,7 @@ export function SettingsModal() {
                         <button
                           onClick={handleConnectGithub}
                           disabled={githubConnecting || !githubPat.trim()}
-                          className="btn-primary px-4 text-sm disabled:opacity-50"
+                          className="btn-primary px-4 text-sm disabled:opacity-50 max-sm:w-full"
                         >
                           {githubConnecting ? 'Connecting…' : 'Connect'}
                         </button>
