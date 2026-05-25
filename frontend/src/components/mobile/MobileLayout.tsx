@@ -201,7 +201,8 @@ export function MobileLayout() {
   }
 
   return (
-    <div className="flex flex-col h-screen bg-base text-ink overflow-hidden">
+    <div className="flex flex-col bg-base text-ink overflow-hidden"
+      style={{ height: '100dvh' }}>
       {/* Global header — always visible, shows current tab + user avatar */}
       <header className="flex-shrink-0 flex items-center justify-between
         px-4 border-b border-border bg-surface/90 backdrop-blur-sm"
