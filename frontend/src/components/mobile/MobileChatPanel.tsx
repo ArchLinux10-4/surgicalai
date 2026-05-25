@@ -329,20 +329,6 @@ export function MobileChatPanel() {
 
   return (
     <div className="flex flex-col h-full bg-base">
-      {/* Header */}
-      <div className="flex-shrink-0 flex items-center gap-3 px-4 py-3 border-b border-border bg-surface/80">
-        <div className="w-6 h-6 rounded-full bg-orange/20 border border-orange/30 flex items-center justify-center">
-          <span className="text-orange text-[9px] font-bold">S</span>
-        </div>
-        <span className="text-sm font-semibold text-ink/80">SurgicalAI</span>
-        {isStreaming && (
-          <div className="ml-auto flex items-center gap-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-orange animate-pulse" />
-            <span className="text-[11px] text-muted/60">Thinking</span>
-          </div>
-        )}
-      </div>
-
       {/* Messages */}
       <div className="flex-1 overflow-y-auto">
         {messages.length === 0 && !isStreaming ? (

@@ -63,14 +63,6 @@ export function MobileFilesPanel() {
 
   return (
     <div className="flex flex-col h-full bg-base">
-      {/* Header */}
-      <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 border-b border-border bg-surface/80">
-        <span className="text-sm font-semibold text-ink/80">Files in Session</span>
-        <span className="text-[11px] text-muted/50">
-          {sessionFiles.length} file{sessionFiles.length !== 1 ? 's' : ''}
-        </span>
-      </div>
-
       {/* List */}
       <div className="flex-1 overflow-y-auto">
         {sessionFiles.length === 0 ? (

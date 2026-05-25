@@ -93,31 +93,25 @@ export function MobileSessionsPanel({ onSelectSession }: Props) {
 
   return (
     <div className="flex flex-col h-full bg-base">
-      {/* Header */}
-      <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 border-b border-border bg-surface/80">
-        <span className="text-sm font-semibold text-ink/80">Sessions</span>
-        <button
-          onClick={createSession}
-          disabled={loading}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-orange/20 border border-orange/30 rounded-lg text-[12px] text-orange font-medium hover:bg-orange/30 active:scale-95 transition-all disabled:opacity-50"
-        >
-          {loading ? (
-            <span className="w-3 h-3 border-2 border-orange/40 border-t-orange rounded-full animate-spin" />
-          ) : (
-            <span>+</span>
-          )}
-          New
-        </button>
-      </div>
-
       {/* Search */}
-      <div className="flex-shrink-0 px-4 py-2 border-b border-border/50">
+      <div className="flex-shrink-0 px-4 py-2 border-b border-border/50 flex items-center gap-2">
         <input
           value={search}
           onChange={e => setSearch(e.target.value)}
           placeholder="Search sessions..."
-          className="w-full bg-surface/60 border border-border rounded-xl px-3 py-2 text-sm text-ink placeholder:text-muted/40 focus:outline-none focus:border-orange/40 transition-colors"
+          className="flex-1 bg-surface/60 border border-border rounded-xl px-3 py-2 text-sm text-ink placeholder:text-muted/40 focus:outline-none focus:border-orange/40 transition-colors"
         />
+        <button
+          onClick={createSession}
+          disabled={loading}
+          className="flex items-center gap-1.5 px-3 py-2 bg-orange/20 border border-orange/30 rounded-xl text-[12px] text-orange font-medium hover:bg-orange/30 active:scale-95 transition-all disabled:opacity-50 flex-shrink-0"
+        >
+          {loading
+            ? <span className="w-3 h-3 border-2 border-orange/40 border-t-orange rounded-full animate-spin" />
+            : <span>+</span>
+          }
+          New
+        </button>
       </div>
 
       {/* List */}
