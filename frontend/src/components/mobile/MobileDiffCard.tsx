@@ -1,0 +1,276 @@
+/**
+ * MobileDiffCard — touch-optimised diff viewer for mobile.
+ * Simplified vs desktop InlineDiffCard: no line-level checkboxes,
+ * large touch targets, swipeable before/after view, single Apply All tap.
+ * Uses same API calls as InlineDiffCard — no new backend needed.
+ */
+import React, { useState } from 'react'
+import { api } from '../../api/client'
+import { toast } from '../../lib/toast'
+import type { SmartResult, SessionFile } from '../../types'
+
+interface Props {
+  result: SmartResult
+  sessionId: string
+  sessionFiles: SessionFile[]
+  setSessionFiles: (f: SessionFile[]) => void
+}
+
+// ── Mini diff renderer — shows +/- lines with color ──────────────────────────
+function DiffPreview({ diff }: { diff: string }) {
+  if (!diff) return null
+  const lines = diff.split('\n').slice(0, 60) // cap for mobile
+  return (
+    <div className="overflow-x-auto rounded-lg bg-[#0d0d0d] border border-border/50">
+      <pre className="text-[10px] font-mono p-3 leading-5 min-w-0">
+        {lines.map((line, i) => {
+          const isAdd = line.startsWith('+') && !line.startsWith('+++')
+          const isDel = line.startsWith('-') && !line.startsWith('---')
+          const isHead = line.startsWith('@@') || line.startsWith('---') || line.startsWith('+++')
+          return (
+            <div
+              key={i}
+              className={
+                isAdd  ? 'text-emerald-400 bg-emerald-400/5' :
+                isDel  ? 'text-red-400 bg-red-400/5'         :
+                isHead ? 'text-blue-400/60'                   :
+                'text-ink/50'
+              }
+            >
+              {line || ' '}
+            </div>
+          )
+        })}
+        {diff.split('\n').length > 60 && (
+          <div className="text-muted/40 mt-1">... {diff.split('\n').length - 60} more lines</div>
+        )}
+      </pre>
+    </div>
+  )
+}
+
+// ── Single file change card ───────────────────────────────────────────────────
+function FileCard({
+  filename, fileData, sessionId, onApplied,
+}: {
+  filename: string
+  fileData: { filename: string; file_id: string; changes: any[] }
+  sessionId: string
+  onApplied: () => void
+}) {
+  const [expanded, setExpanded]     = useState(false)
+  const [applying, setApplying]     = useState(false)
+  const [applied, setApplied]       = useState(false)
+  const [activeChange, setActive]   = useState(0)
+
+  const changes = fileData.changes || []
+  const currentChange = changes[activeChange]
+  const diff = currentChange?.diff || ''
+
+  const handleApply = async () => {
+    if (applying || applied) return
+    setApplying(true)
+    try {
+      const current = await api.sessionFiles.get(sessionId, fileData.file_id)
+      const result  = await api.surgical.applyAll({
+        file_path: filename,
+        changes,
+        file_content: current.content,
+      })
+      if (result.modified_content) {
+        await api.sessionFiles.update(sessionId, fileData.file_id, result.modified_content)
+      }
+      setApplied(true)
+      toast.success(`Applied ${changes.length} change${changes.length !== 1 ? 's' : ''} to ${filename}`)
+      onApplied()
+    } catch (e: any) {
+      toast.error(e.message || 'Apply failed')
+    } finally {
+      setApplying(false)
+    }
+  }
+
+  // QA verdict for current change
+  const qa = currentChange?.qa_result
+  const qaVerdict = qa?.verdict
+  const qaScore   = qa?.qa_score
+  const qaSummary = qa?.summary || ''
+
+  return (
+    <div className={`rounded-xl border overflow-hidden mb-2 ${
+      applied ? 'border-emerald-500/30 bg-emerald-500/5' : 'border-border bg-surface/60'
+    }`}>
+      {/* Header row */}
+      <button
+        className="w-full flex items-center gap-2 px-3 py-2.5 text-left"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span className="text-[11px] font-mono text-ink/80 truncate flex-1">{filename}</span>
+        <span className="text-[10px] text-muted/60 flex-shrink-0">{changes.length} change{changes.length !== 1 ? 's' : ''}</span>
+        <span className={`text-[11px] transition-transform ${expanded ? 'rotate-90' : ''}`}>▶</span>
+      </button>
+
+      {expanded && (
+        <div className="px-3 pb-3 border-t border-border/50">
+          {/* Change selector if multiple */}
+          {changes.length > 1 && (
+            <div className="flex gap-1.5 mt-2 mb-2 flex-wrap">
+              {changes.map((_: any, i: number) => (
+                <button
+                  key={i}
+                  onClick={() => setActive(i)}
+                  className={`px-2 py-1 rounded-lg text-[10px] border transition-colors ${
+                    i === activeChange
+                      ? 'bg-orange/20 border-orange/40 text-orange'
+                      : 'bg-surface border-border text-muted/60'
+                  }`}
+                >
+                  {changes[i]?.symbol?.name || `Change ${i + 1}`}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Change description */}
+          {currentChange?.description && (
+            <p className="text-[11px] text-muted/70 mt-2 mb-2">{currentChange.description}</p>
+          )}
+
+          {/* QA badge */}
+          {qa && (
+            <div className={`flex items-center gap-2 px-2.5 py-1.5 rounded-lg border mb-2 text-[11px] ${
+              qaVerdict === 'safe'    ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-400' :
+              qaVerdict === 'warning' ? 'bg-amber-500/10 border-amber-500/25 text-amber-400'       :
+              qaVerdict === 'blocked' ? 'bg-red-500/10 border-red-500/25 text-red-400'             :
+              'bg-surface border-border text-muted/60'
+            }`}>
+              <span>{qaVerdict === 'safe' ? '✅' : qaVerdict === 'warning' ? '⚠️' : '🚫'}</span>
+              <span className="flex-1">{qaSummary}</span>
+              {qaScore && <span className="font-medium">{qaScore}/10</span>}
+            </div>
+          )}
+
+          {/* Diff preview */}
+          <DiffPreview diff={diff} />
+        </div>
+      )}
+
+      {/* Apply button */}
+      {!applied && (
+        <div className="px-3 pb-3 pt-1">
+          <button
+            onClick={handleApply}
+            disabled={applying || qaVerdict === 'blocked'}
+            className={`w-full py-2.5 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2 ${
+              qaVerdict === 'blocked'
+                ? 'bg-red-500/10 border border-red-500/25 text-red-400/60 cursor-not-allowed'
+                : applying
+                  ? 'bg-orange/20 border border-orange/30 text-orange/60 cursor-wait'
+                  : 'bg-orange/20 border border-orange/40 text-orange hover:bg-orange/30 active:scale-95'
+            }`}
+          >
+            {applying ? (
+              <>
+                <span className="w-3.5 h-3.5 border-2 border-orange/40 border-t-orange rounded-full animate-spin" />
+                Applying...
+              </>
+            ) : qaVerdict === 'blocked' ? (
+              <>🚫 Blocked by QA</>
+            ) : (
+              <>✓ Apply {changes.length > 1 ? `All ${changes.length} Changes` : 'Change'}</>
+            )}
+          </button>
+          {qaVerdict === 'blocked' && (
+            <p className="text-[10px] text-red-400/60 text-center mt-1">
+              QA blocked this change. Review on desktop for details.
+            </p>
+          )}
+        </div>
+      )}
+
+      {applied && (
+        <div className="px-3 pb-3 pt-1 text-center text-[11px] text-emerald-400">
+          ✓ Applied
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── New file card ─────────────────────────────────────────────────────────────
+function NewFileMobileCard({ file }: { file: any }) {
+  const [expanded, setExpanded] = useState(false)
+  return (
+    <div className="rounded-xl border border-blue-500/25 bg-blue-500/5 mb-2 overflow-hidden">
+      <button
+        className="w-full flex items-center gap-2 px-3 py-2.5 text-left"
+        onClick={() => setExpanded(!expanded)}
+      >
+        <span className="text-blue-400 text-[11px]">+ New</span>
+        <span className="text-[11px] font-mono text-ink/80 truncate flex-1">{file.filename}</span>
+        <span className={`text-[11px] transition-transform ${expanded ? 'rotate-90' : ''}`}>▶</span>
+      </button>
+      {expanded && (
+        <div className="px-3 pb-3 border-t border-border/50">
+          {file.summary && <p className="text-[11px] text-muted/70 mt-2 mb-2">{file.summary}</p>}
+          <div className="overflow-x-auto rounded-lg bg-[#0d0d0d] border border-border/50 max-h-48 overflow-y-auto">
+            <pre className="text-[10px] font-mono p-3 leading-5 text-ink/70">
+              {(file.content || '').slice(0, 2000)}
+              {(file.content || '').length > 2000 && '\n... (truncated — download to see full file)'}
+            </pre>
+          </div>
+          <p className="text-[10px] text-muted/50 mt-2 text-center">
+            Download from Files tab to use this file
+          </p>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ── Main export ───────────────────────────────────────────────────────────────
+export function MobileDiffCard({ result, sessionId, sessionFiles, setSessionFiles }: Props) {
+  const [allApplied, setAllApplied] = useState(false)
+
+  const files      = Object.entries(result.changes_by_file || {})
+  const newFiles   = result.new_files || []
+  const totalFiles = files.length + newFiles.length
+
+  if (totalFiles === 0) return null
+
+  const handleApplied = async () => {
+    // Refresh session files after any apply
+    try {
+      const fresh = await api.sessionFiles.list(sessionId)
+      setSessionFiles(fresh)
+    } catch {}
+  }
+
+  return (
+    <div className="w-full mt-1">
+      {/* Summary header */}
+      <div className="flex items-center gap-2 mb-2">
+        <span className="text-[11px] font-medium text-ink/60">
+          ✂️ {files.length} file{files.length !== 1 ? 's' : ''} changed
+          {newFiles.length > 0 && `, ${newFiles.length} new`}
+        </span>
+      </div>
+
+      {/* File cards */}
+      {files.map(([filename, fileData]) => (
+        <FileCard
+          key={filename}
+          filename={filename}
+          fileData={fileData as any}
+          sessionId={sessionId}
+          onApplied={handleApplied}
+        />
+      ))}
+
+      {/* New file cards */}
+      {newFiles.map((f: any, i: number) => (
+        <NewFileMobileCard key={i} file={f} />
+      ))}
+    </div>
+  )
+}

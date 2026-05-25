@@ -1,15 +1,32 @@
 import React, { useEffect } from 'react'
 import { Layout } from './components/Layout'
+import { MobileLayout } from './components/mobile/MobileLayout'
 import { SettingsModal } from './components/SettingsModal'
 import { Toaster } from './components/Toast'
 import { useAppStore } from './stores/appStore'
 import { useAuthStore } from './stores/authStore'
 import { api } from './api/client'
 
+// Detect mobile viewport — the ONLY change to existing App.tsx logic.
+// Desktop (>768px) → Layout (unchanged). Mobile (≤768px) → MobileLayout (new, isolated).
+function useIsMobile() {
+  const [isMobile, setIsMobile] = React.useState(
+    () => typeof window !== 'undefined' && window.innerWidth <= 768
+  )
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 768px)')
+    const handler = (e: MediaQueryListEvent) => setIsMobile(e.matches)
+    mq.addEventListener('change', handler)
+    return () => mq.removeEventListener('change', handler)
+  }, [])
+  return isMobile
+}
+
 export default function App() {
   const { setSettings, settings, setSettingsOpen } = useAppStore()
   const { isAuthenticated } = useAuthStore()
   const [settingsLoaded, setSettingsLoaded] = React.useState(false)
+  const isMobile = useIsMobile()
 
   // Only fetch settings when actually authenticated.
   // This prevents the banner from flashing on the login screen when a stale
@@ -29,10 +46,6 @@ export default function App() {
 
   return (
     <div className="h-screen flex flex-col bg-base text-ink overflow-hidden">
-      {/* Only show banner when:
-           1. User is actually logged in
-           2. Settings have finished loading (no flash while fetching)
-           3. Key genuinely missing */}
       {isAuthenticated && settingsLoaded && !settings?.openai_api_key_set && !(settings as any)?.anthropic_api_key_set && (
         <div className="flex items-center gap-3 px-4 py-2 bg-surface border-b border-orange/30 text-orange text-xs">
           <span className="text-base">⚠️</span>
@@ -45,7 +58,8 @@ export default function App() {
           </button>
         </div>
       )}
-      <Layout />
+      {/* Mobile and desktop routes are fully isolated — no shared component tree */}
+      {isMobile ? <MobileLayout /> : <Layout />}
       <SettingsModal />
       <Toaster />
     </div>
