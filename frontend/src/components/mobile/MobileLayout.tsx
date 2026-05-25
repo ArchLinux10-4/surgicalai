@@ -201,12 +201,11 @@ export function MobileLayout() {
   }
 
   return (
-    <div className="flex flex-col bg-base text-ink overflow-hidden"
-      style={{ height: '100dvh' }}>
+    <div className="fixed inset-0 flex flex-col bg-base text-ink overflow-hidden">
       {/* Global header — always visible, shows current tab + user avatar */}
       <header className="flex-shrink-0 flex items-center justify-between
         px-4 border-b border-border bg-surface/90 backdrop-blur-sm"
-        style={{ paddingTop: 'env(safe-area-inset-top, 12px)', paddingBottom: '10px' }}
+        style={{ paddingTop: 'max(env(safe-area-inset-top, 0px), 12px)', paddingBottom: '10px' }}
       >
         {/* Logo + current tab name */}
         <div className="flex items-center gap-2.5">
