@@ -241,9 +241,7 @@ export function MobileLayout() {
       </div>
 
       {/* Tab bar */}
-      <nav className="flex-shrink-0 flex border-t border-border bg-surface"
-        style={{ paddingBottom: 'env(safe-area-inset-bottom, 0px)' }}
-      >
+      <nav className="flex-shrink-0 flex border-t border-border bg-surface">
         {([
           { id: 'chat',     label: 'Chat',     Icon: ChatIcon     },
           { id: 'sessions', label: 'Sessions', Icon: SessionsIcon },
