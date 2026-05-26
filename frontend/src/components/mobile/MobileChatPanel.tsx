@@ -143,7 +143,74 @@ function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void 
   )
 }
 
-// ── Main component ────────────────────────────────────────────────────────────
+// ── Full-screen compose sheet ─────────────────────────────────────────────────
+function MobileComposeSheet({ value, onChange, onSend, onClose, isStreaming, disabled }: {
+  value: string
+  onChange: (v: string) => void
+  onSend: () => void
+  onClose: () => void
+  isStreaming: boolean
+  disabled: boolean
+}) {
+  const ref = useRef<HTMLTextAreaElement>(null)
+  useEffect(() => {
+    // Focus and move cursor to end
+    if (ref.current) {
+      ref.current.focus()
+      const len = ref.current.value.length
+      ref.current.setSelectionRange(len, len)
+    }
+  }, [])
+
+  const handleSend = () => {
+    onSend()
+    onClose()
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex flex-col bg-base"
+      style={{ paddingTop: 'max(env(safe-area-inset-top, 0px), 12px)' }}>
+      {/* Header */}
+      <div className="flex-shrink-0 flex items-center justify-between px-4 py-3 border-b border-border bg-surface/90">
+        <button
+          onClick={onClose}
+          className="text-sm text-muted/70 hover:text-ink transition-colors px-1 py-1"
+        >
+          Cancel
+        </button>
+        <span className="text-[13px] font-medium text-ink/60">Compose</span>
+        <button
+          onClick={handleSend}
+          disabled={!value.trim() || disabled || isStreaming}
+          className="text-sm font-semibold text-orange disabled:text-muted/40 transition-colors px-1 py-1"
+        >
+          Send
+        </button>
+      </div>
+
+      {/* Large textarea */}
+      <textarea
+        ref={ref}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder="Ask about your code, describe changes, or paste requirements..."
+        className="flex-1 w-full resize-none bg-transparent px-5 py-4 text-base text-ink
+          placeholder:text-muted/40 focus:outline-none leading-relaxed"
+      />
+
+      {/* Character count + hint */}
+      <div className="flex-shrink-0 flex items-center justify-between px-5 py-3
+        border-t border-border/50 bg-surface/50"
+        style={{ paddingBottom: 'max(env(safe-area-inset-bottom, 0px), 12px)' }}>
+        <span className="text-[11px] text-muted/40">Shift+Enter for new line</span>
+        <span className={`text-[11px] tabular-nums ${value.length > 2000 ? 'text-amber-400' : 'text-muted/40'}`}>
+          {value.length > 0 ? `${value.length.toLocaleString()} chars` : ''}
+        </span>
+      </div>
+    </div>
+  )
+}
+
 export function MobileChatPanel() {
   const {
     activeSessions, setActiveSession, messages, addMessage, setMessages,
@@ -158,6 +225,7 @@ export function MobileChatPanel() {
   const [progressHistory, setProgHist]  = useState<string[]>([])
   const [isBuildingEdit, setBuildEdit]  = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
+  const [composeOpen, setComposeOpen]   = useState(false)
   const [error, setError]               = useState<string | null>(null)
 
   const progressHistoryRef = useRef<string[]>([])
@@ -427,23 +495,48 @@ export function MobileChatPanel() {
             onChange={e => handleFileUpload(e.target.files)}
           />
 
-          {/* Text input */}
-          <textarea
-            ref={textareaRef}
-            value={input}
-            onChange={e => {
-              setInput(e.target.value)
-              e.target.style.height = 'auto'
-              e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px'
-            }}
-            onKeyDown={e => {
-              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
-            }}
-            placeholder="Ask about your code..."
-            rows={1}
-            className="flex-1 resize-none bg-overlay/40 border border-border rounded-xl px-3 py-2.5 text-sm text-ink placeholder:text-muted/40 focus:outline-none focus:border-orange/40 focus:bg-overlay/60 transition-colors"
-            style={{ minHeight: 40, maxHeight: 120 }}
-          />
+          {/* Text input + expand button */}
+          <div className="flex-1 relative">
+            <textarea
+              ref={textareaRef}
+              value={input}
+              onChange={e => {
+                setInput(e.target.value)
+                e.target.style.height = 'auto'
+                e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px'
+              }}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
+              }}
+              placeholder="Ask about your code..."
+              rows={1}
+              className="w-full resize-none bg-overlay/40 border border-border rounded-xl px-3 py-2.5 pr-8 text-sm text-ink placeholder:text-muted/40 focus:outline-none focus:border-orange/40 focus:bg-overlay/60 transition-colors"
+              style={{ minHeight: 40, maxHeight: 120 }}
+            />
+            {/* Expand button — opens full-screen compose */}
+            <button
+              onClick={() => setComposeOpen(true)}
+              className="absolute right-2 top-2 w-5 h-5 flex items-center justify-center text-muted/40 hover:text-muted/80 transition-colors"
+              title="Expand editor"
+            >
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/>
+                <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
+              </svg>
+            </button>
+          </div>
+
+          {/* Compose sheet — full-screen editor */}
+          {composeOpen && (
+            <MobileComposeSheet
+              value={input}
+              onChange={setInput}
+              onSend={handleSend}
+              onClose={() => setComposeOpen(false)}
+              isStreaming={isStreaming}
+              disabled={isCompacting}
+            />
+          )}
 
           {/* Send / Stop button */}
           <button
