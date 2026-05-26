@@ -11,6 +11,7 @@ import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import { MobileDiffCard } from './MobileDiffCard'
 import { VoiceButton } from '../VoiceButton'
+import { useCodeRain } from '../../hooks/useCodeRain'
 import type { SessionFile, SmartResult } from '../../types'
 
 // ── Thin progress steps component ───────────────────────────────────────────
@@ -35,13 +36,13 @@ function StreamingBubble({ text, progress, isBuildingEdit }: {
 }) {
   return (
     <div className="flex items-start gap-2.5 px-4 py-3">
-      <div className="w-7 h-7 rounded-full bg-orange/20 border border-orange/30 flex items-center justify-center flex-shrink-0 mt-0.5">
-        <span className="text-orange text-[10px] font-bold">AI</span>
+      <div className="w-7 h-7 rounded-full bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)] flex items-center justify-center flex-shrink-0 mt-0.5">
+        <span className="text-[#4ade80] text-[10px] font-bold">AI</span>
       </div>
       <div className="flex-1 min-w-0">
         {progress && progress !== 'Thinking...' && (
           <div className="flex items-center gap-1.5 text-[11px] text-muted/70 mb-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-orange animate-pulse" />
+            <span className="w-1.5 h-1.5 rounded-full bg-[#4ade80] animate-pulse" />
             {progress}
           </div>
         )}
@@ -104,8 +105,8 @@ function MessageBubble({ msg, sessionId, sessionFiles, setSessionFiles }: {
 
   return (
     <div className="flex items-start gap-2.5 px-4 py-3">
-      <div className="w-7 h-7 rounded-full bg-orange/20 border border-orange/30 flex items-center justify-center flex-shrink-0 mt-0.5">
-        <span className="text-orange text-[10px] font-bold">AI</span>
+      <div className="w-7 h-7 rounded-full bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)] flex items-center justify-center flex-shrink-0 mt-0.5">
+        <span className="text-[#4ade80] text-[10px] font-bold">AI</span>
       </div>
       <div className="flex-1 min-w-0 overflow-hidden">
         {/* Steps trail */}
@@ -182,7 +183,7 @@ function MobileComposeSheet({ value, onChange, onSend, onClose, isStreaming, dis
         <button
           onClick={handleSend}
           disabled={!value.trim() || disabled || isStreaming}
-          className="text-sm font-semibold text-orange disabled:text-muted/40 transition-colors px-1 py-1"
+          className="text-sm font-semibold text-[#4ade80] disabled:text-muted/40 transition-colors px-1 py-1"
         >
           Send
         </button>
@@ -193,7 +194,7 @@ function MobileComposeSheet({ value, onChange, onSend, onClose, isStreaming, dis
         ref={ref}
         value={value}
         onChange={e => onChange(e.target.value)}
-        placeholder="Ready when you are! Describe changes, or paste requirements..."
+        placeholder="Ready when you are!, describe changes, or paste requirements..."
         className="flex-1 w-full resize-none bg-transparent px-5 py-4 text-base text-ink
           placeholder:text-muted/40 focus:outline-none leading-relaxed"
       />
@@ -206,6 +207,71 @@ function MobileComposeSheet({ value, onChange, onSend, onClose, isStreaming, dis
         <span className={`text-[11px] tabular-nums ${value.length > 2000 ? 'text-amber-400' : 'text-muted/40'}`}>
           {value.length > 0 ? `${value.length.toLocaleString()} chars` : ''}
         </span>
+      </div>
+    </div>
+  )
+}
+
+// ── Animated home screen ─────────────────────────────────────────────────────
+function EmptyHomeScreen() {
+  const canvasRef = useCodeRain(true)
+
+  return (
+    <div className="relative flex flex-col items-center justify-center h-full overflow-hidden"
+      style={{ background: '#0a0a0a' }}>
+      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ opacity: 0.85 }} />
+      <div className="absolute inset-0 pointer-events-none"
+        style={{ background: 'radial-gradient(ellipse at center, rgba(74,222,128,0.07) 0%, transparent 70%)' }} />
+      <div className="relative z-10 flex flex-col items-center gap-5 px-8 text-center">
+        {/* Precision Scope icon */}
+        <div className="relative" style={{ width: 88, height: 88 }}>
+          <div className="absolute inset-0 rounded-full"
+            style={{ background: 'radial-gradient(circle, rgba(74,222,128,0.12) 0%, transparent 70%)' }} />
+          <div className="w-full h-full rounded-[22px] flex items-center justify-center" style={{
+            background: 'rgba(74,222,128,0.07)',
+            border: '1px solid rgba(74,222,128,0.28)',
+            boxShadow: '0 0 32px rgba(74,222,128,0.1)',
+          }}>
+            <svg width="56" height="56" viewBox="0 0 64 64" style={{ overflow: 'visible' }}>
+              <style>{`
+                @keyframes sai-spin  { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+                @keyframes sai-rspin { from{transform:rotate(0deg)} to{transform:rotate(-360deg)} }
+                @keyframes sai-blink { 0%,100%{opacity:1} 50%{opacity:0.15} }
+                @keyframes sai-scan  { 0%,100%{transform:translateY(-22px);opacity:0} 20%{opacity:0.7} 80%{opacity:0.7} 100%{transform:translateY(22px);opacity:0} }
+              `}</style>
+              <line x1="8" y1="32" x2="56" y2="32" stroke="rgba(74,222,128,0.55)" strokeWidth="0.75" strokeDasharray="3 3" style={{ animation: 'sai-scan 2.4s ease-in-out infinite' }} />
+              <circle cx="32" cy="32" r="27" fill="none" stroke="rgba(74,222,128,0.22)" strokeWidth="0.75" strokeDasharray="4 3" style={{ animation: 'sai-spin 9s linear infinite', transformOrigin: '32px 32px' }} />
+              <circle cx="32" cy="32" r="20" fill="none" stroke="rgba(74,222,128,0.5)" strokeWidth="1" />
+              <circle cx="32" cy="32" r="13" fill="none" stroke="rgba(74,222,128,0.18)" strokeWidth="0.75" strokeDasharray="2 4" style={{ animation: 'sai-rspin 5s linear infinite', transformOrigin: '32px 32px' }} />
+              <line x1="32" y1="4"  x2="32" y2="18" stroke="#4ade80" strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="32" y1="46" x2="32" y2="60" stroke="#4ade80" strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="4"  y1="32" x2="18" y2="32" stroke="#4ade80" strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="46" y1="32" x2="60" y2="32" stroke="#4ade80" strokeWidth="1.5" strokeLinecap="round" />
+              <path d="M14 21 L14 14 L21 14" fill="none" stroke="rgba(74,222,128,0.55)" strokeWidth="1" strokeLinecap="round" />
+              <path d="M50 21 L50 14 L43 14" fill="none" stroke="rgba(74,222,128,0.55)" strokeWidth="1" strokeLinecap="round" />
+              <path d="M14 43 L14 50 L21 50" fill="none" stroke="rgba(74,222,128,0.55)" strokeWidth="1" strokeLinecap="round" />
+              <path d="M50 43 L50 50 L43 50" fill="none" stroke="rgba(74,222,128,0.55)" strokeWidth="1" strokeLinecap="round" />
+              <circle cx="32" cy="32" r="4.5" fill="rgba(74,222,128,0.1)" stroke="#4ade80" strokeWidth="1.5" />
+              <circle cx="32" cy="32" r="1.5" fill="#4ade80" style={{ animation: 'sai-blink 1.2s ease-in-out infinite' }} />
+            </svg>
+          </div>
+        </div>
+        <div>
+          <h1 style={{ fontFamily: 'monospace', fontSize: 20, fontWeight: 700, color: '#e2e8f0', letterSpacing: 1, margin: 0 }}>SurgicalAI</h1>
+          <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#4ade80', marginTop: 5, letterSpacing: 0.5, opacity: 0.85 }}>
+            Precision code edits. Zero collateral.
+          </div>
+        </div>
+        <div className="flex flex-wrap justify-center gap-2 mt-1">
+          {['Symbol-level edits', 'QA verified', 'Multi-file'].map(chip => (
+            <span key={chip} style={{ fontFamily: 'monospace', fontSize: 9, color: 'rgba(74,222,128,0.7)', border: '1px solid rgba(74,222,128,0.2)', borderRadius: 6, padding: '3px 10px', background: 'rgba(74,222,128,0.05)', letterSpacing: 0.5 }}>
+              {chip}
+            </span>
+          ))}
+        </div>
+        <p style={{ fontFamily: 'monospace', fontSize: 10, color: 'rgba(148,163,184,0.4)', marginTop: 4 }}>
+          Upload a file and describe your change ↓
+        </p>
       </div>
     </div>
   )
@@ -418,15 +484,7 @@ export function MobileChatPanel() {
       {/* Messages */}
       <div className="flex-1 overflow-y-auto">
         {messages.length === 0 && !isStreaming ? (
-          <div className="flex flex-col items-center justify-center h-full gap-4 px-6 text-center">
-            <div className="w-14 h-14 rounded-2xl bg-orange/10 border border-orange/20 flex items-center justify-center">
-              <span className="text-2xl">✂️</span>
-            </div>
-            <div>
-              <p className="text-sm font-semibold text-ink/80 mb-1">SurgicalAI</p>
-              <p className="text-xs text-muted/60">Upload files and ask for code changes.</p>
-            </div>
-          </div>
+          <EmptyHomeScreen />
         ) : (
           <div className="py-2">
             {messages.map((msg, i) => (
@@ -474,7 +532,7 @@ export function MobileChatPanel() {
 
         {/* Unified pill — contains textarea + all actions */}
         <div className="flex flex-col bg-surface border border-border/80 rounded-2xl
-          overflow-hidden shadow-sm focus-within:border-orange/40 transition-colors">
+          overflow-hidden shadow-sm focus-within:border-[rgba(74,222,128,0.35)] transition-colors">
 
           {/* Textarea row */}
           <textarea
@@ -488,7 +546,7 @@ export function MobileChatPanel() {
             onKeyDown={e => {
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
             }}
-            placeholder={isCompacting ? 'Compacting history…' : 'Ask about your code…'}
+            placeholder={isCompacting ? 'Compacting history…' : 'Ready when you are!…'}
             rows={1}
             disabled={isCompacting}
             className="w-full resize-none bg-transparent px-4 pt-3 pb-1 text-[15px]
@@ -561,7 +619,7 @@ export function MobileChatPanel() {
                 className={`w-9 h-9 flex items-center justify-center rounded-xl
                   transition-all active:scale-95
                   ${canSend
-                    ? 'bg-orange text-white shadow-sm shadow-orange/30 hover:bg-orange/90'
+                    ? 'bg-[#4ade80] text-white shadow-sm shadow-[rgba(74,222,128,0.2)] hover:bg-[#4ade80]/90'
                     : 'text-muted/30 cursor-not-allowed'
                   }`}
               >

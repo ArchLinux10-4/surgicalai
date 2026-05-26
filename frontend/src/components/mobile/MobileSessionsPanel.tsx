@@ -99,15 +99,15 @@ export function MobileSessionsPanel({ onSelectSession }: Props) {
           value={search}
           onChange={e => setSearch(e.target.value)}
           placeholder="Search sessions..."
-          className="flex-1 bg-surface/60 border border-border rounded-xl px-3 py-2 text-sm text-ink placeholder:text-muted/40 focus:outline-none focus:border-orange/40 transition-colors"
+          className="flex-1 bg-surface/60 border border-border rounded-xl px-3 py-2 text-sm text-ink placeholder:text-muted/40 focus:outline-none focus:border-[rgba(74,222,128,0.35)] transition-colors"
         />
         <button
           onClick={createSession}
           disabled={loading}
-          className="flex items-center gap-1.5 px-3 py-2 bg-orange/20 border border-orange/30 rounded-xl text-[12px] text-orange font-medium hover:bg-orange/30 active:scale-95 transition-all disabled:opacity-50 flex-shrink-0"
+          className="flex items-center gap-1.5 px-3 py-2 bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)] rounded-xl text-[12px] text-[#4ade80] font-medium hover:bg-[rgba(74,222,128,0.2)] active:scale-95 transition-all disabled:opacity-50 flex-shrink-0"
         >
           {loading
-            ? <span className="w-3 h-3 border-2 border-orange/40 border-t-orange rounded-full animate-spin" />
+            ? <span className="w-3 h-3 border-2 border-[rgba(74,222,128,0.35)] border-t-orange rounded-full animate-spin" />
             : <span>+</span>
           }
           New
@@ -121,7 +121,7 @@ export function MobileSessionsPanel({ onSelectSession }: Props) {
             <p className="text-sm text-muted/50">No sessions yet.</p>
             <button
               onClick={createSession}
-              className="text-orange text-sm font-medium"
+              className="text-[#4ade80] text-sm font-medium"
             >
               Start a new chat →
             </button>
@@ -132,7 +132,7 @@ export function MobileSessionsPanel({ onSelectSession }: Props) {
               <div
                 key={session.id}
                 className={`flex items-center gap-3 px-4 py-3 border-b border-border/30 active:bg-surface/60 transition-colors ${
-                  activeSessions === session.id ? 'bg-orange/5 border-l-2 border-l-orange' : ''
+                  activeSessions === session.id ? 'bg-[rgba(74,222,128,0.04)] border-l-2 border-l-[#4ade80]' : ''
                 }`}
               >
                 <button

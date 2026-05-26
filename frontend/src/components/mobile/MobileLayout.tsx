@@ -136,8 +136,8 @@ function MenuDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
 
         {/* User info section */}
         <div className="flex items-center gap-3 px-5 py-4 border-b border-border/50">
-          <div className="w-11 h-11 rounded-full bg-orange/20 border-2 border-orange/30
-            flex items-center justify-center text-orange font-bold text-sm flex-shrink-0">
+          <div className="w-11 h-11 rounded-full bg-[rgba(74,222,128,0.12)] border-2 border-[rgba(74,222,128,0.25)]
+            flex items-center justify-center text-[#4ade80] font-bold text-sm flex-shrink-0">
             {initials}
           </div>
           <div className="min-w-0">
@@ -235,9 +235,9 @@ export function MobileLayout() {
       >
         {/* Logo + current tab name */}
         <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-lg bg-orange/20 border border-orange/30
+          <div className="w-7 h-7 rounded-lg bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)]
             flex items-center justify-center flex-shrink-0">
-            <span className="text-orange text-[11px] font-bold">S</span>
+            <span className="text-[#4ade80] text-[11px] font-bold">S</span>
           </div>
           <div>
             <span className="text-[13px] font-semibold text-ink/80">SurgicalAI</span>
@@ -249,9 +249,9 @@ export function MobileLayout() {
         {/* User avatar — opens menu */}
         <button
           onClick={() => setMenuOpen(true)}
-          className="w-8 h-8 rounded-full bg-orange/20 border border-orange/30
-            flex items-center justify-center text-orange text-[11px] font-bold
-            hover:bg-orange/30 active:scale-95 transition-all"
+          className="w-8 h-8 rounded-full bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)]
+            flex items-center justify-center text-[#4ade80] text-[11px] font-bold
+            hover:bg-[rgba(74,222,128,0.2)] active:scale-95 transition-all"
           aria-label="Open menu"
         >
           {initials}
@@ -277,7 +277,7 @@ export function MobileLayout() {
             onClick={() => setActiveTab(id as Tab)}
             className={`flex-1 flex flex-col items-center justify-center gap-1 py-3
               text-[10px] font-medium transition-colors
-              ${activeTab === id ? 'text-orange' : 'text-muted/50 hover:text-muted'}`}
+              ${activeTab === id ? 'text-[#4ade80]' : 'text-muted/50 hover:text-muted'}`}
           >
             <Icon active={activeTab === id} />
             {label}

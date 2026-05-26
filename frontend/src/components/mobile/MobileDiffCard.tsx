@@ -197,7 +197,7 @@ function FileCard({
                   onClick={() => setActive(i)}
                   className={`px-2 py-1 rounded-lg text-[10px] border transition-colors ${
                     i === activeChange
-                      ? 'bg-orange/20 border-orange/40 text-orange'
+                      ? 'bg-[rgba(74,222,128,0.12)] border-[rgba(74,222,128,0.35)] text-[#4ade80]'
                       : 'bg-surface border-border text-muted/60'
                   }`}
                 >
@@ -248,13 +248,13 @@ function FileCard({
               currentChange?.qa_result?.verdict === 'blocked'
                 ? 'bg-red-500/10 border border-red-500/25 text-red-400/60 cursor-not-allowed'
                 : applying
-                  ? 'bg-orange/20 border border-orange/30 text-orange/60 cursor-wait'
-                  : 'bg-orange/20 border border-orange/40 text-orange hover:bg-orange/30 active:scale-95'
+                  ? 'bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)] text-[#4ade80]/60 cursor-wait'
+                  : 'bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.35)] text-[#4ade80] hover:bg-[rgba(74,222,128,0.2)] active:scale-95'
             }`}
           >
             {applying ? (
               <>
-                <span className="w-3.5 h-3.5 border-2 border-orange/40 border-t-orange rounded-full animate-spin" />
+                <span className="w-3.5 h-3.5 border-2 border-[rgba(74,222,128,0.35)] border-t-orange rounded-full animate-spin" />
                 Applying...
               </>
             ) : currentChange?.qa_result?.verdict === 'blocked' ? (
