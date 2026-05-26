@@ -256,7 +256,7 @@ function EmptyHomeScreen() {
                 @keyframes sai-blink   { 0%,100%{opacity:1} 50%{opacity:0.15} }
                 @keyframes sai-scan    { 0%,100%{transform:translateY(-22px);opacity:0} 20%{opacity:0.7} 80%{opacity:0.7} 100%{transform:translateY(22px);opacity:0} }
                 @keyframes sai-icon-out  { to { opacity: 0; transform: scale(0.85); } }
-                @keyframes sai-rain-fade { to { opacity: 0.06; } }
+                @keyframes sai-rain-fade { to { opacity: 0; } }
                 @keyframes sai-glow-fade { to { opacity: 0; } }
                 @keyframes sai-tag-fade  { to { opacity: 0; } }
               `}</style>
