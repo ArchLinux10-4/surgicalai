@@ -112,10 +112,52 @@ async def _compact_session(session_id: str, user_id: str) -> str:
         ).fetchone()
         existing = (session_row["session_summary"] if session_row and session_row["session_summary"] else "") or ""
 
-        turns_text = "\n".join([
-            f"{dict(r).get('role','user').upper()}: {str(dict(r).get('content',''))[:600]}"
-            for r in to_compact
-        ])
+        turns_text_parts = []
+        for r in to_compact:
+            row = dict(r)
+            role = row.get("role", "user").upper()
+            raw = str(row.get("content", ""))
+
+            # Clean stored format — same logic as _clean_history_content()
+            # so the summarizer sees readable text, not raw JSON blobs
+            if raw.startswith("__NATURAL_AND_RESULT__:"):
+                try:
+                    import json as _j
+                    payload = _j.loads(raw[len("__NATURAL_AND_RESULT__:"):])
+                    text = payload.get("text", "").strip()
+                    result = payload.get("result", {})
+                    changes = []
+                    for _fname, _fdata in result.get("changes_by_file", {}).items():
+                        for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
+                            sym = ch.get("symbol", {})
+                            name = (sym.get("name") or sym.get("full_path", "")) if isinstance(sym, dict) else ""
+                            if name:
+                                changes.append(f"{_fname}::{name}")
+                    qa_flags = []
+                    for _fname, _fdata in result.get("changes_by_file", {}).items():
+                        for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
+                            qr = ch.get("qa_result") or {}
+                            verdict = qr.get("verdict", "")
+                            summary = (qr.get("summary") or "").strip()
+                            sym = ch.get("symbol", {})
+                            name = (sym.get("name") or "") if isinstance(sym, dict) else ""
+                            if verdict in ("warning", "blocked") and summary:
+                                qa_flags.append(f"{name}: {summary}")
+                    if changes:
+                        text += f" [Changed: {', '.join(changes[:4])}]"
+                    if qa_flags:
+                        text += f" [QA flagged: {'; '.join(qa_flags[:2])}]"
+                    cleaned = text or "Made code changes."
+                except Exception:
+                    cleaned = "Made code changes."
+            elif raw.startswith("__SURGICAL_RESULT__:"):
+                cleaned = "Made code changes (surgical edit)."
+            else:
+                cleaned = raw
+
+            turns_text_parts.append(f"{role}: {cleaned[:500]}")
+
+        turns_text = "\n".join(turns_text_parts)
         prompt_parts = []
         if existing:
             prompt_parts.append(f"Previous summary:\n{existing}\n")

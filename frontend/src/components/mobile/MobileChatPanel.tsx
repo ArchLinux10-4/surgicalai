@@ -156,6 +156,7 @@ export function MobileChatPanel() {
   const [streamingMsg, setStreamingMsg] = useState('')
   const [progressHistory, setProgHist]  = useState<string[]>([])
   const [isBuildingEdit, setBuildEdit]  = useState(false)
+  const [isCompacting, setIsCompacting] = useState(false)
   const [error, setError]               = useState<string | null>(null)
 
   const progressHistoryRef = useRef<string[]>([])
@@ -291,7 +292,23 @@ export function MobileChatPanel() {
       },
       (err) => { setError(err); stopStream(); setBuildEdit(false) },
       undefined, // onThinking — omitted on mobile for simplicity
-      undefined, // onCompacting
+      // onCompacting
+      (phase) => {
+        if (phase === 'start') {
+          setIsCompacting(true)
+          setProgress('Compacting conversation history...')
+        } else {
+          setIsCompacting(false)
+          addMessage({
+            id: Date.now().toString() + '_compact',
+            session_id: sessionId,
+            role: 'system' as any,
+            message_type: 'compact_marker',
+            content: '',
+            created_at: new Date().toISOString(),
+          })
+        }
+      },
       () => setBuildEdit(true),
       () => setBuildEdit(false),
     )
