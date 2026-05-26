@@ -25,14 +25,13 @@ export interface UseSpeechRecognitionReturn {
 
 function isChrome(): boolean {
   if (typeof window === 'undefined') return false
-  const ua = navigator.userAgent
-  // Chrome on desktop and Android — exclude Edge (Chromium) and Opera
-  // to keep the feature focused on the best-tested environment
-  return (
-    /Chrome\//.test(ua) &&
-    !/Edg\//.test(ua) &&   // Edge Chromium
-    !/OPR\//.test(ua) &&   // Opera
-    !/Brave\//.test(ua)    // Brave
+  // Base support on whether the API actually exists — more reliable than UA sniffing.
+  // SpeechRecognition is present on Chrome desktop, Chrome Android, and Edge.
+  // It is NOT present on iOS Safari/Chrome (Apple doesn't expose it).
+  // This correctly shows the button on every browser that can actually use it.
+  return !!(
+    (window as any).SpeechRecognition ||
+    (window as any).webkitSpeechRecognition
   )
 }
 
