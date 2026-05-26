@@ -1,154 +1,174 @@
 /**
- * useSpeechRecognition — Chrome-only speech-to-text hook.
+ * useSpeechRecognition — speech-to-text hook.
  *
- * Returns null on any non-Chrome browser so callers can hide the UI entirely.
- * Uses the Web Speech API (SpeechRecognition / webkitSpeechRecognition).
+ * Shows mic button on any browser that has SpeechRecognition in window.
+ * On iOS (service-not-allowed) shows a clear error instead of hiding the button,
+ * so the user understands why it doesn't work rather than seeing it vanish.
  *
- * Zero dependencies beyond React. Zero backend calls.
+ * Desktop Chrome: works fully, can be used repeatedly without page refresh.
+ * Android Chrome: works fully.
+ * iOS (all browsers): API exists but Apple blocks it — shows error message.
+ * Firefox / other: API absent — button never renders.
  */
 import { useState, useEffect, useRef, useCallback } from 'react'
 
-export type SpeechState = 'idle' | 'listening' | 'processing' | 'error'
+export type SpeechState = 'idle' | 'listening' | 'processing'
 
 export interface UseSpeechRecognitionReturn {
-  /** Whether Chrome SpeechRecognition is available in this browser */
   isSupported: boolean
   state: SpeechState
-  /** Interim transcript shown in real time while speaking */
   interimTranscript: string
-  /** Start listening — calls onTranscript when a final result arrives */
   startListening: () => void
-  /** Stop listening manually */
   stopListening: () => void
   errorMessage: string
 }
 
-function isChrome(): boolean {
-  if (typeof window === 'undefined') return false
-  // Base support on whether the API actually exists — more reliable than UA sniffing.
-  // SpeechRecognition is present on Chrome desktop, Chrome Android, and Edge.
-  // It is NOT present on iOS Safari/Chrome (Apple doesn't expose it).
-  // This correctly shows the button on every browser that can actually use it.
-  return !!(
-    (window as any).SpeechRecognition ||
-    (window as any).webkitSpeechRecognition
-  )
-}
-
-function getSpeechRecognition(): any {
+function getSRClass(): any {
   if (typeof window === 'undefined') return null
-  return (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition || null
+  return (window as any).SpeechRecognition ||
+         (window as any).webkitSpeechRecognition ||
+         null
 }
 
 export function useSpeechRecognition(
   onTranscript: (text: string) => void
 ): UseSpeechRecognitionReturn {
-  const SpeechRecognition = getSpeechRecognition()
-  // Start with API existence check — will be set false if service-not-allowed fires
-  const [isSupported, setIsSupported]       = useState(() => SpeechRecognition !== null)
+  // Derived once — SRClass is stable (it's the constructor on window)
+  const SRClass = useRef<any>(getSRClass())
+  const isSupported = SRClass.current !== null
 
-  const [state, setState]                   = useState<SpeechState>('idle')
-  const [interimTranscript, setInterim]     = useState('')
-  const [errorMessage, setErrorMessage]     = useState('')
-  const recognitionRef                      = useRef<any>(null)
-  const onTranscriptRef                     = useRef(onTranscript)
+  const [state, setState]           = useState<SpeechState>('idle')
+  const [interim, setInterim]       = useState('')
+  const [errorMsg, setErrorMsg]     = useState('')
+  const recRef                      = useRef<any>(null)
+  const cbRef                       = useRef(onTranscript)
 
-  // Keep ref fresh without re-creating the recognition instance
-  useEffect(() => { onTranscriptRef.current = onTranscript }, [onTranscript])
+  useEffect(() => { cbRef.current = onTranscript }, [onTranscript])
 
   const stopListening = useCallback(() => {
-    if (recognitionRef.current) {
-      recognitionRef.current.stop()
-      recognitionRef.current = null
+    const rec = recRef.current
+    if (rec) {
+      try { rec.stop() } catch {}
+      recRef.current = null
     }
     setState('idle')
     setInterim('')
   }, [])
 
   const startListening = useCallback(() => {
-    if (!isSupported) return
-    if (recognitionRef.current) {
-      recognitionRef.current.stop()
-      recognitionRef.current = null
+    if (!SRClass.current) return
+
+    // Clear previous instance cleanly
+    const prev = recRef.current
+    if (prev) {
+      try { prev.abort() } catch {}
+      recRef.current = null
     }
 
-    setErrorMessage('')
+    setErrorMsg('')
     setInterim('')
+    setState('idle')
 
-    const rec = new SpeechRecognition()
-    rec.continuous      = false   // stop after first pause
-    rec.interimResults  = true    // show words as they come
+    const rec = new SRClass.current()
+    rec.continuous      = false
+    rec.interimResults  = true
     rec.lang            = 'en-US'
     rec.maxAlternatives = 1
 
-    rec.onstart = () => setState('listening')
+    rec.onstart = () => {
+      setState('listening')
+    }
 
     rec.onresult = (event: any) => {
-      let interim = ''
-      let final   = ''
+      let interimText = ''
+      let finalText   = ''
       for (let i = event.resultIndex; i < event.results.length; i++) {
         const t = event.results[i][0].transcript
         if (event.results[i].isFinal) {
-          final += t
+          finalText += t
         } else {
-          interim += t
+          interimText += t
         }
       }
-      setInterim(interim)
-      if (final.trim()) {
+      setInterim(interimText)
+      if (finalText.trim()) {
         setState('processing')
         setInterim('')
-        onTranscriptRef.current(final.trim())
+        cbRef.current(finalText.trim())
+        // Reset to idle after handing off transcript so button is usable again
+        setTimeout(() => setState('idle'), 300)
       }
     }
 
     rec.onerror = (event: any) => {
-      if (event.error === 'service-not-allowed' || event.error === 'not-allowed') {
-        // Device has the API but won't allow it (iOS, or mic permission denied permanently)
-        // Hide the button entirely so user isn't confused by a non-functional mic icon
-        if (event.error === 'service-not-allowed') {
-          setIsSupported(false)
-        } else {
-          setErrorMessage('Microphone access denied. Allow it in browser settings.')
-        }
-      } else {
-        const msg =
-          event.error === 'no-speech'  ? 'No speech detected. Try again.' :
-          event.error === 'network'    ? 'Network error. Check your connection.' :
-          event.error === 'aborted'    ? '' :
-          `Speech error: ${event.error}`
-        if (msg) setErrorMessage(msg)
-      }
+      const err = event.error as string
+      // service-not-allowed = iOS blocks the API at the platform level
+      // Show a clear message — don't hide the button (confusing UX)
+      const msg =
+        err === 'service-not-allowed' ? 'Voice input not supported on this device.' :
+        err === 'not-allowed'         ? 'Mic access denied — allow it in browser settings.' :
+        err === 'no-speech'           ? 'No speech detected. Tap and try again.' :
+        err === 'network'             ? 'Network error — check connection.' :
+        err === 'aborted'             ? '' :
+        err === 'audio-capture'       ? 'No microphone found.' :
+        ''
+      if (msg) setErrorMsg(msg)
       setState('idle')
       setInterim('')
+      recRef.current = null
     }
 
     rec.onend = () => {
-      setState(prev => prev === 'processing' ? 'processing' : 'idle')
+      // Only reset to idle if not already in processing (transcript was delivered)
+      setState(prev => (prev === 'processing' ? prev : 'idle'))
       setInterim('')
-      recognitionRef.current = null
+      recRef.current = null
     }
 
-    recognitionRef.current = rec
-    rec.start()
-  }, [isSupported, SpeechRecognition])
+    recRef.current = rec
+    try {
+      rec.start()
+    } catch (e) {
+      // start() can throw if called too quickly after a previous stop
+      // Small delay and retry once
+      setTimeout(() => {
+        try {
+          const rec2 = new SRClass.current()
+          rec2.continuous = false
+          rec2.interimResults = true
+          rec2.lang = 'en-US'
+          rec2.onresult  = rec.onresult
+          rec2.onerror   = rec.onerror
+          rec2.onend     = rec.onend
+          rec2.onstart   = rec.onstart
+          recRef.current = rec2
+          rec2.start()
+        } catch {
+          setState('idle')
+        }
+      }, 250)
+    }
+  }, []) // No deps — uses refs only, never stale
 
   // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      if (recognitionRef.current) {
-        recognitionRef.current.abort()
-        recognitionRef.current = null
-      }
-    }
+  useEffect(() => () => {
+    const rec = recRef.current
+    if (rec) { try { rec.abort() } catch {} }
   }, [])
+
+  // Auto-clear error after 5 s
+  useEffect(() => {
+    if (!errorMsg) return
+    const t = setTimeout(() => setErrorMsg(''), 5000)
+    return () => clearTimeout(t)
+  }, [errorMsg])
 
   return {
     isSupported,
     state,
-    interimTranscript,
+    interimTranscript: interim,
     startListening,
     stopListening,
-    errorMessage,
+    errorMessage: errorMsg,
   }
 }
