@@ -10,6 +10,7 @@ import { useAppStore } from '../../stores/appStore'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import { MobileDiffCard } from './MobileDiffCard'
+import { VoiceButton } from '../VoiceButton'
 import type { SessionFile, SmartResult } from '../../types'
 
 // ── Thin progress steps component ───────────────────────────────────────────
@@ -412,6 +413,12 @@ export function MobileChatPanel() {
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
             </svg>
           </button>
+          <VoiceButton
+            onTranscript={(text) => setInput(prev => prev ? prev + ' ' + text : text)}
+            lastResponse={messages.filter(m => m.role === 'assistant' && m.content).slice(-1)[0]?.content}
+            disabled={isStreaming || isCompacting}
+            size="compact"
+          />
           <input
             ref={fileInputRef}
             type="file"

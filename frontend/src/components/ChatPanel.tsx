@@ -10,6 +10,7 @@ import { MarkdownCode } from './CodeBlock'
 import { SessionFilesTray } from './SessionFilesTray'
 import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
+import { VoiceButton } from './VoiceButton'
 
 // ── Apply All Button — applies every unapplied change across all messages ─────
 function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: {
@@ -1151,6 +1152,11 @@ export function ChatPanel() {
               >
                 <AttachFile sx={{ fontSize: 15 }} />
               </button>
+              <VoiceButton
+                onTranscript={(text) => setInput(prev => prev ? prev + ' ' + text : text)}
+                lastResponse={messages.filter(m => m.role === 'assistant' && m.content).slice(-1)[0]?.content}
+                disabled={isStreaming || isCompacting}
+              />
               <span className="text-[11px] text-faint ml-1 select-none">
                 {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} attached` : ''}
               </span>
