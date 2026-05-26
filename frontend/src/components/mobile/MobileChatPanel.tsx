@@ -469,99 +469,127 @@ export function MobileChatPanel() {
         </div>
       )}
 
-      {/* Input bar */}
-      <div className="flex-shrink-0 px-3 py-3 border-t border-border bg-surface/50">
-        <div className="flex items-end gap-2">
-          {/* File upload button */}
-          <button
-            onClick={() => fileInputRef.current?.click()}
-            className="flex-shrink-0 w-9 h-9 rounded-xl border border-border bg-surface flex items-center justify-center text-muted/60 hover:text-ink hover:border-border/80 transition-colors"
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-            </svg>
-          </button>
-          <VoiceButton
-            onTranscript={(text) => setInput(prev => prev ? prev + ' ' + text : text)}
-            lastResponse={messages.filter(m => m.role === 'assistant' && m.content).slice(-1)[0]?.content}
-            disabled={isStreaming || isCompacting}
-            size="compact"
+      {/* ── Input bar ── */}
+      <div className="flex-shrink-0 bg-base px-3 pt-2 pb-3 border-t border-border/60">
+
+        {/* Unified pill — contains textarea + all actions */}
+        <div className="flex flex-col bg-surface border border-border/80 rounded-2xl
+          overflow-hidden shadow-sm focus-within:border-orange/40 transition-colors">
+
+          {/* Textarea row */}
+          <textarea
+            ref={textareaRef}
+            value={input}
+            onChange={e => {
+              setInput(e.target.value)
+              e.target.style.height = 'auto'
+              e.target.style.height = Math.min(e.target.scrollHeight, 160) + 'px'
+            }}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
+            }}
+            placeholder={isCompacting ? 'Compacting history…' : 'Ask about your code…'}
+            rows={1}
+            disabled={isCompacting}
+            className="w-full resize-none bg-transparent px-4 pt-3 pb-1 text-[15px]
+              text-ink placeholder:text-muted/40 focus:outline-none leading-relaxed"
+            style={{ minHeight: 44, maxHeight: 160 }}
           />
-          <input
-            ref={fileInputRef}
-            type="file"
-            multiple
-            className="hidden"
-            onChange={e => handleFileUpload(e.target.files)}
-          />
 
-          {/* Text input + expand button */}
-          <div className="flex-1 relative">
-            <textarea
-              ref={textareaRef}
-              value={input}
-              onChange={e => {
-                setInput(e.target.value)
-                e.target.style.height = 'auto'
-                e.target.style.height = Math.min(e.target.scrollHeight, 120) + 'px'
-              }}
-              onKeyDown={e => {
-                if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
-              }}
-              placeholder="Ask about your code..."
-              rows={1}
-              className="w-full resize-none bg-overlay/40 border border-border rounded-xl px-3 py-2.5 pr-8 text-sm text-ink placeholder:text-muted/40 focus:outline-none focus:border-orange/40 focus:bg-overlay/60 transition-colors"
-              style={{ minHeight: 40, maxHeight: 120 }}
-            />
-            {/* Expand button — opens full-screen compose */}
-            <button
-              onClick={() => setComposeOpen(true)}
-              className="absolute right-2 top-2 w-5 h-5 flex items-center justify-center text-muted/40 hover:text-muted/80 transition-colors"
-              title="Expand editor"
-            >
-              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/>
-                <line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/>
-              </svg>
-            </button>
-          </div>
+          {/* Bottom toolbar — left icons | right send */}
+          <div className="flex items-center justify-between px-2 pb-2 pt-1">
 
-          {/* Compose sheet — full-screen editor */}
-          {composeOpen && (
-            <MobileComposeSheet
-              value={input}
-              onChange={setInput}
-              onSend={handleSend}
-              onClose={() => setComposeOpen(false)}
-              isStreaming={isStreaming}
-              disabled={isCompacting}
-            />
-          )}
+            {/* Left: attach + voice + expand */}
+            <div className="flex items-center gap-0.5">
+              {/* Attach */}
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                disabled={isCompacting}
+                className="w-9 h-9 flex items-center justify-center rounded-xl
+                  text-muted/60 hover:text-ink hover:bg-overlay/60 active:bg-overlay
+                  transition-colors disabled:opacity-40"
+                title="Attach file"
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                </svg>
+              </button>
 
-          {/* Send / Stop button */}
-          <button
-            onClick={isStreaming ? stopStream : handleSend}
-            disabled={!isStreaming && !canSend}
-            className={`flex-shrink-0 w-9 h-9 rounded-xl flex items-center justify-center transition-all
-              ${isStreaming
-                ? 'bg-red-500/20 border border-red-500/40 text-red-400 hover:bg-red-500/30'
-                : canSend
-                  ? 'bg-orange text-white shadow-sm hover:bg-orange/90'
-                  : 'bg-surface border border-border text-muted/30'
-              }`}
-          >
+              {/* Voice */}
+              <VoiceButton
+                onTranscript={(text) => setInput(prev => prev ? prev + ' ' + text : text)}
+                lastResponse={messages.filter(m => m.role === 'assistant' && m.content).slice(-1)[0]?.content}
+                disabled={isStreaming || isCompacting}
+                size="compact"
+              />
+
+              {/* Expand to full-screen compose */}
+              <button
+                onClick={() => setComposeOpen(true)}
+                disabled={isCompacting}
+                className="w-9 h-9 flex items-center justify-center rounded-xl
+                  text-muted/60 hover:text-ink hover:bg-overlay/60 active:bg-overlay
+                  transition-colors disabled:opacity-40"
+                title="Expand editor"
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <polyline points="15 3 21 3 21 9"/>
+                  <polyline points="9 21 3 21 3 15"/>
+                  <line x1="21" y1="3" x2="14" y2="10"/>
+                  <line x1="3" y1="21" x2="10" y2="14"/>
+                </svg>
+              </button>
+            </div>
+
+            {/* Right: send / stop */}
             {isStreaming ? (
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
-                <rect x="4" y="4" width="16" height="16" rx="2"/>
-              </svg>
+              <button
+                onClick={stopStream}
+                className="w-9 h-9 flex items-center justify-center rounded-xl
+                  bg-red-500/15 text-red-400 hover:bg-red-500/25 active:scale-95 transition-all"
+              >
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
+                  <rect x="4" y="4" width="16" height="16" rx="3"/>
+                </svg>
+              </button>
             ) : (
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                <line x1="22" y1="2" x2="11" y2="13"/>
-                <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-              </svg>
+              <button
+                onClick={handleSend}
+                disabled={!canSend}
+                className={`w-9 h-9 flex items-center justify-center rounded-xl
+                  transition-all active:scale-95
+                  ${canSend
+                    ? 'bg-orange text-white shadow-sm shadow-orange/30 hover:bg-orange/90'
+                    : 'text-muted/30 cursor-not-allowed'
+                  }`}
+              >
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                  <line x1="12" y1="19" x2="12" y2="5"/>
+                  <polyline points="5 12 12 5 19 12"/>
+                </svg>
+              </button>
             )}
-          </button>
+          </div>
         </div>
+
+        {/* Hidden file input */}
+        <input ref={fileInputRef} type="file" multiple className="hidden"
+          onChange={e => handleFileUpload(e.target.files)} />
+
+        {/* Compose sheet */}
+        {composeOpen && (
+          <MobileComposeSheet
+            value={input}
+            onChange={setInput}
+            onSend={handleSend}
+            onClose={() => setComposeOpen(false)}
+            isStreaming={isStreaming}
+            disabled={isCompacting}
+          />
+        )}
       </div>
     </div>
   )
