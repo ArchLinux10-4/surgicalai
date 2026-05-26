@@ -223,22 +223,23 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
                       </span>
                       {/* Sync status badge — only for github-connected files */}
                       {file.github_meta && status === 'synced' && (
-                        <span className="flex items-center gap-1 text-[9px] font-medium px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-md">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />
+                        <span className="flex items-center gap-1 text-[9px] font-medium px-1.5 py-0.5 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded-md">
+                          <span className="w-1.5 h-1.5 rounded-full bg-blue-400 inline-block" />
                           Synced · {relativeTime(file.github_pushed_at)}
                         </span>
                       )}
                       {file.github_meta && status === 'modified' && (
                         <span className="flex items-center gap-1 text-[9px] font-semibold px-1.5 py-0.5 bg-amber-500/10 text-amber-400 border border-amber-500/30 rounded-md">
-                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 inline-block" />
-                          Modified since push
+                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse inline-block" />
+                          Modified · not pushed
                         </span>
                       )}
-                      {/* AI edited badge — only when no github sync badge shown */}
-                      {!file.github_meta && isModified && (
+                      {/* AI-Edited badge — always shown when file has applied changes,
+                          regardless of GitHub connection status */}
+                      {isModified && (
                         <span className="flex items-center gap-1 text-[9px] font-medium px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-md">
                           <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />
-                          AI edited
+                          AI-Edited
                         </span>
                       )}
                     </div>
