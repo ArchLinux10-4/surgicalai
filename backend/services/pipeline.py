@@ -6437,7 +6437,9 @@ def _build_natural_file_context(
         lines_count = sf.get("lines", len(content.splitlines()))
 
         if file_type == "image":
-            return f"FILE: {fname} [IMAGE]\n"
+            return (
+                f"FILE: {fname} [IMAGE — attached as vision block below, you can see it directly]\n"
+            )
 
         if file_type in ("pdf", "csv", "excel", "text"):
             preview = content[:2000] + (f"\n...[{len(content)-2000} chars]" if len(content) > 2000 else "")
@@ -6779,8 +6781,41 @@ async def run_natural_pipeline_stream(
             if content:
                 clean_history.append({"role": role, "content": content[:4000]})
 
-        # Add current user message
-        messages = clean_history + [{"role": "user", "content": user_request}]
+        # ── Build user message — text + optional image vision blocks ──────
+        # Collect image files to attach as base64 vision blocks
+        image_files = [
+            sf for sf in session_files
+            if sf.get("file_type") == "image"
+        ]
+
+        if image_files:
+            # Multipart content: text first, then each image block
+            user_content: list = [{"type": "text", "text": user_request}]
+            for img_sf in image_files:
+                img_data = img_sf.get("content", "")
+                if not img_data:
+                    continue
+                if img_data.startswith("data:"):
+                    # data URL: "data:image/png;base64,<data>"
+                    header, b64 = img_data.split(",", 1)
+                    media_type = header.split(":")[1].split(";")[0]
+                else:
+                    # raw base64 — infer media type from extension
+                    ext = img_sf["filename"].rsplit(".", 1)[-1].lower()
+                    mime_map = {
+                        "jpg": "image/jpeg", "jpeg": "image/jpeg",
+                        "png": "image/png",  "webp": "image/webp",
+                        "gif": "image/gif",
+                    }
+                    media_type = mime_map.get(ext, "image/png")
+                    b64 = img_data
+                user_content.append({
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": media_type, "data": b64},
+                })
+            messages = clean_history + [{"role": "user", "content": user_content}]
+        else:
+            messages = clean_history + [{"role": "user", "content": user_request}]
 
         # ── Stream Claude's response ──────────────────────────────────────
         yield sse({"type": "progress", "content": "Thinking..."})
