@@ -586,7 +586,7 @@ export function MobileChatPanel() {
             onKeyDown={e => {
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
             }}
-            placeholder={isCompacting ? 'Compacting history…' : 'Ask about your code…'}
+            placeholder={isCompacting ? 'Compacting history…' : 'Ready when you are…'}
             rows={1}
             disabled={isCompacting}
             className="w-full resize-none bg-transparent px-4 pt-3 pb-1 text-[15px]
