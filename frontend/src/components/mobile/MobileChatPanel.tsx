@@ -193,7 +193,7 @@ function MobileComposeSheet({ value, onChange, onSend, onClose, isStreaming, dis
         ref={ref}
         value={value}
         onChange={e => onChange(e.target.value)}
-        placeholder="Ask about your code, describe changes, or paste requirements..."
+        placeholder="Ready when you are! Describe changes, or paste requirements..."
         className="flex-1 w-full resize-none bg-transparent px-5 py-4 text-base text-ink
           placeholder:text-muted/40 focus:outline-none leading-relaxed"
       />
