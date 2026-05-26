@@ -194,7 +194,7 @@ function MobileComposeSheet({ value, onChange, onSend, onClose, isStreaming, dis
         ref={ref}
         value={value}
         onChange={e => onChange(e.target.value)}
-        placeholder="Ready when you are!, describe changes, or paste requirements..."
+        placeholder="Ask about your code, describe changes, or paste requirements..."
         className="flex-1 w-full resize-none bg-transparent px-5 py-4 text-base text-ink
           placeholder:text-muted/40 focus:outline-none leading-relaxed"
       />
@@ -219,12 +219,29 @@ function EmptyHomeScreen() {
   return (
     <div className="relative flex flex-col items-center justify-center h-full overflow-hidden"
       style={{ background: '#0a0a0a' }}>
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full" style={{ opacity: 0.85 }} />
+
+      {/* Code rain — fades to near-invisible after 3s */}
+      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full"
+        style={{
+          animation: 'sai-rain-fade 1.5s ease-in-out 3s forwards',
+          opacity: 0.85,
+        }} />
+
+      {/* Center glow — also dims */}
       <div className="absolute inset-0 pointer-events-none"
-        style={{ background: 'radial-gradient(ellipse at center, rgba(74,222,128,0.07) 0%, transparent 70%)' }} />
+        style={{
+          background: 'radial-gradient(ellipse at center, rgba(74,222,128,0.07) 0%, transparent 70%)',
+          animation: 'sai-glow-fade 1.5s ease-in-out 3s forwards',
+        }} />
+
+      {/* Content */}
       <div className="relative z-10 flex flex-col items-center gap-5 px-8 text-center">
-        {/* Precision Scope icon */}
-        <div className="relative" style={{ width: 88, height: 88 }}>
+
+        {/* Precision Scope icon — fades out completely after 3s */}
+        <div className="relative" style={{
+          width: 88, height: 88,
+          animation: 'sai-icon-out 1.2s ease-in-out 3s forwards',
+        }}>
           <div className="absolute inset-0 rounded-full"
             style={{ background: 'radial-gradient(circle, rgba(74,222,128,0.12) 0%, transparent 70%)' }} />
           <div className="w-full h-full rounded-[22px] flex items-center justify-center" style={{
@@ -234,10 +251,14 @@ function EmptyHomeScreen() {
           }}>
             <svg width="56" height="56" viewBox="0 0 64 64" style={{ overflow: 'visible' }}>
               <style>{`
-                @keyframes sai-spin  { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
-                @keyframes sai-rspin { from{transform:rotate(0deg)} to{transform:rotate(-360deg)} }
-                @keyframes sai-blink { 0%,100%{opacity:1} 50%{opacity:0.15} }
-                @keyframes sai-scan  { 0%,100%{transform:translateY(-22px);opacity:0} 20%{opacity:0.7} 80%{opacity:0.7} 100%{transform:translateY(22px);opacity:0} }
+                @keyframes sai-spin    { from{transform:rotate(0deg)}  to{transform:rotate(360deg)}  }
+                @keyframes sai-rspin   { from{transform:rotate(0deg)}  to{transform:rotate(-360deg)} }
+                @keyframes sai-blink   { 0%,100%{opacity:1} 50%{opacity:0.15} }
+                @keyframes sai-scan    { 0%,100%{transform:translateY(-22px);opacity:0} 20%{opacity:0.7} 80%{opacity:0.7} 100%{transform:translateY(22px);opacity:0} }
+                @keyframes sai-icon-out  { to { opacity: 0; transform: scale(0.85); } }
+                @keyframes sai-rain-fade { to { opacity: 0.06; } }
+                @keyframes sai-glow-fade { to { opacity: 0; } }
+                @keyframes sai-tag-fade  { to { opacity: 0; } }
               `}</style>
               <line x1="8" y1="32" x2="56" y2="32" stroke="rgba(74,222,128,0.55)" strokeWidth="0.75" strokeDasharray="3 3" style={{ animation: 'sai-scan 2.4s ease-in-out infinite' }} />
               <circle cx="32" cy="32" r="27" fill="none" stroke="rgba(74,222,128,0.22)" strokeWidth="0.75" strokeDasharray="4 3" style={{ animation: 'sai-spin 9s linear infinite', transformOrigin: '32px 32px' }} />
@@ -256,22 +277,40 @@ function EmptyHomeScreen() {
             </svg>
           </div>
         </div>
+
+        {/* Heading — stays prominent always */}
         <div>
-          <h1 style={{ fontFamily: 'monospace', fontSize: 20, fontWeight: 700, color: '#e2e8f0', letterSpacing: 1, margin: 0 }}>SurgicalAI</h1>
-          <div style={{ fontFamily: 'monospace', fontSize: 11, color: '#4ade80', marginTop: 5, letterSpacing: 0.5, opacity: 0.85 }}>
+          <h1 style={{
+            fontFamily: 'monospace', fontSize: 22, fontWeight: 700,
+            color: '#e2e8f0', letterSpacing: 1, margin: 0,
+          }}>
+            SurgicalAI
+          </h1>
+          {/* Tagline fades away with the icon */}
+          <div style={{
+            fontFamily: 'monospace', fontSize: 11,
+            color: '#4ade80', marginTop: 5, letterSpacing: 0.5, opacity: 0.85,
+            animation: 'sai-tag-fade 1.2s ease-in-out 3s forwards',
+          }}>
             Precision code edits. Zero collateral.
           </div>
         </div>
-        <div className="flex flex-wrap justify-center gap-2 mt-1">
+
+        {/* Capability pills — stay visible */}
+        <div className="flex flex-wrap justify-center gap-2">
           {['Symbol-level edits', 'QA verified', 'Multi-file'].map(chip => (
-            <span key={chip} style={{ fontFamily: 'monospace', fontSize: 9, color: 'rgba(74,222,128,0.7)', border: '1px solid rgba(74,222,128,0.2)', borderRadius: 6, padding: '3px 10px', background: 'rgba(74,222,128,0.05)', letterSpacing: 0.5 }}>
+            <span key={chip} style={{
+              fontFamily: 'monospace', fontSize: 9,
+              color: 'rgba(74,222,128,0.7)',
+              border: '1px solid rgba(74,222,128,0.2)',
+              borderRadius: 6, padding: '3px 10px',
+              background: 'rgba(74,222,128,0.05)',
+              letterSpacing: 0.5,
+            }}>
               {chip}
             </span>
           ))}
         </div>
-        <p style={{ fontFamily: 'monospace', fontSize: 10, color: 'rgba(148,163,184,0.4)', marginTop: 4 }}>
-          Upload a file and describe your change ↓
-        </p>
       </div>
     </div>
   )
@@ -546,7 +585,7 @@ export function MobileChatPanel() {
             onKeyDown={e => {
               if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
             }}
-            placeholder={isCompacting ? 'Compacting history…' : 'Ready when you are!…'}
+            placeholder={isCompacting ? 'Compacting history…' : 'Ask about your code…'}
             rows={1}
             disabled={isCompacting}
             className="w-full resize-none bg-transparent px-4 pt-3 pb-1 text-[15px]
