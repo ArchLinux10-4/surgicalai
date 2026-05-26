@@ -12,6 +12,7 @@ import { toast } from '../../lib/toast'
 import { MobileDiffCard } from './MobileDiffCard'
 import { VoiceButton } from '../VoiceButton'
 import { useCodeRain } from '../../hooks/useCodeRain'
+import { useThemeStore } from '../../stores/themeStore'
 import type { SessionFile, SmartResult } from '../../types'
 
 // ── Thin progress steps component ───────────────────────────────────────────
@@ -215,39 +216,49 @@ function MobileComposeSheet({ value, onChange, onSend, onClose, isStreaming, dis
 // ── Animated home screen ─────────────────────────────────────────────────────
 function EmptyHomeScreen() {
   const canvasRef = useCodeRain(true)
+  const { theme }  = useThemeStore()
+  const isLight    = theme === 'light'
+
+  const g   = isLight ? '#15803d' : '#4ade80'
+  const ga  = (a: number) => isLight ? `rgba(21,128,61,${a})` : `rgba(74,222,128,${a})`
 
   return (
     <div className="relative flex flex-col items-center justify-center h-full overflow-hidden"
-      style={{ background: '#0a0a0a' }}>
+      style={{ background: isLight ? '#ffffff' : '#0a0a0a' }}>
 
-      {/* Code rain — fades to near-invisible after 3s */}
-      <canvas ref={canvasRef} className="absolute inset-0 w-full h-full"
-        style={{
-          animation: 'sai-rain-fade 1.5s ease-in-out 3s forwards',
-          opacity: 0.85,
+      {/* Code rain — dark theme only */}
+      {!isLight && (
+        <canvas ref={canvasRef} className="absolute inset-0 w-full h-full"
+          style={{ animation: 'sai-rain-fade 1.5s ease-in-out 3s forwards', opacity: 0.85 }} />
+      )}
+
+      {/* Light mode subtle grid */}
+      {isLight && (
+        <div className="absolute inset-0 pointer-events-none" style={{
+          backgroundImage: 'linear-gradient(rgba(0,0,0,0.04) 1px,transparent 1px),linear-gradient(90deg,rgba(0,0,0,0.04) 1px,transparent 1px)',
+          backgroundSize: '24px 24px',
         }} />
+      )}
 
-      {/* Center glow — also dims */}
-      <div className="absolute inset-0 pointer-events-none"
-        style={{
-          background: 'radial-gradient(ellipse at center, rgba(74,222,128,0.07) 0%, transparent 70%)',
+      {/* Center glow — dark only */}
+      {!isLight && (
+        <div className="absolute inset-0 pointer-events-none" style={{
+          background: 'radial-gradient(ellipse at center,rgba(74,222,128,0.07) 0%,transparent 70%)',
           animation: 'sai-glow-fade 1.5s ease-in-out 3s forwards',
         }} />
+      )}
 
-      {/* Content */}
       <div className="relative z-10 flex flex-col items-center gap-5 px-8 text-center">
 
-        {/* Precision Scope icon — fades out completely after 3s */}
-        <div className="relative" style={{
-          width: 88, height: 88,
-          animation: 'sai-icon-out 1.2s ease-in-out 3s forwards',
-        }}>
-          <div className="absolute inset-0 rounded-full"
-            style={{ background: 'radial-gradient(circle, rgba(74,222,128,0.12) 0%, transparent 70%)' }} />
+        {/* Precision Scope icon */}
+        <div className="relative" style={{ width: 88, height: 88, animation: 'sai-icon-out 1.2s ease-in-out 3s forwards' }}>
+          <div className="absolute inset-0 rounded-full" style={{
+            background: isLight ? 'radial-gradient(circle,rgba(21,128,61,0.08) 0%,transparent 70%)' : 'radial-gradient(circle,rgba(74,222,128,0.12) 0%,transparent 70%)',
+          }} />
           <div className="w-full h-full rounded-[22px] flex items-center justify-center" style={{
-            background: 'rgba(74,222,128,0.07)',
-            border: '1px solid rgba(74,222,128,0.28)',
-            boxShadow: '0 0 32px rgba(74,222,128,0.1)',
+            background: ga(0.07),
+            border: `1px solid ${ga(0.28)}`,
+            boxShadow: isLight ? '0 2px 16px rgba(21,128,61,0.08)' : '0 0 32px rgba(74,222,128,0.1)',
           }}>
             <svg width="56" height="56" viewBox="0 0 64 64" style={{ overflow: 'visible' }}>
               <style>{`
@@ -255,56 +266,46 @@ function EmptyHomeScreen() {
                 @keyframes sai-rspin   { from{transform:rotate(0deg)}  to{transform:rotate(-360deg)} }
                 @keyframes sai-blink   { 0%,100%{opacity:1} 50%{opacity:0.15} }
                 @keyframes sai-scan    { 0%,100%{transform:translateY(-22px);opacity:0} 20%{opacity:0.7} 80%{opacity:0.7} 100%{transform:translateY(22px);opacity:0} }
-                @keyframes sai-icon-out  { to { opacity: 0; transform: scale(0.85); } }
-                @keyframes sai-rain-fade { to { opacity: 0; } }
-                @keyframes sai-glow-fade { to { opacity: 0; } }
-                @keyframes sai-tag-fade  { to { opacity: 0; } }
+                @keyframes sai-icon-out  { to { opacity:0; transform:scale(0.85); } }
+                @keyframes sai-rain-fade { to { opacity:0; } }
+                @keyframes sai-glow-fade { to { opacity:0; } }
+                @keyframes sai-tag-fade  { to { opacity:0; } }
               `}</style>
-              <line x1="8" y1="32" x2="56" y2="32" stroke="rgba(74,222,128,0.55)" strokeWidth="0.75" strokeDasharray="3 3" style={{ animation: 'sai-scan 2.4s ease-in-out infinite' }} />
-              <circle cx="32" cy="32" r="27" fill="none" stroke="rgba(74,222,128,0.22)" strokeWidth="0.75" strokeDasharray="4 3" style={{ animation: 'sai-spin 9s linear infinite', transformOrigin: '32px 32px' }} />
-              <circle cx="32" cy="32" r="20" fill="none" stroke="rgba(74,222,128,0.5)" strokeWidth="1" />
-              <circle cx="32" cy="32" r="13" fill="none" stroke="rgba(74,222,128,0.18)" strokeWidth="0.75" strokeDasharray="2 4" style={{ animation: 'sai-rspin 5s linear infinite', transformOrigin: '32px 32px' }} />
-              <line x1="32" y1="4"  x2="32" y2="18" stroke="#4ade80" strokeWidth="1.5" strokeLinecap="round" />
-              <line x1="32" y1="46" x2="32" y2="60" stroke="#4ade80" strokeWidth="1.5" strokeLinecap="round" />
-              <line x1="4"  y1="32" x2="18" y2="32" stroke="#4ade80" strokeWidth="1.5" strokeLinecap="round" />
-              <line x1="46" y1="32" x2="60" y2="32" stroke="#4ade80" strokeWidth="1.5" strokeLinecap="round" />
-              <path d="M14 21 L14 14 L21 14" fill="none" stroke="rgba(74,222,128,0.55)" strokeWidth="1" strokeLinecap="round" />
-              <path d="M50 21 L50 14 L43 14" fill="none" stroke="rgba(74,222,128,0.55)" strokeWidth="1" strokeLinecap="round" />
-              <path d="M14 43 L14 50 L21 50" fill="none" stroke="rgba(74,222,128,0.55)" strokeWidth="1" strokeLinecap="round" />
-              <path d="M50 43 L50 50 L43 50" fill="none" stroke="rgba(74,222,128,0.55)" strokeWidth="1" strokeLinecap="round" />
-              <circle cx="32" cy="32" r="4.5" fill="rgba(74,222,128,0.1)" stroke="#4ade80" strokeWidth="1.5" />
-              <circle cx="32" cy="32" r="1.5" fill="#4ade80" style={{ animation: 'sai-blink 1.2s ease-in-out infinite' }} />
+              <line x1="8" y1="32" x2="56" y2="32" stroke={ga(0.55)} strokeWidth="0.75" strokeDasharray="3 3" style={{ animation: 'sai-scan 2.4s ease-in-out infinite' }} />
+              <circle cx="32" cy="32" r="27" fill="none" stroke={ga(0.22)} strokeWidth="0.75" strokeDasharray="4 3" style={{ animation: 'sai-spin 9s linear infinite', transformOrigin: '32px 32px' }} />
+              <circle cx="32" cy="32" r="20" fill="none" stroke={ga(0.5)} strokeWidth="1" />
+              <circle cx="32" cy="32" r="13" fill="none" stroke={ga(0.18)} strokeWidth="0.75" strokeDasharray="2 4" style={{ animation: 'sai-rspin 5s linear infinite', transformOrigin: '32px 32px' }} />
+              <line x1="32" y1="4"  x2="32" y2="18" stroke={g} strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="32" y1="46" x2="32" y2="60" stroke={g} strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="4"  y1="32" x2="18" y2="32" stroke={g} strokeWidth="1.5" strokeLinecap="round" />
+              <line x1="46" y1="32" x2="60" y2="32" stroke={g} strokeWidth="1.5" strokeLinecap="round" />
+              <path d="M14 21 L14 14 L21 14" fill="none" stroke={ga(0.55)} strokeWidth="1" strokeLinecap="round" />
+              <path d="M50 21 L50 14 L43 14" fill="none" stroke={ga(0.55)} strokeWidth="1" strokeLinecap="round" />
+              <path d="M14 43 L14 50 L21 50" fill="none" stroke={ga(0.55)} strokeWidth="1" strokeLinecap="round" />
+              <path d="M50 43 L50 50 L43 50" fill="none" stroke={ga(0.55)} strokeWidth="1" strokeLinecap="round" />
+              <circle cx="32" cy="32" r="4.5" fill={ga(0.1)} stroke={g} strokeWidth="1.5" />
+              <circle cx="32" cy="32" r="1.5" fill={g} style={{ animation: 'sai-blink 1.2s ease-in-out infinite' }} />
             </svg>
           </div>
         </div>
 
-        {/* Heading — stays prominent always */}
         <div>
-          <h1 style={{
-            fontFamily: 'monospace', fontSize: 22, fontWeight: 700,
-            color: '#e2e8f0', letterSpacing: 1, margin: 0,
-          }}>
+          <h1 style={{ fontFamily: 'monospace', fontSize: 22, fontWeight: 700, color: isLight ? '#111827' : '#e2e8f0', letterSpacing: 1, margin: 0 }}>
             SurgicalAI
           </h1>
-          {/* Tagline fades away with the icon */}
-          <div style={{
-            fontFamily: 'monospace', fontSize: 11,
-            color: '#4ade80', marginTop: 5, letterSpacing: 0.5, opacity: 0.85,
-            animation: 'sai-tag-fade 1.2s ease-in-out 3s forwards',
-          }}>
+          <div style={{ fontFamily: 'monospace', fontSize: 11, color: g, marginTop: 5, letterSpacing: 0.5, opacity: 0.85, animation: 'sai-tag-fade 1.2s ease-in-out 3s forwards' }}>
             Precision code edits. Zero collateral.
           </div>
         </div>
 
-        {/* Capability pills — stay visible */}
         <div className="flex flex-wrap justify-center gap-2">
           {['Symbol-level edits', 'QA verified', 'Multi-file'].map(chip => (
             <span key={chip} style={{
               fontFamily: 'monospace', fontSize: 9,
-              color: 'rgba(74,222,128,0.7)',
-              border: '1px solid rgba(74,222,128,0.2)',
+              color: isLight ? '#15803d' : 'rgba(74,222,128,0.7)',
+              border: `1px solid ${ga(isLight ? 0.25 : 0.2)}`,
               borderRadius: 6, padding: '3px 10px',
-              background: 'rgba(74,222,128,0.05)',
+              background: ga(isLight ? 0.06 : 0.05),
               letterSpacing: 0.5,
             }}>
               {chip}

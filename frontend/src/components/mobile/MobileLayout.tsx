@@ -11,6 +11,7 @@ import React, { useState, useEffect, useRef } from 'react'
 import { MobileChatPanel } from './MobileChatPanel'
 import { MobileSessionsPanel } from './MobileSessionsPanel'
 import { MobileFilesPanel } from './MobileFilesPanel'
+import { MobileGitHubSheet } from './MobileGitHubSheet'
 import { useAuthStore } from '../../stores/authStore'
 import { useAppStore } from '../../stores/appStore'
 import { useThemeStore } from '../../stores/themeStore'
@@ -212,6 +213,7 @@ export function MobileLayout() {
   const { isAuthenticated, user } = useAuthStore()
   const [activeTab, setActiveTab] = useState<Tab>('chat')
   const [menuOpen, setMenuOpen]   = useState(false)
+  const [githubOpen, setGithubOpen] = useState(false)
 
   if (!isAuthenticated) {
     return <LoginPage />
@@ -228,7 +230,7 @@ export function MobileLayout() {
 
   return (
     <div className="fixed inset-0 flex flex-col bg-base text-ink overflow-hidden">
-      {/* Global header — always visible, shows current tab + user avatar */}
+      {/* Global header */}
       <header className="flex-shrink-0 flex items-center justify-between
         px-4 border-b border-border bg-surface/90 backdrop-blur-sm"
         style={{ paddingTop: 'max(env(safe-area-inset-top, 0px), 12px)', paddingBottom: '10px' }}
@@ -246,16 +248,33 @@ export function MobileLayout() {
           </div>
         </div>
 
-        {/* User avatar — opens menu */}
-        <button
-          onClick={() => setMenuOpen(true)}
-          className="w-8 h-8 rounded-full bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)]
-            flex items-center justify-center text-[#4ade80] text-[11px] font-bold
-            hover:bg-[rgba(74,222,128,0.2)] active:scale-95 transition-all"
-          aria-label="Open menu"
-        >
-          {initials}
-        </button>
+        {/* Right: GitHub + user avatar */}
+        <div className="flex items-center gap-2">
+          {/* GitHub browser button */}
+          <button
+            onClick={() => setGithubOpen(true)}
+            className="w-8 h-8 rounded-lg border border-border bg-surface/60
+              flex items-center justify-center text-muted/60
+              hover:text-ink hover:border-border/80 active:scale-95 transition-all"
+            aria-label="Browse GitHub"
+            title="GitHub files"
+          >
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+              <path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.44 9.8 8.2 11.39.6.11.82-.26.82-.58v-2.03c-3.34.73-4.04-1.61-4.04-1.61-.54-1.38-1.33-1.75-1.33-1.75-1.09-.74.08-.73.08-.73 1.2.08 1.84 1.24 1.84 1.24 1.07 1.83 2.8 1.3 3.49 1 .1-.78.42-1.31.76-1.61-2.67-.3-5.47-1.33-5.47-5.93 0-1.31.47-2.38 1.24-3.22-.12-.3-.54-1.52.12-3.17 0 0 1.01-.32 3.3 1.23a11.5 11.5 0 0 1 3-.4c1.02.005 2.04.138 3 .4 2.28-1.55 3.29-1.23 3.29-1.23.66 1.65.24 2.87.12 3.17.77.84 1.23 1.91 1.23 3.22 0 4.61-2.81 5.63-5.48 5.92.43.37.82 1.1.82 2.22v3.29c0 .32.21.7.83.58C20.57 21.8 24 17.3 24 12c0-6.63-5.37-12-12-12z"/>
+            </svg>
+          </button>
+
+          {/* User avatar — opens menu */}
+          <button
+            onClick={() => setMenuOpen(true)}
+            className="w-8 h-8 rounded-full bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)]
+              flex items-center justify-center text-[#4ade80] text-[11px] font-bold
+              hover:bg-[rgba(74,222,128,0.2)] active:scale-95 transition-all"
+            aria-label="Open menu"
+          >
+            {initials}
+          </button>
+        </div>
       </header>
 
       {/* Content area */}
@@ -287,6 +306,13 @@ export function MobileLayout() {
 
       {/* Slide-up menu drawer */}
       <MenuDrawer open={menuOpen} onClose={() => setMenuOpen(false)} />
+
+      {/* GitHub bottom sheet */}
+      <MobileGitHubSheet
+        open={githubOpen}
+        onClose={() => setGithubOpen(false)}
+        onOpenSettings={() => { setMenuOpen(true) }}
+      />
     </div>
   )
 }
