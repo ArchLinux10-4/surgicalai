@@ -597,11 +597,11 @@ export function Sidebar() {
       {/* ── Sliding panel ── */}
       <div
         className={`flex flex-col bg-surface overflow-hidden transition-all duration-200 ${
-          panelOpen ? 'w-[220px]' : 'w-0'
+          panelOpen ? 'flex-1 min-w-0' : 'w-0'
         }`}
       >
         {/* Panel header */}
-        <div className="flex items-center justify-between px-3 py-2.5 border-b border-border flex-shrink-0 min-w-[220px]">
+        <div className="flex items-center justify-between px-3 py-2.5 border-b border-border flex-shrink-0">
           <span className="text-[11px] font-semibold uppercase tracking-wider text-muted select-none">
             {panelLabel}
           </span>
@@ -615,7 +615,7 @@ export function Sidebar() {
         </div>
 
         {/* Panel content */}
-        <div className="flex-1 overflow-hidden flex flex-col min-h-0 min-w-[220px]">
+        <div className="flex-1 overflow-hidden flex flex-col min-h-0">
           {sidebarTab === 'sessions' && <SessionList />}
           {sidebarTab === 'files'    && <SessionFilesPanel />}
           {sidebarTab === 'context'  && <ContextPanel />}

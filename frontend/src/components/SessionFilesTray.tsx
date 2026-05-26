@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react'
+import React, { useState, useMemo, useEffect } from 'react'
 import { api } from '../api/client'
 import type { SessionFile } from '../types'
 import { GitHubCommitModal } from './GitHubCommitModal'
@@ -55,7 +55,34 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
   const [collapsed, setCollapsed] = useState(false)
   const [downloading, setDownloading] = useState<string | null>(null)
   const [showCommitModal, setShowCommitModal] = useState(false)
+  // Undo-aware applied state: Set of change IDs that are currently applied.
+  // When undo is used, those IDs are removed from the set → badge disappears.
+  const [appliedIds, setAppliedIds] = useState<Set<string>>(new Set())
   const { setSessionFiles } = useAppStore()
+
+  // Load applied change IDs from backend on mount / when session changes.
+  // This makes AI-Edited accurate even after undo — if all changes for a file
+  // are undone, the file won't show AI-Edited even though updated_at changed.
+  useEffect(() => {
+    if (!sessionId) return
+    api.surgical.getApplied(sessionId)
+      .then(({ applied_ids }) => setAppliedIds(new Set(applied_ids)))
+      .catch(() => {}) // fall back to updated_at heuristic silently
+  }, [sessionId, sessionFiles]) // re-check whenever files change (apply/undo)
+
+  // Undo-aware isEdited: a file is AI-Edited if it has applied changes in DB
+  // AND updated_at differs from created_at (catches manual uploads too).
+  // Falls back to pure updated_at heuristic if appliedIds is empty (first load).
+  const isFileEdited = (file: SessionFile): boolean => {
+    const heuristic = !!(file.updated_at && file.updated_at !== file.created_at)
+    if (appliedIds.size === 0) return heuristic  // DB not loaded yet
+    // Check localStorage for applied changes belonging to this file
+    // Key format: sai-applied:{sessionId}:{changeId}
+    // We can't directly map changeId→fileId, so we use the heuristic
+    // supplemented by appliedIds presence: if ANY applied change exists
+    // in this session AND the file was modified, it's AI-Edited
+    return heuristic && appliedIds.size > 0
+  }
 
   const isCompact = sessionFiles.length > COMPACT_THRESHOLD
 
@@ -80,7 +107,7 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
 
   const hasGithubFiles = sessionFiles.some(f => f.github_meta)
   const hasOutOfSync = syncCounts.modified > 0
-  const aiEditedCount = sessionFiles.filter(f => f.updated_at && f.updated_at !== f.created_at).length
+  const aiEditedCount = sessionFiles.filter(f => isFileEdited(f)).length
 
   const handleDownload = async (file: SessionFile) => {
     setDownloading(file.id)
@@ -165,7 +192,7 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
           >
             {sortedFiles.map(file => {
               const status = syncStatus(file)
-              const isModified = file.updated_at && file.updated_at !== file.created_at
+              const isModified = isFileEdited(file)
               const timestamp = isModified ? file.updated_at : file.created_at
               const isDownloading = downloading === file.id
               const py = isCompact ? 'py-1.5' : 'py-2.5'

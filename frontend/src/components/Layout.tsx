@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useState, useCallback, useRef } from 'react'
 import { Sidebar } from './Sidebar'
 import { ChatPanel } from './ChatPanel'
 import { CodePanel } from './CodePanel'
@@ -6,9 +6,38 @@ import { useAppStore } from '../stores/appStore'
 import { useAuthStore } from '../stores/authStore'
 import { LoginPage } from '../pages/LoginPage'
 
+// Sidebar width constants
+const SIDEBAR_MIN_PX = 264   // 44px rail + 220px panel — current default
+const SIDEBAR_MAX_PX = Math.round(SIDEBAR_MIN_PX * 1.4)  // +40% = ~370px
+
 export function Layout() {
   const activeFile = useAppStore(s => s.activeFile)
   const { isAuthenticated } = useAuthStore()
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_MIN_PX)
+  const dragStartX  = useRef<number>(0)
+  const dragStartW  = useRef<number>(SIDEBAR_MIN_PX)
+  const isDragging  = useRef(false)
+
+  const onDragStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    isDragging.current  = true
+    dragStartX.current  = e.clientX
+    dragStartW.current  = sidebarWidth
+
+    const onMove = (ev: MouseEvent) => {
+      if (!isDragging.current) return
+      const delta  = ev.clientX - dragStartX.current
+      const next   = Math.min(SIDEBAR_MAX_PX, Math.max(SIDEBAR_MIN_PX, dragStartW.current + delta))
+      setSidebarWidth(next)
+    }
+    const onUp = () => {
+      isDragging.current = false
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [sidebarWidth])
 
   if (!isAuthenticated) {
     return <LoginPage />
@@ -16,9 +45,27 @@ export function Layout() {
 
   return (
     <div className="flex flex-1 overflow-hidden">
-      {/* Sidebar — self-sizing: rail (44px always) + panel (220px when open) */}
-      <aside className="flex-shrink-0 flex flex-col bg-surface overflow-hidden">
+      {/* Sidebar — resizable between SIDEBAR_MIN_PX and SIDEBAR_MAX_PX */}
+      <aside
+        className="flex-shrink-0 flex flex-col bg-surface overflow-hidden relative"
+        style={{ width: sidebarWidth }}
+      >
         <Sidebar />
+
+        {/* Drag handle — right edge of sidebar */}
+        <div
+          onMouseDown={onDragStart}
+          className="absolute top-0 right-0 bottom-0 w-1 cursor-col-resize z-10
+            hover:bg-accent/40 active:bg-accent/60 transition-colors group"
+          title="Drag to resize sidebar"
+        >
+          {/* Visual indicator — subtle dots */}
+          <div className="absolute top-1/2 left-0 -translate-y-1/2 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            {[0,1,2].map(i => (
+              <div key={i} className="w-0.5 h-1 bg-muted/60 rounded-full" />
+            ))}
+          </div>
+        </div>
       </aside>
 
       {/* Chat — expands to fill all space when no file is open */}
