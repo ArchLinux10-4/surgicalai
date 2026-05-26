@@ -44,7 +44,8 @@ export function useSpeechRecognition(
   onTranscript: (text: string) => void
 ): UseSpeechRecognitionReturn {
   const SpeechRecognition = getSpeechRecognition()
-  const isSupported = isChrome() && SpeechRecognition !== null
+  // Start with API existence check — will be set false if service-not-allowed fires
+  const [isSupported, setIsSupported]       = useState(() => SpeechRecognition !== null)
 
   const [state, setState]                   = useState<SpeechState>('idle')
   const [interimTranscript, setInterim]     = useState('')
@@ -102,13 +103,22 @@ export function useSpeechRecognition(
     }
 
     rec.onerror = (event: any) => {
-      const msg =
-        event.error === 'not-allowed'   ? 'Microphone access denied. Allow it in browser settings.' :
-        event.error === 'no-speech'     ? 'No speech detected. Try again.' :
-        event.error === 'network'       ? 'Network error. Check your connection.' :
-        event.error === 'aborted'       ? '' :   // user stopped — not an error
-        `Speech error: ${event.error}`
-      if (msg) setErrorMessage(msg)
+      if (event.error === 'service-not-allowed' || event.error === 'not-allowed') {
+        // Device has the API but won't allow it (iOS, or mic permission denied permanently)
+        // Hide the button entirely so user isn't confused by a non-functional mic icon
+        if (event.error === 'service-not-allowed') {
+          setIsSupported(false)
+        } else {
+          setErrorMessage('Microphone access denied. Allow it in browser settings.')
+        }
+      } else {
+        const msg =
+          event.error === 'no-speech'  ? 'No speech detected. Try again.' :
+          event.error === 'network'    ? 'Network error. Check your connection.' :
+          event.error === 'aborted'    ? '' :
+          `Speech error: ${event.error}`
+        if (msg) setErrorMessage(msg)
+      }
       setState('idle')
       setInterim('')
     }

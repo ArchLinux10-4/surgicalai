@@ -128,18 +128,18 @@ export function VoiceButton({
     <div className="flex items-center gap-1 relative">
       {/* Interim transcript tooltip */}
       {interimTranscript && (
-        <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 whitespace-nowrap
+        <div className="absolute bottom-full mb-2 right-0
           bg-surface border border-border rounded-lg px-2.5 py-1.5 text-[11px] text-ink/80
-          shadow-lg max-w-[240px] truncate z-50">
+          shadow-lg max-w-[200px] truncate z-50 whitespace-nowrap">
           {interimTranscript}
         </div>
       )}
 
       {/* Error tooltip */}
       {errorMessage && (
-        <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 whitespace-nowrap
+        <div className="absolute bottom-full mb-2 right-0
           bg-red-900/80 border border-red-500/40 rounded-lg px-2.5 py-1.5 text-[11px] text-red-300
-          shadow-lg max-w-[240px] z-50">
+          shadow-lg max-w-[220px] z-50 whitespace-normal leading-snug">
           {errorMessage}
         </div>
       )}
