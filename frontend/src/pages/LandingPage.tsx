@@ -147,6 +147,15 @@ html{scroll-behavior:smooth}
 .sai-line.del{animation:sai-fade-in .4s ease both}
 .sai-line.add{animation:sai-fade-in .4s ease .25s both}
 .sai-mock-panel{background:var(--e-bg3);border-left:1px solid var(--e-border);display:flex;flex-direction:column}
+.sai-mobile-strip{display:none;flex-direction:column;border-top:1px solid var(--e-border);background:var(--e-bg3);padding:12px 14px;gap:8px}
+.sai-mobile-strip-row{display:flex;align-items:flex-start;gap:8px}
+.sai-mobile-strip-icon{flex-shrink:0;width:20px;text-align:center;font-size:13px;margin-top:1px}
+.sai-mobile-strip-label{font-weight:600;color:var(--e-txt);font-size:11px;display:block;margin-bottom:1px}
+.sai-mobile-strip-text{color:var(--e-txt2);font-size:11px;line-height:1.4}
+@keyframes sai-strip-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.sai-mobile-strip-row:nth-child(1){animation:sai-strip-in .4s ease .1s both}
+.sai-mobile-strip-row:nth-child(2){animation:sai-strip-in .4s ease .5s both}
+.sai-mobile-strip-row:nth-child(3){animation:sai-strip-in .4s ease .9s both}
 .sai-panel-header{height:36px;border-bottom:1px solid var(--e-border);display:flex;align-items:center;padding:0 14px;gap:8px;font-size:12px;font-weight:600;color:var(--e-txt2)}
 .sai-panel-badge{font-size:10px;padding:2px 8px;border-radius:999px;font-weight:700;letter-spacing:.3px}
 .sai-badge-arch{background:rgba(124,106,247,.25);color:#a78bfa}
@@ -499,6 +508,7 @@ html{scroll-behavior:smooth}
   .sai-hamburger{display:flex}
   .sai-mockup-body{grid-template-columns:1fr;min-height:auto}
   .sai-mock-sidebar,.sai-mock-panel{display:none}
+  .sai-mobile-strip{display:flex}
   .sai-stats-strip{grid-template-columns:1fr 1fr}
   .sai-stat:nth-child(2){border-right:none}
   .sai-pipeline-grid{grid-template-columns:1fr}
@@ -857,6 +867,31 @@ export function LandingPage() {
                 <div className="sai-line"><span className="sai-ln">58</span><span className="sai-ct"><span className="sai-kw">return</span> (</span></div>
                 <div className="sai-line"><span className="sai-ln">59</span><span className="sai-ct">  &lt;<span className="sai-ty">ChatContainer</span>&gt;</span></div>
                 <div className="sai-line"><span className="sai-ln">60</span><span className="sai-ct">    &lt;<span className="sai-ty">MessageList</span> messages={'{messages}'}/&gt;<span className="sai-cursor-blink"></span></span></div>
+              </div>
+            </div>
+
+            {/* Mobile pipeline strip — hidden on desktop, visible on mobile */}
+            <div className="sai-mobile-strip">
+              <div className="sai-mobile-strip-row">
+                <span className="sai-mobile-strip-icon">🏛</span>
+                <div>
+                  <span className="sai-mobile-strip-label">Architect · Plan</span>
+                  <span className="sai-mobile-strip-text">Small targeted change · Routing → Surgeon path</span>
+                </div>
+              </div>
+              <div className="sai-mobile-strip-row">
+                <span className="sai-mobile-strip-icon">⚡</span>
+                <div>
+                  <span className="sai-mobile-strip-label">Surgeon · SEARCH/REPLACE</span>
+                  <span className="sai-mobile-strip-text">3 lines replaced · ChatPanel.tsx · confidence 98%</span>
+                </div>
+              </div>
+              <div className="sai-mobile-strip-row">
+                <span className="sai-mobile-strip-icon">✅</span>
+                <div>
+                  <span className="sai-mobile-strip-label" style={{color:'#34d399'}}>QA · TypeScript</span>
+                  <span className="sai-mobile-strip-text">0 errors · build clean · applied to file</span>
+                </div>
               </div>
             </div>
 
