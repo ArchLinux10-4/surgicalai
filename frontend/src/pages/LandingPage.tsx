@@ -1055,16 +1055,23 @@ export function LandingPage() {
 
       {/* CTA */}
       <section className="sai-cta-section" id="contact">
-        <div className="sai-cta-box">
+        <div className="sai-cta-box" style={{maxWidth:'560px',margin:'0 auto'}}>
           <h2>Ready to operate<br/>on your codebase?</h2>
-          <p>SurgicalAI is currently in private access. Reach out to get your team onboarded.</p>
-          <a href="mailto:777rpm@gmail.com" className="sai-btn-primary" style={{fontSize:'16px',padding:'16px 40px',display:'inline-flex'}}>
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-              <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
-              <polyline points="22,6 12,13 2,6"/>
-            </svg>
-            Get in Touch
-          </a>
+          <p>SurgicalAI is currently in private access. Fill out the form and we'll get you onboarded.</p>
+          <form action="https://formspree.io/f/mzdwkojb" method="POST" className="sai-contact-form">
+            <div className="sai-form-row">
+              <input type="text" name="name" placeholder="Your name" required className="sai-form-input"/>
+              <input type="email" name="email" placeholder="Work email" required className="sai-form-input"/>
+            </div>
+            <textarea name="message" placeholder="Tell us about your codebase and team size..." rows={4} required className="sai-form-input sai-form-textarea"/>
+            <button type="submit" className="sai-btn-primary" style={{width:'100%',fontSize:'16px',padding:'16px 40px',justifyContent:'center'}}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+                <polyline points="22,6 12,13 2,6"/>
+              </svg>
+              Get in Touch
+            </button>
+          </form>
         </div>
       </section>
 
