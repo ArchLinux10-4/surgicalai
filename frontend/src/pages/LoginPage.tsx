@@ -1,18 +1,21 @@
 /**
- * LoginPage — "The Terminal" design
- * Hacker/IDE aesthetic: code rain background, monospace type,
- * terminal-style login prompt, glowing green accents.
+ * LoginPage — Dual-theme
+ * "surgical" (default) = light theme matching the homepage palette
+ * "matrix"             = original dark terminal / code-rain theme
  *
- * Handles two states:
- *   1. setup_required = true  → first-run "Create Admin Account"
- *   2. setup_required = false → standard login
+ * ALL AUTH LOGIC IS UNTOUCHED.  Only CSS/rendering changes.
  */
 import { useState, useEffect, useRef, FormEvent } from 'react';
 import { useAuthStore } from '../stores/authStore';
 import { apiClient } from '../api/client';
 
-/* ─── Code Rain Canvas ─── */
-const CODE_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789{}[]()<>=/\\|;:.,+-*&^%$#@!~`';
+type Theme = 'surgical' | 'matrix';
+
+/* ─────────────────────────────────────────────
+   Code Rain Canvas  (Matrix theme only)
+───────────────────────────────────────────── */
+const CODE_CHARS =
+  'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789{}[]()<>=/\\|;:.,+-*&^%$#@!~`';
 
 function CodeRain() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -27,7 +30,6 @@ function CodeRain() {
     let columns: number;
     let drops: number[];
     const fontSize = 18;
-
     const FRAME_INTERVAL = 27;
     let lastTime = 0;
 
@@ -40,7 +42,10 @@ function CodeRain() {
     handleResize();
 
     const draw = (timestamp: number) => {
-      if (timestamp - lastTime < FRAME_INTERVAL) { animFrameId = requestAnimationFrame(draw); return; }
+      if (timestamp - lastTime < FRAME_INTERVAL) {
+        animFrameId = requestAnimationFrame(draw);
+        return;
+      }
       lastTime = timestamp;
       ctx.fillStyle = 'rgba(0, 0, 0, 0.06)';
       ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -49,13 +54,13 @@ function CodeRain() {
       for (let i = 0; i < columns; i++) {
         const char = CODE_CHARS[Math.floor(Math.random() * CODE_CHARS.length)];
         const brightness = Math.random();
-        ctx.fillStyle = brightness > 0.7
-          ? '#4ade80'
-          : `rgba(74, 222, 128, ${0.15 + brightness * 0.3})`;
+        ctx.fillStyle =
+          brightness > 0.7
+            ? '#4ade80'
+            : `rgba(74, 222, 128, ${0.15 + brightness * 0.3})`;
         ctx.fillText(char, i * fontSize, drops[i] * fontSize);
-        if (drops[i] * fontSize > canvas.height && Math.random() > 0.975) {
+        if (drops[i] * fontSize > canvas.height && Math.random() > 0.975)
           drops[i] = 0;
-        }
         drops[i]++;
       }
       animFrameId = requestAnimationFrame(draw);
@@ -73,81 +78,156 @@ function CodeRain() {
     <canvas
       ref={canvasRef}
       style={{
-        position: 'fixed', inset: 0, width: '100%', height: '100%',
-        background: '#0a0a0a', zIndex: 0,
+        position: 'fixed',
+        inset: 0,
+        width: '100%',
+        height: '100%',
+        background: '#0a0a0a',
+        zIndex: 0,
       }}
     />
   );
 }
 
-/* ─── Typing Animation ─── */
+/* ─────────────────────────────────────────────
+   Typing Animation
+───────────────────────────────────────────── */
 function TypingText({ text, delay = 0 }: { text: string; delay?: number }) {
   const [shown, setShown] = useState('');
   useEffect(() => {
     let i = 0;
     const timeout = setTimeout(() => {
       const interval = setInterval(() => {
-        if (i < text.length) { setShown(text.slice(0, i + 1)); i++; }
-        else clearInterval(interval);
+        if (i < text.length) {
+          setShown(text.slice(0, i + 1));
+          i++;
+        } else {
+          clearInterval(interval);
+        }
       }, 45);
       return () => clearInterval(interval);
     }, delay);
     return () => clearTimeout(timeout);
   }, [text, delay]);
-  return <span>{shown}<span style={{ animation: 'pulse 1s infinite' }}>▊</span></span>;
+  return (
+    <span>
+      {shown}
+      <span style={{ animation: 'pulse 1s infinite' }}>▊</span>
+    </span>
+  );
 }
 
-/* ─── Icons (inline SVGs — no extra dependency) ─── */
-const TermIcon = () => (
-  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/>
-  </svg>
-);
+/* ─────────────────────────────────────────────
+   Icons
+───────────────────────────────────────────── */
 const LockIcon = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+    <rect x="3" y="11" width="18" height="11" rx="2" />
+    <path d="M7 11V7a5 5 0 0 1 10 0v4" />
   </svg>
 );
 const ArrowIcon = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/>
+    <line x1="5" y1="12" x2="19" y2="12" />
+    <polyline points="12 5 19 12 12 19" />
   </svg>
 );
 const EyeIcon = () => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
+    <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
+    <circle cx="12" cy="12" r="3" />
   </svg>
 );
 const EyeOffIcon = () => (
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
-    <line x1="1" y1="1" x2="23" y2="23"/>
-  </svg>
-);
-const ShieldIcon = () => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-  </svg>
-);
-const CpuIcon = () => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/>
-  </svg>
-);
-const GitIcon = () => (
-  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/>
+    <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24" />
+    <line x1="1" y1="1" x2="23" y2="23" />
   </svg>
 );
 const MailIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><polyline points="22,6 12,13 2,6"/>
+    <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
+    <polyline points="22,6 12,13 2,6" />
+  </svg>
+);
+/* Matrix-only icons */
+const TermIcon = () => (
+  <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <polyline points="4 17 10 11 4 5" />
+    <line x1="12" y1="19" x2="20" y2="19" />
+  </svg>
+);
+const ShieldIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#4ade80" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+  </svg>
+);
+const CpuIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="4" y="4" width="16" height="16" rx="2" /><rect x="9" y="9" width="6" height="6" />
+    <line x1="9" y1="1" x2="9" y2="4" /><line x1="15" y1="1" x2="15" y2="4" />
+    <line x1="9" y1="20" x2="9" y2="23" /><line x1="15" y1="20" x2="15" y2="23" />
+    <line x1="20" y1="9" x2="23" y2="9" /><line x1="20" y1="14" x2="23" y2="14" />
+    <line x1="1" y1="9" x2="4" y2="9" /><line x1="1" y1="14" x2="4" y2="14" />
+  </svg>
+);
+const GitIcon = () => (
+  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+    <line x1="6" y1="3" x2="6" y2="15" /><circle cx="18" cy="6" r="3" /><circle cx="6" cy="18" r="3" />
+    <path d="M18 9a9 9 0 0 1-9 9" />
   </svg>
 );
 
-/* ─── Main Component ─── */
+/* ─────────────────────────────────────────────
+   Surgical Logo  (light theme)
+───────────────────────────────────────────── */
+function SurgicalLogo({ isSetup }: { isSetup: boolean }) {
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 8 }}>
+      {/* < > icon */}
+      <div style={{
+        width: 44, height: 44, borderRadius: 12,
+        background: 'linear-gradient(135deg, #6d5ce6 0%, #4ade80 100%)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center',
+        flexShrink: 0,
+        boxShadow: '0 4px 14px rgba(109,92,230,0.3)',
+      }}>
+        <span style={{
+          fontFamily: 'monospace', fontWeight: 900, fontSize: 16,
+          color: '#fff', letterSpacing: '-1px',
+        }}>
+          {'< >'}
+        </span>
+      </div>
+      <div>
+        <h1 style={{
+          fontSize: 22, fontWeight: 700,
+          fontFamily: "'Inter', system-ui, sans-serif",
+          color: '#1e1b4b', margin: 0, lineHeight: 1.2,
+        }}>
+          {isSetup ? 'Initialize System' : 'SurgicalAI'}
+        </h1>
+        <div style={{
+          fontSize: 11, fontWeight: 600, letterSpacing: '0.08em',
+          background: 'linear-gradient(90deg, #6d5ce6, #4ade80)',
+          WebkitBackgroundClip: 'text',
+          WebkitTextFillColor: 'transparent',
+          backgroundClip: 'text',
+          marginTop: 2,
+        }}>
+          PRECISION AI EDITOR
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ─────────────────────────────────────────────
+   Main Component
+───────────────────────────────────────────── */
 export function LoginPage() {
   const { login, user } = useAuthStore();
+  const [theme, setTheme] = useState<Theme>('surgical');
   const [setupRequired, setSetupRequired] = useState<boolean | null>(null);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -158,7 +238,8 @@ export function LoginPage() {
   const [focused, setFocused] = useState<string | null>(null);
 
   useEffect(() => {
-    apiClient.get('/api/auth/setup-required')
+    apiClient
+      .get('/api/auth/setup-required')
       .then((r) => setSetupRequired(r.data.setup_required))
       .catch(() => setSetupRequired(false));
   }, []);
@@ -180,13 +261,18 @@ export function LoginPage() {
     }
   }
 
-  /* ─── Loading state ─── */
+  /* ── Loading spinner ── */
   if (setupRequired === null) {
+    const spinnerColor = theme === 'matrix' ? '#4ade80' : '#6d5ce6';
     return (
-      <div style={{ minHeight: '100vh', background: '#0a0a0a', display: 'grid', placeItems: 'center' }}>
+      <div style={{
+        minHeight: '100vh',
+        background: theme === 'matrix' ? '#0a0a0a' : '#f5f4ff',
+        display: 'grid', placeItems: 'center',
+      }}>
         <div style={{
           width: 32, height: 32,
-          border: '2px solid #4ade80', borderTopColor: 'transparent',
+          border: `2px solid ${spinnerColor}`, borderTopColor: 'transparent',
           borderRadius: '50%', animation: 'spin 1s linear infinite',
         }} />
         <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
@@ -195,36 +281,309 @@ export function LoginPage() {
   }
 
   const isSetup = setupRequired;
-  const title = isSetup ? 'Initialize System' : 'SurgicalAI';
   const subtitle = isSetup
     ? 'Create your admin account to begin.'
     : 'Precision code edits. Zero collateral.';
-  const btnText = isSetup ? 'Create Admin & Launch' : 'Authenticate';
+  const btnText = isSetup ? 'Create Admin & Launch' : 'Sign In';
 
-  const inputStyle = (field: string): React.CSSProperties => ({
-    width: '100%',
-    padding: '12px 16px',
-    paddingRight: field === 'pass' ? 48 : 16,
-    borderRadius: 8,
-    fontFamily: 'monospace',
-    fontSize: 14,
-    color: '#e2e8f0',
-    background: 'rgba(30, 30, 30, 0.8)',
-    border: focused === field
-      ? '1px solid rgba(74, 222, 128, 0.5)'
-      : '1px solid rgba(74, 222, 128, 0.12)',
-    boxShadow: focused === field ? '0 0 20px rgba(74, 222, 128, 0.1)' : 'none',
-    outline: 'none',
-    transition: 'all 0.2s',
-  });
+  const isSurgical = theme === 'surgical';
 
-  const labelStyle: React.CSSProperties = {
-    display: 'flex', alignItems: 'center', gap: 6,
-    fontSize: 12, fontFamily: 'monospace',
-    color: 'rgba(148, 163, 184, 0.7)',
-    marginBottom: 6,
+  /* ── Input styles — theme-aware ── */
+  const inputStyle = (field: string): React.CSSProperties =>
+    isSurgical
+      ? {
+          width: '100%',
+          padding: '11px 14px',
+          paddingRight: field === 'pass' ? 46 : 14,
+          borderRadius: 10,
+          fontFamily: "'Inter', system-ui, sans-serif",
+          fontSize: 14,
+          color: '#1e1b4b',
+          background: '#f8f7ff',
+          border:
+            focused === field
+              ? '1.5px solid #6d5ce6'
+              : '1.5px solid rgba(109,92,230,0.18)',
+          boxShadow:
+            focused === field ? '0 0 0 3px rgba(109,92,230,0.08)' : 'none',
+          outline: 'none',
+          transition: 'all 0.18s',
+        }
+      : {
+          width: '100%',
+          padding: '12px 16px',
+          paddingRight: field === 'pass' ? 48 : 16,
+          borderRadius: 8,
+          fontFamily: 'monospace',
+          fontSize: 14,
+          color: '#e2e8f0',
+          background: 'rgba(30, 30, 30, 0.8)',
+          border:
+            focused === field
+              ? '1px solid rgba(74, 222, 128, 0.5)'
+              : '1px solid rgba(74, 222, 128, 0.12)',
+          boxShadow:
+            focused === field ? '0 0 20px rgba(74, 222, 128, 0.1)' : 'none',
+          outline: 'none',
+          transition: 'all 0.2s',
+        };
+
+  const labelStyle: React.CSSProperties = isSurgical
+    ? {
+        display: 'flex', alignItems: 'center', gap: 6,
+        fontSize: 13, fontWeight: 500,
+        fontFamily: "'Inter', system-ui, sans-serif",
+        color: '#4b5563',
+        marginBottom: 6,
+      }
+    : {
+        display: 'flex', alignItems: 'center', gap: 6,
+        fontSize: 12, fontFamily: 'monospace',
+        color: 'rgba(148, 163, 184, 0.7)',
+        marginBottom: 6,
+      };
+
+  /* ── Toggle button ── */
+  const toggleBtn: React.CSSProperties = {
+    background: 'none', border: 'none', cursor: 'pointer',
+    fontSize: 11, fontWeight: 600,
+    fontFamily: isSurgical ? "'Inter', system-ui, sans-serif" : 'monospace',
+    color: isSurgical ? '#6d5ce6' : 'rgba(74,222,128,0.55)',
+    letterSpacing: '0.04em',
+    padding: '4px 8px', borderRadius: 6,
+    transition: 'opacity 0.2s',
+    opacity: 0.8,
   };
 
+  /* ─────────────────────────────────
+     SURGICAL (light) theme render
+  ──────────────────────────────────*/
+  if (isSurgical) {
+    const disabled = loading || !username || !password;
+    return (
+      <>
+        {/* Background */}
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 0,
+          background: '#f5f4ff',
+        }} />
+        {/* Radial glow */}
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 1, pointerEvents: 'none',
+          background:
+            'radial-gradient(ellipse 70% 60% at 50% 40%, rgba(109,92,230,0.09) 0%, transparent 70%)',
+        }} />
+
+        {/* Centering wrapper */}
+        <div style={{
+          position: 'fixed', inset: 0, zIndex: 2,
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          padding: '16px',
+          overflowY: 'auto',
+        }}>
+          <div style={{ width: '100%', maxWidth: 420 }}>
+
+            {/* Card */}
+            <form
+              onSubmit={handleSubmit}
+              style={{
+                background: '#ffffff',
+                borderRadius: 20,
+                border: '1.5px solid rgba(109,92,230,0.14)',
+                boxShadow:
+                  '0 4px 6px rgba(109,92,230,0.04), 0 20px 60px rgba(109,92,230,0.10)',
+                padding: '36px 32px 28px',
+              }}
+            >
+              {/* Logo */}
+              <SurgicalLogo isSetup={isSetup} />
+
+              {/* Tagline */}
+              <div style={{
+                fontSize: 13,
+                fontFamily: "'Inter', system-ui, sans-serif",
+                height: 22,
+                color: '#6d5ce6',
+                marginBottom: 28,
+                opacity: 0.8,
+              }}>
+                <TypingText text={subtitle} delay={300} />
+              </div>
+
+              {/* Error */}
+              {error && (
+                <div style={{
+                  padding: '10px 14px', borderRadius: 10, marginBottom: 18,
+                  background: 'rgba(239,68,68,0.06)',
+                  border: '1px solid rgba(239,68,68,0.25)',
+                  color: '#dc2626',
+                  fontSize: 13,
+                  fontFamily: "'Inter', system-ui, sans-serif",
+                }}>
+                  ⚠ {error}
+                </div>
+              )}
+
+              {/* Fields */}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+
+                {/* Username */}
+                <div>
+                  <label style={labelStyle}>Username</label>
+                  <input
+                    type="text"
+                    value={username}
+                    onChange={e => setUsername(e.target.value)}
+                    onFocus={() => setFocused('user')}
+                    onBlur={() => setFocused(null)}
+                    placeholder="Enter username"
+                    autoComplete="username"
+                    style={inputStyle('user')}
+                  />
+                </div>
+
+                {/* Email (setup only) */}
+                {isSetup && (
+                  <div>
+                    <label style={labelStyle}><MailIcon /> Email</label>
+                    <input
+                      type="email"
+                      value={email}
+                      onChange={e => setEmail(e.target.value)}
+                      onFocus={() => setFocused('email')}
+                      onBlur={() => setFocused(null)}
+                      placeholder="admin@example.com"
+                      autoComplete="email"
+                      style={inputStyle('email')}
+                    />
+                  </div>
+                )}
+
+                {/* Password */}
+                <div>
+                  <label style={labelStyle}>Password</label>
+                  <div style={{ position: 'relative' }}>
+                    <input
+                      type={showPass ? 'text' : 'password'}
+                      value={password}
+                      onChange={e => setPassword(e.target.value)}
+                      onFocus={() => setFocused('pass')}
+                      onBlur={() => setFocused(null)}
+                      placeholder="••••••••"
+                      autoComplete={isSetup ? 'new-password' : 'current-password'}
+                      style={inputStyle('pass')}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPass(!showPass)}
+                      style={{
+                        position: 'absolute', right: 12, top: '50%',
+                        transform: 'translateY(-50%)',
+                        background: 'none', border: 'none', cursor: 'pointer',
+                        color: '#9ca3af', transition: 'color 0.2s',
+                        display: 'flex', alignItems: 'center',
+                      }}
+                      onMouseEnter={e => (e.currentTarget.style.color = '#6d5ce6')}
+                      onMouseLeave={e => (e.currentTarget.style.color = '#9ca3af')}
+                    >
+                      {showPass ? <EyeOffIcon /> : <EyeIcon />}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Submit */}
+                <button
+                  type="submit"
+                  disabled={disabled}
+                  style={{
+                    width: '100%', padding: '12px 0',
+                    borderRadius: 10,
+                    fontFamily: "'Inter', system-ui, sans-serif",
+                    fontSize: 15, fontWeight: 600,
+                    display: 'flex', alignItems: 'center',
+                    justifyContent: 'center', gap: 8,
+                    background: disabled
+                      ? 'rgba(109,92,230,0.25)'
+                      : 'linear-gradient(135deg, #6d5ce6 0%, #4ade80 100%)',
+                    color: disabled ? 'rgba(109,92,230,0.5)' : '#fff',
+                    border: 'none',
+                    cursor: disabled ? 'not-allowed' : 'pointer',
+                    boxShadow: disabled
+                      ? 'none'
+                      : '0 4px 20px rgba(109,92,230,0.3)',
+                    transition: 'all 0.2s',
+                    marginTop: 4,
+                  }}
+                >
+                  {loading ? (
+                    <>
+                      <div style={{
+                        width: 16, height: 16,
+                        border: '2px solid rgba(255,255,255,0.4)',
+                        borderTopColor: '#fff',
+                        borderRadius: '50%',
+                        animation: 'spin 1s linear infinite',
+                      }} />
+                      {isSetup ? 'Initializing...' : 'Signing in...'}
+                    </>
+                  ) : (
+                    <>
+                      <LockIcon />
+                      {btnText}
+                      <ArrowIcon />
+                    </>
+                  )}
+                </button>
+              </div>
+
+              {/* Footer */}
+              <div style={{
+                marginTop: 24, paddingTop: 16,
+                borderTop: '1px solid rgba(109,92,230,0.08)',
+                display: 'flex', alignItems: 'center',
+                justifyContent: 'space-between',
+              }}>
+                <div style={{
+                  fontSize: 11,
+                  fontFamily: "'Inter', system-ui, sans-serif",
+                  color: '#9ca3af',
+                  display: 'flex', alignItems: 'center', gap: 12,
+                }}>
+                  <span>AES-256</span>
+                  <span>·</span>
+                  <span>Multi-model</span>
+                </div>
+                <button
+                  type="button"
+                  style={toggleBtn}
+                  onClick={() => setTheme('matrix')}
+                  title="Switch to Matrix theme"
+                >
+                  ⚡ Matrix mode
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+
+        <style>{`
+          @keyframes spin  { to { transform: rotate(360deg); } }
+          @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+          input::placeholder { color: #c4b5fd !important; opacity: 0.5; }
+          * { box-sizing: border-box; }
+          body { overflow: hidden; }
+          @media (max-width: 480px) {
+            body { overflow: auto; }
+          }
+        `}</style>
+      </>
+    );
+  }
+
+  /* ─────────────────────────────────
+     MATRIX (dark) theme render
+  ──────────────────────────────────*/
+  const matrixDisabled = loading || !username || !password;
   return (
     <>
       {!user && <CodeRain />}
@@ -232,7 +591,8 @@ export function LoginPage() {
       {/* Center glow */}
       <div style={{
         position: 'fixed', inset: 0, zIndex: 1, pointerEvents: 'none',
-        background: 'radial-gradient(ellipse at center, rgba(74, 222, 128, 0.08) 0%, transparent 70%)',
+        background:
+          'radial-gradient(ellipse at center, rgba(74,222,128,0.08) 0%, transparent 70%)',
       }} />
 
       <div style={{
@@ -240,10 +600,9 @@ export function LoginPage() {
         display: 'grid', placeItems: 'center',
         padding: 16,
       }}>
-        {/* Terminal card */}
         <div style={{ width: '100%', maxWidth: 440 }}>
 
-          {/* ── Title bar ── */}
+          {/* Title bar */}
           <div style={{
             display: 'flex', alignItems: 'center', gap: 8,
             padding: '10px 16px',
@@ -264,17 +623,20 @@ export function LoginPage() {
             </span>
           </div>
 
-          {/* ── Body ── */}
-          <form onSubmit={handleSubmit} style={{
-            padding: '32px',
-            background: 'rgba(10, 10, 10, 0.92)',
-            border: '1px solid rgba(74, 222, 128, 0.1)',
-            borderTop: 'none',
-            borderBottomLeftRadius: 12, borderBottomRightRadius: 12,
-            backdropFilter: 'blur(16px)',
-            boxShadow: '0 0 80px rgba(74, 222, 128, 0.08), 0 25px 50px rgba(0,0,0,0.5)',
-          }}>
-
+          {/* Body */}
+          <form
+            onSubmit={handleSubmit}
+            style={{
+              padding: '32px',
+              background: 'rgba(10, 10, 10, 0.92)',
+              border: '1px solid rgba(74, 222, 128, 0.1)',
+              borderTop: 'none',
+              borderBottomLeftRadius: 12, borderBottomRightRadius: 12,
+              backdropFilter: 'blur(16px)',
+              boxShadow:
+                '0 0 80px rgba(74,222,128,0.08), 0 25px 50px rgba(0,0,0,0.5)',
+            }}
+          >
             {/* Logo */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
               <div style={{
@@ -289,12 +651,16 @@ export function LoginPage() {
                 <h1 style={{
                   fontSize: 22, fontWeight: 700, fontFamily: 'monospace',
                   color: '#e2e8f0', margin: 0,
-                }}>{title}</h1>
-                <div style={{ fontSize: 12, fontFamily: 'monospace', color: '#4ade80' }}>v3.16.4</div>
+                }}>
+                  {isSetup ? 'Initialize System' : 'SurgicalAI'}
+                </h1>
+                <div style={{ fontSize: 12, fontFamily: 'monospace', color: '#4ade80' }}>
+                  v3.16.4
+                </div>
               </div>
             </div>
 
-            {/* Typing tagline */}
+            {/* Tagline */}
             <div style={{
               fontSize: 14, fontFamily: 'monospace', height: 24,
               color: 'rgba(74, 222, 128, 0.7)', marginBottom: 28,
@@ -302,7 +668,7 @@ export function LoginPage() {
               <TypingText text={subtitle} delay={400} />
             </div>
 
-            {/* Error message */}
+            {/* Error */}
             {error && (
               <div style={{
                 padding: '10px 14px', borderRadius: 8, marginBottom: 16,
@@ -373,10 +739,10 @@ export function LoginPage() {
                     type="button"
                     onClick={() => setShowPass(!showPass)}
                     style={{
-                      position: 'absolute', right: 12, top: '50%', transform: 'translateY(-50%)',
+                      position: 'absolute', right: 12, top: '50%',
+                      transform: 'translateY(-50%)',
                       background: 'none', border: 'none', cursor: 'pointer',
-                      color: '#94a3b8', opacity: 0.5,
-                      transition: 'opacity 0.2s',
+                      color: '#94a3b8', opacity: 0.5, transition: 'opacity 0.2s',
                     }}
                     onMouseEnter={e => (e.currentTarget.style.opacity = '1')}
                     onMouseLeave={e => (e.currentTarget.style.opacity = '0.5')}
@@ -389,19 +755,20 @@ export function LoginPage() {
               {/* Submit */}
               <button
                 type="submit"
-                disabled={loading || !username || !password}
+                disabled={matrixDisabled}
                 style={{
                   width: '100%', padding: '12px 0', borderRadius: 8,
                   fontFamily: 'monospace', fontSize: 14, fontWeight: 600,
-                  display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8,
-                  background: loading || !username || !password
+                  display: 'flex', alignItems: 'center',
+                  justifyContent: 'center', gap: 8,
+                  background: matrixDisabled
                     ? 'rgba(74, 222, 128, 0.3)'
                     : 'linear-gradient(135deg, #16a34a, #4ade80)',
                   color: '#0a0a0a',
-                  border: 'none', cursor: loading ? 'wait' : 'pointer',
+                  border: 'none', cursor: matrixDisabled ? 'not-allowed' : 'pointer',
                   boxShadow: '0 0 30px rgba(74, 222, 128, 0.2)',
                   transition: 'all 0.2s',
-                  opacity: loading || !username || !password ? 0.6 : 1,
+                  opacity: matrixDisabled ? 0.6 : 1,
                 }}
               >
                 {loading ? (
@@ -416,7 +783,7 @@ export function LoginPage() {
                 ) : (
                   <>
                     <LockIcon />
-                    {btnText}
+                    {isSetup ? 'Create Admin & Launch' : 'Authenticate'}
                     <ArrowIcon />
                   </>
                 )}
@@ -439,16 +806,26 @@ export function LoginPage() {
                   <CpuIcon /> Multi-model
                 </span>
               </div>
-              <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                <GitIcon /> main
-              </span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <GitIcon /> main
+                </span>
+                <button
+                  type="button"
+                  style={toggleBtn}
+                  onClick={() => setTheme('surgical')}
+                  title="Switch to Surgical theme"
+                >
+                  ☀ Surgical mode
+                </button>
+              </div>
             </div>
           </form>
         </div>
       </div>
 
       <style>{`
-        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes spin  { to { transform: rotate(360deg); } }
         @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
         input::placeholder { color: rgba(148, 163, 184, 0.3) !important; }
         * { box-sizing: border-box; margin: 0; padding: 0; }
