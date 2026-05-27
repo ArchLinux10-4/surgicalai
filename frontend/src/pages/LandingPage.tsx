@@ -520,6 +520,23 @@ html{scroll-behavior:smooth}
   .sai-badge-part1{white-space:nowrap}
   .sai-badge-part2{white-space:nowrap}
 }
+
+/* HERO ANIMATION */
+.sai-hidden{display:none!important}
+@keyframes heroSlideIn{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:none}}
+.hero-line-anim{animation:heroSlideIn .35s ease both}
+@keyframes heroPopIn{from{opacity:0;transform:scale(.92) translateY(4px)}to{opacity:1;transform:none}}
+.hero-msg-pop{animation:heroPopIn .3s ease both}
+@keyframes heroDotFlash{0%,80%,100%{opacity:.2}40%{opacity:1}}
+.hero-streaming-dots span{display:inline-block;width:4px;height:4px;border-radius:50%;background:var(--e-txt2);margin:0 1px;animation:heroDotFlash 1.2s infinite}
+.hero-streaming-dots span:nth-child(2){animation-delay:.2s}
+.hero-streaming-dots span:nth-child(3){animation-delay:.4s}
+.hero-send-btn{width:28px;height:28px;border-radius:6px;background:var(--accent);border:none;cursor:pointer;display:flex;align-items:center;justify-content:center;flex-shrink:0;opacity:0;transition:opacity .3s;padding:0}
+.hero-send-btn.visible{opacity:1}
+.hero-send-btn svg{width:13px;height:13px;fill:none;stroke:#fff;stroke-width:2.5}
+@media(max-width:900px){
+  .sai-hero-mockup{max-width:calc(100vw - 48px)}
+}
 `;
 
 export function LandingPage() {
@@ -537,6 +554,135 @@ export function LandingPage() {
       document.body.style.overflow = prevOverflow;
       document.body.style.background = prevBg;
     };
+  }, []);
+
+
+  // Hero mockup animation
+  useEffect(() => {
+    let active = true;
+    const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+    const g = (id: string) => document.getElementById(id);
+
+    function showEl(id: string) { const el = g(id); if (el) el.classList.remove('sai-hidden'); }
+    function hideEl(id: string) { const el = g(id); if (el) el.classList.add('sai-hidden'); }
+    function animLine(id: string) {
+      const el = g(id); if (!el) return;
+      el.classList.remove('sai-hidden'); el.classList.remove('hero-line-anim');
+      void (el as HTMLElement).offsetWidth;
+      el.classList.add('hero-line-anim');
+    }
+    function addMsg(html: string, extraClass = '') {
+      const area = g('heroMessages'); if (!area) return null;
+      const div = document.createElement('div');
+      div.className = 'sai-msg hero-msg-pop ' + extraClass;
+      div.innerHTML = html; area.appendChild(div); return div;
+    }
+    function addStep(icon: string, label: string, text: string, color = '#34d399') {
+      const area = g('heroMessages'); if (!area) return null;
+      const div = document.createElement('div');
+      div.className = 'sai-msg-step hero-msg-pop';
+      div.innerHTML = `<span class="sai-step-icon">${icon}</span><div><span class="sai-step-label" style="color:${color}">${label}</span><span class="sai-step-text">${text}</span></div>`;
+      area.appendChild(div); return div;
+    }
+    async function streamText(el: HTMLElement, text: string, delay = 55) {
+      const words = text.split(' '); el.textContent = '';
+      for (const w of words) {
+        if (!active) return;
+        el.textContent += (el.textContent ? ' ' : '') + w;
+        await sleep(delay);
+      }
+    }
+    async function typeInput(text: string, delay = 60) {
+      const inp = g('heroChatInput'); if (!inp) return;
+      inp.textContent = ''; (inp as HTMLElement).style.color = 'var(--e-txt)';
+      for (const ch of text) {
+        if (!active) return;
+        inp.textContent += ch; await sleep(delay);
+      }
+      const btn = g('heroSendBtn'); if (btn) btn.classList.add('visible');
+    }
+    function clearInput() {
+      const inp = g('heroChatInput');
+      if (inp) { inp.textContent = 'Ask SurgicalAI…'; (inp as HTMLElement).style.color = ''; }
+      const btn = g('heroSendBtn'); if (btn) btn.classList.remove('visible');
+    }
+    function resetCode() {
+      ['heroDel50','heroDel51','heroDel52','heroAdd50','heroAdd51','heroAdd52','heroCl57qa'].forEach(id => {
+        const el = g(id); if (el) { el.classList.add('sai-hidden'); el.classList.remove('hero-line-anim'); }
+      });
+      ['heroCl53','heroCl54','heroCl55'].forEach(id => { const el = g(id); if (el) el.classList.remove('sai-hidden'); });
+      const badge = g('heroPanelBadge');
+      if (badge) { badge.textContent = 'Architect'; badge.className = 'sai-panel-badge sai-badge-arch'; (badge as HTMLElement).style.cssText = ''; }
+      const title = g('heroTitlebarText');
+      if (title) title.textContent = 'SurgicalAI — ChatPanel.tsx';
+    }
+
+    async function runLoop() {
+      while (active) {
+        resetCode();
+        const area = g('heroMessages'); if (area) area.innerHTML = '';
+        clearInput();
+        await sleep(1400); if (!active) return;
+
+        await typeInput('Add streaming to handleSend and wire it to the Surgical editor', 45);
+        if (!active) return; await sleep(500); if (!active) return;
+        const sendBtn = g('heroSendBtn'); if (sendBtn) sendBtn.classList.remove('visible');
+        addMsg('Add streaming to handleSend and wire it to the Surgical editor', 'sai-msg-user');
+        clearInput(); await sleep(600); if (!active) return;
+
+        const archDiv = addMsg('', 'sai-msg-arch');
+        if (archDiv) {
+          archDiv.innerHTML = '<strong style="color:#e0e0f0;font-size:11px;display:block;margin-bottom:4px">🏛 Architect · Plan</strong><span id="heroArchStream"></span>';
+          const archSpan = g('heroArchStream');
+          if (archSpan) {
+            archSpan.innerHTML = '<span class="hero-streaming-dots"><span></span><span></span><span></span></span>';
+            await sleep(900); if (!active) return;
+            await streamText(archSpan as HTMLElement, 'Small targeted change in ChatPanel.tsx line 50–52. Routing → Surgeon path (focused window extracted).', 48);
+          }
+        }
+        await sleep(500); if (!active) return;
+
+        const badge = g('heroPanelBadge');
+        if (badge) { badge.textContent = 'Surgeon'; badge.className = 'sai-panel-badge sai-badge-surg'; (badge as HTMLElement).style.cssText = ''; }
+        const title = g('heroTitlebarText');
+        if (title) title.textContent = 'SurgicalAI — ChatPanel.tsx · editing…';
+        const surgStep = addStep('⚡', 'Surgeon · SEARCH/REPLACE', 'Applying…', '#34d399');
+        await sleep(400); if (!active) return;
+
+        hideEl('heroCl53'); hideEl('heroCl54'); hideEl('heroCl55');
+        await sleep(200); if (!active) return;
+        animLine('heroDel50'); await sleep(180); if (!active) return;
+        animLine('heroDel51'); await sleep(180); if (!active) return;
+        animLine('heroDel52'); await sleep(350); if (!active) return;
+        hideEl('heroDel50'); hideEl('heroDel51'); hideEl('heroDel52');
+        animLine('heroAdd50'); await sleep(180); if (!active) return;
+        animLine('heroAdd51'); await sleep(180); if (!active) return;
+        animLine('heroAdd52'); await sleep(400); if (!active) return;
+        showEl('heroCl53'); showEl('heroCl54'); showEl('heroCl55');
+        if (surgStep) {
+          const st = surgStep.querySelector('.sai-step-text');
+          if (st) st.textContent = '3 lines replaced · ChatPanel.tsx · confidence 98%';
+        }
+        await sleep(700); if (!active) return;
+
+        if (badge) { badge.textContent = 'QA'; badge.className = 'sai-panel-badge'; (badge as HTMLElement).style.cssText = 'background:rgba(217,119,6,.2);color:#fbbf24'; }
+        const qaStep = addStep('⏳', 'QA · TypeScript', 'Compiling…', '#fbbf24');
+        await sleep(1400); if (!active) return;
+        if (qaStep) {
+          const qi = qaStep.querySelector('.sai-step-icon'); if (qi) qi.textContent = '✅';
+          const ql = qaStep.querySelector('.sai-step-label') as HTMLElement | null;
+          if (ql) { ql.style.color = '#34d399'; ql.textContent = 'QA · TypeScript'; }
+          const qt = qaStep.querySelector('.sai-step-text'); if (qt) qt.textContent = '0 errors · build clean · applied to file';
+          (qaStep as HTMLElement).style.borderColor = 'rgba(15,168,118,.4)';
+        }
+        if (badge) { badge.textContent = 'Done'; (badge as HTMLElement).style.cssText = 'background:rgba(15,168,118,.2);color:#34d399'; }
+        animLine('heroCl57qa');
+        await sleep(3200); if (!active) return;
+      }
+    }
+
+    runLoop();
+    return () => { active = false; };
   }, []);
 
   // QA terminal animation
@@ -791,13 +937,13 @@ export function LandingPage() {
           <a href="#how-it-works" className="sai-btn-secondary">See how it works →</a>
         </div>
 
-        {/* APP MOCKUP */}
+        {/* APP MOCKUP — animated */}
         <div className="sai-hero-mockup">
           <div className="sai-mockup-titlebar">
             <div className="sai-dot sai-dot-r"></div>
             <div className="sai-dot sai-dot-y"></div>
             <div className="sai-dot sai-dot-g"></div>
-            <span className="sai-titlebar-text">SurgicalAI — ChatPanel.tsx</span>
+            <span className="sai-titlebar-text" id="heroTitlebarText">SurgicalAI — ChatPanel.tsx</span>
           </div>
           <div className="sai-mockup-body">
             {/* Sidebar */}
@@ -844,16 +990,16 @@ export function LandingPage() {
                 <div className="sai-line"><span className="sai-ln">47</span><span className="sai-ct"><span className="sai-kw">const</span> <span className="sai-fn">handleSend</span> = <span className="sai-kw">async</span> () =&gt; {'{'}</span></div>
                 <div className="sai-line"><span className="sai-ln">48</span><span className="sai-ct">  <span className="sai-kw">if</span> (!input.trim()) <span className="sai-kw">return</span>;</span></div>
                 <div className="sai-line"><span className="sai-ln">49</span><span className="sai-ct">  <span className="sai-fn">setIsLoading</span>(<span className="sai-kw">true</span>);</span></div>
-                <div className="sai-line del"><span className="sai-ln">50</span><span className="sai-ct"><span className="sai-op">-</span>  <span className="sai-kw">const</span> res = <span className="sai-kw">await</span> <span className="sai-fn">fetch</span>(<span className="sai-str">'/api/chat'</span>, {'{'}</span></div>
-                <div className="sai-line del"><span className="sai-ln">51</span><span className="sai-ct"><span className="sai-op">-</span>    method: <span className="sai-str">'POST'</span>, body: input</span></div>
-                <div className="sai-line del"><span className="sai-ln">52</span><span className="sai-ct"><span className="sai-op">-</span>  {'}'});</span></div>
-                <div className="sai-line add"><span className="sai-ln">50</span><span className="sai-ct"><span className="sai-op">+</span>  <span className="sai-kw">const</span> res = <span className="sai-kw">await</span> <span className="sai-fn">streamSurgicalEdit</span>({'{'}</span></div>
-                <div className="sai-line add"><span className="sai-ln">51</span><span className="sai-ct"><span className="sai-op">+</span>    prompt: input, fileIds: sessionFiles</span></div>
-                <div className="sai-line add"><span className="sai-ln">52</span><span className="sai-ct"><span className="sai-op">+</span>  {'}'});</span></div>
-                <div className="sai-line"><span className="sai-ln">53</span><span className="sai-ct">  <span className="sai-kw">const</span> data = <span className="sai-kw">await</span> res.<span className="sai-fn">json</span>();</span></div>
-                <div className="sai-line"><span className="sai-ln">54</span><span className="sai-ct">  <span className="sai-fn">setMessages</span>(prev =&gt; [...prev, data]);</span></div>
-                <div className="sai-line"><span className="sai-ln">55</span><span className="sai-ct">{'}'};</span></div>
-                <div className="sai-line"><span className="sai-ln">57</span><span className="sai-ct"><span className="sai-cm">{'// Surgeon applied 3 lines · QA passed ✓'}</span></span></div>
+                <div className="sai-line del sai-hidden" id="heroDel50"><span className="sai-ln">50</span><span className="sai-ct"><span className="sai-op">-</span>  <span className="sai-kw">const</span> res = <span className="sai-kw">await</span> <span className="sai-fn">fetch</span>(<span className="sai-str">'/api/chat'</span>, {'{'}</span></div>
+                <div className="sai-line del sai-hidden" id="heroDel51"><span className="sai-ln">51</span><span className="sai-ct"><span className="sai-op">-</span>    method: <span className="sai-str">'POST'</span>, body: input</span></div>
+                <div className="sai-line del sai-hidden" id="heroDel52"><span className="sai-ln">52</span><span className="sai-ct"><span className="sai-op">-</span>  {'}'});</span></div>
+                <div className="sai-line add sai-hidden" id="heroAdd50"><span className="sai-ln">50</span><span className="sai-ct"><span className="sai-op">+</span>  <span className="sai-kw">const</span> res = <span className="sai-kw">await</span> <span className="sai-fn">streamSurgicalEdit</span>({'{'}</span></div>
+                <div className="sai-line add sai-hidden" id="heroAdd51"><span className="sai-ln">51</span><span className="sai-ct"><span className="sai-op">+</span>    prompt: input, fileIds: sessionFiles</span></div>
+                <div className="sai-line add sai-hidden" id="heroAdd52"><span className="sai-ln">52</span><span className="sai-ct"><span className="sai-op">+</span>  {'}'});</span></div>
+                <div className="sai-line" id="heroCl53"><span className="sai-ln">53</span><span className="sai-ct">  <span className="sai-kw">const</span> data = <span className="sai-kw">await</span> res.<span className="sai-fn">json</span>();</span></div>
+                <div className="sai-line" id="heroCl54"><span className="sai-ln">54</span><span className="sai-ct">  <span className="sai-fn">setMessages</span>(prev =&gt; [...prev, data]);</span></div>
+                <div className="sai-line" id="heroCl55"><span className="sai-ln">55</span><span className="sai-ct">{'}'};</span></div>
+                <div className="sai-line sai-hidden" id="heroCl57qa"><span className="sai-ln">57</span><span className="sai-ct"><span className="sai-cm">{'// Surgeon applied 3 lines · QA passed ✓'}</span></span></div>
                 <div className="sai-line"><span className="sai-ln">58</span><span className="sai-ct"><span className="sai-kw">return</span> (</span></div>
                 <div className="sai-line"><span className="sai-ln">59</span><span className="sai-ct">  &lt;<span className="sai-ty">ChatContainer</span>&gt;</span></div>
                 <div className="sai-line"><span className="sai-ln">60</span><span className="sai-ct">    &lt;<span className="sai-ty">MessageList</span> messages={'{messages}'}/&gt;<span className="sai-cursor-blink"></span></span></div>
@@ -867,31 +1013,14 @@ export function LandingPage() {
                   <circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
                 </svg>
                 Pipeline
-                <span className="sai-panel-badge sai-badge-arch">Architect</span>
+                <span className="sai-panel-badge sai-badge-arch" id="heroPanelBadge">Architect</span>
               </div>
-              <div className="sai-mock-messages">
-                <div className="sai-msg sai-msg-user sai-typed">Add streaming to handleSend and wire it to the Surgical editor</div>
-                <div className="sai-msg sai-msg-arch sai-typed2">
-                  <strong style={{color:'#e0e0f0',fontSize:'11px',display:'block',marginBottom:'4px'}}>🏛 Architect · Plan</strong>
-                  Small targeted change in ChatPanel.tsx line 50–52. Routing → Surgeon path (focused window).
-                </div>
-                <div className="sai-msg-step sai-typed3">
-                  <span className="sai-step-icon">⚡</span>
-                  <div>
-                    <span className="sai-step-label">Surgeon · SEARCH/REPLACE</span>
-                    <span className="sai-step-text">3 lines replaced · ChatPanel.tsx · confidence 98%</span>
-                  </div>
-                </div>
-                <div className="sai-msg-step">
-                  <span className="sai-step-icon">✅</span>
-                  <div>
-                    <span className="sai-step-label" style={{color:'#34d399'}}>QA · TypeScript</span>
-                    <span className="sai-step-text">0 errors · build clean · applied to file</span>
-                  </div>
-                </div>
-              </div>
+              <div className="sai-mock-messages" id="heroMessages"></div>
               <div className="sai-mock-input-bar">
-                <div className="sai-mock-input">Ask SurgicalAI…</div>
+                <div className="sai-mock-input" id="heroChatInput">Ask SurgicalAI…</div>
+                <button className="hero-send-btn" id="heroSendBtn" aria-label="send">
+                  <svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22,2 15,22 11,13 2,9"/></svg>
+                </button>
               </div>
             </div>
           </div>
