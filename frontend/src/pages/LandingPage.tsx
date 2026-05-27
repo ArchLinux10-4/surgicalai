@@ -533,9 +533,10 @@ export function LandingPage() {
 
   // QA terminal animation
   useEffect(() => {
-    const term = document.getElementById('qaTerm') as HTMLElement | null;
+    const termOrNull = document.getElementById('qaTerm');
+    if (!termOrNull) return;
+    const term: HTMLElement = termOrNull;
     const stepEls = ['qaStep1','qaStep2','qaStep3','qaStep4'].map(id => document.getElementById(id));
-    if (!term) return;
     let cursor: HTMLElement | null = null;
     let fired = false;
 
