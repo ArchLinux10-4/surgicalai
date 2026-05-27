@@ -2,6 +2,12 @@
  * LandingPage — SurgicalAI public marketing homepage
  * Shown at "/" for unauthenticated users.
  * Pure CSS — no JS interactions, works on all devices.
+ *
+ * Stripe wiring notes (future):
+ *  - Starter plan button: data-stripe-price-id="price_starter_monthly"
+ *  - Pro plan button:     data-stripe-price-id="price_pro_monthly"
+ *  - Hook: add onClick={() => stripeCheckout(priceId)} to .sai-pricing-cta buttons
+ *  - Backend: POST /billing/create-checkout-session { priceId, userId }
  */
 import { useEffect } from 'react';
 import LoginIcon from '@mui/icons-material/Login';
@@ -153,7 +159,6 @@ html{scroll-behavior:smooth}
 .sai-step-icon{font-size:14px;margin-top:1px;flex-shrink:0}
 .sai-step-text{font-size:11px;color:var(--e-txt2)}
 .sai-step-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#34d399;display:block;margin-bottom:2px}
-@keyframes sai-dot-bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-5px)}}
 @keyframes sai-blink{0%,100%{opacity:1}50%{opacity:0}}
 .sai-cursor-blink{display:inline-block;width:2px;height:13px;background:#a78bfa;vertical-align:middle;animation:sai-blink 1s step-end infinite}
 .sai-mock-input-bar{padding:10px 12px;border-top:1px solid var(--e-border);display:flex;gap:8px;align-items:center}
@@ -243,6 +248,62 @@ html{scroll-behavior:smooth}
 .sai-diff-line.minus .sai-diff-code{color:rgba(248,113,113,.85)}
 .sai-diff-line.plus .sai-diff-code{color:rgba(52,211,153,.9)}
 
+/* INTEGRATIONS */
+.sai-integ-grid{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:center}
+.sai-integ-grid.reverse{direction:rtl}
+.sai-integ-grid.reverse > *{direction:ltr}
+.sai-integ-mockup{
+  background:var(--e-bg2);border:1px solid rgba(255,255,255,.08);
+  border-radius:16px;overflow:hidden;
+  box-shadow:0 8px 40px rgba(0,0,0,.14),0 0 0 1px rgba(255,255,255,.05);
+}
+.sai-integ-titlebar{
+  height:38px;background:var(--e-bg3);border-bottom:1px solid var(--e-border);
+  display:flex;align-items:center;padding:0 14px;gap:8px;
+}
+.sai-integ-tbtitle{margin-left:8px;font-size:12px;color:var(--e-txt2);font-weight:600}
+.sai-integ-body{padding:14px;display:flex;flex-direction:column;gap:6px}
+.sai-integ-row{
+  display:flex;align-items:center;gap:10px;
+  padding:9px 12px;background:rgba(255,255,255,.03);
+  border:1px solid var(--e-border);border-radius:9px;
+  font-size:12px;color:var(--e-txt2);
+}
+.sai-integ-row.active{background:rgba(124,106,247,.07);border-color:rgba(124,106,247,.2);color:var(--e-txt)}
+.sai-integ-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0}
+.sai-integ-dot.green{background:#34d399}
+.sai-integ-dot.purple{background:#a78bfa}
+.sai-integ-dot.gray{background:#404060}
+.sai-integ-dot.blue{background:#60a5fa}
+.sai-integ-dot.amber{background:#fbbf24}
+.sai-integ-meta{font-size:10px;color:var(--e-txt3);margin-left:auto;white-space:nowrap}
+.sai-integ-badge-sm{font-size:10px;padding:2px 7px;border-radius:5px;font-weight:700;margin-left:auto;white-space:nowrap}
+.sai-integ-badge-sm.merged{background:rgba(124,106,247,.2);color:#a78bfa}
+.sai-integ-badge-sm.open{background:rgba(15,168,118,.15);color:#34d399}
+.sai-integ-badge-sm.review{background:rgba(251,191,36,.15);color:#fbbf24}
+.sai-integ-badge-sm.inprog{background:rgba(96,165,250,.15);color:#60a5fa}
+.sai-integ-badge-sm.done{background:rgba(15,168,118,.15);color:#34d399}
+.sai-integ-badge-sm.todo{background:rgba(255,255,255,.06);color:#7070a0}
+.sai-integ-badge-sm.cancelled{background:rgba(248,113,113,.1);color:#f87171}
+.sai-integ-section-divider{height:1px;background:var(--e-border);margin:4px 0}
+.sai-integ-section-label{font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--e-txt3);padding:4px 12px 0}
+.sai-integ-bullets{display:flex;flex-direction:column;gap:16px;margin-top:32px}
+.sai-integ-bullet{display:flex;align-items:flex-start;gap:14px}
+.sai-integ-bullet-icon{
+  width:36px;height:36px;border-radius:10px;flex-shrink:0;
+  display:flex;align-items:center;justify-content:center;font-size:16px;
+  background:rgba(109,92,230,.08);border:1.5px solid rgba(109,92,230,.15);
+}
+.sai-integ-bullet h4{font-size:15px;font-weight:700;margin-bottom:4px;color:var(--txt)}
+.sai-integ-bullet p{font-size:14px;color:var(--txt2);line-height:1.5}
+.sai-integ-logo-badge{
+  display:inline-flex;align-items:center;gap:8px;
+  background:var(--bg3);border:1.5px solid var(--border2);
+  border-radius:999px;padding:6px 16px 6px 10px;
+  font-size:13px;font-weight:700;color:var(--txt);
+  margin-bottom:20px;
+}
+
 /* COMPARE */
 .sai-compare-grid{display:grid;grid-template-columns:1fr 1fr;gap:32px}
 .sai-compare-card{background:#fff;border:1.5px solid var(--border2);border-radius:16px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.04)}
@@ -257,6 +318,38 @@ html{scroll-behavior:smooth}
 .chk.yes{color:var(--green)}.chk.no{color:var(--red)}.chk.partial{color:var(--amber)}
 .sai-compare-item p{color:var(--txt2);line-height:1.5}
 .sai-compare-item strong{color:var(--txt)}
+
+/* PRICING */
+.sai-pricing-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;max-width:860px;margin:0 auto}
+.sai-pricing-card{background:#fff;border:1.5px solid var(--border2);border-radius:20px;overflow:hidden;transition:transform .2s;box-shadow:0 2px 12px rgba(0,0,0,.04)}
+.sai-pricing-card.featured{border-color:rgba(109,92,230,.4);box-shadow:0 8px 40px rgba(109,92,230,.14);transform:translateY(-4px)}
+.sai-pricing-top{padding:32px 32px 24px}
+.sai-pricing-popular{font-size:11px;font-weight:800;letter-spacing:.4px;text-transform:uppercase;padding:4px 12px;background:rgba(109,92,230,.12);color:var(--accent);border-radius:999px;display:inline-block;margin-bottom:16px}
+.sai-pricing-tier{font-size:11px;font-weight:800;letter-spacing:.8px;text-transform:uppercase;margin-bottom:12px;color:var(--txt2)}
+.sai-pricing-price{font-size:52px;font-weight:800;letter-spacing:-2px;color:var(--txt);line-height:1;margin-bottom:6px;display:flex;align-items:flex-start;gap:2px}
+.sai-pricing-price sup{font-size:22px;vertical-align:top;margin-top:12px;font-weight:700}
+.sai-pricing-price sub{font-size:14px;font-weight:500;color:var(--txt2);letter-spacing:0;align-self:flex-end;margin-bottom:8px}
+.sai-pricing-desc{font-size:14px;color:var(--txt2);margin-bottom:20px;line-height:1.6}
+.sai-pricing-model{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:600;padding:5px 12px;border-radius:7px;margin-bottom:4px}
+.sai-pricing-model.sonnet{background:rgba(96,165,250,.1);color:#60a5fa;border:1px solid rgba(96,165,250,.2)}
+.sai-pricing-model.opus{background:rgba(109,92,230,.1);color:var(--accent);border:1px solid rgba(109,92,230,.2)}
+.sai-pricing-divider{height:1px;background:var(--border);margin:0}
+.sai-pricing-features{padding:24px 32px 32px;display:flex;flex-direction:column;gap:11px}
+.sai-pricing-feature{display:flex;align-items:flex-start;gap:10px;font-size:14px}
+.sai-pricing-feature .ck{color:var(--green);flex-shrink:0;margin-top:1px;font-size:15px}
+.sai-pricing-feature p{color:var(--txt2);line-height:1.4}
+.sai-pricing-feature strong{color:var(--txt)}
+.sai-pricing-cta{
+  width:100%;padding:13px;border-radius:10px;
+  font-size:15px;font-weight:700;cursor:pointer;border:none;
+  transition:opacity .2s,background .2s;text-decoration:none;
+  display:block;text-align:center;margin-top:12px;
+}
+.sai-pricing-cta.starter-btn{background:var(--bg3);color:var(--txt);border:1.5px solid var(--border2)}
+.sai-pricing-cta.starter-btn:hover{background:var(--bg2)}
+.sai-pricing-cta.pro-btn{background:var(--accent);color:#fff}
+.sai-pricing-cta.pro-btn:hover{opacity:.88}
+.sai-pricing-note{text-align:center;margin-top:24px;font-size:13px;color:var(--txt3)}
 
 /* CTA */
 .sai-cta-section{text-align:center;padding:100px 24px;background:linear-gradient(180deg,#ffffff 0%,#f0effe 100%)}
@@ -296,6 +389,10 @@ html{scroll-behavior:smooth}
   .sai-pipeline-grid{grid-template-columns:1fr}
   .sai-features-grid{grid-template-columns:1fr 1fr}
   .sai-compare-grid{grid-template-columns:1fr}
+  .sai-integ-grid{grid-template-columns:1fr}
+  .sai-integ-grid.reverse{direction:ltr}
+  .sai-pricing-grid{grid-template-columns:1fr;max-width:460px}
+  .sai-pricing-card.featured{transform:none}
 }
 @media(max-width:600px){
   .sai-features-grid{grid-template-columns:1fr}
@@ -341,6 +438,8 @@ export function LandingPage() {
         <ul className="sai-nav-links">
           <li><a href="#how-it-works">How it works</a></li>
           <li><a href="#features">Features</a></li>
+          <li><a href="#integrations">Integrations</a></li>
+          <li><a href="#pricing">Pricing</a></li>
           <li><a href="#compare">Compare</a></li>
         </ul>
         <a href="/login" className="sai-nav-cta">
@@ -428,7 +527,6 @@ export function LandingPage() {
                 <div className="sai-line"><span className="sai-ln">53</span><span className="sai-ct">  <span className="sai-kw">const</span> data = <span className="sai-kw">await</span> res.<span className="sai-fn">json</span>();</span></div>
                 <div className="sai-line"><span className="sai-ln">54</span><span className="sai-ct">  <span className="sai-fn">setMessages</span>(prev =&gt; [...prev, data]);</span></div>
                 <div className="sai-line"><span className="sai-ln">55</span><span className="sai-ct">{'}'};</span></div>
-                <div className="sai-line"><span className="sai-ln">56</span><span className="sai-ct"></span></div>
                 <div className="sai-line"><span className="sai-ln">57</span><span className="sai-ct"><span className="sai-cm">{'// Surgeon applied 3 lines · QA passed ✓'}</span></span></div>
                 <div className="sai-line"><span className="sai-ln">58</span><span className="sai-ct"><span className="sai-kw">return</span> (</span></div>
                 <div className="sai-line"><span className="sai-ln">59</span><span className="sai-ct">  &lt;<span className="sai-ty">ChatContainer</span>&gt;</span></div>
@@ -458,7 +556,7 @@ export function LandingPage() {
                     <span className="sai-step-text">3 lines replaced · ChatPanel.tsx · confidence 98%</span>
                   </div>
                 </div>
-                <div className="sai-msg-step" style={{animationDelay:'.5s'}}>
+                <div className="sai-msg-step">
                   <span className="sai-step-icon">✅</span>
                   <div>
                     <span className="sai-step-label" style={{color:'#34d399'}}>QA · TypeScript</span>
@@ -601,8 +699,192 @@ export function LandingPage() {
         </div>
       </section>
 
+      {/* GITHUB INTEGRATION */}
+      <section id="integrations" className="sai-section">
+        <div className="sai-container">
+          <div className="sai-integ-grid">
+            <div>
+              <div className="sai-integ-logo-badge">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="var(--txt)"><path d="M12 2C6.477 2 2 6.477 2 12c0 4.418 2.865 8.167 6.839 9.49.5.092.682-.217.682-.482 0-.237-.009-.868-.013-1.703-2.782.604-3.369-1.342-3.369-1.342-.454-1.155-1.11-1.463-1.11-1.463-.908-.62.069-.608.069-.608 1.003.07 1.531 1.03 1.531 1.03.892 1.529 2.341 1.087 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.11-4.555-4.943 0-1.091.39-1.984 1.029-2.683-.103-.253-.446-1.27.098-2.647 0 0 .84-.269 2.75 1.026A9.578 9.578 0 0112 6.836a9.59 9.59 0 012.504.337c1.909-1.295 2.748-1.026 2.748-1.026.546 1.377.202 2.394.1 2.647.64.699 1.028 1.592 1.028 2.683 0 3.842-2.339 4.687-4.566 4.935.359.309.678.919.678 1.852 0 1.336-.012 2.415-.012 2.743 0 .267.18.578.688.48C19.138 20.164 22 16.418 22 12c0-5.523-4.477-10-10-10z"/></svg>
+                GitHub Integration
+              </div>
+              <div className="sai-section-label">Version Control</div>
+              <h2 className="sai-section-title">Branch-aware.<br/>PR-ready.</h2>
+              <p className="sai-section-sub">SurgicalAI knows your branch, your open PRs, and your commit history. Every edit is scoped to the right context — no cross-branch contamination.</p>
+              <div className="sai-integ-bullets">
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">🌿</div>
+                  <div>
+                    <h4>Branch-scoped edits</h4>
+                    <p>The Architect reads your active branch before planning. Changes are always committed to the correct branch.</p>
+                  </div>
+                </div>
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">🔀</div>
+                  <div>
+                    <h4>Auto PR creation</h4>
+                    <p>After a successful surgical edit session, SurgicalAI can open a pull request with a descriptive title and diff summary.</p>
+                  </div>
+                </div>
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">📜</div>
+                  <div>
+                    <h4>Commit history awareness</h4>
+                    <p>The pipeline can inspect recent commits to understand intent and avoid re-introducing reverted code.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div>
+              <div className="sai-integ-mockup">
+                <div className="sai-integ-titlebar">
+                  <div className="sai-dot sai-dot-r"></div>
+                  <div className="sai-dot sai-dot-y"></div>
+                  <div className="sai-dot sai-dot-g"></div>
+                  <span className="sai-integ-tbtitle">surgicalai / Pull Requests</span>
+                </div>
+                <div className="sai-integ-body">
+                  <div className="sai-integ-section-label">Open</div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>feat: streaming SEARCH/REPLACE surgeon path</span>
+                    <span className="sai-integ-badge-sm open">Open</span>
+                  </div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>fix: QA auto-heal 3 retry attempts</span>
+                    <span className="sai-integ-badge-sm review">Review</span>
+                  </div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>fix: async direct rewrite AsyncAnthropic</span>
+                    <span className="sai-integ-badge-sm open">Open</span>
+                  </div>
+                  <div className="sai-integ-section-divider"></div>
+                  <div className="sai-integ-section-label">Merged</div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot purple"></div>
+                    <span style={{flex:1}}>fix: remove DELETE fast-path</span>
+                    <span className="sai-integ-badge-sm merged">Merged</span>
+                  </div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot purple"></div>
+                    <span style={{flex:1}}>feat: size-based routing threshold 250L</span>
+                    <span className="sai-integ-badge-sm merged">Merged</span>
+                  </div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot purple"></div>
+                    <span style={{flex:1}}>feat: Claude Surgeon model routing</span>
+                    <span className="sai-integ-badge-sm merged">Merged</span>
+                  </div>
+                  <div className="sai-integ-section-divider"></div>
+                  <div className="sai-integ-section-label">Active Branch</div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1,fontFamily:'monospace',fontSize:'11px'}}>feat/landing-page</span>
+                    <span className="sai-integ-meta">2 commits ahead</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* LINEAR INTEGRATION */}
+      <section className="sai-section" style={{background:'var(--bg2)'}}>
+        <div className="sai-container">
+          <div className="sai-integ-grid reverse">
+            <div>
+              <div className="sai-integ-logo-badge">
+                <svg width="20" height="20" viewBox="0 0 100 100" fill="none"><circle cx="50" cy="50" r="50" fill="#5E6AD2"/><path d="M17.55 64.64L35.36 82.45a34.43 34.43 0 01-17.81-17.81zm-3.36-8.97l30.14 30.14a34.5 34.5 0 01-9.99-3.35L17.9 64.12a34.49 34.49 0 01-3.71-8.45zM82.45 35.36L64.64 17.55a34.43 34.43 0 0117.81 17.81zm3.36 8.97L55.67 14.19a34.5 34.5 0 019.99 3.35l18.44 18.44a34.49 34.49 0 013.71 8.45zM80.52 75.17L24.83 19.48A34.5 34.5 0 0150 15.5c18.78 0 34 15.22 34 34a34.4 34.4 0 01-3.48 15.67zm-5.69 5.35A34.5 34.5 0 0150 84.5c-18.78 0-34-15.22-34-34a34.4 34.4 0 013.48-15.67L74.83 80.52z" fill="white"/></svg>
+                Linear Integration
+              </div>
+              <div className="sai-section-label">Issue Tracking</div>
+              <h2 className="sai-section-title">Issues linked.<br/>Progress tracked.</h2>
+              <p className="sai-section-sub">SurgicalAI connects code changes directly to Linear issues. When the Surgeon applies a fix, the linked ticket moves. No manual status updates.</p>
+              <div className="sai-integ-bullets">
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">🎫</div>
+                  <div>
+                    <h4>Issue-linked edits</h4>
+                    <p>Mention a Linear ticket in your prompt and SurgicalAI attaches the code change to that issue automatically.</p>
+                  </div>
+                </div>
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">🔄</div>
+                  <div>
+                    <h4>Auto status updates</h4>
+                    <p>When QA passes and a change is committed, the linked Linear issue moves from In Progress → In Review — no click required.</p>
+                  </div>
+                </div>
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">🗂</div>
+                  <div>
+                    <h4>Ticket-to-code tracing</h4>
+                    <p>Every surgical operation is logged against the ticket. Reviewers see exactly which lines changed and why.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div>
+              <div className="sai-integ-mockup">
+                <div className="sai-integ-titlebar">
+                  <div className="sai-dot sai-dot-r"></div>
+                  <div className="sai-dot sai-dot-y"></div>
+                  <div className="sai-dot sai-dot-g"></div>
+                  <span className="sai-integ-tbtitle">Linear — SurgicalAI Sprint</span>
+                </div>
+                <div className="sai-integ-body">
+                  <div className="sai-integ-section-label">In Progress</div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot blue"></div>
+                    <span style={{flex:1}}>SAI-42 · QA TS hard-fail + auto-heal</span>
+                    <span className="sai-integ-badge-sm inprog">In Progress</span>
+                  </div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot blue"></div>
+                    <span style={{flex:1}}>SAI-43 · Surgeon SEARCH mismatch ValueError</span>
+                    <span className="sai-integ-badge-sm inprog">In Progress</span>
+                  </div>
+                  <div className="sai-integ-section-divider"></div>
+                  <div className="sai-integ-section-label">In Review</div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot amber"></div>
+                    <span style={{flex:1}}>SAI-38 · AsyncAnthropic 32K stream fix</span>
+                    <span className="sai-integ-badge-sm review">In Review</span>
+                  </div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot amber"></div>
+                    <span style={{flex:1}}>SAI-35 · Routing threshold 250 lines</span>
+                    <span className="sai-integ-badge-sm review">In Review</span>
+                  </div>
+                  <div className="sai-integ-section-divider"></div>
+                  <div className="sai-integ-section-label">Done</div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>SAI-32 · Claude Surgeon model routing</span>
+                    <span className="sai-integ-badge-sm done">Done</span>
+                  </div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>SAI-28 · Remove DELETE fast-path</span>
+                    <span className="sai-integ-badge-sm done">Done</span>
+                  </div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot gray"></div>
+                    <span style={{flex:1}}>SAI-27 · MermaidDiagram removal</span>
+                    <span className="sai-integ-badge-sm done">Done</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       {/* COMPARE */}
-      <section id="compare" className="sai-section" style={{paddingBottom:'100px'}}>
+      <section id="compare" className="sai-section">
         <div className="sai-container">
           <div className="sai-section-label" style={{marginBottom:'16px'}}>vs The alternatives</div>
           <h2 className="sai-section-title" style={{marginBottom:'12px'}}>What makes this different</h2>
@@ -615,7 +897,7 @@ export function LandingPage() {
                 <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>No QA step</strong> — TypeScript errors discovered at runtime</p></div>
                 <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>Single model</strong> — planning and editing collapsed into one role</p></div>
                 <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>No auto-heal</strong> — failed edits require manual retry</p></div>
-                <div className="sai-compare-item"><span className="chk partial">~</span><p><strong>Streaming</strong> — some tools stream, some don't</p></div>
+                <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>No integrations</strong> — no GitHub PR, no Linear ticket sync</p></div>
               </div>
             </div>
             <div className="sai-compare-card ours">
@@ -625,10 +907,77 @@ export function LandingPage() {
                 <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>TypeScript QA on every change</strong> — hard fail, not silent pass</p></div>
                 <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>Architect + Surgeon</strong> — dedicated roles, clear separation</p></div>
                 <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>3× auto-heal</strong> — Claude re-reads errors and retries automatically</p></div>
-                <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>Always streaming</strong> — plan, route, operate, QA — all live</p></div>
+                <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>GitHub + Linear</strong> — branch-aware, PR creation, ticket sync</p></div>
               </div>
             </div>
           </div>
+        </div>
+      </section>
+
+      {/* PRICING */}
+      <section id="pricing" className="sai-section" style={{background:'var(--bg2)'}}>
+        <div className="sai-container">
+          <div style={{textAlign:'center',marginBottom:'64px'}}>
+            <div className="sai-section-label">Pricing</div>
+            <h2 className="sai-section-title">Simple, transparent pricing</h2>
+            <p style={{fontSize:'16px',color:'var(--txt2)',maxWidth:'480px',margin:'0 auto',lineHeight:'1.7'}}>
+              Two tiers aligned with Claude's model capabilities. Upgrade anytime — your files and sessions stay intact.
+            </p>
+          </div>
+          {/* Stripe wiring: add onClick={() => stripeCheckout(priceId)} to buttons below */}
+          <div className="sai-pricing-grid">
+
+            {/* STARTER */}
+            <div className="sai-pricing-card">
+              <div className="sai-pricing-top">
+                <div className="sai-pricing-tier">Starter</div>
+                <div className="sai-pricing-price">
+                  <sup>$</sup>100<sub>/mo</sub>
+                </div>
+                <p className="sai-pricing-desc">For individual developers and small teams getting started with AI-assisted editing.</p>
+                <div className="sai-pricing-model sonnet">⚡ Claude Sonnet — Architect + Surgeon</div>
+              </div>
+              <div className="sai-pricing-divider"></div>
+              <div className="sai-pricing-features">
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>Claude Sonnet</strong> for both Architect and Surgeon roles</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>GitHub integration</strong> — branch-aware edits, PR creation</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>Up to 5 files</strong> per session</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>SEARCH/REPLACE</strong> precision editing</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>QA auto-heal</strong> — 1 retry attempt on TS error</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>Real-time streaming</strong> — all pipeline stages</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>Standard support</strong></p></div>
+                {/* Stripe: data-stripe-price-id="price_starter_monthly" */}
+                <a href="/login" className="sai-pricing-cta starter-btn">Get Started</a>
+              </div>
+            </div>
+
+            {/* PRO */}
+            <div className="sai-pricing-card featured">
+              <div className="sai-pricing-top">
+                <div className="sai-pricing-popular">Most Powerful</div>
+                <div className="sai-pricing-tier" style={{color:'var(--accent)'}}>Pro</div>
+                <div className="sai-pricing-price">
+                  <sup>$</sup>200<sub>/mo</sub>
+                </div>
+                <p className="sai-pricing-desc">For teams shipping fast. Maximum intelligence, unlimited scale, priority everything.</p>
+                <div className="sai-pricing-model opus">🏛 Claude Opus — Architect + Surgeon</div>
+              </div>
+              <div className="sai-pricing-divider"></div>
+              <div className="sai-pricing-features">
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>Claude Opus</strong> — Anthropic's most intelligent model for both roles</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>GitHub + Linear</strong> — full integration suite</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>Unlimited files</strong> per session</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>SEARCH/REPLACE + 32K direct rewrite</strong> for large files</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>QA auto-heal</strong> — 3 retry attempts, fresh error + live file each time</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>Priority queue</strong> at peak Anthropic traffic times</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>Priority support</strong> — dedicated response SLA</p></div>
+                {/* Stripe: data-stripe-price-id="price_pro_monthly" */}
+                <a href="/login" className="sai-pricing-cta pro-btn">Get Pro</a>
+              </div>
+            </div>
+
+          </div>
+          <p className="sai-pricing-note">Prices shown exclude applicable tax. Both plans billed monthly. Cancel anytime.</p>
         </div>
       </section>
 
@@ -665,6 +1014,8 @@ export function LandingPage() {
         <div className="sai-footer-links">
           <a href="#how-it-works">How it works</a>
           <a href="#features">Features</a>
+          <a href="#integrations">Integrations</a>
+          <a href="#pricing">Pricing</a>
           <a href="#compare">Compare</a>
           <a href="#contact">Contact</a>
         </div>
