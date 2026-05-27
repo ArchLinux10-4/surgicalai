@@ -1,0 +1,675 @@
+/**
+ * LandingPage — SurgicalAI public marketing homepage
+ * Shown at "/" for unauthenticated users.
+ * Pure CSS — no JS interactions, works on all devices.
+ */
+import { useEffect } from 'react';
+import LoginIcon from '@mui/icons-material/Login';
+
+const CSS = `
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#ffffff;
+  --bg2:#f6f7fb;
+  --bg3:#eef0f7;
+  --surface:#e8ebf5;
+  --border:#e2e5ef;
+  --border2:#d4d8e8;
+  --accent:#6d5ce6;
+  --accent2:#7c6af7;
+  --green:#0fa876;
+  --red:#dc2626;
+  --amber:#d97706;
+  --txt:#0e0e1a;
+  --txt2:#4a4a6a;
+  --txt3:#8888a8;
+  --radius:12px;
+  --font:'Inter',-apple-system,BlinkMacSystemFont,sans-serif;
+  --e-bg:#0d0d17;
+  --e-bg2:#111120;
+  --e-bg3:#161628;
+  --e-border:#ffffff10;
+  --e-txt:#e0e0f0;
+  --e-txt2:#7070a0;
+  --e-txt3:#404060;
+}
+html{scroll-behavior:smooth}
+
+/* NAV */
+.sai-nav{
+  position:fixed;top:0;left:0;right:0;z-index:100;
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 48px;height:64px;
+  background:rgba(255,255,255,0.88);
+  backdrop-filter:blur(16px);
+  border-bottom:1px solid var(--border);
+}
+.sai-nav-logo{display:flex;align-items:center;gap:10px;font-size:18px;font-weight:700;letter-spacing:-0.3px;text-decoration:none;color:var(--txt)}
+.sai-nav-logo svg{width:28px;height:28px}
+.sai-nav-links{display:flex;gap:32px;list-style:none}
+.sai-nav-links a{color:var(--txt2);text-decoration:none;font-size:14px;transition:color .2s}
+.sai-nav-links a:hover{color:var(--txt)}
+.sai-nav-cta{
+  background:var(--accent);color:#fff;border:none;
+  padding:9px 20px;border-radius:8px;font-size:14px;font-weight:600;
+  cursor:pointer;text-decoration:none;transition:opacity .2s;
+  display:inline-flex;align-items:center;gap:6px;
+}
+.sai-nav-cta:hover{opacity:.85}
+
+/* HERO */
+.sai-hero{
+  min-height:100vh;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+  padding:100px 24px 80px;
+  text-align:center;
+  position:relative;overflow:hidden;
+  background:linear-gradient(180deg,#f0effe 0%,#ffffff 55%);
+}
+.sai-hero-glow{
+  position:absolute;top:-100px;left:50%;transform:translateX(-50%);
+  width:900px;height:600px;
+  background:radial-gradient(ellipse at center,rgba(124,106,247,.13) 0%,transparent 65%);
+  pointer-events:none;
+}
+.sai-hero-badge{
+  display:inline-flex;align-items:center;gap:8px;
+  background:rgba(109,92,230,.1);border:1px solid rgba(109,92,230,.25);
+  border-radius:999px;padding:6px 16px;font-size:12px;font-weight:600;
+  color:var(--accent);letter-spacing:.5px;text-transform:uppercase;margin-bottom:28px;
+}
+.sai-hero-badge-dot{width:6px;height:6px;border-radius:50%;background:var(--accent);animation:sai-pulse 2s infinite}
+@keyframes sai-pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.sai-h1{
+  font-size:clamp(40px,6vw,80px);font-weight:800;letter-spacing:-2px;line-height:1.05;
+  max-width:900px;margin-bottom:24px;color:var(--txt);
+}
+.sai-h1 span{
+  background:linear-gradient(135deg,#6d5ce6,#7c6af7,#0fa876);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
+}
+.sai-hero-sub{font-size:clamp(16px,2vw,20px);color:var(--txt2);max-width:560px;margin:0 auto 48px;line-height:1.7}
+.sai-hero-actions{display:flex;gap:16px;justify-content:center;flex-wrap:wrap;margin-bottom:64px}
+.sai-btn-primary{
+  background:var(--accent);color:#fff;padding:14px 32px;border-radius:10px;
+  font-size:15px;font-weight:700;text-decoration:none;transition:transform .2s,opacity .2s;
+  display:inline-flex;align-items:center;gap:8px;
+}
+.sai-btn-primary:hover{opacity:.9;transform:translateY(-1px)}
+.sai-btn-secondary{
+  background:#fff;color:var(--txt);padding:14px 32px;border-radius:10px;
+  font-size:15px;font-weight:600;text-decoration:none;border:1.5px solid var(--border2);
+  transition:border-color .2s,background .2s;
+}
+.sai-btn-secondary:hover{border-color:var(--accent2);background:rgba(109,92,230,.04)}
+
+/* MOCKUP */
+.sai-hero-mockup{
+  width:100%;max-width:1100px;margin:0 auto;
+  background:var(--e-bg2);border:1px solid rgba(255,255,255,.1);border-radius:16px;
+  overflow:hidden;
+  box-shadow:0 4px 6px rgba(0,0,0,.06),0 12px 40px rgba(0,0,0,.12),0 40px 100px rgba(109,92,230,.15),0 0 0 1px rgba(255,255,255,.08);
+}
+.sai-mockup-titlebar{
+  height:40px;background:var(--e-bg3);border-bottom:1px solid var(--e-border);
+  display:flex;align-items:center;padding:0 16px;gap:8px;
+}
+.sai-dot{width:12px;height:12px;border-radius:50%}
+.sai-dot-r{background:#ff5f57}.sai-dot-y{background:#febc2e}.sai-dot-g{background:#28c840}
+.sai-titlebar-text{margin-left:12px;font-size:12px;color:var(--e-txt2);font-weight:500}
+.sai-mockup-body{display:grid;grid-template-columns:220px 1fr 300px;min-height:500px}
+.sai-mock-sidebar{background:var(--e-bg3);border-right:1px solid var(--e-border);padding:16px 0}
+.sai-sidebar-section{padding:8px 16px;font-size:10px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:var(--e-txt3);margin-bottom:4px}
+.sai-mock-file{display:flex;align-items:center;gap:8px;padding:6px 16px;font-size:12px;color:var(--e-txt2)}
+.sai-mock-file.active{background:rgba(124,106,247,.1);color:var(--e-txt)}
+.sai-mock-file.active .sai-file-icon{opacity:1;color:#a78bfa}
+.sai-file-icon{width:14px;height:14px;opacity:.5;flex-shrink:0}
+.sai-mock-editor{background:var(--e-bg2);position:relative;overflow:hidden;display:flex;flex-direction:column}
+.sai-editor-tabs{height:36px;background:var(--e-bg3);border-bottom:1px solid var(--e-border);display:flex;align-items:flex-end;padding:0 12px}
+.sai-mock-tab{font-size:12px;padding:6px 14px;color:var(--e-txt3);border-radius:6px 6px 0 0;border:1px solid transparent;border-bottom:none}
+.sai-mock-tab.active{background:var(--e-bg2);color:var(--e-txt);border-color:var(--e-border);border-bottom-color:var(--e-bg2)}
+.sai-mock-code{flex:1;padding:16px;font-family:'Fira Code','Cascadia Code',monospace;font-size:12px;line-height:1.7;overflow:hidden}
+.sai-line{display:flex;gap:12px;min-height:20px}
+.sai-ln{color:var(--e-txt3);width:24px;text-align:right;flex-shrink:0;user-select:none;font-size:11px}
+.sai-ct{white-space:pre;color:var(--e-txt)}
+.sai-kw{color:#a78bfa}.sai-fn{color:#60a5fa}.sai-str{color:#34d399}.sai-cm{color:#4b6080}.sai-ty{color:#fbbf24}.sai-op{color:#7090b0}
+.sai-line.del{background:rgba(248,113,113,.08);border-left:2px solid rgba(248,113,113,.4)}
+.sai-line.add{background:rgba(15,168,118,.08);border-left:2px solid rgba(15,168,118,.4)}
+.sai-line.del .sai-ct{color:rgba(248,113,113,.85)}
+.sai-line.add .sai-ct{color:rgba(52,211,153,.9)}
+@keyframes sai-fade-in{from{opacity:0;transform:translateX(-6px)}to{opacity:1;transform:none}}
+.sai-line.del{animation:sai-fade-in .4s ease both}
+.sai-line.add{animation:sai-fade-in .4s ease .25s both}
+.sai-mock-panel{background:var(--e-bg3);border-left:1px solid var(--e-border);display:flex;flex-direction:column}
+.sai-panel-header{height:36px;border-bottom:1px solid var(--e-border);display:flex;align-items:center;padding:0 14px;gap:8px;font-size:12px;font-weight:600;color:var(--e-txt2)}
+.sai-panel-badge{font-size:10px;padding:2px 8px;border-radius:999px;font-weight:700;letter-spacing:.3px}
+.sai-badge-arch{background:rgba(124,106,247,.25);color:#a78bfa}
+.sai-badge-surg{background:rgba(15,168,118,.2);color:#34d399}
+.sai-mock-messages{flex:1;padding:12px;overflow:hidden;display:flex;flex-direction:column;gap:10px}
+.sai-msg{font-size:12px;line-height:1.5;padding:10px 12px;border-radius:10px;max-width:100%}
+.sai-msg-user{background:rgba(124,106,247,.15);border:1px solid rgba(124,106,247,.25);color:var(--e-txt);align-self:flex-end}
+.sai-msg-arch{background:rgba(255,255,255,.04);border:1px solid var(--e-border);color:var(--e-txt2)}
+.sai-msg-step{display:flex;align-items:flex-start;gap:8px;padding:8px 10px;background:rgba(15,168,118,.07);border:1px solid rgba(15,168,118,.2);border-radius:8px}
+.sai-step-icon{font-size:14px;margin-top:1px;flex-shrink:0}
+.sai-step-text{font-size:11px;color:var(--e-txt2)}
+.sai-step-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:#34d399;display:block;margin-bottom:2px}
+@keyframes sai-dot-bounce{0%,80%,100%{transform:translateY(0)}40%{transform:translateY(-5px)}}
+@keyframes sai-blink{0%,100%{opacity:1}50%{opacity:0}}
+.sai-cursor-blink{display:inline-block;width:2px;height:13px;background:#a78bfa;vertical-align:middle;animation:sai-blink 1s step-end infinite}
+.sai-mock-input-bar{padding:10px 12px;border-top:1px solid var(--e-border);display:flex;gap:8px;align-items:center}
+.sai-mock-input{flex:1;background:rgba(255,255,255,.06);border:1px solid var(--e-border);border-radius:7px;padding:7px 10px;font-size:11px;color:var(--e-txt3);font-family:inherit}
+@keyframes sai-type-in{from{clip-path:inset(0 100% 0 0)}to{clip-path:inset(0 0% 0 0)}}
+.sai-typed{animation:sai-type-in 1.2s steps(30) 1s both}
+.sai-typed2{animation:sai-type-in 1s steps(25) 2.5s both}
+.sai-typed3{animation:sai-type-in .8s steps(20) 4s both}
+
+/* SECTION SHARED */
+.sai-section{padding:100px 24px}
+.sai-container{max-width:1100px;margin:0 auto}
+.sai-section-label{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--accent);margin-bottom:16px}
+.sai-section-title{font-size:clamp(28px,4vw,48px);font-weight:800;letter-spacing:-1px;line-height:1.1;margin-bottom:20px;color:var(--txt)}
+.sai-section-sub{font-size:16px;color:var(--txt2);max-width:560px;line-height:1.7}
+
+/* STATS */
+.sai-stats-strip{
+  display:grid;grid-template-columns:repeat(4,1fr);gap:0;
+  border:1.5px solid var(--border2);border-radius:16px;overflow:hidden;
+  background:#fff;box-shadow:0 2px 12px rgba(0,0,0,.05);
+}
+.sai-stat{padding:36px 28px;text-align:center;border-right:1px solid var(--border)}
+.sai-stat:last-child{border-right:none}
+.sai-stat-num{font-size:42px;font-weight:800;letter-spacing:-2px;color:var(--txt);line-height:1}
+.sai-stat-num span{color:var(--accent)}
+.sai-stat-label{font-size:13px;color:var(--txt2);margin-top:8px}
+
+/* PIPELINE */
+.sai-pipeline-grid{display:grid;grid-template-columns:1fr 1fr;gap:60px;align-items:center}
+.sai-pipeline-steps{display:flex;flex-direction:column;gap:0}
+.sai-pipe-step{display:flex;gap:20px;padding:24px 0;border-bottom:1px solid var(--border)}
+.sai-pipe-step:last-child{border-bottom:none}
+.sai-pipe-step-num{
+  width:36px;height:36px;border-radius:10px;flex-shrink:0;margin-top:2px;
+  background:rgba(109,92,230,.1);border:1.5px solid rgba(109,92,230,.25);
+  display:flex;align-items:center;justify-content:center;
+  font-size:13px;font-weight:800;color:var(--accent);
+}
+.sai-pipe-step h3{font-size:16px;font-weight:700;margin-bottom:6px;color:var(--txt)}
+.sai-pipe-step p{font-size:14px;color:var(--txt2);line-height:1.6}
+.sai-pipe-tag{display:inline-block;font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;padding:3px 8px;border-radius:5px;margin-top:8px}
+.sai-tag-arch{background:rgba(109,92,230,.1);color:var(--accent)}
+.sai-tag-surg{background:rgba(15,168,118,.1);color:var(--green)}
+.sai-tag-qa{background:rgba(217,119,6,.1);color:var(--amber)}
+.sai-pipeline-visual{position:relative}
+.sai-pipe-card{
+  background:#fff;border:1.5px solid var(--border2);border-radius:14px;
+  padding:20px;margin-bottom:12px;position:relative;overflow:hidden;
+  box-shadow:0 2px 8px rgba(0,0,0,.04);
+}
+.sai-pipe-card::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(to bottom,var(--accent),var(--green))}
+.sai-pipe-card-label{font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--txt3);margin-bottom:8px}
+.sai-pipe-card-title{font-size:14px;font-weight:700;color:var(--txt);margin-bottom:4px}
+.sai-pipe-card-desc{font-size:12px;color:var(--txt2);line-height:1.5}
+.sai-pipe-connector{width:2px;height:16px;background:linear-gradient(to bottom,var(--accent),var(--green));margin:0 auto;opacity:.3}
+
+/* FEATURES */
+.sai-features-grid{
+  display:grid;grid-template-columns:repeat(3,1fr);gap:1px;
+  background:var(--border);border-radius:16px;overflow:hidden;border:1.5px solid var(--border2);
+}
+.sai-feat-card{background:#fff;padding:32px 28px;transition:background .2s}
+.sai-feat-card:hover{background:var(--bg2)}
+.sai-feat-icon{
+  width:44px;height:44px;border-radius:12px;
+  background:rgba(109,92,230,.08);border:1.5px solid rgba(109,92,230,.18);
+  display:flex;align-items:center;justify-content:center;
+  font-size:20px;margin-bottom:18px;
+}
+.sai-feat-card h3{font-size:16px;font-weight:700;margin-bottom:8px;color:var(--txt)}
+.sai-feat-card p{font-size:14px;color:var(--txt2);line-height:1.6}
+
+/* DIFF */
+.sai-diff-section{background:var(--e-bg2);border-radius:16px;border:1px solid rgba(255,255,255,.08);overflow:hidden;box-shadow:0 8px 32px rgba(0,0,0,.12)}
+.sai-diff-header{padding:14px 20px;background:var(--e-bg3);border-bottom:1px solid var(--e-border);display:flex;align-items:center;gap:12px;font-size:13px;font-weight:600}
+.sai-diff-filename{color:var(--e-txt);font-family:monospace}
+.sai-diff-badge{font-size:11px;padding:3px 10px;border-radius:6px;font-weight:700}
+.sai-diff-badge.surg{background:rgba(15,168,118,.15);color:#34d399}
+.sai-diff-body{padding:20px;font-family:'Fira Code',monospace;font-size:13px;line-height:1.8}
+.sai-diff-line{display:flex;gap:14px;padding:1px 8px;border-radius:4px}
+.sai-diff-line.minus{background:rgba(248,113,113,.08)}
+.sai-diff-line.plus{background:rgba(15,168,118,.08)}
+.sai-diff-sign{width:16px;flex-shrink:0;font-weight:700}
+.sai-diff-sign.m{color:#f87171}.sai-diff-sign.p{color:#34d399}.sai-diff-sign.n{color:var(--e-txt3)}
+.sai-diff-code{color:var(--e-txt)}
+.sai-diff-line.minus .sai-diff-code{color:rgba(248,113,113,.85)}
+.sai-diff-line.plus .sai-diff-code{color:rgba(52,211,153,.9)}
+
+/* COMPARE */
+.sai-compare-grid{display:grid;grid-template-columns:1fr 1fr;gap:32px}
+.sai-compare-card{background:#fff;border:1.5px solid var(--border2);border-radius:16px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.04)}
+.sai-compare-card.ours{border-color:rgba(109,92,230,.4);box-shadow:0 4px 24px rgba(109,92,230,.12)}
+.sai-compare-header{padding:16px 24px;background:var(--bg2);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px}
+.sai-compare-header h3{font-size:15px;font-weight:700;color:var(--txt)}
+.sai-compare-logo{font-size:12px;padding:3px 10px;border-radius:6px;font-weight:700;background:var(--bg3);color:var(--txt2)}
+.sai-compare-logo.ours{background:rgba(109,92,230,.12);color:var(--accent)}
+.sai-compare-list{padding:20px 24px;display:flex;flex-direction:column;gap:12px}
+.sai-compare-item{display:flex;align-items:flex-start;gap:12px;font-size:14px}
+.sai-compare-item .chk{font-size:16px;flex-shrink:0;margin-top:1px}
+.chk.yes{color:var(--green)}.chk.no{color:var(--red)}.chk.partial{color:var(--amber)}
+.sai-compare-item p{color:var(--txt2);line-height:1.5}
+.sai-compare-item strong{color:var(--txt)}
+
+/* CTA */
+.sai-cta-section{text-align:center;padding:100px 24px;background:linear-gradient(180deg,#ffffff 0%,#f0effe 100%)}
+.sai-cta-box{
+  background:#fff;
+  border:1.5px solid rgba(109,92,230,.2);border-radius:24px;padding:80px 40px;
+  max-width:720px;margin:0 auto;position:relative;overflow:hidden;
+  box-shadow:0 8px 40px rgba(109,92,230,.1);
+}
+.sai-cta-box::before{
+  content:'';position:absolute;top:-80px;right:-80px;
+  width:300px;height:300px;border-radius:50%;
+  background:radial-gradient(circle,rgba(109,92,230,.08),transparent 70%);
+  pointer-events:none;
+}
+.sai-cta-box h2{font-size:clamp(28px,4vw,44px);font-weight:800;letter-spacing:-1px;margin-bottom:16px;color:var(--txt)}
+.sai-cta-box p{color:var(--txt2);font-size:16px;max-width:460px;margin:0 auto 40px;line-height:1.7}
+
+/* FOOTER */
+.sai-footer{
+  border-top:1px solid var(--border);padding:48px 48px 40px;
+  display:flex;justify-content:space-between;align-items:center;
+  font-size:13px;color:var(--txt3);background:#fff;
+}
+.sai-footer a{color:var(--txt3);text-decoration:none;transition:color .2s}
+.sai-footer a:hover{color:var(--txt)}
+.sai-footer-links{display:flex;gap:28px}
+
+/* Responsive */
+@media(max-width:900px){
+  .sai-nav{padding:0 20px}
+  .sai-nav-links{display:none}
+  .sai-mockup-body{grid-template-columns:1fr;min-height:auto}
+  .sai-mock-sidebar,.sai-mock-panel{display:none}
+  .sai-stats-strip{grid-template-columns:1fr 1fr}
+  .sai-stat:nth-child(2){border-right:none}
+  .sai-pipeline-grid{grid-template-columns:1fr}
+  .sai-features-grid{grid-template-columns:1fr 1fr}
+  .sai-compare-grid{grid-template-columns:1fr}
+}
+@media(max-width:600px){
+  .sai-features-grid{grid-template-columns:1fr}
+  .sai-stats-strip{grid-template-columns:1fr 1fr}
+  .sai-footer{flex-direction:column;gap:20px;text-align:center}
+}
+`;
+
+export function LandingPage() {
+  useEffect(() => {
+    const s = document.createElement('style');
+    s.id = 'sai-landing-css';
+    s.textContent = CSS;
+    document.head.appendChild(s);
+    const prevOverflow = document.body.style.overflow;
+    const prevBg = document.body.style.background;
+    document.body.style.overflow = 'auto';
+    document.body.style.background = '#ffffff';
+    return () => {
+      s.remove();
+      document.body.style.overflow = prevOverflow;
+      document.body.style.background = prevBg;
+    };
+  }, []);
+
+  return (
+    <>
+      {/* NAV */}
+      <nav className="sai-nav">
+        <a href="#" className="sai-nav-logo">
+          <svg viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <rect width="28" height="28" rx="8" fill="url(#sai-g1)"/>
+            <path d="M8 14 L13 9 L13 19" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
+            <path d="M15 9 L20 14 L15 19" stroke="rgba(255,255,255,0.5)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
+            <defs>
+              <linearGradient id="sai-g1" x1="0" y1="0" x2="28" y2="28" gradientUnits="userSpaceOnUse">
+                <stop stopColor="#6d5ce6"/><stop offset="1" stopColor="#0fa876"/>
+              </linearGradient>
+            </defs>
+          </svg>
+          SurgicalAI
+        </a>
+        <ul className="sai-nav-links">
+          <li><a href="#how-it-works">How it works</a></li>
+          <li><a href="#features">Features</a></li>
+          <li><a href="#compare">Compare</a></li>
+        </ul>
+        <a href="/login" className="sai-nav-cta">
+          <LoginIcon style={{ fontSize: 16 }} />
+          Login
+        </a>
+      </nav>
+
+      {/* HERO */}
+      <section className="sai-hero">
+        <div className="sai-hero-glow"></div>
+        <div className="sai-hero-badge">
+          <span className="sai-hero-badge-dot"></span>
+          Powered by Claude · Architect + Surgeon
+        </div>
+        <h1 className="sai-h1">Code edits with<br/><span>surgical precision</span></h1>
+        <p className="sai-hero-sub">SurgicalAI sends an Architect to plan, a Surgeon to operate, and a QA agent to verify. Zero guessing. Zero silent failures.</p>
+        <div className="sai-hero-actions">
+          <a href="/login" className="sai-btn-primary">
+            <LoginIcon style={{ fontSize: 16 }} />
+            Login to SurgicalAI
+          </a>
+          <a href="#how-it-works" className="sai-btn-secondary">See how it works →</a>
+        </div>
+
+        {/* APP MOCKUP */}
+        <div className="sai-hero-mockup">
+          <div className="sai-mockup-titlebar">
+            <div className="sai-dot sai-dot-r"></div>
+            <div className="sai-dot sai-dot-y"></div>
+            <div className="sai-dot sai-dot-g"></div>
+            <span className="sai-titlebar-text">SurgicalAI — ChatPanel.tsx</span>
+          </div>
+          <div className="sai-mockup-body">
+            {/* Sidebar */}
+            <div className="sai-mock-sidebar">
+              <div className="sai-sidebar-section">Project</div>
+              <div className="sai-mock-file active">
+                <svg className="sai-file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/>
+                </svg>
+                ChatPanel.tsx
+              </div>
+              <div className="sai-mock-file">
+                <svg className="sai-file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/>
+                </svg>
+                pipeline.py
+              </div>
+              <div className="sai-mock-file">
+                <svg className="sai-file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/>
+                </svg>
+                surgical_editor.py
+              </div>
+              <div className="sai-mock-file">
+                <svg className="sai-file-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/>
+                </svg>
+                linter_validator.py
+              </div>
+              <div style={{marginTop:'16px'}}>
+                <div className="sai-sidebar-section">Git</div>
+                <div className="sai-mock-file"><span style={{fontSize:'10px',color:'#34d399',marginRight:'4px'}}>●</span>fix/surgeon-patch</div>
+                <div className="sai-mock-file" style={{color:'#404060'}}><span style={{fontSize:'10px',marginRight:'4px'}}>○</span>main</div>
+              </div>
+            </div>
+
+            {/* Code Editor */}
+            <div className="sai-mock-editor">
+              <div className="sai-editor-tabs">
+                <div className="sai-mock-tab active">ChatPanel.tsx</div>
+                <div className="sai-mock-tab">pipeline.py</div>
+              </div>
+              <div className="sai-mock-code">
+                <div className="sai-line"><span className="sai-ln">47</span><span className="sai-ct"><span className="sai-kw">const</span> <span className="sai-fn">handleSend</span> = <span className="sai-kw">async</span> () =&gt; {'{'}</span></div>
+                <div className="sai-line"><span className="sai-ln">48</span><span className="sai-ct">  <span className="sai-kw">if</span> (!input.trim()) <span className="sai-kw">return</span>;</span></div>
+                <div className="sai-line"><span className="sai-ln">49</span><span className="sai-ct">  <span className="sai-fn">setIsLoading</span>(<span className="sai-kw">true</span>);</span></div>
+                <div className="sai-line del"><span className="sai-ln">50</span><span className="sai-ct"><span className="sai-op">-</span>  <span className="sai-kw">const</span> res = <span className="sai-kw">await</span> <span className="sai-fn">fetch</span>(<span className="sai-str">'/api/chat'</span>, {'{'}</span></div>
+                <div className="sai-line del"><span className="sai-ln">51</span><span className="sai-ct"><span className="sai-op">-</span>    method: <span className="sai-str">'POST'</span>, body: input</span></div>
+                <div className="sai-line del"><span className="sai-ln">52</span><span className="sai-ct"><span className="sai-op">-</span>  {'}'});</span></div>
+                <div className="sai-line add"><span className="sai-ln">50</span><span className="sai-ct"><span className="sai-op">+</span>  <span className="sai-kw">const</span> res = <span className="sai-kw">await</span> <span className="sai-fn">streamSurgicalEdit</span>({'{'}</span></div>
+                <div className="sai-line add"><span className="sai-ln">51</span><span className="sai-ct"><span className="sai-op">+</span>    prompt: input, fileIds: sessionFiles</span></div>
+                <div className="sai-line add"><span className="sai-ln">52</span><span className="sai-ct"><span className="sai-op">+</span>  {'}'});</span></div>
+                <div className="sai-line"><span className="sai-ln">53</span><span className="sai-ct">  <span className="sai-kw">const</span> data = <span className="sai-kw">await</span> res.<span className="sai-fn">json</span>();</span></div>
+                <div className="sai-line"><span className="sai-ln">54</span><span className="sai-ct">  <span className="sai-fn">setMessages</span>(prev =&gt; [...prev, data]);</span></div>
+                <div className="sai-line"><span className="sai-ln">55</span><span className="sai-ct">{'}'};</span></div>
+                <div className="sai-line"><span className="sai-ln">56</span><span className="sai-ct"></span></div>
+                <div className="sai-line"><span className="sai-ln">57</span><span className="sai-ct"><span className="sai-cm">{'// Surgeon applied 3 lines · QA passed ✓'}</span></span></div>
+                <div className="sai-line"><span className="sai-ln">58</span><span className="sai-ct"><span className="sai-kw">return</span> (</span></div>
+                <div className="sai-line"><span className="sai-ln">59</span><span className="sai-ct">  &lt;<span className="sai-ty">ChatContainer</span>&gt;</span></div>
+                <div className="sai-line"><span className="sai-ln">60</span><span className="sai-ct">    &lt;<span className="sai-ty">MessageList</span> messages={'{messages}'}/&gt;<span className="sai-cursor-blink"></span></span></div>
+              </div>
+            </div>
+
+            {/* Chat/Pipeline Panel */}
+            <div className="sai-mock-panel">
+              <div className="sai-panel-header">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+                  <circle cx="12" cy="12" r="3"/><path d="M12 1v4M12 19v4M4.22 4.22l2.83 2.83M16.95 16.95l2.83 2.83M1 12h4M19 12h4M4.22 19.78l2.83-2.83M16.95 7.05l2.83-2.83"/>
+                </svg>
+                Pipeline
+                <span className="sai-panel-badge sai-badge-arch">Architect</span>
+              </div>
+              <div className="sai-mock-messages">
+                <div className="sai-msg sai-msg-user sai-typed">Add streaming to handleSend and wire it to the Surgical editor</div>
+                <div className="sai-msg sai-msg-arch sai-typed2">
+                  <strong style={{color:'#e0e0f0',fontSize:'11px',display:'block',marginBottom:'4px'}}>🏛 Architect · Plan</strong>
+                  Small targeted change in ChatPanel.tsx line 50–52. Routing → Surgeon path (focused window).
+                </div>
+                <div className="sai-msg-step sai-typed3">
+                  <span className="sai-step-icon">⚡</span>
+                  <div>
+                    <span className="sai-step-label">Surgeon · SEARCH/REPLACE</span>
+                    <span className="sai-step-text">3 lines replaced · ChatPanel.tsx · confidence 98%</span>
+                  </div>
+                </div>
+                <div className="sai-msg-step" style={{animationDelay:'.5s'}}>
+                  <span className="sai-step-icon">✅</span>
+                  <div>
+                    <span className="sai-step-label" style={{color:'#34d399'}}>QA · TypeScript</span>
+                    <span className="sai-step-text">0 errors · build clean · applied to file</span>
+                  </div>
+                </div>
+              </div>
+              <div className="sai-mock-input-bar">
+                <div className="sai-mock-input">Ask SurgicalAI…</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* STATS */}
+      <section style={{padding:'0 24px 80px'}}>
+        <div className="sai-container">
+          <div className="sai-stats-strip">
+            <div className="sai-stat"><div className="sai-stat-num"><span>2</span></div><div className="sai-stat-label">AI Roles — Architect &amp; Surgeon</div></div>
+            <div className="sai-stat"><div className="sai-stat-num"><span>0</span></div><div className="sai-stat-label">Silent failures — hard errors only</div></div>
+            <div className="sai-stat"><div className="sai-stat-num">32<span>K</span></div><div className="sai-stat-label">Token ceiling for large rewrites</div></div>
+            <div className="sai-stat"><div className="sai-stat-num"><span>3×</span></div><div className="sai-stat-label">Auto-heal retries on TS lint fail</div></div>
+          </div>
+        </div>
+      </section>
+
+      {/* HOW IT WORKS */}
+      <section id="how-it-works" className="sai-section" style={{background:'var(--bg2)'}}>
+        <div className="sai-container">
+          <div className="sai-pipeline-grid">
+            <div>
+              <div className="sai-section-label">How it works</div>
+              <h2 className="sai-section-title">Two agents.<br/>One source of truth.</h2>
+              <p className="sai-section-sub" style={{marginBottom:'48px'}}>Every change passes through a strict four-stage pipeline. No shortcuts, no guessing.</p>
+              <div className="sai-pipeline-steps">
+                <div className="sai-pipe-step">
+                  <div className="sai-pipe-step-num">1</div>
+                  <div>
+                    <h3>Architect plans the change</h3>
+                    <p>Claude reads your request, identifies the exact symbol and line range, and decides whether to route to the Surgeon or trigger a full rewrite.</p>
+                    <span className="sai-pipe-tag sai-tag-arch">Claude — Architect</span>
+                  </div>
+                </div>
+                <div className="sai-pipe-step">
+                  <div className="sai-pipe-step-num">2</div>
+                  <div>
+                    <h3>Size-based routing</h3>
+                    <p>Small, focused changes (&lt;250 lines, 1 region) go to the Surgeon for precise SEARCH/REPLACE. Large multi-region changes go to direct rewrite at 32K tokens.</p>
+                    <span className="sai-pipe-tag sai-tag-surg">Auto-routed</span>
+                  </div>
+                </div>
+                <div className="sai-pipe-step">
+                  <div className="sai-pipe-step-num">3</div>
+                  <div>
+                    <h3>Surgeon applies the operation</h3>
+                    <p>The Surgeon operates on a focused window of the live file — never a stale copy. SEARCH strings are validated before any change is committed.</p>
+                    <span className="sai-pipe-tag sai-tag-surg">Claude — Surgeon</span>
+                  </div>
+                </div>
+                <div className="sai-pipe-step">
+                  <div className="sai-pipe-step-num">4</div>
+                  <div>
+                    <h3>QA auto-heals on failure</h3>
+                    <p>TypeScript is compiled after every change. Any error triggers up to 3 auto-heal attempts — Claude sees the fresh error output and the live file each time.</p>
+                    <span className="sai-pipe-tag sai-tag-qa">QA · Auto-heal</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div className="sai-pipeline-visual">
+              <div className="sai-pipe-card">
+                <div className="sai-pipe-card-label">Step 1 · Architect</div>
+                <div className="sai-pipe-card-title">📋 Analyzing request…</div>
+                <div className="sai-pipe-card-desc">Symbol: <code style={{color:'var(--accent)',fontSize:'12px'}}>handleSend()</code> · File: ChatPanel.tsx · Lines 50–55<br/>Decision: Surgeon path — focused window extracted</div>
+              </div>
+              <div className="sai-pipe-connector"></div>
+              <div className="sai-pipe-card">
+                <div className="sai-pipe-card-label">Step 2 · Routing</div>
+                <div className="sai-pipe-card-title">⚡ Surgeon path selected</div>
+                <div className="sai-pipe-card-desc">Region size: 6 lines · Threshold: 250 lines<br/>Focused window: lines 47–60 passed to Surgeon</div>
+              </div>
+              <div className="sai-pipe-connector"></div>
+              <div className="sai-pipe-card">
+                <div className="sai-pipe-card-label">Step 3 · Surgeon</div>
+                <div className="sai-pipe-card-title">🔬 SEARCH/REPLACE applied</div>
+                <div className="sai-pipe-card-desc">3 lines replaced · SEARCH string validated ✓<br/>File written to disk → session updated</div>
+              </div>
+              <div className="sai-pipe-connector"></div>
+              <div className="sai-pipe-card" style={{borderColor:'rgba(15,168,118,.3)'}}>
+                <div className="sai-pipe-card-label">Step 4 · QA</div>
+                <div className="sai-pipe-card-title" style={{color:'var(--green)'}}>✅ TypeScript: 0 errors</div>
+                <div className="sai-pipe-card-desc">Build clean · Change committed · Stream complete</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* DIFF DEMO */}
+      <section className="sai-section" id="features">
+        <div className="sai-container">
+          <div className="sai-section-label" style={{marginBottom:'16px'}}>Precision editing</div>
+          <h2 className="sai-section-title" style={{marginBottom:'12px'}}>The Surgeon never guesses</h2>
+          <p className="sai-section-sub" style={{marginBottom:'48px'}}>Every SEARCH string is extracted live from the file on disk. If it doesn't match exactly, the operation fails loudly — never silently.</p>
+          <div className="sai-diff-section">
+            <div className="sai-diff-header">
+              <span className="sai-diff-filename">ChatPanel.tsx</span>
+              <span style={{color:'#404060',fontSize:'12px'}}>lines 50–52</span>
+              <span className="sai-diff-badge surg">Surgeon · SEARCH/REPLACE</span>
+            </div>
+            <div className="sai-diff-body">
+              <div className="sai-diff-line"><span className="sai-diff-sign n">·</span><span className="sai-diff-code" style={{color:'#404060'}}>{'  if (!input.trim()) return;'}</span></div>
+              <div className="sai-diff-line"><span className="sai-diff-sign n">·</span><span className="sai-diff-code" style={{color:'#404060'}}>{'  setIsLoading(true);'}</span></div>
+              <div className="sai-diff-line minus"><span className="sai-diff-sign m">−</span><span className="sai-diff-code">{"  const res = await fetch('/api/chat', {"}</span></div>
+              <div className="sai-diff-line minus"><span className="sai-diff-sign m">−</span><span className="sai-diff-code">{'    method: \'POST\', body: input'}</span></div>
+              <div className="sai-diff-line minus"><span className="sai-diff-sign m">−</span><span className="sai-diff-code">{'  });'}</span></div>
+              <div className="sai-diff-line plus"><span className="sai-diff-sign p">+</span><span className="sai-diff-code">{'  const res = await streamSurgicalEdit({'}</span></div>
+              <div className="sai-diff-line plus"><span className="sai-diff-sign p">+</span><span className="sai-diff-code">{'    prompt: input, fileIds: sessionFiles'}</span></div>
+              <div className="sai-diff-line plus"><span className="sai-diff-sign p">+</span><span className="sai-diff-code">{'  });'}</span></div>
+              <div className="sai-diff-line"><span className="sai-diff-sign n">·</span><span className="sai-diff-code" style={{color:'#404060'}}>{'  const data = await res.json();'}</span></div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* FEATURES */}
+      <section className="sai-section" style={{paddingTop:'0',background:'var(--bg2)'}}>
+        <div className="sai-container">
+          <div className="sai-section-label" style={{marginBottom:'16px'}}>Capabilities</div>
+          <h2 className="sai-section-title" style={{marginBottom:'48px'}}>Built for real codebases</h2>
+          <div className="sai-features-grid">
+            <div className="sai-feat-card"><div className="sai-feat-icon">🏛</div><h3>Dual-role AI pipeline</h3><p>The Architect plans and routes. The Surgeon operates. Two models, two jobs, zero role confusion.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">🔬</div><h3>SEARCH/REPLACE precision</h3><p>Changes are applied by finding and replacing exact strings in a focused window — not overwriting entire files.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">⚡</div><h3>Size-based routing</h3><p>Small changes go to the Surgeon. Large multi-region rewrites go direct at 32K tokens. Routing is automatic.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">✅</div><h3>QA with auto-heal</h3><p>TypeScript is compiled after every change. Hard errors trigger up to 3 Claude-powered heal attempts automatically.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">🔁</div><h3>Retry &amp; backoff</h3><p>Anthropic 529 overload errors are retried with exponential backoff — 10s, 20s, 40s — before surfacing a failure.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">📡</div><h3>Real-time streaming</h3><p>Every pipeline stage — plan, route, operate, QA — streams live to the UI. You see the thinking as it happens.</p></div>
+          </div>
+        </div>
+      </section>
+
+      {/* COMPARE */}
+      <section id="compare" className="sai-section" style={{paddingBottom:'100px'}}>
+        <div className="sai-container">
+          <div className="sai-section-label" style={{marginBottom:'16px'}}>vs The alternatives</div>
+          <h2 className="sai-section-title" style={{marginBottom:'12px'}}>What makes this different</h2>
+          <p className="sai-section-sub" style={{marginBottom:'48px'}}>Most AI editors rewrite files blindly. SurgicalAI treats every file like a patient — diagnosed first, operated on second, checked out third.</p>
+          <div className="sai-compare-grid">
+            <div className="sai-compare-card">
+              <div className="sai-compare-header"><h3>Standard AI editors</h3><span className="sai-compare-logo">Generic</span></div>
+              <div className="sai-compare-list">
+                <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>Silent rewrites</strong> — whole file replaced, no diff, no visibility</p></div>
+                <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>No QA step</strong> — TypeScript errors discovered at runtime</p></div>
+                <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>Single model</strong> — planning and editing collapsed into one role</p></div>
+                <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>No auto-heal</strong> — failed edits require manual retry</p></div>
+                <div className="sai-compare-item"><span className="chk partial">~</span><p><strong>Streaming</strong> — some tools stream, some don't</p></div>
+              </div>
+            </div>
+            <div className="sai-compare-card ours">
+              <div className="sai-compare-header"><h3>SurgicalAI</h3><span className="sai-compare-logo ours">SurgicalAI</span></div>
+              <div className="sai-compare-list">
+                <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>SEARCH/REPLACE diffs</strong> — exact lines changed, visible in stream</p></div>
+                <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>TypeScript QA on every change</strong> — hard fail, not silent pass</p></div>
+                <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>Architect + Surgeon</strong> — dedicated roles, clear separation</p></div>
+                <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>3× auto-heal</strong> — Claude re-reads errors and retries automatically</p></div>
+                <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>Always streaming</strong> — plan, route, operate, QA — all live</p></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* CTA */}
+      <section className="sai-cta-section" id="contact">
+        <div className="sai-cta-box">
+          <h2>Ready to operate<br/>on your codebase?</h2>
+          <p>SurgicalAI is currently in private access. Reach out to get your team onboarded.</p>
+          <a href="mailto:777rpm@gmail.com" className="sai-btn-primary" style={{fontSize:'16px',padding:'16px 40px',display:'inline-flex'}}>
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+              <polyline points="22,6 12,13 2,6"/>
+            </svg>
+            Get in Touch
+          </a>
+        </div>
+      </section>
+
+      {/* FOOTER */}
+      <footer className="sai-footer">
+        <div style={{display:'flex',alignItems:'center',gap:'10px',fontSize:'15px',fontWeight:700,color:'var(--txt)'}}>
+          <svg viewBox="0 0 28 28" width="22" height="22" fill="none">
+            <rect width="28" height="28" rx="8" fill="url(#sai-g2)"/>
+            <path d="M8 14 L13 9 L13 19" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
+            <path d="M15 9 L20 14 L15 19" stroke="rgba(255,255,255,0.5)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
+            <defs>
+              <linearGradient id="sai-g2" x1="0" y1="0" x2="28" y2="28" gradientUnits="userSpaceOnUse">
+                <stop stopColor="#6d5ce6"/><stop offset="1" stopColor="#0fa876"/>
+              </linearGradient>
+            </defs>
+          </svg>
+          SurgicalAI
+        </div>
+        <div className="sai-footer-links">
+          <a href="#how-it-works">How it works</a>
+          <a href="#features">Features</a>
+          <a href="#compare">Compare</a>
+          <a href="#contact">Contact</a>
+        </div>
+        <div>© 2026 SurgicalAI. All rights reserved.</div>
+      </footer>
+    </>
+  );
+}
