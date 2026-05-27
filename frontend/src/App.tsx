@@ -6,6 +6,8 @@ import { Toaster } from './components/Toast'
 import { useAppStore } from './stores/appStore'
 import { useAuthStore } from './stores/authStore'
 import { api } from './api/client'
+import { LandingPage } from './pages/LandingPage'
+import { LoginPage } from './pages/LoginPage'
 
 // Detect mobile viewport — the ONLY change to existing App.tsx logic.
 // Desktop (>768px) → Layout (unchanged). Mobile (≤768px) → MobileLayout (new, isolated).
@@ -33,8 +35,6 @@ export default function App() {
   // token lingers in localStorage before the auto-logout 401 fires.
   useEffect(() => {
     if (!isAuthenticated) {
-      // Not logged in — reset "loaded" flag so if user logs back in we re-fetch
-      // fresh settings. Banner is also gated on isAuthenticated so it won't show.
       setSettingsLoaded(false)
       return
     }
@@ -44,6 +44,16 @@ export default function App() {
       .catch(() => setSettingsLoaded(true))
   }, [isAuthenticated])
 
+  // ── Routing for unauthenticated users ──────────────────────────────────────
+  // /login  → LoginPage (terminal design)
+  // /       → LandingPage (marketing homepage)
+  // After login, isAuthenticated becomes true → falls through to authenticated app below
+  if (!isAuthenticated) {
+    if (window.location.pathname === '/login') return <LoginPage />
+    return <LandingPage />
+  }
+
+  // ── Authenticated app ──────────────────────────────────────────────────────
   return (
     <div className="h-screen flex flex-col bg-base text-ink overflow-hidden">
       {isAuthenticated && settingsLoaded && !settings?.openai_api_key_set && !(settings as any)?.anthropic_api_key_set && (
