@@ -304,6 +304,56 @@ html{scroll-behavior:smooth}
   margin-bottom:20px;
 }
 
+/* QA SHOWCASE */
+.sai-qa-section{padding:100px 24px;background:#f4f3ff;position:relative;overflow:hidden}
+.sai-qa-section::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:radial-gradient(ellipse 55% 60% at 80% 40%,rgba(109,92,230,.07) 0%,transparent 70%);pointer-events:none}
+.sai-qa-section::after{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:radial-gradient(ellipse 40% 40% at 15% 90%,rgba(10,168,118,.06) 0%,transparent 65%);pointer-events:none}
+.sai-qa-wrap{max-width:1100px;margin:0 auto;position:relative;z-index:1}
+.sai-qa-head{text-align:center;margin-bottom:72px}
+.sai-qa-pill{display:inline-flex;align-items:center;gap:6px;background:rgba(109,92,230,.1);border:1px solid rgba(109,92,230,.3);color:#6d5ce6;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:6px 16px;border-radius:100px;margin-bottom:24px}
+.sai-qa-pill-dot{width:6px;height:6px;border-radius:50%;background:#6d5ce6;animation:qaPulse 2s ease-in-out infinite}
+@keyframes qaPulse{0%,100%{opacity:1}50%{opacity:.35}}
+.sai-qa-h2{font-size:clamp(36px,5vw,58px);font-weight:800;letter-spacing:-1.5px;line-height:1.08;color:#0f0d1a;margin:0 0 20px}
+.sai-qa-h2 .grad{background:linear-gradient(135deg,#6d5ce6 0%,#0aa876 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.sai-qa-sub{font-size:18px;color:#4b4768;max-width:580px;margin:0 auto;line-height:1.65}
+.sai-qa-body{display:grid;grid-template-columns:380px 1fr;gap:56px;align-items:start;margin-bottom:72px}
+.sai-qa-steps{display:flex;flex-direction:column}
+.sai-qa-step{display:flex;gap:16px;padding:20px 0;position:relative;transition:opacity .3s}
+.sai-qa-step-num{width:38px;height:38px;border-radius:50%;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;letter-spacing:.03em;border:1px solid rgba(109,92,230,.35);background:#fff;color:#6d5ce6;box-shadow:0 2px 8px rgba(109,92,230,.12);transition:all .3s}
+.sai-qa-step.is-pass .sai-qa-step-num{border-color:rgba(10,168,118,.4);background:#fff;color:#0aa876;font-size:16px;box-shadow:0 2px 8px rgba(10,168,118,.15)}
+.sai-qa-step-text strong{display:block;color:#0f0d1a;font-size:15px;margin-bottom:5px;font-weight:600}
+.sai-qa-step-text p{color:#4b4768;font-size:13.5px;margin:0;line-height:1.55}
+.sai-qa-step-text code{background:rgba(109,92,230,.1);color:#6d5ce6;padding:2px 6px;border-radius:4px;font-family:'JetBrains Mono',monospace;font-size:11.5px;border:1px solid rgba(109,92,230,.2)}
+.sai-qa-connector{width:1px;height:20px;background:linear-gradient(to bottom,rgba(109,92,230,.3),rgba(109,92,230,.1));margin-left:18px}
+.sai-qa-step.qa-step-active .sai-qa-step-num{background:linear-gradient(135deg,#6d5ce6,#8b76f0);color:#fff;border-color:#6d5ce6;box-shadow:0 0 0 3px rgba(109,92,230,.18),0 2px 10px rgba(109,92,230,.35);transform:scale(1.08)}
+.sai-qa-step.qa-step-done .sai-qa-step-num{background:linear-gradient(135deg,#0aa876,#34d399);color:#fff;border-color:#0aa876;box-shadow:0 0 0 3px rgba(10,168,118,.18),0 2px 10px rgba(10,168,118,.28)}
+.sai-qa-terminal{background:#1a1333;border:1px solid rgba(109,92,230,.25);border-radius:14px;overflow:hidden;box-shadow:0 24px 64px rgba(109,92,230,.18),0 4px 16px rgba(0,0,0,.12),0 0 0 1px rgba(109,92,230,.08)}
+.sai-term-bar{height:38px;background:#120d24;border-bottom:1px solid rgba(255,255,255,.06);display:flex;align-items:center;padding:0 14px;gap:7px}
+.sai-term-btn{width:12px;height:12px;border-radius:50%;flex-shrink:0}
+.sai-term-btn.r{background:#ff5f57}.sai-term-btn.y{background:#febc2e}.sai-term-btn.g{background:#28c840}
+.sai-term-title{margin-left:10px;font-size:12px;color:rgba(255,255,255,.3);font-weight:500;font-family:'JetBrains Mono',monospace}
+.sai-term-body{padding:18px 20px;min-height:320px;max-height:400px;overflow-y:auto;display:flex;flex-direction:column;gap:3px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:12.5px;line-height:1.6}
+.sai-tl{display:block;white-space:pre-wrap;word-break:break-all}
+.sai-tl.cmd{color:#a78bfa;font-weight:600}
+.sai-tl.ok{color:#34d399}
+.sai-tl.err{color:#f87171}
+.sai-tl.warn{color:#fbbf24}
+.sai-tl.info{color:#60a5fa}
+.sai-tl.dim{color:rgba(255,255,255,.45)}
+.sai-tl.blank{height:6px}
+.sai-tl.divider{height:1px;background:rgba(255,255,255,.08);margin:4px 0}
+.sai-score-fail{display:inline-flex;align-items:center;gap:5px;background:rgba(248,113,113,.15);border:1px solid rgba(248,113,113,.3);color:#f87171;padding:2px 10px;border-radius:6px;font-size:11.5px;font-weight:700}
+.sai-score-pass{display:inline-flex;align-items:center;gap:5px;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.3);color:#34d399;padding:3px 12px;border-radius:6px;font-size:12px;font-weight:700;animation:passGlow 1.8s ease-in-out infinite}
+@keyframes passGlow{0%,100%{box-shadow:0 0 0 0 rgba(52,211,153,0)}50%{box-shadow:0 0 12px 3px rgba(52,211,153,.25)}}
+.qa-cursor{display:inline-block;width:7px;height:13px;background:#a78bfa;vertical-align:middle;margin-left:1px;animation:qaBlinkCursor .7s step-end infinite}
+@keyframes qaBlinkCursor{0%,100%{opacity:1}50%{opacity:0}}
+.sai-qa-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:0;border-top:1px solid rgba(109,92,230,.15);padding-top:56px}
+.sai-qa-stat{text-align:center;padding:0 16px;position:relative}
+.sai-qa-stat+.sai-qa-stat::before{content:'';position:absolute;left:0;top:25%;height:50%;width:1px;background:rgba(109,92,230,.15)}
+.sai-qa-stat-n{display:block;font-size:52px;font-weight:800;letter-spacing:-2px;background:linear-gradient(135deg,#6d5ce6 0%,#0aa876 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;margin-bottom:10px}
+.sai-qa-stat-l{font-size:13.5px;color:#4b4768;line-height:1.4}
+@media(max-width:900px){.sai-qa-body{grid-template-columns:1fr}.sai-qa-stats{grid-template-columns:repeat(2,1fr);gap:32px}.sai-qa-stat+.sai-qa-stat::before{display:none}}
+
 /* COMPARE */
 .sai-compare-grid{display:grid;grid-template-columns:1fr 1fr;gap:32px}
 .sai-compare-card{background:#fff;border:1.5px solid var(--border2);border-radius:16px;overflow:hidden;box-shadow:0 2px 12px rgba(0,0,0,.04)}
@@ -479,6 +529,158 @@ export function LandingPage() {
       document.body.style.overflow = prevOverflow;
       document.body.style.background = prevBg;
     };
+  }, []);
+
+  // QA terminal animation
+  useEffect(() => {
+    const termOrNull = document.getElementById('qaTerm');
+    if (!termOrNull) return;
+    const term: HTMLElement = termOrNull;
+    const stepEls = ['qaStep1','qaStep2','qaStep3','qaStep4'].map(id => document.getElementById(id));
+    let cursor: HTMLElement | null = null;
+    let fired = false;
+
+    function setCursor(el: HTMLElement) {
+      if (cursor && cursor.parentNode) cursor.parentNode.removeChild(cursor);
+      cursor = document.createElement('span');
+      cursor.className = 'qa-cursor';
+      el.appendChild(cursor);
+    }
+    function removeCursor() {
+      if (cursor && cursor.parentNode) cursor.parentNode.removeChild(cursor);
+      cursor = null;
+    }
+    function scroll() { term.scrollTop = term.scrollHeight; }
+    function instant(cls: string, html?: string): HTMLElement {
+      const el = document.createElement('span');
+      el.className = 'sai-tl ' + cls;
+      if (html) el.innerHTML = html;
+      term.appendChild(el);
+      scroll();
+      return el;
+    }
+    function typeIn(cls: string, text: string, speed: number, next: () => void) {
+      removeCursor();
+      const el = document.createElement('span');
+      el.className = 'sai-tl ' + cls;
+      term.appendChild(el);
+      setCursor(el);
+      let i = 0;
+      function step() {
+        if (i < text.length) {
+          el.insertBefore(document.createTextNode(text[i++]), cursor);
+          scroll();
+          setTimeout(step, speed + Math.random() * speed * 0.35);
+        } else { removeCursor(); next(); }
+      }
+      step();
+    }
+    function showDots(label: string, duration: number, next: () => void) {
+      removeCursor();
+      const el = document.createElement('span');
+      el.className = 'sai-tl dim';
+      term.appendChild(el);
+      setCursor(el);
+      let i = 0;
+      const states = [label + ' .', label + ' ..', label + ' ...'];
+      const iv = setInterval(() => { el.textContent = states[i++ % 3]; setCursor(el); scroll(); }, 320);
+      setTimeout(() => { clearInterval(iv); if (el.parentNode) el.parentNode.removeChild(el); removeCursor(); next(); }, duration);
+    }
+    function activateStep(idx: number) {
+      stepEls.forEach(s => s && s.classList.remove('qa-step-active'));
+      if (stepEls[idx]) stepEls[idx]!.classList.add('qa-step-active');
+    }
+    function doneStep(idx: number) {
+      if (stepEls[idx]) { stepEls[idx]!.classList.remove('qa-step-active'); stepEls[idx]!.classList.add('qa-step-done'); }
+    }
+    function wait(ms: number, fn: () => void) { setTimeout(fn, ms); }
+
+    function run() {
+      activateStep(0);
+      typeIn('dim', '▶ Surgical edit applied — 3 lines changed in Dashboard.tsx', 20, () => {
+        doneStep(0); instant('blank');
+        wait(350, () => {
+          activateStep(1);
+          wait(150, () => {
+            typeIn('cmd', '$ tsc --noEmit --strict', 32, () => {
+              wait(180, () => {
+                showDots('Compiling TypeScript', 1500, () => {
+                  instant('err', 'src/components/Dashboard.tsx(142,18): error TS2345:');
+                  wait(140, () => {
+                    instant('err', '\u00a0\u00a0Argument of type \u2018string | undefined\u2019 is not');
+                    wait(110, () => {
+                      instant('err', '\u00a0\u00a0assignable to parameter of type \u2018string\u2019.');
+                      wait(220, () => {
+                        instant('err', 'src/components/Dashboard.tsx(156,9): error TS2322:');
+                        wait(140, () => {
+                          instant('err', '\u00a0\u00a0Type \u2018number\u2019 is not assignable to type \u2018string\u2019.');
+                          wait(320, () => {
+                            const warn = instant('warn', 'Found 2 errors.\u00a0\u00a0');
+                            const badge = document.createElement('span');
+                            badge.className = 'sai-score-fail';
+                            badge.textContent = '❌ QA Score: 2 / 10';
+                            warn.appendChild(badge); scroll();
+                            doneStep(1);
+                            wait(550, () => {
+                              instant('blank'); instant('divider');
+                              wait(380, () => {
+                                activateStep(2);
+                                wait(120, () => {
+                                  instant('info', '↻ Auto-heal attempt 1 / 3');
+                                  wait(280, () => {
+                                    typeIn('dim', '  Sending 2 errors + full file to Claude Surgeon...', 17, () => {
+                                      wait(380, () => {
+                                        typeIn('dim', '  Claude: root cause → null guard + implicit coercion', 17, () => {
+                                          wait(280, () => {
+                                            instant('dim', '  Patch applied. Re-running tsc...');
+                                            instant('blank');
+                                            doneStep(2);
+                                            wait(550, () => {
+                                              activateStep(3);
+                                              wait(120, () => {
+                                                typeIn('cmd', '$ tsc --noEmit --strict', 32, () => {
+                                                  wait(180, () => {
+                                                    showDots('Compiling TypeScript', 1100, () => {
+                                                      instant('ok', '✓\u00a0\u00a00 errors\u00a0\u00a0·\u00a0\u00a00 warnings');
+                                                      wait(420, () => {
+                                                        const passLine = instant('ok', '');
+                                                        const badge2 = document.createElement('span');
+                                                        badge2.className = 'sai-score-pass';
+                                                        badge2.textContent = '✦ QA PASS · Score: 9.4 / 10 · Attempt 1 of 3';
+                                                        passLine.appendChild(badge2); scroll();
+                                                        doneStep(3);
+                                                      });
+                                                    });
+                                                  });
+                                                });
+                                              });
+                                            });
+                                          });
+                                        });
+                                      });
+                                    });
+                                  });
+                                });
+                              });
+                            });
+                          });
+                        });
+                      });
+                    });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    }
+
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => { if (e.isIntersecting && !fired) { fired = true; obs.disconnect(); run(); } });
+    }, { threshold: 0.25 });
+    obs.observe(term);
+    return () => obs.disconnect();
   }, []);
 
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
@@ -782,6 +984,67 @@ export function LandingPage() {
             <div className="sai-feat-card"><div className="sai-feat-icon">✅</div><h3>QA with auto-heal</h3><p>TypeScript is compiled after every change. Hard errors trigger up to 3 Claude-powered heal attempts automatically.</p></div>
             <div className="sai-feat-card"><div className="sai-feat-icon">🔁</div><h3>Retry &amp; backoff</h3><p>Anthropic 529 overload errors are retried with exponential backoff — 10s, 20s, 40s — before surfacing a failure.</p></div>
             <div className="sai-feat-card"><div className="sai-feat-icon">📡</div><h3>Real-time streaming</h3><p>Every pipeline stage — plan, route, operate, QA — streams live to the UI. You see the thinking as it happens.</p></div>
+          </div>
+        </div>
+      </section>
+
+      {/* QA SHOWCASE */}
+      <section className="sai-qa-section" id="qa">
+        <div className="sai-qa-wrap">
+          <div className="sai-qa-head">
+            <div className="sai-qa-pill"><span className="sai-qa-pill-dot"></span>Zero-Defect Engine</div>
+            <h2 className="sai-qa-h2">QA that <span className="grad">actually bites</span></h2>
+            <p className="sai-qa-sub">Every surgical edit is TypeScript-compiled, scored out of 10, and automatically healed by Claude — before a single line touches your repo.</p>
+          </div>
+          <div className="sai-qa-body">
+            <div className="sai-qa-steps">
+              <div className="sai-qa-step" id="qaStep1">
+                <div className="sai-qa-step-num">01</div>
+                <div className="sai-qa-step-text">
+                  <strong>Surgeon applies the edit</strong>
+                  <p>SEARCH/REPLACE lands on the exact region — no full-file overwrite. Focused window only.</p>
+                </div>
+              </div>
+              <div className="sai-qa-connector"></div>
+              <div className="sai-qa-step" id="qaStep2">
+                <div className="sai-qa-step-num">02</div>
+                <div className="sai-qa-step-text">
+                  <strong>TypeScript audit fires immediately</strong>
+                  <p>tsc runs with <code>--noEmit --strict</code>. Any <code>error TS####</code> line hard-fails the score to ≤ 3 — no exceptions.</p>
+                </div>
+              </div>
+              <div className="sai-qa-connector"></div>
+              <div className="sai-qa-step" id="qaStep3">
+                <div className="sai-qa-step-num">03</div>
+                <div className="sai-qa-step-text">
+                  <strong>Auto-heal loop kicks in</strong>
+                  <p>Claude receives every raw error + the full live file. Up to 3 retry attempts, each with a fresh tsc run.</p>
+                </div>
+              </div>
+              <div className="sai-qa-connector"></div>
+              <div className="sai-qa-step is-pass" id="qaStep4">
+                <div className="sai-qa-step-num">✓</div>
+                <div className="sai-qa-step-text">
+                  <strong>Clean pass — or hard stop</strong>
+                  <p>Zero errors → score 9+ → change committed. Still failing after 3 heals? Pipeline halts and tells you exactly why.</p>
+                </div>
+              </div>
+            </div>
+            <div className="sai-qa-terminal" id="qaTerminal">
+              <div className="sai-term-bar">
+                <span className="sai-term-btn r"></span>
+                <span className="sai-term-btn y"></span>
+                <span className="sai-term-btn g"></span>
+                <span className="sai-term-title">surgicalai — QA Audit · Dashboard.tsx</span>
+              </div>
+              <div className="sai-term-body" id="qaTerm"></div>
+            </div>
+          </div>
+          <div className="sai-qa-stats">
+            <div className="sai-qa-stat"><span className="sai-qa-stat-n">3×</span><span className="sai-qa-stat-l">Auto-heal retries<br/>per change</span></div>
+            <div className="sai-qa-stat"><span className="sai-qa-stat-n">0</span><span className="sai-qa-stat-l">Silent failures —<br/>every error surfaces</span></div>
+            <div className="sai-qa-stat"><span className="sai-qa-stat-n">≤3</span><span className="sai-qa-stat-l">Hard-fail score on<br/>any TS error</span></div>
+            <div className="sai-qa-stat"><span className="sai-qa-stat-n">10</span><span className="sai-qa-stat-l">Point scoring<br/>per change</span></div>
           </div>
         </div>
       </section>
