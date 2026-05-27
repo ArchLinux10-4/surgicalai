@@ -352,21 +352,36 @@ html{scroll-behavior:smooth}
 .sai-pricing-note{text-align:center;margin-top:24px;font-size:13px;color:var(--txt3)}
 
 /* CTA */
-.sai-cta-section{text-align:center;padding:100px 24px;background:linear-gradient(180deg,#ffffff 0%,#f0effe 100%)}
-.sai-cta-box{
-  background:#fff;
-  border:1.5px solid rgba(109,92,230,.2);border-radius:24px;padding:80px 40px;
-  max-width:720px;margin:0 auto;position:relative;overflow:hidden;
-  box-shadow:0 8px 40px rgba(109,92,230,.1);
+.sai-cta-section{padding:100px 24px;background:#0f0d1a}
+.sai-cta-inner{max-width:1080px;margin:0 auto;display:grid;grid-template-columns:1fr 1fr;gap:80px;align-items:center}
+.sai-cta-copy{color:#fff}
+.sai-cta-copy h2{font-size:clamp(28px,3.5vw,44px);font-weight:800;letter-spacing:-1px;margin-bottom:20px;line-height:1.15}
+.sai-cta-copy p{color:rgba(255,255,255,.6);font-size:16px;line-height:1.75;margin-bottom:32px}
+.sai-cta-detail{display:flex;align-items:center;gap:10px;font-size:14px;color:rgba(255,255,255,.5);margin-bottom:12px}
+.sai-cta-detail svg{flex-shrink:0;color:#6d5ce6}
+.sai-form-card{background:#1a1630;border:1px solid rgba(109,92,230,.25);border-radius:20px;padding:36px 32px;box-shadow:0 24px 60px rgba(0,0,0,.4)}
+.sai-contact-form{display:flex;flex-direction:column;gap:20px}
+.sai-field{display:flex;flex-direction:column;gap:7px}
+.sai-field label{font-size:13px;font-weight:600;color:rgba(255,255,255,.7);letter-spacing:.03em;text-transform:uppercase}
+.sai-field input,.sai-field textarea{
+  background:#ffffff !important;-webkit-appearance:none;
+  -webkit-text-fill-color:#111 !important;color:#111 !important;
+  border:1.5px solid rgba(109,92,230,.25);border-radius:10px;
+  padding:12px 16px;font-size:15px;font-family:inherit;
+  outline:none;transition:border-color .2s,box-shadow .2s;width:100%;box-sizing:border-box;
 }
-.sai-cta-box::before{
-  content:'';position:absolute;top:-80px;right:-80px;
-  width:300px;height:300px;border-radius:50%;
-  background:radial-gradient(circle,rgba(109,92,230,.08),transparent 70%);
-  pointer-events:none;
+.sai-field input:focus,.sai-field textarea:focus{border-color:#6d5ce6;box-shadow:0 0 0 3px rgba(109,92,230,.15)}
+.sai-field textarea{resize:vertical;min-height:120px}
+.sai-form-row-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.sai-form-submit{display:flex;align-items:center;justify-content:center;gap:10px;background:linear-gradient(135deg,#6d5ce6,#0fa876);color:#fff;border:none;border-radius:12px;padding:16px 24px;font-size:16px;font-weight:700;font-family:inherit;cursor:pointer;width:100%;transition:opacity .2s,transform .1s}
+.sai-form-submit:hover{opacity:.9;transform:translateY(-1px)}
+.sai-form-submit:active{transform:translateY(0)}
+@media(max-width:768px){
+  .sai-cta-inner{grid-template-columns:1fr;gap:48px;text-align:center}
+  .sai-cta-detail{justify-content:center}
+  .sai-form-row-2{grid-template-columns:1fr}
+  .sai-form-card{padding:24px 20px}
 }
-.sai-cta-box h2{font-size:clamp(28px,4vw,44px);font-weight:800;letter-spacing:-1px;margin-bottom:16px;color:var(--txt)}
-.sai-cta-box p{color:var(--txt2);font-size:16px;max-width:460px;margin:0 auto 40px;line-height:1.7}
 
 /* FOOTER */
 .sai-footer{
@@ -1055,23 +1070,51 @@ export function LandingPage() {
 
       {/* CTA */}
       <section className="sai-cta-section" id="contact">
-        <div className="sai-cta-box" style={{maxWidth:'560px',margin:'0 auto'}}>
-          <h2>Ready to operate<br/>on your codebase?</h2>
-          <p>SurgicalAI is currently in private access. Fill out the form and we'll get you onboarded.</p>
-          <form action="https://formspree.io/f/mzdwkojb" method="POST" className="sai-contact-form">
-            <div className="sai-form-row">
-              <input type="text" name="name" placeholder="Your name" required className="sai-form-input"/>
-              <input type="email" name="email" placeholder="Work email" required className="sai-form-input"/>
+        <div className="sai-cta-inner">
+          {/* Left: copy */}
+          <div className="sai-cta-copy">
+            <h2>Ready to operate<br/>on your codebase?</h2>
+            <p>SurgicalAI is in private access. Drop us a message and we'll get your team onboarded — usually within 24 hours.</p>
+            <div className="sai-cta-detail">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><polyline points="20 6 9 17 4 12"/></svg>
+              Surgical precision — no full-file rewrites
             </div>
-            <textarea name="message" placeholder="Tell us about your codebase and team size..." rows={4} required className="sai-form-input sai-form-textarea"/>
-            <button type="submit" className="sai-btn-primary" style={{width:'100%',fontSize:'16px',padding:'16px 40px',justifyContent:'center'}}>
-              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-                <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
-                <polyline points="22,6 12,13 2,6"/>
-              </svg>
-              Get in Touch
-            </button>
-          </form>
+            <div className="sai-cta-detail">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><polyline points="20 6 9 17 4 12"/></svg>
+              GitHub + Linear integrations included
+            </div>
+            <div className="sai-cta-detail">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><polyline points="20 6 9 17 4 12"/></svg>
+              Claude Architect + Surgeon — zero GPT
+            </div>
+          </div>
+          {/* Right: form card */}
+          <div className="sai-form-card">
+            <form action="https://formspree.io/f/mzdwkojb" method="POST" className="sai-contact-form">
+              <div className="sai-form-row-2">
+                <div className="sai-field">
+                  <label htmlFor="cf-name">Your name</label>
+                  <input id="cf-name" type="text" name="name" placeholder="Alex Johnson" required/>
+                </div>
+                <div className="sai-field">
+                  <label htmlFor="cf-email">Work email</label>
+                  <input id="cf-email" type="email" name="email" placeholder="alex@company.com" required/>
+                </div>
+              </div>
+              <div className="sai-field">
+                <label htmlFor="cf-team">Team size</label>
+                <input id="cf-team" type="text" name="team_size" placeholder="e.g. 5 engineers, mono-repo"/>
+              </div>
+              <div className="sai-field">
+                <label htmlFor="cf-msg">Tell us about your codebase</label>
+                <textarea id="cf-msg" name="message" placeholder="What stack are you on? What's the biggest pain point today?" rows={4} required/>
+              </div>
+              <button type="submit" className="sai-form-submit">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                Send Message
+              </button>
+            </form>
+          </div>
         </div>
       </section>
 
