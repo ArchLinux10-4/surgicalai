@@ -9,7 +9,7 @@
  *  - Hook: add onClick={() => stripeCheckout(priceId)} to .sai-pricing-cta buttons
  *  - Backend: POST /billing/create-checkout-session { priceId, userId }
  */
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import LoginIcon from '@mui/icons-material/Login';
 
 const CSS = `
@@ -379,9 +379,51 @@ html{scroll-behavior:smooth}
 .sai-footer-links{display:flex;gap:28px}
 
 /* Responsive */
+/* HAMBURGER */
+.sai-hamburger{
+  display:none;flex-direction:column;justify-content:center;align-items:center;
+  width:40px;height:40px;cursor:pointer;gap:5px;padding:8px;
+  border:none;background:transparent;border-radius:8px;flex-shrink:0;
+}
+.sai-hamburger span{
+  display:block;width:22px;height:2px;background:var(--txt);border-radius:2px;
+  transition:transform .28s ease,opacity .2s ease;
+}
+.sai-hamburger.open span:nth-child(1){transform:translateY(7px) rotate(45deg)}
+.sai-hamburger.open span:nth-child(2){opacity:0;transform:scaleX(0)}
+.sai-hamburger.open span:nth-child(3){transform:translateY(-7px) rotate(-45deg)}
+
+/* MOBILE MENU PANEL */
+.sai-mobile-menu{
+  position:fixed;top:64px;left:0;right:0;z-index:98;
+  background:rgba(255,255,255,0.97);backdrop-filter:blur(20px);
+  border-bottom:1px solid var(--border);
+  display:flex;flex-direction:column;gap:0;
+  transform:translateY(-8px);opacity:0;pointer-events:none;
+  transition:transform .28s ease,opacity .25s ease;
+}
+.sai-mobile-menu.open{transform:translateY(0);opacity:1;pointer-events:all}
+.sai-mobile-menu a{
+  display:block;padding:15px 24px;font-size:16px;font-weight:500;
+  color:var(--txt2);text-decoration:none;border-bottom:1px solid var(--border);
+  transition:color .15s,background .15s;
+}
+.sai-mobile-menu a:hover{color:var(--txt);background:var(--bg2)}
+.sai-mobile-menu a:last-child{border-bottom:none}
+.sai-mobile-login-link{
+  margin:12px 24px 20px !important;
+  background:var(--accent) !important;color:#fff !important;
+  border-radius:8px;border-bottom:none !important;
+  padding:13px 24px !important;text-align:center;font-weight:700 !important;
+  display:flex !important;align-items:center;justify-content:center;gap:8px;
+}
+.sai-mobile-login-link:hover{opacity:.88;background:var(--accent) !important}
+
 @media(max-width:900px){
   .sai-nav{padding:0 20px}
   .sai-nav-links{display:none}
+  .sai-nav-cta{display:none}
+  .sai-hamburger{display:flex}
   .sai-mockup-body{grid-template-columns:1fr;min-height:auto}
   .sai-mock-sidebar,.sai-mock-panel{display:none}
   .sai-stats-strip{grid-template-columns:1fr 1fr}
@@ -397,7 +439,13 @@ html{scroll-behavior:smooth}
 @media(max-width:600px){
   .sai-features-grid{grid-template-columns:1fr}
   .sai-stats-strip{grid-template-columns:1fr 1fr}
-  .sai-footer{flex-direction:column;gap:20px;text-align:center}
+  .sai-footer{flex-direction:column;gap:20px;text-align:center;padding:36px 20px 28px}
+  .sai-footer-links{flex-wrap:wrap;justify-content:center;gap:8px 16px}
+}
+@media(max-width:480px){
+  .sai-hero-badge{flex-wrap:wrap;justify-content:center;text-align:center;max-width:260px;padding:8px 18px;line-height:1.6;border-radius:20px}
+  .sai-badge-part1{white-space:nowrap}
+  .sai-badge-part2{white-space:nowrap}
 }
 `;
 
@@ -417,6 +465,9 @@ export function LandingPage() {
       document.body.style.background = prevBg;
     };
   }, []);
+
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const closeMobileMenu = () => setMobileMenuOpen(false);
 
   return (
     <>
@@ -442,18 +493,39 @@ export function LandingPage() {
           <li><a href="#pricing">Pricing</a></li>
           <li><a href="#compare">Compare</a></li>
         </ul>
+        <button
+          className={`sai-hamburger${mobileMenuOpen ? ' open' : ''}`}
+          onClick={() => setMobileMenuOpen(v => !v)}
+          aria-label="Toggle menu"
+        >
+          <span/><span/><span/>
+        </button>
         <a href="/login" className="sai-nav-cta">
           <LoginIcon style={{ fontSize: 16 }} />
           Login
         </a>
       </nav>
 
+      {/* MOBILE MENU */}
+      <div className={`sai-mobile-menu${mobileMenuOpen ? ' open' : ''}`}>
+        <a href="#how-it-works" onClick={closeMobileMenu}>How it works</a>
+        <a href="#features" onClick={closeMobileMenu}>Features</a>
+        <a href="#integrations" onClick={closeMobileMenu}>Integrations</a>
+        <a href="#pricing" onClick={closeMobileMenu}>Pricing</a>
+        <a href="#compare" onClick={closeMobileMenu}>Compare</a>
+        <a href="/login" className="sai-mobile-login-link">
+          <LoginIcon style={{ fontSize: 16 }} />
+          Login to SurgicalAI
+        </a>
+      </div>
+
       {/* HERO */}
       <section className="sai-hero">
         <div className="sai-hero-glow"></div>
         <div className="sai-hero-badge">
           <span className="sai-hero-badge-dot"></span>
-          Powered by Claude · Architect + Surgeon
+          <span className="sai-badge-part1">Powered by Claude&nbsp;·&nbsp;</span>
+          <span className="sai-badge-part2">Architect&nbsp;+&nbsp;Surgeon</span>
         </div>
         <h1 className="sai-h1">Code edits with<br/><span>surgical precision</span></h1>
         <p className="sai-hero-sub">SurgicalAI sends an Architect to plan, a Surgeon to operate, and a QA agent to verify. Zero guessing. Zero silent failures.</p>
