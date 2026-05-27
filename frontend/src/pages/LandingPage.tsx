@@ -411,6 +411,14 @@ html{scroll-behavior:smooth}
 .sai-cta-detail svg{flex-shrink:0;color:#6d5ce6}
 .sai-form-card{background:#1a1630;border:1px solid rgba(109,92,230,.25);border-radius:20px;padding:36px 32px;box-shadow:0 24px 60px rgba(0,0,0,.4)}
 .sai-contact-form{display:flex;flex-direction:column;gap:20px}
+.sai-form-success{display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:48px 24px;gap:16px;min-height:320px}
+.sai-form-success-icon{width:72px;height:72px;border-radius:50%;background:rgba(15,168,118,0.12);display:flex;align-items:center;justify-content:center}
+.sai-form-success h3{font-size:22px;font-weight:700;color:var(--txt);margin:0}
+.sai-form-success p{color:var(--muted);font-size:15px;margin:0}
+.sai-form-reset{margin-top:8px;background:none;border:1px solid rgba(109,92,230,0.4);color:#6d5ce6;border-radius:8px;padding:10px 22px;font-size:14px;cursor:pointer;transition:all .2s}
+.sai-form-reset:hover{background:rgba(109,92,230,0.08)}
+.sai-form-error{color:#e05c5c;font-size:13px;margin:0;padding:10px 14px;background:rgba(224,92,92,0.08);border-radius:8px;border:1px solid rgba(224,92,92,0.2)}
+@keyframes spin{to{transform:rotate(360deg)}}
 .sai-field{display:flex;flex-direction:column;gap:7px}
 .sai-field label{font-size:13px;font-weight:600;color:rgba(255,255,255,.7);letter-spacing:.03em;text-transform:uppercase}
 .sai-field input,.sai-field textarea{
@@ -684,6 +692,35 @@ export function LandingPage() {
   }, []);
 
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [formSuccess, setFormSuccess] = useState(false);
+  const [formSubmitting, setFormSubmitting] = useState(false);
+  const [formError, setFormError] = useState('');
+
+  async function handleContactSubmit(e: React.FormEvent<HTMLFormElement>) {
+    e.preventDefault();
+    const form = e.currentTarget;
+    setFormSubmitting(true);
+    setFormError('');
+    try {
+      const data = new FormData(form);
+      const res = await fetch('https://formspree.io/f/mzdwkojb', {
+        method: 'POST',
+        body: data,
+        headers: { Accept: 'application/json' },
+      });
+      if (res.ok) {
+        setFormSuccess(true);
+        form.reset();
+      } else {
+        const json = await res.json().catch(() => ({}));
+        setFormError((json as any)?.error || 'Something went wrong. Please try again.');
+      }
+    } catch {
+      setFormError('Network error. Please check your connection and try again.');
+    } finally {
+      setFormSubmitting(false);
+    }
+  }
   const closeMobileMenu = () => setMobileMenuOpen(false);
 
   return (
@@ -1353,30 +1390,51 @@ export function LandingPage() {
           </div>
           {/* Right: form card */}
           <div className="sai-form-card">
-            <form action="https://formspree.io/f/mzdwkojb" method="POST" className="sai-contact-form">
-              <div className="sai-form-row-2">
-                <div className="sai-field">
-                  <label htmlFor="cf-name">Your name</label>
-                  <input id="cf-name" type="text" name="name" placeholder="Alex Johnson" required/>
+            {formSuccess ? (
+              <div className="sai-form-success">
+                <div className="sai-form-success-icon">
+                  <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#0fa876" strokeWidth="2.5"><circle cx="12" cy="12" r="10"/><polyline points="20 6 9 17 4 12"/></svg>
+                </div>
+                <h3>Message sent!</h3>
+                <p>We got it. Expect a reply within 24 hours.</p>
+                <button className="sai-form-reset" onClick={() => setFormSuccess(false)}>Send another message</button>
+              </div>
+            ) : (
+              <form onSubmit={handleContactSubmit} className="sai-contact-form">
+                <div className="sai-form-row-2">
+                  <div className="sai-field">
+                    <label htmlFor="cf-name">Your name</label>
+                    <input id="cf-name" type="text" name="name" placeholder="Alex Johnson" required/>
+                  </div>
+                  <div className="sai-field">
+                    <label htmlFor="cf-email">Work email</label>
+                    <input id="cf-email" type="email" name="email" placeholder="alex@company.com" required/>
+                  </div>
                 </div>
                 <div className="sai-field">
-                  <label htmlFor="cf-email">Work email</label>
-                  <input id="cf-email" type="email" name="email" placeholder="alex@company.com" required/>
+                  <label htmlFor="cf-team">Team size</label>
+                  <input id="cf-team" type="text" name="team_size" placeholder="e.g. 5 engineers, mono-repo"/>
                 </div>
-              </div>
-              <div className="sai-field">
-                <label htmlFor="cf-team">Team size</label>
-                <input id="cf-team" type="text" name="team_size" placeholder="e.g. 5 engineers, mono-repo"/>
-              </div>
-              <div className="sai-field">
-                <label htmlFor="cf-msg">Tell us about your codebase</label>
-                <textarea id="cf-msg" name="message" placeholder="What stack are you on? What's the biggest pain point today?" rows={4} required/>
-              </div>
-              <button type="submit" className="sai-form-submit">
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                Send Message
-              </button>
-            </form>
+                <div className="sai-field">
+                  <label htmlFor="cf-msg">Tell us about your codebase</label>
+                  <textarea id="cf-msg" name="message" placeholder="What stack are you on? What's the biggest pain point today?" rows={4} required/>
+                </div>
+                {formError && <p className="sai-form-error">{formError}</p>}
+                <button type="submit" className="sai-form-submit" disabled={formSubmitting}>
+                  {formSubmitting ? (
+                    <span style={{display:'flex',alignItems:'center',gap:'8px'}}>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" style={{animation:'spin 1s linear infinite'}}><circle cx="12" cy="12" r="10" strokeOpacity="0.25"/><path d="M12 2a10 10 0 0 1 10 10" stroke="currentColor"/></svg>
+                      Sending…
+                    </span>
+                  ) : (
+                    <>
+                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+                      Send Message
+                    </>
+                  )}
+                </button>
+              </form>
+            )}
           </div>
         </div>
       </section>
