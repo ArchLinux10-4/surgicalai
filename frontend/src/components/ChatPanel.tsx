@@ -646,6 +646,41 @@ export function ChatPanel() {
     return s.id
   }
 
+
+  // ── Image compression ─────────────────────────────────
+  // Compresses images > 1.5 MB before upload to avoid payload-too-large errors.
+  // Resizes to max 1500×1500, JPEG quality 0.85. SVGs are passed through as-is.
+  const compressImage = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onerror = reject
+      reader.onload = () => {
+        const dataUrl = reader.result as string
+        // SVGs don't need compression
+        if (file.name.toLowerCase().endsWith('.svg')) { resolve(dataUrl); return }
+        const img = new Image()
+        img.onerror = reject
+        img.onload = () => {
+          const MAX = 1500
+          let { width, height } = img
+          if (width > MAX || height > MAX) {
+            const ratio = Math.min(MAX / width, MAX / height)
+            width = Math.round(width * ratio)
+            height = Math.round(height * ratio)
+          }
+          const canvas = document.createElement('canvas')
+          canvas.width = width
+          canvas.height = height
+          const ctx = canvas.getContext('2d')!
+          ctx.drawImage(img, 0, 0, width, height)
+          resolve(canvas.toDataURL('image/jpeg', 0.85))
+        }
+        img.src = dataUrl
+      }
+      reader.readAsDataURL(file)
+    })
+  }
+
   // ── File upload ───────────────────────────────────────
   const uploadFiles = useCallback(async (fileList: FileList | File[]) => {
     // Convert FileList → Array SYNCHRONOUSLY before any awaits.
@@ -709,13 +744,15 @@ export function ChatPanel() {
       let uploadBody: { filename: string; content: string; language?: string; base64_data?: string; file_type?: string }
 
       if (isImage) {
-        // Read as base64 data URL
-        const base64Data = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader()
-          reader.onload = () => resolve(reader.result as string)
-          reader.onerror = reject
-          reader.readAsDataURL(file)
-        })
+        // Compress if > 1.5 MB to avoid 413 on Railway (camera photos can be 5–10 MB)
+        const base64Data = file.size > 1.5 * 1024 * 1024
+          ? await compressImage(file)
+          : await new Promise<string>((resolve, reject) => {
+              const reader = new FileReader()
+              reader.onload = () => resolve(reader.result as string)
+              reader.onerror = reject
+              reader.readAsDataURL(file)
+            })
         uploadBody = { filename: file.name, content: '', base64_data: base64Data, language, file_type: 'image' }
       } else if (isBinary) {
         // PDF or Excel — read as base64, let backend extract text
