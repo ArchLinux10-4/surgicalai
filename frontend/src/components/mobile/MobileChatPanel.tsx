@@ -8,6 +8,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAppStore } from '../../stores/appStore'
 import { api } from '../../api/client'
+import { toast } from '../../lib/toast'
 import { MobileDiffCard } from './MobileDiffCard'
 import { VoiceButton } from '../VoiceButton'
 import { useCodeRain } from '../../hooks/useCodeRain'
@@ -320,7 +321,7 @@ export function MobileChatPanel() {
   const {
     activeSessions, setActiveSession, messages, addMessage, setMessages,
     sessions, setSessions, settings,
-    sessionFiles, setSessionFiles, addSessionFile,
+    sessionFiles, setSessionFiles,
   } = useAppStore()
 
   const [input, setInput]               = useState('')
@@ -490,62 +491,19 @@ export function MobileChatPanel() {
   }, [input, isStreaming, settings, ensureSession, messages.length, sessionFiles,
       addMessage, setSessions, stopStream])
 
-  // File upload — image-aware (mirrors desktop ChatPanel logic)
+  // File upload
   const handleFileUpload = async (files: FileList | null) => {
     if (!files?.length) return
-    // Snapshot the array synchronously — FileList can lose entries after await
-    const fileArray = Array.from(files)
     const sessionId = await ensureSession()
-
-    for (const file of fileArray) {
-      const ext = file.name.split('.').pop()?.toLowerCase() || ''
-      const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'heic', 'heif']
-      const BINARY_EXTS = ['pdf', 'xlsx', 'xls']
-      let isImage = !!(file.type && file.type.startsWith('image/')) || IMAGE_EXTS.includes(ext)
-      const isBinary = BINARY_EXTS.includes(ext)
-
-      // Magic byte fallback — critical for iOS where file.type can be empty
-      if (!isImage && !isBinary) {
-        try {
-          const hdr = new Uint8Array(await file.slice(0, 12).arrayBuffer())
-          if (hdr[0] === 0xFF && hdr[1] === 0xD8 && hdr[2] === 0xFF) isImage = true            // JPEG
-          else if (hdr[0] === 0x89 && hdr[1] === 0x50 && hdr[2] === 0x4E && hdr[3] === 0x47) isImage = true // PNG
-          else if (hdr[0] === 0x47 && hdr[1] === 0x49 && hdr[2] === 0x46 && hdr[3] === 0x38) isImage = true // GIF
-          else if (hdr[0] === 0x52 && hdr[1] === 0x49 && hdr[2] === 0x46 && hdr[3] === 0x46 &&
-                   hdr[8] === 0x57 && hdr[9] === 0x45 && hdr[10] === 0x42 && hdr[11] === 0x50) isImage = true // WebP
-          else if (hdr[4] === 0x66 && hdr[5] === 0x74 && hdr[6] === 0x79 && hdr[7] === 0x70) isImage = true  // HEIC
-        } catch {}
-      }
-
+    for (const file of Array.from(files)) {
       try {
-        if (isImage) {
-          // ── Image: multipart upload (sends raw bytes — works on iOS) ─────
-          const formData = new FormData()
-          formData.append('file', file)
-          formData.append('filename', file.name)
-          const result = await api.sessionFiles.uploadMultipart(sessionId, formData)
-          addSessionFile(result)
-        } else if (isBinary) {
-          // ── PDF / Excel: base64 encode ──────────────────────────────────
-          const base64Data = await new Promise<string>((resolve, reject) => {
-            const reader = new FileReader()
-            reader.onload = () => resolve(reader.result as string)
-            reader.onerror = reject
-            reader.readAsDataURL(file)
-          })
-          const fileType = ext === 'pdf' ? 'pdf' : 'excel'
-          const body = { filename: file.name, content: '', base64_data: base64Data, file_type: fileType }
-          const result = await api.sessionFiles.upload(sessionId, body as any)
-          addSessionFile(result)
-        } else {
-          // ── Text / code: existing behavior ──────────────────────────────
-          const content = await file.text()
-          const body = { filename: file.name, content }
-          const result = await api.sessionFiles.upload(sessionId, body)
-          addSessionFile(result)
-        }
+        const content = await file.text()
+        const body = { filename: file.name, content, file_type: 'code' as const }
+        const uploaded = await api.sessionFiles.upload(sessionId, body)
+        setSessionFiles([...(useAppStore.getState().sessionFiles), uploaded])
+        toast.success(`${file.name} uploaded`)
       } catch (e: any) {
-        console.error(`Upload failed: ${file.name}`, e)
+        toast.error(`Upload failed: ${file.name}`)
       }
     }
   }
@@ -717,7 +675,6 @@ export function MobileChatPanel() {
 
         {/* Hidden file input */}
         <input ref={fileInputRef} type="file" multiple className="hidden"
-          accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.json,.yaml,.yml,.toml,.md,.sh,.sql,.cpp,.c,.h,image/*,.pdf,.csv,.xlsx,.xls,.txt,.zip"
           onChange={e => handleFileUpload(e.target.files)} />
 
         {/* Compose sheet */}

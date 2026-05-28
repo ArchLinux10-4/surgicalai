@@ -707,6 +707,11 @@ export function ChatPanel() {
       const isBinary = BINARY_EXTS.includes(ext)
       let detectedMime = file.type || ''
 
+      // ── DIAGNOSTIC TOAST — visible on device screen ─────────────────────────
+      // Shows raw file properties so we can see exactly what iOS Chrome sends.
+      // Remove after the iOS upload bug is fixed.
+      toast.info(`📁 ${file.name}`, `type="${file.type}" ext="${ext}" img=${isImage}`)
+
       // ── Magic byte fallback ────────────────────────────────────────────────
       if (!isImage && !isBinary) {
         try {
@@ -724,6 +729,7 @@ export function ChatPanel() {
             isImage = true; detectedMime = 'image/heic'
           }
           if (isImage) {
+            toast.info(`🔬 Magic bytes → ${detectedMime}`)
             console.log(`[IMG-UPLOAD] Magic bytes → ${detectedMime} for "${file.name}"`)
           }
         } catch (e: any) {
@@ -735,6 +741,7 @@ export function ChatPanel() {
 
       if (isImage) {
         // ── Multipart upload ──────────────────────────────────────────────────
+        toast.info(`🚀 → MULTIPART path`)
         console.log(`[IMG-UPLOAD] Multipart: ${file.name} ${(file.size / 1024 / 1024).toFixed(1)}MB type=${file.type}`)
         const formData = new FormData()
         formData.append('file', file)
@@ -742,10 +749,11 @@ export function ChatPanel() {
         try {
           const result = await api.sessionFiles.uploadMultipart(sessionId, formData)
           addSessionFile(result)
+          toast.success(`${file.name} uploaded OK`)
           return result
         } catch (e: any) {
           const detail = (e as any)?.response?.status ? `HTTP ${(e as any).response.status}` : (e as Error).message
-          console.error(`[IMG-UPLOAD] multipart failed: ${detail}`)
+          toast.error(`MULTIPART FAILED: ${detail}`)
           console.error('[IMG-UPLOAD] multipart error:', e)
           return null
         }
@@ -760,6 +768,8 @@ export function ChatPanel() {
         const fileType = ext === 'pdf' ? 'pdf' : 'excel'
         uploadBody = { filename: file.name, content: '', base64_data: base64Data, language, file_type: fileType }
       } else {
+        // ── DIAGNOSTIC: should never reach here for images ────────────────────
+        toast.error(`⚠️ TEXT path for "${file.name}" (ext="${ext}" type="${file.type}")`)
         // Text / code — existing behavior
         const content = await file.text()
         uploadBody = { filename: file.name, content, language }
@@ -770,10 +780,11 @@ export function ChatPanel() {
         console.log(`[IMG-UPLOAD] Sending ${file.name} (${(payloadSize / 1024).toFixed(0)}KB)`)
         const result = await api.sessionFiles.upload(sessionId, uploadBody)
         addSessionFile(result)
+        toast.success(`${file.name} uploaded OK`)
         return result
       } catch (e: any) {
         const detail = e?.response?.status ? `HTTP ${e.response.status}` : e.message
-        console.error(`[IMG-UPLOAD] upload failed ${file.name}: ${detail}`)
+        toast.error(`UPLOAD FAILED ${file.name}: ${detail}`)
         console.error('[IMG-UPLOAD] fetch error:', e)
         return null
       }
@@ -781,6 +792,7 @@ export function ChatPanel() {
 
     await Promise.all(promises)
     setUploadingFiles(false)
+    toast.success(`${files.length} file${files.length > 1 ? 's' : ''} ready`)
     textareaRef.current?.focus()
   }, [activeSessions])
 

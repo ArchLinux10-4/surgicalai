@@ -43,8 +43,7 @@ function ToastItem({ id, type, title, message }: { id: string; type: string; tit
 export function Toaster() {
   const toasts = useToastStore((s) => s.toasts)
   return (
-    <div className="fixed right-5 z-[9999] flex flex-col gap-2 items-end pointer-events-none"
-      style={{ bottom: 'calc(env(safe-area-inset-bottom, 0px) + 20px)' }}>
+    <div className="fixed bottom-5 right-5 z-[9999] flex flex-col gap-2 items-end pointer-events-none">
       {toasts.map((t) => (
         <div key={t.id} className="pointer-events-auto">
           <ToastItem {...t} />
