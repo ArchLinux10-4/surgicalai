@@ -7,7 +7,7 @@ import io
 import logging
 from pathlib import Path
 import mimetypes
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, File, UploadFile, Form
 from fastapi.responses import Response
 from database import get_db
 from services.ast_parser import ASTParser
@@ -398,6 +398,121 @@ def upload_session_file(session_id: str, body: dict):
         "symbol_count": symbol_count,
         "file_type": file_type,
         "updated_at": None,  # fresh upload — DB default applies
+    }
+
+
+@router.post("/{session_id}/files/upload")
+async def upload_session_file_multipart(
+    session_id: str,
+    file: UploadFile = File(...),
+    filename: str = Form(None),
+):
+    """Multipart file upload — the correct approach for iOS / Android / WKWebView.
+
+    Browser-side canvas/FileReader/base64 all fail on iOS Chrome for large images
+    (WKWebView memory limits, HEIC canvas decode not supported, readAsDataURL returns
+    empty/corrupt data). FormData sends raw bytes directly — server detects format via
+    magic bytes and converts HEIC/HEIF/AVIF/BMP → JPEG with pillow-heif.
+
+    This mirrors how Tasklet handles uploads and works on every platform.
+    """
+    actual_filename = filename or file.filename or "upload"
+    raw_bytes = await file.read()
+    file_type = _get_file_type(actual_filename)
+    language = _get_language(actual_filename)
+
+    logger.info(
+        f"[upload-multipart] session={session_id[:8]} filename={actual_filename!r} "
+        f"content_type={file.content_type!r} size={len(raw_bytes):,} bytes file_type={file_type}"
+    )
+
+    if file_type == "image":
+        # Detect true format from magic bytes — never trust client-supplied MIME
+        detected_mime = _detect_image_magic_bytes(raw_bytes)
+        effective_mime = detected_mime or file.content_type or "image/jpeg"
+        logger.info(
+            f"[upload-multipart] image: detected={detected_mime!r} "
+            f"content_type={file.content_type!r} effective={effective_mime!r}"
+        )
+        # Build data URL and normalize to JPEG (no-op if already JPEG/PNG/GIF/WebP)
+        import base64 as _b64
+        b64 = _b64.b64encode(raw_bytes).decode()
+        data_url = f"data:{effective_mime};base64,{b64}"
+        content = _normalize_image_for_claude(data_url)
+        lines = 0
+        symbol_count = 0
+
+    elif file_type == "pdf":
+        import base64 as _b64
+        b64 = _b64.b64encode(raw_bytes).decode()
+        data_url = f"data:application/pdf;base64,{b64}"
+        content = _extract_pdf_text(data_url)
+        lines = len(content.splitlines())
+        symbol_count = 0
+
+    elif file_type in ("csv", "excel"):
+        if file_type == "excel":
+            import base64 as _b64
+            b64 = _b64.b64encode(raw_bytes).decode()
+            data_url = f"data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}"
+            content = _parse_excel_to_markdown(data_url, actual_filename)
+        else:
+            try:
+                raw_text = raw_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                raw_text = raw_bytes.decode("latin-1", errors="replace")
+            content = _parse_csv_to_markdown(raw_text)
+        lines = len(content.splitlines())
+        symbol_count = 0
+
+    else:
+        # Text / code
+        try:
+            content = raw_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            content = raw_bytes.decode("latin-1", errors="replace")
+        lines = len(content.splitlines())
+        try:
+            smap = parser.parse(content, actual_filename)
+            symbol_count = len(smap.symbols)
+        except Exception:
+            symbol_count = 0
+
+    # Sanitize for Postgres (JPEG base64 is pure ASCII so this is a no-op for images)
+    actual_filename = _sanitize_for_postgres(actual_filename)
+    content = _sanitize_for_postgres(content)
+
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT id FROM session_files WHERE session_id = ? AND filename = ?",
+        (session_id, actual_filename)
+    ).fetchone()
+
+    if existing:
+        file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
+        conn.execute(
+            "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (content, language, lines, symbol_count, file_type, file_id)
+        )
+    else:
+        file_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (file_id, session_id, actual_filename, content, language, lines, symbol_count, file_type)
+        )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "id": file_id,
+        "session_id": session_id,
+        "filename": actual_filename,
+        "language": language,
+        "lines": lines,
+        "symbol_count": symbol_count,
+        "file_type": file_type,
+        "updated_at": None,
     }
 
 

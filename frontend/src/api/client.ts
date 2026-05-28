@@ -273,6 +273,39 @@ export const api = {
   sessionFiles: {
     upload: (sessionId: string, data: { filename: string; content: string; language?: string }) =>
       request<any>(`/chat/${sessionId}/files`, { method: 'POST', body: JSON.stringify(data) }),
+    /** Multipart upload — sends raw bytes, server converts HEIC→JPEG.
+     *  Works on iOS Chrome / WKWebView where base64/canvas paths fail. */
+    uploadMultipart: (sessionId: string, formData: FormData): Promise<any> => {
+      const token = (() => {
+        try {
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i)
+            if (k && k.startsWith('surgicalai-auth-') && k !== 'surgicalai-auth') {
+              const d = JSON.parse(localStorage.getItem(k) || '')
+              if (d?.token) return d.token
+            }
+          }
+          const raw = localStorage.getItem('surgicalai-auth')
+          if (!raw) return null
+          const parsed = JSON.parse(raw)
+          return parsed?.state?.token ?? parsed?.token ?? null
+        } catch { return null }
+      })()
+      const headers: Record<string, string> = {}
+      if (token) headers['Authorization'] = `Bearer ${token}`
+      // Do NOT set Content-Type — browser must set it with the multipart boundary
+      return fetch(`${BASE}/chat/${sessionId}/files/upload`, {
+        method: 'POST',
+        headers,
+        body: formData,
+      }).then(async res => {
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }))
+          throw new Error(err.detail || `HTTP ${res.status}`)
+        }
+        return res.json()
+      })
+    },
     list: (sessionId: string) =>
       request<any[]>(`/chat/${sessionId}/files`),
     get: (sessionId: string, fileId: string) =>
