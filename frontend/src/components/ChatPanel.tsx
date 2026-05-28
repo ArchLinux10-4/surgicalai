@@ -818,35 +818,97 @@ export function ChatPanel() {
       const ext = file.name.split('.').pop()?.toLowerCase() || ''
       const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'heic', 'heif']
       const BINARY_EXTS = ['pdf', 'xlsx', 'xls']
-      // Primary: trust browser MIME type (catches iOS HEIC even with weird extensions).
-      // Fallback: extension list. This prevents binary image bytes from being read as text,
-      // which produces NUL bytes that Postgres rejects on INSERT.
-      const isImage = (file.type && file.type.startsWith('image/')) || IMAGE_EXTS.includes(ext)
+      let isImage = !!(file.type && file.type.startsWith('image/')) || IMAGE_EXTS.includes(ext)
       const isBinary = BINARY_EXTS.includes(ext)
+      // Track the effective MIME — may be overridden by magic byte detection below
+      let detectedMime = file.type || ''
+
+      // ── Magic byte fallback ────────────────────────────────────────────────
+      // iOS Safari / Chrome WKWebView delivers images as "TempImage" with no
+      // extension and empty file.type — both MIME and extension checks fail,
+      // routing the file through file.text() which produces NUL-laced binary.
+      // Reading the first 12 bytes and matching known image signatures catches
+      // all of these cases before they hit the text path.
+      if (!isImage && !isBinary) {
+        try {
+          const hdr = new Uint8Array(await file.slice(0, 12).arrayBuffer())
+          // JPEG: FF D8 FF
+          if (hdr[0] === 0xFF && hdr[1] === 0xD8 && hdr[2] === 0xFF) {
+            isImage = true; detectedMime = 'image/jpeg'
+          // PNG: 89 50 4E 47
+          } else if (hdr[0] === 0x89 && hdr[1] === 0x50 && hdr[2] === 0x4E && hdr[3] === 0x47) {
+            isImage = true; detectedMime = 'image/png'
+          // GIF: 47 49 46 38
+          } else if (hdr[0] === 0x47 && hdr[1] === 0x49 && hdr[2] === 0x46 && hdr[3] === 0x38) {
+            isImage = true; detectedMime = 'image/gif'
+          // WebP: RIFF....WEBP
+          } else if (hdr[0] === 0x52 && hdr[1] === 0x49 && hdr[2] === 0x46 && hdr[3] === 0x46 &&
+                     hdr[8] === 0x57 && hdr[9] === 0x45 && hdr[10] === 0x42 && hdr[11] === 0x50) {
+            isImage = true; detectedMime = 'image/webp'
+          // HEIC/HEIF: ....ftyp at bytes 4-7
+          } else if (hdr[4] === 0x66 && hdr[5] === 0x74 && hdr[6] === 0x79 && hdr[7] === 0x70) {
+            isImage = true; detectedMime = 'image/heic'
+          }
+          if (isImage) console.log(`[IMG-UPLOAD] Magic bytes → ${detectedMime} for "${file.name}"`)
+        } catch (e: any) {
+          console.warn(`[IMG-UPLOAD] Magic byte check failed: ${e.message}`)
+        }
+      }
 
       let uploadBody: { filename: string; content: string; language?: string; base64_data?: string; file_type?: string }
 
       if (isImage) {
-        // HEIC/HEIF must always go through canvas compression so they exit as JPEG.
-        // Claude vision only supports JPEG, PNG, GIF, WEBP — HEIC is rejected by the API.
-        // Also compress files > 1.5 MB to avoid 413 on Railway (camera photos can be 5–10 MB).
-        const isHeicFile = file.type === 'image/heic' || file.type === 'image/heif' ||
+        const effectiveMime = detectedMime || file.type || ''
+        const isHeicFile = effectiveMime === 'image/heic' || effectiveMime === 'image/heif' ||
+                           file.type === 'image/heic' || file.type === 'image/heif' ||
                            ext === 'heic' || ext === 'heif'
-        const needsCompression = file.size > 1.5 * 1024 * 1024 || isHeicFile
-        const base64Data = needsCompression
-          ? await compressImage(file)
-          : await new Promise<string>((resolve, reject) => {
-              const reader = new FileReader()
-              reader.onload = () => {
-                const result = reader.result as string
-                // Log the exact MIME type being stored so Railway logs can confirm format
-                const mime = result.startsWith('data:') ? result.split(':')[1].split(';')[0] : 'unknown'
-                console.log(`[IMG-UPLOAD] Pre-upload MIME: ${mime} file=${file.name} size=${(file.size/1024).toFixed(0)}KB`)
-                resolve(result)
-              }
-              reader.onerror = reject
-              reader.readAsDataURL(file)
+
+        let base64Data: string
+
+        if (isHeicFile) {
+          // HEIC/HEIF: canvas cannot decode HEIC on iOS WKWebView — all canvas paths fail.
+          // Read raw bytes via ArrayBuffer and send to backend for server-side JPEG conversion
+          // via pillow-heif. This is more reliable than readAsDataURL which returns corrupt
+          // or empty data on WKWebView for HEIC files.
+          console.log(`[IMG-UPLOAD] HEIC detected — ArrayBuffer read for server-side conversion`)
+          try {
+            const buf = await file.arrayBuffer()
+            const bytes = new Uint8Array(buf)
+            // Chunked btoa avoids call-stack overflow on large (5–10 MB) camera files
+            const CHUNK = 65536
+            let binary = ''
+            for (let i = 0; i < bytes.byteLength; i += CHUNK) {
+              binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)))
+            }
+            base64Data = `data:${effectiveMime || 'image/heic'};base64,${btoa(binary)}`
+            console.log(`[IMG-UPLOAD] HEIC ArrayBuffer OK: ${(base64Data.length / 1024).toFixed(0)}KB → backend converts to JPEG`)
+          } catch (e: any) {
+            console.warn(`[IMG-UPLOAD] HEIC ArrayBuffer failed: ${e.message} — falling back to readAsDataURL`)
+            base64Data = await new Promise<string>((resolve, reject) => {
+              const r = new FileReader()
+              r.onload = () => resolve(r.result as string)
+              r.onerror = reject
+              r.readAsDataURL(file)
             })
+          }
+        } else {
+          // Non-HEIC: canvas compression for large files, direct read for small.
+          // Backend still normalizes if something slips through (e.g. misidentified format).
+          const needsCompression = file.size > 1.5 * 1024 * 1024
+          base64Data = needsCompression
+            ? await compressImage(file)
+            : await new Promise<string>((resolve, reject) => {
+                const reader = new FileReader()
+                reader.onload = () => {
+                  const result = reader.result as string
+                  const mime = result.startsWith('data:') ? result.split(':')[1].split(';')[0] : 'unknown'
+                  console.log(`[IMG-UPLOAD] Pre-upload MIME: ${mime} file=${file.name} size=${(file.size/1024).toFixed(0)}KB`)
+                  resolve(result)
+                }
+                reader.onerror = reject
+                reader.readAsDataURL(file)
+              })
+        }
         uploadBody = { filename: file.name, content: '', base64_data: base64Data, language, file_type: 'image' }
       } else if (isBinary) {
         // PDF or Excel — read as base64, let backend extract text

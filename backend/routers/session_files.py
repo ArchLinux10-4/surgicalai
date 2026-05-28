@@ -71,6 +71,142 @@ def _get_language(filename: str) -> str:
     return lang_map.get(ext, "plaintext")
 
 
+# ── Image format detection + server-side conversion ─────────────────────────
+# Claude vision API only accepts: image/jpeg, image/png, image/gif, image/webp
+# iOS uploads arrive as HEIC (or even raw binary from TempImage with no ext).
+# We detect the true format via magic bytes and convert to JPEG server-side.
+
+_CLAUDE_SUPPORTED_MIME = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
+def _detect_image_magic_bytes(data: bytes) -> str:
+    """Return the detected image MIME type from the first 12 bytes, or '' if not an image."""
+    if len(data) < 4:
+        return ""
+    # JPEG: FF D8 FF
+    if data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF:
+        return "image/jpeg"
+    # PNG: 89 50 4E 47 0D 0A 1A 0A
+    if data[:4] == b"\x89PNG":
+        return "image/png"
+    # GIF: 47 49 46 38
+    if data[:4] in (b"GIF8", b"GIF9"):
+        return "image/gif"
+    # WebP: RIFF....WEBP
+    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
+        return "image/webp"
+    # HEIC/HEIF: ....ftyp at bytes 4-7
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        heic_brands = {
+            b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis",
+            b"hevm", b"hevs", b"mif1", b"msf1",
+        }
+        if brand in heic_brands:
+            return "image/heic"
+        # AVIF (common on newer Android)
+        if brand in {b"avif", b"avis"}:
+            return "image/avif"
+    # BMP: 42 4D
+    if data[:2] == b"BM":
+        return "image/bmp"
+    return ""
+
+
+def _normalize_image_for_claude(base64_data: str) -> str:
+    """Convert any image format to a JPEG data URL that Claude API accepts.
+
+    Claude only supports image/jpeg, image/png, image/gif, image/webp.
+    This converts HEIC, HEIF, AVIF, BMP, and any other unsupported formats.
+    Returns the original data URL unchanged if already supported or if conversion fails.
+    """
+    if not base64_data:
+        return base64_data
+
+    # Parse data URL — extract MIME and raw base64
+    src_mime = ""
+    b64 = base64_data
+    if "," in base64_data:
+        header, b64 = base64_data.split(",", 1)
+        if ":" in header and ";" in header:
+            src_mime = header.split(":")[1].split(";")[0].lower().strip()
+
+    # Decode bytes (lenient — add padding if needed)
+    try:
+        # Pad to multiple of 4
+        padded = b64 + "==" * ((4 - len(b64) % 4) % 4)
+        img_bytes = base64.b64decode(padded)
+    except Exception as e:
+        logger.warning(f"[session_files] normalize_image: b64 decode failed: {e}")
+        return base64_data
+
+    # Detect true format from magic bytes (don't trust the client-supplied MIME header)
+    detected_mime = _detect_image_magic_bytes(img_bytes)
+    effective_mime = detected_mime or src_mime
+
+    logger.info(
+        f"[session_files] normalize_image: src_mime={src_mime!r} "
+        f"detected={detected_mime!r} size={len(img_bytes)} bytes"
+    )
+
+    # If both the header MIME and the detected MIME are Claude-supported → return as-is
+    if src_mime in _CLAUDE_SUPPORTED_MIME and (not detected_mime or detected_mime in _CLAUDE_SUPPORTED_MIME):
+        logger.info(f"[session_files] normalize_image: {src_mime} already Claude-supported — no conversion")
+        return base64_data
+
+    # Conversion needed (HEIC, HEIF, AVIF, BMP, unknown, or MIME mismatch)
+    try:
+        # Register pillow_heif opener for HEIC/HEIF/AVIF formats
+        if effective_mime in ("image/heic", "image/heif", "image/avif") or not detected_mime:
+            try:
+                import pillow_heif  # type: ignore
+                pillow_heif.register_heif_opener()
+                logger.info("[session_files] pillow_heif registered for HEIC/HEIF conversion")
+            except ImportError:
+                logger.warning(
+                    "[session_files] pillow_heif not installed — HEIC conversion may fail. "
+                    "Add pillow-heif to requirements.txt."
+                )
+
+        from PIL import Image as PILImage  # type: ignore
+
+        img = PILImage.open(io.BytesIO(img_bytes))
+        w, h = img.size
+        logger.info(f"[session_files] PIL opened image: mode={img.mode} size={w}x{h}")
+
+        # Convert to RGB for JPEG output, handling alpha / palette modes
+        if img.mode in ("RGBA", "LA", "P"):
+            # Flatten alpha onto white background
+            bg = PILImage.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            if img.mode in ("RGBA", "LA"):
+                bg.paste(img, mask=img.split()[-1])
+            else:
+                bg.paste(img)
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        output = io.BytesIO()
+        img.save(output, format="JPEG", quality=85, optimize=True)
+        jpeg_bytes = output.getvalue()
+        b64_out = base64.b64encode(jpeg_bytes).decode()
+
+        logger.info(
+            f"[session_files] Converted {effective_mime or 'unknown'} → JPEG "
+            f"({len(jpeg_bytes):,} bytes, {w}x{h})"
+        )
+        return f"data:image/jpeg;base64,{b64_out}"
+
+    except Exception as e:
+        logger.warning(
+            f"[session_files] Image normalization failed "
+            f"({type(e).__name__}: {e}) — storing original"
+        )
+        return base64_data
+
+
 def _extract_pdf_text(base64_data: str) -> str:
     """Extract text from a base64-encoded PDF using pdfplumber."""
     try:
@@ -165,8 +301,40 @@ def upload_session_file(session_id: str, body: dict):
 
     # Process content based on file type
     if file_type == "image":
-        # Store the base64 data URL directly — pipeline will use it for vision
-        content = base64_data if base64_data else raw_content
+        # ── Server-side image normalization ─────────────────────────────────
+        # Claude API only accepts image/jpeg, image/png, image/gif, image/webp.
+        # iOS uploads arrive as HEIC/HEIF (or raw binary when the frontend
+        # misclassifies the file). We convert everything to JPEG here so the
+        # pipeline always gets a format Claude can consume.
+        #
+        # Priority: base64_data (proper data URL from frontend image path)
+        # Fallback:  raw_content (arrives when frontend took the text path —
+        #            e.g. iOS "TempImage" with no extension and empty MIME type)
+        raw_b64 = base64_data if base64_data else raw_content
+
+        # If raw_content is non-empty but base64_data is missing, the frontend
+        # sent binary via the text path. Attempt to recover: encode raw bytes
+        # (stripping NUL first) as base64 and try conversion.
+        if not base64_data and raw_content:
+            logger.warning(
+                f"[upload] image arrived via text path (base64_data empty) — "
+                f"raw_len={len(raw_content)} has_nul={chr(0) in raw_content}"
+            )
+            # Strip NUL before encoding to avoid Postgres issues if conversion fails
+            cleaned = raw_content.replace("\x00", "")
+            try:
+                raw_bytes = cleaned.encode("latin-1", errors="replace")
+                detected = _detect_image_magic_bytes(raw_bytes)
+                if detected:
+                    b64_attempt = base64.b64encode(raw_bytes).decode()
+                    raw_b64 = f"data:{detected};base64,{b64_attempt}"
+                    logger.info(f"[upload] Recovered binary image from text path: {detected}")
+            except Exception as e:
+                logger.warning(f"[upload] Binary recovery failed: {e}")
+                raw_b64 = raw_content
+
+        # Normalize to JPEG (no-op if already JPEG/PNG/GIF/WebP)
+        content = _normalize_image_for_claude(raw_b64)
         lines = 0
         symbol_count = 0
     elif file_type == "pdf":
