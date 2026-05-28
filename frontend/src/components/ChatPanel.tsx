@@ -858,58 +858,26 @@ export function ChatPanel() {
       let uploadBody: { filename: string; content: string; language?: string; base64_data?: string; file_type?: string }
 
       if (isImage) {
-        const effectiveMime = detectedMime || file.type || ''
-        const isHeicFile = effectiveMime === 'image/heic' || effectiveMime === 'image/heif' ||
-                           file.type === 'image/heic' || file.type === 'image/heif' ||
-                           ext === 'heic' || ext === 'heif'
-
-        let base64Data: string
-
-        if (isHeicFile) {
-          // HEIC/HEIF: canvas cannot decode HEIC on iOS WKWebView — all canvas paths fail.
-          // Read raw bytes via ArrayBuffer and send to backend for server-side JPEG conversion
-          // via pillow-heif. This is more reliable than readAsDataURL which returns corrupt
-          // or empty data on WKWebView for HEIC files.
-          console.log(`[IMG-UPLOAD] HEIC detected — ArrayBuffer read for server-side conversion`)
-          try {
-            const buf = await file.arrayBuffer()
-            const bytes = new Uint8Array(buf)
-            // Chunked btoa avoids call-stack overflow on large (5–10 MB) camera files
-            const CHUNK = 65536
-            let binary = ''
-            for (let i = 0; i < bytes.byteLength; i += CHUNK) {
-              binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)))
-            }
-            base64Data = `data:${effectiveMime || 'image/heic'};base64,${btoa(binary)}`
-            console.log(`[IMG-UPLOAD] HEIC ArrayBuffer OK: ${(base64Data.length / 1024).toFixed(0)}KB → backend converts to JPEG`)
-          } catch (e: any) {
-            console.warn(`[IMG-UPLOAD] HEIC ArrayBuffer failed: ${e.message} — falling back to readAsDataURL`)
-            base64Data = await new Promise<string>((resolve, reject) => {
-              const r = new FileReader()
-              r.onload = () => resolve(r.result as string)
-              r.onerror = reject
-              r.readAsDataURL(file)
-            })
-          }
-        } else {
-          // Non-HEIC: canvas compression for large files, direct read for small.
-          // Backend still normalizes if something slips through (e.g. misidentified format).
-          const needsCompression = file.size > 1.5 * 1024 * 1024
-          base64Data = needsCompression
-            ? await compressImage(file)
-            : await new Promise<string>((resolve, reject) => {
-                const reader = new FileReader()
-                reader.onload = () => {
-                  const result = reader.result as string
-                  const mime = result.startsWith('data:') ? result.split(':')[1].split(';')[0] : 'unknown'
-                  console.log(`[IMG-UPLOAD] Pre-upload MIME: ${mime} file=${file.name} size=${(file.size/1024).toFixed(0)}KB`)
-                  resolve(result)
-                }
-                reader.onerror = reject
-                reader.readAsDataURL(file)
-              })
+        // ── Multipart upload — works on iOS Chrome, Android, all WKWebView ──────────
+        // Browser-side canvas / FileReader / base64 all fail on iOS WKWebView for
+        // large or HEIC files. FormData sends raw bytes straight to the server.
+        // Server detects format via magic bytes, converts HEIC→JPEG with pillow-heif.
+        // This is exactly how Tasklet handles uploads — zero browser conversion.
+        console.log(`[IMG-UPLOAD] Multipart: ${file.name} ${(file.size / 1024 / 1024).toFixed(1)}MB type=${file.type}`)
+        const formData = new FormData()
+        formData.append('file', file)
+        formData.append('filename', file.name)
+        try {
+          const result = await api.sessionFiles.uploadMultipart(sessionId, formData)
+          addSessionFile(result)
+          toast.success(`${file.name} uploaded OK`)
+          return result
+        } catch (e: any) {
+          const detail = (e as any)?.response?.status ? `HTTP ${(e as any).response.status}` : (e as Error).message
+          toast.error(`UPLOAD FAILED ${file.name}: ${detail}`)
+          console.error('[IMG-UPLOAD] multipart error:', e)
+          return null
         }
-        uploadBody = { filename: file.name, content: '', base64_data: base64Data, language, file_type: 'image' }
       } else if (isBinary) {
         // PDF or Excel — read as base64, let backend extract text
         const base64Data = await new Promise<string>((resolve, reject) => {
