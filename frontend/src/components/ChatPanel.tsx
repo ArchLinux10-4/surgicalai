@@ -648,38 +648,33 @@ export function ChatPanel() {
 
 
   // ── Image compression ─────────────────────────────────
-  // Compresses images > 1.5 MB before upload to avoid payload-too-large errors.
-  // Resizes to max 1500×1500, JPEG quality 0.85. SVGs are passed through as-is.
-  const compressImage = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      // SVGs skip canvas entirely
-      if (file.name.toLowerCase().endsWith('.svg')) {
+  // Compresses images > 1.5 MB before upload to avoid 413 errors on Railway.
+  // Resizes to max 1500×1500, JPEG 0.85. SVGs pass through unchanged.
+  //
+  // iOS-specific fixes (researched from MDN, Stack Overflow, WebKit bug tracker):
+  //   1. accept="image/*" on the file input triggers OS-level HEIC→JPEG conversion
+  //   2. createImageBitmap() decodes in a worker thread — no base64 spike, handles
+  //      HEIC on iOS 15+ (Safari 15+). Primary path.
+  //   3. img.decode() waits for full GPU decode. img.onload fires too early on
+  //      iOS WebKit — drawImage sees a 0×0 bitmap → toBlob returns null.
+  //   4. Full fallback chain: createImageBitmap → objectURL+decode → raw send
+  const compressImage = async (file: File): Promise<string> => {
+    // SVGs skip canvas entirely
+    if (file.name.toLowerCase().endsWith('.svg') || file.type === 'image/svg+xml') {
+      return new Promise<string>((resolve, reject) => {
         const r = new FileReader()
-        r.onload = () => resolve(r.result as string)
+        r.onload  = () => resolve(r.result as string)
         r.onerror = reject
         r.readAsDataURL(file)
-        return
-      }
+      })
+    }
 
-      // Use object URL (not FileReader base64) as img.src — avoids allocating a
-      // 4–10 MB string in memory, which kills canvas on iOS WebKit (Chrome/Safari)
-      const objectUrl = URL.createObjectURL(file)
-      const img = new Image()
+    const MAX = 1500
 
-      const fallbackToRaw = () => {
-        URL.revokeObjectURL(objectUrl)
-        const r = new FileReader()
-        r.onload = () => resolve(r.result as string)
-        r.onerror = reject
-        r.readAsDataURL(file)
-      }
-
-      img.onerror = fallbackToRaw  // can't decode → send original, let backend handle it
-
-      img.onload = () => {
-        URL.revokeObjectURL(objectUrl)
-        const MAX = 1500
-        let { width, height } = img
+    // Draw any decoded image source onto a canvas, encode to JPEG blob → data URL
+    const encodeViaCanvas = (source: CanvasImageSource, w: number, h: number): Promise<string | null> =>
+      new Promise((resolve) => {
+        let width = w, height = h
         if (width > MAX || height > MAX) {
           const ratio = Math.min(MAX / width, MAX / height)
           width  = Math.round(width  * ratio)
@@ -689,25 +684,67 @@ export function ChatPanel() {
         canvas.width  = width
         canvas.height = height
         const ctx = canvas.getContext('2d')
-        if (!ctx) { fallbackToRaw(); return }  // iOS low-memory: context unavailable
-        ctx.drawImage(img, 0, 0, width, height)
+        if (!ctx) { resolve(null); return }
+        try { ctx.drawImage(source as any, 0, 0, width, height) } catch { resolve(null); return }
 
-        // toBlob is more memory-efficient than toDataURL on iOS WebKit
         canvas.toBlob((blob) => {
           if (!blob) {
-            // toBlob returned null (iOS edge case) — try toDataURL then give up
-            try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { fallbackToRaw() }
+            // toBlob null → try toDataURL as secondary attempt
+            try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { resolve(null) }
             return
           }
           const r = new FileReader()
           r.onload  = () => resolve(r.result as string)
-          r.onerror = () => { try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { fallbackToRaw() } }
+          r.onerror = () => { try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { resolve(null) } }
           r.readAsDataURL(blob)
         }, 'image/jpeg', 0.85)
-      }
+      })
 
+    // Last-resort: send the original file unchanged (may be large)
+    const readRaw = (): Promise<string> =>
+      new Promise<string>((resolve, reject) => {
+        const r = new FileReader()
+        r.onload  = () => resolve(r.result as string)
+        r.onerror = reject
+        r.readAsDataURL(file)
+      })
+
+    // ── Path 1: createImageBitmap ─────────────────────────────────────────────
+    // Chrome 54+, Firefox 42+, Safari 15 / iOS 15+.
+    // Decodes in a worker thread — no large base64 string in JS heap.
+    // Handles HEIC natively on iOS 15+ (OS converts before handing to WebKit).
+    if (typeof createImageBitmap === 'function') {
+      try {
+        const bitmap = await createImageBitmap(file)
+        const result = await encodeViaCanvas(bitmap, bitmap.width, bitmap.height)
+        bitmap.close() // release GPU memory immediately
+        if (result) return result
+      } catch {
+        // createImageBitmap unsupported for this format (e.g. HEIC on iOS 14) — fall through
+      }
+    }
+
+    // ── Path 2: objectURL + img.decode() ─────────────────────────────────────
+    // iOS Safari 14, older WebKit. img.decode() blocks until full GPU decode —
+    // unlike img.onload which fires before the bitmap is ready for drawImage.
+    const objectUrl = URL.createObjectURL(file)
+    try {
+      const img = new Image()
       img.src = objectUrl
-    })
+      if (typeof img.decode === 'function') {
+        await img.decode() // guaranteed fully decoded before drawImage
+      } else {
+        await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = () => rej(new Error('load')) })
+      }
+      URL.revokeObjectURL(objectUrl)
+      const result = await encodeViaCanvas(img, img.naturalWidth, img.naturalHeight)
+      if (result) return result
+    } catch {
+      URL.revokeObjectURL(objectUrl)
+    }
+
+    // ── Path 3: raw fallback ──────────────────────────────────────────────────
+    return readRaw()
   }
 
   // ── File upload ───────────────────────────────────────
@@ -1027,7 +1064,7 @@ export function ChatPanel() {
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.json,.yaml,.yml,.toml,.md,.sh,.sql,.cpp,.c,.h,.png,.jpg,.jpeg,.webp,.gif,.bmp,.pdf,.csv,.xlsx,.xls,.txt,.zip"
+        accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.json,.yaml,.yml,.toml,.md,.sh,.sql,.cpp,.c,.h,image/*,.pdf,.csv,.xlsx,.xls,.txt,.zip"
         className="hidden"
         onChange={handleFileInput}
       />
