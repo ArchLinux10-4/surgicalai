@@ -8,7 +8,6 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAppStore } from '../../stores/appStore'
 import { api } from '../../api/client'
-import { toast } from '../../lib/toast'
 import { MobileDiffCard } from './MobileDiffCard'
 import { VoiceButton } from '../VoiceButton'
 import { useCodeRain } from '../../hooks/useCodeRain'
@@ -526,7 +525,6 @@ export function MobileChatPanel() {
           formData.append('filename', file.name)
           const result = await api.sessionFiles.uploadMultipart(sessionId, formData)
           addSessionFile(result)
-          toast.success(`${file.name} uploaded`)
         } else if (isBinary) {
           // ── PDF / Excel: base64 encode ──────────────────────────────────
           const base64Data = await new Promise<string>((resolve, reject) => {
@@ -539,17 +537,15 @@ export function MobileChatPanel() {
           const body = { filename: file.name, content: '', base64_data: base64Data, file_type: fileType }
           const result = await api.sessionFiles.upload(sessionId, body as any)
           addSessionFile(result)
-          toast.success(`${file.name} uploaded`)
         } else {
           // ── Text / code: existing behavior ──────────────────────────────
           const content = await file.text()
           const body = { filename: file.name, content }
           const result = await api.sessionFiles.upload(sessionId, body)
           addSessionFile(result)
-          toast.success(`${file.name} uploaded`)
         }
       } catch (e: any) {
-        toast.error(`Upload failed: ${file.name}`)
+        console.error(`Upload failed: ${file.name}`, e)
       }
     }
   }
