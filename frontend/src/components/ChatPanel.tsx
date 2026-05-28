@@ -827,12 +827,23 @@ export function ChatPanel() {
       let uploadBody: { filename: string; content: string; language?: string; base64_data?: string; file_type?: string }
 
       if (isImage) {
-        // Compress if > 1.5 MB to avoid 413 on Railway (camera photos can be 5–10 MB)
-        const base64Data = file.size > 1.5 * 1024 * 1024
+        // HEIC/HEIF must always go through canvas compression so they exit as JPEG.
+        // Claude vision only supports JPEG, PNG, GIF, WEBP — HEIC is rejected by the API.
+        // Also compress files > 1.5 MB to avoid 413 on Railway (camera photos can be 5–10 MB).
+        const isHeicFile = file.type === 'image/heic' || file.type === 'image/heif' ||
+                           ext === 'heic' || ext === 'heif'
+        const needsCompression = file.size > 1.5 * 1024 * 1024 || isHeicFile
+        const base64Data = needsCompression
           ? await compressImage(file)
           : await new Promise<string>((resolve, reject) => {
               const reader = new FileReader()
-              reader.onload = () => resolve(reader.result as string)
+              reader.onload = () => {
+                const result = reader.result as string
+                // Log the exact MIME type being stored so Railway logs can confirm format
+                const mime = result.startsWith('data:') ? result.split(':')[1].split(';')[0] : 'unknown'
+                console.log(`[IMG-UPLOAD] Pre-upload MIME: ${mime} file=${file.name} size=${(file.size/1024).toFixed(0)}KB`)
+                resolve(result)
+              }
               reader.onerror = reject
               reader.readAsDataURL(file)
             })

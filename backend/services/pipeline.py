@@ -4191,9 +4191,11 @@ USER REQUEST:
 
                 # Build user content for Claude (images use different format)
                 if image_files:
+                    _CLAUDE_VISION_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
                     user_content = [{"type": "text", "text": _react_context}]
                     for img_sf in image_files:
                         img_data = img_sf["content"]
+                        _fname = img_sf.get("filename", "unknown")
                         if img_data.startswith("data:"):
                             parts = img_data.split(",", 1)
                             media_type = parts[0].split(":")[1].split(";")[0]
@@ -4205,6 +4207,15 @@ USER REQUEST:
                                         "gif": "image/gif"}
                             media_type = mime_map.get(ext, "image/png")
                             b64_data = img_data
+                        logger.info(
+                            f"[pipeline:smart] Vision block: file={_fname!r} media_type={media_type!r} "
+                            f"b64_len={len(b64_data)} data_url_valid={img_data.startswith('data:')}"
+                        )
+                        if media_type not in _CLAUDE_VISION_TYPES:
+                            logger.warning(
+                                f"[pipeline:smart] Unsupported media type {media_type!r} for {_fname!r} — skipping vision block"
+                            )
+                            continue
                         user_content.append({
                             "type": "image",
                             "source": {"type": "base64", "media_type": media_type,
@@ -6788,12 +6799,17 @@ async def run_natural_pipeline_stream(
             if sf.get("file_type") == "image"
         ]
 
+        # Claude vision only supports these media types. HEIC/HEIF is NOT supported.
+        CLAUDE_VISION_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
         if image_files:
             # Multipart content: text first, then each image block
             user_content: list = [{"type": "text", "text": user_request}]
             for img_sf in image_files:
                 img_data = img_sf.get("content", "")
+                fname = img_sf.get("filename", "unknown")
                 if not img_data:
+                    logger.warning(f"[pipeline:natural] No content for image file {fname!r} — skipping vision block")
                     continue
                 if img_data.startswith("data:"):
                     # data URL: "data:image/png;base64,<data>"
@@ -6809,6 +6825,25 @@ async def run_natural_pipeline_stream(
                     }
                     media_type = mime_map.get(ext, "image/png")
                     b64 = img_data
+
+                logger.info(
+                    f"[pipeline:natural] Vision block: file={fname!r} media_type={media_type!r} "
+                    f"b64_len={len(b64)} data_url_valid={img_data.startswith('data:')}"
+                )
+
+                if media_type not in CLAUDE_VISION_TYPES:
+                    logger.warning(
+                        f"[pipeline:natural] Unsupported media type {media_type!r} for {fname!r}. "
+                        f"Claude supports: {CLAUDE_VISION_TYPES}. Skipping vision block — "
+                        f"user should re-upload as JPEG or PNG."
+                    )
+                    # Append a text note so Claude knows the image exists but can't be seen
+                    user_content[0]["text"] += (
+                        f"\n\n[Image '{fname}' was uploaded as {media_type} which Claude cannot process visually. "
+                        f"Please ask the user to re-upload as JPEG or PNG.]"
+                    )
+                    continue
+
                 user_content.append({
                     "type": "image",
                     "source": {"type": "base64", "media_type": media_type, "data": b64},
