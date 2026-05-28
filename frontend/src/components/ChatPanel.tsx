@@ -659,6 +659,11 @@ export function ChatPanel() {
   //      iOS WebKit — drawImage sees a 0×0 bitmap → toBlob returns null.
   //   4. Full fallback chain: createImageBitmap → objectURL+decode → raw send
   const compressImage = async (file: File): Promise<string> => {
+    // Debug helper — visible on iOS without dev tools
+    const _dbg = (msg: string) => { console.log(`[IMG-UPLOAD] ${msg}`); toast(msg, { duration: 4000 }) }
+
+    _dbg(`Start: ${file.name} ${(file.size / 1024 / 1024).toFixed(1)}MB type=${file.type}`)
+
     // SVGs skip canvas entirely
     if (file.name.toLowerCase().endsWith('.svg') || file.type === 'image/svg+xml') {
       return new Promise<string>((resolve, reject) => {
@@ -680,19 +685,21 @@ export function ChatPanel() {
           width  = Math.round(width  * ratio)
           height = Math.round(height * ratio)
         }
+        _dbg(`Canvas: ${width}x${height}`)
         const canvas = document.createElement('canvas')
         canvas.width  = width
         canvas.height = height
         const ctx = canvas.getContext('2d')
-        if (!ctx) { resolve(null); return }
-        try { ctx.drawImage(source as any, 0, 0, width, height) } catch { resolve(null); return }
+        if (!ctx) { _dbg('Canvas ctx FAILED'); resolve(null); return }
+        try { ctx.drawImage(source as any, 0, 0, width, height) } catch (e: any) { _dbg(`drawImage FAILED: ${e.message}`); resolve(null); return }
 
         canvas.toBlob((blob) => {
           if (!blob) {
-            // toBlob null → try toDataURL as secondary attempt
+            _dbg('toBlob returned null — trying toDataURL')
             try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { resolve(null) }
             return
           }
+          _dbg(`toBlob OK: ${(blob.size / 1024).toFixed(0)}KB`)
           const r = new FileReader()
           r.onload  = () => resolve(r.result as string)
           r.onerror = () => { try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { resolve(null) } }
@@ -703,43 +710,49 @@ export function ChatPanel() {
     // Last-resort: send the original file unchanged (may be large)
     const readRaw = (): Promise<string> =>
       new Promise<string>((resolve, reject) => {
+        _dbg('Using RAW fallback (no compression)')
         const r = new FileReader()
-        r.onload  = () => resolve(r.result as string)
-        r.onerror = reject
+        r.onload  = () => { _dbg(`Raw read OK: ${((r.result as string).length / 1024).toFixed(0)}KB`); resolve(r.result as string) }
+        r.onerror = (e) => { _dbg(`Raw read FAILED: ${e}`); reject(e) }
         r.readAsDataURL(file)
       })
 
     // ── Path 1: createImageBitmap ─────────────────────────────────────────────
-    // Chrome 54+, Firefox 42+, Safari 15 / iOS 15+.
-    // Decodes in a worker thread — no large base64 string in JS heap.
-    // Handles HEIC natively on iOS 15+ (OS converts before handing to WebKit).
     if (typeof createImageBitmap === 'function') {
       try {
+        _dbg('Path1: createImageBitmap...')
         const bitmap = await createImageBitmap(file)
+        _dbg(`Bitmap: ${bitmap.width}x${bitmap.height}`)
         const result = await encodeViaCanvas(bitmap, bitmap.width, bitmap.height)
-        bitmap.close() // release GPU memory immediately
-        if (result) return result
-      } catch {
-        // createImageBitmap unsupported for this format (e.g. HEIC on iOS 14) — fall through
+        bitmap.close()
+        if (result) { _dbg(`Path1 OK: ${(result.length / 1024).toFixed(0)}KB`); return result }
+        _dbg('Path1: encodeViaCanvas returned null')
+      } catch (e: any) {
+        _dbg(`Path1 FAILED: ${e.message}`)
       }
+    } else {
+      _dbg('createImageBitmap not available')
     }
 
     // ── Path 2: objectURL + img.decode() ─────────────────────────────────────
-    // iOS Safari 14, older WebKit. img.decode() blocks until full GPU decode —
-    // unlike img.onload which fires before the bitmap is ready for drawImage.
+    _dbg('Path2: objectURL + decode...')
     const objectUrl = URL.createObjectURL(file)
     try {
       const img = new Image()
       img.src = objectUrl
       if (typeof img.decode === 'function') {
-        await img.decode() // guaranteed fully decoded before drawImage
+        await img.decode()
+        _dbg(`Decoded: ${img.naturalWidth}x${img.naturalHeight}`)
       } else {
         await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = () => rej(new Error('load')) })
+        _dbg(`Loaded: ${img.naturalWidth}x${img.naturalHeight}`)
       }
       URL.revokeObjectURL(objectUrl)
       const result = await encodeViaCanvas(img, img.naturalWidth, img.naturalHeight)
-      if (result) return result
-    } catch {
+      if (result) { _dbg(`Path2 OK: ${(result.length / 1024).toFixed(0)}KB`); return result }
+      _dbg('Path2: encodeViaCanvas returned null')
+    } catch (e: any) {
+      _dbg(`Path2 FAILED: ${e.message}`)
       URL.revokeObjectURL(objectUrl)
     }
 
@@ -837,11 +850,16 @@ export function ChatPanel() {
       }
 
       try {
+        const payloadSize = JSON.stringify(uploadBody).length
+        toast(`Sending ${file.name} (${(payloadSize / 1024).toFixed(0)}KB payload)...`, { duration: 3000 })
         const result = await api.sessionFiles.upload(sessionId, uploadBody)
         addSessionFile(result)
+        toast.success(`${file.name} uploaded OK`)
         return result
       } catch (e: any) {
-        toast.error(`Failed to upload ${file.name}: ${e.message}`)
+        const detail = e?.response?.status ? `HTTP ${e.response.status}` : e.message
+        toast.error(`UPLOAD FAILED ${file.name}: ${detail}`)
+        console.error('[IMG-UPLOAD] fetch error:', e)
         return null
       }
     })
