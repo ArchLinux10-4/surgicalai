@@ -660,7 +660,7 @@ export function ChatPanel() {
   //   4. Full fallback chain: createImageBitmap → objectURL+decode → raw send
   const compressImage = async (file: File): Promise<string> => {
     // Debug helper — visible on iOS without dev tools
-    const _dbg = (msg: string) => { console.log(`[IMG-UPLOAD] ${msg}`); toast(msg, { duration: 4000 }) }
+    const _dbg = (msg: string) => { console.log(`[IMG-UPLOAD] ${msg}`); toast.info(msg) }
 
     _dbg(`Start: ${file.name} ${(file.size / 1024 / 1024).toFixed(1)}MB type=${file.type}`)
 
@@ -851,7 +851,7 @@ export function ChatPanel() {
 
       try {
         const payloadSize = JSON.stringify(uploadBody).length
-        toast(`Sending ${file.name} (${(payloadSize / 1024).toFixed(0)}KB payload)...`, { duration: 3000 })
+        toast.info(`Sending ${file.name} (${(payloadSize / 1024).toFixed(0)}KB payload)...`)
         const result = await api.sessionFiles.upload(sessionId, uploadBody)
         addSessionFile(result)
         toast.success(`${file.name} uploaded OK`)
