@@ -652,32 +652,61 @@ export function ChatPanel() {
   // Resizes to max 1500×1500, JPEG quality 0.85. SVGs are passed through as-is.
   const compressImage = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
-      const reader = new FileReader()
-      reader.onerror = reject
-      reader.onload = () => {
-        const dataUrl = reader.result as string
-        // SVGs don't need compression
-        if (file.name.toLowerCase().endsWith('.svg')) { resolve(dataUrl); return }
-        const img = new Image()
-        img.onerror = reject
-        img.onload = () => {
-          const MAX = 1500
-          let { width, height } = img
-          if (width > MAX || height > MAX) {
-            const ratio = Math.min(MAX / width, MAX / height)
-            width = Math.round(width * ratio)
-            height = Math.round(height * ratio)
-          }
-          const canvas = document.createElement('canvas')
-          canvas.width = width
-          canvas.height = height
-          const ctx = canvas.getContext('2d')!
-          ctx.drawImage(img, 0, 0, width, height)
-          resolve(canvas.toDataURL('image/jpeg', 0.85))
-        }
-        img.src = dataUrl
+      // SVGs skip canvas entirely
+      if (file.name.toLowerCase().endsWith('.svg')) {
+        const r = new FileReader()
+        r.onload = () => resolve(r.result as string)
+        r.onerror = reject
+        r.readAsDataURL(file)
+        return
       }
-      reader.readAsDataURL(file)
+
+      // Use object URL (not FileReader base64) as img.src — avoids allocating a
+      // 4–10 MB string in memory, which kills canvas on iOS WebKit (Chrome/Safari)
+      const objectUrl = URL.createObjectURL(file)
+      const img = new Image()
+
+      const fallbackToRaw = () => {
+        URL.revokeObjectURL(objectUrl)
+        const r = new FileReader()
+        r.onload = () => resolve(r.result as string)
+        r.onerror = reject
+        r.readAsDataURL(file)
+      }
+
+      img.onerror = fallbackToRaw  // can't decode → send original, let backend handle it
+
+      img.onload = () => {
+        URL.revokeObjectURL(objectUrl)
+        const MAX = 1500
+        let { width, height } = img
+        if (width > MAX || height > MAX) {
+          const ratio = Math.min(MAX / width, MAX / height)
+          width  = Math.round(width  * ratio)
+          height = Math.round(height * ratio)
+        }
+        const canvas = document.createElement('canvas')
+        canvas.width  = width
+        canvas.height = height
+        const ctx = canvas.getContext('2d')
+        if (!ctx) { fallbackToRaw(); return }  // iOS low-memory: context unavailable
+        ctx.drawImage(img, 0, 0, width, height)
+
+        // toBlob is more memory-efficient than toDataURL on iOS WebKit
+        canvas.toBlob((blob) => {
+          if (!blob) {
+            // toBlob returned null (iOS edge case) — try toDataURL then give up
+            try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { fallbackToRaw() }
+            return
+          }
+          const r = new FileReader()
+          r.onload  = () => resolve(r.result as string)
+          r.onerror = () => { try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { fallbackToRaw() } }
+          r.readAsDataURL(blob)
+        }, 'image/jpeg', 0.85)
+      }
+
+      img.src = objectUrl
     })
   }
 
