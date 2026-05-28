@@ -646,121 +646,6 @@ export function ChatPanel() {
     return s.id
   }
 
-
-  // ── Image compression ─────────────────────────────────
-  // Compresses images > 1.5 MB before upload to avoid 413 errors on Railway.
-  // Resizes to max 1500×1500, JPEG 0.85. SVGs pass through unchanged.
-  //
-  // iOS-specific fixes (researched from MDN, Stack Overflow, WebKit bug tracker):
-  //   1. accept="image/*" on the file input triggers OS-level HEIC→JPEG conversion
-  //   2. createImageBitmap() decodes in a worker thread — no base64 spike, handles
-  //      HEIC on iOS 15+ (Safari 15+). Primary path.
-  //   3. img.decode() waits for full GPU decode. img.onload fires too early on
-  //      iOS WebKit — drawImage sees a 0×0 bitmap → toBlob returns null.
-  //   4. Full fallback chain: createImageBitmap → objectURL+decode → raw send
-  const compressImage = async (file: File): Promise<string> => {
-    // Debug helper — visible on iOS without dev tools
-    const _dbg = (msg: string) => { console.log(`[IMG-UPLOAD] ${msg}`) }
-    const _err = (msg: string) => { console.warn(`[IMG-UPLOAD] ${msg}`); toast.error(msg) }
-
-    _dbg(`Start: ${file.name} ${(file.size / 1024 / 1024).toFixed(1)}MB type=${file.type}`)
-
-    // SVGs skip canvas entirely
-    if (file.name.toLowerCase().endsWith('.svg') || file.type === 'image/svg+xml') {
-      return new Promise<string>((resolve, reject) => {
-        const r = new FileReader()
-        r.onload  = () => resolve(r.result as string)
-        r.onerror = reject
-        r.readAsDataURL(file)
-      })
-    }
-
-    const MAX = 1500
-
-    // Draw any decoded image source onto a canvas, encode to JPEG blob → data URL
-    const encodeViaCanvas = (source: CanvasImageSource, w: number, h: number): Promise<string | null> =>
-      new Promise((resolve) => {
-        let width = w, height = h
-        if (width > MAX || height > MAX) {
-          const ratio = Math.min(MAX / width, MAX / height)
-          width  = Math.round(width  * ratio)
-          height = Math.round(height * ratio)
-        }
-        _dbg(`Canvas: ${width}x${height}`)
-        const canvas = document.createElement('canvas')
-        canvas.width  = width
-        canvas.height = height
-        const ctx = canvas.getContext('2d')
-        if (!ctx) { _err('Canvas context unavailable'); resolve(null); return }
-        try { ctx.drawImage(source as any, 0, 0, width, height) } catch (e: any) { _err(`drawImage failed: ${e.message}`); resolve(null); return }
-
-        canvas.toBlob((blob) => {
-          if (!blob) {
-            _dbg('toBlob returned null — falling back to toDataURL')
-            try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { resolve(null) }
-            return
-          }
-          _dbg(`toBlob OK: ${(blob.size / 1024).toFixed(0)}KB`)
-          const r = new FileReader()
-          r.onload  = () => resolve(r.result as string)
-          r.onerror = () => { try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { resolve(null) } }
-          r.readAsDataURL(blob)
-        }, 'image/jpeg', 0.85)
-      })
-
-    // Last-resort: send the original file unchanged (may be large)
-    const readRaw = (): Promise<string> =>
-      new Promise<string>((resolve, reject) => {
-        _dbg('Using RAW fallback (no compression)')
-        const r = new FileReader()
-        r.onload  = () => { _dbg(`Raw read OK: ${((r.result as string).length / 1024).toFixed(0)}KB`); resolve(r.result as string) }
-        r.onerror = (e) => { _err(`Raw read failed: ${e}`); reject(e) }
-        r.readAsDataURL(file)
-      })
-
-    // ── Path 1: createImageBitmap ─────────────────────────────────────────────
-    if (typeof createImageBitmap === 'function') {
-      try {
-        _dbg('Path1: createImageBitmap...')
-        const bitmap = await createImageBitmap(file)
-        _dbg(`Bitmap: ${bitmap.width}x${bitmap.height}`)
-        const result = await encodeViaCanvas(bitmap, bitmap.width, bitmap.height)
-        bitmap.close()
-        if (result) { _dbg(`Path1 OK: ${(result.length / 1024).toFixed(0)}KB`); return result }
-        _dbg('Path1: encodeViaCanvas returned null')
-      } catch (e: any) {
-        _dbg(`createImageBitmap path failed: ${e.message}`)
-      }
-    } else {
-      _dbg('createImageBitmap not available')
-    }
-
-    // ── Path 2: objectURL + img.decode() ─────────────────────────────────────
-    _dbg('Path2: objectURL + decode...')
-    const objectUrl = URL.createObjectURL(file)
-    try {
-      const img = new Image()
-      img.src = objectUrl
-      if (typeof img.decode === 'function') {
-        await img.decode()
-        _dbg(`Decoded: ${img.naturalWidth}x${img.naturalHeight}`)
-      } else {
-        await new Promise<void>((res, rej) => { img.onload = () => res(); img.onerror = () => rej(new Error('load')) })
-        _dbg(`Loaded: ${img.naturalWidth}x${img.naturalHeight}`)
-      }
-      URL.revokeObjectURL(objectUrl)
-      const result = await encodeViaCanvas(img, img.naturalWidth, img.naturalHeight)
-      if (result) { _dbg(`Path2 OK: ${(result.length / 1024).toFixed(0)}KB`); return result }
-      _dbg('Path2: encodeViaCanvas returned null')
-    } catch (e: any) {
-      _dbg(`Path2 FAILED: ${e.message}`)
-      URL.revokeObjectURL(objectUrl)
-    }
-
-    // ── Path 3: raw fallback ──────────────────────────────────────────────────
-    return readRaw()
-  }
-
   // ── File upload ───────────────────────────────────────
   const uploadFiles = useCallback(async (fileList: FileList | File[]) => {
     // Convert FileList → Array SYNCHRONOUSLY before any awaits.
@@ -820,36 +705,33 @@ export function ChatPanel() {
       const BINARY_EXTS = ['pdf', 'xlsx', 'xls']
       let isImage = !!(file.type && file.type.startsWith('image/')) || IMAGE_EXTS.includes(ext)
       const isBinary = BINARY_EXTS.includes(ext)
-      // Track the effective MIME — may be overridden by magic byte detection below
       let detectedMime = file.type || ''
 
+      // ── DIAGNOSTIC TOAST — visible on device screen ─────────────────────────
+      // Shows raw file properties so we can see exactly what iOS Chrome sends.
+      // Remove after the iOS upload bug is fixed.
+      toast.info(`📁 ${file.name}`, `type="${file.type}" ext="${ext}" img=${isImage}`)
+
       // ── Magic byte fallback ────────────────────────────────────────────────
-      // iOS Safari / Chrome WKWebView delivers images as "TempImage" with no
-      // extension and empty file.type — both MIME and extension checks fail,
-      // routing the file through file.text() which produces NUL-laced binary.
-      // Reading the first 12 bytes and matching known image signatures catches
-      // all of these cases before they hit the text path.
       if (!isImage && !isBinary) {
         try {
           const hdr = new Uint8Array(await file.slice(0, 12).arrayBuffer())
-          // JPEG: FF D8 FF
           if (hdr[0] === 0xFF && hdr[1] === 0xD8 && hdr[2] === 0xFF) {
             isImage = true; detectedMime = 'image/jpeg'
-          // PNG: 89 50 4E 47
           } else if (hdr[0] === 0x89 && hdr[1] === 0x50 && hdr[2] === 0x4E && hdr[3] === 0x47) {
             isImage = true; detectedMime = 'image/png'
-          // GIF: 47 49 46 38
           } else if (hdr[0] === 0x47 && hdr[1] === 0x49 && hdr[2] === 0x46 && hdr[3] === 0x38) {
             isImage = true; detectedMime = 'image/gif'
-          // WebP: RIFF....WEBP
           } else if (hdr[0] === 0x52 && hdr[1] === 0x49 && hdr[2] === 0x46 && hdr[3] === 0x46 &&
                      hdr[8] === 0x57 && hdr[9] === 0x45 && hdr[10] === 0x42 && hdr[11] === 0x50) {
             isImage = true; detectedMime = 'image/webp'
-          // HEIC/HEIF: ....ftyp at bytes 4-7
           } else if (hdr[4] === 0x66 && hdr[5] === 0x74 && hdr[6] === 0x79 && hdr[7] === 0x70) {
             isImage = true; detectedMime = 'image/heic'
           }
-          if (isImage) console.log(`[IMG-UPLOAD] Magic bytes → ${detectedMime} for "${file.name}"`)
+          if (isImage) {
+            toast.info(`🔬 Magic bytes → ${detectedMime}`)
+            console.log(`[IMG-UPLOAD] Magic bytes → ${detectedMime} for "${file.name}"`)
+          }
         } catch (e: any) {
           console.warn(`[IMG-UPLOAD] Magic byte check failed: ${e.message}`)
         }
@@ -858,11 +740,8 @@ export function ChatPanel() {
       let uploadBody: { filename: string; content: string; language?: string; base64_data?: string; file_type?: string }
 
       if (isImage) {
-        // ── Multipart upload — works on iOS Chrome, Android, all WKWebView ──────────
-        // Browser-side canvas / FileReader / base64 all fail on iOS WKWebView for
-        // large or HEIC files. FormData sends raw bytes straight to the server.
-        // Server detects format via magic bytes, converts HEIC→JPEG with pillow-heif.
-        // This is exactly how Tasklet handles uploads — zero browser conversion.
+        // ── Multipart upload ──────────────────────────────────────────────────
+        toast.info(`🚀 → MULTIPART path`)
         console.log(`[IMG-UPLOAD] Multipart: ${file.name} ${(file.size / 1024 / 1024).toFixed(1)}MB type=${file.type}`)
         const formData = new FormData()
         formData.append('file', file)
@@ -874,7 +753,7 @@ export function ChatPanel() {
           return result
         } catch (e: any) {
           const detail = (e as any)?.response?.status ? `HTTP ${(e as any).response.status}` : (e as Error).message
-          toast.error(`UPLOAD FAILED ${file.name}: ${detail}`)
+          toast.error(`MULTIPART FAILED: ${detail}`)
           console.error('[IMG-UPLOAD] multipart error:', e)
           return null
         }
@@ -889,6 +768,8 @@ export function ChatPanel() {
         const fileType = ext === 'pdf' ? 'pdf' : 'excel'
         uploadBody = { filename: file.name, content: '', base64_data: base64Data, language, file_type: fileType }
       } else {
+        // ── DIAGNOSTIC: should never reach here for images ────────────────────
+        toast.error(`⚠️ TEXT path for "${file.name}" (ext="${ext}" type="${file.type}")`)
         // Text / code — existing behavior
         const content = await file.text()
         uploadBody = { filename: file.name, content, language }
