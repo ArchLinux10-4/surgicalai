@@ -154,10 +154,13 @@ def upload_session_file(session_id: str, body: dict):
     language = body.get("language") or _get_language(filename)
 
     # Defensive logging — helps diagnose iOS/Android/edge-case uploads
+    _data_url_mime = ""
+    if base64_data and base64_data.startswith("data:") and ";" in base64_data:
+        _data_url_mime = base64_data.split(":")[1].split(";")[0]
     logger.info(
         f"[upload] session={session_id[:8]} filename={filename!r} type={file_type} "
         f"raw_len={len(raw_content)} base64_len={len(base64_data)} "
-        f"raw_has_nul={chr(0) in raw_content}"
+        f"data_url_mime={_data_url_mime!r} raw_has_nul={chr(0) in raw_content}"
     )
 
     # Process content based on file type
