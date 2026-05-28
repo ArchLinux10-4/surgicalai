@@ -4,6 +4,7 @@ Supports: code, images (vision), PDFs, CSV, Excel.
 import uuid
 import base64
 import io
+import logging
 from pathlib import Path
 import mimetypes
 from fastapi import APIRouter, HTTPException
@@ -11,10 +12,12 @@ from fastapi.responses import Response
 from database import get_db
 from services.ast_parser import ASTParser
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter()
 parser = ASTParser()
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg", ".heic", ".heif"}
 PDF_EXTENSIONS = {".pdf"}
 CSV_EXTENSIONS = {".csv"}
 EXCEL_EXTENSIONS = {".xlsx", ".xls"}
@@ -25,6 +28,18 @@ CODE_EXTENSIONS = {
     ".html", ".css", ".json", ".yaml", ".yml", ".md", ".sh", ".sql",
     ".toml", ".txt",
 }
+
+
+def _sanitize_for_postgres(s: str) -> str:
+    """Strip NUL (0x00) bytes — Postgres rejects them in TEXT columns.
+    Defense-in-depth: if the frontend ever ships binary bytes as text
+    (e.g. iOS HEIC misclassified), this prevents a 500."""
+    if not s:
+        return s
+    if "\x00" in s:
+        logger.warning(f"[session_files] Stripping NUL bytes from input (len={len(s)})")
+        return s.replace("\x00", "")
+    return s
 
 
 def _get_file_type(filename: str) -> str:
@@ -138,6 +153,13 @@ def upload_session_file(session_id: str, body: dict):
     file_type = body.get("file_type") or _get_file_type(filename)
     language = body.get("language") or _get_language(filename)
 
+    # Defensive logging — helps diagnose iOS/Android/edge-case uploads
+    logger.info(
+        f"[upload] session={session_id[:8]} filename={filename!r} type={file_type} "
+        f"raw_len={len(raw_content)} base64_len={len(base64_data)} "
+        f"raw_has_nul={chr(0) in raw_content}"
+    )
+
     # Process content based on file type
     if file_type == "image":
         # Store the base64 data URL directly — pipeline will use it for vision
@@ -165,6 +187,13 @@ def upload_session_file(session_id: str, body: dict):
             symbol_count = len(smap.symbols)
         except Exception:
             symbol_count = 0
+
+    # ── Defense-in-depth: strip NUL bytes before DB insert ──────────
+    # Postgres TEXT columns reject embedded \x00. iOS HEIC files
+    # read as text via file.text() produce NUL-laced strings that
+    # cause a 500 here. Sanitize filename + content unconditionally.
+    filename = _sanitize_for_postgres(filename)
+    content = _sanitize_for_postgres(content)
 
     conn = get_db()
     # Replace if same filename in same session
@@ -249,6 +278,9 @@ def update_session_file(session_id: str, file_id: str, body: dict):
         symbol_count = len(smap.symbols)
     except Exception:
         symbol_count = 0
+
+    new_content = _sanitize_for_postgres(new_content)
+    prev_content = _sanitize_for_postgres(prev_content)
 
     conn.execute(
         "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ?",

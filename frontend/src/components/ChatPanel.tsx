@@ -660,7 +660,8 @@ export function ChatPanel() {
   //   4. Full fallback chain: createImageBitmap → objectURL+decode → raw send
   const compressImage = async (file: File): Promise<string> => {
     // Debug helper — visible on iOS without dev tools
-    const _dbg = (msg: string) => { console.log(`[IMG-UPLOAD] ${msg}`); toast.info(msg) }
+    const _dbg = (msg: string) => { console.log(`[IMG-UPLOAD] ${msg}`) }
+    const _err = (msg: string) => { console.warn(`[IMG-UPLOAD] ${msg}`); toast.error(msg) }
 
     _dbg(`Start: ${file.name} ${(file.size / 1024 / 1024).toFixed(1)}MB type=${file.type}`)
 
@@ -690,12 +691,12 @@ export function ChatPanel() {
         canvas.width  = width
         canvas.height = height
         const ctx = canvas.getContext('2d')
-        if (!ctx) { _dbg('Canvas ctx FAILED'); resolve(null); return }
-        try { ctx.drawImage(source as any, 0, 0, width, height) } catch (e: any) { _dbg(`drawImage FAILED: ${e.message}`); resolve(null); return }
+        if (!ctx) { _err('Canvas context unavailable'); resolve(null); return }
+        try { ctx.drawImage(source as any, 0, 0, width, height) } catch (e: any) { _err(`drawImage failed: ${e.message}`); resolve(null); return }
 
         canvas.toBlob((blob) => {
           if (!blob) {
-            _dbg('toBlob returned null — trying toDataURL')
+            _dbg('toBlob returned null — falling back to toDataURL')
             try { resolve(canvas.toDataURL('image/jpeg', 0.85)) } catch { resolve(null) }
             return
           }
@@ -713,7 +714,7 @@ export function ChatPanel() {
         _dbg('Using RAW fallback (no compression)')
         const r = new FileReader()
         r.onload  = () => { _dbg(`Raw read OK: ${((r.result as string).length / 1024).toFixed(0)}KB`); resolve(r.result as string) }
-        r.onerror = (e) => { _dbg(`Raw read FAILED: ${e}`); reject(e) }
+        r.onerror = (e) => { _err(`Raw read failed: ${e}`); reject(e) }
         r.readAsDataURL(file)
       })
 
@@ -728,7 +729,7 @@ export function ChatPanel() {
         if (result) { _dbg(`Path1 OK: ${(result.length / 1024).toFixed(0)}KB`); return result }
         _dbg('Path1: encodeViaCanvas returned null')
       } catch (e: any) {
-        _dbg(`Path1 FAILED: ${e.message}`)
+        _dbg(`createImageBitmap path failed: ${e.message}`)
       }
     } else {
       _dbg('createImageBitmap not available')
@@ -815,9 +816,12 @@ export function ChatPanel() {
     const promises = files.map(async (file) => {
       const language = getLanguage(file.name)
       const ext = file.name.split('.').pop()?.toLowerCase() || ''
-      const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg']
+      const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'heic', 'heif']
       const BINARY_EXTS = ['pdf', 'xlsx', 'xls']
-      const isImage = IMAGE_EXTS.includes(ext)
+      // Primary: trust browser MIME type (catches iOS HEIC even with weird extensions).
+      // Fallback: extension list. This prevents binary image bytes from being read as text,
+      // which produces NUL bytes that Postgres rejects on INSERT.
+      const isImage = (file.type && file.type.startsWith('image/')) || IMAGE_EXTS.includes(ext)
       const isBinary = BINARY_EXTS.includes(ext)
 
       let uploadBody: { filename: string; content: string; language?: string; base64_data?: string; file_type?: string }
@@ -851,7 +855,7 @@ export function ChatPanel() {
 
       try {
         const payloadSize = JSON.stringify(uploadBody).length
-        toast.info(`Sending ${file.name} (${(payloadSize / 1024).toFixed(0)}KB payload)...`)
+        console.log(`[IMG-UPLOAD] Sending ${file.name} (${(payloadSize / 1024).toFixed(0)}KB)`)
         const result = await api.sessionFiles.upload(sessionId, uploadBody)
         addSessionFile(result)
         toast.success(`${file.name} uploaded OK`)
