@@ -1,4 +1,590 @@
-{"owner": "ArchLinux10-4", "repo": "surgicalai", "branch": "fix/ios-vision-logging", "commitMessage": "debug: elevate [upload] log to WARNING so filename shows in Railway", "files": [{
-  "repoPath": "backend/routers/session_files.py",
-  "content": "\"\"\"Per-session file storage — files uploaded to a chat stay in that chat.\nSupports: code, images (vision), PDFs, CSV, Excel.\n\"\"\"\nimport uuid\nimport base64\nimport io\nimport logging\nfrom pathlib import Path\nimport mimetypes\nfrom fastapi import APIRouter, HTTPException, File, UploadFile, Form\nfrom fastapi.responses import Response\nfrom database import get_db\nfrom services.ast_parser import ASTParser\n\nlogger = logging.getLogger(__name__)\n\nrouter = APIRouter()\nparser = ASTParser()\n\nIMAGE_EXTENSIONS = {\".png\", \".jpg\", \".jpeg\", \".webp\", \".gif\", \".bmp\", \".svg\", \".heic\", \".heif\"}\nPDF_EXTENSIONS = {\".pdf\"}\nCSV_EXTENSIONS = {\".csv\"}\nEXCEL_EXTENSIONS = {\".xlsx\", \".xls\"}\n\nCODE_EXTENSIONS = {\n    \".py\", \".js\", \".ts\", \".tsx\", \".jsx\", \".go\", \".rs\", \".java\", \".cs\",\n    \".cpp\", \".c\", \".h\", \".hpp\", \".rb\", \".php\", \".swift\", \".kt\",\n    \".html\", \".css\", \".json\", \".yaml\", \".yml\", \".md\", \".sh\", \".sql\",\n    \".toml\", \".txt\",\n}\n\n\ndef _sanitize_for_postgres(s: str) -> str:\n    \"\"\"Strip NUL (0x00) bytes — Postgres rejects them in TEXT columns.\"\"\"\n    if not s:\n        return s\n    if \"\\x00\" in s:\n        logger.warning(f\"[session_files] Stripping NUL bytes from input (len={len(s)})\")\n        return s.replace(\"\\x00\", \"\")\n    return s\n\n\ndef _get_file_type(filename: str) -> str:\n    ext = Path(filename).suffix.lower()\n    if ext in IMAGE_EXTENSIONS:\n        return \"image\"\n    if ext in PDF_EXTENSIONS:\n        return \"pdf\"\n    if ext in CSV_EXTENSIONS:\n        return \"csv\"\n    if ext in EXCEL_EXTENSIONS:\n        return \"excel\"\n    return \"code\"\n\n\ndef _get_language(filename: str) -> str:\n    ext = Path(filename).suffix.lower()\n    lang_map = {\n        \".py\": \"python\", \".js\": \"javascript\", \".ts\": \"typescript\",\n        \".jsx\": \"javascriptreact\", \".tsx\": \"typescriptreact\",\n        \".go\": \"go\", \".rs\": \"rust\", \".java\": \"java\", \".cs\": \"csharp\",\n        \".cpp\": \"cpp\", \".c\": \"c\", \".h\": \"c\", \".hpp\": \"cpp\",\n        \".rb\": \"ruby\", \".php\": \"php\", \".swift\": \"swift\", \".kt\": \"kotlin\",\n        \".html\": \"html\", \".css\": \"css\", \".json\": \"json\", \".yaml\": \"yaml\",\n        \".yml\": \"yaml\", \".md\": \"markdown\", \".sh\": \"bash\", \".sql\": \"sql\",\n        \".toml\": \"toml\", \".csv\": \"csv\", \".xlsx\": \"excel\", \".xls\": \"excel\",\n        \".pdf\": \"pdf\",\n    }\n    return lang_map.get(ext, \"plaintext\")\n\n\n_CLAUDE_SUPPORTED_MIME = {\"image/jpeg\", \"image/png\", \"image/gif\", \"image/webp\"}\n\n\ndef _detect_image_magic_bytes(data: bytes) -> str:\n    \"\"\"Return the detected image MIME type from the first 12 bytes, or '' if not an image.\"\"\"\n    if len(data) < 4:\n        return \"\"\n    if data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF:\n        return \"image/jpeg\"\n    if data[:4] == b\"\\x89PNG\":\n        return \"image/png\"\n    if data[:4] in (b\"GIF8\", b\"GIF9\"):\n        return \"image/gif\"\n    if data[:4] == b\"RIFF\" and len(data) >= 12 and data[8:12] == b\"WEBP\":\n        return \"image/webp\"\n    if len(data) >= 12 and data[4:8] == b\"ftyp\":\n        brand = data[8:12]\n        heic_brands = {\n            b\"heic\", b\"heix\", b\"hevc\", b\"hevx\", b\"heim\", b\"heis\",\n            b\"hevm\", b\"hevs\", b\"mif1\", b\"msf1\",\n        }\n        if brand in heic_brands:\n            return \"image/heic\"\n        if brand in {b\"avif\", b\"avis\"}:\n            return \"image/avif\"\n    if data[:2] == b\"BM\":\n        return \"image/bmp\"\n    return \"\"\n\n\ndef _normalize_image_for_claude(base64_data: str) -> str:\n    \"\"\"Convert any image format to a JPEG data URL that Claude API accepts.\"\"\"\n    if not base64_data:\n        return base64_data\n\n    src_mime = \"\"\n    b64 = base64_data\n    if \",\" in base64_data:\n        header, b64 = base64_data.split(\",\", 1)\n        if \":\" in header and \";\" in header:\n            src_mime = header.split(\":\")[1].split(\";\")[0].lower().strip()\n\n    try:\n        padded = b64 + \"==\" * ((4 - len(b64) % 4) % 4)\n        img_bytes = base64.b64decode(padded)\n    except Exception as e:\n        logger.warning(f\"[session_files] normalize_image: b64 decode failed: {e}\")\n        return base64_data\n\n    detected_mime = _detect_image_magic_bytes(img_bytes)\n    effective_mime = detected_mime or src_mime\n\n    logger.warning(\n        f\"[session_files] normalize_image: src_mime={src_mime!r} \"\n        f\"detected={detected_mime!r} size={len(img_bytes)} bytes\"\n    )\n\n    if src_mime in _CLAUDE_SUPPORTED_MIME and (not detected_mime or detected_mime in _CLAUDE_SUPPORTED_MIME):\n        logger.warning(f\"[session_files] normalize_image: {src_mime} already Claude-supported — no conversion\")\n        return base64_data\n\n    try:\n        if effective_mime in (\"image/heic\", \"image/heif\", \"image/avif\") or not detected_mime:\n            try:\n                import pillow_heif  # type: ignore\n                pillow_heif.register_heif_opener()\n                logger.warning(\"[session_files] pillow_heif registered for HEIC/HEIF conversion\")\n            except ImportError:\n                logger.warning(\n                    \"[session_files] pillow_heif not installed — HEIC conversion may fail.\"\n                )\n\n        from PIL import Image as PILImage  # type: ignore\n\n        img = PILImage.open(io.BytesIO(img_bytes))\n        w, h = img.size\n        logger.warning(f\"[session_files] PIL opened image: mode={img.mode} size={w}x{h}\")\n\n        if img.mode in (\"RGBA\", \"LA\", \"P\"):\n            bg = PILImage.new(\"RGB\", img.size, (255, 255, 255))\n            if img.mode == \"P\":\n                img = img.convert(\"RGBA\")\n            if img.mode in (\"RGBA\", \"LA\"):\n                bg.paste(img, mask=img.split()[-1])\n            else:\n                bg.paste(img)\n            img = bg\n        elif img.mode != \"RGB\":\n            img = img.convert(\"RGB\")\n\n        output = io.BytesIO()\n        img.save(output, format=\"JPEG\", quality=85, optimize=True)\n        jpeg_bytes = output.getvalue()\n        b64_out = base64.b64encode(jpeg_bytes).decode()\n\n        logger.warning(\n            f\"[session_files] Converted {effective_mime or 'unknown'} → JPEG \"\n            f\"({len(jpeg_bytes):,} bytes, {w}x{h})\"\n        )\n        return f\"data:image/jpeg;base64,{b64_out}\"\n\n    except Exception as e:\n        logger.warning(\n            f\"[session_files] Image normalization FAILED \"\n            f\"({type(e).__name__}: {e}) — storing original\"\n        )\n        return base64_data\n\n\ndef _extract_pdf_text(base64_data: str) -> str:\n    \"\"\"Extract text from a base64-encoded PDF using pdfplumber.\"\"\"\n    try:\n        import pdfplumber\n        if \",\" in base64_data:\n            base64_data = base64_data.split(\",\", 1)[1]\n        pdf_bytes = base64.b64decode(base64_data)\n        text_parts = []\n        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:\n            for i, page in enumerate(pdf.pages, 1):\n                text = page.extract_text()\n                if text:\n                    text_parts.append(f\"--- Page {i} ---\\n{text}\")\n                tables = page.extract_tables()\n                for table in tables:\n                    if table:\n                        rows = []\n                        for row in table:\n                            rows.append(\" | \".join(str(cell or \"\") for cell in row))\n                        text_parts.append(\"\\n\".join(rows))\n        return \"\\n\\n\".join(text_parts) if text_parts else \"(PDF has no extractable text)\"\n    except ImportError:\n        return \"(pdfplumber not installed — PDF text extraction unavailable)\"\n    except Exception as e:\n        return f\"(PDF extraction error: {e})\"\n\n\ndef _parse_csv_to_markdown(content: str) -> str:\n    \"\"\"Convert CSV text to a markdown table.\"\"\"\n    try:\n        import pandas as pd\n        df = pd.read_csv(io.StringIO(content))\n        if len(df) > 200:\n            preview = df.head(200)\n            md = preview.to_markdown(index=False)\n            md += f\"\\n\\n... [{len(df) - 200} more rows not shown]\"\n            return md\n        return df.to_markdown(index=False)\n    except ImportError:\n        return content\n    except Exception as e:\n        return f\"(CSV parse error: {e})\\n\\n{content[:2000]}\"\n\n\ndef _parse_excel_to_markdown(base64_data: str, filename: str) -> str:\n    \"\"\"Convert Excel file (base64) to markdown tables, one per sheet.\"\"\"\n    try:\n        import pandas as pd\n        if \",\" in base64_data:\n            base64_data = base64_data.split(\",\", 1)[1]\n        excel_bytes = base64.b64decode(base64_data)\n        xl = pd.ExcelFile(io.BytesIO(excel_bytes))\n        parts = []\n        for sheet_name in xl.sheet_names:\n            df = xl.parse(sheet_name)\n            if len(df) > 200:\n                preview = df.head(200)\n                md = preview.to_markdown(index=False)\n                md += f\"\\n\\n... [{len(df) - 200} more rows not shown]\"\n            else:\n                md = df.to_markdown(index=False)\n            parts.append(f\"### Sheet: {sheet_name}\\n\\n{md}\")\n        return \"\\n\\n\".join(parts)\n    except ImportError:\n        return \"(pandas/openpyxl not installed — Excel extraction unavailable)\"\n    except Exception as e:\n        return f\"(Excel parse error: {e})\"\n\n\n@router.post(\"/{session_id}/files\")\ndef upload_session_file(session_id: str, body: dict):\n    \"\"\"Upload a file to a chat session (legacy JSON path).\"\"\"\n    filename = body.get(\"filename\", \"untitled\")\n    raw_content = body.get(\"content\", \"\")\n    base64_data = body.get(\"base64_data\", \"\")\n    file_type = body.get(\"file_type\") or _get_file_type(filename)\n    language = body.get(\"language\") or _get_language(filename)\n\n    # ── DIAGNOSTIC: log at WARNING so it always appears in Railway logs ──────\n    _data_url_mime = \"\"\n    if base64_data and base64_data.startswith(\"data:\") and \";\" in base64_data:\n        _data_url_mime = base64_data.split(\":\")[1].split(\";\")[0]\n    logger.warning(\n        f\"[upload-json] session={session_id[:8]} filename={filename!r} \"\n        f\"file_type={file_type} raw_len={len(raw_content)} \"\n        f\"base64_len={len(base64_data)} data_url_mime={_data_url_mime!r} \"\n        f\"raw_has_nul={chr(0) in raw_content}\"\n    )\n\n    if file_type == \"image\":\n        raw_b64 = base64_data if base64_data else raw_content\n\n        if not base64_data and raw_content:\n            logger.warning(\n                f\"[upload-json] image via text path — filename={filename!r} \"\n                f\"raw_len={len(raw_content)} has_nul={chr(0) in raw_content}\"\n            )\n            cleaned = raw_content.replace(\"\\x00\", \"\")\n            try:\n                raw_bytes = cleaned.encode(\"latin-1\", errors=\"replace\")\n                detected = _detect_image_magic_bytes(raw_bytes)\n                logger.warning(f\"[upload-json] magic bytes after latin-1 encode: detected={detected!r} first4={raw_bytes[:4].hex()!r}\")\n                if detected:\n                    b64_attempt = base64.b64encode(raw_bytes).decode()\n                    raw_b64 = f\"data:{detected};base64,{b64_attempt}\"\n                    logger.warning(f\"[upload-json] Recovered binary image from text path: {detected}\")\n            except Exception as e:\n                logger.warning(f\"[upload-json] Binary recovery failed: {e}\")\n                raw_b64 = raw_content\n\n        content = _normalize_image_for_claude(raw_b64)\n        lines = 0\n        symbol_count = 0\n    elif file_type == \"pdf\":\n        content = _extract_pdf_text(base64_data)\n        lines = len(content.splitlines())\n        symbol_count = 0\n    elif file_type == \"csv\":\n        content = _parse_csv_to_markdown(raw_content)\n        lines = len(raw_content.splitlines())\n        symbol_count = 0\n    elif file_type == \"excel\":\n        content = _parse_excel_to_markdown(base64_data, filename)\n        lines = len(content.splitlines())\n        symbol_count = 0\n    else:\n        content = raw_content\n        lines = len(content.splitlines())\n        try:\n            smap = parser.parse(content, filename)\n            symbol_count = len(smap.symbols)\n        except Exception:\n            symbol_count = 0\n\n    filename = _sanitize_for_postgres(filename)\n    content = _sanitize_for_postgres(content)\n\n    conn = get_db()\n    existing = conn.execute(\n        \"SELECT id FROM session_files WHERE session_id = ? AND filename = ?\",\n        (session_id, filename)\n    ).fetchone()\n\n    if existing:\n        file_id = existing[\"id\"] if hasattr(existing, \"__getitem__\") else existing[0]\n        conn.execute(\n            \"UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?\",\n            (content, language, lines, symbol_count, file_type, file_id)\n        )\n    else:\n        file_id = str(uuid.uuid4())\n        conn.execute(\n            \"INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)\",\n            (file_id, session_id, filename, content, language, lines, symbol_count, file_type)\n        )\n\n    conn.commit()\n    conn.close()\n\n    return {\n        \"id\": file_id,\n        \"session_id\": session_id,\n        \"filename\": filename,\n        \"language\": language,\n        \"lines\": lines,\n        \"symbol_count\": symbol_count,\n        \"file_type\": file_type,\n        \"updated_at\": None,\n    }\n\n\n@router.post(\"/{session_id}/files/upload\")\nasync def upload_session_file_multipart(\n    session_id: str,\n    file: UploadFile = File(...),\n    filename: str = Form(None),\n):\n    \"\"\"Multipart file upload — correct approach for iOS / Android / WKWebView.\"\"\"\n    actual_filename = filename or file.filename or \"upload\"\n    raw_bytes = await file.read()\n    file_type = _get_file_type(actual_filename)\n    language = _get_language(actual_filename)\n\n    logger.warning(\n        f\"[upload-multipart] session={session_id[:8]} filename={actual_filename!r} \"\n        f\"content_type={file.content_type!r} size={len(raw_bytes):,} bytes file_type={file_type}\"\n    )\n\n    if file_type == \"image\":\n        detected_mime = _detect_image_magic_bytes(raw_bytes)\n        effective_mime = detected_mime or file.content_type or \"image/jpeg\"\n        logger.warning(\n            f\"[upload-multipart] image: detected={detected_mime!r} \"\n            f\"content_type={file.content_type!r} effective={effective_mime!r}\"\n        )\n        import base64 as _b64\n        b64 = _b64.b64encode(raw_bytes).decode()\n        data_url = f\"data:{effective_mime};base64,{b64}\"\n        content = _normalize_image_for_claude(data_url)\n        lines = 0\n        symbol_count = 0\n\n    elif file_type == \"pdf\":\n        import base64 as _b64\n        b64 = _b64.b64encode(raw_bytes).decode()\n        data_url = f\"data:application/pdf;base64,{b64}\"\n        content = _extract_pdf_text(data_url)\n        lines = len(content.splitlines())\n        symbol_count = 0\n\n    elif file_type in (\"csv\", \"excel\"):\n        if file_type == \"excel\":\n            import base64 as _b64\n            b64 = _b64.b64encode(raw_bytes).decode()\n            data_url = f\"data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}\"\n            content = _parse_excel_to_markdown(data_url, actual_filename)\n        else:\n            try:\n                raw_text = raw_bytes.decode(\"utf-8\", errors=\"replace\")\n            except Exception:\n                raw_text = raw_bytes.decode(\"latin-1\", errors=\"replace\")\n            content = _parse_csv_to_markdown(raw_text)\n        lines = len(content.splitlines())\n        symbol_count = 0\n\n    else:\n        try:\n            content = raw_bytes.decode(\"utf-8\", errors=\"replace\")\n        except Exception:\n            content = raw_bytes.decode(\"latin-1\", errors=\"replace\")\n        lines = len(content.splitlines())\n        try:\n            smap = parser.parse(content, actual_filename)\n            symbol_count = len(smap.symbols)\n        except Exception:\n            symbol_count = 0\n\n    actual_filename = _sanitize_for_postgres(actual_filename)\n    content = _sanitize_for_postgres(content)\n\n    conn = get_db()\n    existing = conn.execute(\n        \"SELECT id FROM session_files WHERE session_id = ? AND filename = ?\",\n        (session_id, actual_filename)\n    ).fetchone()\n\n    if existing:\n        file_id = existing[\"id\"] if hasattr(existing, \"__getitem__\") else existing[0]\n        conn.execute(\n            \"UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?\",\n            (content, language, lines, symbol_count, file_type, file_id)\n        )\n    else:\n        file_id = str(uuid.uuid4())\n        conn.execute(\n            \"INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)\",\n            (file_id, session_id, actual_filename, content, language, lines, symbol_count, file_type)\n        )\n\n    conn.commit()\n    conn.close()\n\n    return {\n        \"id\": file_id,\n        \"session_id\": session_id,\n        \"filename\": actual_filename,\n        \"language\": language,\n        \"lines\": lines,\n        \"symbol_count\": symbol_count,\n        \"file_type\": file_type,\n        \"updated_at\": None,\n    }\n\n\n@router.get(\"/{session_id}/files\")\ndef list_session_files(session_id: str):\n    \"\"\"List files attached to a session (metadata only, no content).\"\"\"\n    conn = get_db()\n    rows = conn.execute(\n        \"\"\"SELECT id, session_id, filename, language, lines, symbol_count, file_type, github_meta, created_at, updated_at, github_pushed_at\n           FROM session_files WHERE session_id = ? ORDER BY created_at ASC\"\"\",\n        (session_id,)\n    ).fetchall()\n    conn.close()\n    return [dict(r) for r in rows]\n\n\n@router.get(\"/{session_id}/files/{file_id}\")\ndef get_session_file(session_id: str, file_id: str):\n    \"\"\"Get a specific file's full content.\"\"\"\n    conn = get_db()\n    row = conn.execute(\n        \"SELECT * FROM session_files WHERE id = ? AND session_id = ?\",\n        (file_id, session_id)\n    ).fetchone()\n    conn.close()\n    if not row:\n        raise HTTPException(status_code=404, detail=\"File not found\")\n    return dict(row)\n\n\n@router.put(\"/{session_id}/files/{file_id}\")\ndef update_session_file(session_id: str, file_id: str, body: dict):\n    \"\"\"Update file content after applying a change.\"\"\"\n    new_content = body.get(\"content\", \"\")\n    conn = get_db()\n    row = conn.execute(\n        \"SELECT content, filename FROM session_files WHERE id = ? AND session_id = ?\",\n        (file_id, session_id)\n    ).fetchone()\n    if not row:\n        conn.close()\n        raise HTTPException(status_code=404, detail=\"File not found\")\n\n    filename = row[\"filename\"] if hasattr(row, \"__getitem__\") else row[1]\n    prev_content = row[\"content\"] if hasattr(row, \"__getitem__\") else row[0]\n    lines = len(new_content.splitlines())\n    try:\n        smap = parser.parse(new_content, filename)\n        symbol_count = len(smap.symbols)\n    except Exception:\n        symbol_count = 0\n\n    new_content = _sanitize_for_postgres(new_content)\n    prev_content = _sanitize_for_postgres(prev_content)\n\n    conn.execute(\n        \"UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ?\",\n        (new_content, prev_content, lines, symbol_count, file_id, session_id)\n    )\n    conn.commit()\n    conn.close()\n    return {\"id\": file_id, \"lines\": lines, \"symbol_count\": symbol_count, \"ok\": True}\n\n\n@router.post(\"/{session_id}/files/{file_id}/undo\")\ndef undo_session_file(session_id: str, file_id: str):\n    \"\"\"Restore a file to its previous version (one-step undo).\"\"\"\n    conn = get_db()\n    row = conn.execute(\n        \"SELECT content, previous_content, filename FROM session_files WHERE id = ? AND session_id = ?\",\n        (file_id, session_id)\n    ).fetchone()\n    if not row:\n        conn.close()\n        raise HTTPException(status_code=404, detail=\"File not found\")\n\n    if hasattr(row, \"__getitem__\"):\n        current = row[\"content\"]\n        prev = row[\"previous_content\"]\n        filename = row[\"filename\"]\n    else:\n        current, prev, filename = row[0], row[1], row[2]\n\n    if not prev:\n        conn.close()\n        raise HTTPException(status_code=400, detail=\"No previous version to restore\")\n\n    lines = len(prev.splitlines())\n    try:\n        smap = parser.parse(prev, filename)\n        symbol_count = len(smap.symbols)\n    except Exception:\n        symbol_count = 0\n\n    conn.execute(\n        \"UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ? WHERE id = ? AND session_id = ?\",\n        (prev, current, lines, symbol_count, file_id, session_id)\n    )\n    conn.commit()\n    conn.close()\n    return {\"id\": file_id, \"content\": prev, \"lines\": lines, \"symbol_count\": symbol_count, \"ok\": True}\n\n\n@router.delete(\"/{session_id}/files/{file_id}\")\ndef delete_session_file(session_id: str, file_id: str):\n    \"\"\"Remove a file from a session.\"\"\"\n    conn = get_db()\n    conn.execute(\n        \"DELETE FROM session_files WHERE id = ? AND session_id = ?\",\n        (file_id, session_id)\n    )\n    conn.commit()\n    conn.close()\n    return {\"ok\": True}\n\n\n@router.get(\"/{session_id}/files/{file_id}/preview\")\ndef preview_session_file(session_id: str, file_id: str):\n    \"\"\"Serve file content for live preview with correct Content-Type.\"\"\"\n    conn = get_db()\n    row = conn.execute(\n        \"SELECT filename, content FROM session_files WHERE id = ? AND session_id = ?\",\n        (file_id, session_id),\n    ).fetchone()\n    conn.close()\n    if not row:\n        raise HTTPException(status_code=404, detail=\"File not found\")\n\n    if hasattr(row, \"__getitem__\"):\n        filename, content = row[\"filename\"], row[\"content\"]\n    else:\n        filename, content = row[0], row[1]\n\n    content_type = mimetypes.guess_type(filename)[0] or \"text/plain\"\n    return Response(\n        content=content,\n        media_type=content_type,\n        headers={\"Access-Control-Allow-Origin\": \"*\"},\n    )\n"
-}]}
+"""Per-session file storage — files uploaded to a chat stay in that chat.
+Supports: code, images (vision), PDFs, CSV, Excel.
+"""
+import uuid
+import base64
+import io
+import logging
+from pathlib import Path
+import mimetypes
+from fastapi import APIRouter, HTTPException, File, UploadFile, Form
+from fastapi.responses import Response
+from database import get_db
+from services.ast_parser import ASTParser
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+parser = ASTParser()
+
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg", ".heic", ".heif"}
+PDF_EXTENSIONS = {".pdf"}
+CSV_EXTENSIONS = {".csv"}
+EXCEL_EXTENSIONS = {".xlsx", ".xls"}
+
+CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".cs",
+    ".cpp", ".c", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
+    ".html", ".css", ".json", ".yaml", ".yml", ".md", ".sh", ".sql",
+    ".toml", ".txt",
+}
+
+
+def _sanitize_for_postgres(s: str) -> str:
+    """Strip NUL (0x00) bytes — Postgres rejects them in TEXT columns."""
+    if not s:
+        return s
+    if "\x00" in s:
+        logger.warning(f"[session_files] Stripping NUL bytes from input (len={len(s)})")
+        return s.replace("\x00", "")
+    return s
+
+
+def _get_file_type(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    if ext in IMAGE_EXTENSIONS:
+        return "image"
+    if ext in PDF_EXTENSIONS:
+        return "pdf"
+    if ext in CSV_EXTENSIONS:
+        return "csv"
+    if ext in EXCEL_EXTENSIONS:
+        return "excel"
+    return "code"
+
+
+def _get_language(filename: str) -> str:
+    ext = Path(filename).suffix.lower()
+    lang_map = {
+        ".py": "python", ".js": "javascript", ".ts": "typescript",
+        ".jsx": "javascriptreact", ".tsx": "typescriptreact",
+        ".go": "go", ".rs": "rust", ".java": "java", ".cs": "csharp",
+        ".cpp": "cpp", ".c": "c", ".h": "c", ".hpp": "cpp",
+        ".rb": "ruby", ".php": "php", ".swift": "swift", ".kt": "kotlin",
+        ".html": "html", ".css": "css", ".json": "json", ".yaml": "yaml",
+        ".yml": "yaml", ".md": "markdown", ".sh": "bash", ".sql": "sql",
+        ".toml": "toml", ".csv": "csv", ".xlsx": "excel", ".xls": "excel",
+        ".pdf": "pdf",
+    }
+    return lang_map.get(ext, "plaintext")
+
+
+_CLAUDE_SUPPORTED_MIME = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+
+
+def _detect_image_magic_bytes(data: bytes) -> str:
+    """Return the detected image MIME type from the first 12 bytes, or '' if not an image."""
+    if len(data) < 4:
+        return ""
+    if data[0] == 0xFF and data[1] == 0xD8 and data[2] == 0xFF:
+        return "image/jpeg"
+    if data[:4] == b"\x89PNG":
+        return "image/png"
+    if data[:4] in (b"GIF8", b"GIF9"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":
+        return "image/webp"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        brand = data[8:12]
+        heic_brands = {
+            b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis",
+            b"hevm", b"hevs", b"mif1", b"msf1",
+        }
+        if brand in heic_brands:
+            return "image/heic"
+        if brand in {b"avif", b"avis"}:
+            return "image/avif"
+    if data[:2] == b"BM":
+        return "image/bmp"
+    return ""
+
+
+def _normalize_image_for_claude(base64_data: str) -> str:
+    """Convert any image format to a JPEG data URL that Claude API accepts."""
+    if not base64_data:
+        return base64_data
+
+    src_mime = ""
+    b64 = base64_data
+    if "," in base64_data:
+        header, b64 = base64_data.split(",", 1)
+        if ":" in header and ";" in header:
+            src_mime = header.split(":")[1].split(";")[0].lower().strip()
+
+    try:
+        padded = b64 + "==" * ((4 - len(b64) % 4) % 4)
+        img_bytes = base64.b64decode(padded)
+    except Exception as e:
+        logger.warning(f"[session_files] normalize_image: b64 decode failed: {e}")
+        return base64_data
+
+    detected_mime = _detect_image_magic_bytes(img_bytes)
+    effective_mime = detected_mime or src_mime
+
+    logger.warning(
+        f"[session_files] normalize_image: src_mime={src_mime!r} "
+        f"detected={detected_mime!r} size={len(img_bytes)} bytes"
+    )
+
+    if src_mime in _CLAUDE_SUPPORTED_MIME and (not detected_mime or detected_mime in _CLAUDE_SUPPORTED_MIME):
+        logger.warning(f"[session_files] normalize_image: {src_mime} already Claude-supported — no conversion")
+        return base64_data
+
+    try:
+        if effective_mime in ("image/heic", "image/heif", "image/avif") or not detected_mime:
+            try:
+                import pillow_heif  # type: ignore
+                pillow_heif.register_heif_opener()
+                logger.warning("[session_files] pillow_heif registered for HEIC/HEIF conversion")
+            except ImportError:
+                logger.warning(
+                    "[session_files] pillow_heif not installed — HEIC conversion may fail."
+                )
+
+        from PIL import Image as PILImage  # type: ignore
+
+        img = PILImage.open(io.BytesIO(img_bytes))
+        w, h = img.size
+        logger.warning(f"[session_files] PIL opened image: mode={img.mode} size={w}x{h}")
+
+        if img.mode in ("RGBA", "LA", "P"):
+            bg = PILImage.new("RGB", img.size, (255, 255, 255))
+            if img.mode == "P":
+                img = img.convert("RGBA")
+            if img.mode in ("RGBA", "LA"):
+                bg.paste(img, mask=img.split()[-1])
+            else:
+                bg.paste(img)
+            img = bg
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+
+        output = io.BytesIO()
+        img.save(output, format="JPEG", quality=85, optimize=True)
+        jpeg_bytes = output.getvalue()
+        b64_out = base64.b64encode(jpeg_bytes).decode()
+
+        logger.warning(
+            f"[session_files] Converted {effective_mime or 'unknown'} → JPEG "
+            f"({len(jpeg_bytes):,} bytes, {w}x{h})"
+        )
+        return f"data:image/jpeg;base64,{b64_out}"
+
+    except Exception as e:
+        logger.warning(
+            f"[session_files] Image normalization FAILED "
+            f"({type(e).__name__}: {e}) — storing original"
+        )
+        return base64_data
+
+
+def _extract_pdf_text(base64_data: str) -> str:
+    """Extract text from a base64-encoded PDF using pdfplumber."""
+    try:
+        import pdfplumber
+        if "," in base64_data:
+            base64_data = base64_data.split(",", 1)[1]
+        pdf_bytes = base64.b64decode(base64_data)
+        text_parts = []
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            for i, page in enumerate(pdf.pages, 1):
+                text = page.extract_text()
+                if text:
+                    text_parts.append(f"--- Page {i} ---\n{text}")
+                tables = page.extract_tables()
+                for table in tables:
+                    if table:
+                        rows = []
+                        for row in table:
+                            rows.append(" | ".join(str(cell or "") for cell in row))
+                        text_parts.append("\n".join(rows))
+        return "\n\n".join(text_parts) if text_parts else "(PDF has no extractable text)"
+    except ImportError:
+        return "(pdfplumber not installed — PDF text extraction unavailable)"
+    except Exception as e:
+        return f"(PDF extraction error: {e})"
+
+
+def _parse_csv_to_markdown(content: str) -> str:
+    """Convert CSV text to a markdown table."""
+    try:
+        import pandas as pd
+        df = pd.read_csv(io.StringIO(content))
+        if len(df) > 200:
+            preview = df.head(200)
+            md = preview.to_markdown(index=False)
+            md += f"\n\n... [{len(df) - 200} more rows not shown]"
+            return md
+        return df.to_markdown(index=False)
+    except ImportError:
+        return content
+    except Exception as e:
+        return f"(CSV parse error: {e})\n\n{content[:2000]}"
+
+
+def _parse_excel_to_markdown(base64_data: str, filename: str) -> str:
+    """Convert Excel file (base64) to markdown tables, one per sheet."""
+    try:
+        import pandas as pd
+        if "," in base64_data:
+            base64_data = base64_data.split(",", 1)[1]
+        excel_bytes = base64.b64decode(base64_data)
+        xl = pd.ExcelFile(io.BytesIO(excel_bytes))
+        parts = []
+        for sheet_name in xl.sheet_names:
+            df = xl.parse(sheet_name)
+            if len(df) > 200:
+                preview = df.head(200)
+                md = preview.to_markdown(index=False)
+                md += f"\n\n... [{len(df) - 200} more rows not shown]"
+            else:
+                md = df.to_markdown(index=False)
+            parts.append(f"### Sheet: {sheet_name}\n\n{md}")
+        return "\n\n".join(parts)
+    except ImportError:
+        return "(pandas/openpyxl not installed — Excel extraction unavailable)"
+    except Exception as e:
+        return f"(Excel parse error: {e})"
+
+
+@router.post("/{session_id}/files")
+def upload_session_file(session_id: str, body: dict):
+    """Upload a file to a chat session (legacy JSON path)."""
+    filename = body.get("filename", "untitled")
+    raw_content = body.get("content", "")
+    base64_data = body.get("base64_data", "")
+    file_type = body.get("file_type") or _get_file_type(filename)
+    language = body.get("language") or _get_language(filename)
+
+    # ── DIAGNOSTIC: log at WARNING so it always appears in Railway logs ──────
+    _data_url_mime = ""
+    if base64_data and base64_data.startswith("data:") and ";" in base64_data:
+        _data_url_mime = base64_data.split(":")[1].split(";")[0]
+    logger.warning(
+        f"[upload-json] session={session_id[:8]} filename={filename!r} "
+        f"file_type={file_type} raw_len={len(raw_content)} "
+        f"base64_len={len(base64_data)} data_url_mime={_data_url_mime!r} "
+        f"raw_has_nul={chr(0) in raw_content}"
+    )
+
+    if file_type == "image":
+        raw_b64 = base64_data if base64_data else raw_content
+
+        if not base64_data and raw_content:
+            logger.warning(
+                f"[upload-json] image via text path — filename={filename!r} "
+                f"raw_len={len(raw_content)} has_nul={chr(0) in raw_content}"
+            )
+            cleaned = raw_content.replace("\x00", "")
+            try:
+                raw_bytes = cleaned.encode("latin-1", errors="replace")
+                detected = _detect_image_magic_bytes(raw_bytes)
+                logger.warning(f"[upload-json] magic bytes after latin-1 encode: detected={detected!r} first4={raw_bytes[:4].hex()!r}")
+                if detected:
+                    b64_attempt = base64.b64encode(raw_bytes).decode()
+                    raw_b64 = f"data:{detected};base64,{b64_attempt}"
+                    logger.warning(f"[upload-json] Recovered binary image from text path: {detected}")
+            except Exception as e:
+                logger.warning(f"[upload-json] Binary recovery failed: {e}")
+                raw_b64 = raw_content
+
+        content = _normalize_image_for_claude(raw_b64)
+        lines = 0
+        symbol_count = 0
+    elif file_type == "pdf":
+        content = _extract_pdf_text(base64_data)
+        lines = len(content.splitlines())
+        symbol_count = 0
+    elif file_type == "csv":
+        content = _parse_csv_to_markdown(raw_content)
+        lines = len(raw_content.splitlines())
+        symbol_count = 0
+    elif file_type == "excel":
+        content = _parse_excel_to_markdown(base64_data, filename)
+        lines = len(content.splitlines())
+        symbol_count = 0
+    else:
+        content = raw_content
+        lines = len(content.splitlines())
+        try:
+            smap = parser.parse(content, filename)
+            symbol_count = len(smap.symbols)
+        except Exception:
+            symbol_count = 0
+
+    filename = _sanitize_for_postgres(filename)
+    content = _sanitize_for_postgres(content)
+
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT id FROM session_files WHERE session_id = ? AND filename = ?",
+        (session_id, filename)
+    ).fetchone()
+
+    if existing:
+        file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
+        conn.execute(
+            "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (content, language, lines, symbol_count, file_type, file_id)
+        )
+    else:
+        file_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (file_id, session_id, filename, content, language, lines, symbol_count, file_type)
+        )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "id": file_id,
+        "session_id": session_id,
+        "filename": filename,
+        "language": language,
+        "lines": lines,
+        "symbol_count": symbol_count,
+        "file_type": file_type,
+        "updated_at": None,
+    }
+
+
+@router.post("/{session_id}/files/upload")
+async def upload_session_file_multipart(
+    session_id: str,
+    file: UploadFile = File(...),
+    filename: str = Form(None),
+):
+    """Multipart file upload — correct approach for iOS / Android / WKWebView."""
+    actual_filename = filename or file.filename or "upload"
+    raw_bytes = await file.read()
+    file_type = _get_file_type(actual_filename)
+    language = _get_language(actual_filename)
+
+    logger.warning(
+        f"[upload-multipart] session={session_id[:8]} filename={actual_filename!r} "
+        f"content_type={file.content_type!r} size={len(raw_bytes):,} bytes file_type={file_type}"
+    )
+
+    if file_type == "image":
+        detected_mime = _detect_image_magic_bytes(raw_bytes)
+        effective_mime = detected_mime or file.content_type or "image/jpeg"
+        logger.warning(
+            f"[upload-multipart] image: detected={detected_mime!r} "
+            f"content_type={file.content_type!r} effective={effective_mime!r}"
+        )
+        import base64 as _b64
+        b64 = _b64.b64encode(raw_bytes).decode()
+        data_url = f"data:{effective_mime};base64,{b64}"
+        content = _normalize_image_for_claude(data_url)
+        lines = 0
+        symbol_count = 0
+
+    elif file_type == "pdf":
+        import base64 as _b64
+        b64 = _b64.b64encode(raw_bytes).decode()
+        data_url = f"data:application/pdf;base64,{b64}"
+        content = _extract_pdf_text(data_url)
+        lines = len(content.splitlines())
+        symbol_count = 0
+
+    elif file_type in ("csv", "excel"):
+        if file_type == "excel":
+            import base64 as _b64
+            b64 = _b64.b64encode(raw_bytes).decode()
+            data_url = f"data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}"
+            content = _parse_excel_to_markdown(data_url, actual_filename)
+        else:
+            try:
+                raw_text = raw_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                raw_text = raw_bytes.decode("latin-1", errors="replace")
+            content = _parse_csv_to_markdown(raw_text)
+        lines = len(content.splitlines())
+        symbol_count = 0
+
+    else:
+        try:
+            content = raw_bytes.decode("utf-8", errors="replace")
+        except Exception:
+            content = raw_bytes.decode("latin-1", errors="replace")
+        lines = len(content.splitlines())
+        try:
+            smap = parser.parse(content, actual_filename)
+            symbol_count = len(smap.symbols)
+        except Exception:
+            symbol_count = 0
+
+    actual_filename = _sanitize_for_postgres(actual_filename)
+    content = _sanitize_for_postgres(content)
+
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT id FROM session_files WHERE session_id = ? AND filename = ?",
+        (session_id, actual_filename)
+    ).fetchone()
+
+    if existing:
+        file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
+        conn.execute(
+            "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (content, language, lines, symbol_count, file_type, file_id)
+        )
+    else:
+        file_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (file_id, session_id, actual_filename, content, language, lines, symbol_count, file_type)
+        )
+
+    conn.commit()
+    conn.close()
+
+    return {
+        "id": file_id,
+        "session_id": session_id,
+        "filename": actual_filename,
+        "language": language,
+        "lines": lines,
+        "symbol_count": symbol_count,
+        "file_type": file_type,
+        "updated_at": None,
+    }
+
+
+@router.get("/{session_id}/files")
+def list_session_files(session_id: str):
+    """List files attached to a session (metadata only, no content)."""
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, github_meta, created_at, updated_at, github_pushed_at
+           FROM session_files WHERE session_id = ? ORDER BY created_at ASC""",
+        (session_id,)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@router.get("/{session_id}/files/{file_id}")
+def get_session_file(session_id: str, file_id: str):
+    """Get a specific file's full content."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM session_files WHERE id = ? AND session_id = ?",
+        (file_id, session_id)
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="File not found")
+    return dict(row)
+
+
+@router.put("/{session_id}/files/{file_id}")
+def update_session_file(session_id: str, file_id: str, body: dict):
+    """Update file content after applying a change."""
+    new_content = body.get("content", "")
+    conn = get_db()
+    row = conn.execute(
+        "SELECT content, filename FROM session_files WHERE id = ? AND session_id = ?",
+        (file_id, session_id)
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="File not found")
+
+    filename = row["filename"] if hasattr(row, "__getitem__") else row[1]
+    prev_content = row["content"] if hasattr(row, "__getitem__") else row[0]
+    lines = len(new_content.splitlines())
+    try:
+        smap = parser.parse(new_content, filename)
+        symbol_count = len(smap.symbols)
+    except Exception:
+        symbol_count = 0
+
+    new_content = _sanitize_for_postgres(new_content)
+    prev_content = _sanitize_for_postgres(prev_content)
+
+    conn.execute(
+        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ?",
+        (new_content, prev_content, lines, symbol_count, file_id, session_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"id": file_id, "lines": lines, "symbol_count": symbol_count, "ok": True}
+
+
+@router.post("/{session_id}/files/{file_id}/undo")
+def undo_session_file(session_id: str, file_id: str):
+    """Restore a file to its previous version (one-step undo)."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT content, previous_content, filename FROM session_files WHERE id = ? AND session_id = ?",
+        (file_id, session_id)
+    ).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if hasattr(row, "__getitem__"):
+        current = row["content"]
+        prev = row["previous_content"]
+        filename = row["filename"]
+    else:
+        current, prev, filename = row[0], row[1], row[2]
+
+    if not prev:
+        conn.close()
+        raise HTTPException(status_code=400, detail="No previous version to restore")
+
+    lines = len(prev.splitlines())
+    try:
+        smap = parser.parse(prev, filename)
+        symbol_count = len(smap.symbols)
+    except Exception:
+        symbol_count = 0
+
+    conn.execute(
+        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ? WHERE id = ? AND session_id = ?",
+        (prev, current, lines, symbol_count, file_id, session_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"id": file_id, "content": prev, "lines": lines, "symbol_count": symbol_count, "ok": True}
+
+
+@router.delete("/{session_id}/files/{file_id}")
+def delete_session_file(session_id: str, file_id: str):
+    """Remove a file from a session."""
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM session_files WHERE id = ? AND session_id = ?",
+        (file_id, session_id)
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+@router.get("/{session_id}/files/{file_id}/preview")
+def preview_session_file(session_id: str, file_id: str):
+    """Serve file content for live preview with correct Content-Type."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT filename, content FROM session_files WHERE id = ? AND session_id = ?",
+        (file_id, session_id),
+    ).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if hasattr(row, "__getitem__"):
+        filename, content = row["filename"], row["content"]
+    else:
+        filename, content = row[0], row[1]
+
+    content_type = mimetypes.guess_type(filename)[0] or "text/plain"
+    return Response(
+        content=content,
+        media_type=content_type,
+        headers={"Access-Control-Allow-Origin": "*"},
+    )
