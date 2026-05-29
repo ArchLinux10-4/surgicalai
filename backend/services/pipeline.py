@@ -3153,12 +3153,43 @@ async def _run_qa_for_new_file(file_result: dict, codebase_context: str, user_id
 
     filename     = file_result.get("filename", "new_file")
     full_content = file_result.get("content", "") or ""
-    content      = full_content[:6000]
+
+    # ── PR #75: never hand the completeness reviewer a HEAD-truncated file ──
+    # The old `full_content[:6000]` silently cut the file at char 6000 with NO
+    # marker, so for any file larger than ~6000 chars (~120-150 lines) the
+    # semantic QA saw a file that ended mid-function — missing its route
+    # registration / exports / closing braces — and (correctly, for its input)
+    # returned verdict=blocked "truncated mid-function, exports missing". The
+    # hard 8/10 gate then false-blocked a COMPLETE file, and the dependency
+    # cascade blocked everything that referenced it. This stayed latent until
+    # PR #74 made semantic QA actually return verdicts instead of empties.
+    #
+    # The completeness check must be able to see that the file *ends properly*
+    # (final handlers, `module.exports`, closing braces). So:
+    #   • small/medium files (≤ _QA_VIEW_FULL): send the whole file, verbatim.
+    #   • large files: send HEAD + an explicit elision marker + TAIL, so the
+    #     reviewer sees both the opening structure AND the real ending and can
+    #     judge completeness honestly instead of mistaking a window edge for a
+    #     truncation. Deterministic delimiter-balance + structural_qa still run
+    #     on the FULL content, so genuine truncation is still caught for real.
+    _QA_VIEW_FULL = 16000   # ≤ this many chars → send the whole file
+    _QA_VIEW_HEAD = 9000    # large files: leading chars
+    _QA_VIEW_TAIL = 5000    # large files: trailing chars (exports/registration)
+    if len(full_content) <= _QA_VIEW_FULL:
+        content = full_content
+    else:
+        _elided = len(full_content) - _QA_VIEW_HEAD - _QA_VIEW_TAIL
+        content = (
+            full_content[:_QA_VIEW_HEAD]
+            + f"\n\n/* … [{_elided} chars elided for length — file continues; "
+              f"this is a middle cut, NOT the end of the file] … */\n\n"
+            + full_content[-_QA_VIEW_TAIL:]
+        )
 
     user_msg = f"""CODEBASE CONTEXT (imports, types, and API signatures in the project):
 {codebase_context[:3000]}
 
-NEW FILE: {filename}
+NEW FILE: {filename} ({len(full_content)} chars / {full_content.count(chr(10)) + 1} lines total)
 {content}
 
 Run all 5 checks and return the JSON verdict."""
