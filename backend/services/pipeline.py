@@ -3844,6 +3844,75 @@ risk_verdicts must have one entry per item in architect_risks. If architect_risk
 logic_errors must be present — use [] if no logic errors found."""
 
 
+# ── PR #80: file-symbol visibility for QA on large files ─────────────────────
+# Root cause of the BIG9 large-file false-block: QA reviews ONE changed symbol in
+# isolation. On a 200KB/6,000-line file it never sees the rest of the file, so
+# every reference to a helper defined elsewhere in the SAME file (e.g. rowToCSV,
+# parseCSVLine, checkAdminAuth, requireAdmin, the express `app`) looks "undefined"
+# and QA scores it blocked at 4/10 — three attempts in a row, gate blocks correct
+# code. We can't fix this by enlarging the QA window (the file is far over budget),
+# so we hand QA a deterministic, zero-LLM inventory of identifiers that are
+# provably defined or imported in the file. QA then stops hallucinating "undefined
+# symbol" issues, and a deterministic backstop clears any it still emits.
+def _file_defined_identifiers(file_content: str) -> set:
+    """Return the set of identifiers DEFINED or IMPORTED at any point in the file.
+    Deterministic, language-tolerant (JS/TS + Python). Over-inclusion is safe
+    (worst case: QA doesn't flag a same-named undefined symbol — rare); the goal
+    is to never UNDER-include a real definition and thus false-block valid code."""
+    ids: set = set()
+    if not file_content:
+        return ids
+    import re as _re
+    fc = file_content
+    # JS/TS function declarations:  function foo / async function foo
+    ids.update(_re.findall(r"\b(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", fc))
+    # JS/TS simple bindings (incl arrow fns):  const/let/var NAME =
+    ids.update(_re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", fc))
+    # class declarations (JS/TS/Python)
+    ids.update(_re.findall(r"\bclass\s+([A-Za-z_$][\w$]*)", fc))
+    # Python def
+    ids.update(_re.findall(r"\bdef\s+([A-Za-z_][\w]*)", fc))
+    # Object-destructure bindings:  const { a, b: c, d = 1 } = require(...)/import
+    for _grp in _re.findall(r"\b(?:const|let|var)\s*\{([^}]*)\}\s*=", fc):
+        for _part in _grp.split(","):
+            _name = _re.sub(r"[^\w$]", "", _part.split(":")[-1].split("=")[0].strip())
+            if _name:
+                ids.add(_name)
+    # Array-destructure bindings:  const [ a, b ] = ...
+    for _grp in _re.findall(r"\b(?:const|let|var)\s*\[([^\]]*)\]\s*=", fc):
+        for _part in _grp.split(","):
+            _name = _re.sub(r"[^\w$]", "", _part.strip())
+            if _name:
+                ids.add(_name)
+    # ES module imports:  import X, {a, b as c}, * as ns from '...'
+    for _clause in _re.findall(r"\bimport\s+(.+?)\s+from\b", fc, _re.S):
+        ids.update(_re.findall(r"[A-Za-z_$][\w$]*", _clause))
+    # Python:  import a, a.b as c
+    for _line in _re.findall(r"^\s*import\s+([^\n#]+)", fc, _re.M):
+        for _part in _line.split(","):
+            _tok = _re.sub(r"[^\w]", "", _part.strip().split(" as ")[-1].strip().split(".")[0])
+            if _tok:
+                ids.add(_tok)
+    # Python:  from m import a, b as c
+    for _line in _re.findall(r"^\s*from\s+\S+\s+import\s+([^\n#]+)", fc, _re.M):
+        for _part in _line.replace("(", "").replace(")", "").split(","):
+            _tok = _re.sub(r"[^\w]", "", _part.strip().split(" as ")[-1].strip())
+            if _tok and _tok != "*":
+                ids.add(_tok)
+    # JS keywords / import syntax tokens that aren't real identifiers
+    ids.discard("")
+    for _kw in ("import", "from", "as", "type", "default"):
+        ids.discard(_kw)
+    return ids
+
+
+# Phrases QA uses when it (wrongly, on a large file) believes a symbol is undefined.
+_QA_UNDEFINED_PHRASES = (
+    "not defined", "undefined", "not imported", "missing import", "no import",
+    "is not declared", "not declared", "needs an import", "needs to be imported",
+)
+
+
 async def run_qa_agent(
     original_code: str,
     new_code: str,
@@ -3858,6 +3927,7 @@ async def run_qa_agent(
     targeted_context: str = "",
     qa_feedback: dict = None,
     same_run_context: str = "",
+    file_content: str = "",   # PR #80: full source of the edited file (for symbol visibility)
 ) -> dict:
     """
     QA agent: verifies Surgeon output before showing diff card to user.
@@ -3893,6 +3963,34 @@ async def run_qa_agent(
     if targeted_context and targeted_context.strip():
         _targeted_block = f"\n\nTARGETED CROSS-FILE CONTEXT (callers/usages of the changed symbol):\n{targeted_context.strip()}"
 
+    # ── PR #80: same-file symbol visibility ──────────────────────────────────
+    # QA only receives the changed symbol, not the whole file. On large files
+    # that caused false "undefined symbol / missing import" blocks for helpers
+    # that ARE defined elsewhere in the same file. Hand QA the deterministic
+    # inventory of identifiers defined/imported in THIS file so it stops flagging
+    # them. (Skip when the QA window already contains the whole file.)
+    _file_symbols_block = ""
+    _file_symbol_ids: set = set()
+    if file_content and file_content.strip() and file_content.strip() != (new_code or "").strip():
+        try:
+            _file_symbol_ids = _file_defined_identifiers(file_content)
+        except Exception:
+            _file_symbol_ids = set()
+        if _file_symbol_ids:
+            _shown = sorted(_file_symbol_ids)
+            _MAX_SHOWN = 400
+            _list_str = ", ".join(_shown[:_MAX_SHOWN])
+            if len(_shown) > _MAX_SHOWN:
+                _list_str += f", … (+{len(_shown) - _MAX_SHOWN} more)"
+            _file_symbols_block = (
+                "\n\nIDENTIFIERS ALREADY DEFINED OR IMPORTED ELSEWHERE IN THIS SAME FILE "
+                "(the NEW CODE shows only the changed symbol, NOT the whole file — these names "
+                "are available at runtime, so do NOT report them as undefined, missing-import, "
+                "or not-declared issues; only flag identifiers that are genuinely absent from "
+                "both the NEW CODE and this list):\n"
+                + _list_str
+            )
+
     # QA feedback block injected on retry
     _qa_feedback_block = ""
     if qa_feedback:
@@ -3923,7 +4021,7 @@ NEW CODE (complete — this is what the Surgeon produced):
 {_new_snippet}
 
 OTHER FILES IN SESSION (for cross-file checking):
-{other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_qa_feedback_block}
+{other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_file_symbols_block}{_qa_feedback_block}
 
 {("\n\nOTHER CHANGES IN THIS SAME REQUEST (planned but reviewed separately — cross-symbol deps covered by these should be scored as warnings, not blocks):\n" + same_run_context + "\n") if same_run_context else ""}Compare ORIGINAL CODE → NEW CODE directly. Run all 8 checks and return the JSON verdict.
 
@@ -4055,9 +4153,84 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
             "import_issues":    data.get("import_issues", []),
             "downstream_risks": data.get("downstream_risks", []),
             "type_errors":      data.get("type_errors", []),
+            "logic_errors":     data.get("logic_errors", []),
             "plan_deviation":   data.get("plan_deviation", ""),
             "skipped_reason":   None,
         }
+
+        # ── PR #80: clear provably-false "undefined symbol" flags ────────────
+        # Even with the visibility list above, QA may still emit an undefined/
+        # missing-import issue for a helper that is actually defined elsewhere in
+        # THIS file. Such a flag is a hallucination the Surgeon can never "fix"
+        # (the code is already correct), so left in place it burns every retry
+        # and then false-blocks correct code — exactly the BIG9 failure. We drop
+        # ONLY flags that are provably false: an undefined-style issue whose named
+        # code identifiers are ALL present in the file inventory. Genuine
+        # undefined symbols (any named identifier NOT in the file) are untouched.
+        if _file_symbol_ids:
+            import re as _re2
+            _new_code_idents = set(_re2.findall(r"[A-Za-z_$][\w$]*", new_code or ""))
+            _code_universe = _file_symbol_ids | _new_code_idents
+
+            def _ident_shaped(_tok: str) -> bool:
+                # camelCase / PascalCase-internal / snake_case / $-prefixed —
+                # shapes that are unmistakably code identifiers, never English words.
+                return bool(
+                    _re2.search(r"[a-z][A-Z]", _tok)
+                    or _re2.search(r"[A-Za-z]_[A-Za-z]", _tok)
+                    or "$" in _tok
+                )
+
+            def _is_false_undefined(_issue) -> bool:
+                _t = str(_issue or "")
+                _tl = _t.lower()
+                if not any(_p in _tl for _p in _QA_UNDEFINED_PHRASES):
+                    return False
+                _toks = set(_re2.findall(r"[A-Za-z_$][\w$]*", _t))
+                # The code identifiers this issue is really talking about: tokens
+                # that are known to the file/edit, OR are unmistakably code-shaped
+                # (so a genuinely-missing camelCase symbol still counts and is NOT
+                # mistaken for an English word).
+                _cands = {x for x in _toks if x in _code_universe or _ident_shaped(x)}
+                # False positive only if it names ≥1 identifier and EVERY named
+                # identifier is defined in-file. If it names anything genuinely
+                # absent (not defined in this file), keep the issue.
+                return bool(_cands) and _cands.issubset(_file_symbol_ids)
+
+            _orig_import_issues = list(result.get("import_issues") or [])
+            _kept = [i for i in _orig_import_issues if not _is_false_undefined(i)]
+            _cleared = len(_orig_import_issues) - len(_kept)
+            if _cleared > 0:
+                result["import_issues"] = _kept
+                # If the ONLY problems were hallucinated undefined symbols (no real
+                # import errors, type errors, logic errors, plan deviation, or
+                # blocked risks remain), the change is clean — lift the hallucinated
+                # block. downstream_risks are non-blocking by design (mirrors the
+                # existing _has_hard_issues definition) and don't prevent recovery.
+                _real_remaining = bool(
+                    result.get("import_issues")
+                    or result.get("type_errors")
+                    or result.get("logic_errors")
+                    or (result.get("plan_deviation") or "").strip()
+                    or any(
+                        isinstance(_rv, dict) and _rv.get("status") == "blocked"
+                        for _rv in (result.get("risk_verdicts") or [])
+                    )
+                )
+                if not _real_remaining and result.get("qa_score", 0) < 8:
+                    result["qa_score"] = 8
+                    result["verdict"] = "safe"
+                    result["summary"] = (
+                        (result.get("summary", "") or "").rstrip()
+                        + f" [PR80: cleared {_cleared} false 'undefined symbol' flag(s) — "
+                        "referenced helper(s) are defined elsewhere in this file; "
+                        "no real blocking issues remain.]"
+                    )
+                    logger.info(
+                        "[pipeline][QA] run_id=%s %s: cleared %d false undefined-symbol "
+                        "flag(s) on large file → score lifted to 8 (no real issues remain)",
+                        session_id, symbol_path, _cleared,
+                    )
 
         # Enforce verdict/score consistency
         # If QA found hard blockers (missing imports, logic errors, type errors)
@@ -6329,6 +6502,7 @@ USER REQUEST:
                     targeted_context=_targeted_qa_ctx,
                     qa_feedback=_qa_feedback_for_retry if _qa_feedback_for_retry else None,
                     same_run_context=_same_run_ctx,
+                    file_content=sf["content"],   # PR #80: same-file symbol visibility
                 )
                 _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫", "skipped": "⏭"}.get(
                     _qa_result.get("verdict", "skipped"), "⏭"
