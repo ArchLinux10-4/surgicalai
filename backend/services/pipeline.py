@@ -2237,7 +2237,7 @@ async def analyze_and_plan_stream(
         _APS_MAX_RETRIES = 2
         _aps_verdict = qa.get("verdict", "safe")
         _aps_score   = qa.get("qa_score", 10) or 10
-        _aps_blocked = (_aps_verdict == "blocked") or (_aps_score <= 4)
+        _aps_blocked = (_aps_verdict == "blocked") or (_aps_score <= 7)
 
         if _aps_blocked:
             for _aps_attempt in range(_APS_MAX_RETRIES):
@@ -3633,14 +3633,11 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
             or result.get("type_errors")
             or result.get("logic_errors")
         )
-        if result["qa_score"] >= 6 and result["verdict"] == "blocked":
-            if _has_hard_issues:
-                # Hard issues found — keep blocked, downgrade score to ensure retry fires
-                result["qa_score"] = min(result["qa_score"], 4)
-            else:
-                # No hard issues — LLM probably over-flagged, soften to warning
-                result["verdict"] = "warning"
-        if result["qa_score"] <= 5 and result["verdict"] == "safe":
+        # If LLM said "blocked", respect it — never soften to "warning".
+        # If hard issues exist, downgrade score to guarantee retry fires.
+        if result["verdict"] == "blocked" and _has_hard_issues:
+            result["qa_score"] = min(result["qa_score"], 4)
+        if result["qa_score"] <= 7 and result["verdict"] == "safe":
             result["verdict"] = "warning"
 
         # Log to DB (non-blocking — fire and forget)
@@ -5832,7 +5829,7 @@ USER REQUEST:
                 _can_retry_qa = (
                     not _can_retry_lint
                     and _qa_result.get("verdict") == "blocked"
-                    and (_qa_result.get("qa_score") or 10) <= 4
+                    and (_qa_result.get("qa_score") or 10) <= 7
                     and not _qa_feedback_for_retry
                     and _surgeon_attempt < _MAX_SURGEON_ATTEMPTS - 1
                 )
@@ -7615,7 +7612,7 @@ async def run_natural_pipeline_stream(
                 )
                 if _bv == "blocked":
                     blocked_indices.append(_bi)
-                elif _bs <= 5 and _b_hard:
+                elif _bs <= 7:
                     blocked_indices.append(_bi)
             if not blocked_indices:
                 break
