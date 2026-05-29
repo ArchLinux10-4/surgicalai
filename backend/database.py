@@ -504,6 +504,33 @@ def _init_postgres():
         conn.execute("""
             ALTER TABLE session_files ADD COLUMN IF NOT EXISTS github_pushed_at TIMESTAMP
         """)
+        # qa_log — proof QA ran on every Surgeon run (was missing on Postgres,
+        # so the audit trail was silently empty in production)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS qa_log (
+                id SERIAL PRIMARY KEY,
+                session_id TEXT,
+                filename TEXT,
+                symbol_name TEXT,
+                verdict TEXT,
+                qa_score INTEGER,
+                issues_json TEXT,
+                ran_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # compliance_log — proves every required pipeline step ran
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS compliance_log (
+                id SERIAL PRIMARY KEY,
+                run_id TEXT UNIQUE,
+                session_id TEXT,
+                intent TEXT,
+                steps_json TEXT,
+                missing_steps TEXT,
+                overall_pass INTEGER DEFAULT 1,
+                ran_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         conn.commit()
 
         _seed_defaults_postgres(conn)

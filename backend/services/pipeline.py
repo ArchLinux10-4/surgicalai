@@ -3677,27 +3677,18 @@ def _log_qa_result(session_id: str, filename: str, symbol_name: str, result: dic
     })
     conn = get_db_connection()
     try:
-        cur = conn.cursor()
-        # Works for both SQLite and PostgreSQL (psycopg2 uses %s, sqlite3 uses ?)
-        try:
-            cur.execute(
-                """INSERT INTO qa_log (session_id, filename, symbol_name, verdict, qa_score, issues_json)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (session_id, filename, symbol_name,
-                 result.get("verdict", "skipped"),
-                 result.get("qa_score"),
-                 issues_json)
-            )
-        except Exception:
-            # PostgreSQL uses %s placeholders
-            cur.execute(
-                """INSERT INTO qa_log (session_id, filename, symbol_name, verdict, qa_score, issues_json)
-                   VALUES (%s, %s, %s, %s, %s, %s)""",
-                (session_id, filename, symbol_name,
-                 result.get("verdict", "skipped"),
-                 result.get("qa_score"),
-                 issues_json)
-            )
+        # Use conn.execute(): works for SQLite (native) AND PostgreSQL, where
+        # CompatConn.execute() auto-translates ? -> %s. The Postgres wrapper does
+        # not expose .cursor(), so the previous cur = conn.cursor() path always
+        # raised AttributeError in production and the write was silently dropped.
+        conn.execute(
+            """INSERT INTO qa_log (session_id, filename, symbol_name, verdict, qa_score, issues_json)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (session_id, filename, symbol_name,
+             result.get("verdict", "skipped"),
+             result.get("qa_score"),
+             issues_json)
+        )
         conn.commit()
     finally:
         conn.close()
@@ -3782,24 +3773,18 @@ class ComplianceTracker:
             from database import get_db_connection
             conn = get_db_connection()
             try:
-                cur = conn.cursor()
                 steps_json = json.dumps(self.steps)
                 missing_json = json.dumps(self.missing_steps())
                 _pass = 1 if self.overall_pass() else 0
-                try:
-                    cur.execute(
-                        """INSERT INTO compliance_log
-                           (run_id, session_id, intent, steps_json, missing_steps, overall_pass)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
-                        (self.run_id, self.session_id, self.intent, steps_json, missing_json, _pass)
-                    )
-                except Exception:
-                    cur.execute(
-                        """INSERT INTO compliance_log
-                           (run_id, session_id, intent, steps_json, missing_steps, overall_pass)
-                           VALUES (%s, %s, %s, %s, %s, %s)""",
-                        (self.run_id, self.session_id, self.intent, steps_json, missing_json, _pass)
-                    )
+                # conn.execute() works for both SQLite and PostgreSQL (CompatConn
+                # adapts ? -> %s). CompatConn has no .cursor(), so the old
+                # cur = conn.cursor() path silently failed in production.
+                conn.execute(
+                    """INSERT INTO compliance_log
+                       (run_id, session_id, intent, steps_json, missing_steps, overall_pass)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (self.run_id, self.session_id, self.intent, steps_json, missing_json, _pass)
+                )
                 conn.commit()
             finally:
                 conn.close()
