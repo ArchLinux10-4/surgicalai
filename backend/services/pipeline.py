@@ -8185,7 +8185,31 @@ async def run_natural_pipeline_stream(
 
         MAX_QA_RETRIES = 2
 
+        # ── Fix-loop safety bounds ───────────────────────────────────────────
+        # The correction (regen) + re-QA calls are non-streaming Anthropic
+        # requests fed the full file context. Left unbounded they inherit the
+        # SDK's 600 s default timeout — long enough that the client read-times-out
+        # first and FastAPI CANCELS this generator, so the hard gate below never
+        # runs and NO ship/block compliance decision is ever recorded. We bound
+        # every call and cap the loop's total wall-clock so we ALWAYS fall
+        # through to the gate (which blocks anything still < QA_GATE_MIN_SCORE)
+        # and always log a decision.
+        _CORR_CALL_TIMEOUT = 150.0     # per correction (regen) call
+        _REQA_CALL_TIMEOUT = 90.0      # per re-QA call
+        _FIX_LOOP_DEADLINE = 300.0     # total wall-clock budget for the loop
+        _fix_loop_start = time.time()
+
+        def _fix_loop_expired() -> bool:
+            return (time.time() - _fix_loop_start) > _FIX_LOOP_DEADLINE
+
         for _qa_retry_round in range(MAX_QA_RETRIES):
+            if _fix_loop_expired():
+                logger.warning(
+                    "[pipeline:natural][FIXLOOP] run_id=%s deadline %.0fs hit before "
+                    "round %d — falling through to gate (unresolved changes blocked)",
+                    run_id, _FIX_LOOP_DEADLINE, _qa_retry_round + 1,
+                )
+                break
             blocked_indices = []
             for _bi, _bqd in enumerate(qa_results):
                 _bv = _bqd.get("verdict", "safe")
@@ -8269,11 +8293,14 @@ async def run_natural_pipeline_stream(
 
                 correction_tasks.append((
                     idx,
-                    asyncio.create_task(aclient.messages.create(
-                        model=arch_model,
-                        max_tokens=16000,
-                        system=system_prompt,
-                        messages=correction_messages,
+                    asyncio.create_task(asyncio.wait_for(
+                        aclient.messages.create(
+                            model=arch_model,
+                            max_tokens=16000,
+                            system=system_prompt,
+                            messages=correction_messages,
+                        ),
+                        timeout=_CORR_CALL_TIMEOUT,
                     ))
                 ))
 
@@ -8313,7 +8340,7 @@ async def run_natural_pipeline_stream(
 
             # Re-run QA on all fixed changes in parallel
             reqa_tasks = [
-                (idx, asyncio.create_task(run_qa_agent(
+                (idx, asyncio.create_task(asyncio.wait_for(run_qa_agent(
                     original_code=change_shells[idx]["symbol"].code,
                     new_code=change_shells[idx]["new_code"],
                     change_description=change_shells[idx]["description"],
@@ -8327,7 +8354,7 @@ async def run_natural_pipeline_stream(
                     targeted_context=change_shells[idx]["targeted_ctx"],
                     qa_feedback=qa_results[idx],   # pass prior QA so it knows what to watch for
                     same_run_context=change_shells[idx]["same_run"],
-                )))
+                ), timeout=_REQA_CALL_TIMEOUT)))
                 for idx in fixed_indices
             ]
 
