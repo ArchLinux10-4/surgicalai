@@ -7022,6 +7022,7 @@ async def run_natural_pipeline_stream(
         new_file_blocks_raw: list = []
         full_response = ""
         in_thinking = False
+        last_stop_reason = None       # captured from message_delta — "max_tokens" ⇒ truncated
 
         # Build the per-file content lookup once (reused across search rounds)
         file_content_lookup_stream: dict = {
@@ -7168,6 +7169,11 @@ async def run_natural_pipeline_stream(
                                     yield sse({"type": "thinking_end", "content": ""})
                                     in_thinking = False
 
+                            elif etype == "message_delta":
+                                _sr = getattr(getattr(event, "delta", None), "stop_reason", None)
+                                if _sr:
+                                    last_stop_reason = _sr
+
                         # If a search was requested mid-stream, break out of the event loop
                         if search_requested is not None:
                             break
@@ -7277,7 +7283,100 @@ async def run_natural_pipeline_stream(
         # Final flush for edge cases (Claude ended inside a block)
         if in_thinking:
             yield sse({"type": "thinking_end", "content": ""})
-        if state == "in_edit" and edit_buf.strip():
+
+        # ── Truncation recovery for large files (PR #69) ──────────────────
+        # If the stream ended INSIDE a <surgical_edit> or <new_file> block, the
+        # closing tag was never emitted — almost always because we hit the
+        # output-token limit on a large file. Rather than ship the truncated
+        # husk (which the QA gate then blocks, so the feature never lands), issue
+        # bounded continuation calls that resume the EXACT raw character stream
+        # until the block closes. On failure we keep the partial and let the gate
+        # block it — we never ship broken or truncated code either way.
+        _trunc_buf = edit_buf if state == "in_edit" else (file_buf if state == "in_file" else "")
+        _close_tag = EDIT_CLOSE if state == "in_edit" else FILE_CLOSE
+        _open_name = "surgical_edit" if state == "in_edit" else "new_file"
+        if state in ("in_edit", "in_file") and _trunc_buf.strip() and _close_tag not in _trunc_buf:
+            _kind = "edit" if state == "in_edit" else "file"
+            logger.info(
+                "[pipeline:natural][CONTINUATION] run_id=%s truncated %s block "
+                "(%d chars, stop_reason=%s) — attempting completion",
+                run_id, _kind, len(_trunc_buf), last_stop_reason,
+            )
+            yield sse({"type": "progress",
+                       "content": f"Large {_kind} detected — finishing the rest..."})
+
+            _MAX_CONT = 4
+            _completed = False
+            _resume_instr = (
+                f"Your previous response was cut off partway through a <{_open_name}> "
+                f"block because of the output length limit. Continue writing from the "
+                f"EXACT character where you stopped. Output ONLY the remaining text "
+                f"needed to finish that block and close it with </{_open_name}>. "
+                f"Do NOT repeat anything you already wrote. Do NOT restate the opening "
+                f"tag. Do NOT add explanations or any other blocks."
+            )
+            # The truncated assistant turn = everything streamed this round.
+            _cont_msgs = current_messages + [{"role": "assistant", "content": full_response}]
+            for _cont_round in range(_MAX_CONT):
+                try:
+                    _cont_resp = await aclient.messages.create(
+                        model=arch_model,
+                        max_tokens=16000,
+                        system=system_prompt,
+                        messages=_cont_msgs + [{"role": "user", "content": _resume_instr}],
+                    )
+                except Exception as _ce:
+                    logger.info("[pipeline:natural][CONTINUATION] run_id=%s call failed: %s",
+                                run_id, _ce)
+                    break
+                _cont_text = "".join(
+                    getattr(_b, "text", "") or "" for _b in (_cont_resp.content or [])
+                )
+                _cont_stop = getattr(_cont_resp, "stop_reason", None)
+                if not _cont_text.strip():
+                    break
+                _trunc_buf += _cont_text
+                full_response += _cont_text
+                _idx = _trunc_buf.find(_close_tag)
+                if _idx != -1:
+                    if _kind == "edit":
+                        edit_blocks_raw.append(_trunc_buf[:_idx])
+                    else:
+                        new_file_blocks_raw.append(_trunc_buf[:_idx])
+                    yield sse({"type": "edit_end", "content": ""})
+                    _completed = True
+                    logger.info(
+                        "[pipeline:natural][CONTINUATION] run_id=%s completed %s after "
+                        "%d round(s), %d chars total",
+                        run_id, _kind, _cont_round + 1, len(_trunc_buf[:_idx]),
+                    )
+                    yield sse({"type": "progress",
+                               "content": f"✅ Large {_kind} completed "
+                                          f"({_cont_round + 1} continuation round(s))."})
+                    break
+                # Still open — feed the partial back and keep going if more remains.
+                _cont_msgs = _cont_msgs + [
+                    {"role": "user", "content": _resume_instr},
+                    {"role": "assistant", "content": _cont_text},
+                ]
+                if _cont_stop != "max_tokens":
+                    # Model stopped naturally but never closed the tag — stop trying.
+                    break
+            if not _completed:
+                logger.info(
+                    "[pipeline:natural][CONTINUATION] run_id=%s could NOT complete %s "
+                    "block — keeping partial; QA gate will block it",
+                    run_id, _kind,
+                )
+                yield sse({"type": "progress",
+                           "content": f"⚠️ Could not fully finish the large {_kind} — it "
+                                      f"will be quality-checked and blocked if incomplete."})
+                if _kind == "edit":
+                    edit_blocks_raw.append(_trunc_buf)
+                else:
+                    new_file_blocks_raw.append(_trunc_buf)
+                yield sse({"type": "edit_end", "content": ""})
+        elif state == "in_edit" and edit_buf.strip():
             edit_blocks_raw.append(edit_buf)
             yield sse({"type": "edit_end", "content": ""})
         elif state == "in_file" and file_buf.strip():
@@ -8054,6 +8153,105 @@ async def run_natural_pipeline_stream(
             compliance.mark(
                 "file_creation", ran=True,
                 output_summary=f"{len(new_files)} new file(s) passed the QA gate",
+            )
+
+        # ── Dependency-aware gating (PR #69) ──────────────────────────────
+        # A change that PASSED the gate must NOT ship if it depends on a NEW FILE
+        # the same run BLOCKED. The demonstrated break: an edit adds
+        # `require('./newRoutes')` while `newRoutes.js` is blocked for being
+        # truncated — applying the edit alone crashes the server at startup with
+        # "Cannot find module". We cascade the block to every dependent shipped
+        # change (transitively). Only blocked NEW FILES break dependents; a blocked
+        # symbol-edit leaves its file on disk, so it is NOT treated as a missing
+        # dependency.
+        if changes_by_file and gated_out:
+            def _blocked_file_keys(entries):
+                ks = set()
+                for e in entries:
+                    if e.get("symbol") != "(new file)":
+                        continue  # only a MISSING new file breaks importers
+                    fn = (e.get("filename") or "").strip()
+                    if not fn:
+                        continue
+                    base = fn.rsplit("/", 1)[-1]
+                    stem = base.rsplit(".", 1)[0] if "." in base else base
+                    for k in (base, stem):
+                        if k:
+                            ks.add(k.lower())
+                return ks
+
+            def _referenced_blocked_module(code, keys):
+                if not code or not keys:
+                    return None
+                for _m in re.finditer(
+                    r"""(?:require\s*\(\s*|from\s+|import\s+)['"]([^'"]+)['"]""", code
+                ):
+                    spec = _m.group(1)
+                    sb = spec.rsplit("/", 1)[-1]
+                    ss = sb.rsplit(".", 1)[0] if "." in sb else sb
+                    if sb.lower() in keys or ss.lower() in keys:
+                        return spec
+                return None
+
+            _cascade_passes = 0
+            while True:
+                _cascade_passes += 1
+                _blocked_keys = _blocked_file_keys(gated_out)
+                if not _blocked_keys:
+                    break
+                _demoted_any = False
+                for _fn in list(changes_by_file.keys()):
+                    _self_base = _fn.rsplit("/", 1)[-1].lower()
+                    _self_stem = (_self_base.rsplit(".", 1)[0]
+                                  if "." in _self_base else _self_base)
+                    _kept = []
+                    for _chg in changes_by_file[_fn]["changes"]:
+                        _ref = _referenced_blocked_module(_chg.get("new_code", ""), _blocked_keys)
+                        # Never self-block: a file may legitimately reference itself.
+                        _ref_stem = (_ref.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+                                     if _ref else None)
+                        if _ref and _ref_stem != _self_stem:
+                            _sym = _chg.get("symbol", {})
+                            _sym_name = _sym.get("name", "?") if isinstance(_sym, dict) else "?"
+                            _shipped -= 1
+                            _blocked += 1
+                            _demoted_any = True
+                            gated_out.append({
+                                "filename": _fn,
+                                "symbol": _sym_name,
+                                "reason": (
+                                    f"Blocked by dependency gate: references '{_ref}', "
+                                    f"which was blocked in this same run. Applying this "
+                                    f"alone would break the build (missing module)."
+                                ),
+                                "qa_score": _chg.get("confidence", 0),
+                                "verdict": "blocked",
+                            })
+                            logger.info(
+                                "[pipeline:natural][GATE] run_id=%s decision=CASCADE-BLOCK "
+                                "symbol=%s file=%s spec=%s reason=depends_on_blocked_file",
+                                run_id, _sym_name, _fn, _ref,
+                            )
+                            yield sse({"type": "progress", "content": (
+                                f"🚫 DEPENDENCY BLOCK {_sym_name} — depends on '{_ref}', "
+                                f"which was blocked. Not shippable (would break the build)."
+                            )})
+                        else:
+                            _kept.append(_chg)
+                    if _kept:
+                        changes_by_file[_fn]["changes"] = _kept
+                    else:
+                        del changes_by_file[_fn]
+                if not _demoted_any or _cascade_passes > 10:
+                    break
+
+            # Fold the cascade outcome into the compliance gate record.
+            compliance.mark(
+                "confidence_gate", ran=True,
+                output_summary=(
+                    f"gate min={QA_GATE_MIN_SCORE} (+dependency cascade): "
+                    f"{_shipped} shipped, {_blocked} blocked"
+                ),
             )
 
         if not changes_by_file and not new_files:
