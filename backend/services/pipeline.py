@@ -4518,6 +4518,29 @@ async def _generate_new_file_with_continuation(
     }
 
 
+def _qa_fails_ship_gate(qa, gate_min: int) -> bool:
+    """Single source of truth for 'this edit/file CANNOT ship' in the smart
+    pipeline. Called by BOTH the fix-loop retry trigger AND the hard ship gate
+    so the two predicates can never drift apart again.
+
+    PR #78 bug: the gate blocked anything score < gate_min, but the retry only
+    fired on verdict=="blocked" (and score<=7, one-shot). A "warning" at score 6
+    was therefore blocked by the gate yet never sent back for a fix — the work
+    was silently dropped instead of repaired. Routing both through this one
+    predicate guarantees: if it would fail the gate, it is eligible for a fix
+    retry; whatever still fails after retries is blocked.
+
+    Field extraction mirrors the gate's _gate_qa_fields: a None/absent qa, or a
+    None/0 score, is treated as FAILING (fail-closed)."""
+    if qa is None:
+        verdict, score = "skipped", 0
+    elif isinstance(qa, dict):
+        verdict, score = qa.get("verdict", "skipped"), (qa.get("qa_score") or 0)
+    else:
+        verdict, score = getattr(qa, "verdict", "skipped"), (getattr(qa, "qa_score", None) or 0)
+    return verdict == "blocked" or score < gate_min
+
+
 async def run_smart_pipeline_stream(
     session_files: list,
     user_request: str,
@@ -5534,7 +5557,8 @@ USER REQUEST:
                             }
                         _file_result["qa_result"] = _nf_qa
                         _nf_v, _nf_s = _gate_qa_fields(_nf_qa)
-                        _nf_passes = (_nf_v != "blocked") and (_nf_s >= QA_GATE_MIN_SCORE)
+                        # PR #78: shared predicate (same as edit gate + retry).
+                        _nf_passes = not _qa_fails_ship_gate(_nf_qa, QA_GATE_MIN_SCORE)
                         logger.info(
                             "[pipeline:smart][GATE] run_id=%s decision=%s new_file=%s "
                             "verdict=%s score=%s attempt=%d",
@@ -6495,13 +6519,20 @@ USER REQUEST:
                     and _surgeon_attempt < _MAX_SURGEON_ATTEMPTS - 1
                     and not _linter_feedback_for_retry
                 )
-                # Priority 2: QA semantic block (score ≤4, not already a QA retry,
-                #             and linter didn't catch it first)
+                # Priority 2: QA semantic rejection.
+                # PR #78: trigger on the SAME predicate as the hard ship gate
+                # below, via the shared _qa_fails_ship_gate() helper, so the
+                # retry trigger and the gate can never drift apart again. The old
+                # condition keyed on verdict=="blocked" AND score<=7 AND allowed
+                # only ONE retry — so a "warning" at score 6 (which the gate
+                # blocks) never triggered a fix attempt and was silently dropped.
+                # Now anything that would FAIL the gate is sent back to the
+                # Surgeon with QA feedback and re-QA'd, up to the attempt budget.
+                # The gate below remains the backstop: anything still below the
+                # bar after retries is blocked, never shipped.
                 _can_retry_qa = (
                     not _can_retry_lint
-                    and _qa_result.get("verdict") == "blocked"
-                    and (_qa_result.get("qa_score") or 10) <= 7
-                    and not _qa_feedback_for_retry
+                    and _qa_fails_ship_gate(_qa_result, QA_GATE_MIN_SCORE)
                     and _surgeon_attempt < _MAX_SURGEON_ATTEMPTS - 1
                 )
                 if _can_retry_lint:
@@ -6589,7 +6620,9 @@ USER REQUEST:
             _kept = []
             for c in changes_by_file[fname]["changes"]:
                 _v, _s = _gate_qa_fields(c.qa_result)
-                _passes = (_v != "blocked") and (_s >= QA_GATE_MIN_SCORE)
+                # PR #78: decide via the shared predicate so the gate and the
+                # fix-loop retry trigger stay byte-for-byte consistent.
+                _passes = not _qa_fails_ship_gate(c.qa_result, QA_GATE_MIN_SCORE)
                 _sym = c.symbol.full_path if getattr(c, "symbol", None) else "unknown"
                 _reasons = []
                 if _v == "blocked":
