@@ -21,6 +21,24 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# --- Gate-decision visibility (PR #77) -----------------------------------
+# The backend never calls logging.basicConfig(), so the root logger has no
+# INFO-level handler and every logger.info(...) in this module — including the
+# [pipeline:*][GATE] ship/block decision lines — was silently dropped in
+# production (only WARNING+ reaches stderr via Python's last-resort handler).
+# Attach a stdout handler scoped to THIS module's logger so gate decisions are
+# visible in deploy logs, without enabling noisy INFO output from third-party
+# libraries (httpx, openai, anthropic, etc.). Guarded against double-add.
+import sys as _sys
+if not any(getattr(_h, "_surgicalai_gate_handler", False) for _h in logger.handlers):
+    _gate_handler = logging.StreamHandler(_sys.stdout)
+    _gate_handler._surgicalai_gate_handler = True
+    _gate_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+    logger.addHandler(_gate_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False  # don't double-emit if the root logger is configured later
+# -------------------------------------------------------------------------
+
 from database import get_setting, get_user_api_key
 from crypto_utils import decrypt_api_key
 from models.schemas import (
