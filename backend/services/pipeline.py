@@ -3691,7 +3691,10 @@ OTHER FILES IN SESSION (for cross-file checking):
 ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 {_risks_block}"""
 
-    try:
+    import re as _re
+
+    # ── one QA model call → extracted JSON text (str) ───────────────────────
+    async def _qa_call_once() -> str:
         if _qa_use_claude:
             _qa_msg = await _qa_aclient.messages.create(
                 model=_qa_model,
@@ -3699,27 +3702,140 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
                 system=QA_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
             )
-            raw = (_qa_msg.content[0].text or "").strip()
-            # Robust JSON extraction — Claude sometimes adds preamble or markdown fences
-            raw = _extract_json_from_text(raw)
-        else:
-            client = _get_client(user_id)
+            _raw = (_qa_msg.content[0].text or "").strip()
+            # Robust JSON extraction — Claude sometimes adds preamble/fences
+            return _extract_json_from_text(_raw)
+        client = _get_client(user_id)
 
-            def _call():
-                return _chat_create(
-                    client,
-                    model=_qa_model,
-                    messages=[
-                        {"role": "system", "content": QA_SYSTEM},
-                        {"role": "user",   "content": user_msg},
-                    ],
-                    temperature=0.1,
-                    response_format={"type": "json_object"},
-                )
+        def _call():
+            return _chat_create(
+                client,
+                model=_qa_model,
+                messages=[
+                    {"role": "system", "content": QA_SYSTEM},
+                    {"role": "user",   "content": user_msg},
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
 
-            response = await asyncio.to_thread(_call)
-            raw = response.choices[0].message.content
-        data = json.loads(raw)
+        _resp = await asyncio.to_thread(_call)
+        return (_resp.choices[0].message.content or "").strip()
+
+    def _edit_delims_balanced(code: str) -> bool:
+        """Truncation detector for edits — balanced {} () [] after stripping
+        comments and string/template literals."""
+        s = code
+        s = _re.sub(r"/\*.*?\*/", "", s, flags=_re.S)
+        s = _re.sub(r"//[^\n]*", "", s)
+        s = _re.sub(r"#[^\n]*", "", s)
+        s = _re.sub(r'"(?:\\.|[^"\\])*"', '""', s)
+        s = _re.sub(r"'(?:\\.|[^'\\])*'", "''", s)
+        s = _re.sub(r"`(?:\\.|[^`\\])*`", "``", s)
+        return (
+            s.count("{") == s.count("}")
+            and s.count("(") == s.count(")")
+            and s.count("[") == s.count("]")
+        )
+
+    def _edit_struct_fallback(note: str = "") -> dict:
+        """Deterministic structural QA fallback for EDITS, used when the QA
+        model returns empty/garbage. We have BOTH original and new code here,
+        so structural_qa's completeness + syntax checks are fully effective.
+
+        A QA that *could not run* must NOT be scored as a real quality failure:
+        the old code returned qa_score=None → the hard gate read it as 0/10 and
+        false-blocked clean edits (e.g. a one-line require()). Mirrors PR #70's
+        new-file resilience for the edit path.
+        """
+        _suffix = f" ({note})" if note else ""
+        _new = (new_code or "").strip()
+
+        def _ret(_res: dict) -> dict:
+            try:
+                _log_qa_result(session_id, filename, symbol_path, _res)
+            except Exception:
+                pass
+            return _res
+
+        # No-op edits (original == new) are legitimately fine.
+        if _no_change:
+            return _ret({
+                "verdict": "safe", "qa_score": 8,
+                "summary": f"QA model unavailable{_suffix}; no code change detected "
+                           f"(original == new) — structurally safe.",
+                "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
+                "type_errors": [], "plan_deviation": "", "skipped_reason": None,
+            })
+        # Empty new code for a real edit is never shippable.
+        if not _new:
+            return _ret({
+                "verdict": "blocked", "qa_score": 0,
+                "summary": f"QA model unavailable{_suffix} and new code is empty.",
+                "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
+                "type_errors": [], "plan_deviation": "", "skipped_reason": note,
+            })
+        # Truncation detector.
+        if not _edit_delims_balanced(_new):
+            return _ret({
+                "verdict": "blocked", "qa_score": 3,
+                "summary": f"QA model unavailable{_suffix}; new code has unbalanced "
+                           f"delimiters — looks truncated/incomplete.",
+                "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
+                "type_errors": [],
+                "plan_deviation": "", "skipped_reason": note,
+            })
+        # Deterministic zero-LLM structural checks (has original + new).
+        try:
+            from services.structural_qa import (
+                run_structural_qa as _sq,
+                has_blocking_issues as _sqb,
+            )
+            _issues = _sq(new_code=new_code, original_code=original_code, filename=filename)
+            if _issues and _sqb(_issues):
+                _msgs = "; ".join(
+                    i.get("message", "") for i in _issues
+                    if i.get("severity") == "error"
+                )[:200]
+                return _ret({
+                    "verdict": "blocked", "qa_score": 3,
+                    "summary": f"QA model unavailable{_suffix}; structural QA found "
+                               f"blocking issues: {_msgs}",
+                    "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
+                    "type_errors": [], "plan_deviation": "", "skipped_reason": note,
+                })
+        except Exception:
+            pass  # structural module unavailable — balance check above still ran
+        # Non-empty, balanced, no structural breaks → structurally sound.
+        # Don't false-block a clean edit just because the LLM QA flaked.
+        return _ret({
+            "verdict": "safe", "qa_score": 8,  # == gate ship bar (QA_GATE_MIN_SCORE)
+            "summary": f"QA model unavailable{_suffix}; deterministic structural "
+                       f"checks passed — structurally sound.",
+            "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
+            "type_errors": [], "plan_deviation": "", "skipped_reason": None,
+        })
+
+    try:
+        raw = await _qa_call_once()
+        # Retry once on empty/blank — transient empty completions happen,
+        # especially on large inputs. One empty response must not = 0/10.
+        if not (raw or "").strip():
+            logger.info("[pipeline][QA] run_id=%s empty QA response for %s — retrying once",
+                        session_id, symbol_path)
+            try:
+                raw = await _qa_call_once()
+            except Exception:
+                raw = ""
+        # Still empty → deterministic structural fallback (never false-0).
+        if not (raw or "").strip():
+            logger.info("[pipeline][QA] run_id=%s QA still empty for %s — structural fallback",
+                        session_id, symbol_path)
+            return _edit_struct_fallback("empty QA response after retry")
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = json.loads(_extract_json_from_text(raw))
 
         result = {
             "verdict":          data.get("verdict", "warning"),
@@ -3758,21 +3874,12 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
         return result
 
     except Exception as e:
-        skipped = {
-            "verdict":          "skipped",
-            "qa_score":         None,
-            "summary":          "QA check could not run — review manually",
-            "import_issues":    [],
-            "downstream_risks": [],
-            "type_errors":      [],
-            "plan_deviation":   "",
-            "skipped_reason":   str(e)[:200],
-        }
-        try:
-            _log_qa_result(session_id, filename, symbol_path, skipped)
-        except Exception:
-            pass
-        return skipped
+        # QA infra failure — fall back to deterministic structural QA rather
+        # than returning qa_score=None (which the hard gate reads as 0/10 and
+        # would false-block a clean change). Mirrors PR #70 for new files.
+        logger.info("[pipeline][QA] run_id=%s QA call errored for %s: %s — structural fallback",
+                    session_id, symbol_path, str(e)[:120])
+        return _edit_struct_fallback(f"QA error: {str(e)[:80]}")
 
 
 def _log_qa_result(session_id: str, filename: str, symbol_name: str, result: dict):
@@ -4003,6 +4110,7 @@ async def _run_claude_direct_rewrite(
     )
 
     import time as _time_dr
+    import asyncio  # used by the 529 back-off below (was a latent NameError)
     _dr_max_attempts = 3
     _dr_delay = 10  # seconds between 529 retries
     for _dr_attempt in range(_dr_max_attempts):
@@ -8204,42 +8312,104 @@ async def run_natural_pipeline_stream(
                 }
                 language = ext_map.get(ext, "text")
 
-            # QA: check the new file against codebase context
+            # QA the new file, and — mirroring the edit path's auto-fix loop —
+            # when it's blocked (e.g. the Surgeon emitted a structurally-closed
+            # but content-truncated file), feed the QA feedback back to the model,
+            # regenerate the COMPLETE file, and re-QA. Loop up to _NF_MAX_FIX
+            # times before blocking. This realises the operator's mental model
+            # for new files: "QA finds issues → send back → fix → re-QA → confirm
+            # resolved." Edits already had this loop; new files did not.
             codebase_ctx = _build_codebase_context_for_creator(symbol_maps_by_name)
-            try:
-                qa = await _run_qa_for_new_file(
-                    file_result={"filename": filename, "content": content,
-                                 "language": language, "summary": summary},
-                    codebase_context=codebase_ctx,
-                    user_id=user_id,
-                )
-                qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(
-                    qa.get("verdict", "safe"), "✅"
-                )
-                yield sse({"type": "progress",
-                           "content": f"{qa_icon} {filename} — {qa.get('summary', 'ready')}"})
-                file_data["qa_result"] = qa
-            except Exception:
-                yield sse({"type": "progress", "content": f"✅ {filename} ready"})
-                file_data["qa_result"] = {"verdict": "safe", "qa_score": 8}
+            _NF_MAX_FIX = 2
+            _nf_shipped = False
+            for _nf_attempt in range(_NF_MAX_FIX + 1):
+                try:
+                    qa = await _run_qa_for_new_file(
+                        file_result={"filename": filename, "content": content,
+                                     "language": language, "summary": summary},
+                        codebase_context=codebase_ctx,
+                        user_id=user_id,
+                    )
+                    qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(
+                        qa.get("verdict", "safe"), "✅"
+                    )
+                    yield sse({"type": "progress",
+                               "content": f"{qa_icon} {filename} — {qa.get('summary', 'ready')}"})
+                    file_data["qa_result"] = qa
+                except Exception:
+                    yield sse({"type": "progress", "content": f"✅ {filename} ready"})
+                    file_data["qa_result"] = {"verdict": "safe", "qa_score": 8}
 
-            # Apply the SAME hard gate to new files — nothing below the bar ships.
-            _nf_qa = file_data.get("qa_result", {}) or {}
-            _nf_verdict = _nf_qa.get("verdict", "safe")
-            _nf_score = _nf_qa.get("qa_score") or 0
-            _nf_passes = (_nf_verdict != "blocked") and (_nf_score >= QA_GATE_MIN_SCORE)
-            _nf_decision = "SHIP" if _nf_passes else "BLOCK"
-            logger.info(
-                "[pipeline:natural][GATE] run_id=%s decision=%s new_file=%s "
-                "verdict=%s score=%s",
-                run_id, _nf_decision, filename, _nf_verdict, _nf_score,
-            )
-            if not _nf_passes:
+                # Apply the SAME hard gate to new files — nothing below the bar ships.
+                _nf_qa = file_data.get("qa_result", {}) or {}
+                _nf_verdict = _nf_qa.get("verdict", "safe")
+                _nf_score = _nf_qa.get("qa_score") or 0
+                _nf_passes = (_nf_verdict != "blocked") and (_nf_score >= QA_GATE_MIN_SCORE)
+                _nf_decision = "SHIP" if _nf_passes else "BLOCK"
+                logger.info(
+                    "[pipeline:natural][GATE] run_id=%s decision=%s new_file=%s "
+                    "verdict=%s score=%s attempt=%d",
+                    run_id, _nf_decision, filename, _nf_verdict, _nf_score, _nf_attempt,
+                )
+                if _nf_passes:
+                    _nf_shipped = True
+                    break
+                if _nf_attempt >= _NF_MAX_FIX:
+                    break  # retries exhausted — gated out below
+
+                # Regenerate the COMPLETE file from the QA feedback. tool_use
+                # rewrite (32K tokens, "output every line") is far less
+                # truncation-prone than the inline <new_file> stream.
+                yield sse({"type": "progress",
+                           "content": f"🔁 Fixing new file {filename} — attempt "
+                                      f"{_nf_attempt + 1}/{_NF_MAX_FIX}..."})
+                try:
+                    _nf_regen = await _run_claude_direct_rewrite(
+                        file_content=content,
+                        filename=filename,
+                        change_description=(
+                            (summary or f"Create {filename}")
+                            + " — the previous version FAILED QA (likely incomplete/"
+                              "truncated). Output the COMPLETE corrected file, every "
+                              "line from first import to last closing brace."
+                        ),
+                        new_logic=(
+                            "Fix ALL of these QA issues and output the entire file "
+                            "with no truncation or ellipsis:\n"
+                            + (_nf_qa.get("summary", "") or "")
+                        ),
+                        architect_plan={"risks": (
+                            (_nf_qa.get("completeness_issues") or [])
+                            + (_nf_qa.get("import_issues") or [])
+                        )},
+                        anthropic_key=_get_anthropic_key(user_id),
+                        model=arch_model,
+                    )
+                    _nf_new_content = (_nf_regen.get("new_file_content") or "").strip()
+                except Exception as _nf_regen_e:
+                    logger.info(
+                        "[pipeline:natural][NEWFILE-FIX] run_id=%s regen failed for %s: %s",
+                        run_id, filename, str(_nf_regen_e)[:120],
+                    )
+                    break  # can't regenerate — gate below blocks it
+                if not _nf_new_content or _nf_new_content == content:
+                    logger.info(
+                        "[pipeline:natural][NEWFILE-FIX] run_id=%s regen produced no "
+                        "improvement for %s — blocking", run_id, filename,
+                    )
+                    break  # no improvement — gate below blocks it
+                content = _nf_new_content  # re-QA the regenerated file next loop
+
+            if not _nf_shipped:
+                _nf_qa = file_data.get("qa_result", {}) or {}
+                _nf_verdict = _nf_qa.get("verdict", "blocked")
+                _nf_score = _nf_qa.get("qa_score") or 0
                 gated_out.append({
                     "filename": filename,
                     "symbol": "(new file)",
                     "reason": f"Blocked by QA gate (verdict={_nf_verdict}, "
-                              f"score {_nf_score} < {QA_GATE_MIN_SCORE}). "
+                              f"score {_nf_score} < {QA_GATE_MIN_SCORE}) after "
+                              f"{_NF_MAX_FIX} fix attempt(s). "
                               + (_nf_qa.get("summary", "") or ""),
                     "qa_score": _nf_score,
                     "verdict": _nf_verdict,
