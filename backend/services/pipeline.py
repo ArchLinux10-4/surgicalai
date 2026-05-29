@@ -4529,6 +4529,25 @@ async def run_smart_pipeline_stream(
     run_id = str(uuid.uuid4())
     compliance = ComplianceTracker(run_id=run_id, session_id=session_id or "", intent="unknown")
 
+    # PR #76: hard QA gate threshold — mirror run_natural_pipeline_stream.
+    # This pipeline previously computed QA verdicts but NEVER enforced them:
+    # the new-file path, the direct-rewrite path, and the Surgeon edit path all
+    # appended their result to the ship set unconditionally, so a change/file
+    # QA blocked (verdict=blocked or qa_score < 8) still shipped — the same
+    # fail-OPEN bug class PR #74 closed in the natural pipeline. The gates below
+    # make the smart pipeline fail-CLOSED: nothing below the bar reaches the
+    # applyable result; blocked items move to skipped_changes and are logged.
+    QA_GATE_MIN_SCORE = 8
+
+    def _gate_qa_fields(qa) -> tuple:
+        """Read (verdict, score) from a QAResult model, a dict, or None.
+        None/absent ⇒ fail-closed (treated as blocked at score 0)."""
+        if qa is None:
+            return "skipped", 0
+        if isinstance(qa, dict):
+            return qa.get("verdict", "skipped"), (qa.get("qa_score") or 0)
+        return getattr(qa, "verdict", "skipped"), (getattr(qa, "qa_score", None) or 0)
+
     try:
         # Detect create intent keywords in the request even before Architect runs.
         # This lets the pipeline skip the early-return for no-files when the user
@@ -5461,6 +5480,8 @@ USER REQUEST:
             # Build codebase context for the file creator
             _creator_context = _build_codebase_context_for_creator(symbol_maps_by_name)
             created_files = []
+            _create_skipped: list = []   # PR #76: new files blocked by the QA gate
+            _NF_MAX_FIX_SMART = 2        # regen attempts before the gate blocks
 
             for _spec in new_file_specs:
                 _fname = _spec.get("filename", "new_file.ts")
@@ -5471,31 +5492,107 @@ USER REQUEST:
                         codebase_context=_creator_context,
                         user_id=user_id,
                     )
-                    # Run QA on the created file
-                    try:
-                        _create_qa = await _run_qa_for_new_file(
-                            file_result=_file_result,
-                            codebase_context=_creator_context,
-                            user_id=user_id,
+                    # ── PR #76: QA + hard gate + bounded regen (fail-closed) ────
+                    # Mirror the natural pipeline's new-file gate. Previously the
+                    # file was appended regardless of verdict, and a QA *crash*
+                    # shipped it at full — both fail-OPEN. Now: QA every attempt
+                    # (crash ⇒ held below gate), regenerate from QA feedback up to
+                    # _NF_MAX_FIX_SMART times, and ship ONLY if it clears the bar.
+                    _nf_passed = False
+                    _nf_qa: dict = {}
+                    for _nf_try in range(_NF_MAX_FIX_SMART + 1):
+                        try:
+                            _nf_qa = await _run_qa_for_new_file(
+                                file_result=_file_result,
+                                codebase_context=_creator_context,
+                                user_id=user_id,
+                            )
+                        except Exception as _cqe:
+                            print(f"[QA_CREATE] error: {_cqe} — fail-closed hold")
+                            _nf_qa = {
+                                "verdict": "warning", "qa_score": 7,
+                                "summary": f"QA raised an error ({str(_cqe)[:80]}) — "
+                                           f"held below gate (fail-closed).",
+                            }
+                        _file_result["qa_result"] = _nf_qa
+                        _nf_v, _nf_s = _gate_qa_fields(_nf_qa)
+                        _nf_passes = (_nf_v != "blocked") and (_nf_s >= QA_GATE_MIN_SCORE)
+                        logger.info(
+                            "[pipeline:smart][GATE] run_id=%s decision=%s new_file=%s "
+                            "verdict=%s score=%s attempt=%d",
+                            run_id, "SHIP" if _nf_passes else "BLOCK",
+                            _fname, _nf_v, _nf_s, _nf_try,
                         )
-                        _file_result["qa_result"] = _create_qa
-                        _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(
-                            _create_qa.get("verdict", "safe"), "✅"
-                        )
+                        _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(_nf_v, "✅")
                         yield sse({"type": "progress", "content": (
-                            f"{_qa_icon} {_fname} ready "
+                            f"{_qa_icon} {_fname} "
                             f"({len(_file_result.get('content','').splitlines())} lines) "
-                            f"— QA {_create_qa.get('summary', '')}"
+                            f"— QA {_nf_qa.get('summary', '')} (score: {_nf_s})"
                         )})
-                    except Exception as _cqe:
-                        yield sse({"type": "progress", "content": f"✅ {_fname} ready ({len(_file_result.get('content','').splitlines())} lines)"})
-                        print(f"[QA_CREATE] Skipped: {_cqe}")
-                    created_files.append(_file_result)
+                        if _nf_passes:
+                            _nf_passed = True
+                            break
+                        if _nf_try >= _NF_MAX_FIX_SMART:
+                            break  # retries exhausted — gated out below
+                        # Regenerate the COMPLETE file with QA feedback folded in.
+                        _nf_fb = (_nf_qa.get("summary", "") or "")
+                        for _fk in ("completeness_issues", "import_issues", "type_errors"):
+                            _nf_fb += "".join(f"\n- {x}" for x in (_nf_qa.get(_fk) or []))
+                        yield sse({"type": "progress", "content": (
+                            f"🔁 Fixing new file {_fname} — attempt "
+                            f"{_nf_try + 1}/{_NF_MAX_FIX_SMART}..."
+                        )})
+                        _retry_spec = dict(_spec)
+                        _retry_spec["content_guidance"] = (
+                            (_spec.get("content_guidance", "") or "")
+                            + "\n\nPREVIOUS ATTEMPT WAS REJECTED BY QA. Output the COMPLETE "
+                              "file and fix ALL of these issues:\n" + _nf_fb
+                        ).strip()
+                        try:
+                            _file_result = await run_file_creator(
+                                file_spec=_retry_spec,
+                                codebase_context=_creator_context,
+                                user_id=user_id,
+                            )
+                        except Exception as _re:
+                            print(f"[NEWFILE-FIX] regen failed for {_fname}: {_re}")
+                            break  # can't regenerate — gate below blocks it
+
+                    if _nf_passed:
+                        created_files.append(_file_result)
+                    else:
+                        _nf_v, _nf_s = _gate_qa_fields(_nf_qa)
+                        _create_skipped.append({
+                            "filename": _fname,
+                            "symbol": "(new file)",
+                            "reason": (
+                                f"Blocked by QA gate (verdict={_nf_v}, "
+                                f"score {_nf_s} < {QA_GATE_MIN_SCORE}) after "
+                                f"{_NF_MAX_FIX_SMART} fix attempt(s). "
+                                + ((_nf_qa or {}).get("summary", "") or "")
+                            ).strip(),
+                            "qa_score": _nf_s,
+                            "verdict": _nf_v,
+                        })
+                        yield sse({"type": "progress", "content": (
+                            f"🚫 GATE BLOCKED new file {_fname} (score {_nf_s}/10) "
+                            f"— not shippable, will not be applied"
+                        )})
                 except Exception as _cfe:
                     yield sse({"type": "progress", "content": f"⚠️ Could not create {_fname}: {_cfe}"})
 
             if not created_files:
-                yield sse({"type": "token", "content": "File creation failed. Try being more specific about what the file should contain."})
+                if _create_skipped:
+                    # Files WERE generated but every one failed the QA gate.
+                    _blk = _create_skipped[0]
+                    yield sse({"type": "token", "content": (
+                        f"I generated the file(s) but blocked them at QA "
+                        f"(score {_blk.get('qa_score', '?')}/10) rather than ship something "
+                        f"incomplete: {_blk.get('reason', '')}\n\n"
+                        f"Try describing the file again with a bit more detail."
+                    )})
+                else:
+                    yield sse({"type": "token", "content": "File creation failed. Try being more specific about what the file should contain."})
                 compliance.save()
                 yield sse({"type": "done", "content": ""})
                 return
@@ -5510,7 +5607,7 @@ USER REQUEST:
                 "new_files": created_files,
                 "risks": plan.get("risks", []),
                 "changes_by_file": {},   # required by SmartResult schema; empty for pure create
-                "skipped_changes": [],
+                "skipped_changes": _create_skipped,  # PR #76: QA-gated new files
             }
 
             # If Architect also planned edits to existing files (mixed create+edit),
@@ -6461,6 +6558,55 @@ USER REQUEST:
                 del changes_by_file[fname]
             else:
                 changes_by_file[fname]["changes"] = real_changes
+
+        # ── PR #76: hard QA gate (fail-closed) — mirror run_natural_pipeline ──
+        # BOTH the Surgeon retry loop AND the direct-rewrite path append their
+        # SurgicalChange to changes_by_file WITHOUT consulting the QA verdict, so
+        # a change QA blocked (verdict=blocked or qa_score < gate) still shipped.
+        # Enforce the gate here, after ghost-diff filtering and before the result
+        # is assembled: nothing below the bar stays applyable; blocked changes
+        # move to skipped_changes. Every decision is logged for ship/block
+        # visibility, exactly like the natural pipeline.
+        for fname in list(changes_by_file.keys()):
+            _kept = []
+            for c in changes_by_file[fname]["changes"]:
+                _v, _s = _gate_qa_fields(c.qa_result)
+                _passes = (_v != "blocked") and (_s >= QA_GATE_MIN_SCORE)
+                _sym = c.symbol.full_path if getattr(c, "symbol", None) else "unknown"
+                _reasons = []
+                if _v == "blocked":
+                    _reasons.append("verdict=blocked")
+                if _s < QA_GATE_MIN_SCORE:
+                    _reasons.append(f"score {_s} < {QA_GATE_MIN_SCORE}")
+                logger.info(
+                    "[pipeline:smart][GATE] run_id=%s decision=%s symbol=%s file=%s "
+                    "verdict=%s score=%s reasons=%s",
+                    run_id, "SHIP" if _passes else "BLOCK", _sym, fname, _v, _s,
+                    (", ".join(_reasons) or "passes"),
+                )
+                if _passes:
+                    _kept.append(c)
+                else:
+                    _qa_summary = ""
+                    if c.qa_result is not None:
+                        _qa_summary = getattr(c.qa_result, "summary", "") or ""
+                    skipped_changes.append({
+                        "filename": fname,
+                        "symbol": _sym,
+                        "reason": (
+                            f"Blocked by QA gate ({', '.join(_reasons)}). " + _qa_summary
+                        ).strip(),
+                        "qa_score": _s,
+                        "verdict": _v,
+                    })
+                    yield sse({"type": "progress", "content": (
+                        f"🚫 GATE BLOCKED {_sym} (score {_s}/10, {_v}) — not shippable, "
+                        f"will not be applied. Reason: {', '.join(_reasons)}"
+                    )})
+            if _kept:
+                changes_by_file[fname]["changes"] = _kept
+            else:
+                del changes_by_file[fname]
 
         if not changes_by_file:
             # If this was a mixed create+edit and edits produced no changes,
