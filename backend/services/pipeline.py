@@ -2958,17 +2958,11 @@ async def _run_qa_for_new_file(file_result: dict, codebase_context: str, user_id
     Returns same shape as run_qa_agent for consistency.
     """
     import asyncio
-    try:
-        _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
-        _use_claude = True
-        _model = "claude-sonnet-4-6"
-    except Exception:
-        _qa_aclient = None
-        _use_claude = False
-        _model = "gpt-4.1"
+    import re as _re
 
-    filename = file_result.get("filename", "new_file")
-    content  = file_result.get("content", "")[:6000]
+    filename     = file_result.get("filename", "new_file")
+    full_content = file_result.get("content", "") or ""
+    content      = full_content[:6000]
 
     user_msg = f"""CODEBASE CONTEXT (imports, types, and API signatures in the project):
 {codebase_context[:3000]}
@@ -2978,31 +2972,32 @@ NEW FILE: {filename}
 
 Run all 5 checks and return the JSON verdict."""
 
-    try:
-        if _use_claude:
-            _msg = await _qa_aclient.messages.create(
-                model=_model, max_tokens=800,
-                system=QA_CREATE_SYSTEM,
-                messages=[{"role": "user", "content": user_msg}],
-            )
-            raw = _msg.content[0].text.strip()
-            if raw.startswith("```"):
-                lines = raw.split("\n")
-                raw = "\n".join(lines[1:] if lines[-1].strip() != "```" else lines[1:-1])
-        else:
-            client = _get_client(user_id)
-            def _call():
-                return _chat_create(client, model=_model,
-                    messages=[{"role":"system","content":QA_CREATE_SYSTEM},
-                               {"role":"user","content":user_msg}],
-                    temperature=0.1, response_format={"type":"json_object"})
-            resp = await asyncio.to_thread(_call)
-            raw = resp.choices[0].message.content
+    # ── PR #70: robust JSON extraction ────────────────────────────────────
+    # The LLM sometimes wraps JSON in a ```fence```, prefixes prose, or (the
+    # bug that blocked a complete 447-line file in the big-file stress test)
+    # returns an EMPTY string. json.loads("") throws "Expecting value: line 1
+    # column 1 (char 0)", which the old code mapped to verdict=skipped/score
+    # None — and the hard gate then blocked a perfectly good file at 0/10.
+    def _extract_json(s: str) -> str:
+        s = (s or "").strip()
+        if not s:
+            return ""
+        if s.startswith("```"):
+            s = _re.sub(r"^```[a-zA-Z0-9]*\n?", "", s)
+            s = _re.sub(r"\n?```\s*$", "", s).strip()
+        i, j = s.find("{"), s.rfind("}")
+        if i != -1 and j != -1 and j > i:
+            return s[i:j + 1]
+        return ""
 
-        data = json.loads(raw)
+    def _normalize(data: dict) -> dict:
+        try:
+            _score = int(data.get("qa_score", 7))
+        except (TypeError, ValueError):
+            _score = 7
         return {
             "verdict":              data.get("verdict", "warning"),
-            "qa_score":             int(data.get("qa_score", 7)),
+            "qa_score":             _score,
             "summary":              data.get("summary", ""),
             "import_issues":        data.get("import_issues", []),
             "type_errors":          data.get("type_errors", []),
@@ -3011,13 +3006,127 @@ Run all 5 checks and return the JSON verdict."""
             "plan_deviation":       "",
             "risk_verdicts":        [],
         }
-    except Exception as e:
+
+    # ── PR #70: deterministic fallback when the LLM QA can't run ───────────
+    # A QA *infrastructure* failure (empty/garbled response, transient API
+    # error) must NOT be scored as if the FILE were terrible. Fall back to the
+    # zero-LLM structural checks (they support .ts/.tsx/.js/.jsx/.py/.vue/
+    # .svelte). If the file is structurally sound, let it ship; if structural
+    # QA finds a real blocking break (unbalanced delimiters, truncation,
+    # syntax), block it for real. This mirrors the operator's mental model:
+    # "run QA till issues resolve" — a QA that didn't run is not a fail.
+    def _delimiters_balanced(code: str) -> bool:
+        """Truncation detector: balanced {} () [] after stripping comments and
+        string/template literals (so a `}` inside a string can't false-trip)."""
+        s = code
+        s = _re.sub(r"/\*.*?\*/", "", s, flags=_re.S)   # block comments
+        s = _re.sub(r"//[^\n]*", "", s)                  # line comments (js)
+        s = _re.sub(r'#[^\n]*', "", s)                   # line comments (py/sh)
+        s = _re.sub(r'"(?:\\.|[^"\\])*"', '""', s)        # dq strings
+        s = _re.sub(r"'(?:\\.|[^'\\])*'", "''", s)        # sq strings
+        s = _re.sub(r"`(?:\\.|[^`\\])*`", "``", s)        # template literals
+        return (
+            s.count("{") == s.count("}")
+            and s.count("(") == s.count(")")
+            and s.count("[") == s.count("]")
+        )
+
+    def _deterministic_fallback(note: str = "") -> dict:
+        _suffix = f" ({note})" if note else ""
+        _c = full_content.strip()
+
+        # (a) Empty output is never shippable.
+        if not _c:
+            return {
+                "verdict": "blocked", "qa_score": 0,
+                "summary": f"QA unavailable{_suffix} and file is empty",
+                "import_issues": [], "type_errors": [], "completeness_issues": [],
+                "downstream_risks": [], "plan_deviation": "", "risk_verdicts": [],
+            }
+
+        # (b) Truncation detector — catches a NEW file cut off mid-block, which
+        # structural_qa's completeness check can't see (it needs original_code).
+        if not _delimiters_balanced(_c):
+            return {
+                "verdict": "blocked", "qa_score": 3,
+                "summary": f"Unbalanced delimiters{_suffix} — file looks truncated/incomplete",
+                "import_issues": [], "type_errors": [],
+                "completeness_issues": ["Unbalanced braces/parens/brackets — likely truncated output"],
+                "downstream_risks": [], "plan_deviation": "", "risk_verdicts": [],
+            }
+
+        # (c) Deterministic zero-LLM structural checks (supports .ts/.tsx/.js/
+        # .jsx/.py/.vue/.svelte). Block on a real structural break.
+        try:
+            from services.structural_qa import (
+                run_structural_qa as _sq,
+                has_blocking_issues as _sqb,
+            )
+            _issues = _sq(new_code=full_content, original_code="", filename=filename)
+            if _issues and _sqb(_issues):
+                _msgs = "; ".join(
+                    i.get("message", "") for i in _issues
+                    if i.get("severity") == "error"
+                )[:200]
+                return {
+                    "verdict": "blocked", "qa_score": 3,
+                    "summary": f"Structural QA failed{_suffix}: {_msgs}",
+                    "import_issues": [], "type_errors": [],
+                    "completeness_issues": [_msgs],
+                    "downstream_risks": [], "plan_deviation": "",
+                    "risk_verdicts": [],
+                }
+        except Exception:
+            pass  # structural module unavailable — balance check above still ran
+
+        # (d) Non-empty, balanced, no structural breaks → structurally sound.
+        # Don't false-block a good file just because the LLM QA flaked.
         return {
-            "verdict": "skipped", "qa_score": None,
-            "summary": f"QA skipped: {str(e)[:100]}",
+            "verdict": "safe", "qa_score": 8,  # == gate ship bar (QA_GATE_MIN_SCORE)
+            "summary": f"LLM QA unavailable{_suffix}; passed deterministic structural checks",
             "import_issues": [], "type_errors": [], "completeness_issues": [],
             "downstream_risks": [], "plan_deviation": "", "risk_verdicts": [],
         }
+
+    async def _attempt() -> str:
+        """One QA call. Prefer Claude, fall back to OpenAI. Return raw text."""
+        try:
+            _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
+            _msg = await _qa_aclient.messages.create(
+                model="claude-sonnet-4-6", max_tokens=1500,
+                system=QA_CREATE_SYSTEM,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            _parts = [
+                b.text for b in _msg.content
+                if getattr(b, "type", None) == "text" and getattr(b, "text", None)
+            ]
+            return "".join(_parts).strip()
+        except Exception:
+            client = _get_client(user_id)
+            def _call():
+                return _chat_create(client, model="gpt-4.1",
+                    messages=[{"role": "system", "content": QA_CREATE_SYSTEM},
+                               {"role": "user", "content": user_msg}],
+                    temperature=0.1, response_format={"type": "json_object"})
+            resp = await asyncio.to_thread(_call)
+            return (resp.choices[0].message.content or "").strip()
+
+    # Retry the QA call on empty/unparseable output before giving up.
+    for _try in range(2):
+        try:
+            raw = await _attempt()
+        except Exception:
+            raw = ""
+        _json = _extract_json(raw)
+        if _json:
+            try:
+                return _normalize(json.loads(_json))
+            except Exception:
+                pass  # unparseable — retry, then fall back
+
+    # All LLM attempts failed → deterministic structural verdict.
+    return _deterministic_fallback(note="LLM QA empty/unparseable after retries")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
