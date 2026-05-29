@@ -4146,6 +4146,191 @@ async def _run_claude_direct_rewrite(
     raise RuntimeError("[DIRECT_REWRITE] Claude did not call submit_file_rewrite — check model/key")
 
 
+def _strip_code_fences(text: str) -> str:
+    """Remove a leading ```lang fence and a trailing ``` fence if the model
+    wrapped the file in markdown despite being told not to. Leaves the inner
+    file content untouched. Conservative: only strips when a fence is actually
+    the first / last non-empty line."""
+    import re as _re_sf
+    s = text
+    # Leading fence: optional whitespace then ``` optionally followed by a lang token, then newline.
+    s = _re_sf.sub(r"^\s*```[^\n`]*\n", "", s, count=1)
+    # Trailing fence: a final line that is just ```
+    s = _re_sf.sub(r"\n```\s*$", "\n", s, count=1)
+    return s
+
+
+def _file_looks_complete(code: str) -> bool:
+    """Lightweight truncation detector for a generated file: balanced
+    {} () [] after stripping comments and string/template literals so a brace
+    inside a string can't false-trip. Mirrors the QA gate's own check so the
+    continuation helper and the gate agree on what 'complete' means."""
+    import re as _re_fc
+    s = code
+    s = _re_fc.sub(r"/\*.*?\*/", "", s, flags=_re_fc.S)
+    s = _re_fc.sub(r"//[^\n]*", "", s)
+    s = _re_fc.sub(r"#[^\n]*", "", s)
+    s = _re_fc.sub(r'"(?:\\.|[^"\\])*"', '""', s)
+    s = _re_fc.sub(r"'(?:\\.|[^'\\])*'", "''", s)
+    s = _re_fc.sub(r"`(?:\\.|[^`\\])*`", "``", s)
+    return (
+        s.count("{") == s.count("}")
+        and s.count("(") == s.count(")")
+        and s.count("[") == s.count("]")
+    )
+
+
+def _dedupe_continuation_overlap(accumulated: str, chunk: str, max_overlap: int = 400) -> str:
+    """When resuming a cut-off file the model sometimes repeats the last few
+    characters/lines it already wrote. Trim the largest suffix of `accumulated`
+    that is a prefix of `chunk` so the stitched file has no duplicated text."""
+    if not accumulated or not chunk:
+        return chunk
+    _max = min(max_overlap, len(accumulated), len(chunk))
+    for _n in range(_max, 0, -1):
+        if accumulated[-_n:] == chunk[:_n]:
+            return chunk[_n:]
+    return chunk
+
+
+async def _generate_new_file_with_continuation(
+    filename: str,
+    spec: str,
+    codebase_context: str = "",
+    qa_feedback: str = "",
+    prior_attempt: str = "",
+    anthropic_key: str = "",
+    model: str = "",
+    max_rounds: int = 6,
+    per_round_tokens: int = 16000,
+) -> dict:
+    """Generate a COMPLETE source file as raw text, continuing across model
+    turns whenever the output hits the token cap.
+
+    This is the new-file analogue of how a human/agent writes a long file:
+    stream it out, and if cut off, RESUME from the exact stopping point —
+    never restart from scratch (which just reproduces the same truncation).
+
+    Why raw text and not tool_use/JSON:
+      • A whole source file escaped inside a JSON string inflates token usage
+        ~30-60% (every " \\ \\n template-literal gets escaped) and shrinks the
+        effective budget.
+      • A truncated JSON blob is unparseable / catastrophic; truncated raw text
+        degrades gracefully and can be continued.
+      • Forcing tool_use blocks extended thinking but still pays the escaping
+        tax and has no continuation path on a max_tokens cutoff.
+
+    Returns: {"content": str, "rounds": int, "complete": bool,
+              "stop_reason": str, "confidence": int}
+    """
+    from anthropic import AsyncAnthropic as _ContAnthropic
+    import asyncio as _asyncio_c
+
+    _client = _ContAnthropic(api_key=anthropic_key)
+
+    _system = (
+        "You are a senior software engineer. You output the COMPLETE, raw contents "
+        f"of the file `{filename}` and NOTHING else.\n"
+        "STRICT OUTPUT RULES:\n"
+        "- Output ONLY the file's source code, starting at the very first line "
+        "(imports/requires) and ending at the final line.\n"
+        "- Do NOT wrap the output in markdown code fences (no ``` ).\n"
+        "- Do NOT add commentary, explanations, JSON, or any other blocks.\n"
+        "- Do NOT use ellipsis, '... rest unchanged', or placeholder comments.\n"
+        "- The file MUST be syntactically valid and complete: every function "
+        "body, every bracket, and every export/registration present."
+    )
+
+    _ctx_block = f"\n\nRELEVANT CODEBASE CONTEXT (for correct imports/usage):\n{codebase_context}\n" if codebase_context.strip() else ""
+    _qa_block = (
+        f"\n\nThe previous attempt FAILED quality review. Fix ALL of these issues "
+        f"and output the entire corrected file:\n{qa_feedback}\n"
+        if qa_feedback.strip() else ""
+    )
+    _prior_block = ""
+    if prior_attempt.strip():
+        _prior_block = (
+            "\n\nThe previous attempt was INCOMPLETE/TRUNCATED (do NOT copy it "
+            "verbatim — produce a complete version):\n"
+            f"```\n{prior_attempt}\n```\n"
+        )
+
+    _first_user = (
+        f"Create the file `{filename}`.\n\n"
+        f"WHAT IT MUST DO:\n{spec}\n"
+        f"{_ctx_block}{_qa_block}{_prior_block}\n"
+        f"Output the complete raw contents of `{filename}` now."
+    )
+
+    _messages: list = [{"role": "user", "content": _first_user}]
+    _accumulated = ""
+    _stop_reason = ""
+    _rounds = 0
+
+    _continue_instr = (
+        "Your output was cut off by the length limit. Continue the file from "
+        "EXACTLY where you stopped — output ONLY the remaining raw text needed "
+        "to finish the file. Do NOT repeat any line you already wrote. Do NOT "
+        "restate earlier code. Do NOT add code fences or commentary."
+    )
+
+    for _rounds in range(1, max_rounds + 1):
+        # Bounded retry on transient 529 overloads.
+        _resp = None
+        _delay = 8
+        for _attempt in range(3):
+            try:
+                _resp = await _client.messages.create(
+                    model=model,
+                    max_tokens=per_round_tokens,
+                    system=_system,
+                    messages=_messages,
+                )
+                break
+            except Exception as _e:
+                _m = str(_e)
+                if ("529" in _m or "overloaded" in _m.lower()) and _attempt < 2:
+                    await _asyncio_c.sleep(_delay)
+                    _delay = min(_delay * 2, 60)
+                    continue
+                raise
+
+        _chunk = "".join(getattr(_b, "text", "") or "" for _b in (_resp.content or []))
+        _stop_reason = getattr(_resp, "stop_reason", "") or ""
+
+        if not _chunk.strip() and not _accumulated:
+            # Nothing came back at all — give up; caller's gate will block.
+            break
+
+        # Strip stray fences only on the first chunk (start) / last chunk (end).
+        if not _accumulated:
+            _chunk = _strip_code_fences(_chunk)
+        _chunk = _dedupe_continuation_overlap(_accumulated, _chunk)
+        _accumulated += _chunk
+
+        if _stop_reason != "max_tokens":
+            # Model finished its turn naturally (end_turn / stop_sequence).
+            break
+
+        # Hit the cap — set up a continuation round with the model's own output
+        # as the assistant turn, then ask it to resume.
+        _messages = _messages + [
+            {"role": "assistant", "content": _accumulated},
+            {"role": "user", "content": _continue_instr},
+        ]
+
+    _final = _strip_code_fences(_accumulated).strip("\n") + "\n" if _accumulated.strip() else ""
+    _complete = bool(_final.strip()) and _stop_reason != "max_tokens" and _file_looks_complete(_final)
+
+    return {
+        "content": _final,
+        "rounds": _rounds,
+        "complete": _complete,
+        "stop_reason": _stop_reason,
+        "confidence": 8 if _complete else 4,
+    }
+
+
 async def run_smart_pipeline_stream(
     session_files: list,
     user_request: str,
@@ -8357,35 +8542,41 @@ async def run_natural_pipeline_stream(
                 if _nf_attempt >= _NF_MAX_FIX:
                     break  # retries exhausted — gated out below
 
-                # Regenerate the COMPLETE file from the QA feedback. tool_use
-                # rewrite (32K tokens, "output every line") is far less
-                # truncation-prone than the inline <new_file> stream.
+                # Regenerate the COMPLETE file from the QA feedback. PR #72:
+                # use raw-text generation WITH continuation — never the tool_use
+                # JSON path, which truncated a ~300-line file on every retry
+                # (JSON-string escaping inflation + no stop_reason check + no
+                # resume on cutoff, so each retry reproduced the same failure).
+                # Raw text removes the escaping tax and, when the output hits the
+                # token cap, we resume from the exact stopping point and stitch —
+                # exactly how a human/agent writes a long file. The model never
+                # has to fit the whole file in a single budget.
                 yield sse({"type": "progress",
                            "content": f"🔁 Fixing new file {filename} — attempt "
                                       f"{_nf_attempt + 1}/{_NF_MAX_FIX}..."})
                 try:
-                    _nf_regen = await _run_claude_direct_rewrite(
-                        file_content=content,
+                    _nf_qa_feedback = "\n".join(
+                        [_nf_qa.get("summary", "") or ""]
+                        + [f"- {x}" for x in (_nf_qa.get("completeness_issues") or [])]
+                        + [f"- {x}" for x in (_nf_qa.get("import_issues") or [])]
+                    ).strip()
+                    _nf_regen = await _generate_new_file_with_continuation(
                         filename=filename,
-                        change_description=(
-                            (summary or f"Create {filename}")
-                            + " — the previous version FAILED QA (likely incomplete/"
-                              "truncated). Output the COMPLETE corrected file, every "
-                              "line from first import to last closing brace."
-                        ),
-                        new_logic=(
-                            "Fix ALL of these QA issues and output the entire file "
-                            "with no truncation or ellipsis:\n"
-                            + (_nf_qa.get("summary", "") or "")
-                        ),
-                        architect_plan={"risks": (
-                            (_nf_qa.get("completeness_issues") or [])
-                            + (_nf_qa.get("import_issues") or [])
-                        )},
+                        spec=(summary or f"Create {filename}"),
+                        codebase_context=codebase_ctx,
+                        qa_feedback=_nf_qa_feedback,
+                        prior_attempt=content,
                         anthropic_key=_get_anthropic_key(user_id),
                         model=arch_model,
                     )
-                    _nf_new_content = (_nf_regen.get("new_file_content") or "").strip()
+                    _nf_new_content = (_nf_regen.get("content") or "").strip()
+                    logger.info(
+                        "[pipeline:natural][NEWFILE-FIX] run_id=%s regen %s rounds=%s "
+                        "complete=%s stop=%s chars=%d",
+                        run_id, filename, _nf_regen.get("rounds"),
+                        _nf_regen.get("complete"), _nf_regen.get("stop_reason"),
+                        len(_nf_new_content),
+                    )
                 except Exception as _nf_regen_e:
                     logger.info(
                         "[pipeline:natural][NEWFILE-FIX] run_id=%s regen failed for %s: %s",
