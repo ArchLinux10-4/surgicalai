@@ -1167,6 +1167,35 @@ def run_surgeon(
             "symbol with the QA-flagged problems fixed and the original lines it replaces removed."
         )
 
+    # ── PR #81: same-file identifier inventory for the Surgeon ───────────────
+    # The Surgeon sees only a windowed slice of a large file, not all of it. On
+    # big files (BIG10) it defensively RE-DECLARED a helper that already existed
+    # elsewhere (a new `const checkAdminAuth` while an `async function
+    # checkAdminAuth` already lived 1,200 lines away) — a hard runtime
+    # "Identifier 'checkAdminAuth' has already been declared" SyntaxError.
+    # PR #80 handed this inventory to QA only; now the Surgeon gets it too, at the
+    # source, so it reuses existing symbols instead of redeclaring them.
+    _surgeon_symbols_block = ""
+    try:
+        _existing_ids = _file_defined_identifiers(file_content)
+    except Exception:
+        _existing_ids = set()
+    if _existing_ids:
+        _shown_ids = sorted(_existing_ids)
+        _MAX_IDS = 400
+        _ids_str = ", ".join(_shown_ids[:_MAX_IDS])
+        if len(_shown_ids) > _MAX_IDS:
+            _ids_str += f", \u2026 (+{len(_shown_ids) - _MAX_IDS} more)"
+        _surgeon_symbols_block = (
+            "\n\nIDENTIFIERS ALREADY DEFINED OR IMPORTED ELSEWHERE IN THIS SAME FILE "
+            "(you are shown only a slice of the file, not all of it). These names already "
+            "exist and are in scope \u2014 CALL/REFERENCE them directly. Do NOT add a new "
+            "top-level const/let/class/function declaration for any of these names: "
+            "re-declaring an existing top-level binding is a duplicate-declaration "
+            "SyntaxError. Only declare a NEW name that is genuinely absent from this list:\n"
+            + _ids_str
+        )
+
     # For DELETE operations, new_logic is typically empty — make the instruction explicit
     # so the Surgeon doesn't misread "nothing to add" as "already correct".
     _ct_val = target.change_type.value if hasattr(target, "change_type") and target.change_type else "modify"
@@ -1227,7 +1256,7 @@ def run_surgeon(
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
-New logic required: {_new_logic_display}{_import_hint}{_file_header}{_semantic_section}{_linter_block}{_extra_ctx_block}{_qa_feedback_block}{_prev_attempt_block}
+New logic required: {_new_logic_display}{_import_hint}{_file_header}{_semantic_section}{_surgeon_symbols_block}{_linter_block}{_extra_ctx_block}{_qa_feedback_block}{_prev_attempt_block}
 
 CONTEXT BEFORE (read-only reference, do NOT include in operations):
 {before_context}
@@ -6672,9 +6701,72 @@ USER REQUEST:
                             if (_qa_result.get("qa_score") or 10) > 3:
                                 _qa_result["qa_score"] = 3
                     elif _lint_new_count == 0:
-                        yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean"})
+                        # PR #81: don't claim "clean" when the linter never ran.
+                        # tsc isn't reliably installed on the backend — reporting a
+                        # false "✅ tsc clean" is what masked BIG10's broken ship.
+                        try:
+                            from services.linter_validator import linter_available as _lint_avail
+                            _tool_ran = _lint_avail(matched_name)
+                        except Exception:
+                            _tool_ran = True
+                        if _tool_ran:
+                            yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean"})
+                        else:
+                            yield sse({"type": "progress", "content": f"⏭ {_lint_tool} skipped (not installed)"})
                 except Exception as _lint_exc:
                     print(f"[LINTER_VALIDATOR] Skipped: {_lint_exc}")
+
+                # ── PR #81: deterministic redeclaration gate ──────────────────
+                # The tree-sitter compile check (above) only validates GRAMMAR — a
+                # duplicate top-level const/let/class is grammatically valid, so it
+                # passes — but it is a hard runtime SyntaxError ("Identifier 'x' has
+                # already been declared"). `node --check` would catch it, but Node/tsc
+                # are not reliably present on the backend, so this closes the blind
+                # spot deterministically. BIG10 shipped exactly this class of bug
+                # (a `const checkAdminAuth` re-declared a pre-existing
+                # `function checkAdminAuth`). Delta vs. original ensures a
+                # pre-existing redeclaration is never blamed on this change.
+                try:
+                    from services.syntax_validator import detect_redeclarations as _detect_redecl
+                    _full_after_redecl = sf["content"]
+                    for _rop in _operations:
+                        _rfind = _rop.get("find", "")
+                        _rrepl = _rop.get("replace", "")
+                        if _rfind and _rfind in _full_after_redecl:
+                            _full_after_redecl = _full_after_redecl.replace(_rfind, _rrepl, 1)
+                    _orig_redecl_msgs = {e["message"] for e in _detect_redecl(sf["content"], matched_name)}
+                    _new_redecls = _detect_redecl(_full_after_redecl, matched_name)
+                    _introduced_redecls = [e for e in _new_redecls if e["message"] not in _orig_redecl_msgs]
+                    if _introduced_redecls:
+                        _rd0 = _introduced_redecls[0]
+                        yield sse({"type": "progress", "content": f"🔴 Redeclaration check: {_rd0['message']} (line {_rd0['line']})"})
+                        if not isinstance(_qa_result.get("risk_verdicts"), list):
+                            _qa_result["risk_verdicts"] = []
+                        for _rd in _introduced_redecls:
+                            _qa_result["risk_verdicts"].append({
+                                "risk": _rd["message"],
+                                "status": "blocked",
+                                "reason": f"Duplicate declaration at line {_rd['line']}: {_rd['detail']}",
+                            })
+                            # Route into the Surgeon's compile-fix retry path so it
+                            # removes the duplicate (paired with the symbol inventory
+                            # now in the Surgeon prompt — prevention + backstop).
+                            _linter_introduced_errors.append({
+                                "line": _rd["line"],
+                                "column": _rd.get("column", 0),
+                                "message": _rd["message"],
+                                "detail": _rd["detail"],
+                            })
+                        _qa_result["verdict"] = "blocked"
+                        _qa_result["summary"] = f"Duplicate declaration — {_rd0['message']}"
+                        if (_qa_result.get("qa_score") or 10) > 3:
+                            _qa_result["qa_score"] = 3
+                    elif _new_redecls:
+                        yield sse({"type": "progress", "content": f"⏭ Redeclaration check: {len(_new_redecls)} pre-existing (not introduced here)"})
+                    else:
+                        yield sse({"type": "progress", "content": "✅ Redeclaration check passed"})
+                except Exception as _rd_exc:
+                    print(f"[REDECL_VALIDATOR] Skipped: {_rd_exc}")
 
                 # ── Auto-run tests ────────────────────────────────────────────
                 # Run after linter so we test the post-linter version of the code.

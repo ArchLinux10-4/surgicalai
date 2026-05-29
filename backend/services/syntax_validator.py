@@ -54,6 +54,107 @@ def count_errors(code: str, filename: str) -> int:
     return len(validate_syntax(code, filename))
 
 
+def detect_redeclarations(code: str, filename: str) -> List[Dict]:
+    """Detect program-level (module scope) redeclarations that are hard runtime
+    SyntaxErrors ("Identifier 'x' has already been declared").
+
+    validate_syntax() above only checks GRAMMAR — a duplicate top-level
+    const/let/class/function is grammatically valid, so tree-sitter reports zero
+    ERROR nodes and the gate waves it through. But `node --check` rejects a
+    const/let/class collision. Node/tsc are not reliably present on the backend,
+    so this catches that class deterministically using the tree-sitter parser
+    already in use.
+
+    Only flags TOP-LEVEL collisions where >=1 binding is const/let/class —
+    matching JS runtime semantics. Legal redeclarations (function+function,
+    var+var, var+function) are NOT flagged. Simple identifier bindings only;
+    destructuring patterns are intentionally skipped to guarantee zero false
+    positives. Returns [] for non-JS/TS files (Python module-scope rebinding is
+    legal, never a SyntaxError).
+
+    Each error dict: {"line", "column", "message", "detail"} — same shape as
+    validate_syntax(), so it slots into the pipeline's existing block path.
+    """
+    ext = _get_extension(filename)
+    if ext not in ('.tsx', '.jsx', '.ts', '.js'):
+        return []
+    try:
+        from tree_sitter import Language, Parser
+        import tree_sitter_typescript as ts_typescript
+
+        if ext in ('.tsx', '.jsx'):
+            lang = Language(ts_typescript.language_tsx())
+        else:
+            lang = Language(ts_typescript.language_typescript())
+
+        parser = Parser(lang)
+        # tree-sitter node offsets are BYTE offsets — slice the encoded bytes,
+        # not the str, or multi-byte UTF-8 chars desync names on large files.
+        code_bytes = code.encode('utf-8')
+        tree = parser.parse(code_bytes)
+        root = tree.root_node
+
+        def _txt(node):
+            return code_bytes[node.start_byte:node.end_byte].decode('utf-8', 'replace')
+
+        decls: dict = {}  # name -> list[(kind, line)]
+
+        def _collect_lexical(node, kind):
+            for child in node.named_children:
+                if child.type == 'variable_declarator':
+                    name_node = child.child_by_field_name('name')
+                    if name_node is not None and name_node.type == 'identifier':
+                        decls.setdefault(_txt(name_node), []).append(
+                            (kind, name_node.start_point[0] + 1))
+
+        for node in root.children:
+            n = node
+            if n.type == 'export_statement':
+                inner = n.child_by_field_name('declaration')
+                if inner is None:
+                    continue
+                n = inner
+            t = n.type
+            if t == 'lexical_declaration':
+                kind = n.children[0].type if n.children else 'const'  # 'const' | 'let'
+                _collect_lexical(n, kind)
+            elif t == 'variable_declaration':
+                _collect_lexical(n, 'var')
+            elif t == 'function_declaration':
+                name_node = n.child_by_field_name('name')
+                if name_node is not None:
+                    decls.setdefault(_txt(name_node), []).append(
+                        ('function', name_node.start_point[0] + 1))
+            elif t == 'class_declaration':
+                name_node = n.child_by_field_name('name')
+                if name_node is not None:
+                    decls.setdefault(_txt(name_node), []).append(
+                        ('class', name_node.start_point[0] + 1))
+
+        errors: List[Dict] = []
+        _HARD = {'const', 'let', 'class'}
+        for name, occ in decls.items():
+            if len(occ) < 2:
+                continue
+            if any(k in _HARD for k, _ln in occ):
+                lines = sorted(ln for _k, ln in occ)
+                errors.append({
+                    "line": lines[1],          # the duplicate (second) declaration
+                    "column": 0,
+                    "message": f"Identifier '{name}' has already been declared",
+                    "detail": (f"'{name}' declared {len(occ)}x at top level "
+                               f"(lines {', '.join(str(l) for l in lines)}); "
+                               f">=1 is const/let/class — runtime SyntaxError"),
+                })
+        return errors
+    except ImportError:
+        print("[SYNTAX_VALIDATOR] tree-sitter not installed, skipping redeclaration check")
+        return []
+    except Exception as e:
+        print(f"[SYNTAX_VALIDATOR] redeclaration check error: {e}")
+        return []
+
+
 def _find_error_nodes(node, errors: list, code: str, max_errors: int = 8):
     """Walk tree-sitter parse tree and collect ERROR nodes."""
     if len(errors) >= max_errors:
