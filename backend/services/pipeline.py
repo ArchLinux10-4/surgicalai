@@ -2126,260 +2126,223 @@ async def analyze_and_plan_stream(
             return
 
         # ------------------------------------------------------------------
-        # Build SurgicalChange objects + QA GATE (retry loop)
+        # Build SurgicalChange objects
         # ------------------------------------------------------------------
-        # v4.1: QA runs BEFORE delivery, not after.  If structural QA finds
-        # blocking issues (missing imports, duplicates, wrong paths, syntax
-        # errors), Claude retries with the feedback injected.  Max 2 retries
-        # for structural issues, 1 retry for LLM-QA "blocked" verdict.
-        # Only code that passes the gate reaches the user.
+        changes_data = plan_data.get("changes", [])
+        if not changes_data:
+            response = plan_data.get(
+                "reasoning", "No changes needed — the code already satisfies your request."
+            )
+            yield sse({"type": "chat", "content": response})
+            yield sse({"type": "done", "content": ""})
+            return
 
-        from services.structural_qa import (
-            run_structural_qa, format_structural_feedback, has_blocking_issues
-        )
+        yield sse({"type": "progress", "content": f"Running QA on {len(changes_data)} change(s)..."})
 
-        MAX_STRUCTURAL_RETRIES = 2
-        MAX_LLM_QA_RETRIES = 1
-        _qa_retry_feedback = ""       # accumulated feedback for Claude retries
-        _structural_attempt = 0
-        _llm_qa_attempt = 0
+        changes = []
+        for ch in changes_data:
+            symbol_path = ch.get("symbol_path", "")
+            new_code = ch.get("new_code", "")
+            description = ch.get("description", "")
+            confidence = ch.get("confidence", 9)
 
-        while True:
-            changes_data = plan_data.get("changes", [])
-            if not changes_data:
-                response = plan_data.get(
-                    "reasoning", "No changes needed — the code already satisfies your request."
-                )
-                yield sse({"type": "chat", "content": response})
-                yield sse({"type": "done", "content": ""})
-                return
+            if not symbol_path or not new_code:
+                continue
 
-            yield sse({"type": "progress", "content": f"Running QA on {len(changes_data)} change(s)..."})
+            # Find symbol in AST map — exact match first
+            symbol = None
+            for s in symbol_map.symbols:
+                if getattr(s, "full_path", None) == symbol_path or getattr(s, "name", None) == symbol_path:
+                    symbol = s
+                    break
 
-            changes = []
-            for ch in changes_data:
-                symbol_path = ch.get("symbol_path", "")
-                new_code = ch.get("new_code", "")
-                description = ch.get("description", "")
-                confidence = ch.get("confidence", 9)
-
-                if not symbol_path or not new_code:
-                    continue
-
-                # Find symbol in AST map — exact match first
-                symbol = None
+            if symbol is None:
+                # Partial match fallback
                 for s in symbol_map.symbols:
-                    if getattr(s, "full_path", None) == symbol_path or getattr(s, "name", None) == symbol_path:
+                    s_fp = getattr(s, "full_path", "") or ""
+                    s_name = getattr(s, "name", "") or ""
+                    if symbol_path in s_fp or s_name in symbol_path:
                         symbol = s
                         break
 
-                if symbol is None:
-                    # Partial match fallback
-                    for s in symbol_map.symbols:
-                        s_fp = getattr(s, "full_path", "") or ""
-                        s_name = getattr(s, "name", "") or ""
-                        if symbol_path in s_fp or s_name in symbol_path:
-                            symbol = s
-                            break
-
-                if symbol is None:
-                    yield sse({
-                        "type": "progress",
-                        "content": f"Warning: symbol '{symbol_path}' not found in file map — skipping",
-                    })
-                    continue
-
-                diff = _make_diff(symbol.code, new_code, symbol_path)
-                _tgt, _repl = _compute_target_element(symbol.code, new_code)
-
-                change = SurgicalChange(
-                    id=str(uuid.uuid4()),
-                    symbol=symbol,
-                    original_code=symbol.code,
-                    new_code=new_code,
-                    diff=diff,
-                    confidence=confidence,
-                    description=description,
-                    applied=False,
-                    operations=[{"find": symbol.code, "replace": new_code}],
-                    target_element=_tgt,
-                    replacement=_repl,
-                )
-                changes.append(change)
-
-            if not changes:
-                yield sse({
-                    "type": "chat",
-                    "content": (
-                        "I analyzed the file but couldn't map the change to a specific symbol. "
-                        "Please re-upload the file and try again."
-                    ),
-                })
-                yield sse({"type": "done", "content": ""})
-                return
-
-            # ------------------------------------------------------------------
-            # GATE 1: Structural QA (fast, deterministic, no LLM)
-            # ------------------------------------------------------------------
-            all_structural_issues = []
-            for change in changes:
-                sym_name = getattr(change.symbol, "full_path", None) or getattr(change.symbol, "name", "")
-                issues = run_structural_qa(
-                    new_code=change.new_code,
-                    original_code=change.original_code,
-                    filename=file_path,
-                    symbol_path=sym_name,
-                    file_content=file_content,
-                )
-                all_structural_issues.extend(issues)
-
-            if has_blocking_issues(all_structural_issues) and _structural_attempt < MAX_STRUCTURAL_RETRIES:
-                _structural_attempt += 1
-                feedback = format_structural_feedback(all_structural_issues)
-                _n_errors = sum(1 for i in all_structural_issues if i["severity"] == "error")
+            if symbol is None:
                 yield sse({
                     "type": "progress",
-                    "content": (
-                        f"Structural QA found {_n_errors} error(s) — "
-                        f"retrying (attempt {_structural_attempt}/{MAX_STRUCTURAL_RETRIES})..."
-                    ),
+                    "content": f"Warning: symbol '{symbol_path}' not found in file map — skipping",
                 })
-                logger.info(
-                    f"[QA GATE] Structural QA failed (attempt {_structural_attempt}): "
-                    f"{_n_errors} errors. Retrying Claude."
-                )
+                continue
 
-                # ── Re-call Claude with structural feedback injected ─────────
-                _qa_retry_feedback = feedback
-                _retry_context = _build_claude_context(
-                    symbol_map, file_content, file_path, user_request,
-                    project_memory=project_memory,
-                    search_results=search_results if search_results else None,
-                )
-                _retry_user_msg = (
-                    f"{_retry_context}\n\nUSER REQUEST:\n{user_request}\n\n"
-                    f"YOUR PREVIOUS ATTEMPT FAILED QA. Fix these issues:\n\n"
-                    f"{_qa_retry_feedback}\n\n"
-                    f"Return the COMPLETE corrected JSON with ALL changes. "
-                    f"Do not return partial snippets."
-                )
-                _retry_messages = [{"role": "user", "content": _retry_user_msg}]
-                _retry_kwargs = {
-                    "model": architect_model,
-                    "max_tokens": 16000,
-                    "system": CLAUDE_EDITOR_SYSTEM,
-                    "messages": _retry_messages,
-                }
-                if _supports_thinking(architect_model):
-                    _retry_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+            diff = _make_diff(symbol.code, new_code, symbol_path)
+            _tgt, _repl = _compute_target_element(symbol.code, new_code)
 
-                _retry_text = ""
-                async with aclient.messages.stream(**_retry_kwargs) as _retry_stream:
-                    async for _retry_event in _retry_stream:
-                        _ret = getattr(_retry_event, "type", None)
-                        if _ret == "content_block_delta":
-                            _rd = getattr(_retry_event, "delta", None)
-                            if _rd:
-                                _rt = getattr(_rd, "text", None)
-                                if _rt:
-                                    _retry_text += _rt
-
-                try:
-                    plan_data = _extract_json_from_text(_retry_text)
-                except ValueError:
-                    # Retry parse failed — fall through with original changes
-                    logger.warning("[QA GATE] Retry parse failed — delivering original with warnings")
-                    break
-
-                if plan_data.get("intent") != "edit":
-                    break  # Claude gave up — deliver what we have
-
-                continue  # Loop back to rebuild changes from new plan_data
-
-            # ------------------------------------------------------------------
-            # GATE 2: LLM QA (semantic review)
-            # ------------------------------------------------------------------
-            qa = await run_qa_for_changes(
-                changes, file_content, user_request, anthropic_key, architect_model
+            change = SurgicalChange(
+                id=str(uuid.uuid4()),
+                symbol=symbol,
+                original_code=symbol.code,
+                new_code=new_code,
+                diff=diff,
+                confidence=confidence,
+                description=description,
+                applied=False,
+                # KEY: symbol.code is extracted directly from the file by the AST parser
+                # so it is GUARANTEED to be an exact substring — always reliable.
+                operations=[{"find": symbol.code, "replace": new_code}],
+                target_element=_tgt,
+                replacement=_repl,
             )
+            changes.append(change)
 
-            qa_verdict = qa.get("verdict", "safe")
-            qa_risks = qa.get("risks", [])
-            qa_issues = qa.get("issues", [])
+        if not changes:
+            yield sse({
+                "type": "chat",
+                "content": (
+                    "I analyzed the file but couldn't map the change to a specific symbol. "
+                    "Please re-upload the file and try again."
+                ),
+            })
+            yield sse({"type": "done", "content": ""})
+            return
 
-            if qa_verdict == "blocked" and _llm_qa_attempt < MAX_LLM_QA_RETRIES:
-                _llm_qa_attempt += 1
-                _qa_summary = qa.get("summary", "QA rejected the changes")
-                _qa_issues_str = "\n".join(f"  - {i}" for i in qa_issues[:5])
-                _qa_risks_str = "\n".join(f"  - {r}" for r in qa_risks[:5])
+        # ------------------------------------------------------------------
+        # QA check — structural + LLM, with retry loop
+        # ------------------------------------------------------------------
+        yield sse({"type": "progress", "content": "Running QA..."})
 
-                yield sse({
-                    "type": "progress",
-                    "content": (
-                        f"QA blocked: {_qa_summary}. "
-                        f"Retrying (attempt {_llm_qa_attempt}/{MAX_LLM_QA_RETRIES})..."
-                    ),
-                })
-                logger.info(f"[QA GATE] LLM QA blocked (attempt {_llm_qa_attempt}): {_qa_summary}")
+        qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model)
+        qa_risks = qa.get("risks", [])
 
-                # Re-call Claude with LLM QA feedback
-                _llm_feedback = (
-                    f"QA REVIEW BLOCKED YOUR PREVIOUS ATTEMPT:\n"
-                    f"Summary: {_qa_summary}\n"
-                    f"Issues:\n{_qa_issues_str}\n"
-                    f"Risks:\n{_qa_risks_str}\n\n"
-                    f"Fix ALL issues above. Return complete corrected JSON."
-                )
-                _retry_context = _build_claude_context(
-                    symbol_map, file_content, file_path, user_request,
-                    project_memory=project_memory,
-                    search_results=search_results if search_results else None,
-                )
-                _retry_user_msg = (
-                    f"{_retry_context}\n\nUSER REQUEST:\n{user_request}\n\n{_llm_feedback}"
-                )
-                _retry_messages = [{"role": "user", "content": _retry_user_msg}]
-                _retry_kwargs = {
-                    "model": architect_model,
-                    "max_tokens": 16000,
-                    "system": CLAUDE_EDITOR_SYSTEM,
-                    "messages": _retry_messages,
-                }
-                if _supports_thinking(architect_model):
-                    _retry_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+        # Structural QA: deterministic checks for missing imports, etc.
+        try:
+            from services.structural_qa import run_structural_qa, has_blocking_issues as _sq_blocking
+        except ImportError:
+            _sq_blocking = None
 
-                _retry_text = ""
-                async with aclient.messages.stream(**_retry_kwargs) as _retry_stream:
-                    async for _retry_event in _retry_stream:
-                        _ret = getattr(_retry_event, "type", None)
-                        if _ret == "content_block_delta":
-                            _rd = getattr(_retry_event, "delta", None)
-                            if _rd:
-                                _rt = getattr(_rd, "text", None)
-                                if _rt:
-                                    _retry_text += _rt
+        _sq_has_errors = False
+        if _sq_blocking is not None:
+            for _sq_ch in changes:
+                _sq_new = getattr(_sq_ch, "new_code", "") or ""
+                _sq_orig = getattr(_sq_ch, "original_code", "") or ""
+                _sq_fname = file_path or ""
+                _sq_issues = run_structural_qa(_sq_new, _sq_orig, _sq_fname)
+                if _sq_blocking(_sq_issues):
+                    _sq_has_errors = True
+                    _sq_msgs = [si["message"] for si in _sq_issues if si["severity"] == "error"]
+                    qa["verdict"] = "blocked"
+                    qa["qa_score"] = min(qa.get("qa_score", 10), 3)
+                    qa_risks.extend([f"[STRUCTURAL] {m}" for m in _sq_msgs])
+                    yield sse({"type": "progress",
+                               "content": f"🔍 Structural QA: {len(_sq_msgs)} blocking issue(s) found"})
 
+        # Retry loop: if QA blocked, send issues back to Claude for a fix
+        _APS_MAX_RETRIES = 2
+        _aps_verdict = qa.get("verdict", "safe")
+        _aps_score   = qa.get("qa_score", 10) or 10
+        _aps_blocked = (_aps_verdict == "blocked") or (_aps_score <= 4)
+
+        if _aps_blocked:
+            for _aps_attempt in range(_APS_MAX_RETRIES):
+                yield sse({"type": "progress",
+                           "content": f"🔁 Fixing blocked code — attempt {_aps_attempt + 1}/{_APS_MAX_RETRIES}..."})
+
+                # Build feedback for Claude
+                _fb_parts = [f"QA BLOCKED (score {qa.get('qa_score', '?')}/10):"]
+                if qa.get("summary"):
+                    _fb_parts.append(f"Summary: {qa['summary']}")
+                for _fb_r in qa.get("risks", []):
+                    _fb_parts.append(f"• {_fb_r}")
+                for _fb_i in qa.get("issues", []):
+                    _fb_parts.append(f"• {_fb_i}")
+                _fb_text = "\n".join(_fb_parts)
+
+                # Re-call Claude with QA feedback injected
                 try:
-                    plan_data = _extract_json_from_text(_retry_text)
-                except ValueError:
-                    break  # Parse failed — deliver what we have
+                    _retry_msgs = [
+                        {"role": "user", "content": user_message},
+                        {"role": "assistant", "content": full_text},
+                        {"role": "user", "content": (
+                            f"Your code changes were rejected by QA:\n\n{_fb_text}\n\n"
+                            f"Please fix all issues and return the corrected JSON with the "
+                            f"same structure (changes array with symbol_path, new_code, description, confidence). "
+                            f"The new_code must be COMPLETE — include all imports, all functions, nothing omitted."
+                        )},
+                    ]
+                    _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
+                        model=architect_model,
+                        max_tokens=16000,
+                        system=CLAUDE_EDITOR_SYSTEM,
+                        messages=_retry_msgs,
+                    )
+                    _retry_text = "".join(
+                        b.text for b in _retry_resp.content if hasattr(b, "text")
+                    )
+                    _retry_data = _extract_json_from_text(_retry_text)
+                    _retry_changes_data = _retry_data.get("changes", [])
 
-                if plan_data.get("intent") != "edit":
-                    break
-
-                continue  # Loop back with new plan_data
-
-            # ── Both gates passed (or retries exhausted) — deliver ───────────
-            break
-
-        # ------------------------------------------------------------------
-        # Attach structural QA warnings to risks (even if not blocking)
-        # ------------------------------------------------------------------
-        _struct_warnings = [
-            f"[{i['check']}] {i['message']}"
-            for i in all_structural_issues
-            if i["severity"] == "warning"
-        ]
+                    if _retry_changes_data:
+                        # Rebuild changes from retry
+                        _new_changes = []
+                        for _rc in _retry_changes_data:
+                            _rc_sp = _rc.get("symbol_path", "")
+                            _rc_nc = _rc.get("new_code", "")
+                            _rc_desc = _rc.get("description", "")
+                            _rc_conf = _rc.get("confidence", 9)
+                            if not _rc_sp or not _rc_nc:
+                                continue
+                            _rc_sym = None
+                            for s in symbol_map.symbols:
+                                if getattr(s, "full_path", None) == _rc_sp or getattr(s, "name", None) == _rc_sp:
+                                    _rc_sym = s
+                                    break
+                            if not _rc_sym:
+                                for s in symbol_map.symbols:
+                                    if _rc_sp in (getattr(s, "full_path", "") or "") or (getattr(s, "name", "") or "") in _rc_sp:
+                                        _rc_sym = s
+                                        break
+                            if not _rc_sym:
+                                continue
+                            _rc_diff = _make_diff(_rc_sym.code, _rc_nc, _rc_sp)
+                            _rc_tgt, _rc_repl = _compute_target_element(_rc_sym.code, _rc_nc)
+                            _new_changes.append(SurgicalChange(
+                                id=str(uuid.uuid4()),
+                                symbol=_rc_sym,
+                                original_code=_rc_sym.code,
+                                new_code=_rc_nc,
+                                diff=_rc_diff,
+                                confidence=_rc_conf,
+                                description=_rc_desc,
+                                applied=False,
+                                operations=[{"find": _rc_sym.code, "replace": _rc_nc}],
+                                target_element=_rc_tgt,
+                                replacement=_rc_repl,
+                            ))
+                        if _new_changes:
+                            changes = _new_changes
+                            # Re-run QA on the fix
+                            qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model)
+                            qa_risks = qa.get("risks", [])
+                            # Re-run structural QA
+                            if _sq_blocking is not None:
+                                _sq_still_bad = False
+                                for _sq_ch2 in changes:
+                                    _sq_n2 = getattr(_sq_ch2, "new_code", "") or ""
+                                    _sq_o2 = getattr(_sq_ch2, "original_code", "") or ""
+                                    _sq_i2 = run_structural_qa(_sq_n2, _sq_o2, file_path or "")
+                                    if _sq_blocking(_sq_i2):
+                                        _sq_still_bad = True
+                                        _sq_m2 = [x["message"] for x in _sq_i2 if x["severity"] == "error"]
+                                        qa["verdict"] = "blocked"
+                                        qa["qa_score"] = min(qa.get("qa_score", 10), 3)
+                                        qa_risks.extend([f"[STRUCTURAL] {m}" for m in _sq_m2])
+                                if not _sq_still_bad and qa.get("verdict") != "blocked":
+                                    yield sse({"type": "progress",
+                                               "content": f"✅ Retry {_aps_attempt + 1} passed QA (score: {qa.get('qa_score', '?')})"})
+                                    break
+                            elif qa.get("verdict") != "blocked" and (qa.get("qa_score", 0) or 0) >= 5:
+                                yield sse({"type": "progress",
+                                           "content": f"✅ Retry {_aps_attempt + 1} passed QA (score: {qa.get('qa_score', '?')})"})
+                                break
+                except Exception:
+                    pass  # Keep current changes if retry fails
 
         # ------------------------------------------------------------------
         # Build final response object and yield
@@ -2387,7 +2350,7 @@ async def analyze_and_plan_stream(
         plan_obj = ArchitectPlan(
             summary=plan_data.get("summary", ""),
             targets=[],
-            risks=plan_data.get("risks", []) + qa_risks + _struct_warnings,
+            risks=plan_data.get("risks", []) + qa_risks,
         )
 
         result_obj = SurgicalAnalyzeResponse(
@@ -3662,8 +3625,21 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
         }
 
         # Enforce verdict/score consistency
+        # If QA found hard blockers (missing imports, logic errors, type errors)
+        # respect the "blocked" verdict even at higher scores — those are
+        # compilation failures regardless of how clever the logic is.
+        _has_hard_issues = bool(
+            result.get("import_issues")
+            or result.get("type_errors")
+            or result.get("logic_errors")
+        )
         if result["qa_score"] >= 6 and result["verdict"] == "blocked":
-            result["verdict"] = "warning"
+            if _has_hard_issues:
+                # Hard issues found — keep blocked, downgrade score to ensure retry fires
+                result["qa_score"] = min(result["qa_score"], 4)
+            else:
+                # No hard issues — LLM probably over-flagged, soften to warning
+                result["verdict"] = "warning"
         if result["qa_score"] <= 5 and result["verdict"] == "safe":
             result["verdict"] = "warning"
 
@@ -7584,20 +7560,63 @@ async def run_natural_pipeline_stream(
                     "plan_deviation": "", "risk_verdicts": [],
                 })
 
+        # ── Structural QA — deterministic pre-check ────────────────────────
+        # Run fast, zero-LLM checks (missing imports, duplicate defs, wrong
+        # import depth, dropped exports) BEFORE the retry loop.  If structural
+        # issues are found, force the LLM QA verdict/score down so the retry
+        # loop fires automatically.
+        try:
+            from services.structural_qa import run_structural_qa, has_blocking_issues as _has_sq_blocking
+        except ImportError:
+            _has_sq_blocking = None
+
+        if _has_sq_blocking is not None:
+            for _sq_i, _sq_cs in enumerate(change_shells):
+                _sq_new   = _sq_cs["new_code"]
+                _sq_orig  = _sq_cs["symbol"].code
+                _sq_fname = _sq_cs["filename"]
+                _sq_issues = run_structural_qa(_sq_new, _sq_orig, _sq_fname)
+                if _has_sq_blocking(_sq_issues):
+                    # Merge structural issues into LLM QA result so the retry
+                    # prompt includes them and Claude knows exactly what to fix.
+                    _sq_msgs = [f"[STRUCTURAL] {si['message']}" for si in _sq_issues if si["severity"] == "error"]
+                    qa_results[_sq_i]["import_issues"] = (
+                        qa_results[_sq_i].get("import_issues", []) + _sq_msgs
+                    )
+                    qa_results[_sq_i]["verdict"] = "blocked"
+                    qa_results[_sq_i]["qa_score"] = min(qa_results[_sq_i].get("qa_score", 10), 3)
+                    qa_results[_sq_i]["summary"] = (
+                        f"Structural QA: {len(_sq_msgs)} blocking issue(s). "
+                        + qa_results[_sq_i].get("summary", "")
+                    )
+                    yield sse({"type": "progress",
+                               "content": f"🔍 Structural QA found {len(_sq_msgs)} blocking issue(s) "
+                                          f"in {_sq_cs['symbol'].name} — will auto-fix"})
+
         # ── QA retry loop — fix blocked changes before showing to user ────────
-        # If QA scores ≤ 4 (blocked), send the issues back to Claude and ask it
-        # to rewrite the code. Re-run QA on the fix. Max 2 attempts per change.
-        # "warning" (5-6) is shown to user as-is — they can decide.
-        # "blocked" (1-4) means the code is broken and must be fixed first.
+        # Triggers on verdict=="blocked" OR score<=5 with hard issues.
+        # Sends QA findings back to Claude, re-runs QA on the fix.
 
         MAX_QA_RETRIES = 2
 
         for _qa_retry_round in range(MAX_QA_RETRIES):
-            # Find all still-blocked changes
-            blocked_indices = [
-                i for i, qd in enumerate(qa_results)
-                if qd.get("verdict") == "blocked" and (qd.get("qa_score") or 10) <= 4
-            ]
+            # Find all still-blocked changes.
+            # Trigger retry when:
+            #   - verdict is "blocked" (any score), OR
+            #   - score <= 5 with specific hard issues (missing imports, type errors)
+            blocked_indices = []
+            for _bi, _bqd in enumerate(qa_results):
+                _bv = _bqd.get("verdict", "safe")
+                _bs = _bqd.get("qa_score") or 10
+                _b_hard = bool(
+                    _bqd.get("import_issues")
+                    or _bqd.get("type_errors")
+                    or _bqd.get("logic_errors")
+                )
+                if _bv == "blocked":
+                    blocked_indices.append(_bi)
+                elif _bs <= 5 and _b_hard:
+                    blocked_indices.append(_bi)
             if not blocked_indices:
                 break
 
