@@ -1024,6 +1024,7 @@ def run_surgeon(
     extra_context: str = "",         # resolved surgeon_context from context_resolver
     qa_feedback: dict = None,        # QA verdict from previous attempt — injected on semantic retry
     forbid_noop: bool = False,       # if True, reject the empty "already correct" escape hatch
+    prev_attempt_code: str = "",     # PR #79: the Surgeon's OWN rejected output from the prior attempt
 ) -> tuple:
     """
     GPT-4.1 (Surgeon): receives ONE code chunk + plan, returns search-and-replace operations.
@@ -1144,6 +1145,28 @@ def run_surgeon(
                 + "\n".join(_qa_lines)
             )
 
+    # ── PR #79: Surgeon self-visibility on retry ─────────────────────────────
+    # Root cause of the SMART3 failure: on a QA retry the Surgeon was handed the
+    # prose verdict but ALWAYS regenerated its SEARCH/REPLACE from the pristine
+    # original TARGET CODE — it never saw the broken code it had actually
+    # produced. So when QA flagged "duplicated return statements", the Surgeon
+    # could not locate the duplication it created and walked into the same trap
+    # every attempt. We now show the Surgeon the EXACT output its previous
+    # attempt produced, the code QA reviewed and rejected, so it can do a
+    # targeted fix instead of re-deriving the same mistake from scratch.
+    _prev_attempt_block = ""
+    if prev_attempt_code and prev_attempt_code.strip() and prev_attempt_code.strip() != (symbol.code or "").strip():
+        _prev_attempt_block = (
+            "\n\nYOUR PREVIOUS ATTEMPT (this is the exact code you produced last time; "
+            "QA reviewed THIS code and rejected it — do NOT reproduce its defects, "
+            "and in particular remove any duplicated, leftover, or now-unreachable "
+            "lines the new logic was meant to replace):\n"
+            "```\n" + prev_attempt_code.strip() + "\n```\n"
+            "Compare it against the ORIGINAL TARGET CODE below: your SEARCH text must still "
+            "come from the ORIGINAL TARGET CODE, and your REPLACE must be the COMPLETE corrected "
+            "symbol with the QA-flagged problems fixed and the original lines it replaces removed."
+        )
+
     # For DELETE operations, new_logic is typically empty — make the instruction explicit
     # so the Surgeon doesn't misread "nothing to add" as "already correct".
     _ct_val = target.change_type.value if hasattr(target, "change_type") and target.change_type else "modify"
@@ -1204,7 +1227,7 @@ def run_surgeon(
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
-New logic required: {_new_logic_display}{_import_hint}{_file_header}{_semantic_section}{_linter_block}{_extra_ctx_block}{_qa_feedback_block}
+New logic required: {_new_logic_display}{_import_hint}{_file_header}{_semantic_section}{_linter_block}{_extra_ctx_block}{_qa_feedback_block}{_prev_attempt_block}
 
 CONTEXT BEFORE (read-only reference, do NOT include in operations):
 {before_context}
@@ -6221,6 +6244,7 @@ USER REQUEST:
             # ── Surgeon retry loop (linter + QA feedback) ───────────────────
             _linter_feedback_for_retry: list = []
             _qa_feedback_for_retry: dict = {}       # QA verdict injected on semantic retry
+            _prev_attempt_code: str = ""            # PR #79: Surgeon's own rejected output, fed back on retry
             _full_after_lint: str = ""
             _MAX_SURGEON_ATTEMPTS = 3               # +1 for QA semantic retry
             _surgeon_context_reqs = change_target.surgeon_context
@@ -6250,6 +6274,7 @@ USER REQUEST:
                     linter_feedback=_linter_feedback_for_retry if _linter_feedback_for_retry else None,
                     qa_feedback=_qa_feedback_for_retry if _qa_feedback_for_retry else None,
                     forbid_noop=bool(_qa_feedback_for_retry) or ct == ChangeType.DELETE,
+                    prev_attempt_code=_prev_attempt_code,
                 )
                 _is_changed = new_code.rstrip() != symbol.code.rstrip()
                 _attempt_label = f" (attempt {_surgeon_attempt+1})" if _surgeon_attempt > 0 else ""
@@ -6537,10 +6562,14 @@ USER REQUEST:
                 )
                 if _can_retry_lint:
                     _linter_feedback_for_retry = _linter_introduced_errors
+                    _prev_attempt_code = new_code   # PR #79: show the Surgeon its own output on compile-error retry too
                     yield sse({"type": "progress", "content": f"🔁 Surgeon retry ({_surgeon_attempt+2}/{_MAX_SURGEON_ATTEMPTS}): fixing {len(_linter_introduced_errors)} compile error(s)..."})
                     continue
                 elif _can_retry_qa:
                     _qa_feedback_for_retry = _qa_result
+                    # PR #79: hand the Surgeon its OWN rejected output next attempt
+                    # so it fixes that code instead of re-deriving the same defect.
+                    _prev_attempt_code = new_code
                     _qa_summary = _qa_result.get("summary", "QA blocked")[:80]
                     yield sse({"type": "progress", "content": f"🔁 Surgeon retry ({_surgeon_attempt+2}/{_MAX_SURGEON_ATTEMPTS}): QA feedback — {_qa_summary}"})
                     continue
