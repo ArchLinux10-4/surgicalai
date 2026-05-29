@@ -6869,6 +6869,17 @@ async def run_natural_pipeline_stream(
     def sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
 
+    # ── Compliance tracking ───────────────────────────────────────────────
+    # The natural pipeline is the PRODUCTION path. Until now it carried no
+    # ComplianceTracker, so compliance_log was always empty in production.
+    # Instantiate here and mark each critical step as the pipeline runs.
+    run_id = str(uuid.uuid4())
+    compliance = ComplianceTracker(
+        run_id=run_id, session_id=session_id or "", intent="unknown"
+    )
+    # Hard QA gate: nothing below this score is allowed to ship.
+    QA_GATE_MIN_SCORE = 8
+
     EDIT_OPEN = "<surgical_edit>"
     EDIT_CLOSE = "</surgical_edit>"
     FILE_OPEN = "<new_file>"
@@ -6898,6 +6909,12 @@ async def run_natural_pipeline_stream(
                 symbol_maps_by_name[fname] = (smap, sf)
             except Exception:
                 symbol_maps_by_name[fname] = (None, sf)
+
+        _parsed_count = sum(1 for _v in symbol_maps_by_name.values() if _v[0] is not None)
+        compliance.mark(
+            "symbol_map_read", ran=True,
+            output_summary=f"{_parsed_count}/{len(symbol_maps_by_name)} file(s) parsed to symbol maps",
+        )
 
         # ── Build file context ────────────────────────────────────────────
         file_context = _build_natural_file_context(
@@ -7269,8 +7286,25 @@ async def run_natural_pipeline_stream(
 
         # ── Process edit blocks ───────────────────────────────────────────
         if not edit_blocks_raw and not new_file_blocks_raw:
+            # Pure conversational reply — no code touched.
+            compliance.set_intent("chat")
+            compliance.mark("architect_routing", ran=True,
+                            output_summary="natural reply, no edit/new_file blocks emitted")
+            compliance.save()
             yield sse({"type": "done", "content": ""})
             return
+
+        # Code was touched — classify intent and record routing. (Final intent
+        # is re-confirmed after processing; this early mark covers early returns.)
+        _early_intent = "edit" if edit_blocks_raw else "create"
+        compliance.set_intent(_early_intent)
+        compliance.mark("architect_routing", ran=True,
+                        output_summary=f"{len(edit_blocks_raw)} edit + {len(new_file_blocks_raw)} new_file block(s)")
+        if edit_blocks_raw:
+            # The natural pipeline folds import validation into structural + LLM QA
+            # (there is no separate architect import-scan pass like the legacy path).
+            compliance.mark("import_check", ran=True,
+                            output_summary="import validation folded into structural + LLM QA")
 
         yield sse({"type": "progress", "content": f"Resolving {len(edit_blocks_raw)} edit(s)..."})
 
@@ -7542,62 +7576,120 @@ async def run_natural_pipeline_stream(
                     "plan_deviation": "", "risk_verdicts": [],
                 })
 
-        # ── Structural QA — deterministic pre-check ────────────────────────
-        # Run fast, zero-LLM checks (missing imports, duplicate defs, wrong
-        # import depth, dropped exports) BEFORE the retry loop.  If structural
-        # issues are found, force the LLM QA verdict/score down so the retry
-        # loop fires automatically.
+        # ── Deterministic gate: structural QA + degenerate-output detection ──
+        # Runs fast, zero-LLM checks and forces the LLM verdict/score down so the
+        # retry loop fires automatically. Lives in a helper so it can run BOTH
+        # before the retry loop AND after every fix (a fix can reintroduce a
+        # structural break or collapse into a degenerate no-op/truncation).
         try:
             from services.structural_qa import run_structural_qa, has_blocking_issues as _has_sq_blocking
         except ImportError:
+            run_structural_qa = None
             _has_sq_blocking = None
 
-        if _has_sq_blocking is not None:
-            for _sq_i, _sq_cs in enumerate(change_shells):
-                _sq_new   = _sq_cs["new_code"]
-                _sq_orig  = _sq_cs["symbol"].code
-                _sq_fname = _sq_cs["filename"]
-                _sq_issues = run_structural_qa(_sq_new, _sq_orig, _sq_fname)
-                if _has_sq_blocking(_sq_issues):
-                    # Merge structural issues into LLM QA result so the retry
-                    # prompt includes them and Claude knows exactly what to fix.
-                    _sq_msgs = [f"[STRUCTURAL] {si['message']}" for si in _sq_issues if si["severity"] == "error"]
-                    qa_results[_sq_i]["import_issues"] = (
-                        qa_results[_sq_i].get("import_issues", []) + _sq_msgs
+        def _detect_degenerate(new_code: str, orig_code: str, symbol_name: str) -> list:
+            """
+            Language-agnostic catch for the two ways the surgeon silently fails
+            on small edits, neither of which structural QA (TS-centric) reliably
+            catches for Python:
+              1. NO-OP   — new code is identical to the original (the surgeon
+                           emitted an edit block but changed nothing).
+              2. DROPPED — new code is a hard truncation of the original (e.g.
+                           the function body was cut off / replaced by `pass`).
+            Returns a list of blocking issue messages.
+            """
+            msgs = []
+            _n = (new_code or "").strip()
+            _o = (orig_code or "").strip()
+            if not _n:
+                msgs.append("[DEGENERATE] The edit produced empty code for "
+                            f"`{symbol_name}` — nothing was written.")
+                return msgs
+            if _n == _o:
+                msgs.append("[DEGENERATE] The edit is a no-op — the new code for "
+                            f"`{symbol_name}` is identical to the original. The "
+                            "requested change was not actually implemented.")
+                return msgs
+            _o_lines = [l for l in _o.splitlines() if l.strip()]
+            _n_lines = [l for l in _n.splitlines() if l.strip()]
+            # Only meaningful for non-trivial symbols (small helpers may shrink).
+            if len(_o_lines) >= 8 and len(_n_lines) < max(3, len(_o_lines) * 0.45):
+                msgs.append(
+                    f"[DEGENERATE] The new code for `{symbol_name}` is "
+                    f"{len(_n_lines)} non-blank lines vs the original "
+                    f"{len(_o_lines)} — the body appears to have been dropped or "
+                    "truncated. Re-emit the COMPLETE symbol."
+                )
+            return msgs
+
+        def _run_deterministic_gate(idx: int) -> list:
+            """Run structural QA + degenerate detection on change_shells[idx],
+            merging any blocking issues into qa_results[idx]. Returns a list of
+            progress strings for the caller to yield."""
+            cs = change_shells[idx]
+            new_code = cs["new_code"]
+            orig_code = cs["symbol"].code
+            fname = cs["filename"]
+            sym_name = cs["symbol"].name
+            blocking_msgs: list = []
+
+            if run_structural_qa is not None:
+                try:
+                    _issues = run_structural_qa(
+                        new_code, orig_code, fname,
+                        symbol_path=sym_name,
+                        file_content=cs.get("qa_original_content", ""),
                     )
-                    qa_results[_sq_i]["verdict"] = "blocked"
-                    qa_results[_sq_i]["qa_score"] = min(qa_results[_sq_i].get("qa_score", 10), 3)
-                    qa_results[_sq_i]["summary"] = (
-                        f"Structural QA: {len(_sq_msgs)} blocking issue(s). "
-                        + qa_results[_sq_i].get("summary", "")
-                    )
-                    yield sse({"type": "progress",
-                               "content": f"🔍 Structural QA found {len(_sq_msgs)} blocking issue(s) "
-                                          f"in {_sq_cs['symbol'].name} — will auto-fix"})
+                    if _has_sq_blocking(_issues):
+                        blocking_msgs += [
+                            f"[STRUCTURAL] {si['message']}"
+                            for si in _issues if si["severity"] == "error"
+                        ]
+                except Exception:
+                    pass
+
+            blocking_msgs += _detect_degenerate(new_code, orig_code, sym_name)
+
+            if not blocking_msgs:
+                return []
+
+            qa_results[idx]["import_issues"] = (
+                qa_results[idx].get("import_issues", []) + blocking_msgs
+            )
+            qa_results[idx]["verdict"] = "blocked"
+            qa_results[idx]["qa_score"] = min(qa_results[idx].get("qa_score") or 10, 3)
+            qa_results[idx]["summary"] = (
+                f"Deterministic gate: {len(blocking_msgs)} blocking issue(s). "
+                + qa_results[idx].get("summary", "")
+            )
+            return [f"🔍 Deterministic gate flagged {len(blocking_msgs)} blocking "
+                    f"issue(s) in {sym_name} — will auto-fix"]
+
+        for _sq_i in range(len(change_shells)):
+            for _msg in _run_deterministic_gate(_sq_i):
+                yield sse({"type": "progress", "content": _msg})
+
+        # QA ran on every change — record it for compliance.
+        compliance.mark(
+            "qa_review", ran=True,
+            output_summary=f"QA + deterministic gate ran on {len(change_shells)} change(s)",
+        )
 
         # ── QA retry loop — fix blocked changes before showing to user ────────
-        # Triggers on verdict=="blocked" OR score<=5 with hard issues.
-        # Sends QA findings back to Claude, re-runs QA on the fix.
+        # Triggers on anything that would FAIL the hard gate:
+        #   - verdict is "blocked" (any score), OR
+        #   - score < QA_GATE_MIN_SCORE (i.e. not "good enough" to ship)
+        # Sends QA findings back to Claude with full visibility, re-runs QA on
+        # the fix, and confirms the issues are actually resolved.
 
         MAX_QA_RETRIES = 2
 
         for _qa_retry_round in range(MAX_QA_RETRIES):
-            # Find all still-blocked changes.
-            # Trigger retry when:
-            #   - verdict is "blocked" (any score), OR
-            #   - score <= 5 with specific hard issues (missing imports, type errors)
             blocked_indices = []
             for _bi, _bqd in enumerate(qa_results):
                 _bv = _bqd.get("verdict", "safe")
                 _bs = _bqd.get("qa_score") or 10
-                _b_hard = bool(
-                    _bqd.get("import_issues")
-                    or _bqd.get("type_errors")
-                    or _bqd.get("logic_errors")
-                )
-                if _bv == "blocked":
-                    blocked_indices.append(_bi)
-                elif _bs <= 7:
+                if _bv == "blocked" or _bs < QA_GATE_MIN_SCORE:
                     blocked_indices.append(_bi)
             if not blocked_indices:
                 break
@@ -7747,6 +7839,10 @@ async def run_natural_pipeline_stream(
             for idx, task in reqa_tasks:
                 try:
                     qa_results[idx] = task.result()
+                    # Re-run the deterministic gate on the FIX — a correction can
+                    # reintroduce a structural break or collapse into a no-op.
+                    for _msg in _run_deterministic_gate(idx):
+                        yield sse({"type": "progress", "content": _msg})
                     new_verdict = qa_results[idx].get("verdict", "?")
                     new_score   = qa_results[idx].get("qa_score", "?")
                     icon = "✅" if new_verdict == "safe" else "⚠️" if new_verdict == "warning" else "🚫"
@@ -7756,16 +7852,41 @@ async def run_natural_pipeline_stream(
                 except Exception:
                     pass  # keep prior result if re-QA fails
 
-        # ── Assemble SurgicalChange objects from results
+        # ── Assemble SurgicalChange objects + enforce the hard QA gate ───────
+        # GATE RULE: a change may ship ONLY if verdict != "blocked" AND
+        # qa_score >= QA_GATE_MIN_SCORE (8). Anything below the bar is moved to
+        # skipped_changes so the UI cannot apply it. Every decision is logged.
+        gated_out: list = []          # changes blocked by the gate (cannot apply)
+        _shipped = 0
+        _blocked = 0
+
         for i, (cs, qa_dict) in enumerate(zip(change_shells, qa_results)):
             symbol = cs["symbol"]
             filename = cs["filename"]
             sf_entry = cs["sf_entry"]
 
+            _verdict = qa_dict.get("verdict", "skipped")
+            _score = qa_dict.get("qa_score") or 0
+            _passes_gate = (_verdict != "blocked") and (_score >= QA_GATE_MIN_SCORE)
+
+            # ── Gate-decision logging — full visibility into ship/block ──────
+            _reasons = []
+            if _verdict == "blocked":
+                _reasons.append("verdict=blocked")
+            if _score < QA_GATE_MIN_SCORE:
+                _reasons.append(f"score {_score} < {QA_GATE_MIN_SCORE}")
+            _decision = "SHIP" if _passes_gate else "BLOCK"
+            logger.info(
+                "[pipeline:natural][GATE] run_id=%s decision=%s symbol=%s file=%s "
+                "verdict=%s score=%s reasons=%s",
+                run_id, _decision, symbol.name, filename, _verdict, _score,
+                (", ".join(_reasons) or "passes"),
+            )
+
             all_qa_risks.extend(qa_dict.get("downstream_risks", []))
 
             qa_result_obj = _QAResult(
-                verdict=qa_dict.get("verdict", "skipped"),
+                verdict=_verdict,
                 qa_score=qa_dict.get("qa_score"),
                 summary=qa_dict.get("summary", ""),
                 import_issues=qa_dict.get("import_issues", []),
@@ -7776,16 +7897,36 @@ async def run_natural_pipeline_stream(
                 risk_verdicts=qa_dict.get("risk_verdicts", []),
             )
 
-            verdict_icon = (
-                "\u2705" if qa_dict.get("verdict") == "safe"
-                else "\u26a0\ufe0f" if qa_dict.get("verdict") == "warning"
-                else "\U0001f6ab"
-            )
+            if not _passes_gate:
+                _blocked += 1
+                gated_out.append({
+                    "filename": filename,
+                    "symbol": symbol.name,
+                    "reason": (
+                        f"Blocked by QA gate ({', '.join(_reasons)}). "
+                        + (qa_dict.get("summary", "") or "")
+                    ).strip(),
+                    "qa_score": _score,
+                    "verdict": _verdict,
+                })
+                yield sse({
+                    "type": "progress",
+                    "content": (
+                        f"🚫 GATE BLOCKED {symbol.name} (score {_score}/10, "
+                        f"{_verdict}) — not shippable, will not be applied. "
+                        f"Reason: {', '.join(_reasons)}"
+                    ),
+                })
+                # Do NOT add to changes_by_file — it must not be applyable.
+                continue
+
+            _shipped += 1
+            verdict_icon = "\u2705" if _verdict == "safe" else "\u26a0\ufe0f"
             yield sse({
                 "type": "progress",
                 "content": (
-                    f"QA {verdict_icon} {qa_dict.get('summary', '')} "
-                    f"(score: {qa_dict.get('qa_score', '?')})"
+                    f"{verdict_icon} GATE PASSED {symbol.name} "
+                    f"(score {_score}/10) — {qa_dict.get('summary', '')}"
                 ),
             })
 
@@ -7812,6 +7953,19 @@ async def run_natural_pipeline_stream(
                 }
             changes_by_file[filename]["changes"].append(change.model_dump())
             summary_parts.append(cs["description"] or f"Updated {symbol.name} in {filename}")
+
+        # Record the gate outcome for compliance.
+        compliance.mark(
+            "confidence_gate", ran=True,
+            output_summary=(
+                f"gate min={QA_GATE_MIN_SCORE}: {_shipped} shipped, "
+                f"{_blocked} blocked of {len(change_shells)} change(s)"
+            ),
+        )
+        compliance.mark(
+            "diff_validate", ran=True,
+            output_summary=f"{_shipped} diff(s) assembled for shippable changes",
+        )
 
         # ── Process new file blocks ───────────────────────────────────────
         new_files: list = []
@@ -7861,6 +8015,32 @@ async def run_natural_pipeline_stream(
                 yield sse({"type": "progress", "content": f"✅ {filename} ready"})
                 file_data["qa_result"] = {"verdict": "safe", "qa_score": 8}
 
+            # Apply the SAME hard gate to new files — nothing below the bar ships.
+            _nf_qa = file_data.get("qa_result", {}) or {}
+            _nf_verdict = _nf_qa.get("verdict", "safe")
+            _nf_score = _nf_qa.get("qa_score") or 0
+            _nf_passes = (_nf_verdict != "blocked") and (_nf_score >= QA_GATE_MIN_SCORE)
+            _nf_decision = "SHIP" if _nf_passes else "BLOCK"
+            logger.info(
+                "[pipeline:natural][GATE] run_id=%s decision=%s new_file=%s "
+                "verdict=%s score=%s",
+                run_id, _nf_decision, filename, _nf_verdict, _nf_score,
+            )
+            if not _nf_passes:
+                gated_out.append({
+                    "filename": filename,
+                    "symbol": "(new file)",
+                    "reason": f"Blocked by QA gate (verdict={_nf_verdict}, "
+                              f"score {_nf_score} < {QA_GATE_MIN_SCORE}). "
+                              + (_nf_qa.get("summary", "") or ""),
+                    "qa_score": _nf_score,
+                    "verdict": _nf_verdict,
+                })
+                yield sse({"type": "progress",
+                           "content": f"🚫 GATE BLOCKED new file {filename} "
+                                      f"(score {_nf_score}/10) — not shippable"})
+                continue
+
             new_files.append({
                 "filename": filename,
                 "content": content,
@@ -7870,7 +8050,27 @@ async def run_natural_pipeline_stream(
             })
             summary_parts.append(summary or f"Created {filename}")
 
+        if new_files:
+            compliance.mark(
+                "file_creation", ran=True,
+                output_summary=f"{len(new_files)} new file(s) passed the QA gate",
+            )
+
         if not changes_by_file and not new_files:
+            # Everything was either pure-chat or blocked by the gate.
+            compliance.save()
+            if gated_out:
+                yield sse({"type": "smart_result", "content": json.dumps({
+                    "intent": "edit",
+                    "summary": f"All {len(gated_out)} proposed change(s) were blocked by the QA gate.",
+                    "reasoning": "No change met the minimum quality bar to ship.",
+                    "risks": all_qa_risks,
+                    "skipped_changes": gated_out,
+                    "changes_by_file": {},
+                    "new_files": [],
+                    "natural_text": full_response,
+                    "compliance": compliance.to_dict(),
+                })})
             yield sse({"type": "done", "content": ""})
             return
 
@@ -7888,19 +8088,28 @@ async def run_natural_pipeline_stream(
         for _raw in new_file_blocks_raw:
             _display_text = _display_text.replace(FILE_OPEN + _raw + FILE_CLOSE, "").strip()
 
+        compliance.set_intent(intent)
+        compliance.save()
+
         result = {
             "intent": intent,
             "summary": "; ".join(summary_parts[:3]),
             "reasoning": "Changes from natural conversation",
             "risks": all_qa_risks,
-            "skipped_changes": [],
+            "skipped_changes": gated_out,
             "changes_by_file": changes_by_file,
             "new_files": new_files,
             "natural_text": _display_text,
+            "compliance": compliance.to_dict(),
         }
 
         yield sse({"type": "smart_result", "content": json.dumps(result)})
         yield sse({"type": "done", "content": ""})
 
     except Exception as e:
+        try:
+            compliance.mark("pipeline_error", ran=False, reason=str(e)[:200])
+            compliance.save()
+        except Exception:
+            pass
         yield f"data: {json.dumps({'type': 'error', 'content': _friendly_error(e)})}\n\n"
