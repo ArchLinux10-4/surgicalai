@@ -60,6 +60,25 @@ def linter_tool_name(filename: str) -> str:
     return "pyflakes" if _ext(filename) == ".py" else "tsc"
 
 
+def linter_available(filename: str) -> bool:
+    """True if the linter for this file type can actually run.
+
+    pyflakes ships as a backend dependency; tsc must be located on disk/PATH.
+    PR #81: the pipeline uses this to report an honest "skipped" instead of a
+    misleading "clean" when tsc is absent (a false "tsc clean" is what hid
+    BIG10's broken ship)."""
+    ext = _ext(filename)
+    if ext == ".py":
+        try:
+            import pyflakes  # noqa: F401
+            return True
+        except Exception:
+            return False
+    if ext in (".ts", ".tsx", ".js", ".jsx"):
+        return _find_tsc() is not None
+    return False
+
+
 def format_feedback_block(errors: List[Dict], tool: str) -> str:
     """
     Format linter errors into a prompt block for the Surgeon retry.
