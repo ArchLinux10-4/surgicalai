@@ -50,6 +50,22 @@ parser = ASTParser()
 # Models that do NOT accept a temperature parameter (reasoning / latest-gen models)
 NO_TEMPERATURE_MODELS = {"gpt-5", "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"}
 
+# ── QA model chain (PR #74) ───────────────────────────────────────────────────
+# Single source of truth so the QA model can never silently drift between call
+# sites again (previously some QA calls ran claude-sonnet-4-6 while the rest of
+# the pipeline ran 4-5 — an accidental, untracked divergence).
+# QA uses an INDEPENDENT cross-provider failover chain: if the primary provider
+# cannot produce a parseable semantic verdict (empty completion, overload, etc.)
+# after bounded retries, we fail over to a DIFFERENT provider for a real
+# semantic review — not just the deterministic structural floor. Only when every
+# provider in the chain is exhausted do we fall back to structural checks, and in
+# that case we fail CLOSED (hold below the gate) rather than ship unreviewed.
+QA_PRIMARY_MODEL  = "claude-sonnet-4-6"   # strongest semantic code reviewer
+QA_FALLBACK_MODEL = "gpt-4.1"             # independent second provider (full, not mini)
+QA_MAX_ATTEMPTS_PER_PROVIDER = 2          # bounded retries within each provider
+QA_RETRY_BASE_DELAY = 1.5                 # seconds; exponential backoff base
+QA_RETRY_MAX_DELAY  = 8.0                 # seconds; backoff cap
+
 # ── Prompt engineering constants ──────────────────────────────────────────────
 HISTORY_WINDOW       = 20   # turns of conversation history passed to every prompt
 TEXT_SEARCH_WINDOW   = 75   # ±lines around a text hit when no symbol contains the line
@@ -2952,6 +2968,181 @@ Return ONLY valid JSON:
 Score guide: 9-10=safe, 7-8=minor notes, 5-6=warning, ≤4=blocked."""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# PR #74 — robust semantic-QA verdict call
+#
+# Root cause this fixes: a QA model call that returns 200-OK-but-empty (empty
+# text block, a refusal, or prose with no JSON) is NOT an SDK error, so the
+# Anthropic/OpenAI SDK auto-retry never fires. The old code ran a regex, got "",
+# counted it as a failure after 2 immediate no-backoff retries, and dropped
+# straight to the deterministic structural floor — which then shipped the file
+# at exactly the gate bar (8/10) without any semantic review ever running. On a
+# heavy run that brushed an overload window, this happened on EVERY attempt.
+#
+# This helper makes the semantic gate actually run:
+#   1. FORCE JSON OUTPUT. Anthropic calls use assistant prefill ("{") so the
+#      model must continue a JSON object — eliminating prose-prefix and
+#      empty-text non-answers. OpenAI calls use response_format=json_object.
+#   2. RETRY WITH BACKOFF, treating empty/unparseable as retryable (not just
+#      transport errors), with exponential backoff to ride out brief overloads.
+#   3. INDEPENDENT PROVIDER FAILOVER. If the primary provider is exhausted, fail
+#      over to a DIFFERENT provider (gpt-4.1) for a real semantic verdict — so a
+#      single provider's outage degrades to "reviewed by the backup model",
+#      not "not reviewed at all".
+#   4. FAIL FAST on permanent errors (bad/missing key, auth) — skip that
+#      provider instead of burning the retry budget.
+#   5. OBSERVABILITY. Every attempt's provider/outcome/reason is logged and
+#      summarised in the returned meta, so ship/hold decisions are explainable.
+#   6. DEADLINE-AWARE. Stops retrying as it approaches the caller's timeout
+#      (the bounded fix-loop calls from PR #73) so it can never cause a hang.
+#
+# Returns (data | None, meta):
+#   data — parsed JSON verdict dict, or None if NO provider produced a parseable
+#          semantic verdict within the deadline (caller then fails closed).
+#   meta — {"provider", "attempts", "reason", "semantic_ran"} for logging.
+# ─────────────────────────────────────────────────────────────────────────────
+def _qa_error_kind(e: Exception) -> str:
+    """Classify a provider error as 'permanent' (skip provider, don't retry) or
+    'transient' (retry with backoff)."""
+    s = (str(e) + " " + type(e).__name__).lower()
+    if any(k in s for k in (
+        "api key", "x-api-key", "authentication", "auth_error", "unauthorized",
+        "permission", "not configured", "invalid_request", "401", "403",
+    )):
+        return "permanent"
+    return "transient"
+
+
+async def _qa_llm_verdict(
+    system_prompt: str,
+    user_msg: str,
+    user_id: str = "",
+    *,
+    label: str = "qa",
+    run_id: str = "",
+    deadline_s: float = 80.0,
+) -> tuple:
+    """Robust semantic-QA verdict call with forced JSON, backoff retries, and
+    independent cross-provider failover. See block comment above.
+    Never raises — returns (data|None, meta)."""
+    import asyncio
+    import time as _time
+
+    _start = _time.monotonic()
+
+    def _remaining() -> float:
+        return deadline_s - (_time.monotonic() - _start)
+
+    def _parse(raw: str):
+        """Parse model text into a dict, tolerating fences/preamble. Returns
+        dict or None. Empty/whitespace -> None (retryable)."""
+        if not (raw or "").strip():
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            pass
+        try:
+            extracted = _extract_json_from_text(raw)
+            if extracted and extracted.strip():
+                return json.loads(extracted)
+        except Exception:
+            pass
+        return None
+
+    async def _call_claude() -> str:
+        # Assistant prefill forces the response to continue a JSON object.
+        _aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
+        _msg = await _aclient.messages.create(
+            model=QA_PRIMARY_MODEL,
+            max_tokens=1500,
+            system=system_prompt,
+            messages=[
+                {"role": "user", "content": user_msg},
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+        _parts = [
+            b.text for b in _msg.content
+            if getattr(b, "type", None) == "text" and getattr(b, "text", None)
+        ]
+        _text = "".join(_parts).strip()
+        # Re-attach the prefilled brace the model was told to continue from.
+        if _text and not _text.lstrip().startswith("{"):
+            _text = "{" + _text
+        return _text
+
+    async def _call_openai() -> str:
+        client = _get_client(user_id)
+
+        def _call():
+            return _chat_create(
+                client,
+                model=QA_FALLBACK_MODEL,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_msg},
+                ],
+                temperature=0.1,
+                response_format={"type": "json_object"},
+            )
+
+        _resp = await asyncio.to_thread(_call)
+        return (_resp.choices[0].message.content or "").strip()
+
+    providers = (("claude", _call_claude), ("openai", _call_openai))
+
+    total_attempts = 0
+    last_reason = "no provider attempted"
+
+    for prov_name, prov_call in providers:
+        for attempt in range(QA_MAX_ATTEMPTS_PER_PROVIDER):
+            if _remaining() <= 2.0:
+                last_reason = f"deadline reached before {prov_name} attempt {attempt + 1}"
+                logger.info("[pipeline][QA:%s] run_id=%s %s", label, run_id, last_reason)
+                return None, {"provider": None, "attempts": total_attempts,
+                              "reason": last_reason, "semantic_ran": False}
+            total_attempts += 1
+            try:
+                raw = await prov_call()
+                data = _parse(raw)
+                if data is not None:
+                    logger.info(
+                        "[pipeline][QA:%s] run_id=%s verdict via %s on attempt %d/%d",
+                        label, run_id, prov_name, attempt + 1, QA_MAX_ATTEMPTS_PER_PROVIDER,
+                    )
+                    return data, {"provider": prov_name, "attempts": total_attempts,
+                                  "reason": "ok", "semantic_ran": True}
+                last_reason = f"{prov_name} returned empty/unparseable"
+                logger.info(
+                    "[pipeline][QA:%s] run_id=%s %s (attempt %d/%d)",
+                    label, run_id, last_reason, attempt + 1, QA_MAX_ATTEMPTS_PER_PROVIDER,
+                )
+            except Exception as e:
+                kind = _qa_error_kind(e)
+                last_reason = f"{prov_name} {kind} error: {str(e)[:100]}"
+                logger.info(
+                    "[pipeline][QA:%s] run_id=%s %s (attempt %d/%d)",
+                    label, run_id, last_reason, attempt + 1, QA_MAX_ATTEMPTS_PER_PROVIDER,
+                )
+                if kind == "permanent":
+                    break  # don't retry this provider; move to next provider
+
+            # Backoff before the next attempt within this provider.
+            if attempt + 1 < QA_MAX_ATTEMPTS_PER_PROVIDER:
+                delay = min(QA_RETRY_BASE_DELAY * (2 ** attempt), QA_RETRY_MAX_DELAY)
+                delay = min(delay, max(0.0, _remaining() - 1.0))
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+    logger.info(
+        "[pipeline][QA:%s] run_id=%s ALL providers exhausted (%d attempts) — last: %s",
+        label, run_id, total_attempts, last_reason,
+    )
+    return None, {"provider": None, "attempts": total_attempts,
+                  "reason": last_reason, "semantic_ran": False}
+
+
 async def _run_qa_for_new_file(file_result: dict, codebase_context: str, user_id: str = "") -> dict:
     """
     Lightweight QA check for Claude-created new files.
@@ -3079,54 +3270,37 @@ Run all 5 checks and return the JSON verdict."""
         except Exception:
             pass  # structural module unavailable — balance check above still ran
 
-        # (d) Non-empty, balanced, no structural breaks → structurally sound.
-        # Don't false-block a good file just because the LLM QA flaked.
+        # (d) Non-empty, balanced, no structural breaks.
+        # PR #74 FAIL-CLOSED POLICY: structural checks catch truncation/empties,
+        # but they do NOT perform semantic review (imports/types/API-usage/logic).
+        # When the semantic gate genuinely could not run — even after forced-JSON,
+        # backoff retries, and independent cross-provider failover — we must NOT
+        # ship a file the gate never reviewed at exactly the ship bar (the old
+        # behaviour returned 8/10, sliding unreviewed code through "at 8/10").
+        # Instead we HOLD below the gate (score 7 / verdict warning) with an
+        # honest reason. The hard 8/10 gate then blocks it and the fix-loop will
+        # re-QA — if a provider has recovered, a real verdict replaces this.
         return {
-            "verdict": "safe", "qa_score": 8,  # == gate ship bar (QA_GATE_MIN_SCORE)
-            "summary": f"LLM QA unavailable{_suffix}; passed deterministic structural checks",
+            "verdict": "warning", "qa_score": 7,  # < QA_GATE_MIN_SCORE (8) → held
+            "summary": f"Semantic QA unavailable{_suffix}; structural checks passed "
+                       f"but semantic review did not run — held below gate (fail-closed).",
             "import_issues": [], "type_errors": [], "completeness_issues": [],
             "downstream_risks": [], "plan_deviation": "", "risk_verdicts": [],
         }
 
-    async def _attempt() -> str:
-        """One QA call. Prefer Claude, fall back to OpenAI. Return raw text."""
-        try:
-            _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
-            _msg = await _qa_aclient.messages.create(
-                model="claude-sonnet-4-6", max_tokens=1500,
-                system=QA_CREATE_SYSTEM,
-                messages=[{"role": "user", "content": user_msg}],
-            )
-            _parts = [
-                b.text for b in _msg.content
-                if getattr(b, "type", None) == "text" and getattr(b, "text", None)
-            ]
-            return "".join(_parts).strip()
-        except Exception:
-            client = _get_client(user_id)
-            def _call():
-                return _chat_create(client, model="gpt-4.1",
-                    messages=[{"role": "system", "content": QA_CREATE_SYSTEM},
-                               {"role": "user", "content": user_msg}],
-                    temperature=0.1, response_format={"type": "json_object"})
-            resp = await asyncio.to_thread(_call)
-            return (resp.choices[0].message.content or "").strip()
+    # PR #74: robust semantic-QA call — forced JSON, backoff retries, and
+    # independent cross-provider failover (Claude → gpt-4.1). Replaces the old
+    # 2-try no-backoff loop whose empty completions dropped straight to the
+    # structural floor and shipped unreviewed at the gate bar.
+    _data, _meta = await _qa_llm_verdict(
+        QA_CREATE_SYSTEM, user_msg, user_id,
+        label="newfile", deadline_s=75.0,
+    )
+    if _data is not None:
+        return _normalize(_data)
 
-    # Retry the QA call on empty/unparseable output before giving up.
-    for _try in range(2):
-        try:
-            raw = await _attempt()
-        except Exception:
-            raw = ""
-        _json = _extract_json(raw)
-        if _json:
-            try:
-                return _normalize(json.loads(_json))
-            except Exception:
-                pass  # unparseable — retry, then fall back
-
-    # All LLM attempts failed → deterministic structural verdict.
-    return _deterministic_fallback(note="LLM QA empty/unparseable after retries")
+    # No provider produced a parseable semantic verdict → fail closed.
+    return _deterministic_fallback(note=_meta.get("reason", "semantic QA unavailable"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3624,15 +3798,8 @@ async def run_qa_agent(
     _risks_block = "\n".join(f"- {r}" for r in _risks_list) if _risks_list else "(none — skip risk_verdicts)"
     import asyncio
 
-    # Prefer Claude Sonnet for QA — strongest semantic code reasoning in the chain
-    try:
-        _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
-        _qa_use_claude = True
-        _qa_model = "claude-sonnet-4-6"
-    except Exception:
-        _qa_aclient = None
-        _qa_use_claude = False
-        _qa_model = "gpt-4.1"  # full GPT-4.1, not mini — QA must not be weakest link
+    # PR #74: provider selection, retry, and cross-provider failover now live in
+    # the shared _qa_llm_verdict() helper — no eager client creation here.
 
     # v3.11.4: QA receives FULL code — no truncation, no diff confusion.
     # Claude Sonnet has 200K context. A full symbol is typically <20KB (~5K tokens).
@@ -3692,35 +3859,6 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 {_risks_block}"""
 
     import re as _re
-
-    # ── one QA model call → extracted JSON text (str) ───────────────────────
-    async def _qa_call_once() -> str:
-        if _qa_use_claude:
-            _qa_msg = await _qa_aclient.messages.create(
-                model=_qa_model,
-                max_tokens=1500,
-                system=QA_SYSTEM,
-                messages=[{"role": "user", "content": user_msg}],
-            )
-            _raw = (_qa_msg.content[0].text or "").strip()
-            # Robust JSON extraction — Claude sometimes adds preamble/fences
-            return _extract_json_from_text(_raw)
-        client = _get_client(user_id)
-
-        def _call():
-            return _chat_create(
-                client,
-                model=_qa_model,
-                messages=[
-                    {"role": "system", "content": QA_SYSTEM},
-                    {"role": "user",   "content": user_msg},
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"},
-            )
-
-        _resp = await asyncio.to_thread(_call)
-        return (_resp.choices[0].message.content or "").strip()
 
     def _edit_delims_balanced(code: str) -> bool:
         """Truncation detector for edits — balanced {} () [] after stripping
@@ -3806,36 +3944,36 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
                 })
         except Exception:
             pass  # structural module unavailable — balance check above still ran
-        # Non-empty, balanced, no structural breaks → structurally sound.
-        # Don't false-block a clean edit just because the LLM QA flaked.
+        # Non-empty, balanced, no structural breaks.
+        # PR #74 FAIL-CLOSED POLICY (edit path): structural checks confirm the
+        # edit isn't truncated/empty, but they do NOT perform semantic review
+        # (import/type/logic/cross-file). When the semantic gate genuinely could
+        # not run — after forced-JSON, backoff retries, and cross-provider
+        # failover — we HOLD below the gate (7 / warning) rather than ship an
+        # unreviewed edit at the ship bar. The hard gate then blocks it and the
+        # fix-loop re-QAs; a recovered provider replaces this with a real verdict.
         return _ret({
-            "verdict": "safe", "qa_score": 8,  # == gate ship bar (QA_GATE_MIN_SCORE)
-            "summary": f"QA model unavailable{_suffix}; deterministic structural "
-                       f"checks passed — structurally sound.",
+            "verdict": "warning", "qa_score": 7,  # < QA_GATE_MIN_SCORE (8) → held
+            "summary": f"Semantic QA unavailable{_suffix}; structural checks passed "
+                       f"but semantic review did not run — held below gate (fail-closed).",
             "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
-            "type_errors": [], "plan_deviation": "", "skipped_reason": None,
+            "type_errors": [], "plan_deviation": "", "skipped_reason": note,
         })
 
     try:
-        raw = await _qa_call_once()
-        # Retry once on empty/blank — transient empty completions happen,
-        # especially on large inputs. One empty response must not = 0/10.
-        if not (raw or "").strip():
-            logger.info("[pipeline][QA] run_id=%s empty QA response for %s — retrying once",
-                        session_id, symbol_path)
-            try:
-                raw = await _qa_call_once()
-            except Exception:
-                raw = ""
-        # Still empty → deterministic structural fallback (never false-0).
-        if not (raw or "").strip():
-            logger.info("[pipeline][QA] run_id=%s QA still empty for %s — structural fallback",
-                        session_id, symbol_path)
-            return _edit_struct_fallback("empty QA response after retry")
-        try:
-            data = json.loads(raw)
-        except Exception:
-            data = json.loads(_extract_json_from_text(raw))
+        # PR #74: robust semantic-QA call — forced JSON output, backoff retries
+        # (empty completions are retried, not just transport errors), and
+        # independent cross-provider failover (Claude → gpt-4.1). Replaces the
+        # prior single-retry path whose empty responses dropped to the structural
+        # floor and shipped unreviewed edits at the gate bar.
+        data, _qa_meta = await _qa_llm_verdict(
+            QA_SYSTEM, user_msg, user_id,
+            label="edit", run_id=session_id, deadline_s=80.0,
+        )
+        # No provider produced a parseable semantic verdict → fail closed
+        # (structural checks still block real truncation/empties).
+        if data is None:
+            return _edit_struct_fallback(_qa_meta.get("reason", "semantic QA unavailable after retries+failover"))
 
         result = {
             "verdict":          data.get("verdict", "warning"),
@@ -8548,9 +8686,18 @@ async def run_natural_pipeline_stream(
                     yield sse({"type": "progress",
                                "content": f"{qa_icon} {filename} — {qa.get('summary', 'ready')}"})
                     file_data["qa_result"] = qa
-                except Exception:
-                    yield sse({"type": "progress", "content": f"✅ {filename} ready"})
-                    file_data["qa_result"] = {"verdict": "safe", "qa_score": 8}
+                except Exception as _qa_exc:
+                    # PR #74 FAIL-CLOSED: a QA crash must NOT ship the file at the
+                    # gate bar. Hold below the gate so the hard gate blocks it and
+                    # the fix-loop re-QAs (rather than silently shipping unreviewed).
+                    logger.info("[pipeline:natural][QA:newfile] run_id=%s QA crashed for %s: %s — fail-closed hold",
+                                run_id, filename, str(_qa_exc)[:120])
+                    yield sse({"type": "progress",
+                               "content": f"⚠️ {filename} — QA error, holding for review"})
+                    file_data["qa_result"] = {
+                        "verdict": "warning", "qa_score": 7,
+                        "summary": "QA raised an error — held below gate (fail-closed).",
+                    }
 
                 # Apply the SAME hard gate to new files — nothing below the bar ships.
                 _nf_qa = file_data.get("qa_result", {}) or {}
