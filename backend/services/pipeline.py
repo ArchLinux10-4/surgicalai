@@ -7453,16 +7453,11 @@ async def run_natural_pipeline_stream(
         # Pre-build diffs and change shells (no I/O — instant)
         change_shells = []
 
-        # ── Fix 1: cross-change ordering ─────────────────────────────────
-        # When multiple changes target the same file, QA must see the file
-        # state AFTER previous changes are applied — not the original.
-        # Example: change 1 adds a helper, change 2 calls it.
-        # QA for change 2 must see the helper already present.
-        # We apply each change to an in-memory copy sequentially so every
-        # QA call receives the correct intermediate "before" state.
-        from services.surgical_editor import apply_change as _apply_change_fn
-        _intermediate_contents: dict = {}   # fname -> content after prior changes
-
+        # Cross-change dependencies (e.g. change 1 adds a helper that change 2
+        # calls) are surfaced to QA via same_run_context + other_files_context,
+        # NOT by mutating the per-symbol "before" code. QA always compares a
+        # symbol's original code against that same symbol's new code so the
+        # completeness check stays apples-to-apples.
         for i, resolved in enumerate(resolved_edits):
             edit_data    = resolved["edit_data"]
             symbol       = resolved["symbol"]
@@ -7471,13 +7466,6 @@ async def run_natural_pipeline_stream(
             filename     = resolved["filename"]
             new_code     = edit_data.get("new_code", "")
             description  = edit_data.get("description", "")
-
-            # Seed intermediate state on first touch for this file
-            if filename not in _intermediate_contents:
-                _intermediate_contents[filename] = file_content
-
-            # QA sees the file state AFTER all previous changes to this file
-            qa_original_content = _intermediate_contents[filename]
 
             diff = _make_diff(symbol.code, new_code, symbol.name)
             _tgt, _repl = _compute_target_element(symbol.code, new_code)
@@ -7499,27 +7487,10 @@ async def run_natural_pipeline_stream(
             except Exception:
                 pass
 
-            # Advance the intermediate state so the NEXT change on this file
-            # sees this change already applied.
-            try:
-                _sc_proxy = type("_SC", (), {
-                    "new_code": new_code,
-                    "original_code": symbol.code,
-                    "symbol": symbol,
-                    "operations": [{"find": symbol.code, "replace": new_code}],
-                    "applied": False,
-                })()
-                _intermediate_contents[filename] = _apply_change_fn(
-                    _intermediate_contents[filename], _sc_proxy
-                )
-            except Exception:
-                pass  # keep current intermediate if apply fails; QA still runs
-
             change_shells.append({
                 "symbol":              symbol,
                 "sf_entry":            sf_entry,
                 "file_content":        file_content,        # original file (for SurgicalChange)
-                "qa_original_content": qa_original_content, # intermediate (for QA)
                 "filename":            filename,
                 "new_code":            new_code,
                 "description":         description,
@@ -7532,7 +7503,15 @@ async def run_natural_pipeline_stream(
         # Launch all QA calls concurrently
         qa_tasks = [
             asyncio.create_task(run_qa_agent(
-                original_code=cs["qa_original_content"],  # intermediate state, not raw original
+                # QA compares ORIGINAL → NEW at the SAME granularity. new_code is a
+                # single symbol, so original_code must be that symbol's original code
+                # too — NOT the whole-file intermediate. Passing the full file here
+                # made QA's completeness check (#1) report every other symbol as
+                # "dropped", falsely blocking correct surgical edits at 1-2/10.
+                # This now matches the structural-QA pre-check and the retry round,
+                # which both already use symbol.code. Cross-change ordering context
+                # is supplied separately via same_run_context / other_files_context.
+                original_code=cs["symbol"].code,
                 new_code=cs["new_code"],
                 change_description=cs["description"],
                 new_logic=cs["description"],
