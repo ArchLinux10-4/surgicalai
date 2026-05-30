@@ -6728,6 +6728,26 @@ USER REQUEST:
                         if _tool_ran:
                             yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean"})
                         else:
+                            # ┌─ LEFTOVER / FUTURE WORK (handoff note, 2026-05-29) ───────────────┐
+                            # │ The real `tsc` binary is NOT installed on the backend, so for      │
+                            # │ TypeScript/JS files this branch honestly reports "skipped" rather  │
+                            # │ than a false "clean". This is the LAST open item from the BIG10     │
+                            # │ root-cause list (the other three causes are fixed: surgeon symbol   │
+                            # │ block, detect_redeclarations(), honest skip).                       │
+                            # │                                                                     │
+                            # │ TO FINISH: a separate "tsc sidecar" PR that (1) installs Node+tsc   │
+                            # │ in the Railway build (Dockerfile / nixpacks) and (2) gates it       │
+                            # │ behind a feature flag. It was DELIBERATELY DEFERRED, not forgotten. │
+                            # │                                                                     │
+                            # │ WHY THE ORDER MATTERS: PR #82 made the lint gate DELTA-based        │
+                            # │ (see ~line 6596: `_lint_orig_count` baseline). That fix is the      │
+                            # │ prerequisite — installing tsc BEFORE it would surface hundreds of   │
+                            # │ pre-existing type errors in large files and false-block every edit. │
+                            # │ With the delta gate now live, enabling tsc is safe. Do NOT install  │
+                            # │ the binary without first confirming the delta gate is intact.       │
+                            # │ Not a live bug today: nothing ships unprotected — this is a         │
+                            # │ type-checking ENHANCEMENT, not a fix.                               │
+                            # └────────────────────────────────────────────────────────────────────┘
                             yield sse({"type": "progress", "content": f"⏭ {_lint_tool} skipped (not installed)"})
                 except Exception as _lint_exc:
                     print(f"[LINTER_VALIDATOR] Skipped: {_lint_exc}")
