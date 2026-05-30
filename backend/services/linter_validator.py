@@ -27,6 +27,8 @@ import os
 import re
 import subprocess
 import tempfile
+import urllib.error
+import urllib.request
 from typing import Dict, List, Optional
 
 
@@ -75,6 +77,11 @@ def linter_available(filename: str) -> bool:
         except Exception:
             return False
     if ext in (".ts", ".tsx", ".js", ".jsx"):
+        # tsc can run via the remote Vercel service (Option #2) OR a local binary.
+        # The remote path only counts as "available" when the feature is enabled
+        # AND a service URL is configured — otherwise we honestly self-skip.
+        if _tsc_service_enabled() and _tsc_service_url():
+            return True
         return _find_tsc() is not None
     return False
 
@@ -171,13 +178,97 @@ _TSC_CONFIG_BASE: Dict = {
 
 _TSC_TIMEOUT_SECS = 25
 
+# ── Option #2: tsc via Vercel serverless function ────────────────────────────
+# Feature flag + endpoint + shared secret. ALL read from the environment so the
+# gate can be toggled without a code change (the kill switch we lacked before).
+#   TSC_ENABLED         "1"/"true" to route tsc to the remote service
+#   TSC_SERVICE_URL     full https URL of the Vercel /api/tsc function
+#   TSC_SERVICE_SECRET  shared secret; sent as the x-tsc-secret header
+_TSC_SERVICE_TIMEOUT_SECS = 25
+
+
+def _tsc_service_enabled() -> bool:
+    """True if the remote-tsc feature flag is on (default OFF / fail-safe)."""
+    return os.environ.get("TSC_ENABLED", "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _tsc_service_url() -> Optional[str]:
+    url = os.environ.get("TSC_SERVICE_URL", "").strip()
+    return url or None
+
+
+def _tsc_service_secret() -> str:
+    return os.environ.get("TSC_SERVICE_SECRET", "").strip()
+
+
+def _run_tsc_via_service(code: str, filename: str, allow_js: bool = False) -> List[Dict]:
+    """
+    POST {filename, content} to the Vercel tsc function and parse its JSON reply.
+
+    Expected response shape (produced by frontend/api/tsc.ts):
+        {"errors": [{line, column, message, detail}, ...], "tool": "tsc"}
+
+    Degrades to a SAFE SKIP (returns []) on any error — unconfigured secret,
+    network failure, non-200, malformed JSON, or timeout — so the remote path
+    can never false-block an edit (same contract as the local binary path).
+    """
+    url = _tsc_service_url()
+    if not url:
+        return []
+
+    payload = json.dumps({"filename": filename, "content": code}).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    secret = _tsc_service_secret()
+    if secret:
+        req.add_header("x-tsc-secret", secret)
+
+    try:
+        with urllib.request.urlopen(req, timeout=_TSC_SERVICE_TIMEOUT_SECS) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        print(f"[LINTER_VALIDATOR] tsc service HTTP {exc.code} — skipping TypeScript lint")
+        return []
+    except Exception as exc:
+        print(f"[LINTER_VALIDATOR] tsc service unreachable ({exc}) — skipping TypeScript lint")
+        return []
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        print("[LINTER_VALIDATOR] tsc service returned malformed JSON — skipping")
+        return []
+
+    errors_in = data.get("errors") if isinstance(data, dict) else None
+    if not isinstance(errors_in, list):
+        return []
+
+    errors: List[Dict] = []
+    for e in errors_in:
+        if not isinstance(e, dict):
+            continue
+        line = int(e.get("line", 0) or 0)
+        col = int(e.get("column", 0) or 0)
+        msg = str(e.get("message", "")).strip()
+        detail = str(e.get("detail") or f"line {line}, col {col}: {msg}")
+        errors.append(_make_err(line, col, msg, detail))
+    return errors[:8]
+
 
 def _run_tsc(code: str, filename: str, allow_js: bool = False) -> List[Dict]:
     """
     Write *code* to a temp dir with a tsconfig.json and run tsc --noEmit.
     Parses stdout and returns structured error dicts.
     Returns [] gracefully if tsc is not installed.
+
+    Option #2 (Vercel sidecar): when TSC_ENABLED is set and TSC_SERVICE_URL is
+    configured, type-checking is delegated to the remote Vercel function instead
+    of a local binary. The remote path degrades to a safe skip (returns []) on
+    any network/HTTP error, so it can never false-block an edit.
     """
+    if _tsc_service_enabled() and _tsc_service_url():
+        return _run_tsc_via_service(code, filename, allow_js=allow_js)
+
     tsc_bin = _find_tsc()
     if not tsc_bin:
         print("[LINTER_VALIDATOR] tsc not found — skipping TypeScript lint. "
@@ -259,6 +350,32 @@ def _find_tsc() -> Optional[str]:
     """
     Locate tsc: checks local node_modules first (version-pinned),
     then falls back to global PATH.
+
+    ┌─ FUTURE WORK / "how to actually turn tsc on" (handoff, 2026-05-29) ──────┐
+    │ tsc is currently NOT installed on the backend, so this returns None and  │
+    │ the whole lint gate honestly self-skips. To enable it, the binary must   │
+    │ land in ONE of the probe paths below — anywhere else and nothing changes.│
+    │ Easiest: `npm install typescript` inside frontend/ (matches the first    │
+    │ two candidates), or put `tsc` on PATH (shutil.which fallback).            │
+    │                                                                          │
+    │ The moment a binary is found here, linter_available() flips to True and  │
+    │ the gate goes LIVE immediately for ALL edits — there is NO feature flag / │
+    │ kill switch today. If you want a gradual rollout or an off-switch, add a  │
+    │ flag check (env var) BEFORE shipping the install. See the matching note  │
+    │ in pipeline.py at the "⏭ tsc skipped (not installed)" branch.            │
+    │                                                                          │
+    │ PERFORMANCE: _run_tsc() is invoked on BOTH the original and edited file  │
+    │ (delta gate), i.e. tsc runs ~2x per edit in the request path. On a large │
+    │ file (6k+ lines, --checkJs) that can add several seconds. It degrades to │
+    │ a safe skip on timeout (returns []), so it can't break an edit, but it   │
+    │ can make edits feel slower — watch latency after enabling.               │
+    │                                                                          │
+    │ SAFE because PR #82 made the lint gate DELTA-based: checking a file in    │
+    │ isolation produces many "Cannot find module" errors (no node_modules in  │
+    │ the temp dir), but those exist in BOTH original and edited versions and  │
+    │ cancel out in the delta — so they do NOT false-block. Do not enable tsc  │
+    │ if that delta gate is ever reverted.                                     │
+    └──────────────────────────────────────────────────────────────────────────┘
     """
     candidates = [
         # Preferred: inside the frontend package
