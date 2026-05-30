@@ -50,7 +50,21 @@ function ScoreBadge({ score, verdict, kind }: { score?: number | null; verdict?:
       </span>
     )
   }
-  if (score == null) return null
+  if (score == null) {
+    // Completed code task that produced no source edits to gate (e.g. created a
+    // net-new doc file): no numeric score, but we still surface the QA verdict
+    // so the row is never an ambiguous blank.
+    if (!verdict) return null
+    const ok = /safe|pass|clean|ok/i.test(verdict)
+    return (
+      <span
+        className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${ok ? 'bg-success/15 text-success border-success/30' : 'bg-overlay/60 text-muted border-border/50'}`}
+        title={verdict}
+      >
+        {ok ? 'QA ✓' : verdict}
+      </span>
+    )
+  }
   const tone =
     score >= 8 ? 'bg-success/15 text-success border-success/30'
     : score >= 5 ? 'bg-warning/15 text-warning border-warning/30'
