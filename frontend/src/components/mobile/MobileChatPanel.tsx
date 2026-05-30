@@ -23,7 +23,7 @@ function ProgressSteps({ steps }: { steps: string[] }) {
     <div className="flex flex-col gap-0.5 mb-2">
       {visible.map((s, i) => (
         <div key={i} className="flex items-center gap-1.5 text-[11px] text-muted/70">
-          <span className="text-emerald-400 text-[10px]">✓</span>
+          <span className="text-success text-[10px]">✓</span>
           {s}
         </div>
       ))}
@@ -48,8 +48,8 @@ function StreamingBubble({ text, progress, isBuildingEdit }: {
           </div>
         )}
         {isBuildingEdit && (
-          <div className="flex items-center gap-1.5 text-[11px] text-amber-400/80 mb-1.5 px-2 py-1 bg-amber-500/10 rounded-lg border border-amber-500/20">
-            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+          <div className="flex items-center gap-1.5 text-[11px] text-warning/80 mb-1.5 px-2 py-1 bg-warning/10 rounded-lg border border-warning/20">
+            <span className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse" />
             Preparing code change...
           </div>
         )}
@@ -140,7 +140,7 @@ function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void 
   return (
     <div className="flex items-center gap-1.5 px-2.5 py-1 bg-surface border border-border rounded-lg max-w-[140px]">
       <span className="text-[10px] text-muted/70 font-mono truncate">{file.filename}</span>
-      <button onClick={onRemove} className="flex-shrink-0 text-muted/50 hover:text-red-400 text-[10px] ml-0.5">✕</button>
+      <button onClick={onRemove} className="flex-shrink-0 text-muted/50 hover:text-danger text-[10px] ml-0.5">✕</button>
     </div>
   )
 }
@@ -205,7 +205,7 @@ function MobileComposeSheet({ value, onChange, onSend, onClose, isStreaming, dis
         border-t border-border/50 bg-surface/50"
         style={{ paddingBottom: 'max(env(safe-area-inset-bottom, 0px), 12px)' }}>
         <span className="text-[11px] text-muted/40">Shift+Enter for new line</span>
-        <span className={`text-[11px] tabular-nums ${value.length > 2000 ? 'text-amber-400' : 'text-muted/40'}`}>
+        <span className={`text-[11px] tabular-nums ${value.length > 2000 ? 'text-warning' : 'text-muted/40'}`}>
           {value.length > 0 ? `${value.length.toLocaleString()} chars` : ''}
         </span>
       </div>
@@ -544,10 +544,10 @@ export function MobileChatPanel() {
               />
             )}
             {error && (
-              <div className="mx-4 my-2 px-3 py-2.5 bg-red-500/10 border border-red-500/30 rounded-xl text-xs text-red-400 flex items-start gap-2">
+              <div className="mx-4 my-2 px-3 py-2.5 bg-danger/10 border border-danger/30 rounded-xl text-xs text-danger flex items-start gap-2">
                 <span>⚠️</span>
                 <span className="flex-1">{error}</span>
-                <button onClick={() => setError(null)} className="text-red-400/60 hover:text-red-400">✕</button>
+                <button onClick={() => setError(null)} className="text-danger/60 hover:text-danger">✕</button>
               </div>
             )}
           </div>
@@ -646,7 +646,7 @@ export function MobileChatPanel() {
               <button
                 onClick={stopStream}
                 className="w-9 h-9 flex items-center justify-center rounded-xl
-                  bg-red-500/15 text-red-400 hover:bg-red-500/25 active:scale-95 transition-all"
+                  bg-danger/15 text-danger hover:bg-danger/25 active:scale-95 transition-all"
               >
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
                   <rect x="4" y="4" width="16" height="16" rx="3"/>

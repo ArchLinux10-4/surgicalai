@@ -104,8 +104,8 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       onClick={handleApplyAll}
       disabled={applying}
       className="flex items-center gap-2 px-3.5 py-2 rounded-xl border text-[12px] font-medium transition-all
-                 bg-emerald-500/10 border-emerald-500/30 text-emerald-400
-                 hover:bg-emerald-500/20 hover:border-emerald-500/50 hover:text-emerald-300
+                 bg-success/10 border-success/30 text-success
+                 hover:bg-success/20 hover:border-success/50 hover:text-success
                  disabled:opacity-50 disabled:cursor-wait"
     >
       <DoneAll sx={{ fontSize: 14 }} />
@@ -144,12 +144,12 @@ const mdComponents = {
   ),
   li: ({ children }: any) => (
     <li className="flex items-start gap-2 text-sm text-ink/80 leading-6">
-      <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-blue-400/70 flex-shrink-0 list-none" />
+      <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-accent/70 flex-shrink-0 list-none" />
       <span>{children}</span>
     </li>
   ),
   blockquote: ({ children }: any) => (
-    <blockquote className="my-3 pl-4 border-l-2 border-blue-500/50 text-muted italic text-sm leading-6">{children}</blockquote>
+    <blockquote className="my-3 pl-4 border-l-2 border-accent/50 text-muted italic text-sm leading-6">{children}</blockquote>
   ),
   strong: ({ children }: any) => (
     <strong className="font-semibold text-ink">{children}</strong>
@@ -158,7 +158,7 @@ const mdComponents = {
     <em className="text-ink/80 italic">{children}</em>
   ),
   a: ({ children, href }: any) => (
-    <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 underline underline-offset-2 transition-colors">{children}</a>
+    <a href={href} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent underline underline-offset-2 transition-colors">{children}</a>
   ),
   hr: () => <hr className="my-4 border-border/50" />,
   table: ({ children }: any) => (
@@ -188,7 +188,7 @@ function getLanguage(filename: string): string {
 // ── AI avatar ─────────────────────────────────────────────
 function AIAvatar() {
   return (
-    <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center flex-shrink-0 shadow-md shadow-blue-500/20">
+    <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-accent to-purple flex items-center justify-center flex-shrink-0 shadow-md shadow-accent/20">
       <Bolt sx={{ fontSize: 14 }} className="text-white" />
     </div>
   )
@@ -206,9 +206,9 @@ class DiffCardBoundary extends Component<{ children: React.ReactNode }, { hasErr
   render() {
     if (this.state.hasError) {
       return (
-        <div className="border border-red-500/40 rounded-xl p-4 bg-red-500/10 text-sm text-red-300">
+        <div className="border border-danger/40 rounded-xl p-4 bg-danger/10 text-sm text-danger">
           <strong>Diff card error:</strong> {this.state.error}
-          <br /><span className="text-xs text-red-400 mt-1 block">The change was planned but could not be displayed. Check the console for details.</span>
+          <br /><span className="text-xs text-danger mt-1 block">The change was planned but could not be displayed. Check the console for details.</span>
         </div>
       )
     }
@@ -331,7 +331,7 @@ function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boole
     <div className="mb-3">
       <button
         onClick={() => setExpanded(!expanded)}
-        className="flex items-center gap-2 text-xs text-violet-400 hover:text-violet-300 transition-colors"
+        className="flex items-center gap-2 text-xs text-purple hover:text-purple transition-colors"
       >
         <span className={`transform transition-transform duration-200 ${expanded ? 'rotate-90' : ''}`}>▶</span>
         <Psychology sx={{ fontSize: 12 }} />
@@ -344,9 +344,9 @@ function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boole
         )}
       </button>
       {expanded && text && (
-        <div className="mt-2 ml-5 pl-3 border-l-2 border-violet-500/30 text-[12px] text-muted/90 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed font-mono">
+        <div className="mt-2 ml-5 pl-3 border-l-2 border-purple/30 text-[12px] text-muted/90 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed font-mono">
           {text}
-          {isStreaming && <span className="inline-block w-1.5 h-3 bg-violet-400/60 rounded-sm ml-0.5 animate-pulse" />}
+          {isStreaming && <span className="inline-block w-1.5 h-3 bg-purple/60 rounded-sm ml-0.5 animate-pulse" />}
         </div>
       )}
     </div>
@@ -371,7 +371,7 @@ function PersistentSteps({ steps }: { steps: string[] }) {
         <div className="mt-1.5 pl-3 border-l-2 border-border/60 space-y-1">
           {allSteps.map((step, i) => (
             <div key={i} className="text-[11px] text-muted/70 flex items-center gap-1.5">
-              <span className="text-green-400/80">✓</span>
+              <span className="text-success/80">✓</span>
               <span>{step}</span>
             </div>
           ))}
@@ -398,7 +398,7 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
   return (
     <div className="flex items-start gap-3 px-4 py-4">
       {/* Pulsing avatar while streaming */}
-      <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-blue-500 to-violet-600 flex items-center justify-center flex-shrink-0 shadow-md shadow-blue-500/20 animate-pulse">
+      <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-accent to-purple flex items-center justify-center flex-shrink-0 shadow-md shadow-accent/20 animate-pulse">
         <Bolt sx={{ fontSize: 14 }} className="text-white" />
       </div>
 
@@ -407,8 +407,8 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
           <span className="text-[12px] font-semibold text-ink/80">SurgicalAI</span>
           {/* Current progress badge */}
           {progress && (
-            <span className="text-[11px] text-blue-400 flex items-center gap-1.5 bg-blue-500/10 px-2 py-0.5 rounded-full border border-blue-500/20">
-              <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
+            <span className="text-[11px] text-accent flex items-center gap-1.5 bg-accent/10 px-2 py-0.5 rounded-full border border-accent/20">
+              <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
               {progress}
             </span>
           )}
@@ -432,7 +432,7 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
               <div className="mt-1.5 pl-3 border-l-2 border-border/60 space-y-1">
                 {completedSteps.map((step, i) => (
                   <div key={i} className="text-[11px] text-muted/70 flex items-center gap-1.5">
-                    <span className="text-green-400/80">✓</span>
+                    <span className="text-success/80">✓</span>
                     <span>{step}</span>
                   </div>
                 ))}
@@ -448,8 +448,8 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
 
         {/* Building edit indicator — shown while parsing a <surgical_edit> block */}
         {isBuildingEdit && (
-          <div className="flex items-center gap-2 my-2 px-3 py-2 bg-amber-500/10 border border-amber-500/25 rounded-lg text-[12px] text-amber-300/90">
-            <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse flex-shrink-0" />
+          <div className="flex items-center gap-2 my-2 px-3 py-2 bg-warning/10 border border-warning/25 rounded-lg text-[12px] text-warning/90">
+            <span className="w-2 h-2 rounded-full bg-warning animate-pulse flex-shrink-0" />
             Preparing code change...
           </div>
         )}
@@ -463,7 +463,7 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
         ) : null}
 
         {/* Blinking cursor */}
-        <span className="inline-block w-2 h-[1.1em] bg-blue-400/80 rounded-sm align-text-bottom ml-0.5 animate-pulse" />
+        <span className="inline-block w-2 h-[1.1em] bg-accent/80 rounded-sm align-text-bottom ml-0.5 animate-pulse" />
       </div>
     </div>
   )
@@ -485,8 +485,8 @@ function getFileIcon(file: SessionFile) {
 // ── File chip ─────────────────────────────────────────────
 function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void }) {
   const langColors: Record<string, string> = {
-    python: 'text-blue-400', typescript: 'text-cyan-400', javascript: 'text-yellow-400',
-    go: 'text-cyan-300', rust: 'text-orange-400', java: 'text-red-400',
+    python: 'text-accent', typescript: 'text-accent', javascript: 'text-warning',
+    go: 'text-accent', rust: 'text-orange', java: 'text-danger',
   }
   const color = langColors[file.language] || 'text-muted'
   const emojiIcon = getFileIcon(file)
@@ -505,7 +505,7 @@ function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void 
       )}
       <button
         onClick={onRemove}
-        className="ml-0.5 opacity-0 group-hover:opacity-100 transition-opacity text-muted/70 hover:text-red-400"
+        className="ml-0.5 opacity-0 group-hover:opacity-100 transition-opacity text-muted/70 hover:text-danger"
       >
         <Close sx={{ fontSize: 10 }} />
       </button>
@@ -517,8 +517,8 @@ function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void 
 function EmptyState({ onUpload }: { onUpload: () => void }) {
   return (
     <div className="flex flex-col items-center justify-center h-full px-8 py-12 text-center">
-      <div className="w-16 h-16 rounded-2xl bg-blue-500/10 border border-blue-500/20 flex items-center justify-center mb-5">
-        <Bolt sx={{ fontSize: 28 }} className="text-blue-400" />
+      <div className="w-16 h-16 rounded-2xl bg-accent/10 border border-accent/20 flex items-center justify-center mb-5">
+        <Bolt sx={{ fontSize: 28 }} className="text-accent" />
       </div>
       <h2 className="text-base font-bold text-ink mb-2">SurgicalAI</h2>
       <p className="text-sm text-muted leading-relaxed mb-6 max-w-xs">
@@ -527,7 +527,7 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
 
       <button
         onClick={onUpload}
-        className="flex items-center gap-2 px-4 py-2.5 bg-blue-500/20 text-blue-400 border border-blue-500/30 rounded-xl text-sm font-semibold hover:bg-blue-500/30 transition-colors mb-6"
+        className="flex items-center gap-2 px-4 py-2.5 bg-accent/20 text-accent border border-accent/30 rounded-xl text-sm font-semibold hover:bg-accent/30 transition-colors mb-6"
       >
         <AttachFile sx={{ fontSize: 15 }} /> Upload files to get started
       </button>
@@ -539,7 +539,7 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
           { ex: 'Upload any code file', desc: 'then ask anything — edit, explain, review' },
         ].map(({ ex, desc }) => (
           <div key={ex} className="flex items-start gap-2.5 px-3 py-2 bg-surface/50 rounded-lg border border-border/50">
-            <Description sx={{ fontSize: 12 }} className="text-blue-400 mt-0.5 flex-shrink-0" />
+            <Description sx={{ fontSize: 12 }} className="text-accent mt-0.5 flex-shrink-0" />
             <div>
               <div className="text-[12px] font-semibold text-ink/80">{ex}</div>
               <div className="text-[11px] text-muted/70">{desc}</div>
@@ -994,11 +994,11 @@ export function ChatPanel() {
     >
       {/* Drag overlay */}
       {isDragging && (
-        <div className="absolute inset-0 z-50 bg-blue-500/10 border-2 border-dashed border-blue-400 rounded-xl flex items-center justify-center pointer-events-none">
+        <div className="absolute inset-0 z-50 bg-accent/10 border-2 border-dashed border-accent rounded-xl flex items-center justify-center pointer-events-none">
           <div className="text-center">
-            <AttachFile sx={{ fontSize: 32 }} className="text-blue-400 mx-auto mb-2" />
-            <p className="text-blue-300 font-semibold text-sm">Drop files here</p>
-            <p className="text-blue-400/60 text-xs mt-1">py, ts, js, go, rs, and more</p>
+            <AttachFile sx={{ fontSize: 32 }} className="text-accent mx-auto mb-2" />
+            <p className="text-accent font-semibold text-sm">Drop files here</p>
+            <p className="text-accent/60 text-xs mt-1">py, ts, js, go, rs, and more</p>
           </div>
         </div>
       )}
@@ -1016,7 +1016,7 @@ export function ChatPanel() {
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-base/50 flex-shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <Bolt sx={{ fontSize: 13 }} className="text-blue-400 flex-shrink-0" />
+          <Bolt sx={{ fontSize: 13 }} className="text-accent flex-shrink-0" />
           <span className="text-sm font-semibold text-ink">
             {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} in context` : 'SurgicalAI'}
           </span>
@@ -1043,9 +1043,9 @@ export function ChatPanel() {
 
       {/* Compacting banner */}
       {isCompacting && (
-        <div className="flex items-center justify-center gap-2 px-4 py-2 bg-blue-500/10 border-b border-blue-500/20 flex-shrink-0">
-          <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-pulse" />
-          <span className="text-[12px] text-blue-400 font-medium">Compacting conversation history…</span>
+        <div className="flex items-center justify-center gap-2 px-4 py-2 bg-accent/10 border-b border-accent/20 flex-shrink-0">
+          <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
+          <span className="text-[12px] text-accent font-medium">Compacting conversation history…</span>
         </div>
       )}
 
@@ -1062,10 +1062,10 @@ export function ChatPanel() {
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} />
             )}
             {error && (
-              <div className="mx-4 my-3 flex items-start gap-2.5 px-3.5 py-3 bg-red-500/10 border border-red-500/30 rounded-xl text-sm text-red-400">
+              <div className="mx-4 my-3 flex items-start gap-2.5 px-3.5 py-3 bg-danger/10 border border-danger/30 rounded-xl text-sm text-danger">
                 <Warning sx={{ fontSize: 15 }} className="flex-shrink-0 mt-0.5" />
                 <span>{error}</span>
-                <button onClick={() => setError(null)} className="ml-auto p-0.5 hover:text-red-300">
+                <button onClick={() => setError(null)} className="ml-auto p-0.5 hover:text-danger">
                   <Close sx={{ fontSize: 11 }} />
                 </button>
               </div>
@@ -1167,7 +1167,7 @@ export function ChatPanel() {
         )}
 
         {/* Unified input pill — Claude/Tasklet style */}
-        <div className="relative bg-surface/80 border border-border/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-border focus-within:shadow-blue-500/5 transition-all">
+        <div className="relative bg-surface/80 border border-border/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-border focus-within:shadow-accent/5 transition-all">
           <textarea
             ref={textareaRef}
             value={input}
@@ -1213,7 +1213,7 @@ export function ChatPanel() {
               {isStreaming ? (
                 <button
                   onClick={() => { abortRef.current?.abort(); stopStream() }}
-                  className="h-8 px-3 rounded-lg bg-red-500/15 text-red-400 text-xs font-semibold flex items-center gap-1.5 hover:bg-red-500/25 transition-colors"
+                  className="h-8 px-3 rounded-lg bg-danger/15 text-danger text-xs font-semibold flex items-center gap-1.5 hover:bg-danger/25 transition-colors"
                 >
                   <Close sx={{ fontSize: 13 }} /> Stop
                 </button>
@@ -1224,7 +1224,7 @@ export function ChatPanel() {
                   className={`h-8 w-8 rounded-lg flex items-center justify-center transition-all ${
                     !input.trim() || isCompacting
                       ? 'text-faint cursor-not-allowed'
-                      : 'bg-blue-500 text-white hover:bg-blue-400 active:scale-95 shadow-sm shadow-blue-500/25'
+                      : 'bg-accent text-white hover:bg-accent active:scale-95 shadow-sm shadow-accent/25'
                   }`}
                 >
                   <Send sx={{ fontSize: 14 }} />
