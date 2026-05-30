@@ -69,12 +69,24 @@ def get_available_models(request: Request):
     # SurgicalAI runs exclusively on Claude. All other model families are hidden.
     # GPT, Gemini, and Ollama models are preserved in comments for future re-enabling.
 
+    # Verified against the live Anthropic key via /v1 probe — only IDs the
+    # account actually accepts are listed (others 404 at request time).
     claude_models = [
+        {"id": "claude-opus-4-8", "name": "Claude Opus 4.8", "role": "architect",
+         "description": "Newest flagship — most capable, best for complex multi-file work", "provider": "anthropic"},
+        {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "role": "architect",
+         "description": "High-capability Opus — strong for large, multi-step changes", "provider": "anthropic"},
+        {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "role": "architect",
+         "description": "Capable Opus — great for complex, multi-file changes", "provider": "anthropic"},
+        {"id": "claude-opus-4-5", "name": "Claude Opus 4.5", "role": "architect",
+         "description": "Opus 4.5 — deep reasoning for involved edits", "provider": "anthropic"},
+        {"id": "claude-opus-4-1", "name": "Claude Opus 4.1", "role": "architect",
+         "description": "Earlier Opus — solid for complex changes", "provider": "anthropic"},
         {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "role": "architect",
          "description": "Fast, intelligent — recommended for most tasks", "provider": "anthropic"},
-        {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "role": "architect",
-         "description": "Most capable Claude — best for complex, multi-file changes", "provider": "anthropic"},
-        {"id": "claude-haiku-4-5-20251001", "name": "Claude Haiku 4.5", "role": "architect",
+        {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "role": "architect",
+         "description": "Fast and capable — balanced speed and quality", "provider": "anthropic"},
+        {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "role": "architect",
          "description": "Fastest Claude — great for quick edits and simple changes", "provider": "anthropic"},
     ]
 
