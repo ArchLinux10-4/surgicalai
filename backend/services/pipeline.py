@@ -1849,6 +1849,52 @@ def _apply_snippet_to_symbol(symbol_code: str, old_code: str, new_code: str):
     )
 
 
+def _fragment_reason(symbol_code: str, new_code: str):
+    """
+    Detect a degenerate "fragment" edit.
+
+    When the model supplies a ``new_code`` with NO ``old_code`` that is clearly
+    only PART of a large symbol — much shorter than the symbol AND missing the
+    symbol's declaration line — treating it as a full-symbol replacement would
+    delete the rest of the symbol (the exact large-file failure mode: a 2-line
+    hero snippet replacing an 850-line component).
+
+    Returns a guidance string when the new_code looks degenerate, else ``None``.
+    Small symbols are never flagged (cheap and safe to re-emit whole); a genuine
+    large refactor that keeps the declaration line is never flagged either.
+    """
+    sym_lines = symbol_code.splitlines()
+    new_lines = new_code.splitlines()
+    n_sym = len(sym_lines)
+    n_new = len(new_lines)
+
+    # Only guard reasonably large symbols. Small ones are cheap to re-emit fully,
+    # and legitimate full rewrites of small symbols can be much shorter.
+    if n_sym < 40:
+        return None
+
+    # Declaration = first non-empty line of the symbol
+    # (e.g. "export function LandingPage() {", "def handler(...):", "class Foo:").
+    decl = ""
+    for _l in sym_lines:
+        if _l.strip():
+            decl = _l.strip()
+            break
+
+    has_decl = bool(decl) and decl in new_code
+    much_smaller = n_new < max(n_sym * 0.5, 25)
+
+    # A legitimate full-symbol edit keeps the declaration line; a fragment drops it.
+    if has_decl or not much_smaller:
+        return None
+
+    return (
+        f"new_code is only {n_new} line(s) but the symbol is {n_sym} line(s) and does not "
+        f"include the symbol's declaration line — it looks like a FRAGMENT of the symbol, "
+        f"not the whole symbol. Applying it as-is would delete the rest of the symbol."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helper: _resolve_search_terms
 # ---------------------------------------------------------------------------
@@ -6132,6 +6178,9 @@ Rules for new_code:
 - Match original indentation exactly (same spaces/tabs)
 - If a function is 200 lines and you change 1 line, new_code is still 200 lines
 - new_code REPLACES the entire original symbol — omitting lines deletes them
+- For a SMALL change to a LARGE symbol you cannot fully see, do NOT put only the changed
+  lines in new_code by themselves — that would delete the rest of the symbol. Use a
+  TARGETED edit with "old_code" + "new_code" instead (see below).
 
 ━━━ TARGETED EDITS FOR LARGE SYMBOLS (PREFERRED for big files) ━━━
 
@@ -7527,6 +7576,24 @@ async def run_natural_pipeline_stream(
                                 "description": description,
                                 "_raw": edit_raw,
                                 "_snippet_reason": snip_reason,
+                            })
+                            continue
+                    else:
+                        # ── Degenerate-fragment guard ────────────────────────
+                        # No old_code was supplied. If new_code is clearly only a
+                        # FRAGMENT of a large symbol, applying it as a full-symbol
+                        # replacement would destroy the rest of the symbol. Force a
+                        # targeted-edit retry (old_code/new_code) instead of building
+                        # a destructive find:<whole symbol> -> replace:<fragment> op.
+                        frag_reason = _fragment_reason(symbol.code, new_code)
+                        if frag_reason:
+                            still_unresolved.append({
+                                "filename": filename,
+                                "symbol": symbol_name,
+                                "new_code": new_code,
+                                "description": description,
+                                "_raw": edit_raw,
+                                "_snippet_reason": frag_reason,
                             })
                             continue
                     resolved_edits.append({
