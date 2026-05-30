@@ -6907,10 +6907,35 @@ async def run_natural_pipeline_stream(
             project_memory=project_memory, session_summary=session_summary
         )
 
-        # ── Build system prompt ───────────────────────────────────────────
-        system_prompt = NATURAL_SYSTEM
+        # ── Build system prompt (with Anthropic prompt caching) ───────────
+        # This system prompt is re-sent on every Claude call in the natural
+        # pipeline: the streaming search loop (up to MAX_SEARCH_ROUNDS + 2
+        # rounds), the symbol-correction call, and each per-edit fix call.
+        # Without caching, every one of those repeats re-pays full input cost
+        # for the (often very large) uploaded file. We mark cache breakpoints
+        # so repeats become ~90%-cheaper cache reads with lower latency:
+        #   • NATURAL_SYSTEM — static across every request/session (global)
+        #   • file_context   — static within this request's search+fix loop
+        # Passing `system` as a list of text blocks is accepted everywhere it
+        # is consumed below (stream loop, correction call, per-edit fixes).
+        # Ephemeral prompt caching is GA — no beta header required. Blocks
+        # below Anthropic's minimum cacheable length are simply not cached
+        # (no error), so this is safe regardless of prompt size.
+        system_prompt = [
+            {
+                "type": "text",
+                "text": NATURAL_SYSTEM,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
         if file_context.strip():
-            system_prompt = NATURAL_SYSTEM + "\n\n" + file_context
+            system_prompt.append(
+                {
+                    "type": "text",
+                    "text": file_context,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            )
 
         # ── Clean conversation history — strip JSON artifacts ─────────────
         clean_history = []
