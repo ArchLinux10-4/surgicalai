@@ -6593,10 +6593,26 @@ USER REQUEST:
                         if _lfind and _lfind in _full_after_lint:
                             _full_after_lint = _full_after_lint.replace(_lfind, _lrepl, 1)
                     _lint_new_count = _count_lint(_full_after_lint, matched_name)
-                    if _lint_new_count > 0:
-                        # Absolute check: ANY TS errors in output → attempt Claude auto-fix first
-                        _linter_introduced_errors = _validate_lint(_full_after_lint, matched_name)
-                        yield sse({"type": "progress", "content": f"🔧 {_lint_tool}: {_lint_new_count} error(s) — asking Claude to auto-fix..."})
+                    # Delta gate (was absolute): subtract the baseline error multiset so the
+                    # fixer only ever sees errors THIS edit introduced. Pre-existing linter
+                    # errors in a large file must never be blamed on the change — that was the
+                    # BIG7/BIG9 false-positive class — and a delta gate is the prerequisite that
+                    # lets a real tsc be turned on safely later (otherwise every large file with
+                    # pre-existing errors hard-blocks). `_lint_orig_count` (computed above and
+                    # previously dead) is the baseline we finally compare against.
+                    from collections import Counter as _LintCounter
+                    _orig_lint_msg_counts = _LintCounter(
+                        e.get("message") for e in _validate_lint(sf["content"], matched_name)
+                    )
+                    _linter_introduced_errors = []
+                    for _le in _validate_lint(_full_after_lint, matched_name):
+                        _lm = _le.get("message")
+                        if _orig_lint_msg_counts.get(_lm, 0) > 0:
+                            _orig_lint_msg_counts[_lm] -= 1   # consume one pre-existing occurrence
+                        else:
+                            _linter_introduced_errors.append(_le)
+                    if _linter_introduced_errors:
+                        yield sse({"type": "progress", "content": f"🔧 {_lint_tool}: {len(_linter_introduced_errors)} new error(s) — asking Claude to auto-fix..."})
                         # ── Lint self-heal: up to 3 Claude attempts ───────────
                         _lint_fixed = False
                         _MAX_LINT_ATTEMPTS = 3
@@ -6700,7 +6716,7 @@ USER REQUEST:
                             _qa_result["summary"] = f"{_lint_tool} error — {_linter_introduced_errors[0]['message']}"
                             if (_qa_result.get("qa_score") or 10) > 3:
                                 _qa_result["qa_score"] = 3
-                    elif _lint_new_count == 0:
+                    else:
                         # PR #81: don't claim "clean" when the linter never ran.
                         # tsc isn't reliably installed on the backend — reporting a
                         # false "✅ tsc clean" is what masked BIG10's broken ship.
@@ -8811,6 +8827,64 @@ async def run_natural_pipeline_stream(
                     pass
 
             blocking_msgs += _detect_degenerate(new_code, orig_code, sym_name)
+
+            # ── Redeclaration delta gate (PARITY with the smart pipeline) ──────────
+            # The Claude/natural pipeline previously had NO redeclaration backstop, so
+            # selecting a Claude architect model silently dropped the PR #81 protection.
+            # A duplicate top-level const/let/class is valid GRAMMAR (structural QA and
+            # tree-sitter both pass it) but a hard runtime SyntaxError. This is the exact
+            # bug BIG10 shipped (`const checkAdminAuth` colliding with a pre-existing
+            # `function checkAdminAuth`). Delta vs. the original guarantees a pre-existing
+            # duplicate is never blamed on this change. `fname` (the filename) drives
+            # language detection — the validators key off the extension.
+            try:
+                from services.syntax_validator import detect_redeclarations as _detect_redecl
+                _orig_full = cs.get("qa_original_content", "") or ""
+                _edited_full = _orig_full
+                if orig_code and orig_code in _orig_full:
+                    _edited_full = _orig_full.replace(orig_code, new_code, 1)
+                _orig_rd_msgs = {e["message"] for e in _detect_redecl(_orig_full, fname)}
+                _introduced_rd = [
+                    e for e in _detect_redecl(_edited_full, fname)
+                    if e["message"] not in _orig_rd_msgs
+                ]
+                for _rd in _introduced_rd:
+                    blocking_msgs.append(
+                        f"[REDECLARATION] Duplicate declaration at line {_rd['line']}: "
+                        f"{_rd['detail']} — {_rd['message']}. Remove the duplicate; that "
+                        "symbol already exists elsewhere in the file."
+                    )
+            except Exception:
+                pass
+
+            # ── Linter delta gate (honest skip; never a false "clean") ────────────
+            # Mirrors the smart pipeline: only NEW linter errors introduced by this edit
+            # are blocking. When tsc/pyflakes is unavailable the validators return [] →
+            # nothing is flagged (fail-skipped, never fail-broken).
+            try:
+                from services.linter_validator import (
+                    count_linter_errors as _count_lint,
+                    validate_linters as _validate_lint,
+                )
+                _orig_full = cs.get("qa_original_content", "") or ""
+                _edited_full = _orig_full
+                if orig_code and orig_code in _orig_full:
+                    _edited_full = _orig_full.replace(orig_code, new_code, 1)
+                if _count_lint(_edited_full, fname) > _count_lint(_orig_full, fname):
+                    from collections import Counter as _LintCounter
+                    _obase = _LintCounter(
+                        e.get("message") for e in _validate_lint(_orig_full, fname)
+                    )
+                    for _e in _validate_lint(_edited_full, fname):
+                        _m = _e.get("message")
+                        if _obase.get(_m, 0) > 0:
+                            _obase[_m] -= 1
+                        else:
+                            blocking_msgs.append(
+                                f"[LINTER] {_m} (line {_e.get('line')}) — introduced by this edit."
+                            )
+            except Exception:
+                pass
 
             if not blocking_msgs:
                 return []
