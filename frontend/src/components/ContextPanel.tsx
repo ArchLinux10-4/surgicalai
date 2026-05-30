@@ -3,7 +3,7 @@ import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import type { PinnedContext, MemoryPreset } from '../types'
-import { Check, Delete, MenuBook, PushPin, Save } from '@mui/icons-material';
+import { Check, Close, Delete, MenuBook, PushPin, Save } from '@mui/icons-material';
 
 export function ContextPanel() {
   const { activeSessions, activeFile } = useAppStore()
@@ -14,7 +14,6 @@ export function ContextPanel() {
   const [saving, setSaving] = useState(false)
   const [saveDone, setSaveDone] = useState(false)
   const [presets, setPresets] = useState<MemoryPreset[]>([])
-  const [addedPresets, setAddedPresets] = useState<Record<string, boolean>>({})
 
   // Pinned files are per-session.
   useEffect(() => {
@@ -60,12 +59,22 @@ export function ContextPanel() {
     setSaving(false)
   }
 
-  const insertPreset = (preset: MemoryPreset) => {
+  // A preset counts as "added" when its (unedited) block is present in memory.
+  // Deriving from the text — rather than a separate flag — keeps the chips correct
+  // after a page reload and lets the same chip remove what it added.
+  const isPresetAdded = (preset: MemoryPreset) => memory.includes(preset.content.trim())
+
+  const togglePreset = (preset: MemoryPreset) => {
+    const block = preset.content.trim()
     setMemory((prev) => {
+      if (prev.includes(block)) {
+        // Remove the preset block and collapse any orphaned blank lines.
+        const next = prev.replace(block, '').replace(/\n{3,}/g, '\n\n').trim()
+        return next ? `${next}\n` : ''
+      }
       const trimmed = prev.trimEnd()
-      return trimmed ? `${trimmed}\n\n${preset.content.trim()}\n` : `${preset.content.trim()}\n`
+      return trimmed ? `${trimmed}\n\n${block}\n` : `${block}\n`
     })
-    setAddedPresets((prev) => ({ ...prev, [preset.id]: true }))
   }
 
   return (
@@ -133,24 +142,32 @@ export function ContextPanel() {
           </div>
           {presets.length > 0 && (
             <div className="flex flex-col gap-1.5">
-              <div className="text-[10px] uppercase tracking-wide text-faint font-semibold">Presets — click to add</div>
+              <div className="text-[10px] uppercase tracking-wide text-faint font-semibold">Presets — click to add, click again to remove</div>
               <div className="flex flex-wrap gap-1.5">
-                {presets.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => insertPreset(p)}
-                    title={p.description}
-                    className={`flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-medium transition-colors ${
-                      addedPresets[p.id]
-                        ? 'bg-success/15 border-success/30 text-success'
-                        : 'bg-overlay border-border text-muted hover:text-ink hover:border-accent/40'
-                    }`}
-                  >
-                    <span>{p.icon}</span>
-                    <span>{p.title}</span>
-                    {addedPresets[p.id] && <Check sx={{ fontSize: 11 }} />}
-                  </button>
-                ))}
+                {presets.map((p) => {
+                  const added = isPresetAdded(p)
+                  return (
+                    <button
+                      key={p.id}
+                      onClick={() => togglePreset(p)}
+                      title={added ? `Remove “${p.title}” from memory` : p.description}
+                      className={`group/chip flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-medium transition-colors ${
+                        added
+                          ? 'bg-success/15 border-success/30 text-success hover:bg-danger/15 hover:border-danger/30 hover:text-danger'
+                          : 'bg-overlay border-border text-muted hover:text-ink hover:border-accent/40'
+                      }`}
+                    >
+                      <span>{p.icon}</span>
+                      <span>{p.title}</span>
+                      {added && (
+                        <>
+                          <Check sx={{ fontSize: 11 }} className="group-hover/chip:hidden" />
+                          <Close sx={{ fontSize: 11 }} className="hidden group-hover/chip:inline-flex" />
+                        </>
+                      )}
+                    </button>
+                  )
+                })}
               </div>
             </div>
           )}

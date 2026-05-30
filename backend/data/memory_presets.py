@@ -153,6 +153,69 @@ MEMORY_PRESETS = [
 """,
     },
     {
+        "id": "aws-lambda",
+        "icon": "☁️",
+        "title": "Cloud / AWS Lambda",
+        "category": "devops",
+        "description": "Serverless functions — secure, lean, resilient",
+        "content": """# Cloud / AWS Lambda & Serverless
+
+- Keep the handler thin: parse/validate the event, then delegate to a separate, testable business-logic module.
+- Use `async` handlers with async/await — do not mix the legacy callback signature; return the response, never call `callback`.
+- Initialize reusable resources (DB pools, SDK clients, secrets) OUTSIDE the handler so they are cached across warm invocations.
+- Validate and type every incoming event (API Gateway, SQS, S3, EventBridge) before use; never trust the payload shape.
+- Apply least-privilege IAM: scope each function's role to the exact actions/resources it needs — no wildcard `*` policies.
+- Never hardcode secrets; load them from AWS Secrets Manager or SSM Parameter Store, and cache them outside the handler.
+- Make handlers idempotent (use a dedup/idempotency key) — Lambda can deliver the same event more than once.
+- For SQS/stream sources, report partial batch failures (`batchItemFailures`) so only failed records are retried.
+- Set explicit timeout, memory, and reserved/maximum concurrency; configure a dead-letter queue or on-failure destination.
+- Use structured JSON logging to CloudWatch with a request/correlation id; never log secrets, tokens, or PII.
+- Minimize cold starts: trim the deploy package, lazy-load heavy deps, and keep the runtime current.
+- Return the exact response contract the trigger expects (e.g. `{ statusCode, headers, body }` for API Gateway) with correct status codes.
+
+## API security & quality baseline (applies to every endpoint this function exposes)
+- AuthN then AuthZ on every route; enforce object-level ownership (no IDOR).
+- Validate input against a schema; reject unknown fields; enforce types, lengths, and ranges.
+- Return correct HTTP status codes and structured errors `{ code, message }`; never leak stack traces.
+- Rate-limit and set sane request size limits; enable a strict CORS allowlist (no `*` with credentials).
+- Parameterize all DB/queries; escape output; keep dependencies patched against known CVEs.
+""",
+    },
+    {
+        "id": "node-express",
+        "icon": "🟢",
+        "title": "Node / Express API",
+        "category": "backend",
+        "description": "Express APIs — async-correct, secure by default",
+        "content": """# Node / Express API Creation
+
+## Async correctness
+- Use async/await everywhere; never block the event loop with sync APIs (`fs.readFileSync`, `crypto.*Sync`, heavy CPU) inside a request path.
+- Run INDEPENDENT async work concurrently with `Promise.all` / `Promise.allSettled` — do not `await` in a sequential loop when the calls don't depend on each other.
+  - Use `Promise.all` when all must succeed (it rejects on the first failure).
+  - Use `Promise.allSettled` when you need every result regardless of individual failures.
+  - Use `Promise.race`/`AbortController` to enforce timeouts on external calls.
+- Wrap every async route handler so rejections reach Express: use `express-async-errors` or a `wrapAsync(fn)` helper — an unhandled promise rejection must never crash the process.
+- Always handle promise rejections; never leave a floating promise. Add a process-level `unhandledRejection` guard as a backstop only.
+
+## Structure & errors
+- Keep routes thin → controllers → services; put business logic in services, not in route handlers.
+- Define ONE centralized error-handling middleware (the 4-arg `(err, req, res, next)`) and forward all errors to it via `next(err)`.
+- Use typed/custom error classes (e.g. `AppError` with a status code); return structured JSON `{ code, message }` and never expose stack traces in production.
+- Return correct status codes (400/401/403/404/409/422/429/500); validate request bodies with zod/joi/celebrate BEFORE business logic runs.
+- Paginate list endpoints; wrap multi-step writes in transactions; make writes idempotent where possible.
+- Implement graceful shutdown (drain the server, close DB pools on SIGTERM).
+
+## Security baseline (every endpoint, no exceptions)
+- AuthN then AuthZ on each protected route; enforce object-level ownership (no IDOR).
+- Add `helmet` for secure headers, `express-rate-limit` for abuse protection, and a strict CORS allowlist (never `*` with credentials).
+- Treat all input as untrusted: validate/sanitize, enforce body-size limits, and use parameterized queries — never string-concatenate SQL/NoSQL.
+- Store secrets in env/secret manager (never in source or logs); hash passwords with bcrypt/argon2; set Secure, HttpOnly, SameSite cookies.
+- Never log secrets, tokens, or PII; keep dependencies patched and fail the build on critical CVEs.
+- Use structured logging (pino/winston) with a request id; return generic messages to clients while logging detail server-side.
+""",
+    },
+    {
         "id": "git",
         "icon": "📦",
         "title": "Git & Commits",
