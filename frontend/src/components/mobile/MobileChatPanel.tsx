@@ -11,6 +11,8 @@ import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import { MobileDiffCard } from './MobileDiffCard'
 import { SessionFilesTray } from '../SessionFilesTray'
+import { TaskListPanel } from '../TaskListPanel'
+import { useTaskPolling } from '../../hooks/useTaskPolling'
 import { VoiceButton } from '../VoiceButton'
 import { useCodeRain } from '../../hooks/useCodeRain'
 import { useThemeStore } from '../../stores/themeStore'
@@ -323,7 +325,12 @@ export function MobileChatPanel() {
     activeSessions, setActiveSession, messages, addMessage, setMessages,
     sessions, setSessions, settings,
     sessionFiles, setSessionFiles,
+    setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble,
   } = useAppStore()
+
+  // Keep the task list in sync with the DB-backed source of truth while a run
+  // is active (SSE is the instant channel; polling reconciles after drops).
+  useTaskPolling(activeSessions)
 
   const [input, setInput]               = useState('')
   const [isStreaming, setIsStreaming]    = useState(false)
@@ -350,8 +357,29 @@ export function MobileChatPanel() {
   useEffect(() => {
     if (activeSessions) {
       api.sessionFiles.list(activeSessions).then(setSessionFiles).catch(() => {})
+      // Reconcile the agentic task list to whatever this session has on the
+      // server (clears stale cross-session state; repopulates if a run exists).
+      clearAgentTasks()
+      api.tasks.list(activeSessions)
+        .then((rows: any[]) => {
+          if (!Array.isArray(rows) || rows.length === 0) return
+          const latestRun = rows[0]?.run_id
+          const forRun = rows.filter(r => r.run_id === latestRun)
+          setTaskRunId(latestRun || null)
+          setAgentTasks(forRun
+            .slice()
+            .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+            .map(r => ({
+              id: r.id, seq: r.seq, title: r.title, detail: r.detail,
+              kind: r.kind || 'code',
+              status: r.status, qa_score: r.qa_score ?? null, verdict: r.verdict ?? null,
+              run_id: r.run_id, progress: r.result_summary ?? undefined,
+            })))
+        })
+        .catch(() => {})
     } else {
       setSessionFiles([])
+      clearAgentTasks()
     }
   }, [activeSessions])
 
@@ -487,6 +515,36 @@ export function MobileChatPanel() {
       },
       () => setBuildEdit(true),
       () => setBuildEdit(false),
+      // onTask — agentic task lifecycle (instant channel; polling reconciles)
+      (event) => {
+        switch (event.type) {
+          case 'task_plan':
+            setTaskRunId(event.run_id)
+            setTaskPreamble(event.preamble || '')
+            setAgentTasks((event.tasks || []).map((t: any) => ({
+              id: t.id, seq: t.seq, title: t.title, detail: t.detail,
+              kind: t.kind || 'code',
+              status: t.status || 'pending', qa_score: null, verdict: null,
+              run_id: event.run_id,
+            })))
+            break
+          case 'task_start':
+            updateAgentTask(event.id, { status: 'running', progress: undefined })
+            break
+          case 'task_progress':
+            updateAgentTask(event.id, { progress: event.content })
+            break
+          case 'task_done':
+            updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict })
+            break
+          case 'task_blocked':
+            updateAgentTask(event.id, { status: 'blocked', qa_score: event.qa_score, verdict: event.verdict })
+            break
+          case 'task_cancelled':
+            updateAgentTask(event.id, { status: 'cancelled' })
+            break
+        }
+      },
     )
     ctrlRef.current = ctrl
   }, [input, isStreaming, settings, ensureSession, messages.length, sessionFiles,
@@ -537,6 +595,9 @@ export function MobileChatPanel() {
                 setSessionFiles={setSessionFiles}
               />
             ))}
+            <div className="px-3">
+              <TaskListPanel />
+            </div>
             {isStreaming && (
               <StreamingBubble
                 text={streamingMsg}
