@@ -179,7 +179,7 @@ def mark_change_applied(session_id: str, change_id: str):
     conn.execute(
         """CREATE TABLE IF NOT EXISTS applied_changes
            (session_id TEXT NOT NULL, change_id TEXT NOT NULL,
-            applied_at TEXT DEFAULT (datetime('now')),
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (session_id, change_id))"""
     )
     conn.execute(
@@ -211,7 +211,7 @@ def get_applied_changes(session_id: str):
     conn.execute(
         """CREATE TABLE IF NOT EXISTS applied_changes
            (session_id TEXT NOT NULL, change_id TEXT NOT NULL,
-            applied_at TEXT DEFAULT (datetime('now')),
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (session_id, change_id))"""
     )
     rows = conn.execute(
