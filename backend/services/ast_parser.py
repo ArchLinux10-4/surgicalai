@@ -309,6 +309,51 @@ class ASTParser:
                 )
             )
 
+        # Express / Fastify / Koa-style route handlers passed as anonymous callbacks.
+        # e.g. router.post('/api/batch-search', async (req, res) => { ... })
+        # These hold the bulk of the logic in a routes file, yet none of the patterns
+        # above match them (there is no name binding). We synthesize a stable,
+        # targetable name from the HTTP verb + route path so the surgeon can edit
+        # them with full QA instead of degrading to manual instructions.
+        route_re = re.compile(
+            r"^\s*(?:export\s+(?:default\s+)?)?(?:const\s+\w+\s*=\s*)?"
+            r"\w+\s*\.\s*(get|post|put|patch|delete|options|head|all)\s*\(\s*"
+            r"[`'\"]([^`'\"]+)[`'\"]\s*,",
+            re.MULTILINE,
+        )
+        _existing_starts = {s.start_line for s in symbols}
+        _route_seen: dict = {}
+        for m in route_re.finditer(source):
+            line_no = source[: m.start()].count("\n") + 1
+            if line_no in _existing_starts:
+                continue  # already captured by another pattern
+            end_line = self._find_block_end(lines, line_no - 1)
+            code = "\n".join(lines[line_no - 1 : end_line])
+            if "{" not in code:
+                continue  # not a real handler body (e.g. a router mount)
+            method = m.group(1).lower()
+            path = m.group(2)
+            slug = re.sub(r"[^A-Za-z0-9]+", "_", path).strip("_").lower()
+            base = f"route_{method}_{slug}" if slug else f"route_{method}"
+            if base in _route_seen:
+                _route_seen[base] += 1
+                name = f"{base}_{_route_seen[base]}"
+            else:
+                _route_seen[base] = 0
+                name = base
+            symbols.append(
+                SymbolInfo(
+                    name=name,
+                    symbol_type=SymbolType.FUNCTION,
+                    start_line=line_no,
+                    end_line=end_line,
+                    parent=None,
+                    indentation=0,
+                    code=code,
+                    signature=f"{method.upper()} {path}  —  {lines[line_no - 1].strip()}",
+                )
+            )
+
         return symbols
 
     # ─── Go Parser ───────────────────────────────────────────────────────────
