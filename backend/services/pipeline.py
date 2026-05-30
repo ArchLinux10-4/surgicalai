@@ -8,6 +8,7 @@ Best Practice #2: Minimal footprint (surgeon only touches requested symbol)
 Best Practice #3: Verify before commit (confidence scoring + diff)
 """
 import ast
+import os
 import json
 import re
 import uuid
@@ -3523,6 +3524,42 @@ async def _run_tests_inline(patched_files: dict, session_id: str) -> dict:
         _shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _assemble_patched_file_map(session_files: list, applied_changes: list) -> dict:
+    """Build {filename: full content} for the WHOLE session with every supplied
+    change's current new_code applied.
+
+    Tests import un-edited sibling files, so we must start from ALL session files
+    (not only the edited ones), then substitute each changed symbol's original
+    code with its new code — the same per-symbol assembly the deterministic gate
+    uses, extended across the whole multi-change set.
+
+    `applied_changes` is the subset of change shells that should be reflected
+    (normally the ones currently passing the per-change gate). Pure + side-effect
+    free so it is unit-testable in isolation.
+    """
+    files: dict = {
+        (sf.get("filename") if isinstance(sf, dict) else None): (
+            (sf.get("content") if isinstance(sf, dict) else "") or ""
+        )
+        for sf in (session_files or [])
+    }
+    files.pop(None, None)
+    for cs in (applied_changes or []):
+        fname = cs.get("filename")
+        if not fname:
+            continue
+        base = files.get(fname)
+        if base is None:
+            base = cs.get("qa_original_content") or ""
+        sym = cs.get("symbol")
+        orig_code = getattr(sym, "code", "") or ""
+        new_code = cs.get("new_code") or ""
+        if orig_code and orig_code in base:
+            base = base.replace(orig_code, new_code, 1)
+        files[fname] = base
+    return files
+
+
 # QA AGENT — runs after every Surgeon output, before diff card is shown to user
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -6795,7 +6832,14 @@ USER REQUEST:
                     }
                     # Substitute the Surgeon's patched content for the changed file
                     _test_files_map[matched_name] = _full_after_lint or sf.get("content", "")
-                    _test_result = await _run_tests_inline(_test_files_map, session_id or "")
+                    # Feature-flagged (TEST_EXEC_GATE, default OFF) — keeps this previously
+                    # dormant path (pytest was never in requirements) behaviourally identical
+                    # to today until an operator opts in. Flag off → skipped → block no-ops.
+                    _test_result = (
+                        await _run_tests_inline(_test_files_map, session_id or "")
+                        if os.getenv("TEST_EXEC_GATE", "0") == "1"
+                        else {"verdict": "skipped"}
+                    )
                     if _test_result.get("verdict") not in ("skipped", "unknown"):
                         _t_emoji = "✅" if _test_result["verdict"] == "passed" else "🔴"
                         _t_fw = _test_result.get("framework", "tests")
@@ -9114,6 +9158,198 @@ async def run_natural_pipeline_stream(
                                           f"{qa_results[idx].get('summary', '')} (score: {new_score})"})
                 except Exception:
                     pass  # keep prior result if re-QA fails
+
+        # ── Whole-session test-execution gate (long-term parity with smart pipeline) ──
+        # The natural/Claude pipeline ran the test runner NOWHERE: _run_tests_inline()
+        # existed but was wired only into run_smart_pipeline_stream (~line 6798). Selecting
+        # a Claude architect model therefore silently dropped execution-based verification —
+        # the SAME class of silent parity gap BIG10/PR #82 closed for the redeclaration and
+        # linter gates. Static checks answer "does it compile"; only running the project's
+        # own tests answers "does it still WORK".
+        #
+        # What this does: after the per-change retry loop has converged, assemble the FULL
+        # session (all files, with every currently-shipping change applied) and run the
+        # project's own suite ONCE. A real failure is fed back to the Surgeon through the
+        # same correction pattern (QA -> Claude -> fix -> re-verify — the user's stated
+        # mental model) for a bounded number of rounds; anything still failing is marked
+        # blocked so the HARD GATE below refuses to ship it. "Repo tests still pass" becomes
+        # a hard ship condition, consistent with "nothing below 8/10 ships".
+        #
+        # ENV NOTE (D2): Railway runs a Python-only container — pytest executes for real;
+        # jest/vitest honest-skip (no Node runtime). JS execution is a future Vercel sidecar
+        # seam, mirroring how tsc landed in PR #84. _run_tests_inline already skips JS cleanly,
+        # so this is a zero-behaviour-change no-op for sessions without runnable tests.
+        _TEST_GATE_MAX_ROUNDS = 2
+
+        def _testgate_block(_indices: list, _failed: int, _fw: str, _note: str) -> None:
+            """Mark the given shipping changes blocked so the hard gate stops them."""
+            for _i in _indices:
+                if _qa_fails_ship_gate(qa_results[_i], QA_GATE_MIN_SCORE):
+                    continue  # already blocked by an earlier gate
+                qa_results[_i]["verdict"] = "blocked"
+                if (qa_results[_i].get("qa_score") or 10) > 4:
+                    qa_results[_i]["qa_score"] = 4
+                qa_results[_i].setdefault("import_issues", []).append(f"[TESTS] {_note}")
+                qa_results[_i]["summary"] = (
+                    f"{_failed} repo test(s) failing — "
+                    + (qa_results[_i].get("summary", "") or "")
+                )
+
+        # Feature flag (default OFF): the whole test-execution gate stays dark until an
+        # operator sets TEST_EXEC_GATE=1, mirroring the TSC_ENABLED rollout (PR #84). Merge
+        # is therefore behaviourally zero-risk; activation is one env var + a smoke test,
+        # with an instant kill switch. pytest is now in requirements so the runner is real
+        # the moment the flag flips.
+        _tg_enabled = os.getenv("TEST_EXEC_GATE", "0") == "1"
+        try:
+            for _tg_round in range(_TEST_GATE_MAX_ROUNDS + 1):
+                if not _tg_enabled:
+                    break
+                # Candidates = changes that currently PASS the per-change gate (what would ship).
+                _ship_idx = [
+                    _i for _i, _q in enumerate(qa_results)
+                    if not _qa_fails_ship_gate(_q, QA_GATE_MIN_SCORE)
+                ]
+                if not _ship_idx:
+                    break  # nothing shippable — the hard gate handles it
+
+                _tg_map = _assemble_patched_file_map(
+                    session_files, [change_shells[_i] for _i in _ship_idx]
+                )
+                _tg_res = await _run_tests_inline(_tg_map, session_id or "")
+                _tg_verdict = _tg_res.get("verdict")
+                _tg_fw = _tg_res.get("framework", "tests")
+
+                # Honest skip (fail-skipped, never fail-broken): either the runner
+                # reported skipped/unknown, OR it ran but neither passed nor failed any
+                # test (0/0). The 0/0 case is what a MISSING test runner looks like
+                # (e.g. pytest not installed on the backend → non-zero exit, no counts).
+                # We must NOT treat that as a pass (dishonest) NOR as a failure (would
+                # false-block every edit). Skip cleanly, exactly like the linter gate.
+                _tg_passed = _tg_res.get("passed", 0) or 0
+                _tg_failed_n = _tg_res.get("failed", 0) or 0
+                if _tg_verdict in ("skipped", "unknown") or (_tg_passed <= 0 and _tg_failed_n <= 0):
+                    if _tg_round == 0:
+                        _skip_msg = _tg_res.get("message") or (
+                            "test runner unavailable or no tests collected"
+                            if _tg_verdict not in ("skipped", "unknown")
+                            else "no runnable tests in session")
+                        yield sse({"type": "progress", "content": f"⏭ Test gate: {_skip_msg}"})
+                        logger.info(
+                            "[pipeline:natural][TESTGATE] run_id=%s decision=SKIP framework=%s "
+                            "verdict=%s passed=%s failed=%s", run_id, _tg_fw, _tg_verdict,
+                            _tg_passed, _tg_failed_n)
+                    break
+
+                # Tests pass — at least one passed and none failed.
+                if _tg_failed_n <= 0:
+                    yield sse({"type": "progress", "content":
+                               f"✅ Test gate: {_tg_res.get('passed', 0)} test(s) passing ({_tg_fw})"})
+                    logger.info(
+                        "[pipeline:natural][TESTGATE] run_id=%s decision=PASS framework=%s "
+                        "passed=%s round=%d", run_id, _tg_fw, _tg_res.get("passed", 0), _tg_round)
+                    break
+
+                # ── Tests FAILED ──────────────────────────────────────────────
+                _tg_failed = _tg_res.get("failed", 0) or 0
+                _tg_out = (_tg_res.get("output", "") or "")[:1500]
+                logger.info(
+                    "[pipeline:natural][TESTGATE] run_id=%s decision=FAIL framework=%s "
+                    "failed=%s round=%d", run_id, _tg_fw, _tg_failed, _tg_round)
+
+                # Budget exhausted → block the shipping changes; hard gate refuses them.
+                if _tg_round >= _TEST_GATE_MAX_ROUNDS:
+                    _testgate_block(
+                        _ship_idx, _tg_failed, _tg_fw,
+                        f"{_tg_failed} test(s) still failing after {_TEST_GATE_MAX_ROUNDS} "
+                        f"fix round(s) ({_tg_fw}).")
+                    yield sse({"type": "progress", "content":
+                               f"🚫 Test gate: {_tg_failed} test(s) still failing after fixes — "
+                               f"blocking ({_tg_fw})"})
+                    break
+
+                # Otherwise feed the failure back to the Surgeon (QA -> Claude -> fix).
+                yield sse({"type": "progress", "content":
+                           f"🔁 Test gate: {_tg_failed} test(s) failing — sending to Surgeon "
+                           f"(round {_tg_round + 1}/{_TEST_GATE_MAX_ROUNDS})"})
+                _tg_fix_tasks = []
+                for _i in _ship_idx:
+                    _cs = change_shells[_i]
+                    _sym = _cs["symbol"]
+                    _tg_prompt = (
+                        f"The project's automated test suite was run after your "
+                        f"<surgical_edit> for `{_sym.name}` in `{_cs['filename']}` was applied, "
+                        f"and {_tg_failed} test(s) FAILED. The edit cannot ship while tests fail.\n\n"
+                        f"TEST OUTPUT ({_tg_fw}):\n```\n{_tg_out}\n```\n\n"
+                        f"ORIGINAL CODE (before your change):\n```\n{_sym.code}\n```\n\n"
+                        f"YOUR CURRENT CODE (which may have broken the tests):\n```\n{_cs['new_code']}\n```\n\n"
+                        f"If THIS symbol is the cause, return a corrected <surgical_edit> block that "
+                        f"makes the tests pass while still implementing: {_cs['description']}. "
+                        f"It must contain the COMPLETE symbol code and use the exact name `{_sym.name}`. "
+                        f"If this symbol is clearly unrelated to the failure, return your current code "
+                        f"unchanged.\n\nReturn ONLY the <surgical_edit> block, nothing else."
+                    )
+                    _tg_msgs = current_messages + [
+                        {"role": "assistant", "content": full_response or "(writing code...)"},
+                        {"role": "user", "content": _tg_prompt},
+                    ]
+                    _tg_fix_tasks.append((_i, asyncio.create_task(asyncio.wait_for(
+                        aclient.messages.create(
+                            model=arch_model, max_tokens=16000,
+                            system=system_prompt, messages=_tg_msgs,
+                        ), timeout=_CORR_CALL_TIMEOUT))))
+
+                _tg_pending = {t for _, t in _tg_fix_tasks}
+                while _tg_pending:
+                    _tg_done, _tg_pending = await asyncio.wait(_tg_pending, timeout=20.0)
+                    if _tg_pending:
+                        yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+
+                _tg_changed = False
+                for _i, _t in _tg_fix_tasks:
+                    try:
+                        _ct = "".join(b.text for b in _t.result().content if hasattr(b, "text"))
+                        _ei = _ct.find(EDIT_OPEN)
+                        _ec = _ct.find(EDIT_CLOSE, _ei) if _ei != -1 else -1
+                        if _ei != -1 and _ec != -1:
+                            _raw = _ct[_ei + len(EDIT_OPEN):_ec].strip()
+                            try:
+                                _ed = json.loads(_raw)
+                            except json.JSONDecodeError:
+                                _ed = json.loads(_repair_json(_raw))
+                            _cc = _ed.get("new_code", "")
+                            if _cc and _cc != change_shells[_i]["new_code"]:
+                                change_shells[_i]["new_code"] = _cc
+                                _tg_changed = True
+                                # Re-run the deterministic gate on the new code before re-testing.
+                                for _m in _run_deterministic_gate(_i):
+                                    yield sse({"type": "progress", "content": _m})
+                    except Exception:
+                        pass  # keep current code if a correction call/parse fails
+
+                if not _tg_changed:
+                    # Surgeon produced no usable fix → block now rather than spin.
+                    _testgate_block(
+                        _ship_idx, _tg_failed, _tg_fw,
+                        f"{_tg_failed} test(s) failing; Surgeon produced no fix ({_tg_fw}).")
+                    yield sse({"type": "progress", "content":
+                               f"🚫 Test gate: no fix produced — blocking {_tg_failed} "
+                               f"failing test(s) ({_tg_fw})"})
+                    break
+                # else: loop re-assembles the shipping set and re-runs the suite.
+
+            if _tg_enabled:
+                compliance.mark(
+                    "qa_review", ran=True,
+                    output_summary="Whole-session test-execution gate evaluated",
+                )
+        except Exception as _tg_exc:
+            # The test gate must NEVER crash the pipeline — fall through to the hard gate,
+            # which still blocks anything below the bar. Fail-skipped, never fail-broken.
+            logger.warning(
+                "[pipeline:natural][TESTGATE] run_id=%s skipped due to error: %s",
+                run_id, _tg_exc)
+            print(f"[TESTGATE] Skipped: {_tg_exc}")
 
         # ── Assemble SurgicalChange objects + enforce the hard QA gate ───────
         # GATE RULE: a change may ship ONLY if verdict != "blocked" AND
