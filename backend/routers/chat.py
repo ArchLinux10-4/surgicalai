@@ -4,10 +4,34 @@ import json
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from models.schemas import ChatRequest, NewSessionRequest, ChatSession
-from database import get_db, get_setting, get_user_api_key
+from database import get_db, get_setting, get_user_api_key, GLOBAL_MEMORY_KEY
 from services.pipeline import run_chat, run_chat_stream
 
 router = APIRouter()
+
+
+def _load_effective_memory(conn, session_id):
+    """Merge GLOBAL (team-wide) project memory with per-session memory.
+
+    Global conventions are injected into every prompt for every session/user;
+    any session-specific memory is appended after. Returns None when both are
+    empty so downstream code behaves exactly as before for the no-memory case.
+    """
+    parts = []
+    g = conn.execute(
+        "SELECT content FROM project_memory WHERE workspace_path = ? LIMIT 1",
+        (GLOBAL_MEMORY_KEY,)
+    ).fetchone()
+    if g and (g["content"] or "").strip():
+        parts.append(g["content"].strip())
+    if session_id and session_id != GLOBAL_MEMORY_KEY:
+        s = conn.execute(
+            "SELECT content FROM project_memory WHERE workspace_path = ? LIMIT 1",
+            (session_id,)
+        ).fetchone()
+        if s and (s["content"] or "").strip():
+            parts.append(s["content"].strip())
+    return "\n\n".join(parts) if parts else None
 
 
 @router.post("/sessions")
@@ -318,10 +342,8 @@ def send_message(req: ChatRequest):
         except Exception:
             pass
 
-    memory_row = conn.execute(
-        "SELECT content FROM project_memory WHERE workspace_path = ? LIMIT 1", (workspace,)
-    ).fetchone() if workspace else None
-    project_memory = memory_row["content"] if memory_row else None
+    # Global (team-wide) memory + per-session memory, both injected every prompt
+    project_memory = _load_effective_memory(conn, workspace)
 
     conn.commit()
     conn.close()
@@ -395,10 +417,8 @@ async def stream_message(req: ChatRequest):
         except Exception:
             pass
 
-    memory_row = conn.execute(
-        "SELECT content FROM project_memory WHERE workspace_path = ? LIMIT 1", (workspace,)
-    ).fetchone() if workspace else None
-    project_memory = memory_row["content"] if memory_row else None
+    # Global (team-wide) memory + per-session memory, both injected every prompt
+    project_memory = _load_effective_memory(conn, workspace)
 
     conn.commit()
     conn.close()
@@ -520,11 +540,8 @@ async def smart_stream(req: dict, request: Request):
     ).fetchall()
     session_files = [dict(r) for r in file_rows]
 
-    # Project memory — keyed by session_id for cloud users (workspacePath is per-session)
-    memory_row = conn.execute(
-        "SELECT content FROM project_memory WHERE workspace_path = ? LIMIT 1", (session_id,)
-    ).fetchone() if session_id else None
-    project_memory = memory_row["content"] if memory_row else None
+    # Project memory — GLOBAL team conventions (every prompt) + any per-session memory
+    project_memory = _load_effective_memory(conn, session_id)
 
     conn.commit()
     conn.close()

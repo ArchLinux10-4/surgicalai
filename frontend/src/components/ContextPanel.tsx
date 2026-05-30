@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
-import type { PinnedContext } from '../types'
+import type { PinnedContext, MemoryPreset } from '../types'
 import { Check, Delete, MenuBook, PushPin, Save } from '@mui/icons-material';
 
 export function ContextPanel() {
@@ -13,14 +13,23 @@ export function ContextPanel() {
   const [tab, setTab] = useState<'pins' | 'memory'>('pins')
   const [saving, setSaving] = useState(false)
   const [saveDone, setSaveDone] = useState(false)
+  const [presets, setPresets] = useState<MemoryPreset[]>([])
+  const [addedPresets, setAddedPresets] = useState<Record<string, boolean>>({})
 
+  // Pinned files are per-session.
   useEffect(() => {
     if (!activeSessions) return
     api.context.getPins(activeSessions).then(setPins).catch(() => {})
-    api.context.getMemory(activeSessions).then((m) => {
+  }, [activeSessions])
+
+  // Global memory + the shared preset library load once — they are team-wide,
+  // not tied to any single chat session.
+  useEffect(() => {
+    api.context.getGlobalMemory().then((m) => {
       setMemory(m.content); setSavedMemory(m.content)
     }).catch(() => {})
-  }, [activeSessions])
+    api.context.getMemoryPresets().then(setPresets).catch(() => {})
+  }, [])
 
   const pinCurrentFile = async () => {
     if (!activeFile || !activeSessions) return
@@ -39,17 +48,24 @@ export function ContextPanel() {
   }
 
   const saveMemory = async () => {
-    if (!activeSessions) return
     setSaving(true)
     try {
-      await api.context.saveMemory({ workspace_path: activeSessions, content: memory })
+      await api.context.saveGlobalMemory(memory)
       setSavedMemory(memory); setSaveDone(true)
       setTimeout(() => setSaveDone(false), 2500)
-      toast.success('Project memory saved')
+      toast.success('Global memory saved')
     } catch (e: any) {
       toast.error('Save failed', e.message)
     }
     setSaving(false)
+  }
+
+  const insertPreset = (preset: MemoryPreset) => {
+    setMemory((prev) => {
+      const trimmed = prev.trimEnd()
+      return trimmed ? `${trimmed}\n\n${preset.content.trim()}\n` : `${preset.content.trim()}\n`
+    })
+    setAddedPresets((prev) => ({ ...prev, [preset.id]: true }))
   }
 
   return (
@@ -113,8 +129,31 @@ export function ContextPanel() {
       ) : (
         <div className="flex-1 flex flex-col p-3 gap-2">
           <div className="text-[11px] text-muted leading-relaxed">
-            Project conventions injected into every prompt. Use markdown.
+            Global conventions — injected into <span className="text-ink font-semibold">every prompt, in every chat</span>, shared by all developers. Use markdown.
           </div>
+          {presets.length > 0 && (
+            <div className="flex flex-col gap-1.5">
+              <div className="text-[10px] uppercase tracking-wide text-faint font-semibold">Presets — click to add</div>
+              <div className="flex flex-wrap gap-1.5">
+                {presets.map((p) => (
+                  <button
+                    key={p.id}
+                    onClick={() => insertPreset(p)}
+                    title={p.description}
+                    className={`flex items-center gap-1 px-2 py-1 rounded-md border text-[11px] font-medium transition-colors ${
+                      addedPresets[p.id]
+                        ? 'bg-success/15 border-success/30 text-success'
+                        : 'bg-overlay border-border text-muted hover:text-ink hover:border-accent/40'
+                    }`}
+                  >
+                    <span>{p.icon}</span>
+                    <span>{p.title}</span>
+                    {addedPresets[p.id] && <Check sx={{ fontSize: 11 }} />}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
           <textarea
             value={memory}
             onChange={(e) => setMemory(e.target.value)}

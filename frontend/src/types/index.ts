@@ -148,6 +148,15 @@ export interface PromptTemplate {
   created_at: string
 }
 
+export interface MemoryPreset {
+  id: string
+  icon: string
+  title: string
+  category: string
+  description: string
+  content: string
+}
+
 export interface ImpactResult {
   symbol_path: string
   file_path: string
