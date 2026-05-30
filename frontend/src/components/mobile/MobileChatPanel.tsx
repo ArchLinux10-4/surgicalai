@@ -10,6 +10,7 @@ import { useAppStore } from '../../stores/appStore'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import { MobileDiffCard } from './MobileDiffCard'
+import { SessionFilesTray } from '../SessionFilesTray'
 import { VoiceButton } from '../VoiceButton'
 import { useCodeRain } from '../../hooks/useCodeRain'
 import { useThemeStore } from '../../stores/themeStore'
@@ -555,15 +556,15 @@ export function MobileChatPanel() {
         <div ref={bottomRef} />
       </div>
 
-      {/* File chips */}
-      {hasFiles && (
-        <div className="flex-shrink-0 px-3 py-2 border-t border-border/50 flex flex-wrap gap-1.5">
-          {sessionFiles.slice(0, 4).map(f => (
-            <FileChip key={f.id} file={f} onRemove={() => removeFile(f.id)} />
-          ))}
-          {sessionFiles.length > 4 && (
-            <span className="text-[10px] text-muted/50 self-center">+{sessionFiles.length - 4} more</span>
-          )}
+      {/* Session file drawer — single docked source of truth atop the composer */}
+      {activeSessions && hasFiles && (
+        <div className="flex-shrink-0 px-3 pt-2 border-t border-border/50">
+          <SessionFilesTray
+            sessionId={activeSessions}
+            sessionFiles={sessionFiles}
+            onAddFiles={() => fileInputRef.current?.click()}
+            onRemove={removeFile}
+          />
         </div>
       )}
 

@@ -8,6 +8,10 @@ import { GitHub } from '@mui/icons-material';
 interface SessionFilesTrayProps {
   sessionId: string
   sessionFiles: SessionFile[]
+  /** Opens the file picker. When omitted, the "Add" affordances are hidden. */
+  onAddFiles?: () => void
+  /** Removes a file. When omitted, the per-row × and "Clear all" are hidden. */
+  onRemove?: (fileId: string) => void
 }
 
 function relativeTime(dateStr?: string): string {
@@ -25,19 +29,20 @@ function relativeTime(dateStr?: string): string {
   return `${diffDay}d ago`
 }
 
+// Theme-safe language badge classes (semantic tokens — adapt to light + dark)
 function langColor(lang: string): string {
   const map: Record<string, string> = {
-    typescript: 'bg-blue-500/15 text-blue-400 border-blue-500/25',
-    javascript: 'bg-yellow-500/15 text-yellow-400 border-yellow-500/25',
-    python: 'bg-green-500/15 text-green-400 border-green-500/25',
-    rust: 'bg-orange-500/15 text-orange-400 border-orange-500/25',
-    go: 'bg-cyan-500/15 text-cyan-400 border-cyan-500/25',
-    html: 'bg-red-500/15 text-red-400 border-red-500/25',
-    css: 'bg-purple-500/15 text-purple-400 border-purple-500/25',
-    json: 'bg-gray-500/15 text-gray-400 border-gray-500/25',
-    markdown: 'bg-gray-500/15 text-gray-300 border-gray-500/25',
+    typescript: 'bg-accent/15 text-accent border-accent/25',
+    javascript: 'bg-warning/15 text-warning border-warning/25',
+    python: 'bg-success/15 text-success border-success/25',
+    rust: 'bg-orange/15 text-orange border-orange/25',
+    go: 'bg-accent/15 text-accent border-accent/25',
+    html: 'bg-danger/15 text-danger border-danger/25',
+    css: 'bg-purple/15 text-purple border-purple/25',
+    json: 'bg-overlay text-muted border-border',
+    markdown: 'bg-overlay text-muted border-border',
   }
-  return map[lang?.toLowerCase()] ?? 'bg-surface-alt text-muted border-border'
+  return map[lang?.toLowerCase()] ?? 'bg-overlay text-muted border-border'
 }
 
 // sync status: 'synced' | 'modified' | 'never'
@@ -49,61 +54,57 @@ function syncStatus(file: SessionFile): 'synced' | 'modified' | 'never' {
   return updated > pushed + 2000 ? 'modified' : 'synced'
 }
 
-const COMPACT_THRESHOLD = 8
-
-export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayProps) {
-  const [collapsed, setCollapsed] = useState(false)
+export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove }: SessionFilesTrayProps) {
+  // Collapsed by default — the drawer is a calm one-line bar until opened.
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
   const [downloading, setDownloading] = useState<string | null>(null)
   const [showCommitModal, setShowCommitModal] = useState(false)
-  // Undo-aware applied state: Set of change IDs that are currently applied.
-  // When undo is used, those IDs are removed from the set → badge disappears.
   const [appliedIds, setAppliedIds] = useState<Set<string>>(new Set())
   const { setSessionFiles } = useAppStore()
 
-  // Load applied change IDs from backend on mount / when session changes.
-  // This makes AI-Edited accurate even after undo — if all changes for a file
-  // are undone, the file won't show AI-Edited even though updated_at changed.
+  // Load applied change IDs so the AI-edited badge stays accurate after undo.
   useEffect(() => {
     if (!sessionId) return
     api.surgical.getApplied(sessionId)
       .then(({ applied_ids }) => setAppliedIds(new Set(applied_ids)))
       .catch(() => {}) // fall back to updated_at heuristic silently
-  }, [sessionId, sessionFiles]) // re-check whenever files change (apply/undo)
+  }, [sessionId, sessionFiles])
 
-  // Undo-aware isEdited: a file is AI-Edited if it has applied changes in DB
-  // AND updated_at differs from created_at (catches manual uploads too).
-  // Falls back to pure updated_at heuristic if appliedIds is empty (first load).
   const isFileEdited = (file: SessionFile): boolean => {
     const heuristic = !!(file.updated_at && file.updated_at !== file.created_at)
-    if (appliedIds.size === 0) return heuristic  // DB not loaded yet
-    // Check localStorage for applied changes belonging to this file
-    // Key format: sai-applied:{sessionId}:{changeId}
-    // We can't directly map changeId→fileId, so we use the heuristic
-    // supplemented by appliedIds presence: if ANY applied change exists
-    // in this session AND the file was modified, it's AI-Edited
+    if (appliedIds.size === 0) return heuristic
     return heuristic && appliedIds.size > 0
   }
 
-  const isCompact = sessionFiles.length > COMPACT_THRESHOLD
-
-  // Sort: modified-since-push first, then synced, then never; AI-edited always before unedited
+  // Sort: modified-since-push first, then synced, then never; AI-edited before unedited.
   const sortedFiles = useMemo(() => {
     const order = { modified: 0, synced: 1, never: 2 }
     return [...sessionFiles].sort((a, b) => {
       const so = order[syncStatus(a)] - order[syncStatus(b)]
       if (so !== 0) return so
-      // within same sync group: AI-edited first
       const aEdited = a.updated_at && a.updated_at !== a.created_at ? 0 : 1
       const bEdited = b.updated_at && b.updated_at !== b.created_at ? 0 : 1
       return aEdited - bEdited
     })
   }, [sessionFiles])
 
+  const visibleFiles = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return sortedFiles
+    return sortedFiles.filter(f => f.filename.toLowerCase().includes(q))
+  }, [sortedFiles, query])
+
   const syncCounts = useMemo(() => {
     const counts = { modified: 0, synced: 0, never: 0 }
     for (const f of sessionFiles) counts[syncStatus(f)]++
     return counts
   }, [sessionFiles])
+
+  const totalLines = useMemo(
+    () => sessionFiles.reduce((sum, f) => sum + (f.lines || 0), 0),
+    [sessionFiles],
+  )
 
   const hasGithubFiles = sessionFiles.some(f => f.github_meta)
   const hasOutOfSync = syncCounts.modified > 0
@@ -120,54 +121,60 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
     }
   }
 
+  const handleClearAll = () => {
+    if (!onRemove) return
+    if (!window.confirm(`Remove all ${sessionFiles.length} files from this session?`)) return
+    sessionFiles.forEach(f => onRemove(f.id))
+  }
+
   if (sessionFiles.length === 0) return null
+
+  const fileWord = sessionFiles.length === 1 ? 'file' : 'files'
 
   return (
     <>
-      <div className="border border-border/60 rounded-xl bg-surface/50 overflow-hidden mb-2 mx-1 backdrop-blur-sm">
-        {/* Header row */}
-        <button
-          onClick={() => setCollapsed(c => !c)}
-          className="w-full flex items-center justify-between px-3.5 py-2.5 hover:bg-surface-alt/50 transition-colors select-none"
-        >
-          <div className="flex items-center gap-2 flex-wrap">
+      <div className="border border-border/70 rounded-xl bg-surface/60 overflow-hidden mb-2.5 backdrop-blur-sm">
+        {/* ── Collapsed bar (always visible) ─────────────────────── */}
+        <div className="w-full flex items-center justify-between px-3.5 py-2.5">
+          <button
+            onClick={() => setOpen(o => !o)}
+            className="flex items-center gap-2 min-w-0 flex-1 text-left select-none group"
+          >
+            <svg
+              className={`w-3 h-3 text-muted/60 shrink-0 transition-transform ${open ? 'rotate-90' : ''}`}
+              fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}
+            >
+              <path d="M9 5l7 7-7 7" />
+            </svg>
             <svg className="w-3.5 h-3.5 text-muted/70 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
               <path d="M3 7a2 2 0 012-2h3l2 2h9a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" />
             </svg>
-            <span className="text-[12px] font-medium text-ink/80">Session Files</span>
-            {/* Total count */}
-            <span className="text-[10px] font-semibold px-1.5 py-0.5 bg-blue-500/15 text-blue-400 border border-blue-500/25 rounded-full">
-              {sessionFiles.length}
+            <span className="text-[12px] font-semibold text-ink truncate">
+              {sessionFiles.length} {fileWord}
             </span>
-            {/* AI-edited badge */}
+            <span className="text-[11px] text-muted/60 truncate">
+              · {totalLines.toLocaleString()} lines in context
+            </span>
             {aiEditedCount > 0 && (
-              <span className="text-[10px] font-medium px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-full">
+              <span className="text-[10px] font-medium px-1.5 py-0.5 bg-success/10 text-success border border-success/20 rounded-full shrink-0">
                 {aiEditedCount} AI-edited
               </span>
             )}
-            {/* Sync summary — only shown when github files exist */}
-            {hasGithubFiles && (
-              <span className="text-[10px] text-muted/50 font-medium">
-                {syncCounts.modified > 0 && (
-                  <span className="text-amber-400 font-semibold">{syncCounts.modified} modified</span>
-                )}
-                {syncCounts.modified > 0 && syncCounts.synced > 0 && <span className="mx-1 text-muted/30">·</span>}
-                {syncCounts.synced > 0 && (
-                  <span className="text-emerald-400">{syncCounts.synced} synced</span>
-                )}
+            {hasOutOfSync && (
+              <span className="text-[10px] font-semibold text-warning shrink-0">
+                {syncCounts.modified} modified
               </span>
             )}
-          </div>
+          </button>
 
-          <div className="flex items-center gap-2 shrink-0">
-            {/* Push button — pulses amber if any file modified since push */}
+          <div className="flex items-center gap-2 shrink-0 pl-2">
             {hasGithubFiles && (
               <button
-                onClick={e => { e.stopPropagation(); setShowCommitModal(true) }}
+                onClick={() => setShowCommitModal(true)}
                 className={`flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-semibold border transition-all ${
                   hasOutOfSync
-                    ? 'bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border-amber-500/40 animate-pulse'
-                    : 'bg-gray-700/60 hover:bg-gray-700 text-white border-gray-600/50'
+                    ? 'bg-warning/20 hover:bg-warning/30 text-warning border-warning/40 animate-pulse'
+                    : 'bg-overlay hover:bg-overlay text-ink border-border'
                 }`}
                 title={hasOutOfSync ? 'You have unpushed changes' : 'Push changes to GitHub'}
               >
@@ -175,75 +182,91 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
                 {hasOutOfSync ? 'Push ↑' : 'Push'}
               </button>
             )}
-            <svg
-              className={`w-3.5 h-3.5 text-muted/50 transition-transform ${collapsed ? '' : 'rotate-180'}`}
-              fill="none" viewBox="0 0 24 24" stroke="currentColor"
-            >
-              <path d="M19 9l-7 7-7-7" />
-            </svg>
+            {onAddFiles && (
+              <button
+                onClick={onAddFiles}
+                className="flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-medium text-accent hover:bg-accent/10 transition-colors"
+                title="Add files"
+              >
+                + Add
+              </button>
+            )}
           </div>
-        </button>
+        </div>
 
-        {/* File list */}
-        {!collapsed && (
-          <div
-            className={`divide-y divide-border/40 ${isCompact ? 'overflow-y-auto max-h-72' : ''}`}
-            style={isCompact ? { scrollbarWidth: 'thin', scrollbarColor: 'rgba(100,100,120,0.3) transparent' } : {}}
-          >
-            {sortedFiles.map(file => {
-              const status = syncStatus(file)
-              const isModified = isFileEdited(file)
-              const timestamp = isModified ? file.updated_at : file.created_at
-              const isDownloading = downloading === file.id
-              const py = isCompact ? 'py-1.5' : 'py-2.5'
-
-              return (
-                <div
-                  key={file.id}
-                  className={`flex items-center gap-3 px-3.5 ${py} hover:bg-surface-alt/30 transition-colors group`}
-                >
-                  {/* File icon */}
-                  {!isCompact && (
-                    <div className="shrink-0">
-                      <svg className="w-4 h-4 text-muted/50" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                      </svg>
-                    </div>
+        {/* ── Expanded panel ─────────────────────────────────────── */}
+        {open && (
+          <div className="border-t border-border/50">
+            {/* Filter */}
+            {sessionFiles.length > 4 && (
+              <div className="px-3 py-2 border-b border-border/40">
+                <div className="flex items-center gap-2 px-2.5 py-1.5 bg-base/60 border border-border/60 rounded-lg">
+                  <svg className="w-3.5 h-3.5 text-muted/50 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path d="M21 21l-4.35-4.35M11 18a7 7 0 100-14 7 7 0 000 14z" />
+                  </svg>
+                  <input
+                    value={query}
+                    onChange={e => setQuery(e.target.value)}
+                    placeholder="Filter files…"
+                    className="flex-1 bg-transparent text-[12px] text-ink placeholder:text-muted/50 outline-none"
+                  />
+                  {query && (
+                    <button onClick={() => setQuery('')} className="text-muted/50 hover:text-ink text-[12px] shrink-0">✕</button>
                   )}
+                </div>
+              </div>
+            )}
 
-                  {/* Filename + meta */}
-                  <div className="flex-1 min-w-0">
-                    <div className="flex items-center gap-1.5 flex-wrap">
-                      <span className={`${isCompact ? 'text-[12px]' : 'text-[13px]'} font-medium text-ink truncate max-w-[180px]`} title={file.filename}>
-                        {file.filename}
-                      </span>
-                      {/* Language badge */}
-                      <span className={`text-[9px] font-medium px-1.5 py-0.5 border rounded-md ${langColor(file.language)}`}>
-                        {file.language || 'text'}
-                      </span>
-                      {/* Sync status badge — only for github-connected files */}
-                      {file.github_meta && status === 'synced' && (
-                        <span className="flex items-center gap-1 text-[9px] font-medium px-1.5 py-0.5 bg-blue-500/10 text-blue-400 border border-blue-500/20 rounded-md">
-                          <span className="w-1.5 h-1.5 rounded-full bg-blue-400 inline-block" />
-                          Synced · {relativeTime(file.github_pushed_at)}
+            {/* File list — height-capped + scrollable so the chat never moves */}
+            <div
+              className="divide-y divide-border/40 overflow-y-auto max-h-72"
+              style={{ scrollbarWidth: 'thin', scrollbarColor: 'rgba(120,120,140,0.3) transparent' }}
+            >
+              {visibleFiles.length === 0 && (
+                <div className="px-3.5 py-4 text-center text-[12px] text-muted/60">No files match “{query}”.</div>
+              )}
+              {visibleFiles.map(file => {
+                const status = syncStatus(file)
+                const isModified = isFileEdited(file)
+                const timestamp = isModified ? file.updated_at : file.created_at
+                const isDownloading = downloading === file.id
+
+                return (
+                  <div
+                    key={file.id}
+                    className="flex items-center gap-3 px-3.5 py-2 hover:bg-overlay/40 transition-colors group"
+                  >
+                    <svg className="w-4 h-4 text-muted/50 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-[13px] font-medium text-ink truncate max-w-[200px]" title={file.filename}>
+                          {file.filename}
                         </span>
-                      )}
-                      {file.github_meta && status === 'modified' && (
-                        <span className="flex items-center gap-1 text-[9px] font-semibold px-1.5 py-0.5 bg-amber-500/10 text-amber-400 border border-amber-500/30 rounded-md">
-                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse inline-block" />
-                          Modified · not pushed
+                        <span className={`text-[9px] font-medium px-1.5 py-0.5 border rounded-md ${langColor(file.language)}`}>
+                          {file.language || 'text'}
                         </span>
-                      )}
-                      {/* AI-Edited badge — always shown when file has applied changes,
-                          regardless of GitHub connection status */}
-                      {isModified && (
-                        <span className="flex items-center gap-1 text-[9px] font-medium px-1.5 py-0.5 bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 rounded-md">
-                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 inline-block" />
-                          AI-Edited
-                        </span>
-                      )}
-                    </div>
-                    {!isCompact && (
+                        {file.github_meta && status === 'synced' && (
+                          <span className="flex items-center gap-1 text-[9px] font-medium px-1.5 py-0.5 bg-accent/10 text-accent border border-accent/20 rounded-md">
+                            <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block" />
+                            Synced · {relativeTime(file.github_pushed_at)}
+                          </span>
+                        )}
+                        {file.github_meta && status === 'modified' && (
+                          <span className="flex items-center gap-1 text-[9px] font-semibold px-1.5 py-0.5 bg-warning/10 text-warning border border-warning/30 rounded-md">
+                            <span className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse inline-block" />
+                            Modified · not pushed
+                          </span>
+                        )}
+                        {isModified && (
+                          <span className="flex items-center gap-1 text-[9px] font-medium px-1.5 py-0.5 bg-success/10 text-success border border-success/20 rounded-md">
+                            <span className="w-1.5 h-1.5 rounded-full bg-success inline-block" />
+                            AI-Edited
+                          </span>
+                        )}
+                      </div>
                       <div className="flex items-center gap-2 mt-0.5">
                         <span className="text-[11px] text-muted/60">{file.lines?.toLocaleString()} lines</span>
                         {file.symbol_count > 0 && (
@@ -254,42 +277,62 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
                           {isModified ? 'Last edit ' : 'Uploaded '}{relativeTime(timestamp)}
                         </span>
                       </div>
-                    )}
-                    {/* Compact mode: inline meta */}
-                    {isCompact && (
-                      <span className="text-[10px] text-muted/50">
-                        {file.lines?.toLocaleString()} lines
-                        {isModified ? ` · edited ${relativeTime(timestamp)}` : ''}
-                      </span>
+                    </div>
+
+                    {/* Download */}
+                    <button
+                      onClick={() => handleDownload(file)}
+                      disabled={isDownloading}
+                      className="shrink-0 flex items-center justify-center w-7 h-7 rounded-lg text-muted
+                        hover:bg-accent/10 hover:text-accent disabled:opacity-50 disabled:cursor-not-allowed
+                        opacity-0 group-hover:opacity-100 transition-all"
+                      title={`Download ${file.filename}`}
+                    >
+                      {isDownloading ? (
+                        <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
+                          <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" />
+                          <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                        </svg>
+                      ) : (
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                        </svg>
+                      )}
+                    </button>
+
+                    {/* Remove */}
+                    {onRemove && (
+                      <button
+                        onClick={() => onRemove(file.id)}
+                        className="shrink-0 flex items-center justify-center w-7 h-7 rounded-lg text-muted/60
+                          hover:bg-danger/10 hover:text-danger opacity-0 group-hover:opacity-100 transition-all"
+                        title={`Remove ${file.filename}`}
+                      >
+                        <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                          <path d="M6 18L18 6M6 6l12 12" />
+                        </svg>
+                      </button>
                     )}
                   </div>
+                )
+              })}
+            </div>
 
-                  {/* Download button */}
-                  <button
-                    onClick={() => handleDownload(file)}
-                    disabled={isDownloading}
-                    className="shrink-0 flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-medium
-                      bg-surface border border-border text-muted
-                      hover:bg-blue-500/10 hover:border-blue-500/40 hover:text-blue-400
-                      disabled:opacity-50 disabled:cursor-not-allowed
-                      opacity-0 group-hover:opacity-100 transition-all"
-                    title={`Download ${file.filename}`}
-                  >
-                    {isDownloading ? (
-                      <svg className="w-3.5 h-3.5 animate-spin" fill="none" viewBox="0 0 24 24">
-                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" />
-                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                      </svg>
-                    ) : (
-                      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                        <path d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                      </svg>
-                    )}
-                    {!isCompact && <span>{isDownloading ? 'Downloading…' : 'Download'}</span>}
+            {/* Footer */}
+            {(onAddFiles || onRemove) && (
+              <div className="flex items-center justify-between px-3.5 py-2 border-t border-border/40 bg-base/30">
+                {onAddFiles ? (
+                  <button onClick={onAddFiles} className="text-[11px] font-medium text-accent hover:underline">
+                    + Add files
                   </button>
-                </div>
-              )
-            })}
+                ) : <span />}
+                {onRemove && (
+                  <button onClick={handleClearAll} className="text-[11px] text-muted/60 hover:text-danger transition-colors">
+                    Clear all
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -299,9 +342,9 @@ export function SessionFilesTray({ sessionId, sessionFiles }: SessionFilesTrayPr
           sessionFiles={sessionFiles}
           onClose={() => setShowCommitModal(false)}
           onSuccess={() => {
-              setShowCommitModal(false)
-              api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
-            }}
+            setShowCommitModal(false)
+            api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
+          }}
         />
       )}
     </>
