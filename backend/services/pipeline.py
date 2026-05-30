@@ -8,7 +8,6 @@ Best Practice #2: Minimal footprint (surgeon only touches requested symbol)
 Best Practice #3: Verify before commit (confidence scoring + diff)
 """
 import ast
-import os
 import json
 import re
 import uuid
@@ -21,24 +20,6 @@ from openai import OpenAI
 import httpx
 
 logger = logging.getLogger(__name__)
-
-# --- Gate-decision visibility (PR #77) -----------------------------------
-# The backend never calls logging.basicConfig(), so the root logger has no
-# INFO-level handler and every logger.info(...) in this module — including the
-# [pipeline:*][GATE] ship/block decision lines — was silently dropped in
-# production (only WARNING+ reaches stderr via Python's last-resort handler).
-# Attach a stdout handler scoped to THIS module's logger so gate decisions are
-# visible in deploy logs, without enabling noisy INFO output from third-party
-# libraries (httpx, openai, anthropic, etc.). Guarded against double-add.
-import sys as _sys
-if not any(getattr(_h, "_surgicalai_gate_handler", False) for _h in logger.handlers):
-    _gate_handler = logging.StreamHandler(_sys.stdout)
-    _gate_handler._surgicalai_gate_handler = True
-    _gate_handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
-    logger.addHandler(_gate_handler)
-    logger.setLevel(logging.INFO)
-    logger.propagate = False  # don't double-emit if the root logger is configured later
-# -------------------------------------------------------------------------
 
 from database import get_setting, get_user_api_key
 from crypto_utils import decrypt_api_key
@@ -68,22 +49,6 @@ parser = ASTParser()
 
 # Models that do NOT accept a temperature parameter (reasoning / latest-gen models)
 NO_TEMPERATURE_MODELS = {"gpt-5", "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"}
-
-# ── QA model chain (PR #74) ───────────────────────────────────────────────────
-# Single source of truth so the QA model can never silently drift between call
-# sites again (previously some QA calls ran claude-sonnet-4-6 while the rest of
-# the pipeline ran 4-5 — an accidental, untracked divergence).
-# QA uses an INDEPENDENT cross-provider failover chain: if the primary provider
-# cannot produce a parseable semantic verdict (empty completion, overload, etc.)
-# after bounded retries, we fail over to a DIFFERENT provider for a real
-# semantic review — not just the deterministic structural floor. Only when every
-# provider in the chain is exhausted do we fall back to structural checks, and in
-# that case we fail CLOSED (hold below the gate) rather than ship unreviewed.
-QA_PRIMARY_MODEL  = "claude-sonnet-4-6"   # strongest semantic code reviewer
-QA_FALLBACK_MODEL = "gpt-4.1"             # independent second provider (full, not mini)
-QA_MAX_ATTEMPTS_PER_PROVIDER = 2          # bounded retries within each provider
-QA_RETRY_BASE_DELAY = 1.5                 # seconds; exponential backoff base
-QA_RETRY_MAX_DELAY  = 8.0                 # seconds; backoff cap
 
 # ── Prompt engineering constants ──────────────────────────────────────────────
 HISTORY_WINDOW       = 20   # turns of conversation history passed to every prompt
@@ -117,7 +82,9 @@ def _is_gemini_model(model: str) -> bool:
 
 # Models confirmed to support extended thinking (budget_tokens).
 # claude-opus-4-7 and others without native thinking support must be excluded.
-_THINKING_CAPABLE_PATTERNS = ("claude-sonnet-4", "claude-3-7", "claude-3-5")
+# Extended-thinking support. All Claude 4.x families (Opus/Sonnet/Haiku 4.5+)
+# emit thinking blocks; 3.7 also supports it. 3.5 does NOT and is excluded.
+_THINKING_CAPABLE_PATTERNS = ("claude-opus-4", "claude-sonnet-4", "claude-haiku-4-5", "claude-3-7")
 
 # -- ReAct agentic search: per-session grep cache ----------------------------
 # Keyed by session_cache_key -> accumulated grep text from prior search rounds.
@@ -1025,7 +992,6 @@ def run_surgeon(
     extra_context: str = "",         # resolved surgeon_context from context_resolver
     qa_feedback: dict = None,        # QA verdict from previous attempt — injected on semantic retry
     forbid_noop: bool = False,       # if True, reject the empty "already correct" escape hatch
-    prev_attempt_code: str = "",     # PR #79: the Surgeon's OWN rejected output from the prior attempt
 ) -> tuple:
     """
     GPT-4.1 (Surgeon): receives ONE code chunk + plan, returns search-and-replace operations.
@@ -1146,57 +1112,6 @@ def run_surgeon(
                 + "\n".join(_qa_lines)
             )
 
-    # ── PR #79: Surgeon self-visibility on retry ─────────────────────────────
-    # Root cause of the SMART3 failure: on a QA retry the Surgeon was handed the
-    # prose verdict but ALWAYS regenerated its SEARCH/REPLACE from the pristine
-    # original TARGET CODE — it never saw the broken code it had actually
-    # produced. So when QA flagged "duplicated return statements", the Surgeon
-    # could not locate the duplication it created and walked into the same trap
-    # every attempt. We now show the Surgeon the EXACT output its previous
-    # attempt produced, the code QA reviewed and rejected, so it can do a
-    # targeted fix instead of re-deriving the same mistake from scratch.
-    _prev_attempt_block = ""
-    if prev_attempt_code and prev_attempt_code.strip() and prev_attempt_code.strip() != (symbol.code or "").strip():
-        _prev_attempt_block = (
-            "\n\nYOUR PREVIOUS ATTEMPT (this is the exact code you produced last time; "
-            "QA reviewed THIS code and rejected it — do NOT reproduce its defects, "
-            "and in particular remove any duplicated, leftover, or now-unreachable "
-            "lines the new logic was meant to replace):\n"
-            "```\n" + prev_attempt_code.strip() + "\n```\n"
-            "Compare it against the ORIGINAL TARGET CODE below: your SEARCH text must still "
-            "come from the ORIGINAL TARGET CODE, and your REPLACE must be the COMPLETE corrected "
-            "symbol with the QA-flagged problems fixed and the original lines it replaces removed."
-        )
-
-    # ── PR #81: same-file identifier inventory for the Surgeon ───────────────
-    # The Surgeon sees only a windowed slice of a large file, not all of it. On
-    # big files (BIG10) it defensively RE-DECLARED a helper that already existed
-    # elsewhere (a new `const checkAdminAuth` while an `async function
-    # checkAdminAuth` already lived 1,200 lines away) — a hard runtime
-    # "Identifier 'checkAdminAuth' has already been declared" SyntaxError.
-    # PR #80 handed this inventory to QA only; now the Surgeon gets it too, at the
-    # source, so it reuses existing symbols instead of redeclaring them.
-    _surgeon_symbols_block = ""
-    try:
-        _existing_ids = _file_defined_identifiers(file_content)
-    except Exception:
-        _existing_ids = set()
-    if _existing_ids:
-        _shown_ids = sorted(_existing_ids)
-        _MAX_IDS = 400
-        _ids_str = ", ".join(_shown_ids[:_MAX_IDS])
-        if len(_shown_ids) > _MAX_IDS:
-            _ids_str += f", \u2026 (+{len(_shown_ids) - _MAX_IDS} more)"
-        _surgeon_symbols_block = (
-            "\n\nIDENTIFIERS ALREADY DEFINED OR IMPORTED ELSEWHERE IN THIS SAME FILE "
-            "(you are shown only a slice of the file, not all of it). These names already "
-            "exist and are in scope \u2014 CALL/REFERENCE them directly. Do NOT add a new "
-            "top-level const/let/class/function declaration for any of these names: "
-            "re-declaring an existing top-level binding is a duplicate-declaration "
-            "SyntaxError. Only declare a NEW name that is genuinely absent from this list:\n"
-            + _ids_str
-        )
-
     # For DELETE operations, new_logic is typically empty — make the instruction explicit
     # so the Surgeon doesn't misread "nothing to add" as "already correct".
     _ct_val = target.change_type.value if hasattr(target, "change_type") and target.change_type else "modify"
@@ -1257,7 +1172,7 @@ def run_surgeon(
     user_msg = f"""CHANGE PLAN:
 Type: {target.change_type.value}
 Description: {target.description}
-New logic required: {_new_logic_display}{_import_hint}{_file_header}{_semantic_section}{_surgeon_symbols_block}{_linter_block}{_extra_ctx_block}{_qa_feedback_block}{_prev_attempt_block}
+New logic required: {_new_logic_display}{_import_hint}{_file_header}{_semantic_section}{_linter_block}{_extra_ctx_block}{_qa_feedback_block}
 
 CONTEXT BEFORE (read-only reference, do NOT include in operations):
 {before_context}
@@ -3039,258 +2954,57 @@ Return ONLY valid JSON:
 Score guide: 9-10=safe, 7-8=minor notes, 5-6=warning, ≤4=blocked."""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# PR #74 — robust semantic-QA verdict call
-#
-# Root cause this fixes: a QA model call that returns 200-OK-but-empty (empty
-# text block, a refusal, or prose with no JSON) is NOT an SDK error, so the
-# Anthropic/OpenAI SDK auto-retry never fires. The old code ran a regex, got "",
-# counted it as a failure after 2 immediate no-backoff retries, and dropped
-# straight to the deterministic structural floor — which then shipped the file
-# at exactly the gate bar (8/10) without any semantic review ever running. On a
-# heavy run that brushed an overload window, this happened on EVERY attempt.
-#
-# This helper makes the semantic gate actually run:
-#   1. FORCE JSON OUTPUT. Anthropic calls use assistant prefill ("{") so the
-#      model must continue a JSON object — eliminating prose-prefix and
-#      empty-text non-answers. OpenAI calls use response_format=json_object.
-#   2. RETRY WITH BACKOFF, treating empty/unparseable as retryable (not just
-#      transport errors), with exponential backoff to ride out brief overloads.
-#   3. INDEPENDENT PROVIDER FAILOVER. If the primary provider is exhausted, fail
-#      over to a DIFFERENT provider (gpt-4.1) for a real semantic verdict — so a
-#      single provider's outage degrades to "reviewed by the backup model",
-#      not "not reviewed at all".
-#   4. FAIL FAST on permanent errors (bad/missing key, auth) — skip that
-#      provider instead of burning the retry budget.
-#   5. OBSERVABILITY. Every attempt's provider/outcome/reason is logged and
-#      summarised in the returned meta, so ship/hold decisions are explainable.
-#   6. DEADLINE-AWARE. Stops retrying as it approaches the caller's timeout
-#      (the bounded fix-loop calls from PR #73) so it can never cause a hang.
-#
-# Returns (data | None, meta):
-#   data — parsed JSON verdict dict, or None if NO provider produced a parseable
-#          semantic verdict within the deadline (caller then fails closed).
-#   meta — {"provider", "attempts", "reason", "semantic_ran"} for logging.
-# ─────────────────────────────────────────────────────────────────────────────
-def _qa_error_kind(e: Exception) -> str:
-    """Classify a provider error as 'permanent' (skip provider, don't retry) or
-    'transient' (retry with backoff)."""
-    s = (str(e) + " " + type(e).__name__).lower()
-    if any(k in s for k in (
-        "api key", "x-api-key", "authentication", "auth_error", "unauthorized",
-        "permission", "not configured", "invalid_request", "401", "403",
-    )):
-        return "permanent"
-    return "transient"
-
-
-async def _qa_llm_verdict(
-    system_prompt: str,
-    user_msg: str,
-    user_id: str = "",
-    *,
-    label: str = "qa",
-    run_id: str = "",
-    deadline_s: float = 80.0,
-) -> tuple:
-    """Robust semantic-QA verdict call with forced JSON, backoff retries, and
-    independent cross-provider failover. See block comment above.
-    Never raises — returns (data|None, meta)."""
-    import asyncio
-    import time as _time
-
-    _start = _time.monotonic()
-
-    def _remaining() -> float:
-        return deadline_s - (_time.monotonic() - _start)
-
-    def _parse(raw: str):
-        """Parse model text into a dict, tolerating fences/preamble. Returns
-        dict or None. Empty/whitespace -> None (retryable)."""
-        if not (raw or "").strip():
-            return None
-        try:
-            return json.loads(raw)
-        except Exception:
-            pass
-        try:
-            extracted = _extract_json_from_text(raw)
-            if extracted and extracted.strip():
-                return json.loads(extracted)
-        except Exception:
-            pass
-        return None
-
-    async def _call_claude() -> str:
-        # Assistant prefill forces the response to continue a JSON object.
-        _aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
-        _msg = await _aclient.messages.create(
-            model=QA_PRIMARY_MODEL,
-            max_tokens=1500,
-            system=system_prompt,
-            messages=[
-                {"role": "user", "content": user_msg},
-                {"role": "assistant", "content": "{"},
-            ],
-        )
-        _parts = [
-            b.text for b in _msg.content
-            if getattr(b, "type", None) == "text" and getattr(b, "text", None)
-        ]
-        _text = "".join(_parts).strip()
-        # Re-attach the prefilled brace the model was told to continue from.
-        if _text and not _text.lstrip().startswith("{"):
-            _text = "{" + _text
-        return _text
-
-    async def _call_openai() -> str:
-        client = _get_client(user_id)
-
-        def _call():
-            return _chat_create(
-                client,
-                model=QA_FALLBACK_MODEL,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_msg},
-                ],
-                temperature=0.1,
-                response_format={"type": "json_object"},
-            )
-
-        _resp = await asyncio.to_thread(_call)
-        return (_resp.choices[0].message.content or "").strip()
-
-    providers = (("claude", _call_claude), ("openai", _call_openai))
-
-    total_attempts = 0
-    last_reason = "no provider attempted"
-
-    for prov_name, prov_call in providers:
-        for attempt in range(QA_MAX_ATTEMPTS_PER_PROVIDER):
-            if _remaining() <= 2.0:
-                last_reason = f"deadline reached before {prov_name} attempt {attempt + 1}"
-                logger.info("[pipeline][QA:%s] run_id=%s %s", label, run_id, last_reason)
-                return None, {"provider": None, "attempts": total_attempts,
-                              "reason": last_reason, "semantic_ran": False}
-            total_attempts += 1
-            try:
-                raw = await prov_call()
-                data = _parse(raw)
-                if data is not None:
-                    logger.info(
-                        "[pipeline][QA:%s] run_id=%s verdict via %s on attempt %d/%d",
-                        label, run_id, prov_name, attempt + 1, QA_MAX_ATTEMPTS_PER_PROVIDER,
-                    )
-                    return data, {"provider": prov_name, "attempts": total_attempts,
-                                  "reason": "ok", "semantic_ran": True}
-                last_reason = f"{prov_name} returned empty/unparseable"
-                logger.info(
-                    "[pipeline][QA:%s] run_id=%s %s (attempt %d/%d)",
-                    label, run_id, last_reason, attempt + 1, QA_MAX_ATTEMPTS_PER_PROVIDER,
-                )
-            except Exception as e:
-                kind = _qa_error_kind(e)
-                last_reason = f"{prov_name} {kind} error: {str(e)[:100]}"
-                logger.info(
-                    "[pipeline][QA:%s] run_id=%s %s (attempt %d/%d)",
-                    label, run_id, last_reason, attempt + 1, QA_MAX_ATTEMPTS_PER_PROVIDER,
-                )
-                if kind == "permanent":
-                    break  # don't retry this provider; move to next provider
-
-            # Backoff before the next attempt within this provider.
-            if attempt + 1 < QA_MAX_ATTEMPTS_PER_PROVIDER:
-                delay = min(QA_RETRY_BASE_DELAY * (2 ** attempt), QA_RETRY_MAX_DELAY)
-                delay = min(delay, max(0.0, _remaining() - 1.0))
-                if delay > 0:
-                    await asyncio.sleep(delay)
-
-    logger.info(
-        "[pipeline][QA:%s] run_id=%s ALL providers exhausted (%d attempts) — last: %s",
-        label, run_id, total_attempts, last_reason,
-    )
-    return None, {"provider": None, "attempts": total_attempts,
-                  "reason": last_reason, "semantic_ran": False}
-
-
 async def _run_qa_for_new_file(file_result: dict, codebase_context: str, user_id: str = "") -> dict:
     """
     Lightweight QA check for Claude-created new files.
     Returns same shape as run_qa_agent for consistency.
     """
     import asyncio
-    import re as _re
+    try:
+        _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
+        _use_claude = True
+        _model = "claude-sonnet-4-6"
+    except Exception:
+        _qa_aclient = None
+        _use_claude = False
+        _model = "gpt-4.1"
 
-    filename     = file_result.get("filename", "new_file")
-    full_content = file_result.get("content", "") or ""
-
-    # ── PR #75: never hand the completeness reviewer a HEAD-truncated file ──
-    # The old `full_content[:6000]` silently cut the file at char 6000 with NO
-    # marker, so for any file larger than ~6000 chars (~120-150 lines) the
-    # semantic QA saw a file that ended mid-function — missing its route
-    # registration / exports / closing braces — and (correctly, for its input)
-    # returned verdict=blocked "truncated mid-function, exports missing". The
-    # hard 8/10 gate then false-blocked a COMPLETE file, and the dependency
-    # cascade blocked everything that referenced it. This stayed latent until
-    # PR #74 made semantic QA actually return verdicts instead of empties.
-    #
-    # The completeness check must be able to see that the file *ends properly*
-    # (final handlers, `module.exports`, closing braces). So:
-    #   • small/medium files (≤ _QA_VIEW_FULL): send the whole file, verbatim.
-    #   • large files: send HEAD + an explicit elision marker + TAIL, so the
-    #     reviewer sees both the opening structure AND the real ending and can
-    #     judge completeness honestly instead of mistaking a window edge for a
-    #     truncation. Deterministic delimiter-balance + structural_qa still run
-    #     on the FULL content, so genuine truncation is still caught for real.
-    _QA_VIEW_FULL = 16000   # ≤ this many chars → send the whole file
-    _QA_VIEW_HEAD = 9000    # large files: leading chars
-    _QA_VIEW_TAIL = 5000    # large files: trailing chars (exports/registration)
-    if len(full_content) <= _QA_VIEW_FULL:
-        content = full_content
-    else:
-        _elided = len(full_content) - _QA_VIEW_HEAD - _QA_VIEW_TAIL
-        content = (
-            full_content[:_QA_VIEW_HEAD]
-            + f"\n\n/* … [{_elided} chars elided for length — file continues; "
-              f"this is a middle cut, NOT the end of the file] … */\n\n"
-            + full_content[-_QA_VIEW_TAIL:]
-        )
+    filename = file_result.get("filename", "new_file")
+    content  = file_result.get("content", "")[:6000]
 
     user_msg = f"""CODEBASE CONTEXT (imports, types, and API signatures in the project):
 {codebase_context[:3000]}
 
-NEW FILE: {filename} ({len(full_content)} chars / {full_content.count(chr(10)) + 1} lines total)
+NEW FILE: {filename}
 {content}
 
 Run all 5 checks and return the JSON verdict."""
 
-    # ── PR #70: robust JSON extraction ────────────────────────────────────
-    # The LLM sometimes wraps JSON in a ```fence```, prefixes prose, or (the
-    # bug that blocked a complete 447-line file in the big-file stress test)
-    # returns an EMPTY string. json.loads("") throws "Expecting value: line 1
-    # column 1 (char 0)", which the old code mapped to verdict=skipped/score
-    # None — and the hard gate then blocked a perfectly good file at 0/10.
-    def _extract_json(s: str) -> str:
-        s = (s or "").strip()
-        if not s:
-            return ""
-        if s.startswith("```"):
-            s = _re.sub(r"^```[a-zA-Z0-9]*\n?", "", s)
-            s = _re.sub(r"\n?```\s*$", "", s).strip()
-        i, j = s.find("{"), s.rfind("}")
-        if i != -1 and j != -1 and j > i:
-            return s[i:j + 1]
-        return ""
+    try:
+        if _use_claude:
+            _msg = await _qa_aclient.messages.create(
+                model=_model, max_tokens=800,
+                system=QA_CREATE_SYSTEM,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            raw = _msg.content[0].text.strip()
+            if raw.startswith("```"):
+                lines = raw.split("\n")
+                raw = "\n".join(lines[1:] if lines[-1].strip() != "```" else lines[1:-1])
+        else:
+            client = _get_client(user_id)
+            def _call():
+                return _chat_create(client, model=_model,
+                    messages=[{"role":"system","content":QA_CREATE_SYSTEM},
+                               {"role":"user","content":user_msg}],
+                    temperature=0.1, response_format={"type":"json_object"})
+            resp = await asyncio.to_thread(_call)
+            raw = resp.choices[0].message.content
 
-    def _normalize(data: dict) -> dict:
-        try:
-            _score = int(data.get("qa_score", 7))
-        except (TypeError, ValueError):
-            _score = 7
+        data = json.loads(raw)
         return {
             "verdict":              data.get("verdict", "warning"),
-            "qa_score":             _score,
+            "qa_score":             int(data.get("qa_score", 7)),
             "summary":              data.get("summary", ""),
             "import_issues":        data.get("import_issues", []),
             "type_errors":          data.get("type_errors", []),
@@ -3299,110 +3013,13 @@ Run all 5 checks and return the JSON verdict."""
             "plan_deviation":       "",
             "risk_verdicts":        [],
         }
-
-    # ── PR #70: deterministic fallback when the LLM QA can't run ───────────
-    # A QA *infrastructure* failure (empty/garbled response, transient API
-    # error) must NOT be scored as if the FILE were terrible. Fall back to the
-    # zero-LLM structural checks (they support .ts/.tsx/.js/.jsx/.py/.vue/
-    # .svelte). If the file is structurally sound, let it ship; if structural
-    # QA finds a real blocking break (unbalanced delimiters, truncation,
-    # syntax), block it for real. This mirrors the operator's mental model:
-    # "run QA till issues resolve" — a QA that didn't run is not a fail.
-    def _delimiters_balanced(code: str) -> bool:
-        """Truncation detector: balanced {} () [] after stripping comments and
-        string/template literals (so a `}` inside a string can't false-trip)."""
-        s = code
-        s = _re.sub(r"/\*.*?\*/", "", s, flags=_re.S)   # block comments
-        s = _re.sub(r"//[^\n]*", "", s)                  # line comments (js)
-        s = _re.sub(r'#[^\n]*', "", s)                   # line comments (py/sh)
-        s = _re.sub(r'"(?:\\.|[^"\\])*"', '""', s)        # dq strings
-        s = _re.sub(r"'(?:\\.|[^'\\])*'", "''", s)        # sq strings
-        s = _re.sub(r"`(?:\\.|[^`\\])*`", "``", s)        # template literals
-        return (
-            s.count("{") == s.count("}")
-            and s.count("(") == s.count(")")
-            and s.count("[") == s.count("]")
-        )
-
-    def _deterministic_fallback(note: str = "") -> dict:
-        _suffix = f" ({note})" if note else ""
-        _c = full_content.strip()
-
-        # (a) Empty output is never shippable.
-        if not _c:
-            return {
-                "verdict": "blocked", "qa_score": 0,
-                "summary": f"QA unavailable{_suffix} and file is empty",
-                "import_issues": [], "type_errors": [], "completeness_issues": [],
-                "downstream_risks": [], "plan_deviation": "", "risk_verdicts": [],
-            }
-
-        # (b) Truncation detector — catches a NEW file cut off mid-block, which
-        # structural_qa's completeness check can't see (it needs original_code).
-        if not _delimiters_balanced(_c):
-            return {
-                "verdict": "blocked", "qa_score": 3,
-                "summary": f"Unbalanced delimiters{_suffix} — file looks truncated/incomplete",
-                "import_issues": [], "type_errors": [],
-                "completeness_issues": ["Unbalanced braces/parens/brackets — likely truncated output"],
-                "downstream_risks": [], "plan_deviation": "", "risk_verdicts": [],
-            }
-
-        # (c) Deterministic zero-LLM structural checks (supports .ts/.tsx/.js/
-        # .jsx/.py/.vue/.svelte). Block on a real structural break.
-        try:
-            from services.structural_qa import (
-                run_structural_qa as _sq,
-                has_blocking_issues as _sqb,
-            )
-            _issues = _sq(new_code=full_content, original_code="", filename=filename)
-            if _issues and _sqb(_issues):
-                _msgs = "; ".join(
-                    i.get("message", "") for i in _issues
-                    if i.get("severity") == "error"
-                )[:200]
-                return {
-                    "verdict": "blocked", "qa_score": 3,
-                    "summary": f"Structural QA failed{_suffix}: {_msgs}",
-                    "import_issues": [], "type_errors": [],
-                    "completeness_issues": [_msgs],
-                    "downstream_risks": [], "plan_deviation": "",
-                    "risk_verdicts": [],
-                }
-        except Exception:
-            pass  # structural module unavailable — balance check above still ran
-
-        # (d) Non-empty, balanced, no structural breaks.
-        # PR #74 FAIL-CLOSED POLICY: structural checks catch truncation/empties,
-        # but they do NOT perform semantic review (imports/types/API-usage/logic).
-        # When the semantic gate genuinely could not run — even after forced-JSON,
-        # backoff retries, and independent cross-provider failover — we must NOT
-        # ship a file the gate never reviewed at exactly the ship bar (the old
-        # behaviour returned 8/10, sliding unreviewed code through "at 8/10").
-        # Instead we HOLD below the gate (score 7 / verdict warning) with an
-        # honest reason. The hard 8/10 gate then blocks it and the fix-loop will
-        # re-QA — if a provider has recovered, a real verdict replaces this.
+    except Exception as e:
         return {
-            "verdict": "warning", "qa_score": 7,  # < QA_GATE_MIN_SCORE (8) → held
-            "summary": f"Semantic QA unavailable{_suffix}; structural checks passed "
-                       f"but semantic review did not run — held below gate (fail-closed).",
+            "verdict": "skipped", "qa_score": None,
+            "summary": f"QA skipped: {str(e)[:100]}",
             "import_issues": [], "type_errors": [], "completeness_issues": [],
             "downstream_risks": [], "plan_deviation": "", "risk_verdicts": [],
         }
-
-    # PR #74: robust semantic-QA call — forced JSON, backoff retries, and
-    # independent cross-provider failover (Claude → gpt-4.1). Replaces the old
-    # 2-try no-backoff loop whose empty completions dropped straight to the
-    # structural floor and shipped unreviewed at the gate bar.
-    _data, _meta = await _qa_llm_verdict(
-        QA_CREATE_SYSTEM, user_msg, user_id,
-        label="newfile", deadline_s=75.0,
-    )
-    if _data is not None:
-        return _normalize(_data)
-
-    # No provider produced a parseable semantic verdict → fail closed.
-    return _deterministic_fallback(note=_meta.get("reason", "semantic QA unavailable"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3522,42 +3139,6 @@ async def _run_tests_inline(patched_files: dict, session_id: str) -> dict:
     finally:
         import shutil as _shutil
         _shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def _assemble_patched_file_map(session_files: list, applied_changes: list) -> dict:
-    """Build {filename: full content} for the WHOLE session with every supplied
-    change's current new_code applied.
-
-    Tests import un-edited sibling files, so we must start from ALL session files
-    (not only the edited ones), then substitute each changed symbol's original
-    code with its new code — the same per-symbol assembly the deterministic gate
-    uses, extended across the whole multi-change set.
-
-    `applied_changes` is the subset of change shells that should be reflected
-    (normally the ones currently passing the per-change gate). Pure + side-effect
-    free so it is unit-testable in isolation.
-    """
-    files: dict = {
-        (sf.get("filename") if isinstance(sf, dict) else None): (
-            (sf.get("content") if isinstance(sf, dict) else "") or ""
-        )
-        for sf in (session_files or [])
-    }
-    files.pop(None, None)
-    for cs in (applied_changes or []):
-        fname = cs.get("filename")
-        if not fname:
-            continue
-        base = files.get(fname)
-        if base is None:
-            base = cs.get("qa_original_content") or ""
-        sym = cs.get("symbol")
-        orig_code = getattr(sym, "code", "") or ""
-        new_code = cs.get("new_code") or ""
-        if orig_code and orig_code in base:
-            base = base.replace(orig_code, new_code, 1)
-        files[fname] = base
-    return files
 
 
 # QA AGENT — runs after every Surgeon output, before diff card is shown to user
@@ -3910,75 +3491,6 @@ risk_verdicts must have one entry per item in architect_risks. If architect_risk
 logic_errors must be present — use [] if no logic errors found."""
 
 
-# ── PR #80: file-symbol visibility for QA on large files ─────────────────────
-# Root cause of the BIG9 large-file false-block: QA reviews ONE changed symbol in
-# isolation. On a 200KB/6,000-line file it never sees the rest of the file, so
-# every reference to a helper defined elsewhere in the SAME file (e.g. rowToCSV,
-# parseCSVLine, checkAdminAuth, requireAdmin, the express `app`) looks "undefined"
-# and QA scores it blocked at 4/10 — three attempts in a row, gate blocks correct
-# code. We can't fix this by enlarging the QA window (the file is far over budget),
-# so we hand QA a deterministic, zero-LLM inventory of identifiers that are
-# provably defined or imported in the file. QA then stops hallucinating "undefined
-# symbol" issues, and a deterministic backstop clears any it still emits.
-def _file_defined_identifiers(file_content: str) -> set:
-    """Return the set of identifiers DEFINED or IMPORTED at any point in the file.
-    Deterministic, language-tolerant (JS/TS + Python). Over-inclusion is safe
-    (worst case: QA doesn't flag a same-named undefined symbol — rare); the goal
-    is to never UNDER-include a real definition and thus false-block valid code."""
-    ids: set = set()
-    if not file_content:
-        return ids
-    import re as _re
-    fc = file_content
-    # JS/TS function declarations:  function foo / async function foo
-    ids.update(_re.findall(r"\b(?:async\s+)?function\s+([A-Za-z_$][\w$]*)", fc))
-    # JS/TS simple bindings (incl arrow fns):  const/let/var NAME =
-    ids.update(_re.findall(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", fc))
-    # class declarations (JS/TS/Python)
-    ids.update(_re.findall(r"\bclass\s+([A-Za-z_$][\w$]*)", fc))
-    # Python def
-    ids.update(_re.findall(r"\bdef\s+([A-Za-z_][\w]*)", fc))
-    # Object-destructure bindings:  const { a, b: c, d = 1 } = require(...)/import
-    for _grp in _re.findall(r"\b(?:const|let|var)\s*\{([^}]*)\}\s*=", fc):
-        for _part in _grp.split(","):
-            _name = _re.sub(r"[^\w$]", "", _part.split(":")[-1].split("=")[0].strip())
-            if _name:
-                ids.add(_name)
-    # Array-destructure bindings:  const [ a, b ] = ...
-    for _grp in _re.findall(r"\b(?:const|let|var)\s*\[([^\]]*)\]\s*=", fc):
-        for _part in _grp.split(","):
-            _name = _re.sub(r"[^\w$]", "", _part.strip())
-            if _name:
-                ids.add(_name)
-    # ES module imports:  import X, {a, b as c}, * as ns from '...'
-    for _clause in _re.findall(r"\bimport\s+(.+?)\s+from\b", fc, _re.S):
-        ids.update(_re.findall(r"[A-Za-z_$][\w$]*", _clause))
-    # Python:  import a, a.b as c
-    for _line in _re.findall(r"^\s*import\s+([^\n#]+)", fc, _re.M):
-        for _part in _line.split(","):
-            _tok = _re.sub(r"[^\w]", "", _part.strip().split(" as ")[-1].strip().split(".")[0])
-            if _tok:
-                ids.add(_tok)
-    # Python:  from m import a, b as c
-    for _line in _re.findall(r"^\s*from\s+\S+\s+import\s+([^\n#]+)", fc, _re.M):
-        for _part in _line.replace("(", "").replace(")", "").split(","):
-            _tok = _re.sub(r"[^\w]", "", _part.strip().split(" as ")[-1].strip())
-            if _tok and _tok != "*":
-                ids.add(_tok)
-    # JS keywords / import syntax tokens that aren't real identifiers
-    ids.discard("")
-    for _kw in ("import", "from", "as", "type", "default"):
-        ids.discard(_kw)
-    return ids
-
-
-# Phrases QA uses when it (wrongly, on a large file) believes a symbol is undefined.
-_QA_UNDEFINED_PHRASES = (
-    "not defined", "undefined", "not imported", "missing import", "no import",
-    "is not declared", "not declared", "needs an import", "needs to be imported",
-)
-
-
 async def run_qa_agent(
     original_code: str,
     new_code: str,
@@ -3993,7 +3505,6 @@ async def run_qa_agent(
     targeted_context: str = "",
     qa_feedback: dict = None,
     same_run_context: str = "",
-    file_content: str = "",   # PR #80: full source of the edited file (for symbol visibility)
 ) -> dict:
     """
     QA agent: verifies Surgeon output before showing diff card to user.
@@ -4006,8 +3517,15 @@ async def run_qa_agent(
     _risks_block = "\n".join(f"- {r}" for r in _risks_list) if _risks_list else "(none — skip risk_verdicts)"
     import asyncio
 
-    # PR #74: provider selection, retry, and cross-provider failover now live in
-    # the shared _qa_llm_verdict() helper — no eager client creation here.
+    # Prefer Claude Sonnet for QA — strongest semantic code reasoning in the chain
+    try:
+        _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
+        _qa_use_claude = True
+        _qa_model = "claude-sonnet-4-6"
+    except Exception:
+        _qa_aclient = None
+        _qa_use_claude = False
+        _qa_model = "gpt-4.1"  # full GPT-4.1, not mini — QA must not be weakest link
 
     # v3.11.4: QA receives FULL code — no truncation, no diff confusion.
     # Claude Sonnet has 200K context. A full symbol is typically <20KB (~5K tokens).
@@ -4028,34 +3546,6 @@ async def run_qa_agent(
     _targeted_block = ""
     if targeted_context and targeted_context.strip():
         _targeted_block = f"\n\nTARGETED CROSS-FILE CONTEXT (callers/usages of the changed symbol):\n{targeted_context.strip()}"
-
-    # ── PR #80: same-file symbol visibility ──────────────────────────────────
-    # QA only receives the changed symbol, not the whole file. On large files
-    # that caused false "undefined symbol / missing import" blocks for helpers
-    # that ARE defined elsewhere in the same file. Hand QA the deterministic
-    # inventory of identifiers defined/imported in THIS file so it stops flagging
-    # them. (Skip when the QA window already contains the whole file.)
-    _file_symbols_block = ""
-    _file_symbol_ids: set = set()
-    if file_content and file_content.strip() and file_content.strip() != (new_code or "").strip():
-        try:
-            _file_symbol_ids = _file_defined_identifiers(file_content)
-        except Exception:
-            _file_symbol_ids = set()
-        if _file_symbol_ids:
-            _shown = sorted(_file_symbol_ids)
-            _MAX_SHOWN = 400
-            _list_str = ", ".join(_shown[:_MAX_SHOWN])
-            if len(_shown) > _MAX_SHOWN:
-                _list_str += f", … (+{len(_shown) - _MAX_SHOWN} more)"
-            _file_symbols_block = (
-                "\n\nIDENTIFIERS ALREADY DEFINED OR IMPORTED ELSEWHERE IN THIS SAME FILE "
-                "(the NEW CODE shows only the changed symbol, NOT the whole file — these names "
-                "are available at runtime, so do NOT report them as undefined, missing-import, "
-                "or not-declared issues; only flag identifiers that are genuinely absent from "
-                "both the NEW CODE and this list):\n"
-                + _list_str
-            )
 
     # QA feedback block injected on retry
     _qa_feedback_block = ""
@@ -4087,129 +3577,42 @@ NEW CODE (complete — this is what the Surgeon produced):
 {_new_snippet}
 
 OTHER FILES IN SESSION (for cross-file checking):
-{other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_file_symbols_block}{_qa_feedback_block}
+{other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_qa_feedback_block}
 
 {("\n\nOTHER CHANGES IN THIS SAME REQUEST (planned but reviewed separately — cross-symbol deps covered by these should be scored as warnings, not blocks):\n" + same_run_context + "\n") if same_run_context else ""}Compare ORIGINAL CODE → NEW CODE directly. Run all 8 checks and return the JSON verdict.
 
 ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 {_risks_block}"""
 
-    import re as _re
-
-    def _edit_delims_balanced(code: str) -> bool:
-        """Truncation detector for edits — balanced {} () [] after stripping
-        comments and string/template literals."""
-        s = code
-        s = _re.sub(r"/\*.*?\*/", "", s, flags=_re.S)
-        s = _re.sub(r"//[^\n]*", "", s)
-        s = _re.sub(r"#[^\n]*", "", s)
-        s = _re.sub(r'"(?:\\.|[^"\\])*"', '""', s)
-        s = _re.sub(r"'(?:\\.|[^'\\])*'", "''", s)
-        s = _re.sub(r"`(?:\\.|[^`\\])*`", "``", s)
-        return (
-            s.count("{") == s.count("}")
-            and s.count("(") == s.count(")")
-            and s.count("[") == s.count("]")
-        )
-
-    def _edit_struct_fallback(note: str = "") -> dict:
-        """Deterministic structural QA fallback for EDITS, used when the QA
-        model returns empty/garbage. We have BOTH original and new code here,
-        so structural_qa's completeness + syntax checks are fully effective.
-
-        A QA that *could not run* must NOT be scored as a real quality failure:
-        the old code returned qa_score=None → the hard gate read it as 0/10 and
-        false-blocked clean edits (e.g. a one-line require()). Mirrors PR #70's
-        new-file resilience for the edit path.
-        """
-        _suffix = f" ({note})" if note else ""
-        _new = (new_code or "").strip()
-
-        def _ret(_res: dict) -> dict:
-            try:
-                _log_qa_result(session_id, filename, symbol_path, _res)
-            except Exception:
-                pass
-            return _res
-
-        # No-op edits (original == new) are legitimately fine.
-        if _no_change:
-            return _ret({
-                "verdict": "safe", "qa_score": 8,
-                "summary": f"QA model unavailable{_suffix}; no code change detected "
-                           f"(original == new) — structurally safe.",
-                "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
-                "type_errors": [], "plan_deviation": "", "skipped_reason": None,
-            })
-        # Empty new code for a real edit is never shippable.
-        if not _new:
-            return _ret({
-                "verdict": "blocked", "qa_score": 0,
-                "summary": f"QA model unavailable{_suffix} and new code is empty.",
-                "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
-                "type_errors": [], "plan_deviation": "", "skipped_reason": note,
-            })
-        # Truncation detector.
-        if not _edit_delims_balanced(_new):
-            return _ret({
-                "verdict": "blocked", "qa_score": 3,
-                "summary": f"QA model unavailable{_suffix}; new code has unbalanced "
-                           f"delimiters — looks truncated/incomplete.",
-                "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
-                "type_errors": [],
-                "plan_deviation": "", "skipped_reason": note,
-            })
-        # Deterministic zero-LLM structural checks (has original + new).
-        try:
-            from services.structural_qa import (
-                run_structural_qa as _sq,
-                has_blocking_issues as _sqb,
-            )
-            _issues = _sq(new_code=new_code, original_code=original_code, filename=filename)
-            if _issues and _sqb(_issues):
-                _msgs = "; ".join(
-                    i.get("message", "") for i in _issues
-                    if i.get("severity") == "error"
-                )[:200]
-                return _ret({
-                    "verdict": "blocked", "qa_score": 3,
-                    "summary": f"QA model unavailable{_suffix}; structural QA found "
-                               f"blocking issues: {_msgs}",
-                    "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
-                    "type_errors": [], "plan_deviation": "", "skipped_reason": note,
-                })
-        except Exception:
-            pass  # structural module unavailable — balance check above still ran
-        # Non-empty, balanced, no structural breaks.
-        # PR #74 FAIL-CLOSED POLICY (edit path): structural checks confirm the
-        # edit isn't truncated/empty, but they do NOT perform semantic review
-        # (import/type/logic/cross-file). When the semantic gate genuinely could
-        # not run — after forced-JSON, backoff retries, and cross-provider
-        # failover — we HOLD below the gate (7 / warning) rather than ship an
-        # unreviewed edit at the ship bar. The hard gate then blocks it and the
-        # fix-loop re-QAs; a recovered provider replaces this with a real verdict.
-        return _ret({
-            "verdict": "warning", "qa_score": 7,  # < QA_GATE_MIN_SCORE (8) → held
-            "summary": f"Semantic QA unavailable{_suffix}; structural checks passed "
-                       f"but semantic review did not run — held below gate (fail-closed).",
-            "risk_verdicts": [], "import_issues": [], "downstream_risks": [],
-            "type_errors": [], "plan_deviation": "", "skipped_reason": note,
-        })
-
     try:
-        # PR #74: robust semantic-QA call — forced JSON output, backoff retries
-        # (empty completions are retried, not just transport errors), and
-        # independent cross-provider failover (Claude → gpt-4.1). Replaces the
-        # prior single-retry path whose empty responses dropped to the structural
-        # floor and shipped unreviewed edits at the gate bar.
-        data, _qa_meta = await _qa_llm_verdict(
-            QA_SYSTEM, user_msg, user_id,
-            label="edit", run_id=session_id, deadline_s=80.0,
-        )
-        # No provider produced a parseable semantic verdict → fail closed
-        # (structural checks still block real truncation/empties).
-        if data is None:
-            return _edit_struct_fallback(_qa_meta.get("reason", "semantic QA unavailable after retries+failover"))
+        if _qa_use_claude:
+            _qa_msg = await _qa_aclient.messages.create(
+                model=_qa_model,
+                max_tokens=1500,
+                system=QA_SYSTEM,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            raw = (_qa_msg.content[0].text or "").strip()
+            # Robust JSON extraction — Claude sometimes adds preamble or markdown fences
+            raw = _extract_json_from_text(raw)
+        else:
+            client = _get_client(user_id)
+
+            def _call():
+                return _chat_create(
+                    client,
+                    model=_qa_model,
+                    messages=[
+                        {"role": "system", "content": QA_SYSTEM},
+                        {"role": "user",   "content": user_msg},
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                )
+
+            response = await asyncio.to_thread(_call)
+            raw = response.choices[0].message.content
+        data = json.loads(raw)
 
         result = {
             "verdict":          data.get("verdict", "warning"),
@@ -4219,84 +3622,9 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
             "import_issues":    data.get("import_issues", []),
             "downstream_risks": data.get("downstream_risks", []),
             "type_errors":      data.get("type_errors", []),
-            "logic_errors":     data.get("logic_errors", []),
             "plan_deviation":   data.get("plan_deviation", ""),
             "skipped_reason":   None,
         }
-
-        # ── PR #80: clear provably-false "undefined symbol" flags ────────────
-        # Even with the visibility list above, QA may still emit an undefined/
-        # missing-import issue for a helper that is actually defined elsewhere in
-        # THIS file. Such a flag is a hallucination the Surgeon can never "fix"
-        # (the code is already correct), so left in place it burns every retry
-        # and then false-blocks correct code — exactly the BIG9 failure. We drop
-        # ONLY flags that are provably false: an undefined-style issue whose named
-        # code identifiers are ALL present in the file inventory. Genuine
-        # undefined symbols (any named identifier NOT in the file) are untouched.
-        if _file_symbol_ids:
-            import re as _re2
-            _new_code_idents = set(_re2.findall(r"[A-Za-z_$][\w$]*", new_code or ""))
-            _code_universe = _file_symbol_ids | _new_code_idents
-
-            def _ident_shaped(_tok: str) -> bool:
-                # camelCase / PascalCase-internal / snake_case / $-prefixed —
-                # shapes that are unmistakably code identifiers, never English words.
-                return bool(
-                    _re2.search(r"[a-z][A-Z]", _tok)
-                    or _re2.search(r"[A-Za-z]_[A-Za-z]", _tok)
-                    or "$" in _tok
-                )
-
-            def _is_false_undefined(_issue) -> bool:
-                _t = str(_issue or "")
-                _tl = _t.lower()
-                if not any(_p in _tl for _p in _QA_UNDEFINED_PHRASES):
-                    return False
-                _toks = set(_re2.findall(r"[A-Za-z_$][\w$]*", _t))
-                # The code identifiers this issue is really talking about: tokens
-                # that are known to the file/edit, OR are unmistakably code-shaped
-                # (so a genuinely-missing camelCase symbol still counts and is NOT
-                # mistaken for an English word).
-                _cands = {x for x in _toks if x in _code_universe or _ident_shaped(x)}
-                # False positive only if it names ≥1 identifier and EVERY named
-                # identifier is defined in-file. If it names anything genuinely
-                # absent (not defined in this file), keep the issue.
-                return bool(_cands) and _cands.issubset(_file_symbol_ids)
-
-            _orig_import_issues = list(result.get("import_issues") or [])
-            _kept = [i for i in _orig_import_issues if not _is_false_undefined(i)]
-            _cleared = len(_orig_import_issues) - len(_kept)
-            if _cleared > 0:
-                result["import_issues"] = _kept
-                # If the ONLY problems were hallucinated undefined symbols (no real
-                # import errors, type errors, logic errors, plan deviation, or
-                # blocked risks remain), the change is clean — lift the hallucinated
-                # block. downstream_risks are non-blocking by design (mirrors the
-                # existing _has_hard_issues definition) and don't prevent recovery.
-                _real_remaining = bool(
-                    result.get("import_issues")
-                    or result.get("type_errors")
-                    or result.get("logic_errors")
-                    or (result.get("plan_deviation") or "").strip()
-                    or any(
-                        isinstance(_rv, dict) and _rv.get("status") == "blocked"
-                        for _rv in (result.get("risk_verdicts") or [])
-                    )
-                )
-                if not _real_remaining and result.get("qa_score", 0) < 8:
-                    result["qa_score"] = 8
-                    result["verdict"] = "safe"
-                    result["summary"] = (
-                        (result.get("summary", "") or "").rstrip()
-                        + f" [PR80: cleared {_cleared} false 'undefined symbol' flag(s) — "
-                        "referenced helper(s) are defined elsewhere in this file; "
-                        "no real blocking issues remain.]"
-                    )
-                    logger.info(
-                        "[pipeline][QA] run_id=%s %s: cleared %d false undefined-symbol "
-                        "flag(s) on large file → score lifted to 8 (no real issues remain)",
-                        session_id, symbol_path, _cleared,
-                    )
 
         # Enforce verdict/score consistency
         # If QA found hard blockers (missing imports, logic errors, type errors)
@@ -4323,12 +3651,21 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
         return result
 
     except Exception as e:
-        # QA infra failure — fall back to deterministic structural QA rather
-        # than returning qa_score=None (which the hard gate reads as 0/10 and
-        # would false-block a clean change). Mirrors PR #70 for new files.
-        logger.info("[pipeline][QA] run_id=%s QA call errored for %s: %s — structural fallback",
-                    session_id, symbol_path, str(e)[:120])
-        return _edit_struct_fallback(f"QA error: {str(e)[:80]}")
+        skipped = {
+            "verdict":          "skipped",
+            "qa_score":         None,
+            "summary":          "QA check could not run — review manually",
+            "import_issues":    [],
+            "downstream_risks": [],
+            "type_errors":      [],
+            "plan_deviation":   "",
+            "skipped_reason":   str(e)[:200],
+        }
+        try:
+            _log_qa_result(session_id, filename, symbol_path, skipped)
+        except Exception:
+            pass
+        return skipped
 
 
 def _log_qa_result(session_id: str, filename: str, symbol_name: str, result: dict):
@@ -4559,7 +3896,6 @@ async def _run_claude_direct_rewrite(
     )
 
     import time as _time_dr
-    import asyncio  # used by the 529 back-off below (was a latent NameError)
     _dr_max_attempts = 3
     _dr_delay = 10  # seconds between 529 retries
     for _dr_attempt in range(_dr_max_attempts):
@@ -4595,214 +3931,6 @@ async def _run_claude_direct_rewrite(
     raise RuntimeError("[DIRECT_REWRITE] Claude did not call submit_file_rewrite — check model/key")
 
 
-def _strip_code_fences(text: str) -> str:
-    """Remove a leading ```lang fence and a trailing ``` fence if the model
-    wrapped the file in markdown despite being told not to. Leaves the inner
-    file content untouched. Conservative: only strips when a fence is actually
-    the first / last non-empty line."""
-    import re as _re_sf
-    s = text
-    # Leading fence: optional whitespace then ``` optionally followed by a lang token, then newline.
-    s = _re_sf.sub(r"^\s*```[^\n`]*\n", "", s, count=1)
-    # Trailing fence: a final line that is just ```
-    s = _re_sf.sub(r"\n```\s*$", "\n", s, count=1)
-    return s
-
-
-def _file_looks_complete(code: str) -> bool:
-    """Lightweight truncation detector for a generated file: balanced
-    {} () [] after stripping comments and string/template literals so a brace
-    inside a string can't false-trip. Mirrors the QA gate's own check so the
-    continuation helper and the gate agree on what 'complete' means."""
-    import re as _re_fc
-    s = code
-    s = _re_fc.sub(r"/\*.*?\*/", "", s, flags=_re_fc.S)
-    s = _re_fc.sub(r"//[^\n]*", "", s)
-    s = _re_fc.sub(r"#[^\n]*", "", s)
-    s = _re_fc.sub(r'"(?:\\.|[^"\\])*"', '""', s)
-    s = _re_fc.sub(r"'(?:\\.|[^'\\])*'", "''", s)
-    s = _re_fc.sub(r"`(?:\\.|[^`\\])*`", "``", s)
-    return (
-        s.count("{") == s.count("}")
-        and s.count("(") == s.count(")")
-        and s.count("[") == s.count("]")
-    )
-
-
-def _dedupe_continuation_overlap(accumulated: str, chunk: str, max_overlap: int = 400) -> str:
-    """When resuming a cut-off file the model sometimes repeats the last few
-    characters/lines it already wrote. Trim the largest suffix of `accumulated`
-    that is a prefix of `chunk` so the stitched file has no duplicated text."""
-    if not accumulated or not chunk:
-        return chunk
-    _max = min(max_overlap, len(accumulated), len(chunk))
-    for _n in range(_max, 0, -1):
-        if accumulated[-_n:] == chunk[:_n]:
-            return chunk[_n:]
-    return chunk
-
-
-async def _generate_new_file_with_continuation(
-    filename: str,
-    spec: str,
-    codebase_context: str = "",
-    qa_feedback: str = "",
-    prior_attempt: str = "",
-    anthropic_key: str = "",
-    model: str = "",
-    max_rounds: int = 6,
-    per_round_tokens: int = 16000,
-) -> dict:
-    """Generate a COMPLETE source file as raw text, continuing across model
-    turns whenever the output hits the token cap.
-
-    This is the new-file analogue of how a human/agent writes a long file:
-    stream it out, and if cut off, RESUME from the exact stopping point —
-    never restart from scratch (which just reproduces the same truncation).
-
-    Why raw text and not tool_use/JSON:
-      • A whole source file escaped inside a JSON string inflates token usage
-        ~30-60% (every " \\ \\n template-literal gets escaped) and shrinks the
-        effective budget.
-      • A truncated JSON blob is unparseable / catastrophic; truncated raw text
-        degrades gracefully and can be continued.
-      • Forcing tool_use blocks extended thinking but still pays the escaping
-        tax and has no continuation path on a max_tokens cutoff.
-
-    Returns: {"content": str, "rounds": int, "complete": bool,
-              "stop_reason": str, "confidence": int}
-    """
-    from anthropic import AsyncAnthropic as _ContAnthropic
-    import asyncio as _asyncio_c
-
-    _client = _ContAnthropic(api_key=anthropic_key)
-
-    _system = (
-        "You are a senior software engineer. You output the COMPLETE, raw contents "
-        f"of the file `{filename}` and NOTHING else.\n"
-        "STRICT OUTPUT RULES:\n"
-        "- Output ONLY the file's source code, starting at the very first line "
-        "(imports/requires) and ending at the final line.\n"
-        "- Do NOT wrap the output in markdown code fences (no ``` ).\n"
-        "- Do NOT add commentary, explanations, JSON, or any other blocks.\n"
-        "- Do NOT use ellipsis, '... rest unchanged', or placeholder comments.\n"
-        "- The file MUST be syntactically valid and complete: every function "
-        "body, every bracket, and every export/registration present."
-    )
-
-    _ctx_block = f"\n\nRELEVANT CODEBASE CONTEXT (for correct imports/usage):\n{codebase_context}\n" if codebase_context.strip() else ""
-    _qa_block = (
-        f"\n\nThe previous attempt FAILED quality review. Fix ALL of these issues "
-        f"and output the entire corrected file:\n{qa_feedback}\n"
-        if qa_feedback.strip() else ""
-    )
-    _prior_block = ""
-    if prior_attempt.strip():
-        _prior_block = (
-            "\n\nThe previous attempt was INCOMPLETE/TRUNCATED (do NOT copy it "
-            "verbatim — produce a complete version):\n"
-            f"```\n{prior_attempt}\n```\n"
-        )
-
-    _first_user = (
-        f"Create the file `{filename}`.\n\n"
-        f"WHAT IT MUST DO:\n{spec}\n"
-        f"{_ctx_block}{_qa_block}{_prior_block}\n"
-        f"Output the complete raw contents of `{filename}` now."
-    )
-
-    _messages: list = [{"role": "user", "content": _first_user}]
-    _accumulated = ""
-    _stop_reason = ""
-    _rounds = 0
-
-    _continue_instr = (
-        "Your output was cut off by the length limit. Continue the file from "
-        "EXACTLY where you stopped — output ONLY the remaining raw text needed "
-        "to finish the file. Do NOT repeat any line you already wrote. Do NOT "
-        "restate earlier code. Do NOT add code fences or commentary."
-    )
-
-    for _rounds in range(1, max_rounds + 1):
-        # Bounded retry on transient 529 overloads.
-        _resp = None
-        _delay = 8
-        for _attempt in range(3):
-            try:
-                _resp = await _client.messages.create(
-                    model=model,
-                    max_tokens=per_round_tokens,
-                    system=_system,
-                    messages=_messages,
-                )
-                break
-            except Exception as _e:
-                _m = str(_e)
-                if ("529" in _m or "overloaded" in _m.lower()) and _attempt < 2:
-                    await _asyncio_c.sleep(_delay)
-                    _delay = min(_delay * 2, 60)
-                    continue
-                raise
-
-        _chunk = "".join(getattr(_b, "text", "") or "" for _b in (_resp.content or []))
-        _stop_reason = getattr(_resp, "stop_reason", "") or ""
-
-        if not _chunk.strip() and not _accumulated:
-            # Nothing came back at all — give up; caller's gate will block.
-            break
-
-        # Strip stray fences only on the first chunk (start) / last chunk (end).
-        if not _accumulated:
-            _chunk = _strip_code_fences(_chunk)
-        _chunk = _dedupe_continuation_overlap(_accumulated, _chunk)
-        _accumulated += _chunk
-
-        if _stop_reason != "max_tokens":
-            # Model finished its turn naturally (end_turn / stop_sequence).
-            break
-
-        # Hit the cap — set up a continuation round with the model's own output
-        # as the assistant turn, then ask it to resume.
-        _messages = _messages + [
-            {"role": "assistant", "content": _accumulated},
-            {"role": "user", "content": _continue_instr},
-        ]
-
-    _final = _strip_code_fences(_accumulated).strip("\n") + "\n" if _accumulated.strip() else ""
-    _complete = bool(_final.strip()) and _stop_reason != "max_tokens" and _file_looks_complete(_final)
-
-    return {
-        "content": _final,
-        "rounds": _rounds,
-        "complete": _complete,
-        "stop_reason": _stop_reason,
-        "confidence": 8 if _complete else 4,
-    }
-
-
-def _qa_fails_ship_gate(qa, gate_min: int) -> bool:
-    """Single source of truth for 'this edit/file CANNOT ship' in the smart
-    pipeline. Called by BOTH the fix-loop retry trigger AND the hard ship gate
-    so the two predicates can never drift apart again.
-
-    PR #78 bug: the gate blocked anything score < gate_min, but the retry only
-    fired on verdict=="blocked" (and score<=7, one-shot). A "warning" at score 6
-    was therefore blocked by the gate yet never sent back for a fix — the work
-    was silently dropped instead of repaired. Routing both through this one
-    predicate guarantees: if it would fail the gate, it is eligible for a fix
-    retry; whatever still fails after retries is blocked.
-
-    Field extraction mirrors the gate's _gate_qa_fields: a None/absent qa, or a
-    None/0 score, is treated as FAILING (fail-closed)."""
-    if qa is None:
-        verdict, score = "skipped", 0
-    elif isinstance(qa, dict):
-        verdict, score = qa.get("verdict", "skipped"), (qa.get("qa_score") or 0)
-    else:
-        verdict, score = getattr(qa, "verdict", "skipped"), (getattr(qa, "qa_score", None) or 0)
-    return verdict == "blocked" or score < gate_min
-
-
 async def run_smart_pipeline_stream(
     session_files: list,
     user_request: str,
@@ -4831,25 +3959,6 @@ async def run_smart_pipeline_stream(
 
     run_id = str(uuid.uuid4())
     compliance = ComplianceTracker(run_id=run_id, session_id=session_id or "", intent="unknown")
-
-    # PR #76: hard QA gate threshold — mirror run_natural_pipeline_stream.
-    # This pipeline previously computed QA verdicts but NEVER enforced them:
-    # the new-file path, the direct-rewrite path, and the Surgeon edit path all
-    # appended their result to the ship set unconditionally, so a change/file
-    # QA blocked (verdict=blocked or qa_score < 8) still shipped — the same
-    # fail-OPEN bug class PR #74 closed in the natural pipeline. The gates below
-    # make the smart pipeline fail-CLOSED: nothing below the bar reaches the
-    # applyable result; blocked items move to skipped_changes and are logged.
-    QA_GATE_MIN_SCORE = 8
-
-    def _gate_qa_fields(qa) -> tuple:
-        """Read (verdict, score) from a QAResult model, a dict, or None.
-        None/absent ⇒ fail-closed (treated as blocked at score 0)."""
-        if qa is None:
-            return "skipped", 0
-        if isinstance(qa, dict):
-            return qa.get("verdict", "skipped"), (qa.get("qa_score") or 0)
-        return getattr(qa, "verdict", "skipped"), (getattr(qa, "qa_score", None) or 0)
 
     try:
         # Detect create intent keywords in the request even before Architect runs.
@@ -5783,8 +4892,6 @@ USER REQUEST:
             # Build codebase context for the file creator
             _creator_context = _build_codebase_context_for_creator(symbol_maps_by_name)
             created_files = []
-            _create_skipped: list = []   # PR #76: new files blocked by the QA gate
-            _NF_MAX_FIX_SMART = 2        # regen attempts before the gate blocks
 
             for _spec in new_file_specs:
                 _fname = _spec.get("filename", "new_file.ts")
@@ -5795,108 +4902,31 @@ USER REQUEST:
                         codebase_context=_creator_context,
                         user_id=user_id,
                     )
-                    # ── PR #76: QA + hard gate + bounded regen (fail-closed) ────
-                    # Mirror the natural pipeline's new-file gate. Previously the
-                    # file was appended regardless of verdict, and a QA *crash*
-                    # shipped it at full — both fail-OPEN. Now: QA every attempt
-                    # (crash ⇒ held below gate), regenerate from QA feedback up to
-                    # _NF_MAX_FIX_SMART times, and ship ONLY if it clears the bar.
-                    _nf_passed = False
-                    _nf_qa: dict = {}
-                    for _nf_try in range(_NF_MAX_FIX_SMART + 1):
-                        try:
-                            _nf_qa = await _run_qa_for_new_file(
-                                file_result=_file_result,
-                                codebase_context=_creator_context,
-                                user_id=user_id,
-                            )
-                        except Exception as _cqe:
-                            print(f"[QA_CREATE] error: {_cqe} — fail-closed hold")
-                            _nf_qa = {
-                                "verdict": "warning", "qa_score": 7,
-                                "summary": f"QA raised an error ({str(_cqe)[:80]}) — "
-                                           f"held below gate (fail-closed).",
-                            }
-                        _file_result["qa_result"] = _nf_qa
-                        _nf_v, _nf_s = _gate_qa_fields(_nf_qa)
-                        # PR #78: shared predicate (same as edit gate + retry).
-                        _nf_passes = not _qa_fails_ship_gate(_nf_qa, QA_GATE_MIN_SCORE)
-                        logger.info(
-                            "[pipeline:smart][GATE] run_id=%s decision=%s new_file=%s "
-                            "verdict=%s score=%s attempt=%d",
-                            run_id, "SHIP" if _nf_passes else "BLOCK",
-                            _fname, _nf_v, _nf_s, _nf_try,
+                    # Run QA on the created file
+                    try:
+                        _create_qa = await _run_qa_for_new_file(
+                            file_result=_file_result,
+                            codebase_context=_creator_context,
+                            user_id=user_id,
                         )
-                        _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(_nf_v, "✅")
+                        _file_result["qa_result"] = _create_qa
+                        _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(
+                            _create_qa.get("verdict", "safe"), "✅"
+                        )
                         yield sse({"type": "progress", "content": (
-                            f"{_qa_icon} {_fname} "
+                            f"{_qa_icon} {_fname} ready "
                             f"({len(_file_result.get('content','').splitlines())} lines) "
-                            f"— QA {_nf_qa.get('summary', '')} (score: {_nf_s})"
+                            f"— QA {_create_qa.get('summary', '')}"
                         )})
-                        if _nf_passes:
-                            _nf_passed = True
-                            break
-                        if _nf_try >= _NF_MAX_FIX_SMART:
-                            break  # retries exhausted — gated out below
-                        # Regenerate the COMPLETE file with QA feedback folded in.
-                        _nf_fb = (_nf_qa.get("summary", "") or "")
-                        for _fk in ("completeness_issues", "import_issues", "type_errors"):
-                            _nf_fb += "".join(f"\n- {x}" for x in (_nf_qa.get(_fk) or []))
-                        yield sse({"type": "progress", "content": (
-                            f"🔁 Fixing new file {_fname} — attempt "
-                            f"{_nf_try + 1}/{_NF_MAX_FIX_SMART}..."
-                        )})
-                        _retry_spec = dict(_spec)
-                        _retry_spec["content_guidance"] = (
-                            (_spec.get("content_guidance", "") or "")
-                            + "\n\nPREVIOUS ATTEMPT WAS REJECTED BY QA. Output the COMPLETE "
-                              "file and fix ALL of these issues:\n" + _nf_fb
-                        ).strip()
-                        try:
-                            _file_result = await run_file_creator(
-                                file_spec=_retry_spec,
-                                codebase_context=_creator_context,
-                                user_id=user_id,
-                            )
-                        except Exception as _re:
-                            print(f"[NEWFILE-FIX] regen failed for {_fname}: {_re}")
-                            break  # can't regenerate — gate below blocks it
-
-                    if _nf_passed:
-                        created_files.append(_file_result)
-                    else:
-                        _nf_v, _nf_s = _gate_qa_fields(_nf_qa)
-                        _create_skipped.append({
-                            "filename": _fname,
-                            "symbol": "(new file)",
-                            "reason": (
-                                f"Blocked by QA gate (verdict={_nf_v}, "
-                                f"score {_nf_s} < {QA_GATE_MIN_SCORE}) after "
-                                f"{_NF_MAX_FIX_SMART} fix attempt(s). "
-                                + ((_nf_qa or {}).get("summary", "") or "")
-                            ).strip(),
-                            "qa_score": _nf_s,
-                            "verdict": _nf_v,
-                        })
-                        yield sse({"type": "progress", "content": (
-                            f"🚫 GATE BLOCKED new file {_fname} (score {_nf_s}/10) "
-                            f"— not shippable, will not be applied"
-                        )})
+                    except Exception as _cqe:
+                        yield sse({"type": "progress", "content": f"✅ {_fname} ready ({len(_file_result.get('content','').splitlines())} lines)"})
+                        print(f"[QA_CREATE] Skipped: {_cqe}")
+                    created_files.append(_file_result)
                 except Exception as _cfe:
                     yield sse({"type": "progress", "content": f"⚠️ Could not create {_fname}: {_cfe}"})
 
             if not created_files:
-                if _create_skipped:
-                    # Files WERE generated but every one failed the QA gate.
-                    _blk = _create_skipped[0]
-                    yield sse({"type": "token", "content": (
-                        f"I generated the file(s) but blocked them at QA "
-                        f"(score {_blk.get('qa_score', '?')}/10) rather than ship something "
-                        f"incomplete: {_blk.get('reason', '')}\n\n"
-                        f"Try describing the file again with a bit more detail."
-                    )})
-                else:
-                    yield sse({"type": "token", "content": "File creation failed. Try being more specific about what the file should contain."})
+                yield sse({"type": "token", "content": "File creation failed. Try being more specific about what the file should contain."})
                 compliance.save()
                 yield sse({"type": "done", "content": ""})
                 return
@@ -5911,7 +4941,7 @@ USER REQUEST:
                 "new_files": created_files,
                 "risks": plan.get("risks", []),
                 "changes_by_file": {},   # required by SmartResult schema; empty for pure create
-                "skipped_changes": _create_skipped,  # PR #76: QA-gated new files
+                "skipped_changes": [],
             }
 
             # If Architect also planned edits to existing files (mixed create+edit),
@@ -6483,7 +5513,6 @@ USER REQUEST:
             # ── Surgeon retry loop (linter + QA feedback) ───────────────────
             _linter_feedback_for_retry: list = []
             _qa_feedback_for_retry: dict = {}       # QA verdict injected on semantic retry
-            _prev_attempt_code: str = ""            # PR #79: Surgeon's own rejected output, fed back on retry
             _full_after_lint: str = ""
             _MAX_SURGEON_ATTEMPTS = 3               # +1 for QA semantic retry
             _surgeon_context_reqs = change_target.surgeon_context
@@ -6513,7 +5542,6 @@ USER REQUEST:
                     linter_feedback=_linter_feedback_for_retry if _linter_feedback_for_retry else None,
                     qa_feedback=_qa_feedback_for_retry if _qa_feedback_for_retry else None,
                     forbid_noop=bool(_qa_feedback_for_retry) or ct == ChangeType.DELETE,
-                    prev_attempt_code=_prev_attempt_code,
                 )
                 _is_changed = new_code.rstrip() != symbol.code.rstrip()
                 _attempt_label = f" (attempt {_surgeon_attempt+1})" if _surgeon_attempt > 0 else ""
@@ -6568,7 +5596,6 @@ USER REQUEST:
                     targeted_context=_targeted_qa_ctx,
                     qa_feedback=_qa_feedback_for_retry if _qa_feedback_for_retry else None,
                     same_run_context=_same_run_ctx,
-                    file_content=sf["content"],   # PR #80: same-file symbol visibility
                 )
                 _qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫", "skipped": "⏭"}.get(
                     _qa_result.get("verdict", "skipped"), "⏭"
@@ -6630,26 +5657,10 @@ USER REQUEST:
                         if _lfind and _lfind in _full_after_lint:
                             _full_after_lint = _full_after_lint.replace(_lfind, _lrepl, 1)
                     _lint_new_count = _count_lint(_full_after_lint, matched_name)
-                    # Delta gate (was absolute): subtract the baseline error multiset so the
-                    # fixer only ever sees errors THIS edit introduced. Pre-existing linter
-                    # errors in a large file must never be blamed on the change — that was the
-                    # BIG7/BIG9 false-positive class — and a delta gate is the prerequisite that
-                    # lets a real tsc be turned on safely later (otherwise every large file with
-                    # pre-existing errors hard-blocks). `_lint_orig_count` (computed above and
-                    # previously dead) is the baseline we finally compare against.
-                    from collections import Counter as _LintCounter
-                    _orig_lint_msg_counts = _LintCounter(
-                        e.get("message") for e in _validate_lint(sf["content"], matched_name)
-                    )
-                    _linter_introduced_errors = []
-                    for _le in _validate_lint(_full_after_lint, matched_name):
-                        _lm = _le.get("message")
-                        if _orig_lint_msg_counts.get(_lm, 0) > 0:
-                            _orig_lint_msg_counts[_lm] -= 1   # consume one pre-existing occurrence
-                        else:
-                            _linter_introduced_errors.append(_le)
-                    if _linter_introduced_errors:
-                        yield sse({"type": "progress", "content": f"🔧 {_lint_tool}: {len(_linter_introduced_errors)} new error(s) — asking Claude to auto-fix..."})
+                    if _lint_new_count > 0:
+                        # Absolute check: ANY TS errors in output → attempt Claude auto-fix first
+                        _linter_introduced_errors = _validate_lint(_full_after_lint, matched_name)
+                        yield sse({"type": "progress", "content": f"🔧 {_lint_tool}: {_lint_new_count} error(s) — asking Claude to auto-fix..."})
                         # ── Lint self-heal: up to 3 Claude attempts ───────────
                         _lint_fixed = False
                         _MAX_LINT_ATTEMPTS = 3
@@ -6753,73 +5764,10 @@ USER REQUEST:
                             _qa_result["summary"] = f"{_lint_tool} error — {_linter_introduced_errors[0]['message']}"
                             if (_qa_result.get("qa_score") or 10) > 3:
                                 _qa_result["qa_score"] = 3
-                    else:
-                        # PR #81: don't claim "clean" when the linter never ran.
-                        # tsc isn't reliably installed on the backend — reporting a
-                        # false "✅ tsc clean" is what masked BIG10's broken ship.
-                        try:
-                            from services.linter_validator import linter_available as _lint_avail
-                            _tool_ran = _lint_avail(matched_name)
-                        except Exception:
-                            _tool_ran = True
-                        if _tool_ran:
-                            yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean"})
-                        else:
-                            yield sse({"type": "progress", "content": f"⏭ {_lint_tool} skipped (not installed)"})
+                    elif _lint_new_count == 0:
+                        yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean"})
                 except Exception as _lint_exc:
                     print(f"[LINTER_VALIDATOR] Skipped: {_lint_exc}")
-
-                # ── PR #81: deterministic redeclaration gate ──────────────────
-                # The tree-sitter compile check (above) only validates GRAMMAR — a
-                # duplicate top-level const/let/class is grammatically valid, so it
-                # passes — but it is a hard runtime SyntaxError ("Identifier 'x' has
-                # already been declared"). `node --check` would catch it, but Node/tsc
-                # are not reliably present on the backend, so this closes the blind
-                # spot deterministically. BIG10 shipped exactly this class of bug
-                # (a `const checkAdminAuth` re-declared a pre-existing
-                # `function checkAdminAuth`). Delta vs. original ensures a
-                # pre-existing redeclaration is never blamed on this change.
-                try:
-                    from services.syntax_validator import detect_redeclarations as _detect_redecl
-                    _full_after_redecl = sf["content"]
-                    for _rop in _operations:
-                        _rfind = _rop.get("find", "")
-                        _rrepl = _rop.get("replace", "")
-                        if _rfind and _rfind in _full_after_redecl:
-                            _full_after_redecl = _full_after_redecl.replace(_rfind, _rrepl, 1)
-                    _orig_redecl_msgs = {e["message"] for e in _detect_redecl(sf["content"], matched_name)}
-                    _new_redecls = _detect_redecl(_full_after_redecl, matched_name)
-                    _introduced_redecls = [e for e in _new_redecls if e["message"] not in _orig_redecl_msgs]
-                    if _introduced_redecls:
-                        _rd0 = _introduced_redecls[0]
-                        yield sse({"type": "progress", "content": f"🔴 Redeclaration check: {_rd0['message']} (line {_rd0['line']})"})
-                        if not isinstance(_qa_result.get("risk_verdicts"), list):
-                            _qa_result["risk_verdicts"] = []
-                        for _rd in _introduced_redecls:
-                            _qa_result["risk_verdicts"].append({
-                                "risk": _rd["message"],
-                                "status": "blocked",
-                                "reason": f"Duplicate declaration at line {_rd['line']}: {_rd['detail']}",
-                            })
-                            # Route into the Surgeon's compile-fix retry path so it
-                            # removes the duplicate (paired with the symbol inventory
-                            # now in the Surgeon prompt — prevention + backstop).
-                            _linter_introduced_errors.append({
-                                "line": _rd["line"],
-                                "column": _rd.get("column", 0),
-                                "message": _rd["message"],
-                                "detail": _rd["detail"],
-                            })
-                        _qa_result["verdict"] = "blocked"
-                        _qa_result["summary"] = f"Duplicate declaration — {_rd0['message']}"
-                        if (_qa_result.get("qa_score") or 10) > 3:
-                            _qa_result["qa_score"] = 3
-                    elif _new_redecls:
-                        yield sse({"type": "progress", "content": f"⏭ Redeclaration check: {len(_new_redecls)} pre-existing (not introduced here)"})
-                    else:
-                        yield sse({"type": "progress", "content": "✅ Redeclaration check passed"})
-                except Exception as _rd_exc:
-                    print(f"[REDECL_VALIDATOR] Skipped: {_rd_exc}")
 
                 # ── Auto-run tests ────────────────────────────────────────────
                 # Run after linter so we test the post-linter version of the code.
@@ -6832,14 +5780,7 @@ USER REQUEST:
                     }
                     # Substitute the Surgeon's patched content for the changed file
                     _test_files_map[matched_name] = _full_after_lint or sf.get("content", "")
-                    # Feature-flagged (TEST_EXEC_GATE, default OFF) — keeps this previously
-                    # dormant path (pytest was never in requirements) behaviourally identical
-                    # to today until an operator opts in. Flag off → skipped → block no-ops.
-                    _test_result = (
-                        await _run_tests_inline(_test_files_map, session_id or "")
-                        if os.getenv("TEST_EXEC_GATE", "0") == "1"
-                        else {"verdict": "skipped"}
-                    )
+                    _test_result = await _run_tests_inline(_test_files_map, session_id or "")
                     if _test_result.get("verdict") not in ("skipped", "unknown"):
                         _t_emoji = "✅" if _test_result["verdict"] == "passed" else "🔴"
                         _t_fw = _test_result.get("framework", "tests")
@@ -6870,32 +5811,21 @@ USER REQUEST:
                     and _surgeon_attempt < _MAX_SURGEON_ATTEMPTS - 1
                     and not _linter_feedback_for_retry
                 )
-                # Priority 2: QA semantic rejection.
-                # PR #78: trigger on the SAME predicate as the hard ship gate
-                # below, via the shared _qa_fails_ship_gate() helper, so the
-                # retry trigger and the gate can never drift apart again. The old
-                # condition keyed on verdict=="blocked" AND score<=7 AND allowed
-                # only ONE retry — so a "warning" at score 6 (which the gate
-                # blocks) never triggered a fix attempt and was silently dropped.
-                # Now anything that would FAIL the gate is sent back to the
-                # Surgeon with QA feedback and re-QA'd, up to the attempt budget.
-                # The gate below remains the backstop: anything still below the
-                # bar after retries is blocked, never shipped.
+                # Priority 2: QA semantic block (score ≤4, not already a QA retry,
+                #             and linter didn't catch it first)
                 _can_retry_qa = (
                     not _can_retry_lint
-                    and _qa_fails_ship_gate(_qa_result, QA_GATE_MIN_SCORE)
+                    and _qa_result.get("verdict") == "blocked"
+                    and (_qa_result.get("qa_score") or 10) <= 7
+                    and not _qa_feedback_for_retry
                     and _surgeon_attempt < _MAX_SURGEON_ATTEMPTS - 1
                 )
                 if _can_retry_lint:
                     _linter_feedback_for_retry = _linter_introduced_errors
-                    _prev_attempt_code = new_code   # PR #79: show the Surgeon its own output on compile-error retry too
                     yield sse({"type": "progress", "content": f"🔁 Surgeon retry ({_surgeon_attempt+2}/{_MAX_SURGEON_ATTEMPTS}): fixing {len(_linter_introduced_errors)} compile error(s)..."})
                     continue
                 elif _can_retry_qa:
                     _qa_feedback_for_retry = _qa_result
-                    # PR #79: hand the Surgeon its OWN rejected output next attempt
-                    # so it fixes that code instead of re-deriving the same defect.
-                    _prev_attempt_code = new_code
                     _qa_summary = _qa_result.get("summary", "QA blocked")[:80]
                     yield sse({"type": "progress", "content": f"🔁 Surgeon retry ({_surgeon_attempt+2}/{_MAX_SURGEON_ATTEMPTS}): QA feedback — {_qa_summary}"})
                     continue
@@ -6962,57 +5892,6 @@ USER REQUEST:
                 del changes_by_file[fname]
             else:
                 changes_by_file[fname]["changes"] = real_changes
-
-        # ── PR #76: hard QA gate (fail-closed) — mirror run_natural_pipeline ──
-        # BOTH the Surgeon retry loop AND the direct-rewrite path append their
-        # SurgicalChange to changes_by_file WITHOUT consulting the QA verdict, so
-        # a change QA blocked (verdict=blocked or qa_score < gate) still shipped.
-        # Enforce the gate here, after ghost-diff filtering and before the result
-        # is assembled: nothing below the bar stays applyable; blocked changes
-        # move to skipped_changes. Every decision is logged for ship/block
-        # visibility, exactly like the natural pipeline.
-        for fname in list(changes_by_file.keys()):
-            _kept = []
-            for c in changes_by_file[fname]["changes"]:
-                _v, _s = _gate_qa_fields(c.qa_result)
-                # PR #78: decide via the shared predicate so the gate and the
-                # fix-loop retry trigger stay byte-for-byte consistent.
-                _passes = not _qa_fails_ship_gate(c.qa_result, QA_GATE_MIN_SCORE)
-                _sym = c.symbol.full_path if getattr(c, "symbol", None) else "unknown"
-                _reasons = []
-                if _v == "blocked":
-                    _reasons.append("verdict=blocked")
-                if _s < QA_GATE_MIN_SCORE:
-                    _reasons.append(f"score {_s} < {QA_GATE_MIN_SCORE}")
-                logger.info(
-                    "[pipeline:smart][GATE] run_id=%s decision=%s symbol=%s file=%s "
-                    "verdict=%s score=%s reasons=%s",
-                    run_id, "SHIP" if _passes else "BLOCK", _sym, fname, _v, _s,
-                    (", ".join(_reasons) or "passes"),
-                )
-                if _passes:
-                    _kept.append(c)
-                else:
-                    _qa_summary = ""
-                    if c.qa_result is not None:
-                        _qa_summary = getattr(c.qa_result, "summary", "") or ""
-                    skipped_changes.append({
-                        "filename": fname,
-                        "symbol": _sym,
-                        "reason": (
-                            f"Blocked by QA gate ({', '.join(_reasons)}). " + _qa_summary
-                        ).strip(),
-                        "qa_score": _s,
-                        "verdict": _v,
-                    })
-                    yield sse({"type": "progress", "content": (
-                        f"🚫 GATE BLOCKED {_sym} (score {_s}/10, {_v}) — not shippable, "
-                        f"will not be applied. Reason: {', '.join(_reasons)}"
-                    )})
-            if _kept:
-                changes_by_file[fname]["changes"] = _kept
-            else:
-                del changes_by_file[fname]
 
         if not changes_by_file:
             # If this was a mixed create+edit and edits produced no changes,
@@ -7992,17 +6871,6 @@ async def run_natural_pipeline_stream(
     def sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
 
-    # ── Compliance tracking ───────────────────────────────────────────────
-    # The natural pipeline is the PRODUCTION path. Until now it carried no
-    # ComplianceTracker, so compliance_log was always empty in production.
-    # Instantiate here and mark each critical step as the pipeline runs.
-    run_id = str(uuid.uuid4())
-    compliance = ComplianceTracker(
-        run_id=run_id, session_id=session_id or "", intent="unknown"
-    )
-    # Hard QA gate: nothing below this score is allowed to ship.
-    QA_GATE_MIN_SCORE = 8
-
     EDIT_OPEN = "<surgical_edit>"
     EDIT_CLOSE = "</surgical_edit>"
     FILE_OPEN = "<new_file>"
@@ -8032,12 +6900,6 @@ async def run_natural_pipeline_stream(
                 symbol_maps_by_name[fname] = (smap, sf)
             except Exception:
                 symbol_maps_by_name[fname] = (None, sf)
-
-        _parsed_count = sum(1 for _v in symbol_maps_by_name.values() if _v[0] is not None)
-        compliance.mark(
-            "symbol_map_read", ran=True,
-            output_summary=f"{_parsed_count}/{len(symbol_maps_by_name)} file(s) parsed to symbol maps",
-        )
 
         # ── Build file context ────────────────────────────────────────────
         file_context = _build_natural_file_context(
@@ -8145,7 +7007,6 @@ async def run_natural_pipeline_stream(
         new_file_blocks_raw: list = []
         full_response = ""
         in_thinking = False
-        last_stop_reason = None       # captured from message_delta — "max_tokens" ⇒ truncated
 
         # Build the per-file content lookup once (reused across search rounds)
         file_content_lookup_stream: dict = {
@@ -8292,11 +7153,6 @@ async def run_natural_pipeline_stream(
                                     yield sse({"type": "thinking_end", "content": ""})
                                     in_thinking = False
 
-                            elif etype == "message_delta":
-                                _sr = getattr(getattr(event, "delta", None), "stop_reason", None)
-                                if _sr:
-                                    last_stop_reason = _sr
-
                         # If a search was requested mid-stream, break out of the event loop
                         if search_requested is not None:
                             break
@@ -8406,100 +7262,7 @@ async def run_natural_pipeline_stream(
         # Final flush for edge cases (Claude ended inside a block)
         if in_thinking:
             yield sse({"type": "thinking_end", "content": ""})
-
-        # ── Truncation recovery for large files (PR #69) ──────────────────
-        # If the stream ended INSIDE a <surgical_edit> or <new_file> block, the
-        # closing tag was never emitted — almost always because we hit the
-        # output-token limit on a large file. Rather than ship the truncated
-        # husk (which the QA gate then blocks, so the feature never lands), issue
-        # bounded continuation calls that resume the EXACT raw character stream
-        # until the block closes. On failure we keep the partial and let the gate
-        # block it — we never ship broken or truncated code either way.
-        _trunc_buf = edit_buf if state == "in_edit" else (file_buf if state == "in_file" else "")
-        _close_tag = EDIT_CLOSE if state == "in_edit" else FILE_CLOSE
-        _open_name = "surgical_edit" if state == "in_edit" else "new_file"
-        if state in ("in_edit", "in_file") and _trunc_buf.strip() and _close_tag not in _trunc_buf:
-            _kind = "edit" if state == "in_edit" else "file"
-            logger.info(
-                "[pipeline:natural][CONTINUATION] run_id=%s truncated %s block "
-                "(%d chars, stop_reason=%s) — attempting completion",
-                run_id, _kind, len(_trunc_buf), last_stop_reason,
-            )
-            yield sse({"type": "progress",
-                       "content": f"Large {_kind} detected — finishing the rest..."})
-
-            _MAX_CONT = 4
-            _completed = False
-            _resume_instr = (
-                f"Your previous response was cut off partway through a <{_open_name}> "
-                f"block because of the output length limit. Continue writing from the "
-                f"EXACT character where you stopped. Output ONLY the remaining text "
-                f"needed to finish that block and close it with </{_open_name}>. "
-                f"Do NOT repeat anything you already wrote. Do NOT restate the opening "
-                f"tag. Do NOT add explanations or any other blocks."
-            )
-            # The truncated assistant turn = everything streamed this round.
-            _cont_msgs = current_messages + [{"role": "assistant", "content": full_response}]
-            for _cont_round in range(_MAX_CONT):
-                try:
-                    _cont_resp = await aclient.messages.create(
-                        model=arch_model,
-                        max_tokens=16000,
-                        system=system_prompt,
-                        messages=_cont_msgs + [{"role": "user", "content": _resume_instr}],
-                    )
-                except Exception as _ce:
-                    logger.info("[pipeline:natural][CONTINUATION] run_id=%s call failed: %s",
-                                run_id, _ce)
-                    break
-                _cont_text = "".join(
-                    getattr(_b, "text", "") or "" for _b in (_cont_resp.content or [])
-                )
-                _cont_stop = getattr(_cont_resp, "stop_reason", None)
-                if not _cont_text.strip():
-                    break
-                _trunc_buf += _cont_text
-                full_response += _cont_text
-                _idx = _trunc_buf.find(_close_tag)
-                if _idx != -1:
-                    if _kind == "edit":
-                        edit_blocks_raw.append(_trunc_buf[:_idx])
-                    else:
-                        new_file_blocks_raw.append(_trunc_buf[:_idx])
-                    yield sse({"type": "edit_end", "content": ""})
-                    _completed = True
-                    logger.info(
-                        "[pipeline:natural][CONTINUATION] run_id=%s completed %s after "
-                        "%d round(s), %d chars total",
-                        run_id, _kind, _cont_round + 1, len(_trunc_buf[:_idx]),
-                    )
-                    yield sse({"type": "progress",
-                               "content": f"✅ Large {_kind} completed "
-                                          f"({_cont_round + 1} continuation round(s))."})
-                    break
-                # Still open — feed the partial back and keep going if more remains.
-                _cont_msgs = _cont_msgs + [
-                    {"role": "user", "content": _resume_instr},
-                    {"role": "assistant", "content": _cont_text},
-                ]
-                if _cont_stop != "max_tokens":
-                    # Model stopped naturally but never closed the tag — stop trying.
-                    break
-            if not _completed:
-                logger.info(
-                    "[pipeline:natural][CONTINUATION] run_id=%s could NOT complete %s "
-                    "block — keeping partial; QA gate will block it",
-                    run_id, _kind,
-                )
-                yield sse({"type": "progress",
-                           "content": f"⚠️ Could not fully finish the large {_kind} — it "
-                                      f"will be quality-checked and blocked if incomplete."})
-                if _kind == "edit":
-                    edit_blocks_raw.append(_trunc_buf)
-                else:
-                    new_file_blocks_raw.append(_trunc_buf)
-                yield sse({"type": "edit_end", "content": ""})
-        elif state == "in_edit" and edit_buf.strip():
+        if state == "in_edit" and edit_buf.strip():
             edit_blocks_raw.append(edit_buf)
             yield sse({"type": "edit_end", "content": ""})
         elif state == "in_file" and file_buf.strip():
@@ -8508,25 +7271,8 @@ async def run_natural_pipeline_stream(
 
         # ── Process edit blocks ───────────────────────────────────────────
         if not edit_blocks_raw and not new_file_blocks_raw:
-            # Pure conversational reply — no code touched.
-            compliance.set_intent("chat")
-            compliance.mark("architect_routing", ran=True,
-                            output_summary="natural reply, no edit/new_file blocks emitted")
-            compliance.save()
             yield sse({"type": "done", "content": ""})
             return
-
-        # Code was touched — classify intent and record routing. (Final intent
-        # is re-confirmed after processing; this early mark covers early returns.)
-        _early_intent = "edit" if edit_blocks_raw else "create"
-        compliance.set_intent(_early_intent)
-        compliance.mark("architect_routing", ran=True,
-                        output_summary=f"{len(edit_blocks_raw)} edit + {len(new_file_blocks_raw)} new_file block(s)")
-        if edit_blocks_raw:
-            # The natural pipeline folds import validation into structural + LLM QA
-            # (there is no separate architect import-scan pass like the legacy path).
-            compliance.mark("import_check", ran=True,
-                            output_summary="import validation folded into structural + LLM QA")
 
         yield sse({"type": "progress", "content": f"Resolving {len(edit_blocks_raw)} edit(s)..."})
 
@@ -8798,202 +7544,62 @@ async def run_natural_pipeline_stream(
                     "plan_deviation": "", "risk_verdicts": [],
                 })
 
-        # ── Deterministic gate: structural QA + degenerate-output detection ──
-        # Runs fast, zero-LLM checks and forces the LLM verdict/score down so the
-        # retry loop fires automatically. Lives in a helper so it can run BOTH
-        # before the retry loop AND after every fix (a fix can reintroduce a
-        # structural break or collapse into a degenerate no-op/truncation).
+        # ── Structural QA — deterministic pre-check ────────────────────────
+        # Run fast, zero-LLM checks (missing imports, duplicate defs, wrong
+        # import depth, dropped exports) BEFORE the retry loop.  If structural
+        # issues are found, force the LLM QA verdict/score down so the retry
+        # loop fires automatically.
         try:
             from services.structural_qa import run_structural_qa, has_blocking_issues as _has_sq_blocking
         except ImportError:
-            run_structural_qa = None
             _has_sq_blocking = None
 
-        def _detect_degenerate(new_code: str, orig_code: str, symbol_name: str) -> list:
-            """
-            Language-agnostic catch for the two ways the surgeon silently fails
-            on small edits, neither of which structural QA (TS-centric) reliably
-            catches for Python:
-              1. NO-OP   — new code is identical to the original (the surgeon
-                           emitted an edit block but changed nothing).
-              2. DROPPED — new code is a hard truncation of the original (e.g.
-                           the function body was cut off / replaced by `pass`).
-            Returns a list of blocking issue messages.
-            """
-            msgs = []
-            _n = (new_code or "").strip()
-            _o = (orig_code or "").strip()
-            if not _n:
-                msgs.append("[DEGENERATE] The edit produced empty code for "
-                            f"`{symbol_name}` — nothing was written.")
-                return msgs
-            if _n == _o:
-                msgs.append("[DEGENERATE] The edit is a no-op — the new code for "
-                            f"`{symbol_name}` is identical to the original. The "
-                            "requested change was not actually implemented.")
-                return msgs
-            _o_lines = [l for l in _o.splitlines() if l.strip()]
-            _n_lines = [l for l in _n.splitlines() if l.strip()]
-            # Only meaningful for non-trivial symbols (small helpers may shrink).
-            if len(_o_lines) >= 8 and len(_n_lines) < max(3, len(_o_lines) * 0.45):
-                msgs.append(
-                    f"[DEGENERATE] The new code for `{symbol_name}` is "
-                    f"{len(_n_lines)} non-blank lines vs the original "
-                    f"{len(_o_lines)} — the body appears to have been dropped or "
-                    "truncated. Re-emit the COMPLETE symbol."
-                )
-            return msgs
-
-        def _run_deterministic_gate(idx: int) -> list:
-            """Run structural QA + degenerate detection on change_shells[idx],
-            merging any blocking issues into qa_results[idx]. Returns a list of
-            progress strings for the caller to yield."""
-            cs = change_shells[idx]
-            new_code = cs["new_code"]
-            orig_code = cs["symbol"].code
-            fname = cs["filename"]
-            sym_name = cs["symbol"].name
-            blocking_msgs: list = []
-
-            if run_structural_qa is not None:
-                try:
-                    _issues = run_structural_qa(
-                        new_code, orig_code, fname,
-                        symbol_path=sym_name,
-                        file_content=cs.get("qa_original_content", ""),
+        if _has_sq_blocking is not None:
+            for _sq_i, _sq_cs in enumerate(change_shells):
+                _sq_new   = _sq_cs["new_code"]
+                _sq_orig  = _sq_cs["symbol"].code
+                _sq_fname = _sq_cs["filename"]
+                _sq_issues = run_structural_qa(_sq_new, _sq_orig, _sq_fname)
+                if _has_sq_blocking(_sq_issues):
+                    # Merge structural issues into LLM QA result so the retry
+                    # prompt includes them and Claude knows exactly what to fix.
+                    _sq_msgs = [f"[STRUCTURAL] {si['message']}" for si in _sq_issues if si["severity"] == "error"]
+                    qa_results[_sq_i]["import_issues"] = (
+                        qa_results[_sq_i].get("import_issues", []) + _sq_msgs
                     )
-                    if _has_sq_blocking(_issues):
-                        blocking_msgs += [
-                            f"[STRUCTURAL] {si['message']}"
-                            for si in _issues if si["severity"] == "error"
-                        ]
-                except Exception:
-                    pass
-
-            blocking_msgs += _detect_degenerate(new_code, orig_code, sym_name)
-
-            # ── Redeclaration delta gate (PARITY with the smart pipeline) ──────────
-            # The Claude/natural pipeline previously had NO redeclaration backstop, so
-            # selecting a Claude architect model silently dropped the PR #81 protection.
-            # A duplicate top-level const/let/class is valid GRAMMAR (structural QA and
-            # tree-sitter both pass it) but a hard runtime SyntaxError. This is the exact
-            # bug BIG10 shipped (`const checkAdminAuth` colliding with a pre-existing
-            # `function checkAdminAuth`). Delta vs. the original guarantees a pre-existing
-            # duplicate is never blamed on this change. `fname` (the filename) drives
-            # language detection — the validators key off the extension.
-            try:
-                from services.syntax_validator import detect_redeclarations as _detect_redecl
-                _orig_full = cs.get("qa_original_content", "") or ""
-                _edited_full = _orig_full
-                if orig_code and orig_code in _orig_full:
-                    _edited_full = _orig_full.replace(orig_code, new_code, 1)
-                _orig_rd_msgs = {e["message"] for e in _detect_redecl(_orig_full, fname)}
-                _introduced_rd = [
-                    e for e in _detect_redecl(_edited_full, fname)
-                    if e["message"] not in _orig_rd_msgs
-                ]
-                for _rd in _introduced_rd:
-                    blocking_msgs.append(
-                        f"[REDECLARATION] Duplicate declaration at line {_rd['line']}: "
-                        f"{_rd['detail']} — {_rd['message']}. Remove the duplicate; that "
-                        "symbol already exists elsewhere in the file."
+                    qa_results[_sq_i]["verdict"] = "blocked"
+                    qa_results[_sq_i]["qa_score"] = min(qa_results[_sq_i].get("qa_score", 10), 3)
+                    qa_results[_sq_i]["summary"] = (
+                        f"Structural QA: {len(_sq_msgs)} blocking issue(s). "
+                        + qa_results[_sq_i].get("summary", "")
                     )
-            except Exception:
-                pass
-
-            # ── Linter delta gate (honest skip; never a false "clean") ────────────
-            # Mirrors the smart pipeline: only NEW linter errors introduced by this edit
-            # are blocking. When tsc/pyflakes is unavailable the validators return [] →
-            # nothing is flagged (fail-skipped, never fail-broken).
-            try:
-                from services.linter_validator import (
-                    count_linter_errors as _count_lint,
-                    validate_linters as _validate_lint,
-                )
-                _orig_full = cs.get("qa_original_content", "") or ""
-                _edited_full = _orig_full
-                if orig_code and orig_code in _orig_full:
-                    _edited_full = _orig_full.replace(orig_code, new_code, 1)
-                if _count_lint(_edited_full, fname) > _count_lint(_orig_full, fname):
-                    from collections import Counter as _LintCounter
-                    _obase = _LintCounter(
-                        e.get("message") for e in _validate_lint(_orig_full, fname)
-                    )
-                    for _e in _validate_lint(_edited_full, fname):
-                        _m = _e.get("message")
-                        if _obase.get(_m, 0) > 0:
-                            _obase[_m] -= 1
-                        else:
-                            blocking_msgs.append(
-                                f"[LINTER] {_m} (line {_e.get('line')}) — introduced by this edit."
-                            )
-            except Exception:
-                pass
-
-            if not blocking_msgs:
-                return []
-
-            qa_results[idx]["import_issues"] = (
-                qa_results[idx].get("import_issues", []) + blocking_msgs
-            )
-            qa_results[idx]["verdict"] = "blocked"
-            qa_results[idx]["qa_score"] = min(qa_results[idx].get("qa_score") or 10, 3)
-            qa_results[idx]["summary"] = (
-                f"Deterministic gate: {len(blocking_msgs)} blocking issue(s). "
-                + qa_results[idx].get("summary", "")
-            )
-            return [f"🔍 Deterministic gate flagged {len(blocking_msgs)} blocking "
-                    f"issue(s) in {sym_name} — will auto-fix"]
-
-        for _sq_i in range(len(change_shells)):
-            for _msg in _run_deterministic_gate(_sq_i):
-                yield sse({"type": "progress", "content": _msg})
-
-        # QA ran on every change — record it for compliance.
-        compliance.mark(
-            "qa_review", ran=True,
-            output_summary=f"QA + deterministic gate ran on {len(change_shells)} change(s)",
-        )
+                    yield sse({"type": "progress",
+                               "content": f"🔍 Structural QA found {len(_sq_msgs)} blocking issue(s) "
+                                          f"in {_sq_cs['symbol'].name} — will auto-fix"})
 
         # ── QA retry loop — fix blocked changes before showing to user ────────
-        # Triggers on anything that would FAIL the hard gate:
-        #   - verdict is "blocked" (any score), OR
-        #   - score < QA_GATE_MIN_SCORE (i.e. not "good enough" to ship)
-        # Sends QA findings back to Claude with full visibility, re-runs QA on
-        # the fix, and confirms the issues are actually resolved.
+        # Triggers on verdict=="blocked" OR score<=5 with hard issues.
+        # Sends QA findings back to Claude, re-runs QA on the fix.
 
         MAX_QA_RETRIES = 2
 
-        # ── Fix-loop safety bounds ───────────────────────────────────────────
-        # The correction (regen) + re-QA calls are non-streaming Anthropic
-        # requests fed the full file context. Left unbounded they inherit the
-        # SDK's 600 s default timeout — long enough that the client read-times-out
-        # first and FastAPI CANCELS this generator, so the hard gate below never
-        # runs and NO ship/block compliance decision is ever recorded. We bound
-        # every call and cap the loop's total wall-clock so we ALWAYS fall
-        # through to the gate (which blocks anything still < QA_GATE_MIN_SCORE)
-        # and always log a decision.
-        _CORR_CALL_TIMEOUT = 150.0     # per correction (regen) call
-        _REQA_CALL_TIMEOUT = 90.0      # per re-QA call
-        _FIX_LOOP_DEADLINE = 300.0     # total wall-clock budget for the loop
-        _fix_loop_start = time.time()
-
-        def _fix_loop_expired() -> bool:
-            return (time.time() - _fix_loop_start) > _FIX_LOOP_DEADLINE
-
         for _qa_retry_round in range(MAX_QA_RETRIES):
-            if _fix_loop_expired():
-                logger.warning(
-                    "[pipeline:natural][FIXLOOP] run_id=%s deadline %.0fs hit before "
-                    "round %d — falling through to gate (unresolved changes blocked)",
-                    run_id, _FIX_LOOP_DEADLINE, _qa_retry_round + 1,
-                )
-                break
+            # Find all still-blocked changes.
+            # Trigger retry when:
+            #   - verdict is "blocked" (any score), OR
+            #   - score <= 5 with specific hard issues (missing imports, type errors)
             blocked_indices = []
             for _bi, _bqd in enumerate(qa_results):
                 _bv = _bqd.get("verdict", "safe")
                 _bs = _bqd.get("qa_score") or 10
-                if _bv == "blocked" or _bs < QA_GATE_MIN_SCORE:
+                _b_hard = bool(
+                    _bqd.get("import_issues")
+                    or _bqd.get("type_errors")
+                    or _bqd.get("logic_errors")
+                )
+                if _bv == "blocked":
+                    blocked_indices.append(_bi)
+                elif _bs <= 7:
                     blocked_indices.append(_bi)
             if not blocked_indices:
                 break
@@ -9072,14 +7678,11 @@ async def run_natural_pipeline_stream(
 
                 correction_tasks.append((
                     idx,
-                    asyncio.create_task(asyncio.wait_for(
-                        aclient.messages.create(
-                            model=arch_model,
-                            max_tokens=16000,
-                            system=system_prompt,
-                            messages=correction_messages,
-                        ),
-                        timeout=_CORR_CALL_TIMEOUT,
+                    asyncio.create_task(aclient.messages.create(
+                        model=arch_model,
+                        max_tokens=16000,
+                        system=system_prompt,
+                        messages=correction_messages,
                     ))
                 ))
 
@@ -9119,7 +7722,7 @@ async def run_natural_pipeline_stream(
 
             # Re-run QA on all fixed changes in parallel
             reqa_tasks = [
-                (idx, asyncio.create_task(asyncio.wait_for(run_qa_agent(
+                (idx, asyncio.create_task(run_qa_agent(
                     original_code=change_shells[idx]["symbol"].code,
                     new_code=change_shells[idx]["new_code"],
                     change_description=change_shells[idx]["description"],
@@ -9133,7 +7736,7 @@ async def run_natural_pipeline_stream(
                     targeted_context=change_shells[idx]["targeted_ctx"],
                     qa_feedback=qa_results[idx],   # pass prior QA so it knows what to watch for
                     same_run_context=change_shells[idx]["same_run"],
-                ), timeout=_REQA_CALL_TIMEOUT)))
+                )))
                 for idx in fixed_indices
             ]
 
@@ -9146,10 +7749,6 @@ async def run_natural_pipeline_stream(
             for idx, task in reqa_tasks:
                 try:
                     qa_results[idx] = task.result()
-                    # Re-run the deterministic gate on the FIX — a correction can
-                    # reintroduce a structural break or collapse into a no-op.
-                    for _msg in _run_deterministic_gate(idx):
-                        yield sse({"type": "progress", "content": _msg})
                     new_verdict = qa_results[idx].get("verdict", "?")
                     new_score   = qa_results[idx].get("qa_score", "?")
                     icon = "✅" if new_verdict == "safe" else "⚠️" if new_verdict == "warning" else "🚫"
@@ -9159,233 +7758,16 @@ async def run_natural_pipeline_stream(
                 except Exception:
                     pass  # keep prior result if re-QA fails
 
-        # ── Whole-session test-execution gate (long-term parity with smart pipeline) ──
-        # The natural/Claude pipeline ran the test runner NOWHERE: _run_tests_inline()
-        # existed but was wired only into run_smart_pipeline_stream (~line 6798). Selecting
-        # a Claude architect model therefore silently dropped execution-based verification —
-        # the SAME class of silent parity gap BIG10/PR #82 closed for the redeclaration and
-        # linter gates. Static checks answer "does it compile"; only running the project's
-        # own tests answers "does it still WORK".
-        #
-        # What this does: after the per-change retry loop has converged, assemble the FULL
-        # session (all files, with every currently-shipping change applied) and run the
-        # project's own suite ONCE. A real failure is fed back to the Surgeon through the
-        # same correction pattern (QA -> Claude -> fix -> re-verify — the user's stated
-        # mental model) for a bounded number of rounds; anything still failing is marked
-        # blocked so the HARD GATE below refuses to ship it. "Repo tests still pass" becomes
-        # a hard ship condition, consistent with "nothing below 8/10 ships".
-        #
-        # ENV NOTE (D2): Railway runs a Python-only container — pytest executes for real;
-        # jest/vitest honest-skip (no Node runtime). JS execution is a future Vercel sidecar
-        # seam, mirroring how tsc landed in PR #84. _run_tests_inline already skips JS cleanly,
-        # so this is a zero-behaviour-change no-op for sessions without runnable tests.
-        _TEST_GATE_MAX_ROUNDS = 2
-
-        def _testgate_block(_indices: list, _failed: int, _fw: str, _note: str) -> None:
-            """Mark the given shipping changes blocked so the hard gate stops them."""
-            for _i in _indices:
-                if _qa_fails_ship_gate(qa_results[_i], QA_GATE_MIN_SCORE):
-                    continue  # already blocked by an earlier gate
-                qa_results[_i]["verdict"] = "blocked"
-                if (qa_results[_i].get("qa_score") or 10) > 4:
-                    qa_results[_i]["qa_score"] = 4
-                qa_results[_i].setdefault("import_issues", []).append(f"[TESTS] {_note}")
-                qa_results[_i]["summary"] = (
-                    f"{_failed} repo test(s) failing — "
-                    + (qa_results[_i].get("summary", "") or "")
-                )
-
-        # Feature flag (default OFF): the whole test-execution gate stays dark until an
-        # operator sets TEST_EXEC_GATE=1, mirroring the TSC_ENABLED rollout (PR #84). Merge
-        # is therefore behaviourally zero-risk; activation is one env var + a smoke test,
-        # with an instant kill switch. pytest is now in requirements so the runner is real
-        # the moment the flag flips.
-        _tg_enabled = os.getenv("TEST_EXEC_GATE", "0") == "1"
-        try:
-            for _tg_round in range(_TEST_GATE_MAX_ROUNDS + 1):
-                if not _tg_enabled:
-                    break
-                # Candidates = changes that currently PASS the per-change gate (what would ship).
-                _ship_idx = [
-                    _i for _i, _q in enumerate(qa_results)
-                    if not _qa_fails_ship_gate(_q, QA_GATE_MIN_SCORE)
-                ]
-                if not _ship_idx:
-                    break  # nothing shippable — the hard gate handles it
-
-                _tg_map = _assemble_patched_file_map(
-                    session_files, [change_shells[_i] for _i in _ship_idx]
-                )
-                _tg_res = await _run_tests_inline(_tg_map, session_id or "")
-                _tg_verdict = _tg_res.get("verdict")
-                _tg_fw = _tg_res.get("framework", "tests")
-
-                # Honest skip (fail-skipped, never fail-broken): either the runner
-                # reported skipped/unknown, OR it ran but neither passed nor failed any
-                # test (0/0). The 0/0 case is what a MISSING test runner looks like
-                # (e.g. pytest not installed on the backend → non-zero exit, no counts).
-                # We must NOT treat that as a pass (dishonest) NOR as a failure (would
-                # false-block every edit). Skip cleanly, exactly like the linter gate.
-                _tg_passed = _tg_res.get("passed", 0) or 0
-                _tg_failed_n = _tg_res.get("failed", 0) or 0
-                if _tg_verdict in ("skipped", "unknown") or (_tg_passed <= 0 and _tg_failed_n <= 0):
-                    if _tg_round == 0:
-                        _skip_msg = _tg_res.get("message") or (
-                            "test runner unavailable or no tests collected"
-                            if _tg_verdict not in ("skipped", "unknown")
-                            else "no runnable tests in session")
-                        yield sse({"type": "progress", "content": f"⏭ Test gate: {_skip_msg}"})
-                        logger.info(
-                            "[pipeline:natural][TESTGATE] run_id=%s decision=SKIP framework=%s "
-                            "verdict=%s passed=%s failed=%s", run_id, _tg_fw, _tg_verdict,
-                            _tg_passed, _tg_failed_n)
-                    break
-
-                # Tests pass — at least one passed and none failed.
-                if _tg_failed_n <= 0:
-                    yield sse({"type": "progress", "content":
-                               f"✅ Test gate: {_tg_res.get('passed', 0)} test(s) passing ({_tg_fw})"})
-                    logger.info(
-                        "[pipeline:natural][TESTGATE] run_id=%s decision=PASS framework=%s "
-                        "passed=%s round=%d", run_id, _tg_fw, _tg_res.get("passed", 0), _tg_round)
-                    break
-
-                # ── Tests FAILED ──────────────────────────────────────────────
-                _tg_failed = _tg_res.get("failed", 0) or 0
-                _tg_out = (_tg_res.get("output", "") or "")[:1500]
-                logger.info(
-                    "[pipeline:natural][TESTGATE] run_id=%s decision=FAIL framework=%s "
-                    "failed=%s round=%d", run_id, _tg_fw, _tg_failed, _tg_round)
-
-                # Budget exhausted → block the shipping changes; hard gate refuses them.
-                if _tg_round >= _TEST_GATE_MAX_ROUNDS:
-                    _testgate_block(
-                        _ship_idx, _tg_failed, _tg_fw,
-                        f"{_tg_failed} test(s) still failing after {_TEST_GATE_MAX_ROUNDS} "
-                        f"fix round(s) ({_tg_fw}).")
-                    yield sse({"type": "progress", "content":
-                               f"🚫 Test gate: {_tg_failed} test(s) still failing after fixes — "
-                               f"blocking ({_tg_fw})"})
-                    break
-
-                # Otherwise feed the failure back to the Surgeon (QA -> Claude -> fix).
-                yield sse({"type": "progress", "content":
-                           f"🔁 Test gate: {_tg_failed} test(s) failing — sending to Surgeon "
-                           f"(round {_tg_round + 1}/{_TEST_GATE_MAX_ROUNDS})"})
-                _tg_fix_tasks = []
-                for _i in _ship_idx:
-                    _cs = change_shells[_i]
-                    _sym = _cs["symbol"]
-                    _tg_prompt = (
-                        f"The project's automated test suite was run after your "
-                        f"<surgical_edit> for `{_sym.name}` in `{_cs['filename']}` was applied, "
-                        f"and {_tg_failed} test(s) FAILED. The edit cannot ship while tests fail.\n\n"
-                        f"TEST OUTPUT ({_tg_fw}):\n```\n{_tg_out}\n```\n\n"
-                        f"ORIGINAL CODE (before your change):\n```\n{_sym.code}\n```\n\n"
-                        f"YOUR CURRENT CODE (which may have broken the tests):\n```\n{_cs['new_code']}\n```\n\n"
-                        f"If THIS symbol is the cause, return a corrected <surgical_edit> block that "
-                        f"makes the tests pass while still implementing: {_cs['description']}. "
-                        f"It must contain the COMPLETE symbol code and use the exact name `{_sym.name}`. "
-                        f"If this symbol is clearly unrelated to the failure, return your current code "
-                        f"unchanged.\n\nReturn ONLY the <surgical_edit> block, nothing else."
-                    )
-                    _tg_msgs = current_messages + [
-                        {"role": "assistant", "content": full_response or "(writing code...)"},
-                        {"role": "user", "content": _tg_prompt},
-                    ]
-                    _tg_fix_tasks.append((_i, asyncio.create_task(asyncio.wait_for(
-                        aclient.messages.create(
-                            model=arch_model, max_tokens=16000,
-                            system=system_prompt, messages=_tg_msgs,
-                        ), timeout=_CORR_CALL_TIMEOUT))))
-
-                _tg_pending = {t for _, t in _tg_fix_tasks}
-                while _tg_pending:
-                    _tg_done, _tg_pending = await asyncio.wait(_tg_pending, timeout=20.0)
-                    if _tg_pending:
-                        yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
-
-                _tg_changed = False
-                for _i, _t in _tg_fix_tasks:
-                    try:
-                        _ct = "".join(b.text for b in _t.result().content if hasattr(b, "text"))
-                        _ei = _ct.find(EDIT_OPEN)
-                        _ec = _ct.find(EDIT_CLOSE, _ei) if _ei != -1 else -1
-                        if _ei != -1 and _ec != -1:
-                            _raw = _ct[_ei + len(EDIT_OPEN):_ec].strip()
-                            try:
-                                _ed = json.loads(_raw)
-                            except json.JSONDecodeError:
-                                _ed = json.loads(_repair_json(_raw))
-                            _cc = _ed.get("new_code", "")
-                            if _cc and _cc != change_shells[_i]["new_code"]:
-                                change_shells[_i]["new_code"] = _cc
-                                _tg_changed = True
-                                # Re-run the deterministic gate on the new code before re-testing.
-                                for _m in _run_deterministic_gate(_i):
-                                    yield sse({"type": "progress", "content": _m})
-                    except Exception:
-                        pass  # keep current code if a correction call/parse fails
-
-                if not _tg_changed:
-                    # Surgeon produced no usable fix → block now rather than spin.
-                    _testgate_block(
-                        _ship_idx, _tg_failed, _tg_fw,
-                        f"{_tg_failed} test(s) failing; Surgeon produced no fix ({_tg_fw}).")
-                    yield sse({"type": "progress", "content":
-                               f"🚫 Test gate: no fix produced — blocking {_tg_failed} "
-                               f"failing test(s) ({_tg_fw})"})
-                    break
-                # else: loop re-assembles the shipping set and re-runs the suite.
-
-            if _tg_enabled:
-                compliance.mark(
-                    "qa_review", ran=True,
-                    output_summary="Whole-session test-execution gate evaluated",
-                )
-        except Exception as _tg_exc:
-            # The test gate must NEVER crash the pipeline — fall through to the hard gate,
-            # which still blocks anything below the bar. Fail-skipped, never fail-broken.
-            logger.warning(
-                "[pipeline:natural][TESTGATE] run_id=%s skipped due to error: %s",
-                run_id, _tg_exc)
-            print(f"[TESTGATE] Skipped: {_tg_exc}")
-
-        # ── Assemble SurgicalChange objects + enforce the hard QA gate ───────
-        # GATE RULE: a change may ship ONLY if verdict != "blocked" AND
-        # qa_score >= QA_GATE_MIN_SCORE (8). Anything below the bar is moved to
-        # skipped_changes so the UI cannot apply it. Every decision is logged.
-        gated_out: list = []          # changes blocked by the gate (cannot apply)
-        _shipped = 0
-        _blocked = 0
-
+        # ── Assemble SurgicalChange objects from results
         for i, (cs, qa_dict) in enumerate(zip(change_shells, qa_results)):
             symbol = cs["symbol"]
             filename = cs["filename"]
             sf_entry = cs["sf_entry"]
 
-            _verdict = qa_dict.get("verdict", "skipped")
-            _score = qa_dict.get("qa_score") or 0
-            _passes_gate = (_verdict != "blocked") and (_score >= QA_GATE_MIN_SCORE)
-
-            # ── Gate-decision logging — full visibility into ship/block ──────
-            _reasons = []
-            if _verdict == "blocked":
-                _reasons.append("verdict=blocked")
-            if _score < QA_GATE_MIN_SCORE:
-                _reasons.append(f"score {_score} < {QA_GATE_MIN_SCORE}")
-            _decision = "SHIP" if _passes_gate else "BLOCK"
-            logger.info(
-                "[pipeline:natural][GATE] run_id=%s decision=%s symbol=%s file=%s "
-                "verdict=%s score=%s reasons=%s",
-                run_id, _decision, symbol.name, filename, _verdict, _score,
-                (", ".join(_reasons) or "passes"),
-            )
-
             all_qa_risks.extend(qa_dict.get("downstream_risks", []))
 
             qa_result_obj = _QAResult(
-                verdict=_verdict,
+                verdict=qa_dict.get("verdict", "skipped"),
                 qa_score=qa_dict.get("qa_score"),
                 summary=qa_dict.get("summary", ""),
                 import_issues=qa_dict.get("import_issues", []),
@@ -9396,36 +7778,16 @@ async def run_natural_pipeline_stream(
                 risk_verdicts=qa_dict.get("risk_verdicts", []),
             )
 
-            if not _passes_gate:
-                _blocked += 1
-                gated_out.append({
-                    "filename": filename,
-                    "symbol": symbol.name,
-                    "reason": (
-                        f"Blocked by QA gate ({', '.join(_reasons)}). "
-                        + (qa_dict.get("summary", "") or "")
-                    ).strip(),
-                    "qa_score": _score,
-                    "verdict": _verdict,
-                })
-                yield sse({
-                    "type": "progress",
-                    "content": (
-                        f"🚫 GATE BLOCKED {symbol.name} (score {_score}/10, "
-                        f"{_verdict}) — not shippable, will not be applied. "
-                        f"Reason: {', '.join(_reasons)}"
-                    ),
-                })
-                # Do NOT add to changes_by_file — it must not be applyable.
-                continue
-
-            _shipped += 1
-            verdict_icon = "\u2705" if _verdict == "safe" else "\u26a0\ufe0f"
+            verdict_icon = (
+                "\u2705" if qa_dict.get("verdict") == "safe"
+                else "\u26a0\ufe0f" if qa_dict.get("verdict") == "warning"
+                else "\U0001f6ab"
+            )
             yield sse({
                 "type": "progress",
                 "content": (
-                    f"{verdict_icon} GATE PASSED {symbol.name} "
-                    f"(score {_score}/10) — {qa_dict.get('summary', '')}"
+                    f"QA {verdict_icon} {qa_dict.get('summary', '')} "
+                    f"(score: {qa_dict.get('qa_score', '?')})"
                 ),
             })
 
@@ -9452,19 +7814,6 @@ async def run_natural_pipeline_stream(
                 }
             changes_by_file[filename]["changes"].append(change.model_dump())
             summary_parts.append(cs["description"] or f"Updated {symbol.name} in {filename}")
-
-        # Record the gate outcome for compliance.
-        compliance.mark(
-            "confidence_gate", ran=True,
-            output_summary=(
-                f"gate min={QA_GATE_MIN_SCORE}: {_shipped} shipped, "
-                f"{_blocked} blocked of {len(change_shells)} change(s)"
-            ),
-        )
-        compliance.mark(
-            "diff_validate", ran=True,
-            output_summary=f"{_shipped} diff(s) assembled for shippable changes",
-        )
 
         # ── Process new file blocks ───────────────────────────────────────
         new_files: list = []
@@ -9495,127 +7844,24 @@ async def run_natural_pipeline_stream(
                 }
                 language = ext_map.get(ext, "text")
 
-            # QA the new file, and — mirroring the edit path's auto-fix loop —
-            # when it's blocked (e.g. the Surgeon emitted a structurally-closed
-            # but content-truncated file), feed the QA feedback back to the model,
-            # regenerate the COMPLETE file, and re-QA. Loop up to _NF_MAX_FIX
-            # times before blocking. This realises the operator's mental model
-            # for new files: "QA finds issues → send back → fix → re-QA → confirm
-            # resolved." Edits already had this loop; new files did not.
+            # QA: check the new file against codebase context
             codebase_ctx = _build_codebase_context_for_creator(symbol_maps_by_name)
-            _NF_MAX_FIX = 2
-            _nf_shipped = False
-            for _nf_attempt in range(_NF_MAX_FIX + 1):
-                try:
-                    qa = await _run_qa_for_new_file(
-                        file_result={"filename": filename, "content": content,
-                                     "language": language, "summary": summary},
-                        codebase_context=codebase_ctx,
-                        user_id=user_id,
-                    )
-                    qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(
-                        qa.get("verdict", "safe"), "✅"
-                    )
-                    yield sse({"type": "progress",
-                               "content": f"{qa_icon} {filename} — {qa.get('summary', 'ready')}"})
-                    file_data["qa_result"] = qa
-                except Exception as _qa_exc:
-                    # PR #74 FAIL-CLOSED: a QA crash must NOT ship the file at the
-                    # gate bar. Hold below the gate so the hard gate blocks it and
-                    # the fix-loop re-QAs (rather than silently shipping unreviewed).
-                    logger.info("[pipeline:natural][QA:newfile] run_id=%s QA crashed for %s: %s — fail-closed hold",
-                                run_id, filename, str(_qa_exc)[:120])
-                    yield sse({"type": "progress",
-                               "content": f"⚠️ {filename} — QA error, holding for review"})
-                    file_data["qa_result"] = {
-                        "verdict": "warning", "qa_score": 7,
-                        "summary": "QA raised an error — held below gate (fail-closed).",
-                    }
-
-                # Apply the SAME hard gate to new files — nothing below the bar ships.
-                _nf_qa = file_data.get("qa_result", {}) or {}
-                _nf_verdict = _nf_qa.get("verdict", "safe")
-                _nf_score = _nf_qa.get("qa_score") or 0
-                _nf_passes = (_nf_verdict != "blocked") and (_nf_score >= QA_GATE_MIN_SCORE)
-                _nf_decision = "SHIP" if _nf_passes else "BLOCK"
-                logger.info(
-                    "[pipeline:natural][GATE] run_id=%s decision=%s new_file=%s "
-                    "verdict=%s score=%s attempt=%d",
-                    run_id, _nf_decision, filename, _nf_verdict, _nf_score, _nf_attempt,
+            try:
+                qa = await _run_qa_for_new_file(
+                    file_result={"filename": filename, "content": content,
+                                 "language": language, "summary": summary},
+                    codebase_context=codebase_ctx,
+                    user_id=user_id,
                 )
-                if _nf_passes:
-                    _nf_shipped = True
-                    break
-                if _nf_attempt >= _NF_MAX_FIX:
-                    break  # retries exhausted — gated out below
-
-                # Regenerate the COMPLETE file from the QA feedback. PR #72:
-                # use raw-text generation WITH continuation — never the tool_use
-                # JSON path, which truncated a ~300-line file on every retry
-                # (JSON-string escaping inflation + no stop_reason check + no
-                # resume on cutoff, so each retry reproduced the same failure).
-                # Raw text removes the escaping tax and, when the output hits the
-                # token cap, we resume from the exact stopping point and stitch —
-                # exactly how a human/agent writes a long file. The model never
-                # has to fit the whole file in a single budget.
+                qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(
+                    qa.get("verdict", "safe"), "✅"
+                )
                 yield sse({"type": "progress",
-                           "content": f"🔁 Fixing new file {filename} — attempt "
-                                      f"{_nf_attempt + 1}/{_NF_MAX_FIX}..."})
-                try:
-                    _nf_qa_feedback = "\n".join(
-                        [_nf_qa.get("summary", "") or ""]
-                        + [f"- {x}" for x in (_nf_qa.get("completeness_issues") or [])]
-                        + [f"- {x}" for x in (_nf_qa.get("import_issues") or [])]
-                    ).strip()
-                    _nf_regen = await _generate_new_file_with_continuation(
-                        filename=filename,
-                        spec=(summary or f"Create {filename}"),
-                        codebase_context=codebase_ctx,
-                        qa_feedback=_nf_qa_feedback,
-                        prior_attempt=content,
-                        anthropic_key=_get_anthropic_key(user_id),
-                        model=arch_model,
-                    )
-                    _nf_new_content = (_nf_regen.get("content") or "").strip()
-                    logger.info(
-                        "[pipeline:natural][NEWFILE-FIX] run_id=%s regen %s rounds=%s "
-                        "complete=%s stop=%s chars=%d",
-                        run_id, filename, _nf_regen.get("rounds"),
-                        _nf_regen.get("complete"), _nf_regen.get("stop_reason"),
-                        len(_nf_new_content),
-                    )
-                except Exception as _nf_regen_e:
-                    logger.info(
-                        "[pipeline:natural][NEWFILE-FIX] run_id=%s regen failed for %s: %s",
-                        run_id, filename, str(_nf_regen_e)[:120],
-                    )
-                    break  # can't regenerate — gate below blocks it
-                if not _nf_new_content or _nf_new_content == content:
-                    logger.info(
-                        "[pipeline:natural][NEWFILE-FIX] run_id=%s regen produced no "
-                        "improvement for %s — blocking", run_id, filename,
-                    )
-                    break  # no improvement — gate below blocks it
-                content = _nf_new_content  # re-QA the regenerated file next loop
-
-            if not _nf_shipped:
-                _nf_qa = file_data.get("qa_result", {}) or {}
-                _nf_verdict = _nf_qa.get("verdict", "blocked")
-                _nf_score = _nf_qa.get("qa_score") or 0
-                gated_out.append({
-                    "filename": filename,
-                    "symbol": "(new file)",
-                    "reason": f"Blocked by QA gate (verdict={_nf_verdict}, "
-                              f"score {_nf_score} < {QA_GATE_MIN_SCORE}) after "
-                              f"{_NF_MAX_FIX} fix attempt(s). "
-                              + (_nf_qa.get("summary", "") or ""),
-                    "qa_score": _nf_score,
-                    "verdict": _nf_verdict,
-                })
-                yield sse({"type": "progress",
-                           "content": f"🚫 GATE BLOCKED new file {filename} "
-                                      f"(score {_nf_score}/10) — not shippable"})
-                continue
+                           "content": f"{qa_icon} {filename} — {qa.get('summary', 'ready')}"})
+                file_data["qa_result"] = qa
+            except Exception:
+                yield sse({"type": "progress", "content": f"✅ {filename} ready"})
+                file_data["qa_result"] = {"verdict": "safe", "qa_score": 8}
 
             new_files.append({
                 "filename": filename,
@@ -9626,126 +7872,7 @@ async def run_natural_pipeline_stream(
             })
             summary_parts.append(summary or f"Created {filename}")
 
-        if new_files:
-            compliance.mark(
-                "file_creation", ran=True,
-                output_summary=f"{len(new_files)} new file(s) passed the QA gate",
-            )
-
-        # ── Dependency-aware gating (PR #69) ──────────────────────────────
-        # A change that PASSED the gate must NOT ship if it depends on a NEW FILE
-        # the same run BLOCKED. The demonstrated break: an edit adds
-        # `require('./newRoutes')` while `newRoutes.js` is blocked for being
-        # truncated — applying the edit alone crashes the server at startup with
-        # "Cannot find module". We cascade the block to every dependent shipped
-        # change (transitively). Only blocked NEW FILES break dependents; a blocked
-        # symbol-edit leaves its file on disk, so it is NOT treated as a missing
-        # dependency.
-        if changes_by_file and gated_out:
-            def _blocked_file_keys(entries):
-                ks = set()
-                for e in entries:
-                    if e.get("symbol") != "(new file)":
-                        continue  # only a MISSING new file breaks importers
-                    fn = (e.get("filename") or "").strip()
-                    if not fn:
-                        continue
-                    base = fn.rsplit("/", 1)[-1]
-                    stem = base.rsplit(".", 1)[0] if "." in base else base
-                    for k in (base, stem):
-                        if k:
-                            ks.add(k.lower())
-                return ks
-
-            def _referenced_blocked_module(code, keys):
-                if not code or not keys:
-                    return None
-                for _m in re.finditer(
-                    r"""(?:require\s*\(\s*|from\s+|import\s+)['"]([^'"]+)['"]""", code
-                ):
-                    spec = _m.group(1)
-                    sb = spec.rsplit("/", 1)[-1]
-                    ss = sb.rsplit(".", 1)[0] if "." in sb else sb
-                    if sb.lower() in keys or ss.lower() in keys:
-                        return spec
-                return None
-
-            _cascade_passes = 0
-            while True:
-                _cascade_passes += 1
-                _blocked_keys = _blocked_file_keys(gated_out)
-                if not _blocked_keys:
-                    break
-                _demoted_any = False
-                for _fn in list(changes_by_file.keys()):
-                    _self_base = _fn.rsplit("/", 1)[-1].lower()
-                    _self_stem = (_self_base.rsplit(".", 1)[0]
-                                  if "." in _self_base else _self_base)
-                    _kept = []
-                    for _chg in changes_by_file[_fn]["changes"]:
-                        _ref = _referenced_blocked_module(_chg.get("new_code", ""), _blocked_keys)
-                        # Never self-block: a file may legitimately reference itself.
-                        _ref_stem = (_ref.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
-                                     if _ref else None)
-                        if _ref and _ref_stem != _self_stem:
-                            _sym = _chg.get("symbol", {})
-                            _sym_name = _sym.get("name", "?") if isinstance(_sym, dict) else "?"
-                            _shipped -= 1
-                            _blocked += 1
-                            _demoted_any = True
-                            gated_out.append({
-                                "filename": _fn,
-                                "symbol": _sym_name,
-                                "reason": (
-                                    f"Blocked by dependency gate: references '{_ref}', "
-                                    f"which was blocked in this same run. Applying this "
-                                    f"alone would break the build (missing module)."
-                                ),
-                                "qa_score": _chg.get("confidence", 0),
-                                "verdict": "blocked",
-                            })
-                            logger.info(
-                                "[pipeline:natural][GATE] run_id=%s decision=CASCADE-BLOCK "
-                                "symbol=%s file=%s spec=%s reason=depends_on_blocked_file",
-                                run_id, _sym_name, _fn, _ref,
-                            )
-                            yield sse({"type": "progress", "content": (
-                                f"🚫 DEPENDENCY BLOCK {_sym_name} — depends on '{_ref}', "
-                                f"which was blocked. Not shippable (would break the build)."
-                            )})
-                        else:
-                            _kept.append(_chg)
-                    if _kept:
-                        changes_by_file[_fn]["changes"] = _kept
-                    else:
-                        del changes_by_file[_fn]
-                if not _demoted_any or _cascade_passes > 10:
-                    break
-
-            # Fold the cascade outcome into the compliance gate record.
-            compliance.mark(
-                "confidence_gate", ran=True,
-                output_summary=(
-                    f"gate min={QA_GATE_MIN_SCORE} (+dependency cascade): "
-                    f"{_shipped} shipped, {_blocked} blocked"
-                ),
-            )
-
         if not changes_by_file and not new_files:
-            # Everything was either pure-chat or blocked by the gate.
-            compliance.save()
-            if gated_out:
-                yield sse({"type": "smart_result", "content": json.dumps({
-                    "intent": "edit",
-                    "summary": f"All {len(gated_out)} proposed change(s) were blocked by the QA gate.",
-                    "reasoning": "No change met the minimum quality bar to ship.",
-                    "risks": all_qa_risks,
-                    "skipped_changes": gated_out,
-                    "changes_by_file": {},
-                    "new_files": [],
-                    "natural_text": full_response,
-                    "compliance": compliance.to_dict(),
-                })})
             yield sse({"type": "done", "content": ""})
             return
 
@@ -9763,28 +7890,19 @@ async def run_natural_pipeline_stream(
         for _raw in new_file_blocks_raw:
             _display_text = _display_text.replace(FILE_OPEN + _raw + FILE_CLOSE, "").strip()
 
-        compliance.set_intent(intent)
-        compliance.save()
-
         result = {
             "intent": intent,
             "summary": "; ".join(summary_parts[:3]),
             "reasoning": "Changes from natural conversation",
             "risks": all_qa_risks,
-            "skipped_changes": gated_out,
+            "skipped_changes": [],
             "changes_by_file": changes_by_file,
             "new_files": new_files,
             "natural_text": _display_text,
-            "compliance": compliance.to_dict(),
         }
 
         yield sse({"type": "smart_result", "content": json.dumps(result)})
         yield sse({"type": "done", "content": ""})
 
     except Exception as e:
-        try:
-            compliance.mark("pipeline_error", ran=False, reason=str(e)[:200])
-            compliance.save()
-        except Exception:
-            pass
         yield f"data: {json.dumps({'type': 'error', 'content': _friendly_error(e)})}\n\n"

@@ -467,7 +467,10 @@ export function SettingsModal() {
                 </Field>
                 )}
 
-                {/* Surgeon temperature hidden — single Claude model pipeline */}
+                {/* Temperature hidden for Claude models: extended thinking requires
+                    temperature=1, so the control is inert on Claude. Shown only if a
+                    non-Claude model is ever re-enabled. */}
+                {!form.architect_model.startsWith('claude-') && (
                 <Field label={`Temperature: ${form.temperature_architect}`}>
                   <input type="range" min="0" max="1" step="0.1" value={form.temperature_architect}
                     onChange={(e) => upd('temperature_architect')(parseFloat(e.target.value))} className="w-full accent-accent" />
@@ -475,6 +478,7 @@ export function SettingsModal() {
                     <span>0 — precise</span><span>1 — creative</span>
                   </div>
                 </Field>
+                )}
 
                 <Field label={`Confidence Threshold: ${form.confidence_threshold}/10 (lower = more auto-applies)`}>
                   <input type="range" min="1" max="10" step="1" value={form.confidence_threshold}
