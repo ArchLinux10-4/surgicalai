@@ -6739,6 +6739,16 @@ USER REQUEST:
                             # │ in the Railway build (Dockerfile / nixpacks) and (2) gates it       │
                             # │ behind a feature flag. It was DELIBERATELY DEFERRED, not forgotten. │
                             # │                                                                     │
+                            # │ INSTALL LOCATION MATTERS: linter_validator._find_tsc() only probes  │
+                            # │ specific paths (frontend/node_modules/.bin/tsc, project-root        │
+                            # │ node_modules, then PATH). Install tsc anywhere else and NOTHING      │
+                            # │ changes. Easiest: `npm install typescript` in frontend/.            │
+                            # │ NO KILL SWITCH TODAY: the instant the binary is found,              │
+                            # │ linter_available() flips True and this gate goes live for ALL edits │
+                            # │ at once — no gradual rollout. Add an env-var flag check here if you  │
+                            # │ want an on/off toggle. (Full operational detail lives next to       │
+                            # │ _find_tsc() in linter_validator.py.)                                │
+                            # │                                                                     │
                             # │ WHY THE ORDER MATTERS: PR #82 made the lint gate DELTA-based        │
                             # │ (see ~line 6596: `_lint_orig_count` baseline). That fix is the      │
                             # │ prerequisite — installing tsc BEFORE it would surface hundreds of   │

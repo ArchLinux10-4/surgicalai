@@ -259,6 +259,32 @@ def _find_tsc() -> Optional[str]:
     """
     Locate tsc: checks local node_modules first (version-pinned),
     then falls back to global PATH.
+
+    ┌─ FUTURE WORK / "how to actually turn tsc on" (handoff, 2026-05-29) ──────┐
+    │ tsc is currently NOT installed on the backend, so this returns None and  │
+    │ the whole lint gate honestly self-skips. To enable it, the binary must   │
+    │ land in ONE of the probe paths below — anywhere else and nothing changes.│
+    │ Easiest: `npm install typescript` inside frontend/ (matches the first    │
+    │ two candidates), or put `tsc` on PATH (shutil.which fallback).            │
+    │                                                                          │
+    │ The moment a binary is found here, linter_available() flips to True and  │
+    │ the gate goes LIVE immediately for ALL edits — there is NO feature flag / │
+    │ kill switch today. If you want a gradual rollout or an off-switch, add a  │
+    │ flag check (env var) BEFORE shipping the install. See the matching note  │
+    │ in pipeline.py at the "⏭ tsc skipped (not installed)" branch.            │
+    │                                                                          │
+    │ PERFORMANCE: _run_tsc() is invoked on BOTH the original and edited file  │
+    │ (delta gate), i.e. tsc runs ~2x per edit in the request path. On a large │
+    │ file (6k+ lines, --checkJs) that can add several seconds. It degrades to │
+    │ a safe skip on timeout (returns []), so it can't break an edit, but it   │
+    │ can make edits feel slower — watch latency after enabling.               │
+    │                                                                          │
+    │ SAFE because PR #82 made the lint gate DELTA-based: checking a file in    │
+    │ isolation produces many "Cannot find module" errors (no node_modules in  │
+    │ the temp dir), but those exist in BOTH original and edited versions and  │
+    │ cancel out in the delta — so they do NOT false-block. Do not enable tsc  │
+    │ if that delta gate is ever reverted.                                     │
+    └──────────────────────────────────────────────────────────────────────────┘
     """
     candidates = [
         # Preferred: inside the frontend package
