@@ -1756,6 +1756,100 @@ def _build_claude_context(
 
 
 # ---------------------------------------------------------------------------
+# Helper: _apply_snippet_to_symbol  (SNIPPET / targeted edit support)
+# ---------------------------------------------------------------------------
+
+def _apply_snippet_to_symbol(symbol_code: str, old_code: str, new_code: str):
+    """
+    Reconstruct a full symbol body from a *targeted* edit.
+
+    Instead of forcing Claude to re-emit an entire (possibly 900+ line) symbol,
+    a surgical_edit may supply a small ``old_code`` snippet and its ``new_code``
+    replacement. We splice that change into the *complete* original symbol code
+    so every downstream stage (diff, QA, structural QA, retry loop, apply) keeps
+    operating on the full before/after symbol exactly as it does today.
+
+    Matching strategy (most precise first):
+      1. Exact, unique verbatim match of old_code inside symbol_code.
+      2. Whitespace-tolerant match (trailing whitespace per line ignored),
+         still requiring a single unambiguous location.
+      3. Line-number-prefix strip — if Claude copied numbered search output
+         (e.g. "  736: <div>"), strip the "NNN: " prefix and retry (1) & (2).
+
+    Returns (full_new_code, ok, reason).
+      ok=True  -> full_new_code is the complete new symbol body.
+      ok=False -> reason explains why (not found / ambiguous) for a correction round.
+    """
+    if not old_code:
+        return None, False, "no old_code provided"
+    if not symbol_code:
+        return None, False, "empty symbol"
+
+    # 1. Exact verbatim
+    cnt = symbol_code.count(old_code)
+    if cnt == 1:
+        return symbol_code.replace(old_code, new_code, 1), True, "exact"
+    if cnt > 1:
+        return None, False, (
+            f"old_code appears {cnt} times in the symbol — it is ambiguous. "
+            f"Include a few more surrounding lines so it matches exactly one place."
+        )
+
+    # 3. Strip line-number prefixes Claude may have copied from search output.
+    def _strip_lineno(block: str) -> str:
+        out = []
+        any_stripped = False
+        for ln in block.splitlines():
+            m = re.match(r'^\s*\d+:\s?(.*)$', ln)
+            if m:
+                out.append(m.group(1))
+                any_stripped = True
+            else:
+                out.append(ln)
+        return "\n".join(out) if any_stripped else block
+
+    stripped_old = _strip_lineno(old_code)
+    if stripped_old != old_code:
+        c2 = symbol_code.count(stripped_old)
+        if c2 == 1:
+            return symbol_code.replace(stripped_old, new_code, 1), True, "exact-after-strip"
+        if c2 > 1:
+            return None, False, "old_code (after stripping line numbers) is ambiguous"
+        old_code = stripped_old  # fall through to whitespace-tolerant below
+
+    # 2. Whitespace-tolerant match (ignore trailing whitespace on each line).
+    def _norm(s: str) -> str:
+        return "\n".join(line.rstrip() for line in s.splitlines())
+
+    norm_sym = _norm(symbol_code)
+    norm_old = _norm(old_code)
+    if norm_old and norm_sym.count(norm_old) == 1:
+        # Locate the matching region in the ORIGINAL (un-normalised) symbol so we
+        # preserve exact trailing whitespace outside the edit.
+        sym_lines = symbol_code.splitlines(keepends=True)
+        old_line_count = len(norm_old.split("\n"))
+        target_norm = norm_old.split("\n")
+        for i in range(0, len(sym_lines) - old_line_count + 1):
+            window = [sym_lines[i + k].rstrip("\n").rstrip("\r").rstrip()
+                      for k in range(old_line_count)]
+            if window == target_norm:
+                before = "".join(sym_lines[:i])
+                after = "".join(sym_lines[i + old_line_count:])
+                # Preserve a trailing newline convention between segments.
+                joiner = "" if (not new_code.endswith("\n") and after.startswith("\n")) else ""
+                rebuilt = before + new_code
+                if after and not rebuilt.endswith("\n") and not after.startswith("\n"):
+                    rebuilt += "\n"
+                rebuilt += after
+                return rebuilt, True, "whitespace-tolerant"
+
+    return None, False, (
+        "old_code was not found verbatim in the target symbol. Copy the exact lines "
+        "(no line-number prefix) from the file/search results you were shown."
+    )
+
+
+# ---------------------------------------------------------------------------
 # Helper: _resolve_search_terms
 # ---------------------------------------------------------------------------
 
@@ -6039,6 +6133,32 @@ Rules for new_code:
 - If a function is 200 lines and you change 1 line, new_code is still 200 lines
 - new_code REPLACES the entire original symbol — omitting lines deletes them
 
+━━━ TARGETED EDITS FOR LARGE SYMBOLS (PREFERRED for big files) ━━━
+
+For a large symbol (e.g. a 900-line React component) re-emitting the entire body is
+wasteful and error-prone — and you may only have been shown PART of it. In that case,
+do NOT replace the whole symbol and do NOT create a new file. Instead make a TARGETED
+edit: provide the small "old_code" snippet you want to change plus its "new_code"
+replacement. The system splices it into the full symbol and runs the same QA gate.
+
+<surgical_edit>
+{
+  "filename": "src/pages/LandingPage.tsx",
+  "symbol": "LandingPage",
+  "description": "Add the animated QA hero mockup below the headline",
+  "old_code": "        <h1 className=\\"hero-title\\">Ship code with confidence</h1>",
+  "new_code": "        <h1 className=\\"hero-title\\">Ship code with confidence</h1>\\n        <HeroMockupAnimation />"
+}
+</surgical_edit>
+
+Rules for targeted edits:
+- "old_code" must be copied VERBATIM from the file/search results (NO line-number prefix)
+  and must match EXACTLY ONE place in the symbol — include a few surrounding lines if needed
+- "new_code" is the full replacement for just that snippet (include the old lines you keep)
+- If you can't see the region you need, emit a <search_request> for a nearby string literal
+  FIRST — you'll get a focused window around it — then write the targeted edit
+- Use a full-symbol new_code (no old_code) only for small symbols you can see entirely
+
 Rules for symbol:
 - Must exactly match a name from the SYMBOL INDEX in the file context
 - For React/TSX: use the component name (e.g. "LoginPage"), never hooks ("useXxx") for UI changes
@@ -6070,6 +6190,12 @@ Use <surgical_edit> when: user wants changes to an existing uploaded file
 Use <new_file> when: user wants a new file that doesn't exist yet
 Use both when: creating a new file AND updating an existing one (e.g. new component + registering it in App.tsx)
 Just chat (no blocks) when: answering a question, explaining code, or you need clarification first
+
+NEVER do this: when the user asks to change behavior that lives in an existing uploaded
+file, do NOT create a brand-new file as a substitute, and do NOT fall back to telling the
+user how to wire it up manually. If the symbol is large or only partially visible, emit a
+<search_request> to load the exact region, then make a TARGETED edit (old_code/new_code)
+on the real symbol. A new file is only correct when genuinely net-new code is requested.
 
 ━━━ EXAMPLE — EDIT ━━━
 
@@ -6341,6 +6467,22 @@ def _build_symbol_correction(
         filename = item.get("filename", "")
         bad_name = item.get("symbol", "")
         smap, _ = symbol_maps_by_name.get(filename, (None, None))
+
+        # Snippet edits: the symbol exists, but the supplied old_code did not
+        # match. Guide Claude to fix the targeted snippet rather than telling it
+        # the symbol is missing.
+        snippet_reason = item.get("_snippet_reason")
+        if snippet_reason:
+            parts.append(
+                f"\n❌ Targeted edit on symbol '{bad_name}' in {filename} could not be applied: "
+                f"{snippet_reason}\n"
+                f"   Fix it by EITHER:\n"
+                f"   • providing an \"old_code\" snippet copied verbatim (no line-number prefix) "
+                f"from the symbol, that matches exactly one location, with its \"new_code\" replacement; OR\n"
+                f"   • emitting the COMPLETE symbol in \"new_code\" with no \"old_code\".\n"
+                f"   Use <search_request> first if you need to see the exact current lines."
+            )
+            continue
 
         parts.append(f"\n❌ Symbol '{bad_name}' in {filename} — NOT FOUND.")
 
@@ -6759,9 +6901,16 @@ def _resolve_search_multifile(
                     seen_paths.add(path_key)
                     code = getattr(sym, "code", "") or ""
                     code_lines = code.splitlines()
-                    # Show up to 120 lines of the symbol
-                    shown = code_lines[:120]
-                    trunc = f"\n  ... [{len(code_lines)-120} more lines]" if len(code_lines) > 120 else ""
+                    # Show up to 400 lines of the symbol. For very large symbols,
+                    # the model should grep for a string near the region it wants
+                    # so it gets a window centred on that line (see grep path).
+                    _SYM_CAP = 400
+                    shown = code_lines[:_SYM_CAP]
+                    trunc = (
+                        f"\n  ... [{len(code_lines)-_SYM_CAP} more lines — to see a deeper "
+                        f"region, search for a string literal near it to get a focused window]"
+                        if len(code_lines) > _SYM_CAP else ""
+                    )
                     numbered = "\n".join(
                         f"{sym.start_line + i:5d}: {shown[i]}"
                         for i in range(len(shown))
@@ -6793,22 +6942,31 @@ def _resolve_search_multifile(
                             best_size, best_sym = sz, sym
 
                 if best_sym:
-                    path_key = f"{fname}::{best_sym.full_path}"
+                    path_key = f"{fname}::{best_sym.full_path}::{lineno}"
                     if path_key in seen_paths:
                         continue
                     seen_paths.add(path_key)
                     code = getattr(best_sym, "code", "") or ""
                     code_lines_s = code.splitlines()
-                    shown = code_lines_s[:120]
-                    trunc = f"\n  ... [{len(code_lines_s)-120} more lines]" if len(code_lines_s) > 120 else ""
+                    # Window the symbol AROUND the matched line (not from its
+                    # start). For large symbols this is what lets the model see
+                    # the exact region it searched for — e.g. a return block deep
+                    # inside a 900-line component — so it can write a targeted edit.
+                    _WIN = 90  # lines of context on each side of the match
+                    match_idx = (lineno - best_sym.start_line)  # 0-based index within symbol
+                    lo = max(0, match_idx - _WIN)
+                    hi = min(len(code_lines_s), match_idx + _WIN + 1)
+                    shown = code_lines_s[lo:hi]
+                    pre = f"  ... [{lo} earlier line(s) in this symbol]\n" if lo > 0 else ""
+                    post = f"\n  ... [{len(code_lines_s)-hi} later line(s) in this symbol]" if hi < len(code_lines_s) else ""
                     numbered = "\n".join(
-                        f"{best_sym.start_line + i:5d}: {shown[i]}"
+                        f"{best_sym.start_line + lo + i:5d}: {shown[i]}"
                         for i in range(len(shown))
                     )
                     result_parts.append(
                         f"GREP MATCH ('{term}') [{fname} :: {best_sym.full_path} "
-                        f"({best_sym.symbol_type.value}, L{best_sym.start_line}–{best_sym.end_line})]:\n"
-                        f"{numbered}{trunc}"
+                        f"({best_sym.symbol_type.value}, L{best_sym.start_line}–{best_sym.end_line}), "
+                        f"match at L{lineno}]:\n{pre}{numbered}{post}"
                     )
                 else:
                     # No enclosing symbol — show ±40 lines of raw context
@@ -7333,6 +7491,7 @@ async def run_natural_pipeline_stream(
                 symbol_name = edit_data.get("symbol", "")
                 new_code = edit_data.get("new_code", "")
                 description = edit_data.get("description", "")
+                old_code = edit_data.get("old_code", "")  # SNIPPET / targeted edit
 
                 if not filename or not symbol_name or not new_code:
                     continue
@@ -7347,6 +7506,29 @@ async def run_natural_pipeline_stream(
                 symbol, match_method = _fuzzy_find_symbol(smap, symbol_name)
 
                 if symbol:
+                    # ── Targeted (snippet) edit ──────────────────────────────
+                    # When Claude supplies an old_code snippet instead of the
+                    # entire symbol, splice it into the FULL original symbol so
+                    # every downstream stage keeps working on the complete
+                    # before/after symbol. This is the "edit, don't rewrite"
+                    # path for large symbols the model can only see partially.
+                    if old_code:
+                        full_new, ok_snip, snip_reason = _apply_snippet_to_symbol(
+                            symbol.code, old_code, new_code
+                        )
+                        if ok_snip:
+                            edit_data["new_code"] = full_new
+                            edit_data.pop("old_code", None)  # now a full-symbol edit
+                        else:
+                            still_unresolved.append({
+                                "filename": filename,
+                                "symbol": symbol_name,
+                                "new_code": new_code,
+                                "description": description,
+                                "_raw": edit_raw,
+                                "_snippet_reason": snip_reason,
+                            })
+                            continue
                     resolved_edits.append({
                         "edit_data": edit_data,
                         "symbol": symbol,
@@ -7453,11 +7635,16 @@ async def run_natural_pipeline_stream(
         # Pre-build diffs and change shells (no I/O — instant)
         change_shells = []
 
-        # Cross-change dependencies (e.g. change 1 adds a helper that change 2
-        # calls) are surfaced to QA via same_run_context + other_files_context,
-        # NOT by mutating the per-symbol "before" code. QA always compares a
-        # symbol's original code against that same symbol's new code so the
-        # completeness check stays apples-to-apples.
+        # ── Fix 1: cross-change ordering ─────────────────────────────────
+        # When multiple changes target the same file, QA must see the file
+        # state AFTER previous changes are applied — not the original.
+        # Example: change 1 adds a helper, change 2 calls it.
+        # QA for change 2 must see the helper already present.
+        # We apply each change to an in-memory copy sequentially so every
+        # QA call receives the correct intermediate "before" state.
+        from services.surgical_editor import apply_change as _apply_change_fn
+        _intermediate_contents: dict = {}   # fname -> content after prior changes
+
         for i, resolved in enumerate(resolved_edits):
             edit_data    = resolved["edit_data"]
             symbol       = resolved["symbol"]
@@ -7466,6 +7653,13 @@ async def run_natural_pipeline_stream(
             filename     = resolved["filename"]
             new_code     = edit_data.get("new_code", "")
             description  = edit_data.get("description", "")
+
+            # Seed intermediate state on first touch for this file
+            if filename not in _intermediate_contents:
+                _intermediate_contents[filename] = file_content
+
+            # QA sees the file state AFTER all previous changes to this file
+            qa_original_content = _intermediate_contents[filename]
 
             diff = _make_diff(symbol.code, new_code, symbol.name)
             _tgt, _repl = _compute_target_element(symbol.code, new_code)
@@ -7487,10 +7681,27 @@ async def run_natural_pipeline_stream(
             except Exception:
                 pass
 
+            # Advance the intermediate state so the NEXT change on this file
+            # sees this change already applied.
+            try:
+                _sc_proxy = type("_SC", (), {
+                    "new_code": new_code,
+                    "original_code": symbol.code,
+                    "symbol": symbol,
+                    "operations": [{"find": symbol.code, "replace": new_code}],
+                    "applied": False,
+                })()
+                _intermediate_contents[filename] = _apply_change_fn(
+                    _intermediate_contents[filename], _sc_proxy
+                )
+            except Exception:
+                pass  # keep current intermediate if apply fails; QA still runs
+
             change_shells.append({
                 "symbol":              symbol,
                 "sf_entry":            sf_entry,
                 "file_content":        file_content,        # original file (for SurgicalChange)
+                "qa_original_content": qa_original_content, # intermediate (for QA)
                 "filename":            filename,
                 "new_code":            new_code,
                 "description":         description,
@@ -7503,15 +7714,7 @@ async def run_natural_pipeline_stream(
         # Launch all QA calls concurrently
         qa_tasks = [
             asyncio.create_task(run_qa_agent(
-                # QA compares ORIGINAL → NEW at the SAME granularity. new_code is a
-                # single symbol, so original_code must be that symbol's original code
-                # too — NOT the whole-file intermediate. Passing the full file here
-                # made QA's completeness check (#1) report every other symbol as
-                # "dropped", falsely blocking correct surgical edits at 1-2/10.
-                # This now matches the structural-QA pre-check and the retry round,
-                # which both already use symbol.code. Cross-change ordering context
-                # is supplied separately via same_run_context / other_files_context.
-                original_code=cs["symbol"].code,
+                original_code=cs["qa_original_content"],  # intermediate state, not raw original
                 new_code=cs["new_code"],
                 change_description=cs["description"],
                 new_logic=cs["description"],
