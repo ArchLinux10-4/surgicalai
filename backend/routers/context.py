@@ -9,8 +9,9 @@ from models.schemas import (
     PromptTemplate, PromptTemplateCreate,
     MultiFileAnalyzeRequest, ImpactAnalysisResponse
 )
-from database import get_db, get_setting
+from database import get_db, get_setting, GLOBAL_MEMORY_KEY
 from services.pipeline import run_impact_analysis, analyze_multi_file
+from data.memory_presets import MEMORY_PRESETS
 
 router = APIRouter()
 
@@ -96,6 +97,47 @@ def save_memory(req: ProjectMemory):
     conn.commit()
     conn.close()
     return {"ok": True}
+
+# ─── Global Project Memory (team-wide, injected into every prompt) ────────────
+
+@router.get("/memory/global")
+def get_global_memory():
+    """Team-wide conventions injected into every prompt, every session, every user."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT * FROM project_memory WHERE workspace_path = ? ORDER BY updated_at DESC LIMIT 1",
+        (GLOBAL_MEMORY_KEY,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"workspace_path": GLOBAL_MEMORY_KEY, "content": "", "id": None}
+    return dict(row)
+
+@router.post("/memory/global")
+def save_global_memory(req: ProjectMemory):
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT id FROM project_memory WHERE workspace_path = ?",
+        (GLOBAL_MEMORY_KEY,)
+    ).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE project_memory SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE workspace_path = ?",
+            (req.content, GLOBAL_MEMORY_KEY)
+        )
+    else:
+        conn.execute(
+            "INSERT INTO project_memory (id, workspace_path, content) VALUES (?, ?, ?)",
+            (str(uuid.uuid4()), GLOBAL_MEMORY_KEY, req.content)
+        )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+@router.get("/memory/presets")
+def get_memory_presets():
+    """Curated, shared library of convention presets every developer can pick from."""
+    return MEMORY_PRESETS
 
 # ─── Prompt Templates ─────────────────────────────────────────────────────────
 

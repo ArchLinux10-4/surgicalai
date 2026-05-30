@@ -11,6 +11,11 @@ from pathlib import Path
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = DATABASE_URL.startswith("postgres")
 
+# Reserved workspace_path sentinel for GLOBAL (team-wide) project memory.
+# Stored as a normal project_memory row under this key. Merged into EVERY chat
+# prompt — every session, every user — alongside any per-session memory.
+GLOBAL_MEMORY_KEY = "__global__"
+
 if USE_POSTGRES:
     import psycopg2
     import psycopg2.extras
