@@ -576,8 +576,6 @@ export function ChatPanel() {
   const [error, setError] = useState<string | null>(null)
   const [isDragging, setIsDragging] = useState(false)
   const [uploadingFiles, setUploadingFiles] = useState(false)
-  const [showAllFiles, setShowAllFiles] = useState(false)
-  const [filesCollapsed, setFilesCollapsed] = useState(false)
   const [isBuildingEdit, setIsBuildingEdit] = useState(false)
   const [progressHistory, setProgressHistory] = useState<string[]>([])
   const [thinkingText, setThinkingText] = useState('')
@@ -1018,7 +1016,7 @@ export function ChatPanel() {
         <div className="flex items-center gap-2 min-w-0">
           <Bolt sx={{ fontSize: 13 }} className="text-accent flex-shrink-0" />
           <span className="text-sm font-semibold text-ink">
-            {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} in context` : 'SurgicalAI'}
+            SurgicalAI
           </span>
         </div>
         <div className="flex items-center gap-1.5">
@@ -1087,59 +1085,20 @@ export function ChatPanel() {
         </div>
       )}
 
-      {/* Session Files Tray — always-fresh download hub */}
-      {activeSessions && sessionFiles.length > 0 && (
-        <div className="px-3 pt-2 flex-shrink-0">
-          <SessionFilesTray sessionId={activeSessions} sessionFiles={sessionFiles} />
-        </div>
-      )}
-
       {/* Input area */}
       <div className="border-t border-border p-3 flex-shrink-0 bg-base/50">
-        {/* File chips */}
-        {hasFiles && (
-          <div className="mb-2.5">
-            {/* Collapse toggle row */}
-            <button
-              onClick={() => setFilesCollapsed(c => !c)}
-              className="flex items-center gap-1.5 mb-1.5 text-[11px] text-muted/70 hover:text-ink/80 transition-colors select-none"
-            >
-              <span>{filesCollapsed ? '▸' : '▾'}</span>
-              <span>{sessionFiles.length} file{sessionFiles.length !== 1 ? 's' : ''} in context</span>
-            </button>
-            {/* Chips — hidden when collapsed */}
-            {!filesCollapsed && (
-              <div className="flex flex-wrap gap-1.5">
-                {(showAllFiles ? sessionFiles : sessionFiles.slice(0, 5)).map(file => (
-                  <FileChip
-                    key={file.id}
-                    file={file}
-                    onRemove={() => removeFile(file.id)}
-                  />
-                ))}
-                {sessionFiles.length > 5 && !showAllFiles && (
-                  <button
-                    onClick={() => setShowAllFiles(true)}
-                    className="flex items-center gap-1 px-2.5 py-1 bg-surface/60 border border-border rounded-lg text-[11px] text-muted hover:text-ink hover:border-border transition-colors"
-                  >
-                    +{sessionFiles.length - 5} more
-                  </button>
-                )}
-                {showAllFiles && sessionFiles.length > 5 && (
-                  <button
-                    onClick={() => setShowAllFiles(false)}
-                    className="flex items-center gap-1 px-2.5 py-1 bg-surface/60 border border-border rounded-lg text-[11px] text-muted hover:text-ink hover:border-border transition-colors"
-                  >
-                    show less
-                  </button>
-                )}
-                {uploadingFiles && (
-                  <div className="flex items-center gap-1.5 px-2.5 py-1 bg-surface/60 border border-border rounded-lg">
-                    <span className="text-[11px] text-muted/70 animate-pulse">Uploading...</span>
-                  </div>
-                )}
-              </div>
-            )}
+        {/* Session file drawer — single docked source of truth atop the composer */}
+        {activeSessions && hasFiles && (
+          <SessionFilesTray
+            sessionId={activeSessions}
+            sessionFiles={sessionFiles}
+            onAddFiles={() => fileInputRef.current?.click()}
+            onRemove={removeFile}
+          />
+        )}
+        {uploadingFiles && (
+          <div className="mb-2.5 flex items-center gap-1.5 px-2.5 py-1 bg-surface/60 border border-border rounded-lg w-fit">
+            <span className="text-[11px] text-muted/70 animate-pulse">Uploading...</span>
           </div>
         )}
 
