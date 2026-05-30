@@ -171,7 +171,8 @@ export const api = {
       onThinking?: (text: string, phase: 'start' | 'delta' | 'end') => void,
       onCompacting?: (phase: 'start' | 'done') => void,
       onEditStart?: () => void,
-      onEditEnd?: () => void
+      onEditEnd?: () => void,
+      onTask?: (event: any) => void
     ): AbortController => {
       const controller = new AbortController()
       const tokens: string[] = []
@@ -209,6 +210,12 @@ export const api = {
             else if (chunk.type === 'compacting_done') onCompacting?.('done')
             else if (chunk.type === 'edit_start') onEditStart?.()
             else if (chunk.type === 'edit_end') onEditEnd?.()
+            else if (
+              chunk.type === 'task_plan' || chunk.type === 'task_start' ||
+              chunk.type === 'task_progress' || chunk.type === 'task_done' ||
+              chunk.type === 'task_blocked' || chunk.type === 'task_cancelled' ||
+              chunk.type === 'tasks_complete'
+            ) onTask?.(chunk)
           } catch {}
         }
 
@@ -382,6 +389,14 @@ export const api = {
     detect: (sessionId: string) => request<any>(`/tests/detect/${sessionId}`),
     run: (sessionId: string, fileId?: string) => request<any>('/tests/run', { method: 'POST', body: JSON.stringify({ session_id: sessionId, file_id: fileId }) }),
     status: (runId: string) => request<any>(`/tests/status/${runId}`),
+  },
+
+  tasks: {
+    list: (sessionId: string, runId?: string) =>
+      request<import('../types').AgentTask[]>(`/tasks?session_id=${encodeURIComponent(sessionId)}${runId ? `&run_id=${encodeURIComponent(runId)}` : ''}`),
+    cancel: (taskId: string) => request<any>(`/tasks/${taskId}/cancel`, { method: 'POST', body: JSON.stringify({}) }),
+    cancelAll: (sessionId: string, runId?: string) =>
+      request<any>('/tasks/cancel-all', { method: 'POST', body: JSON.stringify({ session_id: sessionId, run_id: runId }) }),
   },
 
   github: {
