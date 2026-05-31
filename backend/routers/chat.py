@@ -774,6 +774,12 @@ async def smart_stream(req: dict, request: Request):
                         _score = None if _is_answer else score
                         update_task(t["id"], status="done", qa_score=_score,
                                     verdict=_verdict, result_summary=natural_text[:500])
+                        # Emit the diff result so the frontend renders the code card.
+                        # Without this the result is saved to DB but never shown in chat.
+                        if parsed and not _is_answer:
+                            _result_payload = dict(parsed)
+                            _result_payload["natural_text"] = natural_text
+                            yield _sse({"type": "smart_result", "content": _json.dumps(_result_payload)})
                         yield _sse({"type": "task_done", "id": t["id"], "qa_score": _score, "verdict": _verdict})
                         completed += 1
 
