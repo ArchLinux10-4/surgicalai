@@ -208,6 +208,21 @@ export interface NewFile {
   summary: string
 }
 
+export type AgentTaskStatus = 'pending' | 'running' | 'done' | 'blocked' | 'cancelled' | 'error'
+
+export interface AgentTask {
+  id: string
+  seq: number
+  title: string
+  detail: string
+  kind?: 'code' | 'answer'
+  status: AgentTaskStatus
+  qa_score?: number | null
+  verdict?: string | null
+  run_id?: string
+  progress?: string  // latest live progress line (client-side only)
+}
+
 export interface SmartResult {
   intent: 'edit' | 'chat' | 'create'
   summary: string
