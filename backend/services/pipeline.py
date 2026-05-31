@@ -2017,9 +2017,13 @@ async def run_qa_for_changes(
     _QA_SYSTEM = (
         "You are a code reviewer. Review the proposed code changes and verify they "
         "correctly implement the request.\n"
+        "SCOPE: ORIGINAL and NEW CODE are a SINGLE SYMBOL excerpted from a larger file. "
+        "File-level imports and module-level exports outside the symbol are present in the "
+        "file but not shown here — do NOT flag them as missing or dropped. Only flag an "
+        "import issue when NEW CODE introduces a NEW dependency that ORIGINAL did not use.\n"
         "For each change, check:\n"
         "1. Does new_code correctly implement what was requested?\n"
-        "2. Does new_code preserve all unchanged parts of the original?\n"
+        "2. Does new_code preserve all unchanged parts of the original SYMBOL?\n"
         "3. Are there any obvious bugs, syntax errors, or missing logic?\n"
         "4. Are there risks (side effects, other files that might need updating)?\n\n"
         "Return ONLY valid JSON:\n"
@@ -3581,11 +3585,24 @@ IMPORTANT: You have the FULL original and FULL new code — there is no truncati
 Compare them directly, like a real code reviewer would. Do NOT ask for a diff or complain
 about missing context — everything you need is in ORIGINAL CODE and NEW CODE.
 
+SCOPE — READ THIS FIRST: ORIGINAL CODE and NEW CODE are a SINGLE SYMBOL (one function,
+class, or component) excerpted from a LARGER FILE. File-level imports, other functions,
+helper definitions, and module-level exports (e.g. `import ... from ...`,
+`export default X`) live OUTSIDE this symbol. They are NOT shown here but ARE present in
+the file. Their absence from NEW CODE is EXPECTED and CORRECT — do NOT flag them as
+"missing", "dropped", "absent", or a downstream risk. Evaluate ONLY the symbol itself
+(ORIGINAL vs NEW). A correct edit that changes a few lines inside the symbol and leaves
+the rest of the symbol intact is a 9-10, even though it does not contain the file's imports.
+
 Check ALL of the following by comparing ORIGINAL → NEW:
-1. COMPLETENESS — does NEW CODE contain everything it should? Flag anything dropped that wasn't part of the plan.
+1. COMPLETENESS — within THIS symbol, does NEW CODE preserve every line of ORIGINAL that the
+   plan did not ask to change? Flag only lines dropped FROM THE SYMBOL itself — never file-level
+   imports/exports/other symbols that were never inside ORIGINAL CODE to begin with.
 2. PLAN COMPLIANCE — does NEW CODE implement exactly what was asked? No more, no less.
 3. SYNTAX — unclosed brackets, missing semicolons, malformed JSX/TSX tags, broken template literals.
-4. IMPORT ISSUES — does new code use anything that needs an import not already present in the file?
+4. IMPORT ISSUES — flag an import issue ONLY when NEW CODE introduces a NEW identifier/dependency
+   that ORIGINAL CODE did NOT already use. If both ORIGINAL and NEW use the same identifier
+   (e.g. `motion`, `useState`, `useRef`), the import already exists in the file — do NOT flag it.
 5. TYPE ERRORS — obvious type mismatches, wrong argument counts, wrong return types.
 6. DUPLICATION — is any function, component, or block defined twice?
 7. DOWNSTREAM RISKS — does this change break signatures, exported types, or constants other files depend on?
@@ -7926,6 +7943,35 @@ async def run_natural_pipeline_stream(
                     )
                 )
 
+                # Large symbols must NOT be re-emitted in full — that is the #1 cause
+                # of degradation (the model can only see part of an 800+ line symbol, so
+                # "re-emit everything" makes it drop the rest). For anything sizeable, steer
+                # to a TARGETED old_code/new_code edit which is spliced into the full symbol
+                # server-side. Small symbols may still be re-emitted whole.
+                _sym_line_count = len(symbol.code.splitlines())
+                _is_large_symbol = _sym_line_count > 60
+
+                if _is_large_symbol:
+                    _format_instructions = (
+                        f"This symbol is {_sym_line_count} lines — DO NOT re-emit the whole symbol. "
+                        f"Make a TARGETED edit: in your <surgical_edit> JSON provide\n"
+                        f'  "old_code": the EXACT small snippet from ORIGINAL CODE you are changing '
+                        f"(copied verbatim, no line-number prefixes), and\n"
+                        f'  "new_code": the replacement for just that snippet.\n'
+                        f"The system splices your snippet into the complete symbol, so everything "
+                        f"you do NOT mention is preserved automatically. Keep old_code as small as "
+                        f"possible while still matching exactly one place.\n\n"
+                        f"NOTE ON THE QA ISSUES ABOVE: file-level imports, other functions, and "
+                        f"module exports live OUTSIDE this symbol — you do NOT need to add them. "
+                        f"Only fix issues that are genuinely inside the symbol."
+                    )
+                else:
+                    _format_instructions = (
+                        f"Write a corrected <surgical_edit> block whose \"new_code\" contains the "
+                        f"COMPLETE symbol code (nothing omitted) using the exact symbol name "
+                        f"`{symbol.name}`."
+                    )
+
                 correction_prompt = (
                     f"QA reviewed your <surgical_edit> for `{symbol.name}` in "
                     f"`{cs['filename']}` and found it BLOCKED (score "
@@ -7937,11 +7983,12 @@ async def run_natural_pipeline_stream(
                     f"```\n{symbol.code}\n```\n\n"
                     f"YOUR BROKEN CODE (what you wrote — DO NOT reuse this verbatim):\n"
                     f"```\n{cs['new_code']}\n```\n\n"
-                    f"Write a corrected <surgical_edit> block that:\n"
-                    f"1. Fixes every issue listed above\n"
-                    f"2. Still implements the original request: {cs['description']}\n"
-                    f"3. Contains the COMPLETE symbol code — nothing omitted\n"
-                    f"4. Uses the exact symbol name: `{symbol.name}`\n\n"
+                    f"Requirements:\n"
+                    f"1. Fix every issue listed above\n"
+                    f"2. Still implement the original request: {cs['description']}\n"
+                    f"3. Preserve everything you are not explicitly changing\n"
+                    f"4. Use the exact symbol name: `{symbol.name}`\n\n"
+                    f"{_format_instructions}\n\n"
                     f"Return ONLY the <surgical_edit> block, nothing else."
                 )
 
@@ -7985,8 +8032,41 @@ async def run_natural_pipeline_stream(
                         except json.JSONDecodeError:
                             edit_data = json.loads(_repair_json(raw_edit.strip()))
                         corrected_code = edit_data.get("new_code", "")
-                        if corrected_code and corrected_code != change_shells[idx]["new_code"]:
-                            change_shells[idx]["new_code"] = corrected_code
+                        corrected_old  = edit_data.get("old_code", "")
+                        _sym_code = change_shells[idx]["symbol"].code
+
+                        # Reconstruct a FULL symbol from the correction before it can be
+                        # stored. This loop must NEVER replace a change with a degenerate
+                        # fragment (the large-file failure mode: a 2-line snippet stored as
+                        # the whole 850-line symbol). Three cases:
+                        accepted = None
+                        if corrected_code:
+                            if corrected_old:
+                                # Targeted edit: splice the snippet into the full symbol.
+                                _full, _ok_snip, _ = _apply_snippet_to_symbol(
+                                    _sym_code, corrected_old, corrected_code
+                                )
+                                if _ok_snip:
+                                    accepted = _full
+                                # splice failed (snippet not found/ambiguous) -> keep prior,
+                                # do NOT store a fragment.
+                            else:
+                                # No old_code: only accept as a full-symbol replacement when
+                                # it is NOT a degenerate fragment of a large symbol.
+                                if _fragment_reason(_sym_code, corrected_code) is None:
+                                    accepted = corrected_code
+                                # else: degenerate fragment -> reject, keep prior change.
+
+                        if accepted is not None and accepted != change_shells[idx]["new_code"]:
+                            change_shells[idx]["new_code"] = accepted
+                            # Keep target_element/replacement consistent with the new full
+                            # symbol so the applied operation stays non-destructive.
+                            _new_tgt, _new_repl = _compute_target_element(_sym_code, accepted)
+                            change_shells[idx]["_tgt"]  = _new_tgt
+                            change_shells[idx]["_repl"] = _new_repl
+                            change_shells[idx]["diff"]  = _make_diff(
+                                _sym_code, accepted, change_shells[idx]["symbol"].name
+                            )
                             fixed_indices.append(idx)
                 except Exception:
                     pass  # keep original if correction call fails
