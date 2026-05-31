@@ -278,7 +278,7 @@ export const api = {
   },
 
   sessionFiles: {
-    upload: (sessionId: string, data: { filename: string; content: string; language?: string }) =>
+    upload: (sessionId: string, data: { filename: string; content: string; language?: string; origin?: 'uploaded' | 'created' }) =>
       request<any>(`/chat/${sessionId}/files`, { method: 'POST', body: JSON.stringify(data) }),
     /** Multipart upload — sends raw bytes, server converts HEIC→JPEG.
      *  Works on iOS Chrome / WKWebView where base64/canvas paths fail. */

@@ -2,13 +2,14 @@ import React, { useEffect, useState, useRef } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { useAuthStore } from '../stores/authStore'
 import { api } from '../api/client'
-import { FileNode } from '../types'
+import { FileNode, SessionFile } from '../types'
 import { toast } from '../lib/toast'
 import { ContextPanel } from './ContextPanel'
 import { GitHubPanel } from './GitHubPanel'
 import { LinearPanel } from './LinearPanel'
 import { useThemeStore } from '../stores/themeStore'
-import { Add, Bolt, Chat, Close, Code, DarkMode, Delete, Description, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, PushPin, Search, Settings } from '@mui/icons-material';
+import { Add, Bolt, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, PushPin, Search, Settings } from '@mui/icons-material';
+import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile } from '../lib/fileClassify'
 
 // ── File icon helper ─────────────────────────────────────────────────────────
 const FILE_ICONS: Record<string, string> = {
@@ -349,8 +350,23 @@ function getFileIcon(filename: string) {
 }
 
 function SessionFilesPanel() {
-  const { sessionFiles, removeSessionFile, addSessionFile } = useAppStore()
+  const { sessionFiles, removeSessionFile, addSessionFile, fileFilter } = useAppStore()
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const counts = fileCounts(sessionFiles)
+  const visibleFiles = sessionFiles.filter(f => matchesFileFilter(f, fileFilter))
+
+  const handleDownload = async (file: SessionFile) => {
+    try {
+      if (file.session_id) {
+        await api.sessionFiles.download(file.session_id, file.id, file.filename)
+      } else if (file.content != null) {
+        const blob = new Blob([file.content], { type: 'text/plain' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a'); a.href = url; a.download = file.filename; a.click()
+        URL.revokeObjectURL(url)
+      }
+    } catch { /* silent */ }
+  }
 
   const handleUpload = (files: FileList | null) => {
     if (!files) return
@@ -398,6 +414,11 @@ function SessionFilesPanel() {
           onChange={(e) => handleUpload(e.target.files)}
         />
       </div>
+      {sessionFiles.length > 0 && (
+        <div className="px-3 py-2 border-b border-border/60">
+          <FileFilterTabs counts={counts} size="sm" />
+        </div>
+      )}
       <div className="flex-1 overflow-y-auto py-1">
         {sessionFiles.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full gap-3 px-4 text-center pb-8">
@@ -417,20 +438,37 @@ function SessionFilesPanel() {
               <FileUpload sx={{ fontSize: 12 }} /> Upload files
             </button>
           </div>
+        ) : visibleFiles.length === 0 ? (
+          <div className="px-4 py-6 text-center text-[12px] text-muted/60">
+            No {fileFilter === 'new' ? 'new' : 'current'} files in this chat
+          </div>
         ) : (
           <div className="px-2 py-1 space-y-0.5">
-            {sessionFiles.map(file => (
+            {visibleFiles.map(file => (
               <div
                 key={file.id}
                 className="group flex items-center gap-2 px-2.5 py-2 rounded-lg hover:bg-overlay transition-colors"
               >
-                <span className="text-[14px] flex-shrink-0">{getFileIcon(file.filename)}</span>
+                <FileKindGlyph file={file} size={16} />
                 <div className="flex-1 min-w-0">
-                  <p className="text-[12px] font-medium text-ink truncate">{file.filename}</p>
+                  <div className="flex items-center gap-1.5">
+                    <p className="text-[12px] font-medium text-ink truncate">{file.filename}</p>
+                    {isCreatedFile(file) && <NewBadge compact />}
+                    {!isCreatedFile(file) && isEditedFile(file) && (
+                      <span className="flex items-center gap-1 text-[9px] font-medium px-1.5 py-0.5 bg-success/10 text-success border border-success/20 rounded-md shrink-0">
+                        <span className="w-1.5 h-1.5 rounded-full bg-success inline-block" /> Edited
+                      </span>
+                    )}
+                  </div>
                   {file.lines > 0 && (
                     <p className="text-[10px] text-faint">{file.lines} lines{file.symbol_count > 0 ? ` · ${file.symbol_count} symbols` : ''}</p>
                   )}
                 </div>
+                <button
+                  onClick={() => handleDownload(file)}
+                  className="opacity-0 group-hover:opacity-100 text-faint hover:text-accent transition-all flex-shrink-0"
+                  title="Download file"
+                ><Download sx={{ fontSize: 14 }} /></button>
                 <button
                   onClick={() => removeSessionFile(file.id)}
                   className="opacity-0 group-hover:opacity-100 text-faint hover:text-red-400 transition-all flex-shrink-0"

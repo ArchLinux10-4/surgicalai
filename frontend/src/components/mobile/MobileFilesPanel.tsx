@@ -8,6 +8,7 @@ import { useAppStore } from '../../stores/appStore'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import type { SessionFile } from '../../types'
+import { FileFilterTabs, NewBadge, matchesFileFilter, fileCounts, isCreatedFile } from '../../lib/fileClassify'
 
 const EXT_COLORS: Record<string, string> = {
   ts: '#3178c6', tsx: '#3178c6', js: '#f7df1e', jsx: '#61dafb',
@@ -45,7 +46,9 @@ function relativeTime(dateStr?: string): string {
 }
 
 export function MobileFilesPanel() {
-  const { sessionFiles, setSessionFiles, activeSessions } = useAppStore()
+  const { sessionFiles, setSessionFiles, activeSessions, fileFilter } = useAppStore()
+  const counts = fileCounts(sessionFiles)
+  const visibleFiles = sessionFiles.filter(f => matchesFileFilter(f, fileFilter))
   // Track which files have applied changes in DB (for AI-Edited badge accuracy)
   const [appliedFileIds, setAppliedFileIds] = useState<Set<string>>(new Set())
 
@@ -124,6 +127,13 @@ export function MobileFilesPanel() {
         </div>
       )}
 
+      {/* Current / New / All segmented filter — synced with desktop */}
+      {sessionFiles.length > 0 && (
+        <div className="flex-shrink-0 px-4 py-2 border-b border-border/50">
+          <FileFilterTabs counts={counts} size="sm" />
+        </div>
+      )}
+
       {/* List */}
       <div className="flex-1 overflow-y-auto">
         {sessionFiles.length === 0 ? (
@@ -138,9 +148,13 @@ export function MobileFilesPanel() {
               <p className="text-xs text-muted/40">Upload files from the Chat tab to get started</p>
             </div>
           </div>
+        ) : visibleFiles.length === 0 ? (
+          <div className="px-6 py-8 text-center text-[12px] text-muted/50">
+            No {fileFilter === 'new' ? 'new' : 'current'} files
+          </div>
         ) : (
           <div className="py-2">
-            {sessionFiles.map(file => {
+            {visibleFiles.map(file => {
               const ext       = file.filename.split('.').pop()?.toLowerCase() || ''
               const isEdited  = !!(file.updated_at && file.updated_at !== file.created_at)
               const status    = syncStatus(file)
@@ -154,7 +168,10 @@ export function MobileFilesPanel() {
                   <div className="flex items-center gap-3">
                     <FileIcon ext={ext} />
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-ink truncate">{file.filename}</p>
+                      <div className="flex items-center gap-1.5">
+                        <p className="text-sm font-medium text-ink truncate">{file.filename}</p>
+                        {isCreatedFile(file) && <NewBadge compact />}
+                      </div>
                       <p className="text-[11px] text-muted/50 mt-0.5">
                         {(file.lines || 0).toLocaleString()}L
                         {file.symbol_count > 0 && ` · ${file.symbol_count} sym`}

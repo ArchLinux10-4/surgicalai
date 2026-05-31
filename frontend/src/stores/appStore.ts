@@ -81,6 +81,9 @@ interface AppState {
   setSessionFiles: (files: import('../types').SessionFile[]) => void
   addSessionFile: (file: import('../types').SessionFile) => void
   removeSessionFile: (fileId: string) => void
+  // Shared file filter — keeps the side panel + chat-box tray + mobile in sync
+  fileFilter: import('../lib/fileClassify').FileFilter
+  setFileFilter: (f: import('../lib/fileClassify').FileFilter) => void
 
   // Agentic tasks
   agentTasks: import('../types').AgentTask[]
@@ -165,6 +168,8 @@ export const useAppStore = create<AppState>((set) => ({
   setSessionFiles: (sessionFiles) => set({ sessionFiles }),
   addSessionFile: (file) => set((state) => ({ sessionFiles: [...state.sessionFiles.filter(f => f.filename !== file.filename), file] })),
   removeSessionFile: (fileId) => set((state) => ({ sessionFiles: state.sessionFiles.filter(f => f.id !== fileId) })),
+  fileFilter: 'all',
+  setFileFilter: (fileFilter) => set({ fileFilter }),
 
   agentTasks: [],
   taskRunId: null,

@@ -293,15 +293,52 @@ function FileCard({
 }
 
 // ── New file card ─────────────────────────────────────────────────────────────
-function NewFileMobileCard({ file }: { file: any }) {
+function NewFileMobileCard({ file, sessionId, onAdded }: { file: any; sessionId: string; onAdded: () => void }) {
   const [expanded, setExpanded] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const savedKey = `sai-added:${sessionId}:${file.filename}`
+  const [saved, setSaved] = useState(() => {
+    try { return localStorage.getItem(savedKey) === '1' } catch { return false }
+  })
+
+  const handleDownload = () => {
+    const blob = new Blob([file.content || ''], { type: 'text/plain' })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = (file.filename || 'file').split('/').pop()
+    a.click()
+    URL.revokeObjectURL(url)
+  }
+
+  const handleAdd = async () => {
+    if (saved || saving) return
+    setSaving(true)
+    try {
+      await api.sessionFiles.upload(sessionId, {
+        filename: file.filename,
+        content: file.content,
+        language: file.language,
+        origin: 'created',
+      })
+      setSaved(true)
+      try { localStorage.setItem(savedKey, '1') } catch {}
+      onAdded()
+      toast.success(`${file.filename} added to session`)
+    } catch (e: any) {
+      toast.error(`Failed to add: ${e?.message || 'error'}`)
+    } finally {
+      setSaving(false)
+    }
+  }
+
   return (
-    <div className="rounded-xl border border-blue-500/25 bg-blue-500/5 mb-2 overflow-hidden">
+    <div className="rounded-xl border border-purple/25 bg-purple/5 mb-2 overflow-hidden">
       <button
         className="w-full flex items-center gap-2 px-3 py-2.5 text-left"
         onClick={() => setExpanded(!expanded)}
       >
-        <span className="text-blue-400 text-[11px]">+ New</span>
+        <span className="text-purple text-[11px] font-semibold">+ New</span>
         <span className="text-[11px] font-mono text-ink/80 truncate flex-1">{file.filename}</span>
         <span className={`text-[11px] transition-transform ${expanded ? 'rotate-90' : ''}`}>▶</span>
       </button>
@@ -314,9 +351,25 @@ function NewFileMobileCard({ file }: { file: any }) {
               {(file.content || '').length > 2000 && '\n... (truncated — download to see full file)'}
             </pre>
           </div>
-          <p className="text-[10px] text-muted/50 mt-2 text-center">
-            Download from Files tab to use this file
-          </p>
+          <div className="flex items-center gap-2 mt-2.5">
+            <button
+              onClick={handleAdd}
+              disabled={saving || saved}
+              className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-[12px] font-semibold transition-colors ${
+                saved
+                  ? 'bg-success/15 text-success border border-success/30'
+                  : 'bg-accent/15 text-accent border border-accent/30 hover:bg-accent/25 disabled:opacity-60'
+              }`}
+            >
+              {saved ? '✓ Added to session' : saving ? 'Adding…' : '+ Add to session'}
+            </button>
+            <button
+              onClick={handleDownload}
+              className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg text-[12px] font-medium bg-overlay text-ink border border-border hover:bg-overlay/80 transition-colors"
+            >
+              ↓ Download
+            </button>
+          </div>
         </div>
       )}
     </div>
@@ -364,7 +417,7 @@ export function MobileDiffCard({ result, sessionId, sessionFiles, setSessionFile
 
       {/* New file cards */}
       {newFiles.map((f: any, i: number) => (
-        <NewFileMobileCard key={i} file={f} />
+        <NewFileMobileCard key={i} file={f} sessionId={sessionId} onAdded={handleApplied} />
       ))}
     </div>
   )

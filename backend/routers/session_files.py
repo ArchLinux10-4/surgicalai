@@ -255,6 +255,9 @@ def upload_session_file(session_id: str, body: dict):
     base64_data = body.get("base64_data", "")
     file_type = body.get("file_type") or _get_file_type(filename)
     language = body.get("language") or _get_language(filename)
+    # 'created' = AI-generated net-new file (added from a New File card);
+    # anything else is treated as a user-provided upload.
+    origin = "created" if body.get("origin") == "created" else "uploaded"
 
     # ── DIAGNOSTIC: log at WARNING so it always appears in Railway logs ──────
     _data_url_mime = ""
@@ -330,8 +333,8 @@ def upload_session_file(session_id: str, body: dict):
     else:
         file_id = str(uuid.uuid4())
         conn.execute(
-            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            (file_id, session_id, filename, content, language, lines, symbol_count, file_type)
+            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, origin, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            (file_id, session_id, filename, content, language, lines, symbol_count, file_type, origin)
         )
 
     conn.commit()
@@ -345,6 +348,7 @@ def upload_session_file(session_id: str, body: dict):
         "lines": lines,
         "symbol_count": symbol_count,
         "file_type": file_type,
+        "origin": origin,
         "updated_at": None,
     }
 
@@ -433,7 +437,7 @@ async def upload_session_file_multipart(
     else:
         file_id = str(uuid.uuid4())
         conn.execute(
-            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, origin, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', CURRENT_TIMESTAMP)",
             (file_id, session_id, actual_filename, content, language, lines, symbol_count, file_type)
         )
 
@@ -448,6 +452,7 @@ async def upload_session_file_multipart(
         "lines": lines,
         "symbol_count": symbol_count,
         "file_type": file_type,
+        "origin": "uploaded",
         "updated_at": None,
     }
 
@@ -457,7 +462,7 @@ def list_session_files(session_id: str):
     """List files attached to a session (metadata only, no content)."""
     conn = get_db()
     rows = conn.execute(
-        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, github_meta, created_at, updated_at, github_pushed_at
+        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, origin, github_meta, created_at, updated_at, github_pushed_at
            FROM session_files WHERE session_id = ? ORDER BY created_at ASC""",
         (session_id,)
     ).fetchall()
