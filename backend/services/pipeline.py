@@ -7983,6 +7983,85 @@ async def run_natural_pipeline_stream(
                                "content": f"🔍 Structural QA found {len(_sq_msgs)} blocking issue(s) "
                                           f"in {_sq_cs['symbol'].name} — will auto-fix"})
 
+        # ── tsc compile gate (natural pipeline) ───────────────────────────────
+        # The smart pipeline runs tsc on its edits; the natural/large-file path
+        # historically did not, so compile-only errors that LLM QA does not
+        # mentally emulate (e.g. TS1487 octal escape inside a JS template
+        # literal) could pass at a high score and break the production build.
+        # This helper runs real `tsc --noEmit` on the FULL file after a change
+        # and returns only the errors that change *introduced* — comparing
+        # against the original so pre-existing isolated-file noise (e.g. TS2307
+        # "cannot find module" for unresolved imports) never causes a false
+        # block. Introduced errors are fed into the SAME retry + 8/10-gate
+        # machinery used for QA/structural issues — no parallel loop.
+        async def _tsc_introduced_errors(cs, orig_cache):
+            fname = cs["filename"]
+            if not fname.lower().endswith((".ts", ".tsx", ".js", ".jsx")):
+                return []
+            try:
+                from services.linter_validator import validate_linters as _vl
+            except Exception:
+                return []
+            orig_full = cs["file_content"]
+            try:
+                _proxy = type("_SC", (), {
+                    "new_code": cs["new_code"],
+                    "original_code": cs["symbol"].code,
+                    "symbol": cs["symbol"],
+                    "operations": [{"find": cs["symbol"].code, "replace": cs["new_code"]}],
+                    "applied": False,
+                })()
+                new_full = await asyncio.to_thread(_apply_change_fn, orig_full, _proxy)
+            except Exception:
+                return []
+            if not new_full or new_full == orig_full:
+                return []
+            try:
+                if fname not in orig_cache:
+                    orig_cache[fname] = await asyncio.to_thread(_vl, orig_full, fname)
+                _orig_errs = orig_cache[fname]
+                _new_errs = await asyncio.to_thread(_vl, new_full, fname)
+            except Exception:
+                return []
+            _sig = lambda e: (e.get("code", ""), (e.get("message", "") or "").strip())
+            _counts: dict = {}
+            for _e in _orig_errs:
+                _counts[_sig(_e)] = _counts.get(_sig(_e), 0) + 1
+            _introduced = []
+            for _e in _new_errs:
+                _s = _sig(_e)
+                if _counts.get(_s, 0) > 0:
+                    _counts[_s] -= 1
+                else:
+                    _introduced.append(_e)
+            return _introduced
+
+        def _force_block_on_tsc(_idx, _errs, _suffix):
+            _msgs = [
+                f"{e.get('code', 'TS')} (line {e.get('line', '?')}): {(e.get('message', '') or '').strip()}"
+                for e in _errs
+            ]
+            qa_results[_idx]["type_errors"] = (
+                qa_results[_idx].get("type_errors", []) + _msgs
+            )
+            qa_results[_idx]["verdict"] = "blocked"
+            qa_results[_idx]["qa_score"] = min(qa_results[_idx].get("qa_score", 10) or 10, 3)
+            qa_results[_idx]["summary"] = (
+                f"tsc: {len(_msgs)} compile error(s){_suffix}. "
+                + (qa_results[_idx].get("summary", "") or "")
+            )
+            return _msgs
+
+        # ── tsc pre-check — feed introduced compile errors into the retry loop ─
+        _tsc_orig_cache: dict = {}
+        for _ti, _tcs in enumerate(change_shells):
+            _t_introduced = await _tsc_introduced_errors(_tcs, _tsc_orig_cache)
+            if _t_introduced:
+                _t_msgs = _force_block_on_tsc(_ti, _t_introduced, "")
+                yield sse({"type": "progress",
+                           "content": f"🔧 tsc found {len(_t_msgs)} compile error(s) in "
+                                      f"{_tcs['symbol'].name} — will auto-fix"})
+
         # ── QA retry loop — fix blocked changes before showing to user ────────
         # Triggers on verdict=="blocked" OR score<=5 with hard issues.
         # Sends QA findings back to Claude, re-runs QA on the fix.
@@ -8269,6 +8348,19 @@ async def run_natural_pipeline_stream(
                                           f"{qa_results[idx].get('summary', '')} (score: {new_score})"})
                 except Exception:
                     pass  # keep prior result if re-QA fails
+
+        # ── tsc compile gate — final verification after all retries ───────────
+        # Re-run tsc on the FINAL content of every change. Anything that still
+        # introduces a compile error is forced below the 8/10 gate so it cannot
+        # ship — the production build is never broken by a tsc-rejected change.
+        _tsc_final_cache: dict = {}
+        for _ti, _tcs in enumerate(change_shells):
+            _t_introduced = await _tsc_introduced_errors(_tcs, _tsc_final_cache)
+            if _t_introduced:
+                _t_msgs = _force_block_on_tsc(_ti, _t_introduced, " remain after auto-fix")
+                yield sse({"type": "progress",
+                           "content": f"🔴 tsc gate: {_tcs['symbol'].name} still has "
+                                      f"{len(_t_msgs)} compile error(s) — blocked from shipping"})
 
         # ── Assemble SurgicalChange objects from results
         # HARD 8/10 GATE — enforced, not advisory. A change ships ONLY if QA
