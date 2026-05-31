@@ -33,24 +33,49 @@ TERMINAL_STATUSES = ("done", "blocked", "cancelled", "error")
 # planner, which re-decomposed the request and failed to produce the single
 # coherent edit the user expected. The gate must be strictly opt-in so ordinary
 # prompts always flow through the proven single-pass pipeline untouched.
-_PLAN_CUE_PATTERNS = [
-    r"\bcreate (?:a )?tasks?\b",
-    r"\bmake (?:a )?tasks?\b",
-    r"\bbreak (?:this|it|that|the following)?\s*(?:down |up )?into tasks?\b",
+# Unambiguous list/decomposition cues. On their own these always mean "produce
+# a task list" and effectively never appear in ordinary descriptive prose, so
+# they may trigger anywhere in the message.
+_STRONG_CUE_PATTERNS = [
     r"\btask list\b",
-    r"\bas (?:separate )?tasks?\b",
-    r"\bturn (?:this|the following|these) into tasks?\b",
-    r"\bgenerate tasks?\b",
-    r"\bplan (?:out )?(?:the )?(?:work|tasks?)\b",
+    r"\blist of tasks\b",
+    r"\b(?:break|split|divide|decompose)\s+(?:this|it|that|them|these|the following|the request|the work)?\s*(?:down |up )?into\s+(?:separate |individual |distinct )?tasks?\b",
+    r"\bturn\s+(?:this|it|that|these|the following|the request)?\s*into\s+(?:separate |individual )?tasks?\b",
+    r"\bas\s+(?:separate|individual|distinct)\s+tasks?\b",
+    r"\bplan\s+(?:out\s+)?(?:the\s+)?(?:work|tasks?)\b",
+    r"\b(?:create|make|generate)\s+(?:a |an )?task list\b",
+    r"\b(?:create|make|generate)\s+(?:the following|these)\s+tasks?\b",
 ]
-_PLAN_CUE_RE = re.compile("|".join(_PLAN_CUE_PATTERNS), re.IGNORECASE)
+_STRONG_CUE_RE = re.compile("|".join(_STRONG_CUE_PATTERNS), re.IGNORECASE)
+
+# Bare verb cues ("create/make/generate tasks") are fragile: the exact same
+# words appear in DESCRIPTIONS of features ("a tool that lets users create tasks
+# from a prompt", "build a button to create tasks"). Matching those hijacked
+# ordinary coding prompts into the planner — the production incident. So a verb
+# cue only counts when it sits in INSTRUCTION position: at the start of the
+# message/clause, or right after a polite/imperative lead-in. It must never
+# match mid-clause after a connector like "to / that / which / allows ...".
+_VERB_CUE_RE = re.compile(
+    r"(?:^|[.!?:;\n]\s*|\b(?:please|pls|kindly|can you|could you|would you|will you|"
+    r"i want you to|i'd like you to|i would like you to|let's|lets)\s+)"
+    r"(?:create|make|generate)\s+(?:a |an |the |some |several |multiple )?(?:new )?tasks?\b",
+    re.IGNORECASE,
+)
 
 
 def wants_task_breakdown(message: str) -> bool:
-    """Cheap gate: only run the planner when the user explicitly asks for tasks."""
+    """Cheap gate: only run the planner when the user explicitly asks for tasks.
+
+    Strictly opt-in. Unambiguous list/decomposition phrases trigger anywhere;
+    bare verb cues ("create tasks") trigger only in instruction position so that
+    descriptive mentions ("a feature that lets users create tasks") never hijack
+    an ordinary coding prompt into the planner.
+    """
     if not message:
         return False
-    return bool(_PLAN_CUE_RE.search(message))
+    if _STRONG_CUE_RE.search(message):
+        return True
+    return bool(_VERB_CUE_RE.search(message))
 
 
 # ---------------------------------------------------------------------------
