@@ -3684,17 +3684,32 @@ async def run_qa_agent(
         _qa_use_claude = False
         _qa_model = "gpt-4.1"  # full GPT-4.1, not mini — QA must not be weakest link
 
-    # v3.11.4: QA receives FULL code — no truncation, no diff confusion.
-    # Claude Sonnet has 200K context. A full symbol is typically <20KB (~5K tokens).
-    # Sending full original + full new lets QA compare directly, like a real code reviewer.
-    # Hard cap at 60K chars per block to guard against pathological files (still ~15K tokens each).
-    _MAX_CODE_CHARS = 60_000
-    _orig_snippet = original_code if len(original_code) <= _MAX_CODE_CHARS else (
-        original_code[:_MAX_CODE_CHARS] + f"\n... [hard cap: file exceeds {_MAX_CODE_CHARS} chars — review manually]"
-    )
-    _new_snippet = new_code if len(new_code) <= _MAX_CODE_CHARS else (
-        new_code[:_MAX_CODE_CHARS] + f"\n... [hard cap: file exceeds {_MAX_CODE_CHARS} chars — review manually]"
-    )
+    # v3.12.0: QA receives FULL code — no truncation, no diff confusion.
+    # Claude Sonnet has a 200K-token context. Real-world symbols (e.g. a large
+    # landing-page component) routinely run 70-90K chars; the previous 60K cap
+    # silently truncated the TAIL of such symbols — exactly where appends and
+    # "insert before the closing section" edits land — so QA could not verify the
+    # change and scored it conservatively, causing the hard gate to block a
+    # perfectly valid edit. Raise the cap to 200K chars (~50K tokens/block;
+    # original + new ≈ 100K tokens, still well within the 200K window) and, when a
+    # symbol genuinely exceeds the cap, keep the HEAD *and* the TAIL with a marked
+    # elision in the middle so the end of the symbol is never the part dropped.
+    _MAX_CODE_CHARS = 200_000
+
+    def _cap_code(_c: str) -> str:
+        if len(_c) <= _MAX_CODE_CHARS:
+            return _c
+        _half = _MAX_CODE_CHARS // 2
+        _dropped = len(_c) - (2 * _half)
+        return (
+            _c[:_half]
+            + f"\n\n... [{_dropped} chars elided from the MIDDLE to fit the review window — "
+              f"head and tail are shown in full; review the elided region manually] ...\n\n"
+            + _c[-_half:]
+        )
+
+    _orig_snippet = _cap_code(original_code)
+    _new_snippet = _cap_code(new_code)
     other_ctx = other_files_context[:8000] + ("\n... [truncated]" if len(other_files_context) > 8000 else "")
     # Unchanged flag for QA awareness
     _no_change = _orig_snippet.strip() == _new_snippet.strip()
