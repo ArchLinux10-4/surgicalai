@@ -7578,6 +7578,16 @@ async def run_natural_pipeline_stream(
         skipped_messages: list = []
         skipped_changes_struct: list = []  # structured {filename, symbol, reason} for the UI
 
+        # ── Same-symbol cumulative merge ──────────────────────────────────
+        # When several edits target the SAME symbol, each must be spliced into
+        # the running (already-edited) symbol — NOT the pristine original — and
+        # collapsed into ONE change. Otherwise every edit emits an operation
+        # whose `find` is the *original* symbol text, so only the first can
+        # apply and the rest silently conflict (the "N edits → 1 survives"
+        # failure mode). Keyed by (filename, symbol.full_path).
+        _symbol_accum: dict = {}        # key -> latest merged symbol code
+        _resolved_by_symbol: dict = {}  # key -> the single resolved_edit entry
+
         for resolve_round in range(MAX_SYMBOL_RETRIES + 1):
             still_unresolved = []
 
@@ -7616,13 +7626,20 @@ async def run_natural_pipeline_stream(
                 if symbol:
                     # ── Targeted (snippet) edit ──────────────────────────────
                     # When Claude supplies an old_code snippet instead of the
-                    # entire symbol, splice it into the FULL original symbol so
+                    # entire symbol, splice it into the running symbol body so
                     # every downstream stage keeps working on the complete
                     # before/after symbol. This is the "edit, don't rewrite"
                     # path for large symbols the model can only see partially.
+                    # Multiple edits to the same symbol splice cumulatively and
+                    # collapse into ONE change (see _symbol_accum below).
+                    _akey = (filename, symbol.full_path)
                     if old_code:
+                        # Splice into the running (cumulative) symbol so a second
+                        # edit to the same symbol builds on the first, not the
+                        # pristine original.
+                        _accum_base = _symbol_accum.get(_akey, symbol.code)
                         full_new, ok_snip, snip_reason = _apply_snippet_to_symbol(
-                            symbol.code, old_code, new_code
+                            _accum_base, old_code, new_code
                         )
                         if ok_snip:
                             edit_data["new_code"] = full_new
@@ -7659,13 +7676,31 @@ async def run_natural_pipeline_stream(
                                 "_symbol_start": symbol.start_line,
                             })
                             continue
-                    resolved_edits.append({
-                        "edit_data": edit_data,
-                        "symbol": symbol,
-                        "sf_entry": sf_entry,
-                        "file_content": file_content,
-                        "filename": filename,
-                    })
+                    # Record the latest merged symbol code for this symbol so a
+                    # subsequent edit to the same symbol splices on top of it.
+                    _symbol_accum[_akey] = edit_data["new_code"]
+                    if _akey in _resolved_by_symbol:
+                        # Collapse into the single change for this symbol: keep ONE
+                        # operation (find=original, replace=fully-merged code) so
+                        # there is never a conflicting second op on the same text.
+                        _prev = _resolved_by_symbol[_akey]
+                        _prev["edit_data"]["new_code"] = edit_data["new_code"]
+                        _d_old = _prev["edit_data"].get("description", "")
+                        _d_new = edit_data.get("description", "")
+                        if _d_new and _d_new not in _d_old:
+                            _prev["edit_data"]["description"] = (
+                                f"{_d_old}; {_d_new}".strip("; ")
+                            )
+                    else:
+                        _entry = {
+                            "edit_data": edit_data,
+                            "symbol": symbol,
+                            "sf_entry": sf_entry,
+                            "file_content": file_content,
+                            "filename": filename,
+                        }
+                        _resolved_by_symbol[_akey] = _entry
+                        resolved_edits.append(_entry)
                 else:
                     still_unresolved.append({
                         "filename": filename,
@@ -7940,6 +7975,49 @@ async def run_natural_pipeline_stream(
         MAX_QA_RETRIES = 2
 
         for _qa_retry_round in range(MAX_QA_RETRIES):
+            # ── Re-run QA for any change whose QA could not execute ───────────
+            # A "skipped"/None-score result means the QA *check* failed to run
+            # (transient LLM/API error) — NOT that the code is bad. Re-running
+            # QA is the correct remedy; re-editing good code would risk
+            # degrading it. If QA still can't score after the retries, the
+            # hard 8/10 gate below excludes the change (never ships unscored).
+            _unscored = [
+                _ui for _ui, _uqd in enumerate(qa_results)
+                if _uqd.get("verdict") == "skipped" or _uqd.get("qa_score") is None
+            ]
+            if _unscored:
+                yield sse({"type": "progress",
+                           "content": f"🔁 Re-running QA on {len(_unscored)} unscored change(s) — "
+                                      f"attempt {_qa_retry_round + 1}/{MAX_QA_RETRIES}..."})
+                _reqa_sk = [
+                    (idx, asyncio.create_task(run_qa_agent(
+                        original_code=change_shells[idx]["qa_original_content"],
+                        new_code=change_shells[idx]["new_code"],
+                        change_description=change_shells[idx]["description"],
+                        new_logic=change_shells[idx]["description"],
+                        symbol_path=change_shells[idx]["symbol"].name,
+                        filename=change_shells[idx]["filename"],
+                        other_files_context=_qa_other_context,
+                        session_id=session_id or "",
+                        user_id=user_id,
+                        architect_risks=all_qa_risks,
+                        targeted_context=change_shells[idx]["targeted_ctx"],
+                        qa_feedback=None,
+                        same_run_context=change_shells[idx]["same_run"],
+                    )))
+                    for idx in _unscored
+                ]
+                _pend_sk = {t for _, t in _reqa_sk}
+                while _pend_sk:
+                    _d_sk, _pend_sk = await asyncio.wait(_pend_sk, timeout=20.0)
+                    if _pend_sk:
+                        yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+                for idx, task in _reqa_sk:
+                    try:
+                        qa_results[idx] = task.result()
+                    except Exception:
+                        pass  # stays unscored -> excluded by the hard gate below
+
             # Find all still-blocked changes.
             # Trigger retry when:
             #   - verdict is "blocked" (any score), OR
@@ -8178,10 +8256,39 @@ async def run_natural_pipeline_stream(
                     pass  # keep prior result if re-QA fails
 
         # ── Assemble SurgicalChange objects from results
+        # HARD 8/10 GATE — enforced, not advisory. A change ships ONLY if QA
+        # produced a real score >= 8 and did not block it. Anything blocked,
+        # skipped (QA could not run), unscored, or below 8 after every retry is
+        # excluded from changes_by_file and surfaced in skipped_changes so the
+        # user sees exactly what was withheld and why. Nothing below 8 ships.
+        _GATE_MIN = 8
         for i, (cs, qa_dict) in enumerate(zip(change_shells, qa_results)):
             symbol = cs["symbol"]
             filename = cs["filename"]
             sf_entry = cs["sf_entry"]
+
+            _gv = qa_dict.get("verdict", "skipped")
+            _gs = qa_dict.get("qa_score")
+            if _gv in ("blocked", "skipped") or _gs is None or _gs < _GATE_MIN:
+                _gscore_txt = str(_gs) if _gs is not None else "n/a"
+                _greason = (
+                    qa_dict.get("summary")
+                    or qa_dict.get("skipped_reason")
+                    or "did not clear the QA gate"
+                )
+                skipped_changes_struct.append({
+                    "filename": filename,
+                    "symbol": symbol.name,
+                    "reason": f"QA gate {_gv} (score: {_gscore_txt}/10): {_greason}",
+                })
+                yield sse({"type": "progress",
+                           "content": f"🚫 Blocked by 8/10 gate — {symbol.name} "
+                                      f"(verdict: {_gv}, score: {_gscore_txt}/10); not shipped"})
+                try:
+                    _log_qa_result(session_id, filename, symbol.name, qa_dict)
+                except Exception:
+                    pass
+                continue
 
             all_qa_risks.extend(qa_dict.get("downstream_risks", []))
 
