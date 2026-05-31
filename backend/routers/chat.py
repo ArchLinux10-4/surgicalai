@@ -726,6 +726,9 @@ async def smart_stream(req: dict, request: Request):
                         if poll % 20 == 0 and cancel_requested_for_run(session_id, run_id):
                             aborted = True
                             break
+                        if chunk.startswith(": "):
+                            yield chunk  # forward SSE keepalive comment to client
+                            continue
                         if chunk.startswith("data: "):
                             try:
                                 _d = _json.loads(chunk[6:])
