@@ -309,6 +309,40 @@ class ASTParser:
                 )
             )
 
+        # Module-level VALUE constants — template literals and large object/array
+        # literals that are NOT arrow functions. e.g. `const CSS = \`...500 lines...\``
+        # or a big config object. Without this pass such a constant is invisible to
+        # the editor, so any edit that targets it (a CSS block, a config map) can
+        # never resolve and is silently dropped. Only sizeable multi-line values
+        # are indexed so the symbol map is not flooded with trivial scalars.
+        value_const_re = re.compile(
+            r"^(?:export\s+)?(?:export\s+default\s+)?(const|let|var)\s+(\w+)"
+            r"(?:\s*:\s*[^=\n]+?)?\s*=\s*([`{\[])",
+            re.MULTILINE,
+        )
+        _value_existing = {s.start_line for s in symbols}
+        for m in value_const_re.finditer(source):
+            line_no = source[: m.start()].count("\n") + 1
+            if line_no in _value_existing:
+                continue  # already captured (e.g. arrow-function const)
+            opener_off = m.end() - 1  # offset of the ` { or [ opener
+            end_line = self._find_value_end(source, opener_off)
+            if end_line - line_no + 1 < 3:
+                continue  # too small to be worth indexing — avoid map bloat
+            name = m.group(2)
+            symbols.append(
+                SymbolInfo(
+                    name=name,
+                    symbol_type=SymbolType.VARIABLE,
+                    start_line=line_no,
+                    end_line=end_line,
+                    parent=None,
+                    indentation=0,
+                    code="\n".join(lines[line_no - 1 : end_line]),
+                    signature=lines[line_no - 1].strip()[:120],
+                )
+            )
+
         # Express / Fastify / Koa-style route handlers passed as anonymous callbacks.
         # e.g. router.post('/api/batch-search', async (req, res) => { ... })
         # These hold the bulk of the logic in a routes file, yet none of the patterns
@@ -355,6 +389,79 @@ class ASTParser:
             )
 
         return symbols
+
+    def _skip_template(self, source: str, i: int) -> int:
+        """Given i at an opening backtick, return the index of the matching
+        closing backtick (handles \\ escapes and nested ${ } interpolations,
+        which may themselves contain template literals). If unterminated,
+        returns the last index."""
+        n = len(source)
+        i += 1  # past opening backtick
+        while i < n:
+            c = source[i]
+            if c == "\\":
+                i += 2
+                continue
+            if c == "`":
+                return i
+            if c == "$" and i + 1 < n and source[i + 1] == "{":
+                depth = 1
+                i += 2
+                while i < n and depth > 0:
+                    cc = source[i]
+                    if cc == "\\":
+                        i += 2
+                        continue
+                    if cc == "`":
+                        i = self._skip_template(source, i)
+                    elif cc == "{":
+                        depth += 1
+                    elif cc == "}":
+                        depth -= 1
+                    i += 1
+                continue
+            i += 1
+        return n - 1
+
+    def _find_value_end(self, source: str, start_offset: int) -> int:
+        """Given start_offset at an opening delimiter (` { or [) of a value
+        expression, return the 1-based line number of the matching close.
+        String- and template-literal-aware so delimiters inside strings are
+        ignored. Falls back to end-of-file when unbalanced."""
+        n = len(source)
+        opener = source[start_offset]
+        if opener == "`":
+            end = self._skip_template(source, start_offset)
+            return source[:end].count("\n") + 1
+        # object / array literal — balance braces/brackets, skipping string
+        # and template-literal contents.
+        i = start_offset
+        depth = 0
+        while i < n:
+            c = source[i]
+            if c == "\\":
+                i += 2
+                continue
+            if c in ('"', "'"):
+                q = c
+                i += 1
+                while i < n:
+                    if source[i] == "\\":
+                        i += 2
+                        continue
+                    if source[i] == q:
+                        break
+                    i += 1
+            elif c == "`":
+                i = self._skip_template(source, i)
+            elif c in "{[":
+                depth += 1
+            elif c in "}]":
+                depth -= 1
+                if depth == 0:
+                    return source[:i].count("\n") + 1
+            i += 1
+        return source.count("\n") + 1
 
     # ─── Go Parser ───────────────────────────────────────────────────────────
 
