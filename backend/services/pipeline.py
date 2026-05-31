@@ -6544,10 +6544,46 @@ def _build_symbol_correction(
                 f"{snippet_reason}\n"
                 f"   Fix it by EITHER:\n"
                 f"   • providing an \"old_code\" snippet copied verbatim (no line-number prefix) "
-                f"from the symbol, that matches exactly one location, with its \"new_code\" replacement; OR\n"
-                f"   • emitting the COMPLETE symbol in \"new_code\" with no \"old_code\".\n"
-                f"   Use <search_request> first if you need to see the exact current lines."
+                f"from the symbol below, that matches exactly one location, with its \"new_code\" replacement; OR\n"
+                f"   • emitting the COMPLETE symbol in \"new_code\" with no \"old_code\"."
             )
+            # Show the ACTUAL current symbol so the model anchors to ground truth
+            # instead of re-guessing lines it never saw (the large-file drop bug).
+            _sym_code = item.get("_symbol_code") or ""
+            if _sym_code:
+                _sc_lines = _sym_code.splitlines()
+                _sc_start = item.get("_symbol_start", 1) or 1
+                # Large symbols: show head + tail so the model can pick a real
+                # anchor near either end without flooding the context.
+                _HEAD, _TAIL = 220, 80
+                if len(_sc_lines) > _HEAD + _TAIL + 10:
+                    head = "\n".join(
+                        f"   {_sc_start + i:5d}: {_sc_lines[i]}" for i in range(_HEAD)
+                    )
+                    tail_start = len(_sc_lines) - _TAIL
+                    tail = "\n".join(
+                        f"   {_sc_start + tail_start + i:5d}: {_sc_lines[tail_start + i]}"
+                        for i in range(_TAIL)
+                    )
+                    gap = len(_sc_lines) - _HEAD - _TAIL
+                    parts.append(
+                        f"\n   ACTUAL current content of '{bad_name}' "
+                        f"(copy an \"old_code\" anchor VERBATIM from here):\n"
+                        f"{head}\n   ... [{gap} more lines omitted — use <search_request> "
+                        f"to see them] ...\n{tail}"
+                    )
+                else:
+                    numbered = "\n".join(
+                        f"   {_sc_start + i:5d}: {_sc_lines[i]}" for i in range(len(_sc_lines))
+                    )
+                    parts.append(
+                        f"\n   ACTUAL current content of '{bad_name}' "
+                        f"(copy an \"old_code\" anchor VERBATIM from here):\n{numbered}"
+                    )
+            else:
+                parts.append(
+                    "   Use <search_request> first if you need to see the exact current lines."
+                )
             continue
 
         parts.append(f"\n❌ Symbol '{bad_name}' in {filename} — NOT FOUND.")
@@ -7540,6 +7576,7 @@ async def run_natural_pipeline_stream(
         pending_edits = list(edit_blocks_raw)
         resolved_edits: list = []
         skipped_messages: list = []
+        skipped_changes_struct: list = []  # structured {filename, symbol, reason} for the UI
 
         for resolve_round in range(MAX_SYMBOL_RETRIES + 1):
             still_unresolved = []
@@ -7567,6 +7604,11 @@ async def run_natural_pipeline_stream(
 
                 if not file_content or not smap:
                     skipped_messages.append(f"File '{filename}' not found in session")
+                    skipped_changes_struct.append({
+                        "filename": filename,
+                        "symbol": symbol_name,
+                        "reason": "file_not_in_session",
+                    })
                     continue
 
                 symbol, match_method = _fuzzy_find_symbol(smap, symbol_name)
@@ -7593,6 +7635,8 @@ async def run_natural_pipeline_stream(
                                 "description": description,
                                 "_raw": edit_raw,
                                 "_snippet_reason": snip_reason,
+                                "_symbol_code": symbol.code,
+                                "_symbol_start": symbol.start_line,
                             })
                             continue
                     else:
@@ -7611,6 +7655,8 @@ async def run_natural_pipeline_stream(
                                 "description": description,
                                 "_raw": edit_raw,
                                 "_snippet_reason": frag_reason,
+                                "_symbol_code": symbol.code,
+                                "_symbol_start": symbol.start_line,
                             })
                             continue
                     resolved_edits.append({
@@ -7632,9 +7678,23 @@ async def run_natural_pipeline_stream(
             if not still_unresolved or resolve_round >= MAX_SYMBOL_RETRIES:
                 if still_unresolved:
                     for item in still_unresolved:
-                        skipped_messages.append(
-                            f"Symbol '{item['symbol']}' not found in {item['filename']} after {MAX_SYMBOL_RETRIES} correction attempts"
-                        )
+                        _snip_r = item.get("_snippet_reason")
+                        if _snip_r:
+                            skipped_messages.append(
+                                f"Edit to '{item['symbol']}' in {item['filename']} could not be "
+                                f"anchored after {MAX_SYMBOL_RETRIES} correction attempts: {_snip_r}"
+                            )
+                            _reason = "edit_anchor_unmatched"
+                        else:
+                            skipped_messages.append(
+                                f"Symbol '{item['symbol']}' not found in {item['filename']} after {MAX_SYMBOL_RETRIES} correction attempts"
+                            )
+                            _reason = "symbol_not_found"
+                        skipped_changes_struct.append({
+                            "filename": item.get("filename", ""),
+                            "symbol": item.get("symbol", ""),
+                            "reason": _reason,
+                        })
                 break
 
             # ── Silent correction call ────────────────────────────────────
@@ -7684,6 +7744,11 @@ async def run_natural_pipeline_stream(
             except Exception:
                 for item in still_unresolved:
                     skipped_messages.append(f"Symbol '{item['symbol']}' not found in {item['filename']} — skipped")
+                    skipped_changes_struct.append({
+                        "filename": item.get("filename", ""),
+                        "symbol": item.get("symbol", ""),
+                        "reason": "correction_failed",
+                    })
                 break
 
         # ── Build SurgicalChange objects with parallel QA ────────────────────
@@ -8227,6 +8292,40 @@ async def run_natural_pipeline_stream(
             summary_parts.append(summary or f"Created {filename}")
 
         if not changes_by_file and not new_files:
+            # ── Degenerate-drop guard ────────────────────────────────────────
+            # The model emitted one or more edit/file blocks, yet NONE survived
+            # resolution (snippet anchors never matched a large symbol, target
+            # symbol not found, etc.). Emitting a bare "done" here reports phantom
+            # success — the user sees nothing happen with no explanation, and the
+            # QA gate is bypassed entirely (it ran on 0 changes). Instead surface
+            # the dropped edits explicitly so the failure is visible and is never
+            # silently shipped as success.
+            if edit_blocks_raw or new_file_blocks_raw:
+                _attempted = len(edit_blocks_raw) + len(new_file_blocks_raw)
+                _reasons = skipped_messages or [
+                    "The proposed edits could not be matched to the current code."
+                ]
+                _detail = "\n".join(f"• {m}" for m in _reasons[:10])
+                _plural = "them" if _attempted > 1 else "it"
+                _msg = (
+                    f"I drafted {_attempted} change(s) but couldn't safely apply {_plural} to "
+                    f"the current code, so nothing was shipped:\n\n{_detail}\n\n"
+                    "This usually means the target spot moved or the file is large enough that I "
+                    "need another pass. Tell me the specific area to focus on and I'll re-target it."
+                )
+                _fail_result = {
+                    "intent": "edit",
+                    "summary": f"{_attempted} change(s) drafted — none could be applied",
+                    "reasoning": "Edits were produced but failed to resolve against the current code.",
+                    "risks": all_qa_risks,
+                    "skipped_changes": skipped_changes_struct or [
+                        {"filename": "", "symbol": "", "reason": "unresolved"}
+                    ],
+                    "changes_by_file": {},
+                    "new_files": [],
+                    "natural_text": _msg,
+                }
+                yield sse({"type": "smart_result", "content": json.dumps(_fail_result)})
             yield sse({"type": "done", "content": ""})
             return
 
@@ -8249,7 +8348,7 @@ async def run_natural_pipeline_stream(
             "summary": "; ".join(summary_parts[:3]),
             "reasoning": "Changes from natural conversation",
             "risks": all_qa_risks,
-            "skipped_changes": [],
+            "skipped_changes": skipped_changes_struct,
             "changes_by_file": changes_by_file,
             "new_files": new_files,
             "natural_text": _display_text,
