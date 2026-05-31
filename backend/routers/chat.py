@@ -1,4 +1,5 @@
 """Chat router — standard AI chat with file context."""
+import asyncio
 import uuid
 import json
 from fastapi import APIRouter, HTTPException, Request
@@ -8,6 +9,43 @@ from database import get_db, get_setting, get_user_api_key, GLOBAL_MEMORY_KEY
 from services.pipeline import run_chat, run_chat_stream
 
 router = APIRouter()
+
+
+async def _with_heartbeat(aiter, interval: int = 20):
+    """Wrap an async iterator, yielding SSE keepalive comments when it stalls.
+
+    Prevents Railway/nginx from closing idle SSE connections during long Claude
+    API calls (architect pass, QA pass, fix-loop retry).  SSE comment lines
+    starting with ':' are forwarded by all proxies and silently ignored by
+    browsers, so this is invisible to the client UI.
+    """
+    _DONE = object()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _produce():
+        try:
+            async for item in aiter:
+                await queue.put(item)
+        finally:
+            await queue.put(_DONE)
+
+    task = asyncio.create_task(_produce())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            if item is _DONE:
+                break
+            yield item
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
 
 
 def _load_effective_memory(conn, session_id):
@@ -675,7 +713,7 @@ async def smart_stream(req: dict, request: Request):
                     yield _sse({"type": "task_start", "id": t["id"]})
 
                     collected, result_content, poll, aborted = [], None, 0, False
-                    async for chunk in run_natural_pipeline_stream(
+                    async for chunk in _with_heartbeat(run_natural_pipeline_stream(
                         session_files=session_files,
                         user_request=t["detail"],
                         conversation_history=conversation_history,
@@ -683,7 +721,7 @@ async def smart_stream(req: dict, request: Request):
                         project_memory=project_memory,
                         session_summary=current_summary,
                         user_id=current_user_id,
-                    ):
+                    )):
                         poll += 1
                         if poll % 20 == 0 and cancel_requested_for_run(session_id, run_id):
                             aborted = True
