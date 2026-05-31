@@ -1,0 +1,14 @@
+# Make the TypeScript compiler (`tsc`) available inside the Python backend image.
+#
+# The backend deploys as a Python (nixpacks) service, so the container shipped
+# with no Node.js / tsc. As a result `_find_tsc()` in services/linter_validator.py
+# returned None and the tsc compile gate SILENTLY no-op'd on production — TS-only
+# compile errors (e.g. TS1487 octal escape in a template literal) could pass LLM
+# QA at 9/10 and break the build. This adds the compiler so the gate can run.
+#
+# `"..."` APPENDS to nixpacks' auto-detected Python packages (it does not replace
+# them), so the existing python venv + pip install phase is left completely
+# untouched. `nodePackages.typescript` provides the `tsc` binary on PATH; no
+# custom build commands are introduced, keeping the change minimal and additive.
+[phases.setup]
+nixPkgs = ["...", "nodejs_20", "nodePackages.typescript"]
