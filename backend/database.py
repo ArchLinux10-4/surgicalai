@@ -319,6 +319,27 @@ def _init_sqlite():
             ran_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # agent_tasks — agentic task list (plan → execute → track → cancel).
+    # One row per task within an agentic run. status moves through:
+    #   pending → running → done | blocked | cancelled | error
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS agent_tasks (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            run_id TEXT,
+            seq INTEGER DEFAULT 0,
+            title TEXT NOT NULL,
+            detail TEXT DEFAULT '',
+            kind TEXT DEFAULT 'code',
+            status TEXT DEFAULT 'pending',
+            qa_score INTEGER,
+            verdict TEXT,
+            cancel_requested INTEGER DEFAULT 0,
+            result_summary TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
 
     _seed_defaults_sqlite(cur)
     conn.commit()
@@ -534,6 +555,25 @@ def _init_postgres():
                 missing_steps TEXT,
                 overall_pass INTEGER DEFAULT 1,
                 ran_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # agent_tasks — agentic task list (plan → execute → track → cancel)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_tasks (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                run_id TEXT,
+                seq INTEGER DEFAULT 0,
+                title TEXT NOT NULL,
+                detail TEXT DEFAULT '',
+                kind TEXT DEFAULT 'code',
+                status TEXT DEFAULT 'pending',
+                qa_score INTEGER,
+                verdict TEXT,
+                cancel_requested INTEGER DEFAULT 0,
+                result_summary TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
         conn.commit()
