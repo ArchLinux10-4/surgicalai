@@ -701,6 +701,271 @@ export function LandingPage() {
     return () => obs.disconnect();
   }, []);
 
+  // ── Hero mockup live animation ────────────────────────────────────────────
+  useEffect(() => {
+    // Inject hero animation CSS
+    const heroStyle = document.createElement('style');
+    heroStyle.id = 'sai-hero-anim-css';
+    heroStyle.textContent = `
+      .hero-step-indicator{display:flex;align-items:center;gap:10px;padding:10px 12px;border-radius:8px;border:1px solid var(--e-border);background:rgba(255,255,255,.02);margin-bottom:6px;transition:all .35s ease;opacity:.5}
+      .hero-step-indicator.hero-active{opacity:1;border-color:rgba(124,106,247,.35);background:rgba(124,106,247,.08)}
+      .hero-step-indicator.hero-done{opacity:1;border-color:rgba(15,168,118,.3);background:rgba(15,168,118,.06)}
+      .hero-step-num{width:24px;height:24px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;border:1.5px solid rgba(124,106,247,.3);color:#a78bfa;background:transparent;transition:all .3s;flex-shrink:0}
+      .hero-active .hero-step-num{background:linear-gradient(135deg,#6d5ce6,#8b76f0);color:#fff;border-color:#6d5ce6;box-shadow:0 0 0 3px rgba(109,92,230,.15),0 2px 8px rgba(109,92,230,.3);transform:scale(1.1)}
+      .hero-done .hero-step-num{background:linear-gradient(135deg,#0aa876,#34d399);color:#fff;border-color:#0aa876;box-shadow:0 0 0 3px rgba(10,168,118,.15)}
+      .hero-step-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.5px;color:var(--e-txt3);transition:color .3s}
+      .hero-active .hero-step-label{color:#a78bfa}
+      .hero-done .hero-step-label{color:#34d399}
+      .hero-step-desc{font-size:10px;color:var(--e-txt3);margin-top:1px;transition:color .3s;min-height:13px}
+      .hero-active .hero-step-desc{color:var(--e-txt2)}
+      .hero-done .hero-step-desc{color:var(--e-txt2)}
+      .hero-cursor{display:inline-block;width:7px;height:13px;background:#a78bfa;vertical-align:middle;margin-left:2px;border-radius:1px;animation:heroBlink 1s step-end infinite}
+      @keyframes heroBlink{0%,100%{opacity:1}50%{opacity:0}}
+      .hero-input-cursor{display:inline-block;width:1px;height:14px;background:var(--e-txt2);vertical-align:middle;margin-left:1px;animation:heroBlink 1s step-end infinite}
+      .hero-qa-line{display:block;margin:0;font-family:'JetBrains Mono','Fira Code',monospace;font-size:11px;line-height:1.7}
+      .hero-qa-line.hq-cmd{color:#7dd3fc}
+      .hero-qa-line.hq-dim{color:rgba(255,255,255,.4)}
+      .hero-qa-line.hq-err{color:#fca5a5}
+      .hero-qa-line.hq-ok{color:#6ee7b7}
+      .hero-qa-line.hq-blank{height:10px}
+      .hero-score-fail{display:inline-flex;align-items:center;gap:6px;background:rgba(248,113,113,.15);border:1px solid rgba(248,113,113,.35);color:#fca5a5;padding:4px 10px;border-radius:5px;font-size:11px;font-weight:700;animation:heroFlashRed .9s ease forwards}
+      .hero-score-pass{display:inline-flex;align-items:center;gap:6px;background:linear-gradient(135deg,rgba(109,92,230,.35),rgba(10,168,118,.3));border:1px solid rgba(52,211,153,.5);color:#fff;padding:6px 14px;border-radius:7px;font-size:12px;font-weight:800;letter-spacing:.04em;box-shadow:0 0 24px rgba(52,211,153,.2);animation:heroGlowGreen 2.2s ease infinite}
+      @keyframes heroFlashRed{0%{box-shadow:0 0 0 0 rgba(248,113,113,.7)}60%{box-shadow:0 0 0 10px rgba(248,113,113,0)}100%{box-shadow:none}}
+      @keyframes heroGlowGreen{0%,100%{box-shadow:0 0 20px rgba(52,211,153,.2)}50%{box-shadow:0 0 40px rgba(52,211,153,.5),0 0 60px rgba(10,168,118,.25)}}
+      .hero-code-line{opacity:0;transform:translateX(-8px);transition:opacity .35s ease,transform .35s ease}
+      .hero-code-line.visible{opacity:1;transform:none}
+      .hero-qa-mini{border-top:1px solid var(--e-border);padding:10px 16px;background:rgba(26,19,51,.6);font-family:'JetBrains Mono','Fira Code',monospace;font-size:11px;line-height:1.65;max-height:0;overflow:hidden;transition:max-height .4s ease}
+      .hero-qa-mini.open{max-height:200px}
+    `;
+    document.head.appendChild(heroStyle);
+
+    const mockup = document.querySelector('.sai-hero-mockup');
+    if (!mockup) return () => heroStyle.remove();
+
+    let fired = false;
+
+    function run() {
+      const codeArea = mockup!.querySelector('.sai-mock-code') as HTMLElement;
+      const panelMessages = mockup!.querySelector('.sai-mock-messages') as HTMLElement;
+      const inputEl = mockup!.querySelector('.sai-mock-input') as HTMLElement;
+      if (!codeArea || !panelMessages || !inputEl) return;
+
+      // ─── Prepare: clear static content ───────────────────────
+      const origCodeHTML = codeArea.innerHTML;
+      const origPanelHTML = panelMessages.innerHTML;
+      const origInputText = inputEl.textContent || '';
+      codeArea.innerHTML = '';
+      inputEl.textContent = '';
+      inputEl.style.color = 'var(--e-txt)';
+
+      // Build pipeline steps in the panel
+      panelMessages.innerHTML = '';
+      const steps = [
+        { id: 'heroS1', num: '1', label: 'Architect', desc: '' },
+        { id: 'heroS2', num: '2', label: 'Surgeon', desc: '' },
+        { id: 'heroS3', num: '3', label: 'QA Gate', desc: '' },
+      ];
+      steps.forEach(s => {
+        const el = document.createElement('div');
+        el.id = s.id;
+        el.className = 'hero-step-indicator';
+        el.innerHTML = `<div class="hero-step-num">${s.num}</div><div><div class="hero-step-label">${s.label}</div><div class="hero-step-desc" id="${s.id}-desc">${s.desc}</div></div>`;
+        panelMessages.appendChild(el);
+      });
+
+      // Add a mini QA terminal area below the code
+      let qaMini = mockup!.querySelector('.hero-qa-mini') as HTMLElement;
+      if (!qaMini) {
+        qaMini = document.createElement('div');
+        qaMini.className = 'hero-qa-mini';
+        const editor = codeArea.parentElement!;
+        editor.appendChild(qaMini);
+      }
+      qaMini.innerHTML = '';
+
+      // ─── Helpers ──────────────────────────────────────────────
+      let cursorEl: HTMLElement | null = null;
+      function setCursor(parent: HTMLElement) {
+        removeCursorH();
+        cursorEl = document.createElement('span');
+        cursorEl.className = 'hero-cursor';
+        parent.appendChild(cursorEl);
+      }
+      function removeCursorH() {
+        if (cursorEl && cursorEl.parentNode) cursorEl.parentNode.removeChild(cursorEl);
+        cursorEl = null;
+      }
+      function activateStep(idx: number) {
+        steps.forEach((s, i) => {
+          const el = document.getElementById(s.id);
+          if (!el) return;
+          el.classList.remove('hero-active');
+          if (i === idx) el.classList.add('hero-active');
+        });
+      }
+      function doneStep(idx: number) {
+        const el = document.getElementById(steps[idx].id);
+        if (el) { el.classList.remove('hero-active'); el.classList.add('hero-done'); }
+      }
+      function setStepDesc(idx: number, text: string) {
+        const el = document.getElementById(steps[idx].id + '-desc');
+        if (el) el.textContent = text;
+      }
+      function wait(ms: number, fn: () => void) { setTimeout(fn, ms); }
+
+      function typeInInput(text: string, speed: number, done: () => void) {
+        let cursor = document.createElement('span');
+        cursor.className = 'hero-input-cursor';
+        inputEl.appendChild(cursor);
+        let i = 0;
+        function step() {
+          if (i < text.length) {
+            inputEl.insertBefore(document.createTextNode(text[i++]), cursor);
+            setTimeout(step, speed + Math.random() * speed * 0.4);
+          } else {
+            if (cursor.parentNode) cursor.parentNode.removeChild(cursor);
+            done();
+          }
+        }
+        step();
+      }
+
+      // Code lines to inject
+      const codeLines: Array<{ln: string; cls: string; html: string}> = [
+        {ln:'47', cls:'', html:'<span class="sai-kw">const</span> <span class="sai-fn">handleSend</span> = <span class="sai-kw">async</span> () =&gt; {'},
+        {ln:'48', cls:'', html:'  <span class="sai-kw">if</span> (!input.trim()) <span class="sai-kw">return</span>;'},
+        {ln:'49', cls:'', html:'  <span class="sai-fn">setIsLoading</span>(<span class="sai-kw">true</span>);'},
+        {ln:'50', cls:'del', html:'<span class="sai-op">-</span>  <span class="sai-kw">const</span> res = <span class="sai-kw">await</span> <span class="sai-fn">fetch</span>(<span class="sai-str">\'<wbr>/api/chat\'</span>, {'},
+        {ln:'51', cls:'del', html:'<span class="sai-op">-</span>    method: <span class="sai-str">\'POST\'</span>, body: input'},
+        {ln:'52', cls:'del', html:'<span class="sai-op">-</span>  });'},
+        {ln:'50', cls:'add', html:'<span class="sai-op">+</span>  <span class="sai-kw">const</span> res = <span class="sai-kw">await</span> <span class="sai-fn">streamSurgicalEdit</span>({'},
+        {ln:'51', cls:'add', html:'<span class="sai-op">+</span>    prompt: input, fileIds: sessionFiles'},
+        {ln:'52', cls:'add', html:'<span class="sai-op">+</span>  });'},
+        {ln:'53', cls:'', html:'  <span class="sai-kw">const</span> data = <span class="sai-kw">await</span> res.<span class="sai-fn">json</span>();'},
+        {ln:'54', cls:'', html:'  <span class="sai-fn">setMessages</span>(prev =&gt; [...prev, data]);'},
+        {ln:'55', cls:'', html:'};'},
+        {ln:'57', cls:'', html:'<span class="sai-cm">// Surgeon applied 3 lines · QA passed ✓</span>'},
+      ];
+
+      function injectCodeLines(startIdx: number, endIdx: number, delay: number, done: () => void) {
+        let idx = startIdx;
+        function next() {
+          if (idx > endIdx) { done(); return; }
+          const line = codeLines[idx];
+          const el = document.createElement('div');
+          el.className = `sai-line ${line.cls} hero-code-line`;
+          el.innerHTML = `<span class="sai-ln">${line.ln}</span><span class="sai-ct">${line.html}</span>`;
+          codeArea.appendChild(el);
+          // Trigger reflow then animate
+          requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('visible')));
+          idx++;
+          setTimeout(next, delay);
+        }
+        next();
+      }
+
+      function addQALine(cls: string, text: string): HTMLElement {
+        const el = document.createElement('span');
+        el.className = 'hero-qa-line ' + cls;
+        el.textContent = text;
+        qaMini.appendChild(el);
+        return el;
+      }
+
+      // ─── Animation sequence ──────────────────────────────────
+      // Phase 1: Type user prompt
+      typeInInput('Refactor fetch to use streaming API', 35, () => {
+        wait(400, () => {
+          // Phase 2: Architect
+          activateStep(0);
+          setStepDesc(0, 'Analyzing codebase...');
+          wait(800, () => {
+            setStepDesc(0, 'Small targeted change → Surgeon path');
+            wait(600, () => {
+              setStepDesc(0, 'Plan: replace fetch() → streamSurgicalEdit()');
+              wait(500, () => {
+                doneStep(0);
+                setStepDesc(0, '✓ Plan ready · 3 lines · ChatPanel.tsx');
+
+                // Phase 3: Surgeon — inject code
+                wait(350, () => {
+                  activateStep(1);
+                  setStepDesc(1, 'Operating on ChatPanel.tsx...');
+                  // Context lines first
+                  injectCodeLines(0, 2, 100, () => {
+                    wait(300, () => {
+                      // Deletion lines
+                      setStepDesc(1, 'Removing old fetch() calls...');
+                      injectCodeLines(3, 5, 120, () => {
+                        wait(400, () => {
+                          // Addition lines
+                          setStepDesc(1, 'Inserting streamSurgicalEdit()...');
+                          injectCodeLines(6, 8, 120, () => {
+                            wait(300, () => {
+                              // Remaining context
+                              injectCodeLines(9, 12, 80, () => {
+                                doneStep(1);
+                                setStepDesc(1, '✓ 3 lines replaced · Patch applied');
+
+                                // Phase 4: QA Gate
+                                wait(400, () => {
+                                  activateStep(2);
+                                  setStepDesc(2, 'Running type checker...');
+                                  qaMini.classList.add('open');
+
+                                  wait(200, () => {
+                                    addQALine('hq-cmd', '$ tsc --noEmit --strict');
+                                    wait(600, () => {
+                                      addQALine('hq-dim', 'Compiling TypeScript...');
+                                      wait(900, () => {
+                                        addQALine('hq-ok', '✓ 0 errors  ·  0 warnings');
+                                        setStepDesc(2, 'Type check passed');
+                                        wait(300, () => {
+                                          addQALine('hq-blank', '');
+                                          const passLine = addQALine('hq-ok', '');
+                                          const badge = document.createElement('span');
+                                          badge.className = 'hero-score-pass';
+                                          badge.textContent = '✦ QA PASS · Score: 9.8 / 10';
+                                          passLine.appendChild(badge);
+                                          doneStep(2);
+                                          setStepDesc(2, '✓ All checks passed');
+                                        });
+                                      });
+                                    });
+                                  });
+                                });
+                              });
+                            });
+                          });
+                        });
+                      });
+                    });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    }
+
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting && !fired) {
+          fired = true;
+          obs.disconnect();
+          run();
+        }
+      });
+    }, { threshold: 0.15 });
+    obs.observe(mockup);
+
+    return () => {
+      obs.disconnect();
+      heroStyle.remove();
+    };
+  }, []);
+
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [formSuccess, setFormSuccess] = useState(false);
   const [formSubmitting, setFormSubmitting] = useState(false);
