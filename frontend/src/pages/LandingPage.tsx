@@ -402,7 +402,7 @@ html{scroll-behavior:smooth}
 .sai-task-item.highlight{border-color:rgba(15,168,118,.3);background:rgba(15,168,118,.06)}
 .sai-task-checkbox{width:16px;height:16px;border-radius:5px;border:1.5px solid var(--e-txt3);flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .3s}
 .sai-task-checkbox.checked{border-color:#34d399;background:linear-gradient(135deg,#0aa876,#34d399)}
-.sai-task-checkbox.checked::after{content:'\2713';color:#fff;font-size:10px;font-weight:700}
+.sai-task-checkbox.checked::after{content:'\\2713';color:#fff;font-size:10px;font-weight:700}
 .sai-task-text{flex:1;color:var(--e-txt2);transition:color .3s}
 .sai-task-item.highlight .sai-task-text{color:var(--e-txt)}
 .sai-task-priority{font-size:9px;padding:2px 7px;border-radius:4px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;flex-shrink:0}
