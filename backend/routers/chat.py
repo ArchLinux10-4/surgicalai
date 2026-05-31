@@ -506,6 +506,22 @@ def delete_session(session_id: str):
     conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
     conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
     conn.commit()
+    # Hard-delete all session-scoped auxiliary rows so nothing orphans by
+    # session_id (code-diff history, applied/undo state, tasks, audit logs).
+    # Each runs in its own committed step and is best-effort: a not-yet-created
+    # table simply rolls back and is skipped, never breaking the core delete.
+    for _tbl in (
+        "change_history",
+        "applied_changes",
+        "agent_tasks",
+        "qa_log",
+        "compliance_log",
+    ):
+        try:
+            conn.execute(f"DELETE FROM {_tbl} WHERE session_id = ?", (session_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
     conn.close()
     return {"ok": True}
 
