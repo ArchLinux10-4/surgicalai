@@ -701,6 +701,257 @@ export function LandingPage() {
     return () => obs.disconnect();
   }, []);
 
+  // ── Task Planner section (imperative DOM — same pattern as QA terminal) ──
+  useEffect(() => {
+    // 1. Inject CSS
+    const taskStyle = document.createElement('style');
+    taskStyle.id = 'sai-task-planner-css';
+    taskStyle.textContent = `
+      .sai-task-mockup{background:var(--e-bg2);border:1px solid rgba(255,255,255,.08);border-radius:16px;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.14),0 0 0 1px rgba(255,255,255,.05)}
+      .sai-task-titlebar{height:38px;background:var(--e-bg3);border-bottom:1px solid var(--e-border);display:flex;align-items:center;padding:0 14px;gap:8px}
+      .sai-task-titlebar .sai-dot{width:10px;height:10px;border-radius:50%}
+      .sai-task-tbtitle{margin-left:8px;font-size:12px;color:var(--e-txt2);font-weight:600}
+      .sai-task-body{padding:16px;display:flex;flex-direction:column;gap:10px}
+      .sai-task-prompt{font-size:12px;color:var(--e-txt);padding:10px 14px;background:rgba(124,106,247,.1);border:1px solid rgba(124,106,247,.2);border-radius:10px;line-height:1.5;opacity:0;transition:opacity .5s ease}
+      .sai-task-prompt.visible{opacity:1}
+      .sai-task-prompt-cursor{display:inline-block;width:2px;height:13px;background:#a78bfa;vertical-align:middle;margin-left:2px;animation:sai-blink 1s step-end infinite}
+      .sai-task-divider{display:flex;align-items:center;gap:10px;padding:4px 0;opacity:0;transform:translateY(-6px);transition:opacity .4s ease,transform .4s ease}
+      .sai-task-divider.visible{opacity:1;transform:none}
+      .sai-task-divider-line{flex:1;height:1px;background:var(--e-border)}
+      .sai-task-divider-label{font-size:10px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;color:var(--e-txt3);white-space:nowrap}
+      .sai-task-card{display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(255,255,255,.03);border:1px solid var(--e-border);border-radius:10px;opacity:0;transform:translateX(-10px);transition:all .4s ease}
+      .sai-task-card.visible{opacity:1;transform:none}
+      .sai-task-card.running{border-color:rgba(96,165,250,.35);background:rgba(96,165,250,.06)}
+      .sai-task-card.done{border-color:rgba(15,168,118,.3);background:rgba(15,168,118,.06)}
+      .sai-task-num{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:800;flex-shrink:0;border:1.5px solid var(--e-border);color:var(--e-txt3);background:transparent;transition:all .3s}
+      .sai-task-card.running .sai-task-num{background:rgba(96,165,250,.2);border-color:rgba(96,165,250,.4);color:#60a5fa;animation:sai-task-pulse 1.5s ease infinite}
+      .sai-task-card.done .sai-task-num{background:linear-gradient(135deg,#0aa876,#34d399);border-color:#0aa876;color:#fff}
+      @keyframes sai-task-pulse{0%,100%{box-shadow:0 0 0 0 rgba(96,165,250,.3)}50%{box-shadow:0 0 0 6px rgba(96,165,250,0)}}
+      .sai-task-info{flex:1;min-width:0}
+      .sai-task-title{font-size:12px;font-weight:600;color:var(--e-txt2);transition:color .3s}
+      .sai-task-card.running .sai-task-title{color:var(--e-txt)}
+      .sai-task-card.done .sai-task-title{color:var(--e-txt)}
+      .sai-task-kind{font-size:10px;padding:2px 7px;border-radius:5px;font-weight:700;white-space:nowrap;transition:all .3s}
+      .sai-task-kind.code{background:rgba(124,106,247,.15);color:#a78bfa}
+      .sai-task-kind.answer{background:rgba(251,191,36,.12);color:#fbbf24}
+      .sai-task-score{font-size:10px;font-weight:700;padding:2px 7px;border-radius:5px;background:rgba(15,168,118,.15);color:#34d399;opacity:0;transform:scale(.8);transition:all .3s}
+      .sai-task-score.visible{opacity:1;transform:scale(1)}
+      .sai-task-status{font-size:10px;font-weight:600;padding:2px 7px;border-radius:5px;white-space:nowrap;transition:all .3s}
+      .sai-task-status.pending{background:rgba(255,255,255,.05);color:var(--e-txt3)}
+      .sai-task-status.running{background:rgba(96,165,250,.15);color:#60a5fa}
+      .sai-task-status.done{background:rgba(15,168,118,.15);color:#34d399}
+      .sai-task-summary{display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:10px;font-size:12px;font-weight:800;letter-spacing:.03em;opacity:0;transform:translateY(8px);transition:all .5s ease;background:linear-gradient(135deg,rgba(109,92,230,.25),rgba(10,168,118,.2));border:1px solid rgba(52,211,153,.35);color:#fff}
+      .sai-task-summary.visible{opacity:1;transform:none}
+      .sai-task-summary-glow{animation:sai-task-glow 2.5s ease infinite}
+      @keyframes sai-task-glow{0%,100%{box-shadow:0 0 20px rgba(52,211,153,.15)}50%{box-shadow:0 0 40px rgba(52,211,153,.35),0 0 60px rgba(10,168,118,.15)}}
+    `;
+    document.head.appendChild(taskStyle);
+
+    // 2. Build section HTML
+    const section = document.createElement('section');
+    section.className = 'sai-section';
+    section.id = 'sai-task-planner-section';
+    section.innerHTML = `
+      <div class="sai-container">
+        <div class="sai-integ-grid">
+          <div>
+            <div class="sai-integ-logo-badge">
+              <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#6d5ce6" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+              Agentic Execution
+            </div>
+            <h2 class="sai-section-title">One prompt.<br/>Multiple tasks.</h2>
+            <p class="sai-section-sub" style="margin-bottom:32px">
+              Describe a complex change and SurgicalAI automatically decomposes it into ordered tasks — each running through the full Architect → Surgeon → QA pipeline independently.
+            </p>
+            <div class="sai-integ-bullets">
+              <div class="sai-integ-bullet">
+                <div class="sai-integ-bullet-icon">🧠</div>
+                <div>
+                  <h4>AI-powered planning</h4>
+                  <p>Claude analyzes your prompt and breaks it into ordered, dependent tasks with the right execution strategy for each.</p>
+                </div>
+              </div>
+              <div class="sai-integ-bullet">
+                <div class="sai-integ-bullet-icon">⚡</div>
+                <div>
+                  <h4>Sequential execution</h4>
+                  <p>Each task runs through the full pipeline with its own QA gate. If one fails, execution halts — no cascading broken code.</p>
+                </div>
+              </div>
+              <div class="sai-integ-bullet">
+                <div class="sai-integ-bullet-icon">🛑</div>
+                <div>
+                  <h4>Cancel anytime</h4>
+                  <p>Stop mid-flight with one click. Completed tasks are preserved — only pending work gets cancelled.</p>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div class="sai-task-mockup" id="saiTaskMockup">
+            <div class="sai-task-titlebar">
+              <span class="sai-dot sai-dot-r"></span>
+              <span class="sai-dot sai-dot-y"></span>
+              <span class="sai-dot sai-dot-g"></span>
+              <span class="sai-task-tbtitle">Task Planner</span>
+            </div>
+            <div class="sai-task-body" id="saiTaskBody">
+              <div class="sai-task-prompt" id="saiTaskPrompt"></div>
+              <div class="sai-task-divider" id="saiTaskDivider">
+                <div class="sai-task-divider-line"></div>
+                <div class="sai-task-divider-label" id="saiTaskDividerLabel">Planning...</div>
+                <div class="sai-task-divider-line"></div>
+              </div>
+              <div id="saiTaskCards"></div>
+              <div class="sai-task-summary" id="saiTaskSummary"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+
+    // 3. Insert into page — find the right position
+    //    Look for the first sai-section that contains an sai-integ-grid or sai-compare-grid
+    //    and insert BEFORE it. Fallback: append before the last sai-section.
+    const allSections = document.querySelectorAll('.sai-section');
+    let insertBefore: Element | null = null;
+    for (const sec of allSections) {
+      if (sec.querySelector('.sai-integ-grid') || sec.querySelector('.sai-compare-grid')) {
+        insertBefore = sec;
+        break;
+      }
+    }
+    if (insertBefore && insertBefore.parentNode) {
+      insertBefore.parentNode.insertBefore(section, insertBefore);
+    } else {
+      // Fallback: append after the last sai-section with sai-features-grid
+      for (const sec of allSections) {
+        if (sec.querySelector('.sai-features-grid')) {
+          sec.parentNode?.insertBefore(section, sec.nextSibling);
+          break;
+        }
+      }
+    }
+
+    // 4. Animation — triggered by IntersectionObserver
+    const mockup = document.getElementById('saiTaskMockup');
+    if (!mockup) return () => { taskStyle.remove(); section.remove(); };
+
+    let fired = false;
+    const tasks = [
+      { num: '1', title: 'Refactor auth middleware to use JWT', kind: 'code', score: '9.2' },
+      { num: '2', title: 'Add comprehensive error handling', kind: 'code', score: '9.5' },
+      { num: '3', title: 'Write unit tests for auth module', kind: 'code', score: '8.8' },
+      { num: '4', title: 'Update API docs with new auth flow', kind: 'answer', score: '9.0' },
+    ];
+
+    function run() {
+      const promptEl = document.getElementById('saiTaskPrompt')!;
+      const dividerEl = document.getElementById('saiTaskDivider')!;
+      const dividerLabel = document.getElementById('saiTaskDividerLabel')!;
+      const cardsContainer = document.getElementById('saiTaskCards')!;
+      const summaryEl = document.getElementById('saiTaskSummary')!;
+
+      // Phase 1: Type the prompt
+      const promptText = 'Refactor the auth system with better error handling, add tests, and update the docs';
+      promptEl.classList.add('visible');
+      let cursor = document.createElement('span');
+      cursor.className = 'sai-task-prompt-cursor';
+      promptEl.appendChild(cursor);
+      let ci = 0;
+      function typeChar() {
+        if (ci < promptText.length) {
+          promptEl.insertBefore(document.createTextNode(promptText[ci++]), cursor);
+          setTimeout(typeChar, 25 + Math.random() * 15);
+        } else {
+          if (cursor.parentNode) cursor.parentNode.removeChild(cursor);
+          setTimeout(showDivider, 400);
+        }
+      }
+      typeChar();
+
+      // Phase 2: Show divider
+      function showDivider() {
+        dividerEl.classList.add('visible');
+        setTimeout(() => {
+          dividerLabel.textContent = '4 Tasks Planned';
+          setTimeout(showCards, 300);
+        }, 500);
+      }
+
+      // Phase 3: Reveal task cards
+      function showCards() {
+        cardsContainer.innerHTML = '';
+        tasks.forEach((t, i) => {
+          const card = document.createElement('div');
+          card.className = 'sai-task-card';
+          card.id = 'saiTaskCard' + i;
+          card.innerHTML = `
+            <div class="sai-task-num">${t.num}</div>
+            <div class="sai-task-info"><div class="sai-task-title">${t.title}</div></div>
+            <span class="sai-task-kind ${t.kind}">${t.kind}</span>
+            <span class="sai-task-score" id="saiTaskScore${i}">QA ${t.score}</span>
+            <span class="sai-task-status pending" id="saiTaskStatus${i}">Pending</span>
+          `;
+          cardsContainer.appendChild(card);
+          setTimeout(() => card.classList.add('visible'), 200 * (i + 1));
+        });
+        // After all cards visible, start executing
+        setTimeout(executeSequential, 200 * tasks.length + 600);
+      }
+
+      // Phase 4: Execute tasks sequentially
+      function executeSequential() {
+        let idx = 0;
+        function runTask() {
+          if (idx >= tasks.length) { setTimeout(showSummary, 500); return; }
+          const card = document.getElementById('saiTaskCard' + idx)!;
+          const status = document.getElementById('saiTaskStatus' + idx)!;
+          const score = document.getElementById('saiTaskScore' + idx)!;
+          // Running
+          card.classList.add('running');
+          card.classList.remove('done');
+          status.className = 'sai-task-status running';
+          status.textContent = 'Running';
+          const duration = 900 + Math.random() * 600;
+          setTimeout(() => {
+            // Done
+            card.classList.remove('running');
+            card.classList.add('done');
+            status.className = 'sai-task-status done';
+            status.textContent = 'Done';
+            score.classList.add('visible');
+            idx++;
+            setTimeout(runTask, 300);
+          }, duration);
+        }
+        runTask();
+      }
+
+      // Phase 5: Summary
+      function showSummary() {
+        summaryEl.innerHTML = '✦ 4 / 4 tasks complete · All QA passed';
+        summaryEl.classList.add('visible', 'sai-task-summary-glow');
+      }
+    }
+
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting && !fired) {
+          fired = true;
+          obs.disconnect();
+          run();
+        }
+      });
+    }, { threshold: 0.25 });
+    obs.observe(mockup);
+
+    return () => {
+      obs.disconnect();
+      taskStyle.remove();
+      section.remove();
+    };
+  }, []);
+
   // ── Hero mockup live animation ────────────────────────────────────────────
   useEffect(() => {
     // Inject hero animation CSS
