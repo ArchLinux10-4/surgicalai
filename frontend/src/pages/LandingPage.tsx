@@ -378,6 +378,49 @@ html{scroll-behavior:smooth}
 .sai-compare-item p{color:var(--txt2);line-height:1.5}
 .sai-compare-item strong{color:var(--txt)}
 
+/* TASKS */
+.sai-tasks-section{padding:100px 24px;background:linear-gradient(180deg,#f0fdf7 0%,#ffffff 50%,#f6f7fb 100%);position:relative;overflow:hidden}
+.sai-tasks-section::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:radial-gradient(ellipse 50% 55% at 20% 30%,rgba(15,168,118,.06) 0%,transparent 65%);pointer-events:none}
+.sai-tasks-section::after{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:radial-gradient(ellipse 45% 50% at 85% 80%,rgba(109,92,230,.05) 0%,transparent 60%);pointer-events:none}
+.sai-tasks-wrap{max-width:1100px;margin:0 auto;position:relative;z-index:1}
+.sai-tasks-head{margin-bottom:56px}
+.sai-tasks-pill{display:inline-flex;align-items:center;gap:6px;background:rgba(15,168,118,.1);border:1px solid rgba(15,168,118,.3);color:#0aa876;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:6px 16px;border-radius:100px;margin-bottom:24px}
+.sai-tasks-pill-dot{width:6px;height:6px;border-radius:50%;background:#0aa876;animation:sai-pulse 2s ease-in-out infinite}
+.sai-tasks-grid{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:center}
+.sai-tasks-mockup{background:var(--e-bg2);border:1px solid rgba(255,255,255,.08);border-radius:16px;overflow:hidden;box-shadow:0 8px 40px rgba(0,0,0,.14),0 0 0 1px rgba(255,255,255,.05)}
+.sai-tasks-titlebar{height:38px;background:var(--e-bg3);border-bottom:1px solid var(--e-border);display:flex;align-items:center;padding:0 14px;gap:8px}
+.sai-tasks-tbtitle{margin-left:8px;font-size:12px;color:var(--e-txt2);font-weight:600}
+.sai-tasks-prompt-bar{padding:14px 16px;border-bottom:1px solid var(--e-border);display:flex;align-items:center;gap:10px}
+.sai-tasks-prompt-icon{width:28px;height:28px;border-radius:8px;background:linear-gradient(135deg,rgba(109,92,230,.3),rgba(15,168,118,.3));display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0}
+.sai-tasks-prompt-text{flex:1;font-size:12px;color:var(--e-txt);font-family:'JetBrains Mono','Fira Code',monospace;min-height:16px}
+.sai-tasks-prompt-cursor{display:inline-block;width:1px;height:14px;background:var(--e-txt);vertical-align:middle;margin-left:1px;animation:sai-blink 1s step-end infinite}
+.sai-tasks-body{padding:12px 14px;display:flex;flex-direction:column;gap:8px;min-height:280px}
+.sai-tasks-gen-label{font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--e-txt3);padding:4px 0 2px;display:flex;align-items:center;gap:8px}
+.sai-tasks-gen-line{flex:1;height:1px;background:var(--e-border)}
+.sai-task-item{display:flex;align-items:center;gap:10px;padding:10px 12px;background:rgba(255,255,255,.03);border:1px solid var(--e-border);border-radius:9px;font-size:12px;color:var(--e-txt2);opacity:0;transform:translateY(8px);transition:opacity .4s ease,transform .4s ease,border-color .3s,background .3s}
+.sai-task-item.visible{opacity:1;transform:none}
+.sai-task-item.highlight{border-color:rgba(15,168,118,.3);background:rgba(15,168,118,.06)}
+.sai-task-checkbox{width:16px;height:16px;border-radius:5px;border:1.5px solid var(--e-txt3);flex-shrink:0;display:flex;align-items:center;justify-content:center;transition:all .3s}
+.sai-task-checkbox.checked{border-color:#34d399;background:linear-gradient(135deg,#0aa876,#34d399)}
+.sai-task-checkbox.checked::after{content:'\2713';color:#fff;font-size:10px;font-weight:700}
+.sai-task-text{flex:1;color:var(--e-txt2);transition:color .3s}
+.sai-task-item.highlight .sai-task-text{color:var(--e-txt)}
+.sai-task-priority{font-size:9px;padding:2px 7px;border-radius:4px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;flex-shrink:0}
+.sai-task-priority.high{background:rgba(248,113,113,.15);color:#fca5a5}
+.sai-task-priority.med{background:rgba(251,191,36,.12);color:#fbbf24}
+.sai-task-priority.low{background:rgba(96,165,250,.12);color:#60a5fa}
+.sai-task-status-badge{font-size:10px;padding:2px 7px;border-radius:5px;font-weight:700;flex-shrink:0}
+.sai-task-status-badge.generated{background:rgba(124,106,247,.15);color:#a78bfa}
+.sai-tasks-summary{display:flex;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid var(--e-border);font-size:11px;color:var(--e-txt2);opacity:0;transition:opacity .5s ease}
+.sai-tasks-summary.visible{opacity:1}
+.sai-tasks-summary-badge{display:inline-flex;align-items:center;gap:5px;background:linear-gradient(135deg,rgba(109,92,230,.25),rgba(15,168,118,.2));border:1px solid rgba(52,211,153,.35);color:#34d399;padding:3px 10px;border-radius:5px;font-size:11px;font-weight:700}
+.sai-tasks-bullets{display:flex;flex-direction:column;gap:16px;margin-top:32px}
+.sai-tasks-bullet{display:flex;align-items:flex-start;gap:14px}
+.sai-tasks-bullet-icon{width:36px;height:36px;border-radius:10px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:16px;background:rgba(15,168,118,.08);border:1.5px solid rgba(15,168,118,.18)}
+.sai-tasks-bullet h4{font-size:15px;font-weight:700;margin-bottom:4px;color:var(--txt)}
+.sai-tasks-bullet p{font-size:14px;color:var(--txt2);line-height:1.5}
+@media(max-width:900px){.sai-tasks-grid{grid-template-columns:1fr;gap:40px}}
+
 /* PRICING */
 .sai-pricing-grid{display:grid;grid-template-columns:1fr 1fr;gap:24px;max-width:860px;margin:0 auto}
 .sai-pricing-card{background:#fff;border:1.5px solid var(--border2);border-radius:20px;overflow:hidden;transition:transform .2s;box-shadow:0 2px 12px rgba(0,0,0,.04)}
@@ -699,6 +742,113 @@ export function LandingPage() {
     }, { threshold: 0.25 });
     obs.observe(term);
     return () => obs.disconnect();
+  }, []);
+
+  // ── Tasks section animation ───────────────────────────────────────────────
+  useEffect(() => {
+    const mockup = document.getElementById('tasksMockup');
+    if (!mockup) return;
+
+    const promptText = mockup.querySelector('.sai-tasks-prompt-text') as HTMLElement;
+    const tasksBody = mockup.querySelector('.sai-tasks-body') as HTMLElement;
+    const tasksSummary = mockup.querySelector('.sai-tasks-summary') as HTMLElement;
+    if (!promptText || !tasksBody || !tasksSummary) return;
+
+    let fired = false;
+
+    const tasks = [
+      { text: 'Set up OAuth 2.0 provider config (Google, GitHub)', priority: 'high', priorityLabel: 'High' },
+      { text: 'Create /api/auth/callback endpoint handler', priority: 'high', priorityLabel: 'High' },
+      { text: 'Build JWT session token with refresh rotation', priority: 'high', priorityLabel: 'High' },
+      { text: 'Add protected route middleware + useAuth hook', priority: 'med', priorityLabel: 'Med' },
+      { text: 'Design login page with provider buttons', priority: 'med', priorityLabel: 'Med' },
+      { text: 'Write integration tests for auth flow', priority: 'low', priorityLabel: 'Low' },
+    ];
+
+    function typePrompt(text: string, speed: number, done: () => void) {
+      const cursor = document.createElement('span');
+      cursor.className = 'sai-tasks-prompt-cursor';
+      promptText.appendChild(cursor);
+      let i = 0;
+      function step() {
+        if (i < text.length) {
+          promptText.insertBefore(document.createTextNode(text[i++]), cursor);
+          setTimeout(step, speed + Math.random() * speed * 0.4);
+        } else {
+          if (cursor.parentNode) cursor.parentNode.removeChild(cursor);
+          done();
+        }
+      }
+      step();
+    }
+
+    function run() {
+      promptText.textContent = '';
+      tasksBody.innerHTML = '';
+      tasksSummary.classList.remove('visible');
+
+      typePrompt('Build a user auth system with OAuth + JWT sessions', 28, () => {
+        setTimeout(() => {
+          // Show generating label
+          const genLabel = document.createElement('div');
+          genLabel.className = 'sai-tasks-gen-label';
+          genLabel.innerHTML = '<span>\u2726 Generated Tasks</span><span class="sai-tasks-gen-line"></span><span>6 tasks</span>';
+          genLabel.style.opacity = '0';
+          genLabel.style.transition = 'opacity .4s ease';
+          tasksBody.appendChild(genLabel);
+          requestAnimationFrame(() => { genLabel.style.opacity = '1'; });
+
+          // Stagger task items
+          let idx = 0;
+          function addTask() {
+            if (idx >= tasks.length) {
+              // All tasks added — show summary
+              setTimeout(() => {
+                tasksSummary.classList.add('visible');
+                // Highlight first two tasks after a beat
+                setTimeout(() => {
+                  const items = tasksBody.querySelectorAll('.sai-task-item');
+                  if (items[0]) items[0].classList.add('highlight');
+                  if (items[1]) items[1].classList.add('highlight');
+                }, 600);
+              }, 400);
+              return;
+            }
+
+            const t = tasks[idx];
+            const el = document.createElement('div');
+            el.className = 'sai-task-item';
+            el.innerHTML = [
+              '<div class="sai-task-checkbox"></div>',
+              '<span class="sai-task-text">' + t.text + '</span>',
+              '<span class="sai-task-priority ' + t.priority + '">' + t.priorityLabel + '</span>',
+              '<span class="sai-task-status-badge generated">Generated</span>',
+            ].join('');
+            tasksBody.appendChild(el);
+
+            // Trigger animation
+            requestAnimationFrame(() => requestAnimationFrame(() => el.classList.add('visible')));
+
+            idx++;
+            setTimeout(addTask, 180 + Math.random() * 120);
+          }
+
+          setTimeout(addTask, 300);
+        }, 500);
+      });
+    }
+
+    const obsT = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting && !fired) {
+          fired = true;
+          obsT.disconnect();
+          run();
+        }
+      });
+    }, { threshold: 0.25 });
+    obsT.observe(mockup);
+    return () => obsT.disconnect();
   }, []);
 
   // ── Hero mockup live animation ────────────────────────────────────────────
@@ -1595,6 +1745,68 @@ export function LandingPage() {
                 <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>Architect + Surgeon</strong> — dedicated roles, clear separation</p></div>
                 <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>3× auto-heal</strong> — Claude re-reads errors and retries automatically</p></div>
                 <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>GitHub + Linear</strong> — branch-aware, PR creation, ticket sync</p></div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* TASKS */}
+      <section className="sai-tasks-section">
+        <div className="sai-tasks-wrap">
+          <div className="sai-tasks-head">
+            <div className="sai-tasks-pill">
+              <span className="sai-tasks-pill-dot"></span>
+              Task Generation
+            </div>
+            <h2 className="sai-section-title">Prompt to tasks,<br/>in seconds</h2>
+            <p className="sai-section-sub">Describe what you want to build. SurgicalAI breaks it down into structured, prioritized tasks — ready to assign, track, and execute.</p>
+          </div>
+          <div className="sai-tasks-grid">
+            <div>
+              <div id="tasksMockup" className="sai-tasks-mockup">
+                <div className="sai-tasks-titlebar">
+                  <div className="sai-dot sai-dot-r"></div>
+                  <div className="sai-dot sai-dot-y"></div>
+                  <div className="sai-dot sai-dot-g"></div>
+                  <span className="sai-tasks-tbtitle">SurgicalAI — Task Generator</span>
+                </div>
+                <div className="sai-tasks-prompt-bar">
+                  <div className="sai-tasks-prompt-icon">✦</div>
+                  <div className="sai-tasks-prompt-text"></div>
+                </div>
+                <div className="sai-tasks-body"></div>
+                <div className="sai-tasks-summary">
+                  <span className="sai-tasks-summary-badge">✦ 6 tasks generated</span>
+                  <span style={{color:'var(--e-txt3)',fontSize:'11px'}}>Ready to assign · Auto-prioritized</span>
+                </div>
+              </div>
+            </div>
+            <div>
+              <h3 style={{fontSize:'24px',fontWeight:800,letterSpacing:'-0.5px',color:'var(--txt)',marginBottom:'16px',lineHeight:1.2}}>Your prompt becomes<br/>a project plan</h3>
+              <p style={{fontSize:'15px',color:'var(--txt2)',lineHeight:1.7,marginBottom:'8px'}}>Stop manually writing tickets. Describe the feature in natural language and let AI decompose it into actionable tasks with priorities, scopes, and dependencies.</p>
+              <div className="sai-tasks-bullets">
+                <div className="sai-tasks-bullet">
+                  <div className="sai-tasks-bullet-icon">⚡</div>
+                  <div>
+                    <h4>Instant decomposition</h4>
+                    <p>One prompt → multiple scoped tasks, each with a clear deliverable and priority level.</p>
+                  </div>
+                </div>
+                <div className="sai-tasks-bullet">
+                  <div className="sai-tasks-bullet-icon">🎯</div>
+                  <div>
+                    <h4>Smart prioritization</h4>
+                    <p>Tasks are auto-ranked by dependency order and complexity — critical path items surface first.</p>
+                  </div>
+                </div>
+                <div className="sai-tasks-bullet">
+                  <div className="sai-tasks-bullet-icon">🔗</div>
+                  <div>
+                    <h4>Execute with one click</h4>
+                    <p>Each generated task feeds directly into the Architect → Surgeon → QA pipeline. No copy-pasting.</p>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
