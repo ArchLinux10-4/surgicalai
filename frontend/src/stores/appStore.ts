@@ -81,16 +81,6 @@ interface AppState {
   setSessionFiles: (files: import('../types').SessionFile[]) => void
   addSessionFile: (file: import('../types').SessionFile) => void
   removeSessionFile: (fileId: string) => void
-
-  // Agentic tasks
-  agentTasks: import('../types').AgentTask[]
-  taskRunId: string | null
-  taskPreamble: string
-  setAgentTasks: (tasks: import('../types').AgentTask[]) => void
-  updateAgentTask: (id: string, patch: Partial<import('../types').AgentTask>) => void
-  clearAgentTasks: () => void
-  setTaskRunId: (id: string | null) => void
-  setTaskPreamble: (s: string) => void
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -165,15 +155,4 @@ export const useAppStore = create<AppState>((set) => ({
   setSessionFiles: (sessionFiles) => set({ sessionFiles }),
   addSessionFile: (file) => set((state) => ({ sessionFiles: [...state.sessionFiles.filter(f => f.filename !== file.filename), file] })),
   removeSessionFile: (fileId) => set((state) => ({ sessionFiles: state.sessionFiles.filter(f => f.id !== fileId) })),
-
-  agentTasks: [],
-  taskRunId: null,
-  taskPreamble: '',
-  setAgentTasks: (agentTasks) => set({ agentTasks }),
-  updateAgentTask: (id, patch) => set((state) => ({
-    agentTasks: state.agentTasks.map(t => t.id === id ? { ...t, ...patch } : t)
-  })),
-  clearAgentTasks: () => set({ agentTasks: [], taskRunId: null, taskPreamble: '' }),
-  setTaskRunId: (taskRunId) => set({ taskRunId }),
-  setTaskPreamble: (taskPreamble) => set({ taskPreamble }),
 }))

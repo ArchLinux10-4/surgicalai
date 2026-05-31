@@ -1,7 +1,7 @@
 """Chat router — standard AI chat with file context."""
-import asyncio
 import uuid
 import json
+import asyncio
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from models.schemas import ChatRequest, NewSessionRequest, ChatSession
@@ -11,41 +11,39 @@ from services.pipeline import run_chat, run_chat_stream
 router = APIRouter()
 
 
-async def _with_heartbeat(aiter, interval: int = 20):
-    """Wrap an async iterator, yielding SSE keepalive comments when it stalls.
+async def _with_heartbeat(gen, interval: float = 20.0):
+    """Wrap an async generator, yielding SSE keepalive comments when it stalls.
 
-    Prevents Railway/nginx from closing idle SSE connections during long Claude
-    API calls (architect pass, QA pass, fix-loop retry).  SSE comment lines
-    starting with ':' are forwarded by all proxies and silently ignored by
-    browsers, so this is invisible to the client UI.
+    Prevents Railway / Vercel proxy from closing the connection during long
+    Claude calls (architect pass, QA pass, retry loops on large files).
     """
-    _DONE = object()
-    queue: asyncio.Queue = asyncio.Queue()
+    _sentinel = object()
 
-    async def _produce():
+    async def _next(aiter):
         try:
-            async for item in aiter:
-                await queue.put(item)
-        finally:
-            await queue.put(_DONE)
+            return await aiter.__anext__()
+        except StopAsyncIteration:
+            return _sentinel
 
-    task = asyncio.create_task(_produce())
+    aiter = gen.__aiter__()
+    pending = asyncio.ensure_future(_next(aiter))
     try:
         while True:
             try:
-                item = await asyncio.wait_for(queue.get(), timeout=interval)
-            except asyncio.TimeoutError:
-                yield ": keepalive\n\n"
-                continue
-            if item is _DONE:
+                done, _ = await asyncio.wait({pending}, timeout=interval)
+            except Exception:
                 break
-            yield item
+            if done:
+                item = pending.result()
+                if item is _sentinel:
+                    break
+                yield item
+                pending = asyncio.ensure_future(_next(aiter))
+            else:
+                yield ": keepalive\n\n"
     finally:
-        task.cancel()
-        try:
-            await task
-        except (asyncio.CancelledError, Exception):
-            pass
+        if not pending.done():
+            pending.cancel()
 
 
 def _load_effective_memory(conn, session_id):
@@ -608,208 +606,9 @@ async def smart_stream(req: dict, request: Request):
         _arch_model = _gs("architect_model", "gpt-4.1")
         _use_natural = _arch_model.startswith("claude-")
 
-        # ── Agentic task branch ───────────────────────────────────────────
-        # Only when (a) using the Claude natural pipeline and (b) the user
-        # explicitly asked to break the work into tasks. Otherwise the normal
-        # single-pass path below runs exactly as before (zero behaviour change).
-        from services.task_planner import (
-            wants_task_breakdown, plan_tasks, create_tasks, update_task,
-            cancel_requested_for_run, mark_pending_cancelled,
-        )
-
-        def _sse(obj):
-            return "data: " + _json.dumps(obj) + "\n\n"
-
-        if _use_natural and wants_task_breakdown(message):
-            yield _sse({"type": "progress", "content": "Planning tasks..."})
-            try:
-                _plan = await plan_tasks(message, session_files, current_user_id)
-            except Exception as _pe:
-                print(f"[tasks] planning failed: {_pe}")
-                _plan = {"tasks": []}
-
-            _planned = _plan.get("tasks", []) or []
-            if len(_planned) >= 2:
-                # ---- helpers (closure over session_id) ----
-                _VERDICT_ORDER = {"safe": 0, "skipped": 0, "verified_safe": 0, "warning": 1, "blocked": 2}
-
-                def _eval_result(parsed):
-                    scores, worst = [], "safe"
-                    for _fd in (parsed or {}).get("changes_by_file", {}).values():
-                        for _ch in (_fd.get("changes", []) if isinstance(_fd, dict) else []):
-                            _qr = _ch.get("qa_result") or {}
-                            _s = _qr.get("qa_score")
-                            if isinstance(_s, (int, float)):
-                                scores.append(int(_s))
-                            _v = _qr.get("verdict", "")
-                            if _VERDICT_ORDER.get(_v, 0) > _VERDICT_ORDER.get(worst, 0):
-                                worst = _v
-                    return (min(scores) if scores else None, worst)
-
-                def _save_task_message(natural_text, parsed):
-                    db = get_db()
-                    rid = str(uuid.uuid4())
-                    if parsed:
-                        qa_warnings = []
-                        for _fd in parsed.get("changes_by_file", {}).values():
-                            for _ch in (_fd.get("changes", []) if isinstance(_fd, dict) else []):
-                                _qr = _ch.get("qa_result") or {}
-                                _vd = _qr.get("verdict", "")
-                                _sm = (_qr.get("summary") or "").strip()
-                                _sc = _qr.get("qa_score")
-                                if _vd in ("warning", "blocked") and _sm:
-                                    _ic = "⚠️" if _vd == "warning" else "🚫"
-                                    _sy = (_ch.get("symbol") or {})
-                                    _nm = _sy.get("name") or _sy.get("full_path", "change")
-                                    qa_warnings.append(f"{_ic} **{_nm}** (QA {_sc}/10): {_sm}")
-                        _txt = natural_text
-                        if qa_warnings:
-                            _txt = (_txt + ("\n\n" if _txt else "") + "**QA Notes:**\n"
-                                    + "\n".join(f"- {w}" for w in qa_warnings))
-                        saved = "__NATURAL_AND_RESULT__:" + _json.dumps({"text": _txt, "result": parsed})
-                    else:
-                        saved = natural_text
-                    db.execute(
-                        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                        (rid, session_id, "assistant", saved),
-                    )
-                    db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
-                    db.commit()
-                    db.close()
-
-                def _save_note(text):
-                    db = get_db()
-                    rid = str(uuid.uuid4())
-                    db.execute(
-                        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                        (rid, session_id, "assistant", text),
-                    )
-                    db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
-                    db.commit()
-                    db.close()
-
-                run_id = str(uuid.uuid4())
-                tasks = create_tasks(session_id, run_id, _planned)
-                yield _sse({
-                    "type": "task_plan",
-                    "run_id": run_id,
-                    "preamble": _plan.get("preamble", ""),
-                    "tasks": [
-                        {"id": t["id"], "seq": t["seq"], "title": t["title"],
-                         "detail": t["detail"], "kind": t.get("kind", "code"),
-                         "status": "pending"}
-                        for t in tasks
-                    ],
-                })
-
-                completed, blocked_task, cancelled = 0, None, False
-                total = len(tasks)
-
-                for t in tasks:
-                    if cancel_requested_for_run(session_id, run_id):
-                        cancelled = True
-                        break
-                    update_task(t["id"], status="running")
-                    yield _sse({"type": "task_start", "id": t["id"]})
-
-                    collected, result_content, poll, aborted = [], None, 0, False
-                    async for chunk in _with_heartbeat(run_natural_pipeline_stream(
-                        session_files=session_files,
-                        user_request=t["detail"],
-                        conversation_history=conversation_history,
-                        session_id=session_id,
-                        project_memory=project_memory,
-                        session_summary=current_summary,
-                        user_id=current_user_id,
-                    )):
-                        poll += 1
-                        if poll % 20 == 0 and cancel_requested_for_run(session_id, run_id):
-                            aborted = True
-                            break
-                        if chunk.startswith(": "):
-                            yield chunk  # forward SSE keepalive comment to client
-                            continue
-                        if chunk.startswith("data: "):
-                            try:
-                                _d = _json.loads(chunk[6:])
-                                _ct = _d.get("type", "")
-                                if _ct in ("token", "chat"):
-                                    collected.append(_d.get("content", ""))
-                                elif _ct == "smart_result":
-                                    result_content = _d.get("content", "")
-                                elif _ct == "progress":
-                                    yield _sse({"type": "task_progress", "id": t["id"], "content": _d.get("content", "")})
-                                elif _ct == "error":
-                                    yield _sse({"type": "task_progress", "id": t["id"], "content": "⚠️ " + _d.get("content", "")})
-                            except Exception:
-                                pass
-
-                    if aborted:
-                        update_task(t["id"], status="cancelled")
-                        yield _sse({"type": "task_cancelled", "id": t["id"]})
-                        cancelled = True
-                        break
-
-                    natural_text = "".join(collected).strip()
-                    parsed = None
-                    if result_content:
-                        try:
-                            parsed = _json.loads(result_content)
-                        except Exception:
-                            parsed = None
-                    score, worst = _eval_result(parsed) if parsed else (None, "safe")
-                    _save_task_message(natural_text, parsed)
-
-                    # Non-code ("answer") tasks edit nothing, so they skip the
-                    # 8/10 QA gate entirely and report a "skipped" verdict.
-                    _is_answer = t.get("kind") == "answer"
-                    if parsed and worst == "blocked" and not _is_answer:
-                        update_task(t["id"], status="blocked", qa_score=score,
-                                    verdict=worst, result_summary=natural_text[:500])
-                        yield _sse({"type": "task_blocked", "id": t["id"], "qa_score": score, "verdict": worst})
-                        blocked_task = t
-                        break
-                    else:
-                        _verdict = "skipped" if _is_answer else (worst or "safe")
-                        _score = None if _is_answer else score
-                        update_task(t["id"], status="done", qa_score=_score,
-                                    verdict=_verdict, result_summary=natural_text[:500])
-                        # Emit the diff result so the frontend renders the code card.
-                        # Without this the result is saved to DB but never shown in chat.
-                        if parsed and not _is_answer:
-                            _result_payload = dict(parsed)
-                            _result_payload["natural_text"] = natural_text
-                            yield _sse({"type": "smart_result", "content": _json.dumps(_result_payload)})
-                        yield _sse({"type": "task_done", "id": t["id"], "qa_score": _score, "verdict": _verdict})
-                        completed += 1
-
-                if cancelled:
-                    mark_pending_cancelled(session_id, run_id)
-                    note = f"⛔ Task run cancelled. Completed {completed} of {total} task(s); the remaining were cancelled."
-                    _save_note(note)
-                    yield _sse({"type": "tasks_complete", "status": "cancelled",
-                                "completed": completed, "total": total, "summary": note})
-                elif blocked_task is not None:
-                    mark_pending_cancelled(session_id, run_id)
-                    note = (f"🚫 Task run paused. Completed {completed} of {total}. "
-                            f"Task “{blocked_task['title']}” did not pass the 8/10 QA gate, "
-                            f"so the remaining tasks were halted for your review.")
-                    _save_note(note)
-                    yield _sse({"type": "tasks_complete", "status": "blocked",
-                                "completed": completed, "total": total, "summary": note})
-                else:
-                    note = f"✅ Completed all {total} task(s)."
-                    _save_note(note)
-                    yield _sse({"type": "tasks_complete", "status": "done",
-                                "completed": completed, "total": total, "summary": note})
-
-                yield _sse({"type": "done"})
-                return
-        # ── End agentic task branch ───────────────────────────────────────
-
         _pipeline = run_natural_pipeline_stream if _use_natural else run_smart_pipeline_stream
 
-        async for chunk in _pipeline(
+        async for chunk in _with_heartbeat(_pipeline(
             session_files=session_files,
             user_request=message,
             conversation_history=conversation_history,
@@ -817,7 +616,10 @@ async def smart_stream(req: dict, request: Request):
             project_memory=project_memory,
             session_summary=current_summary,
             user_id=current_user_id,
-        ):
+        )):
+            if chunk.startswith(": "):
+                yield chunk   # forward SSE keepalive comment — keeps proxy alive
+                continue
             if chunk.startswith("data: "):
                 try:
                     data = _json.loads(chunk[6:])
