@@ -217,17 +217,42 @@ def list_tasks(session_id: str, run_id: str = None) -> list:
                 "SELECT * FROM agent_tasks WHERE session_id = ? ORDER BY created_at DESC, seq ASC",
                 (session_id,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        result = [dict(r) for r in rows]
+        # Heal tasks stuck as running/pending with cancel_requested set — this
+        # happens when the SSE loop died (network error) before it could check
+        # the flag and update the status itself.
+        stale_ids = [
+            r["id"] for r in result
+            if r.get("cancel_requested") and r.get("status") in ("running", "pending")
+        ]
+        if stale_ids:
+            placeholders = ",".join("?" * len(stale_ids))
+            conn.execute(
+                f"UPDATE agent_tasks SET status = 'cancelled', updated_at = CURRENT_TIMESTAMP "
+                f"WHERE id IN ({placeholders})",
+                stale_ids,
+            )
+            conn.commit()
+            for r in result:
+                if r["id"] in stale_ids:
+                    r["status"] = "cancelled"
+        return result
     finally:
         conn.close()
 
 
 def request_cancel(task_id: str) -> bool:
-    """Flag a single non-terminal task for cancellation."""
+    """Cancel a single non-terminal task immediately.
+
+    Sets both the flag (for the running loop to detect) and the status (so
+    re-entry after a dropped connection shows the correct state rather than
+    restarting polling on a stuck 'running' task).
+    """
     conn = get_db()
     try:
         cur = conn.execute(
-            "UPDATE agent_tasks SET cancel_requested = 1, updated_at = CURRENT_TIMESTAMP "
+            "UPDATE agent_tasks "
+            "SET cancel_requested = 1, status = 'cancelled', updated_at = CURRENT_TIMESTAMP "
             "WHERE id = ? AND status NOT IN ('done','blocked','cancelled','error')",
             (task_id,),
         )
@@ -238,19 +263,25 @@ def request_cancel(task_id: str) -> bool:
 
 
 def request_cancel_all(session_id: str, run_id: str = None) -> int:
-    """Flag every non-terminal task (optionally within a run) for cancellation."""
+    """Cancel every non-terminal task (optionally within a run) immediately.
+
+    Sets both the flag (for the running loop) and the status (so the DB
+    reflects the true state even if the SSE loop died before checking the flag).
+    """
     conn = get_db()
     try:
         if run_id:
             cur = conn.execute(
-                "UPDATE agent_tasks SET cancel_requested = 1, updated_at = CURRENT_TIMESTAMP "
+                "UPDATE agent_tasks "
+                "SET cancel_requested = 1, status = 'cancelled', updated_at = CURRENT_TIMESTAMP "
                 "WHERE session_id = ? AND run_id = ? "
                 "AND status NOT IN ('done','blocked','cancelled','error')",
                 (session_id, run_id),
             )
         else:
             cur = conn.execute(
-                "UPDATE agent_tasks SET cancel_requested = 1, updated_at = CURRENT_TIMESTAMP "
+                "UPDATE agent_tasks "
+                "SET cancel_requested = 1, status = 'cancelled', updated_at = CURRENT_TIMESTAMP "
                 "WHERE session_id = ? AND status NOT IN ('done','blocked','cancelled','error')",
                 (session_id,),
             )
