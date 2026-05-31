@@ -293,6 +293,9 @@ def _init_sqlite():
         cur.execute("ALTER TABLE session_files ADD COLUMN previous_content TEXT")
     if "updated_at" not in sf_cols:
         cur.execute("ALTER TABLE session_files ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+    if "origin" not in sf_cols:
+        # 'uploaded' (user-provided) | 'created' (AI-generated net-new file)
+        cur.execute("ALTER TABLE session_files ADD COLUMN origin TEXT DEFAULT 'uploaded'")
 
     # Migration: add QA log + compliance log tables
     cur.execute("""
@@ -529,6 +532,9 @@ def _init_postgres():
         """)
         conn.execute("""
             ALTER TABLE session_files ADD COLUMN IF NOT EXISTS github_pushed_at TIMESTAMP
+        """)
+        conn.execute("""
+            ALTER TABLE session_files ADD COLUMN IF NOT EXISTS origin TEXT DEFAULT 'uploaded'
         """)
         # qa_log — proof QA ran on every Surgeon run (was missing on Postgres,
         # so the audit trail was silently empty in production)

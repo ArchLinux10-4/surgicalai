@@ -3,6 +3,7 @@ import { api } from '../api/client'
 import type { SessionFile } from '../types'
 import { GitHubCommitModal } from './GitHubCommitModal'
 import { useAppStore } from '../stores/appStore'
+import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile } from '../lib/fileClassify'
 import { GitHub } from '@mui/icons-material';
 
 interface SessionFilesTrayProps {
@@ -62,6 +63,8 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
   const [showCommitModal, setShowCommitModal] = useState(false)
   const [appliedIds, setAppliedIds] = useState<Set<string>>(new Set())
   const { setSessionFiles } = useAppStore()
+  const fileFilter = useAppStore(s => s.fileFilter)
+  const counts = useMemo(() => fileCounts(sessionFiles), [sessionFiles])
 
   // Load applied change IDs so the AI-edited badge stays accurate after undo.
   useEffect(() => {
@@ -91,9 +94,11 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
 
   const visibleFiles = useMemo(() => {
     const q = query.trim().toLowerCase()
-    if (!q) return sortedFiles
-    return sortedFiles.filter(f => f.filename.toLowerCase().includes(q))
-  }, [sortedFiles, query])
+    return sortedFiles.filter(f =>
+      matchesFileFilter(f, fileFilter) &&
+      (!q || f.filename.toLowerCase().includes(q))
+    )
+  }, [sortedFiles, query, fileFilter])
 
   const syncCounts = useMemo(() => {
     const counts = { modified: 0, synced: 0, never: 0 }
@@ -197,7 +202,11 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
         {/* ── Expanded panel ─────────────────────────────────────── */}
         {open && (
           <div className="border-t border-border/50">
-            {/* Filter */}
+            {/* Current / New / All segmented filter — synced with the side panel */}
+            <div className="px-3 py-2 border-b border-border/40">
+              <FileFilterTabs counts={counts} size="sm" />
+            </div>
+            {/* Search filter */}
             {sessionFiles.length > 4 && (
               <div className="px-3 py-2 border-b border-border/40">
                 <div className="flex items-center gap-2 px-2.5 py-1.5 bg-base/60 border border-border/60 rounded-lg">
@@ -236,15 +245,14 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
                     key={file.id}
                     className="flex items-center gap-3 px-3.5 py-2 hover:bg-overlay/40 transition-colors group"
                   >
-                    <svg className="w-4 h-4 text-muted/50 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                      <path d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                    </svg>
+                    <FileKindGlyph file={file} size={16} />
 
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-1.5 flex-wrap">
                         <span className="text-[13px] font-medium text-ink truncate max-w-[200px]" title={file.filename}>
                           {file.filename}
                         </span>
+                        {isCreatedFile(file) && <NewBadge compact />}
                         <span className={`text-[9px] font-medium px-1.5 py-0.5 border rounded-md ${langColor(file.language)}`}>
                           {file.language || 'text'}
                         </span>

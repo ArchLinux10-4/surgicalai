@@ -67,6 +67,7 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
         filename: file.filename,
         content: file.content,
         language: lang,
+        origin: 'created',
       })
       setSaved(true)
       localStorage.setItem(savedKey, '1')
