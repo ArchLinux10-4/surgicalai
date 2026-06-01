@@ -3,7 +3,8 @@ import { api } from '../api/client'
 import type { SessionFile } from '../types'
 import { GitHubCommitModal } from './GitHubCommitModal'
 import { useAppStore } from '../stores/appStore'
-import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile } from '../lib/fileClassify'
+import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isSpreadsheetFile } from '../lib/fileClassify'
+import { DataLabModal } from './DataLabModal'
 import { GitHub } from '@mui/icons-material';
 
 interface SessionFilesTrayProps {
@@ -62,9 +63,16 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
   const [downloading, setDownloading] = useState<string | null>(null)
   const [showCommitModal, setShowCommitModal] = useState(false)
   const [appliedIds, setAppliedIds] = useState<Set<string>>(new Set())
+  const [datalabOn, setDatalabOn] = useState(false)
+  const [transformFile, setTransformFile] = useState<SessionFile | null>(null)
   const { setSessionFiles } = useAppStore()
   const fileFilter = useAppStore(s => s.fileFilter)
   const counts = useMemo(() => fileCounts(sessionFiles), [sessionFiles])
+
+  // Check the DataLab feature flag once — gates all spreadsheet affordances.
+  useEffect(() => {
+    api.datalab.enabled().then(r => setDatalabOn(!!r?.enabled)).catch(() => setDatalabOn(false))
+  }, [])
 
   // Load applied change IDs so the AI-edited badge stays accurate after undo.
   useEffect(() => {
@@ -118,7 +126,12 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
   const handleDownload = async (file: SessionFile) => {
     setDownloading(file.id)
     try {
-      await api.sessionFiles.download(sessionId, file.id, file.filename)
+      // Spreadsheets are binary — pull the real bytes via the DataLab endpoint.
+      if (datalabOn && isSpreadsheetFile(file)) {
+        await api.datalab.download(sessionId, file.id, file.filename)
+      } else {
+        await api.sessionFiles.download(sessionId, file.id, file.filename)
+      }
     } catch {
       // silently fail
     } finally {
@@ -287,6 +300,20 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
                       </div>
                     </div>
 
+                    {/* Transform (spreadsheets only, when DataLab is enabled) */}
+                    {datalabOn && isSpreadsheetFile(file) && (
+                      <button
+                        onClick={() => setTransformFile(file)}
+                        className="shrink-0 flex items-center justify-center w-7 h-7 rounded-lg text-success
+                          hover:bg-success/10 opacity-0 group-hover:opacity-100 transition-all"
+                        title={`Transform ${file.filename} with AI`}
+                      >
+                        <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+                          <path d="M12 2l2.2 5.5L20 9l-5.8 1.5L12 16l-2.2-5.5L4 9l5.8-1.5z" />
+                        </svg>
+                      </button>
+                    )}
+
                     {/* Download */}
                     <button
                       onClick={() => handleDownload(file)}
@@ -344,6 +371,17 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
           </div>
         )}
       </div>
+
+      {transformFile && (
+        <DataLabModal
+          sessionId={sessionId}
+          file={transformFile}
+          onClose={() => setTransformFile(null)}
+          onTransformed={() => {
+            api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
+          }}
+        />
+      )}
 
       {showCommitModal && (
         <GitHubCommitModal

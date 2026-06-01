@@ -27,3 +27,6 @@ tree-sitter-typescript>=0.23.0
 pillow-heif>=0.16.0
 Pillow>=10.0.0
 pytest>=8.0.0
+# DataLab (spreadsheet/CSV lane) — pure-pip wheels, no system deps
+duckdb>=1.1.0
+charset-normalizer>=3.3.0

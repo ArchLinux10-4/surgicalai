@@ -399,6 +399,36 @@ export const api = {
       request<any>('/tasks/cancel-all', { method: 'POST', body: JSON.stringify({ session_id: sessionId, run_id: runId }) }),
   },
 
+  datalab: {
+    /** Feature flag — UI hides all spreadsheet affordances when false. */
+    enabled: () => request<{ enabled: boolean }>('/datalab/enabled'),
+    /** Run a natural-language transform. Resolves to {ok, file?, qa, sql?, attempts, trail}. */
+    transform: (sessionId: string, fileId: string, prompt: string) =>
+      request<any>(`/datalab/${sessionId}/transform`, {
+        method: 'POST',
+        body: JSON.stringify({ file_id: fileId, prompt }),
+      }),
+    versions: (sessionId: string, fileId: string) =>
+      request<any>(`/datalab/${sessionId}/versions/${fileId}`),
+    /** Download the real binary (xlsx/csv) for a spreadsheet file row. */
+    download: async (sessionId: string, fileId: string, filename: string) => {
+      const res = await fetch(`${BASE}/datalab/${sessionId}/download/${fileId}`, {
+        headers: { ...authHeaders() },
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }))
+        throw new Error(err.detail || `HTTP ${res.status}`)
+      }
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      a.click()
+      URL.revokeObjectURL(url)
+    },
+  },
+
   github: {
     status: () => request<any>('/github/status'),
     connect: (pat: string) => request<any>('/github/connect', { method: 'POST', body: JSON.stringify({ pat }) }),

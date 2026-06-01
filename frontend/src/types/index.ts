@@ -197,7 +197,7 @@ export interface SessionFile {
   updated_at?: string  // set on every code edit — always fresh
   content?: string  // only present when explicitly fetched
   file_type?: string  // 'code' | 'image' | 'pdf' | 'csv' | 'excel' | 'text'
-  origin?: 'uploaded' | 'created'  // 'created' = AI-generated net-new file
+  origin?: 'uploaded' | 'created' | 'edited'  // 'created' = AI-generated net-new file; 'edited' = transform output
   github_meta?: string  // JSON string with owner/repo/branch/path/sha
   github_pushed_at?: string  // timestamp of last push to GitHub
 }

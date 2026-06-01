@@ -8,7 +8,8 @@ import { useAppStore } from '../../stores/appStore'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import type { SessionFile } from '../../types'
-import { FileFilterTabs, NewBadge, matchesFileFilter, fileCounts, isCreatedFile } from '../../lib/fileClassify'
+import { FileFilterTabs, NewBadge, matchesFileFilter, fileCounts, isCreatedFile, isSpreadsheetFile } from '../../lib/fileClassify'
+import { DataLabModal } from '../DataLabModal'
 
 const EXT_COLORS: Record<string, string> = {
   ts: '#3178c6', tsx: '#3178c6', js: '#f7df1e', jsx: '#61dafb',
@@ -51,6 +52,13 @@ export function MobileFilesPanel() {
   const visibleFiles = sessionFiles.filter(f => matchesFileFilter(f, fileFilter))
   // Track which files have applied changes in DB (for AI-Edited badge accuracy)
   const [appliedFileIds, setAppliedFileIds] = useState<Set<string>>(new Set())
+  const [datalabOn, setDatalabOn] = useState(false)
+  const [transformFile, setTransformFile] = useState<SessionFile | null>(null)
+
+  // DataLab feature flag — gates spreadsheet affordances (parity with desktop).
+  useEffect(() => {
+    api.datalab.enabled().then(r => setDatalabOn(!!r?.enabled)).catch(() => setDatalabOn(false))
+  }, [])
 
   // Load applied change state from backend on mount / session change
   useEffect(() => {
@@ -84,14 +92,19 @@ export function MobileFilesPanel() {
     } catch { toast.error('Remove failed') }
   }
 
-  const downloadFile = async (fileId: string, filename: string) => {
+  const downloadFile = async (file: SessionFile) => {
     if (!activeSessions) return
     try {
-      const file = await api.sessionFiles.get(activeSessions, fileId)
-      const blob = new Blob([file.content], { type: 'text/plain' })
+      // Spreadsheets are binary — pull real bytes via the DataLab endpoint.
+      if (datalabOn && isSpreadsheetFile(file)) {
+        await api.datalab.download(activeSessions, file.id, file.filename)
+        return
+      }
+      const f = await api.sessionFiles.get(activeSessions, file.id)
+      const blob = new Blob([f.content], { type: 'text/plain' })
       const url  = URL.createObjectURL(blob)
       const a    = document.createElement('a')
-      a.href = url; a.download = filename; a.click()
+      a.href = url; a.download = file.filename; a.click()
       URL.revokeObjectURL(url)
     } catch { toast.error('Download failed') }
   }
@@ -179,7 +192,16 @@ export function MobileFilesPanel() {
                       </p>
                     </div>
                     <div className="flex items-center gap-1 flex-shrink-0">
-                      <button onClick={() => downloadFile(file.id, file.filename)}
+                      {datalabOn && isSpreadsheetFile(file) && (
+                        <button onClick={() => setTransformFile(file)}
+                          className="w-8 h-8 flex items-center justify-center rounded-lg text-success hover:bg-success/10 transition-colors"
+                          aria-label={`Transform ${file.filename} with AI`}>
+                          <svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor">
+                            <path d="M12 2l2.2 5.5L20 9l-5.8 1.5L12 16l-2.2-5.5L4 9l5.8-1.5z" />
+                          </svg>
+                        </button>
+                      )}
+                      <button onClick={() => downloadFile(file)}
                         className="w-8 h-8 flex items-center justify-center rounded-lg text-muted/50 hover:text-blue-400 hover:bg-blue-400/10 transition-colors">
                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
@@ -245,6 +267,17 @@ export function MobileFilesPanel() {
           Files are scoped to the current session · Download to save changes
         </p>
       </div>
+
+      {transformFile && activeSessions && (
+        <DataLabModal
+          sessionId={activeSessions}
+          file={transformFile}
+          onClose={() => setTransformFile(null)}
+          onTransformed={() => {
+            api.sessionFiles.list(activeSessions).then(setSessionFiles).catch(() => {})
+          }}
+        />
+      )}
     </div>
   )
 }

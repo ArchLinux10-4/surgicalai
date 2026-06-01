@@ -24,7 +24,15 @@ export function isCreatedFile(f: SessionFile): boolean {
 
 /** File whose content changed after it was first added (AI edit or re-upload). */
 export function isEditedFile(f: SessionFile): boolean {
+  if ((f as any).origin === 'edited') return true
   return !!(f.updated_at && f.updated_at !== f.created_at)
+}
+
+/** Spreadsheet/CSV file — eligible for the DataLab transform affordance. */
+export function isSpreadsheetFile(f: SessionFile): boolean {
+  const t = (f as any).file_type
+  if (t === 'csv' || t === 'excel') return true
+  return /\.(xlsx|xls|csv|tsv)$/i.test(f.filename || '')
 }
 
 /** The visual "kind" used for the leading glyph. Edited takes visual priority. */

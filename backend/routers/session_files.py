@@ -40,6 +40,30 @@ def _sanitize_for_postgres(s: str) -> str:
     return s
 
 
+def _maybe_store_datalab_bytes(session_id, file_id, filename, file_type, raw_bytes, mime=""):
+    """
+    DataLab fork: when the feature is ON and this is a spreadsheet/CSV, persist
+    the ORIGINAL bytes so the workbook can be round-tripped/edited later.
+    Best-effort and fully isolated — never raises into the upload path, and is a
+    complete no-op when the flag is off (zero behavior change).
+    """
+    try:
+        if file_type not in ("csv", "excel"):
+            return
+        from services.datalab.config import datalab_enabled
+        if not datalab_enabled():
+            return
+        if not raw_bytes:
+            return
+        from services.datalab import persist
+        persist.register_upload_artifact(
+            session_id=session_id, source_file_id=file_id,
+            filename=filename, raw=raw_bytes, mime=mime,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"[datalab] upload artifact store skipped: {type(e).__name__}: {e}")
+
+
 def _get_file_type(filename: str) -> str:
     ext = Path(filename).suffix.lower()
     if ext in IMAGE_EXTENSIONS:
@@ -340,6 +364,18 @@ def upload_session_file(session_id: str, body: dict):
     conn.commit()
     conn.close()
 
+    # DataLab fork (flag-gated, best-effort): keep the original spreadsheet bytes.
+    if file_type in ("csv", "excel"):
+        try:
+            if file_type == "excel":
+                _b = base64_data.split(",", 1)[1] if "," in base64_data else base64_data
+                _raw = base64.b64decode(_b) if _b else b""
+            else:
+                _raw = (raw_content or "").encode("utf-8", errors="replace")
+            _maybe_store_datalab_bytes(session_id, file_id, filename, file_type, _raw)
+        except Exception as _e:  # noqa: BLE001
+            logger.warning(f"[datalab] json upload byte capture skipped: {_e}")
+
     return {
         "id": file_id,
         "session_id": session_id,
@@ -443,6 +479,12 @@ async def upload_session_file_multipart(
 
     conn.commit()
     conn.close()
+
+    # DataLab fork (flag-gated, best-effort): keep the original spreadsheet bytes.
+    _maybe_store_datalab_bytes(
+        session_id, file_id, actual_filename, file_type, raw_bytes,
+        mime=(file.content_type or ""),
+    )
 
     return {
         "id": file_id,
