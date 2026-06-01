@@ -76,6 +76,7 @@ function FileCard({
   const [applying, setApplying]     = useState(false)
   const [undoing, setUndoing]       = useState(false)
   const [activeChange, setActive]   = useState(0)
+  const [confOpen, setConfOpen]     = useState(false)
   // Per-change applied state — keyed by change.id, same as InlineDiffCard
   const [appliedMap, setAppliedMap] = useState<Record<string, boolean>>({})
 
@@ -194,7 +195,7 @@ function FileCard({
               {changes.map((_: any, i: number) => (
                 <button
                   key={i}
-                  onClick={() => setActive(i)}
+                  onClick={() => { setActive(i); setConfOpen(false) }}
                   className={`px-2 py-1 rounded-lg text-[10px] border transition-colors ${
                     i === activeChange
                       ? 'bg-[rgba(74,222,128,0.12)] border-[rgba(74,222,128,0.35)] text-[#4ade80]'
@@ -212,6 +213,67 @@ function FileCard({
           {currentChange?.description && (
             <p className="text-[11px] text-muted/70 mt-2 mb-2">{currentChange.description}</p>
           )}
+
+          {/* Confidence chip + expandable detail (parity with desktop ConfidenceBadge) */}
+          {typeof currentChange?.confidence === 'number' && (() => {
+            const score: number = currentChange.confidence
+            const label = score >= 8 ? 'High' : score >= 6 ? 'Medium' : 'Low'
+            const chipColor =
+              score >= 8 ? 'bg-emerald-500/10 border-emerald-500/25 text-emerald-400' :
+              score >= 6 ? 'bg-amber-500/10 border-amber-500/25 text-amber-400'       :
+              'bg-red-500/10 border-red-500/25 text-red-400'
+            const meaning = score >= 8
+              ? 'High — the editor is confident this change is correct and complete.'
+              : score >= 6
+                ? 'Medium — the change looks right but a quick review is recommended before applying.'
+                : 'Low — review carefully before applying; the editor is not certain this is fully correct.'
+            const desc: string = (currentChange?.description || '').trim()
+            const notes: string[] = Array.isArray(currentChange?.surgeon_notes)
+              ? currentChange.surgeon_notes.filter(Boolean) : []
+            return (
+              <div className="mb-2">
+                <button
+                  onClick={() => setConfOpen(o => !o)}
+                  className={`w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg border text-[11px] ${chipColor}`}
+                >
+                  <span>🎯</span>
+                  <span className="flex-1 text-left font-medium">Confidence: {label}</span>
+                  <span className="font-medium">{score}/10</span>
+                  <span className={`transition-transform ${confOpen ? 'rotate-90' : ''}`}>▶</span>
+                </button>
+                {confOpen && (
+                  <div className="mt-1 px-2.5 py-2 rounded-lg border border-border bg-surface/60 max-h-[40vh] overflow-y-auto text-[11px]">
+                    <p className="text-muted mb-1.5">{meaning}</p>
+                    <p className="text-muted/70 italic mb-2">
+                      The editor's self-assessment of how certain it is about this specific edit —
+                      separate from the QA score below.
+                    </p>
+                    {desc && (
+                      <div className="mb-2">
+                        <span className="font-semibold text-ink block mb-0.5">Why this change</span>
+                        <p className="text-muted">{desc}</p>
+                      </div>
+                    )}
+                    {notes.length > 0 && (
+                      <div>
+                        <span className="font-semibold text-ink block mb-0.5">Editor notes</span>
+                        <ul className="space-y-1">
+                          {notes.map((n, i) => (
+                            <li key={i} className="flex gap-1.5 text-muted"><span>•</span><span>{n}</span></li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {score < 7 && (
+                      <p className="text-amber-400 mt-1.5">
+                        Below the auto-apply comfort threshold (7/10) — flagged for review.
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            )
+          })()}
 
           {/* QA badge */}
           {currentChange?.qa_result && (() => {

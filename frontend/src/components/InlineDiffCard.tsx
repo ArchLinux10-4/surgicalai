@@ -212,14 +212,106 @@ function BlastRadius({ change }: { change: any }) {
   )
 }
 
-function ConfidenceBadge({ score }: { score: number }) {
+function ConfidenceBadge({ change }: { change: any }) {
+  const [expanded, setExpanded] = useState(false)
+  const btnRef = useRef<HTMLButtonElement>(null)
+  const popupRef = useRef<HTMLDivElement>(null)
+  const [pos, setPos] = useState({ top: 0, left: 0 })
+
+  const score: number = typeof change?.confidence === 'number' ? change.confidence : 0
   const color = score >= 8 ? 'text-success bg-success/15 border-success/30'
     : score >= 6 ? 'text-warning bg-warning/15 border-warning/30'
     : 'text-danger bg-danger/15 border-danger/30'
   const label = score >= 8 ? 'High' : score >= 6 ? 'Medium' : 'Low'
+
+  const meaning = score >= 8
+    ? 'High — the editor is confident this change is correct and complete.'
+    : score >= 6
+      ? 'Medium — the change looks right but a quick review is recommended before applying.'
+      : 'Low — review carefully before applying; the editor is not certain this is fully correct.'
+
+  const description: string = (change?.description || '').trim()
+  const notes: string[] = Array.isArray(change?.surgeon_notes)
+    ? change.surgeon_notes.filter(Boolean)
+    : []
+
+  const handleToggle = () => {
+    if (!expanded && btnRef.current) {
+      const rect = btnRef.current.getBoundingClientRect()
+      const POPUP_W = 420
+      const MARGIN = 12
+      // Right-align popup with button's right edge; clamp so it never leaves viewport
+      const rawLeft = rect.right - POPUP_W
+      const clampedLeft = Math.min(rawLeft, window.innerWidth - POPUP_W - MARGIN)
+      const left = Math.max(MARGIN, clampedLeft)
+      setPos({ top: rect.bottom + 6, left })
+    }
+    setExpanded(e => !e)
+  }
+
+  useEffect(() => {
+    if (!expanded) return
+    const handler = (e: MouseEvent) => {
+      if (
+        btnRef.current && !btnRef.current.contains(e.target as Node) &&
+        popupRef.current && !popupRef.current.contains(e.target as Node)
+      ) setExpanded(false)
+    }
+    document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [expanded])
+
   return (
-    <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border ${color}`}>
-      {label} {score}/10
+    <span>
+      <button
+        ref={btnRef}
+        onClick={handleToggle}
+        className={`text-[11px] font-semibold px-2 py-0.5 rounded-full border cursor-pointer ${color}`}
+        title="How confident the editor is in this change — click for details"
+      >
+        {label} {score}/10
+      </button>
+      {expanded && createPortal(
+        <div
+          ref={popupRef}
+          style={{ position: 'fixed', top: pos.top, left: pos.left, zIndex: 9999, background: 'rgb(var(--c-surface))', width: 420, maxHeight: `calc(100vh - ${pos.top + 16}px)`, overflowY: 'scroll' }}
+          className="border border-border rounded-lg shadow-2xl p-4 text-[12px]"
+        >
+          <div className="flex items-center justify-between mb-2">
+            <span className="font-semibold text-ink">Confidence — {label} ({score}/10)</span>
+            <button onClick={() => setExpanded(false)} className="text-muted hover:text-ink">✕</button>
+          </div>
+          <p className="text-muted mb-2">{meaning}</p>
+          <p className="text-muted/80 mb-2 text-[11px] italic">
+            This is the AI editor's self-assessment of how certain it is that this specific edit is
+            correct and complete. It is separate from the QA score, which is an independent reviewer's verdict.
+          </p>
+          {description && (
+            <div className="mb-2">
+              <span className="font-semibold text-ink block mb-1">Why this change</span>
+              <p className="text-muted">{description}</p>
+            </div>
+          )}
+          {notes.length > 0 && (
+            <div className="mb-1">
+              <span className="font-semibold text-ink block mb-1">Editor notes</span>
+              <ul className="space-y-1">
+                {notes.map((n, i) => (
+                  <li key={i} className="flex gap-1.5 text-muted">
+                    <span>•</span><span>{n}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {score < 7 && (
+            <p className="text-warning mt-1 text-[11px]">
+              Below the auto-apply comfort threshold (7/10) — flagged for review.
+            </p>
+          )}
+        </div>,
+        document.body
+      )}
     </span>
   )
 }
@@ -773,7 +865,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                   <span className="text-muted/40 mx-0.5">/</span>
                   <span className="text-danger">-{removeCount}</span>
                 </span>
-                <ConfidenceBadge score={change.confidence} />
+                <ConfidenceBadge change={change} />
                 {change.qa_result && <QABadge qa={change.qa_result} />}
                 {change.qa_result && <BlastRadius change={{ qa: change.qa_result }} />}
                 {change.confidence < 7 && !isBlocked && (
