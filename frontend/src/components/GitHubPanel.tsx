@@ -204,19 +204,16 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
       toast.error('No active chat', 'Open or create a chat first')
       return
     }
-    // Get all files in the folder
+    // Send the folder path straight to the backend, which expands it
+    // recursively (including subdirectories) into the full file list.
     setLoadingTree(true)
     try {
-      const d: any = await (api as any).github.tree(selectedRepo.owner, selectedRepo.name, selectedBranch, folderPath)
-      const filePaths = (d.items || []).filter((i: TreeItem) => i.type === 'file').map((i: TreeItem) => i.path)
-      if (filePaths.length === 0) { toast.error('No files in folder'); return }
-      filePaths.forEach((p: string) => setLoadingFiles(f => new Set(f).add(p)))
       const result: any = await (api as any).github.load({
         session_id: activeSessions,
         owner: selectedRepo.owner,
         repo: selectedRepo.name,
         branch: selectedBranch,
-        paths: filePaths,
+        paths: [folderPath],
       })
       const updated: any[] = await (api as any).sessionFiles.list(activeSessions)
       setSessionFiles(updated)
@@ -224,7 +221,12 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
         const meta = f.github_meta ? JSON.parse(f.github_meta) : null
         if (meta?.path) setLoadedPaths(p => new Set(p).add(meta.path))
       })
-      toast.success(`${result.loaded?.length || 0} files loaded into chat`)
+      const n = result.loaded?.length || 0
+      if (n === 0) { toast.error('No files in folder'); return }
+      toast.success(`${n} file${n === 1 ? '' : 's'} loaded into chat${result.truncated ? ` (capped at ${n})` : ''}`)
+      if (result.errors?.length) {
+        toast.error('Some files failed', result.errors[0].error)
+      }
     } catch (e: any) {
       toast.error('Failed to load folder', e.message)
     } finally {
