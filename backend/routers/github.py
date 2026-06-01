@@ -184,6 +184,64 @@ class LoadFilesRequest(BaseModel):
     paths: List[str]
 
 
+# Directories skipped when recursively expanding a folder load — heavy build
+# artifacts and dependency trees that should never be pulled into a session.
+_SKIP_DIRS = {
+    "node_modules", ".git", "dist", "build", "out", "coverage",
+    ".next", ".nuxt", ".svelte-kit", ".turbo", ".parcel-cache",
+    "venv", ".venv", "env", "__pycache__", ".mypy_cache", ".pytest_cache",
+    ".cache", ".idea", ".vscode", "vendor", "target", ".gradle",
+}
+# Safety cap on how many files a single folder load can pull in.
+_MAX_FOLDER_FILES = 300
+
+
+def _expand_paths(repo, branch: str, paths: List[str]):
+    """Expand directory paths into their full recursive set of file paths.
+
+    Plain file paths pass through unchanged, so existing single-file loads
+    behave exactly as before. Returns (file_paths, truncated).
+    """
+    out: List[str] = []
+    seen = set()
+    truncated = False
+
+    def add(p: str):
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+
+    def walk(path: str):
+        nonlocal truncated
+        try:
+            contents = repo.get_contents(path, ref=branch)
+        except Exception:
+            # Unresolvable here — treat as a literal path; the load loop
+            # below will surface any real error for it.
+            add(path)
+            return
+        if not isinstance(contents, list):
+            add(contents.path)  # a single file
+            return
+        for item in contents:  # a directory listing
+            if len(out) >= _MAX_FOLDER_FILES:
+                truncated = True
+                return
+            if item.type == "dir":
+                if item.name in _SKIP_DIRS:
+                    continue
+                walk(item.path)
+            elif item.type == "file":
+                add(item.path)
+
+    for p in paths:
+        if len(out) >= _MAX_FOLDER_FILES:
+            truncated = True
+            break
+        walk(p)
+    return out, truncated
+
+
 @router.post("/load")
 def load_files(body: LoadFilesRequest, request: Request):
     user_id = _get_user_id(request)
@@ -205,10 +263,13 @@ def load_files(body: LoadFilesRequest, request: Request):
 
     try:
         r = g.get_repo(f"{body.owner}/{body.repo}")
+        # Expand any directory paths into their full recursive file list so
+        # that subdirectories are included, not just the top level.
+        file_paths, truncated = _expand_paths(r, body.branch, body.paths)
         loaded = []
         errors = []
 
-        for path in body.paths:
+        for path in file_paths:
             try:
                 content_file = r.get_contents(path, ref=body.branch)
                 raw = base64.b64decode(content_file.content).decode("utf-8", errors="replace")
@@ -266,7 +327,7 @@ def load_files(body: LoadFilesRequest, request: Request):
             except Exception as e:
                 errors.append({"path": path, "error": str(e)})
 
-        return {"loaded": loaded, "errors": errors}
+        return {"loaded": loaded, "errors": errors, "truncated": truncated}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
