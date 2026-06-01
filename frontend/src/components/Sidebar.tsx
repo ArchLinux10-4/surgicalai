@@ -8,7 +8,7 @@ import { ContextPanel } from './ContextPanel'
 import { GitHubPanel } from './GitHubPanel'
 import { LinearPanel } from './LinearPanel'
 import { useThemeStore } from '../stores/themeStore'
-import { Add, Bolt, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, PushPin, Search, Settings } from '@mui/icons-material';
+import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, PushPin, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile } from '../lib/fileClassify'
 
 // ── File icon helper ─────────────────────────────────────────────────────────
@@ -552,7 +552,7 @@ export function Sidebar() {
 
         {/* Logo mark */}
         <div className="mb-2 flex items-center justify-center w-8 h-8">
-          <Bolt sx={{ fontSize: 16 }} className="text-accent" />
+          <img src="/otter.png" alt="SurgicalAI" className="w-7 h-7 rounded-md" />
         </div>
 
         {/* Nav icons */}

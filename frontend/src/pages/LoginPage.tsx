@@ -184,21 +184,17 @@ const GitIcon = () => (
 function SurgicalLogo({ isSetup }: { isSetup: boolean }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 8 }}>
-      {/* < > icon */}
-      <div style={{
-        width: 44, height: 44, borderRadius: 12,
-        background: 'linear-gradient(135deg, #6d5ce6 0%, #4ade80 100%)',
-        display: 'flex', alignItems: 'center', justifyContent: 'center',
-        flexShrink: 0,
-        boxShadow: '0 4px 14px rgba(109,92,230,0.3)',
-      }}>
-        <span style={{
-          fontFamily: 'monospace', fontWeight: 900, fontSize: 16,
-          color: '#fff', letterSpacing: '-1px',
-        }}>
-          {'< >'}
-        </span>
-      </div>
+      {/* Otter mascot */}
+      <img
+        src="/otter.png"
+        alt="SurgicalAI"
+        width={44}
+        height={44}
+        style={{
+          width: 44, height: 44, borderRadius: 12, flexShrink: 0,
+          boxShadow: '0 4px 14px rgba(109,92,230,0.25)',
+        }}
+      />
       <div>
         <h1 style={{
           fontSize: 22, fontWeight: 700,
@@ -639,14 +635,13 @@ export function LoginPage() {
           >
             {/* Logo */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
-              <div style={{
-                padding: 8, borderRadius: 8,
-                background: 'rgba(74, 222, 128, 0.1)',
-                border: '1px solid rgba(74, 222, 128, 0.2)',
-                display: 'flex',
-              }}>
-                <TermIcon />
-              </div>
+              <img
+                src="/otter.png"
+                alt="SurgicalAI"
+                width={40}
+                height={40}
+                style={{ width: 40, height: 40, borderRadius: 8, flexShrink: 0 }}
+              />
               <div>
                 <h1 style={{
                   fontSize: 22, fontWeight: 700, fontFamily: 'monospace',

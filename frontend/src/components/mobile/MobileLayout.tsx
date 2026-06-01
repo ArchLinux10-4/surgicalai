@@ -237,10 +237,7 @@ export function MobileLayout() {
       >
         {/* Logo + current tab name */}
         <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-lg bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)]
-            flex items-center justify-center flex-shrink-0">
-            <span className="text-[#4ade80] text-[11px] font-bold">S</span>
-          </div>
+          <img src="/otter.png" alt="SurgicalAI" className="w-7 h-7 rounded-lg flex-shrink-0" />
           <div>
             <span className="text-[13px] font-semibold text-ink/80">SurgicalAI</span>
             <span className="text-muted/40 text-[12px] mx-1.5">·</span>

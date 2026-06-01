@@ -1153,16 +1153,7 @@ export function LandingPage() {
       {/* NAV */}
       <nav className="sai-nav">
         <a href="#" className="sai-nav-logo">
-          <svg viewBox="0 0 28 28" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <rect width="28" height="28" rx="8" fill="url(#sai-g1)"/>
-            <path d="M8 14 L13 9 L13 19" stroke="white" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
-            <path d="M15 9 L20 14 L15 19" stroke="rgba(255,255,255,0.5)" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"/>
-            <defs>
-              <linearGradient id="sai-g1" x1="0" y1="0" x2="28" y2="28" gradientUnits="userSpaceOnUse">
-                <stop stopColor="#6d5ce6"/><stop offset="1" stopColor="#0fa876"/>
-              </linearGradient>
-            </defs>
-          </svg>
+          <img src="/otter.png" alt="SurgicalAI" width={28} height={28} style={{ width: 28, height: 28, borderRadius: 8 }} />
           SurgicalAI
         </a>
         <ul className="sai-nav-links">
