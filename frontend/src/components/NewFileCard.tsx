@@ -160,7 +160,13 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
       )}
 
       {/* Code */}
-      <div className="relative">
+      <div
+        className="relative"
+        // When expanded, cap the height and scroll internally (ChatGPT/Claude-style)
+        // so even a 1,000-line file never dominates the page. Collapsed view only
+        // shows PREVIEW lines, so no cap is needed there.
+        style={!collapsed && isLong ? { maxHeight: '60vh', overflowY: 'auto' } : undefined}
+      >
         <SyntaxHighlighter
           language={lang}
           style={theme === 'dark' ? vscDarkPlus : oneLight}
