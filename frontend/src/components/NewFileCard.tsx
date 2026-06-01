@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react'
+import React, { useState, useRef, useCallback } from 'react'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { vscDarkPlus, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism'
 import { useThemeStore } from '../stores/themeStore'
@@ -46,7 +46,9 @@ interface SingleFileCardProps {
 
 function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps) {
   const theme = useThemeStore(s => s.theme)
-  const [collapsed, setCollapsed] = useState(index > 0) // first file expanded
+  // Collapsed by default for every file — keeps long files from blowing up scroll height
+  const [collapsed, setCollapsed] = useState(true)
+  const cardRef = useRef<HTMLDivElement>(null)
   const [saving, setSaving] = useState(false)
   const savedKey = `sai-added:${sessionId}:${file.filename}`
   const [saved, setSaved] = useState(() => localStorage.getItem(savedKey) === '1')
@@ -57,6 +59,7 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
   const colorClass = LANG_COLORS[lang] || 'text-muted bg-muted/10 border-muted/20'
   const lines = file.content.split('\n')
   const PREVIEW = 12
+  const isLong = lines.length > PREVIEW
   const displayCode = collapsed ? lines.slice(0, PREVIEW).join('\n') : file.content
 
   const handleSave = async () => {
@@ -105,7 +108,7 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
   }
 
   return (
-    <div className="rounded-xl overflow-hidden border border-border/60 bg-base shadow-sm">
+    <div ref={cardRef} className="rounded-xl overflow-hidden border border-border/60 bg-base shadow-sm">
 
       {/* Header */}
       <div className="flex items-center justify-between px-3.5 py-2.5 bg-surface/80 border-b border-border/60">
@@ -137,13 +140,15 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
           >
             <FileDownload sx={{ fontSize: 12 }} /><span>Download</span>
           </button>
-          <button
-            onClick={() => setCollapsed(c => !c)}
-            className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
-          >
-            {collapsed ? <KeyboardArrowDown sx={{ fontSize: 12 }} /> : <KeyboardArrowUp sx={{ fontSize: 12 }} />}
-            <span>{collapsed ? `Expand` : 'Collapse'}</span>
-          </button>
+          {isLong && (
+            <button
+              onClick={() => setCollapsed(c => !c)}
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-[11px] text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
+            >
+              {collapsed ? <KeyboardArrowDown sx={{ fontSize: 12 }} /> : <KeyboardArrowUp sx={{ fontSize: 12 }} />}
+              <span>{collapsed ? `Expand` : 'Collapse'}</span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -167,18 +172,32 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
           {displayCode}
         </SyntaxHighlighter>
 
-        {collapsed && lines.length > PREVIEW && (
+        {collapsed && isLong && (
           <div className="absolute bottom-0 left-0 right-0 h-14 bg-gradient-to-t from-base to-transparent pointer-events-none" />
         )}
       </div>
 
-      {collapsed && lines.length > PREVIEW && (
+      {/* Footer expand/collapse — symmetric control so long files can be collapsed
+          from the bottom without scrolling back up to the header (GitHub-style) */}
+      {isLong && (
         <button
-          onClick={() => setCollapsed(false)}
+          onClick={() => {
+            if (collapsed) {
+              setCollapsed(false)
+            } else {
+              setCollapsed(true)
+              // Bring the card header back into view so collapsing from the bottom
+              // never strands the user in empty space.
+              requestAnimationFrame(() => cardRef.current?.scrollIntoView({ block: 'nearest' }))
+            }
+          }}
           className="w-full py-2 text-[12px] text-muted hover:text-ink hover:bg-surface/60 transition-colors border-t border-border/60 flex items-center justify-center gap-1.5"
         >
-          <KeyboardArrowDown sx={{ fontSize: 13 }} />
-          Show {lines.length - PREVIEW} more lines
+          {collapsed ? (
+            <><KeyboardArrowDown sx={{ fontSize: 13 }} /> Show {lines.length - PREVIEW} more lines</>
+          ) : (
+            <><KeyboardArrowUp sx={{ fontSize: 13 }} /> Collapse</>
+          )}
         </button>
       )}
 

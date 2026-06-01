@@ -432,6 +432,13 @@ function NewFileMobileCard({ file, sessionId, onAdded }: { file: any; sessionId:
               ↓ Download
             </button>
           </div>
+          {/* Footer collapse — parity with desktop so the card can be closed from the bottom */}
+          <button
+            onClick={() => setExpanded(false)}
+            className="w-full mt-2 py-1.5 text-[11px] text-muted/70 hover:text-ink flex items-center justify-center gap-1 transition-colors"
+          >
+            ▲ Collapse
+          </button>
         </div>
       )}
     </div>
