@@ -36,6 +36,31 @@ _ASSET_EXTS = {".svg", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".ico", ".avif"
 # Packages the Sandpack react-ts template already provides — never list as deps.
 _PROVIDED = {"react", "react-dom", "react/jsx-runtime", "react-dom/client"}
 
+# Mandatory peer dependencies that the in-browser bundler will NOT auto-install.
+# When a key package is declared, its peers must be declared too or the package's
+# own internal code fails to resolve at runtime (e.g. @mui/icons-material's
+# createSvgIcon.mjs imports @mui/material). Keep this list conservative and
+# limited to peers that are genuinely required for the package to load at all.
+_PEER_DEPS: Dict[str, Tuple[str, ...]] = {
+    "@mui/icons-material": ("@mui/material", "@emotion/react", "@emotion/styled"),
+    "@mui/material": ("@emotion/react", "@emotion/styled"),
+    "@mui/lab": ("@mui/material", "@emotion/react", "@emotion/styled"),
+    "@mui/system": ("@emotion/react", "@emotion/styled"),
+    "@mui/x-data-grid": ("@mui/material", "@emotion/react", "@emotion/styled"),
+    "@mui/x-date-pickers": ("@mui/material", "@emotion/react", "@emotion/styled"),
+    "@emotion/styled": ("@emotion/react",),
+    "@mantine/core": ("@mantine/hooks",),
+}
+
+
+def expand_peer_deps(deps: Dict[str, str]) -> None:
+    """Add mandatory peer dependencies for any declared package, in place."""
+    # Snapshot keys first: we mutate `deps` while iterating.
+    for pkg in list(deps.keys()):
+        for peer in _PEER_DEPS.get(pkg, ()):  # noqa: B007
+            if peer not in _PROVIDED:
+                deps.setdefault(peer, "latest")
+
 # Safety caps so a pathological graph can never hang the request.
 _MAX_FILES = 80
 _MAX_DEPTH = 12
@@ -348,6 +373,8 @@ def build_bundle(
                 if target not in seen:
                     seen.add(target)
                     queue.append((target, depth + 1))
+
+    expand_peer_deps(deps)
 
     entry_code = out_files[entry_path]
     component = detect_component(entry_content)
