@@ -317,6 +317,13 @@ export const api = {
       request<any[]>(`/chat/${sessionId}/files`),
     get: (sessionId: string, fileId: string) =>
       request<any>(`/chat/${sessionId}/files/${fileId}`),
+    /** Resolve the full import graph (components + CSS + npm deps) for a live
+     *  preview. Pass `content` to preview an unsaved/modified version. */
+    previewBundle: (sessionId: string, fileId: string, content?: string) =>
+      request<any>(`/chat/${sessionId}/files/${fileId}/preview-bundle`, {
+        method: 'POST',
+        body: JSON.stringify(content != null ? { content } : {}),
+      }),
     update: (sessionId: string, fileId: string, content: string) =>
       request<any>(`/chat/${sessionId}/files/${fileId}`, { method: 'PUT', body: JSON.stringify({ content }) }),
     undo: (sessionId: string, fileId: string) =>

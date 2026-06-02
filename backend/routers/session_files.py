@@ -635,3 +635,65 @@ def preview_session_file(session_id: str, file_id: str):
         media_type=content_type,
         headers={"Access-Control-Allow-Origin": "*"},
     )
+
+
+# File types that are NOT source/style text and must never enter a preview graph.
+_NON_GRAPH_TYPES = {"image", "pdf", "csv", "excel"}
+
+
+@router.post("/{session_id}/files/{file_id}/preview-bundle")
+def preview_bundle(session_id: str, file_id: str, body: dict = None):
+    """Resolve the import graph for a TSX/JSX/TS/JS file across the session.
+
+    Returns a Sandpack-ready file map so the live preview renders with all of
+    its real local imports (components + CSS) instead of empty stubs, and with
+    every bare npm dependency declared so the bundler can install it.
+
+    Body (optional): {"content": "<exact source to preview>"}. When omitted, the
+    stored content is used. This lets the frontend preview the *modified* version
+    of a file without first persisting it.
+    """
+    body = body or {}
+    override = body.get("content")
+
+    conn = get_db()
+    target = conn.execute(
+        "SELECT filename, content, file_type FROM session_files WHERE id = ? AND session_id = ?",
+        (file_id, session_id),
+    ).fetchone()
+    if not target:
+        conn.close()
+        raise HTTPException(status_code=404, detail="File not found")
+
+    if hasattr(target, "__getitem__"):
+        filename = target["filename"]
+        stored = target["content"]
+    else:
+        filename, stored = target[0], target[1]
+
+    rows = conn.execute(
+        "SELECT filename, content, file_type FROM session_files WHERE session_id = ?",
+        (session_id,),
+    ).fetchall()
+    conn.close()
+
+    session_map = {}
+    for r in rows:
+        if hasattr(r, "__getitem__"):
+            fn, ct, ft = r["filename"], r["content"], r["file_type"]
+        else:
+            fn, ct, ft = r[0], r[1], r[2]
+        if (ft or "code") in _NON_GRAPH_TYPES:
+            continue
+        session_map[fn] = ct or ""
+
+    entry_content = override if isinstance(override, str) and override.strip() else (stored or "")
+
+    try:
+        from services.preview_bundle import build_bundle
+        bundle = build_bundle(filename, entry_content, session_map)
+    except Exception as e:  # noqa: BLE001 — degrade gracefully, never 500 the preview
+        logger.warning(f"[preview-bundle] resolver failed: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=422, detail=f"preview resolve failed: {e}")
+
+    return bundle

@@ -1,7 +1,8 @@
-import React, { useState, useCallback, Component } from 'react'
+import React, { useState, useCallback, useEffect, Component } from 'react'
 import { SandpackProvider, SandpackPreview } from '@codesandbox/sandpack-react'
 import { useThemeStore } from '../stores/themeStore'
 import { Fullscreen, FullscreenExit, Refresh } from '@mui/icons-material'
+import { api } from '../api/client'
 
 /* ─── Public API ───────────────────────────────────────────────── */
 export function isVisualFile(filename: string): boolean {
@@ -16,7 +17,18 @@ interface LivePreviewProps {
   fileId?: string
 }
 
-/* ─── Fix 6: Error boundary — shows compile errors instead of blank screen ── */
+/* The resolved import graph returned by the backend preview-bundle endpoint. */
+interface PreviewBundle {
+  entry: string
+  entryImport: string
+  files: Record<string, string>
+  dependencies: Record<string, string>
+  external: string[]
+  unresolved: string[]
+  component: string
+}
+
+/* ─── Error boundary — shows compile errors instead of a blank screen ── */
 interface EBState { error: string | null }
 class PreviewErrorBoundary extends Component<
   { children: React.ReactNode; onError?: (msg: string) => void },
@@ -45,7 +57,7 @@ class PreviewErrorBoundary extends Component<
   }
 }
 
-/* ─── Helpers ──────────────────────────────────────────────────── */
+/* ─── Fallback helpers (used only when no session graph is available) ───── */
 function detectComponent(code: string): string {
   return (
     code.match(/export\s+default\s+(?:function|class)\s+([A-Z]\w*)/)?.[1] ||
@@ -58,46 +70,29 @@ function detectComponent(code: string): string {
 
 function prepareCode(raw: string): string {
   let code = raw
-
-  // ── Fix 2: remove `import type` entirely — they're compile-time only ──────
-  // Must run BEFORE the relative-import stub so type imports don't get stubbed
   code = code.replace(
     /^import\s+type\s+.+?from\s+['"][^'"]+['"]\s*;?\s*$/gm,
     '// [type import removed for preview]'
   )
-
-  // ── Fix 1: remove bare CSS/asset side-effect imports (no 'from' clause) ───
-  // e.g. import './styles.css'  import '../../globals.css'  import './foo.svg'
   code = code.replace(
     /^import\s+['"]([^'"]+)['"]\s*;?\s*$/gm,
     (_, path) => `// [side-effect import removed: ${path}]`
   )
-
-  // ── Fix 3: stub @/ path alias imports (shadcn/ui, workspace aliases) ───────
-  // Treat @/... exactly like ./... — proxy stub
   code = code.replace(
     /^import\s+(.+?)\s+from\s+['"](@\/[^'"]+)['"]\s*;?\s*$/gm,
     (_, spec, path) => buildStub(spec, `@/ alias: ${path}`)
   )
-
-  // ── Original: stub relative imports (./foo, ../bar) ───────────────────────
   code = code.replace(
     /^import\s+(.+?)\s+from\s+['"](\.{1,2}[^'"]+)['"]\s*;?\s*$/gm,
     (_, spec, path) => buildStub(spec, path)
   )
-
-  // ── Fix 4: neutralise import.meta.env references ─────────────────────────
-  // Replace import.meta.env.FOO → (__import_meta_env__.FOO)
-  // and inject a safe empty object at the top
   if (/import\.meta\.env/.test(code)) {
     const envStub = `const __import_meta_env__ = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : {};\n`
     code = envStub + code.replace(/import\.meta\.env/g, '__import_meta_env__')
   }
-
   return code
 }
 
-/** Build a two-tier Proxy stub for a named import specifier string */
 function buildStub(spec: string, pathComment: string): string {
   const names = spec
     .replace(/\*\s+as\s+(\w+)/, '$1')
@@ -120,12 +115,28 @@ function buildStub(spec: string, pathComment: string): string {
   ).join('\n')
 }
 
+/* Base files always present in the Sandpack workspace. */
+const BASE_INDEX_CSS = [
+  '*, *::before, *::after { box-sizing: border-box; }',
+  'html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; }',
+  '#root { width: 100%; height: 100%; }',
+].join(' ')
+
+const BASE_DEPS: Record<string, string> = {
+  'lucide-react': 'latest',
+  'class-variance-authority': 'latest',
+  'clsx': 'latest',
+  'tailwind-merge': 'latest',
+}
+
 /* ─── Component ────────────────────────────────────────────────── */
 export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }: LivePreviewProps) {
   const { theme } = useThemeStore()
   const [expanded, setExpanded] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
   const [sandpackError, setSandpackError] = useState<string | null>(null)
+  const [bundle, setBundle] = useState<PreviewBundle | null>(null)
+  const [bundleLoading, setBundleLoading] = useState(false)
 
   const handleRefresh = useCallback(() => {
     setSandpackError(null)
@@ -136,6 +147,30 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
   const isHtml = /\.html?$/i.test(filename)
   const apiBase = (import.meta as any).env?.VITE_API_URL || ''
 
+  /* ── Resolve the full import graph from the session (components + CSS + deps) ── */
+  useEffect(() => {
+    if (isHtml || !sessionId || !fileId) {
+      setBundle(null)
+      return
+    }
+    let cancelled = false
+    setBundleLoading(true)
+    api.sessionFiles
+      .previewBundle(sessionId, fileId, src)
+      .then((b: PreviewBundle) => {
+        if (!cancelled) setBundle(b && b.files ? b : null)
+      })
+      .catch(() => {
+        if (!cancelled) setBundle(null) // graceful fall back to single-file mode
+      })
+      .finally(() => {
+        if (!cancelled) setBundleLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [isHtml, sessionId, fileId, src, refreshKey])
+
   const previewStyle: React.CSSProperties = expanded
     ? { flex: 1, minHeight: 0, width: '100%' }
     : { height: '440px', width: '100%' }
@@ -144,11 +179,29 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
     expanded ? ' fixed inset-4 z-50 bg-base' : ''
   }`
 
+  const resolvedCount = bundle ? Object.keys(bundle.files).length : 0
+  const unresolvedCount = bundle ? bundle.unresolved.length : 0
+
   const toolbar = (
     <div className="flex items-center justify-between px-3 py-1.5 bg-surface border-b border-border flex-shrink-0">
       <div className="flex items-center gap-2 min-w-0">
         <span className="text-[11px] text-muted font-mono truncate">👁 {filename}</span>
-        {/* Fix 6: show error indicator in toolbar */}
+        {resolvedCount > 1 && (
+          <span
+            className="text-[10px] text-accent/80 bg-accent/10 px-1.5 py-0.5 rounded flex-shrink-0"
+            title="Local files (components + CSS) resolved into this preview"
+          >
+            {resolvedCount} files
+          </span>
+        )}
+        {unresolvedCount > 0 && (
+          <span
+            className="text-[10px] text-amber-500 bg-amber-500/10 px-1.5 py-0.5 rounded flex-shrink-0"
+            title={`Imports not found in this session (stubbed): ${bundle?.unresolved.join(', ')}`}
+          >
+            {unresolvedCount} stubbed
+          </span>
+        )}
         {sandpackError && (
           <span className="text-[10px] text-red-400 bg-red-500/10 px-1.5 py-0.5 rounded flex-shrink-0">
             ⚠ error
@@ -207,13 +260,60 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
     )
   }
 
+  /* ── While the graph is resolving, hold the frame (avoids a flash of the
+        single-file fallback that then remounts as the full bundle). ── */
+  if (sessionId && fileId && bundleLoading && !bundle) {
+    return (
+      <div className={containerCls}>
+        {toolbar}
+        <div style={previewStyle} className="flex items-center justify-center bg-base">
+          <span className="text-[11px] text-muted animate-pulse">Resolving imports…</span>
+        </div>
+      </div>
+    )
+  }
+
   /* ── Option B: TSX/JSX via Sandpack ──────────────────────────── */
-  const componentName = detectComponent(src)
-  const hasDefault = /export\s+default\s+/.test(src)
-  const processedCode = prepareCode(src)
-  const appCode = hasDefault
-    ? processedCode
-    : `${processedCode}\nexport default ${componentName}`
+  let sandpackFiles: Record<string, string>
+  let sandpackDeps: Record<string, string>
+
+  if (bundle && bundle.files) {
+    // Full module graph: real components + CSS + declared npm deps.
+    const harness = [
+      "import React from 'react';",
+      "import { createRoot } from 'react-dom/client';",
+      "import './index.css';",
+      `import App from '${bundle.entryImport}';`,
+      "createRoot(document.getElementById('root')!).render(<App />);",
+    ].join('\n')
+    sandpackFiles = {
+      ...bundle.files,
+      '/index.css': BASE_INDEX_CSS,
+      '/index.tsx': harness,
+    }
+    sandpackDeps = { ...BASE_DEPS, ...(bundle.dependencies || {}) }
+  } else {
+    // Fallback: single-file stub mode (no session context available).
+    const componentName = detectComponent(src)
+    const hasDefault = /export\s+default\s+/.test(src)
+    const processedCode = prepareCode(src)
+    const appCode = hasDefault ? processedCode : `${processedCode}\nexport default ${componentName}`
+    sandpackFiles = {
+      '/App.tsx': appCode,
+      '/index.css': BASE_INDEX_CSS,
+      '/index.tsx': [
+        "import React from 'react';",
+        "import { createRoot } from 'react-dom/client';",
+        "import './index.css';",
+        "import App from './App';",
+        "createRoot(document.getElementById('root')!).render(<App />);",
+      ].join('\n'),
+    }
+    sandpackDeps = BASE_DEPS
+  }
+
+  // Re-mount Sandpack whenever the file set or refresh key changes.
+  const sandpackKey = `${refreshKey}-${bundle ? 'graph' : 'single'}-${Object.keys(sandpackFiles).length}`
 
   return (
     <div className={containerCls}>
@@ -221,39 +321,16 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
       <div style={previewStyle}>
         <PreviewErrorBoundary onError={setSandpackError}>
           <SandpackProvider
-            key={refreshKey}
+            key={sandpackKey}
             template="react-ts"
             style={{ height: '100%', width: '100%' }}
-            files={{
-              '/App.tsx': appCode,
-              '/index.css': [
-                '*, *::before, *::after { box-sizing: border-box; }',
-                'html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; }',
-                '#root { width: 100%; height: 100%; }',
-              ].join(' '),
-              '/index.tsx': [
-                "import React from 'react';",
-                "import { createRoot } from 'react-dom/client';",
-                "import './index.css';",
-                "import App from './App';",
-                "createRoot(document.getElementById('root')!).render(<App />);",
-              ].join('\n'),
-            }}
+            files={sandpackFiles}
             theme={theme === 'dark' ? 'dark' : 'light'}
-            customSetup={{
-              dependencies: {
-                'lucide-react': 'latest',
-                'class-variance-authority': 'latest',
-                'clsx': 'latest',
-                'tailwind-merge': 'latest',
-              },
-            }}
+            customSetup={{ dependencies: sandpackDeps }}
             options={{
-              // Fix 5: load Tailwind synchronously before first paint so
-              // styles are present on the initial render, not a frame late
-              externalResources: [
-                'https://cdn.tailwindcss.com/3.4.1',
-              ],
+              // Load Tailwind synchronously before first paint so utility
+              // classes are present on the initial render, not a frame late.
+              externalResources: ['https://cdn.tailwindcss.com/3.4.1'],
             }}
           >
             <SandpackPreview
