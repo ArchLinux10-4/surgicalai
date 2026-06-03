@@ -7291,7 +7291,10 @@ async def run_natural_pipeline_stream(
 
         stream_kwargs = {
             "model": arch_model,
-            "max_tokens": 16000,
+            # Raised from 16000: large multi-file edits (e.g. a full folder loaded
+            # from GitHub) were exhausting the output budget mid-edit-block, which
+            # truncated the response and silently dropped every drafted edit.
+            "max_tokens": 32000,
             "system": system_prompt,
             "messages": messages,
         }
@@ -7307,6 +7310,11 @@ async def run_natural_pipeline_stream(
         new_file_blocks_raw: list = []
         full_response = ""
         in_thinking = False
+        # Set when the architect response is cut off (max_tokens) or a tag block
+        # is still open when the stream ends — used to record an honest skip
+        # reason + surface an accurate "response was cut off" message instead of
+        # a misleading "could not be matched to the current code".
+        _arch_truncated = False
 
         # Build the per-file content lookup once (reused across search rounds)
         file_content_lookup_stream: dict = {
@@ -7453,6 +7461,17 @@ async def run_natural_pipeline_stream(
                                     yield sse({"type": "thinking_end", "content": ""})
                                     in_thinking = False
 
+                        # Detect a hard output-budget cutoff (truncation) so we can
+                        # record an honest skip reason and an accurate user message
+                        # rather than silently dropping a half-written edit block.
+                        if search_requested is None:
+                            try:
+                                _final_msg = await astream.get_final_message()
+                                if getattr(_final_msg, "stop_reason", None) == "max_tokens":
+                                    _arch_truncated = True
+                            except Exception:
+                                pass
+
                         # If a search was requested mid-stream, break out of the event loop
                         if search_requested is not None:
                             break
@@ -7563,9 +7582,13 @@ async def run_natural_pipeline_stream(
         if in_thinking:
             yield sse({"type": "thinking_end", "content": ""})
         if state == "in_edit" and edit_buf.strip():
+            # An edit tag was still open when the stream ended — the block is
+            # incomplete, which means the response was cut off mid-edit.
+            _arch_truncated = True
             edit_blocks_raw.append(edit_buf)
             yield sse({"type": "edit_end", "content": ""})
         elif state == "in_file" and file_buf.strip():
+            _arch_truncated = True
             new_file_blocks_raw.append(file_buf)
             yield sse({"type": "edit_end", "content": ""})
 
@@ -7613,6 +7636,23 @@ async def run_natural_pipeline_stream(
                     try:
                         edit_data = json.loads(_repair_json(edit_raw.strip()))
                     except Exception:
+                        # An edit block could not be parsed. Previously this was a
+                        # silent `continue`, so a truncated/garbled block vanished
+                        # with zero telemetry and the user got a misleading
+                        # "could not be matched" message. Record it instead.
+                        _reason = "edit_block_truncated" if _arch_truncated else "edit_block_malformed"
+                        _snippet = (edit_raw or "").strip()[:80]
+                        skipped_messages.append(
+                            "An edit was cut off before it finished"
+                            if _reason == "edit_block_truncated"
+                            else "An edit block was malformed and could not be read"
+                            + (f" (starts with `{_snippet}...`)" if _snippet else "")
+                        )
+                        skipped_changes_struct.append({
+                            "filename": "", "symbol": "", "reason": _reason,
+                        })
+                        print(f"[NATURAL] dropped unparseable edit block "
+                              f"(reason={_reason}, len={len(edit_raw or '')}, truncated={_arch_truncated})")
                         continue
 
                 filename = edit_data.get("filename", "")
@@ -7622,6 +7662,22 @@ async def run_natural_pipeline_stream(
                 old_code = edit_data.get("old_code", "")  # SNIPPET / targeted edit
 
                 if not filename or not symbol_name or not new_code:
+                    # Required field missing. Previously a silent `continue`; now
+                    # recorded so the failure is visible and the user message is honest.
+                    _missing = [k for k, v in (("filename", filename),
+                                               ("symbol", symbol_name),
+                                               ("new_code", new_code)) if not v]
+                    _reason = "edit_block_truncated" if _arch_truncated else "edit_block_incomplete"
+                    skipped_messages.append(
+                        "An edit was cut off before it finished"
+                        if _reason == "edit_block_truncated"
+                        else f"An edit was missing required field(s): {', '.join(_missing)}"
+                    )
+                    skipped_changes_struct.append({
+                        "filename": filename or "", "symbol": symbol_name or "", "reason": _reason,
+                    })
+                    print(f"[NATURAL] dropped incomplete edit block "
+                          f"(missing={_missing}, truncated={_arch_truncated})")
                     continue
 
                 file_content = file_content_lookup.get(filename, "")
@@ -8517,15 +8573,23 @@ async def run_natural_pipeline_stream(
             if edit_blocks_raw or new_file_blocks_raw:
                 _attempted = len(edit_blocks_raw) + len(new_file_blocks_raw)
                 _reasons = skipped_messages or [
+                    "The response was cut off before the edits finished."
+                    if _arch_truncated else
                     "The proposed edits could not be matched to the current code."
                 ]
                 _detail = "\n".join(f"• {m}" for m in _reasons[:10])
                 _plural = "them" if _attempted > 1 else "it"
-                _msg = (
-                    f"I drafted {_attempted} change(s) but couldn't safely apply {_plural} to "
-                    f"the current code, so nothing was shipped:\n\n{_detail}\n\n"
+                _tail = (
+                    "My response was cut off before the edits were complete, which usually "
+                    "happens when a request spans a lot of code at once. Point me at the specific "
+                    "file or area you want changed and I'll complete it."
+                    if _arch_truncated else
                     "This usually means the target spot moved or the file is large enough that I "
                     "need another pass. Tell me the specific area to focus on and I'll re-target it."
+                )
+                _msg = (
+                    f"I drafted {_attempted} change(s) but couldn't safely apply {_plural} to "
+                    f"the current code, so nothing was shipped:\n\n{_detail}\n\n" + _tail
                 )
                 _fail_result = {
                     "intent": "edit",

@@ -1037,16 +1037,42 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
         <div className="mt-2 flex items-start gap-2 px-3 py-2 bg-surface/60 border border-border/50 rounded-lg">
           <SkipNext sx={{ fontSize: 13 }} className="text-muted/60 mt-0.5 flex-shrink-0" />
           <div className="text-[12px] text-muted/80">
-            <strong className="text-ink/60">Skipped {result.skipped_changes.length} symbol{result.skipped_changes.length !== 1 ? 's' : ''}:</strong>{' '}
-            {result.skipped_changes.map((s: any, i: number) => (
-              <span key={i}>
-                <code className="text-[11px] text-accent/70">{s.symbol}</code>
-                {s.reason === 'already_matches'
-                  ? ' — code already matches'
-                  : ' — no visible diff produced'}
-                {i < (result.skipped_changes?.length ?? 0) - 1 ? '; ' : ''}
-              </span>
-            ))}
+            <strong className="text-ink/60">Skipped {result.skipped_changes.length} change{result.skipped_changes.length !== 1 ? 's' : ''}:</strong>{' '}
+            {result.skipped_changes.map((s: any, i: number) => {
+              // Map each reason code to accurate, plain-language text. Previously
+              // every reason except "already_matches" rendered as "no visible diff
+              // produced", which masked the real cause (truncation, missing target,
+              // QA block, etc.).
+              const reasonMap: Record<string, string> = {
+                already_matches: 'code already matches',
+                no_visible_diff: 'no visible diff produced',
+                symbol_not_found: 'target not found',
+                edit_anchor_unmatched: "couldn't anchor the edit",
+                file_not_in_session: 'file not loaded',
+                correction_failed: 'could not resolve target',
+                edit_block_truncated: 'response was cut off',
+                edit_block_malformed: 'malformed edit',
+                edit_block_incomplete: 'incomplete edit',
+                unresolved: 'could not be applied',
+              }
+              const rawReason = String(s.reason ?? '')
+              const reasonText =
+                reasonMap[rawReason] ??
+                (rawReason.startsWith('QA gate') ? 'blocked by QA gate' : 'could not be applied')
+              return (
+                <span key={i}>
+                  {s.symbol ? (
+                    <>
+                      <code className="text-[11px] text-accent/70">{s.symbol}</code>
+                      {` — ${reasonText}`}
+                    </>
+                  ) : (
+                    reasonText
+                  )}
+                  {i < (result.skipped_changes?.length ?? 0) - 1 ? '; ' : ''}
+                </span>
+              )
+            })}
           </div>
         </div>
       )}
