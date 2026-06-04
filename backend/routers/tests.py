@@ -93,11 +93,18 @@ async def run_tests(body: dict, request: Request):
         raise HTTPException(status_code=400, detail="session_id required")
 
     # ── Load session files from DB ──
-    with get_db_connection() as conn:
+    # NOTE: get_db_connection() returns a CompatConn on Postgres which does NOT
+    # implement the context-manager protocol. Use the explicit open/close
+    # pattern (matching the detect endpoint below) so this works on both the
+    # SQLite dev backend and the Postgres production backend.
+    conn = get_db_connection()
+    try:
         rows = conn.execute(
             "SELECT filename, content FROM session_files WHERE session_id = ? ORDER BY filename",
             (session_id,),
         ).fetchall()
+    finally:
+        conn.close()
 
     if not rows:
         raise HTTPException(status_code=404, detail="No files found in this session")
