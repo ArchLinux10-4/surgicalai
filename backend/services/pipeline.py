@@ -6095,6 +6095,17 @@ USER REQUEST:
                     "symbol": c.symbol.full_path if c.symbol else "unknown",
                     "reason": reason,
                 })
+                _dlog("ghost_diff_suppressed",
+                      session_id=session_id,
+                      user_id=user_id,
+                      filename=fname,
+                      symbol=c.symbol.full_path if c.symbol else "unknown",
+                      reason=reason,
+                      original_code=c.original_code,
+                      original_code_len=len(c.original_code),
+                      new_code=c.new_code,
+                      new_code_len=len(c.new_code),
+                      codes_identical=c.original_code.rstrip() == c.new_code.rstrip())
             if not real_changes:
                 del changes_by_file[fname]
             else:
@@ -7221,7 +7232,7 @@ async def run_natural_pipeline_stream(
               num_files=len(session_files),
               filenames=[sf["filename"] for sf in session_files],
               context_chars=len(file_context),
-              context_preview=file_context[:2000],
+              context_preview=file_context,
                   user_id=user_id)
 
         # ── Build system prompt (with Anthropic prompt caching) ───────────
@@ -7581,7 +7592,7 @@ async def run_natural_pipeline_stream(
                       session_id=session_id,
                       terms=new_terms,
                       results_chars=len(search_results),
-                      results_preview=search_results[:3000],
+                      results_preview=search_results,
                           user_id=user_id)
 
                 # On the last permitted search round, add a strong write-now warning
@@ -7646,7 +7657,7 @@ async def run_natural_pipeline_stream(
         _dlog("edit_blocks_collected",
               session_id=session_id,
               count=len(pending_edits),
-              blocks=[b[:800] for b in pending_edits],
+              blocks=pending_edits,
                   user_id=user_id)
         resolved_edits: list = []
         skipped_messages: list = []
@@ -7724,8 +7735,10 @@ async def run_natural_pipeline_stream(
                                   filename=filename,
                                   symbol=symbol_name,
                                   reason=snip_reason,
-                                  old_code_sent=old_code[:1000],
-                                  symbol_code_actual=_accum_base[:1000],
+                                  old_code_sent=old_code,
+                                  old_code_len=len(old_code),
+                                  symbol_code_actual=_accum_base,
+                                  symbol_code_len=len(_accum_base),
                                       user_id=user_id)
                             still_unresolved.append({
                                 "filename": filename,
@@ -7824,7 +7837,7 @@ async def run_natural_pipeline_stream(
                   resolve_round=resolve_round,
                   unresolved_count=len(still_unresolved),
                   unresolved=[{"f": x.get("filename"), "s": x.get("symbol"), "reason": x.get("_snippet_reason")} for x in still_unresolved],
-                  correction_prompt=correction_text[:3000],
+                  correction_prompt=correction_text,
                       user_id=user_id)
             correction_msgs = messages + [
                 {"role": "assistant", "content": full_response or "(analyzing code...)"},
@@ -7853,7 +7866,7 @@ async def run_natural_pipeline_stream(
                       session_id=session_id,
                       resolve_round=resolve_round,
                       response_chars=len(corr_text),
-                      response_preview=corr_text[:3000],
+                      response_preview=corr_text,
                           user_id=user_id)
 
                 # Extract new edit blocks from correction response
