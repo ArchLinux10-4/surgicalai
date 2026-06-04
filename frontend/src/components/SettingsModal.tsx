@@ -5,9 +5,9 @@ import { toast } from '../lib/toast'
 import { AdminUsersPanel } from './AdminUsersPanel'
 import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
-import { CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
+import { BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
-type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'security'
+type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'security' | 'debug'
 
 const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'api',       icon: <VpnKey sx={{ fontSize: 14 }} />,       label: 'API Keys' },
@@ -17,10 +17,12 @@ const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'editor',    icon: <Code sx={{ fontSize: 14 }} />,       label: 'Editor' },
   { id: 'users',     icon: <Group sx={{ fontSize: 14 }} />,      label: 'Users' },
   { id: 'security',  icon: <Lock sx={{ fontSize: 14 }} />,       label: 'Security' },
+  { id: 'debug',     icon: <BugReport sx={{ fontSize: 14 }} />,   label: 'Debug Logs' },
 ]
 
 export function SettingsModal() {
   const { settingsOpen, setSettingsOpen, settings, setSettings } = useAppStore()
+  const { user } = useAuthStore()
   const [tab, setTab] = useState<Tab>('api')
   const [apiKey, setApiKey] = useState('')
   const [showKey, setShowKey] = useState(false)
@@ -270,7 +272,7 @@ export function SettingsModal() {
           <div className="w-36 flex-shrink-0 border-r border-border py-2
             max-sm:w-full max-sm:border-r-0 max-sm:border-b max-sm:border-border max-sm:py-0
             max-sm:flex max-sm:flex-row max-sm:overflow-x-auto max-sm:flex-shrink-0">
-            {TABS.map(({ id, icon, label }) => (
+            {TABS.filter(t => t.id !== 'debug' || user?.is_admin).map(({ id, icon, label }) => (
               <button
                 key={id}
                 onClick={() => setTab(id)}
@@ -628,6 +630,9 @@ export function SettingsModal() {
               </div>
             )}
 
+            {tab === 'debug' && (
+              <DebugLogsPanel />
+            )}
             {tab === 'security' && (
               <SecurityPanel
                 pwCurrent={pwCurrent} setPwCurrent={setPwCurrent}
@@ -651,7 +656,7 @@ export function SettingsModal() {
         {/* Footer */}
         <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-border flex-shrink-0">
           <button onClick={() => setSettingsOpen(false)} className="btn-ghost border border-border px-5 py-2 text-sm">Cancel</button>
-          {tab !== 'users' && tab !== 'security' && <button onClick={handleSave} className="btn-primary px-6">Save Settings</button>}
+          {tab !== 'users' && tab !== 'security' && tab !== 'debug' && <button onClick={handleSave} className="btn-primary px-6">Save Settings</button>}
         </div>
       </div>
     </div>
@@ -832,5 +837,189 @@ function Select({ value, onChange, options }: { value: string; onChange: (v: str
     >
       {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
     </select>
+  )
+}
+
+
+// ── Debug Logs Panel ──────────────────────────────────────────────────────────
+// Admin-only tab: live view, download, and clear pipeline debug logs.
+
+interface LogEvent {
+  ts: string
+  event: string
+  session_id?: string
+  [key: string]: any
+}
+
+const EVENT_COLORS: Record<string, string> = {
+  file_context_built:        'text-blue-400',
+  search_requested:          'text-yellow-400',
+  search_results_returned:   'text-green-400',
+  edit_blocks_collected:     'text-purple-400',
+  snippet_apply_failed:      'text-red-400',
+  correction_prompt_sent:    'text-orange-400',
+  correction_response:       'text-cyan-400',
+}
+
+function DebugLogsPanel() {
+  const [events, setEvents] = useState<LogEvent[]>([])
+  const [loading, setLoading] = useState(false)
+  const [expanded, setExpanded] = useState<number | null>(null)
+  const [filter, setFilter] = useState<string>('all')
+  const [autoRefresh, setAutoRefresh] = useState(false)
+  const [sessionFilter, setSessionFilter] = useState('')
+  const [userFilter, setUserFilter] = useState('')
+  const [totalCount, setTotalCount] = useState(0)
+  const [filteredCount, setFilteredCount] = useState(0)
+  const { token } = useAuthStore()
+
+  const BASE = import.meta.env.VITE_API_URL || ''
+
+  const fetchLogs = async () => {
+    setLoading(true)
+    try {
+      const params = new URLSearchParams({ last: '500' })
+      if (sessionFilter.trim()) params.set('session_id', sessionFilter.trim())
+      if (userFilter.trim()) params.set('user_id', userFilter.trim())
+      const res = await fetch(`${BASE}/api/debug/pipeline-log?${params}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (!res.ok) throw new Error(`${res.status}`)
+      const data = await res.json()
+      setEvents((data.events || []).slice().reverse()) // newest first
+      setTotalCount(data.total ?? 0)
+      setFilteredCount(data.filtered ?? 0)
+    } catch (e: any) {
+      toast.error('Could not load debug logs', e.message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const clearLogs = async () => {
+    try {
+      await fetch(`${BASE}/api/debug/pipeline-log`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      setEvents([])
+      toast.success('Debug log cleared')
+    } catch (e: any) {
+      toast.error('Clear failed', e.message)
+    }
+  }
+
+  const downloadLogs = () => {
+    const params = new URLSearchParams()
+    if (sessionFilter.trim()) params.set('session_id', sessionFilter.trim())
+    if (userFilter.trim()) params.set('user_id', userFilter.trim())
+    const qs = params.toString()
+    window.open(`${BASE}/api/debug/pipeline-log/download${qs ? '?' + qs : ''}`, '_blank')
+  }
+
+  useEffect(() => { fetchLogs() }, [])
+
+  useEffect(() => {
+    if (!autoRefresh) return
+    const id = setInterval(fetchLogs, 5000)
+    return () => clearInterval(id)
+  }, [autoRefresh])
+
+  const eventTypes = ['all', ...Array.from(new Set(events.map(e => e.event)))]
+  const visible = filter === 'all' ? events : events.filter(e => e.event === filter)
+
+  return (
+    <div className="flex flex-col h-full gap-4">
+      {/* Filter inputs */}
+      <div className="flex gap-2 flex-wrap">
+        <input
+          type="text" value={sessionFilter} onChange={e => setSessionFilter(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && fetchLogs()}
+          placeholder="Filter by session ID…"
+          className="flex-1 min-w-[180px] bg-overlay border border-border rounded-lg px-3 py-1.5 text-xs text-ink placeholder:text-faint focus:outline-none focus:border-accent"
+        />
+        <input
+          type="text" value={userFilter} onChange={e => setUserFilter(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && fetchLogs()}
+          placeholder="Filter by user ID…"
+          className="flex-1 min-w-[140px] bg-overlay border border-border rounded-lg px-3 py-1.5 text-xs text-ink placeholder:text-faint focus:outline-none focus:border-accent"
+        />
+        <button onClick={fetchLogs} disabled={loading}
+          className="btn-primary px-3 py-1.5 text-xs rounded-lg disabled:opacity-50">
+          {loading ? '…' : 'Search'}
+        </button>
+      </div>
+
+      {/* Header row */}
+      <div className="flex items-center gap-2 flex-wrap">
+        <button onClick={fetchLogs} disabled={loading}
+          className="btn-ghost border border-border px-3 py-1.5 text-xs rounded-lg disabled:opacity-50">
+          {loading ? 'Loading…' : '↻ Refresh'}
+        </button>
+        <button onClick={() => setAutoRefresh(v => !v)}
+          className={`border px-3 py-1.5 text-xs rounded-lg transition-colors ${autoRefresh ? 'bg-accent/20 border-accent text-accent' : 'btn-ghost border-border'}`}>
+          {autoRefresh ? '● Live (5s)' : 'Auto-refresh off'}
+        </button>
+        <button onClick={downloadLogs}
+          className="btn-ghost border border-border px-3 py-1.5 text-xs rounded-lg">
+          ⬇ Download JSONL
+        </button>
+        <button onClick={clearLogs}
+          className="btn-ghost border border-red-500/40 text-red-400 px-3 py-1.5 text-xs rounded-lg hover:bg-red-500/10">
+          🗑 Clear
+        </button>
+        <span className="text-xs text-muted ml-auto">
+          {totalCount > 0 && <span className="text-faint mr-1">{filteredCount}/{totalCount} total</span>}
+          {events.length} shown
+        </span>
+      </div>
+
+      {/* Filter chips */}
+      <div className="flex gap-1.5 flex-wrap">
+        {eventTypes.map(t => (
+          <button key={t} onClick={() => setFilter(t)}
+            className={`px-2.5 py-0.5 rounded-full text-[11px] font-medium border transition-colors ${
+              filter === t
+                ? 'bg-accent text-white border-accent'
+                : 'border-border text-muted hover:text-ink hover:border-ink/30'
+            }`}>
+            {t}
+          </button>
+        ))}
+      </div>
+
+      {/* Log list */}
+      <div className="flex-1 overflow-y-auto flex flex-col gap-1.5 min-h-0 font-mono text-xs">
+        {visible.length === 0 && (
+          <div className="text-muted text-center py-12">
+            {loading ? 'Loading…' : 'No log events yet. Run a pipeline edit to see debug output here.'}
+          </div>
+        )}
+        {visible.map((ev, i) => {
+          const color = EVENT_COLORS[ev.event] || 'text-ink'
+          const isOpen = expanded === i
+          const { ts, event, ...rest } = ev
+          return (
+            <div key={i}
+              onClick={() => setExpanded(isOpen ? null : i)}
+              className="bg-overlay border border-edge rounded-lg px-3 py-2 cursor-pointer hover:border-accent/40 transition-colors">
+              <div className="flex items-center gap-2">
+                <span className="text-faint text-[10px] shrink-0">{new Date(ts).toLocaleTimeString()}</span>
+                <span className={`font-semibold shrink-0 ${color}`}>{event}</span>
+                {ev.session_id && (
+                  <span className="text-faint text-[10px] truncate">{ev.session_id.slice(0, 8)}…</span>
+                )}
+                <span className="ml-auto text-faint text-[10px]">{isOpen ? '▲' : '▼'}</span>
+              </div>
+              {isOpen && (
+                <pre className="mt-2 text-[10px] text-ink/80 whitespace-pre-wrap break-all max-h-64 overflow-y-auto bg-surface rounded p-2 border border-edge">
+                  {JSON.stringify(rest, null, 2)}
+                </pre>
+              )}
+            </div>
+          )
+        })}
+      </div>
+    </div>
   )
 }

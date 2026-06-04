@@ -7221,7 +7221,8 @@ async def run_natural_pipeline_stream(
               num_files=len(session_files),
               filenames=[sf["filename"] for sf in session_files],
               context_chars=len(file_context),
-              context_preview=file_context[:2000])
+              context_preview=file_context[:2000],
+                  user_id=user_id)
 
         # ── Build system prompt (with Anthropic prompt caching) ───────────
         # This system prompt is re-sent on every Claude call in the natural
@@ -7526,7 +7527,8 @@ async def run_natural_pipeline_stream(
                       session_id=session_id,
                       round=search_round,
                       terms=raw_terms,
-                      reason=reason)
+                      reason=reason,
+                          user_id=user_id)
 
                 # Budget exhausted — do one forced-edit round, then stop
                 if search_round >= MAX_SEARCH_ROUNDS or _forced_edit_round_done:
@@ -7579,7 +7581,8 @@ async def run_natural_pipeline_stream(
                       session_id=session_id,
                       terms=new_terms,
                       results_chars=len(search_results),
-                      results_preview=search_results[:3000])
+                      results_preview=search_results[:3000],
+                          user_id=user_id)
 
                 # On the last permitted search round, add a strong write-now warning
                 is_last_search_round = (search_round == MAX_SEARCH_ROUNDS - 1)
@@ -7643,7 +7646,8 @@ async def run_natural_pipeline_stream(
         _dlog("edit_blocks_collected",
               session_id=session_id,
               count=len(pending_edits),
-              blocks=[b[:800] for b in pending_edits])
+              blocks=[b[:800] for b in pending_edits],
+                  user_id=user_id)
         resolved_edits: list = []
         skipped_messages: list = []
         skipped_changes_struct: list = []  # structured {filename, symbol, reason} for the UI
@@ -7721,7 +7725,8 @@ async def run_natural_pipeline_stream(
                                   symbol=symbol_name,
                                   reason=snip_reason,
                                   old_code_sent=old_code[:1000],
-                                  symbol_code_actual=_accum_base[:1000])
+                                  symbol_code_actual=_accum_base[:1000],
+                                      user_id=user_id)
                             still_unresolved.append({
                                 "filename": filename,
                                 "symbol": symbol_name,
@@ -7819,7 +7824,8 @@ async def run_natural_pipeline_stream(
                   resolve_round=resolve_round,
                   unresolved_count=len(still_unresolved),
                   unresolved=[{"f": x.get("filename"), "s": x.get("symbol"), "reason": x.get("_snippet_reason")} for x in still_unresolved],
-                  correction_prompt=correction_text[:3000])
+                  correction_prompt=correction_text[:3000],
+                      user_id=user_id)
             correction_msgs = messages + [
                 {"role": "assistant", "content": full_response or "(analyzing code...)"},
                 {"role": "user", "content": correction_text},
@@ -7847,7 +7853,8 @@ async def run_natural_pipeline_stream(
                       session_id=session_id,
                       resolve_round=resolve_round,
                       response_chars=len(corr_text),
-                      response_preview=corr_text[:3000])
+                      response_preview=corr_text[:3000],
+                          user_id=user_id)
 
                 # Extract new edit blocks from correction response
                 new_pending = []

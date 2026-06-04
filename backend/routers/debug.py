@@ -1,14 +1,17 @@
 """
 Debug router — exposes structured pipeline failure logs for admin download.
 
-GET  /api/debug/pipeline-log          → last N events (JSON array)
-GET  /api/debug/pipeline-log/download → raw JSONL file download
-DELETE /api/debug/pipeline-log        → clear the log
+GET  /api/debug/pipeline-log              → last N events (JSON)
+GET  /api/debug/pipeline-log?session_id=X → filter by session
+GET  /api/debug/pipeline-log?user_id=X    → filter by user
+GET  /api/debug/pipeline-log/download     → raw JSONL download
+DELETE /api/debug/pipeline-log            → clear the log
 """
 import os
 import json
-from fastapi import APIRouter, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
+from typing import Optional
+from fastapi import APIRouter, Request, Query
+from fastapi.responses import FileResponse, JSONResponse, Response
 
 router = APIRouter(prefix="/api/debug", tags=["debug"])
 
@@ -16,52 +19,110 @@ _DLOG_PATH = "/tmp/surgical_debug.jsonl"
 
 
 def _require_admin(request: Request) -> bool:
-    """Return True if caller is authenticated. Log endpoint is admin-only."""
-    # Check session cookie or Authorization header set by the auth middleware
     user = getattr(request.state, "user", None)
     return user is not None
 
 
 @router.get("/pipeline-log")
-async def get_pipeline_log(request: Request, last: int = 200):
-    """Return the last `last` log events as a JSON array."""
+async def get_pipeline_log(
+    request: Request,
+    last: int = Query(500, ge=1, le=5000),
+    session_id: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
+):
+    """Return the last `last` log events, optionally filtered by session_id or user_id."""
     if not _require_admin(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     if not os.path.exists(_DLOG_PATH):
-        return JSONResponse([])
+        return JSONResponse({"events": [], "total": 0, "filtered": 0})
 
     try:
         with open(_DLOG_PATH, "r") as f:
             lines = f.readlines()
-        events = []
-        for line in lines[-last:]:
+
+        all_events = []
+        for line in lines:
             line = line.strip()
             if line:
                 try:
-                    events.append(json.loads(line))
+                    all_events.append(json.loads(line))
                 except Exception:
-                    events.append({"raw": line})
-        return JSONResponse(events)
+                    all_events.append({"raw": line})
+
+        total = len(all_events)
+
+        # Apply filters
+        filtered = all_events
+        if session_id:
+            filtered = [e for e in filtered if e.get("session_id") == session_id]
+        if user_id:
+            filtered = [e for e in filtered if str(e.get("user_id", "")) == str(user_id)]
+
+        # Return last N after filtering
+        events = filtered[-last:]
+
+        return JSONResponse({
+            "events": events,
+            "total": total,
+            "filtered": len(filtered),
+            "returned": len(events),
+        })
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @router.get("/pipeline-log/download")
-async def download_pipeline_log(request: Request):
-    """Download the full raw JSONL log file."""
+async def download_pipeline_log(
+    request: Request,
+    session_id: Optional[str] = Query(None),
+    user_id: Optional[str] = Query(None),
+):
+    """Download the log as JSONL. Supports same session_id/user_id filters."""
     if not _require_admin(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     if not os.path.exists(_DLOG_PATH):
         return Response(content="", media_type="text/plain",
                         headers={"Content-Disposition": "attachment; filename=surgical_debug.jsonl"})
-    return FileResponse(
-        path=_DLOG_PATH,
-        media_type="application/x-ndjson",
-        filename="surgical_debug.jsonl",
-        headers={"Content-Disposition": "attachment; filename=surgical_debug.jsonl"},
-    )
+
+    # If no filters, serve the raw file directly
+    if not session_id and not user_id:
+        return FileResponse(
+            path=_DLOG_PATH,
+            media_type="application/x-ndjson",
+            filename="surgical_debug.jsonl",
+            headers={"Content-Disposition": "attachment; filename=surgical_debug.jsonl"},
+        )
+
+    # Filtered download — build in memory
+    try:
+        with open(_DLOG_PATH, "r") as f:
+            lines = f.readlines()
+        out_lines = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except Exception:
+                continue
+            if session_id and ev.get("session_id") != session_id:
+                continue
+            if user_id and str(ev.get("user_id", "")) != str(user_id):
+                continue
+            out_lines.append(line)
+
+        content = "\n".join(out_lines)
+        fname = f"surgical_debug{'_' + session_id[:8] if session_id else ''}{'_u' + str(user_id) if user_id else ''}.jsonl"
+        return Response(
+            content=content,
+            media_type="application/x-ndjson",
+            headers={"Content-Disposition": f"attachment; filename={fname}"},
+        )
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 @router.delete("/pipeline-log")
@@ -69,7 +130,6 @@ async def clear_pipeline_log(request: Request):
     """Wipe the log file."""
     if not _require_admin(request):
         return JSONResponse({"error": "unauthorized"}, status_code=401)
-
     try:
         if os.path.exists(_DLOG_PATH):
             os.remove(_DLOG_PATH)
