@@ -1081,6 +1081,15 @@ export function ChatPanel() {
           </span>
         </div>
         <div className="flex items-center gap-1.5">
+          {activeSessions && (
+            <button
+              onClick={() => { navigator.clipboard.writeText(activeSessions); }}
+              className="text-[10px] font-mono text-muted/50 hover:text-accent bg-overlay/40 hover:bg-overlay px-1.5 py-0.5 rounded transition-colors leading-none"
+              title={`Session ID: ${activeSessions}\nClick to copy`}
+            >
+              {activeSessions.slice(0, 8)}
+            </button>
+          )}
           <span className="text-[11px] text-muted/70">{(() => {
             const m = settings?.architect_model || 'gpt-4.1'
             if (m.includes('claude-opus')) return 'Claude Opus'

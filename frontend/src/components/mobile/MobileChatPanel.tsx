@@ -659,8 +659,17 @@ export function MobileChatPanel() {
           {/* Bottom toolbar — left icons | right send */}
           <div className="flex items-center justify-between px-2 pb-2 pt-1">
 
-            {/* Left: attach + voice + expand */}
+            {/* Left: attach + voice + expand + session-id chip */}
             <div className="flex items-center gap-0.5">
+              {activeSessions && (
+                <button
+                  onClick={() => { navigator.clipboard.writeText(activeSessions); }}
+                  className="h-9 flex items-center px-2 font-mono text-[10px] text-muted/50 hover:text-accent hover:bg-overlay/60 active:bg-overlay rounded-xl transition-colors leading-none"
+                  title={`Session ID: ${activeSessions}\nClick to copy`}
+                >
+                  {activeSessions.slice(0, 8)}
+                </button>
+              )}
               {/* Attach */}
               <button
                 onClick={() => fileInputRef.current?.click()}
