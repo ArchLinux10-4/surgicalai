@@ -291,32 +291,8 @@ def apply_change(file_content: str, change) -> str:
                 result = result.replace(find_text, replace_text, 1)
                 any_applied = True
             else:
-                # Whitespace-normalized fallback: handles LLM-generated SEARCH strings
-                # that differ from file content only in whitespace (trailing spaces,
-                # mixed indentation, etc.). Line-by-line match — no false-positive risk.
-                _lines = result.splitlines(keepends=True)
-                _find_lines = find_text.splitlines()
-                _found_range = None
-                for _i in range(len(_lines)):
-                    if _i + len(_find_lines) > len(_lines):
-                        break
-                    if all(
-                        " ".join(_lines[_i + _j].split()) == " ".join(_find_lines[_j].split())
-                        for _j in range(len(_find_lines))
-                    ):
-                        _found_range = (_i, _i + len(_find_lines))
-                        break
-                if _found_range:
-                    _before = "".join(_lines[:_found_range[0]])
-                    _after = "".join(_lines[_found_range[1]:])
-                    _rep = replace_text
-                    if _rep and not _rep.endswith("\n"):
-                        _rep += "\n"
-                    result = _before + _rep + _after
-                    any_applied = True
-                else:
-                    # Track which find strings failed for a useful error message
-                    failed_finds.append(find_text[:120].strip())
+                # Track which find strings failed for a useful error message
+                failed_finds.append(find_text[:120].strip())
 
         if any_applied:
             change.applied = True
