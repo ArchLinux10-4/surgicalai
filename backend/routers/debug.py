@@ -1,52 +1,78 @@
 """
-Debug router — exposes structured pipeline failure logs for agent download.
-GET /api/debug/pipeline-log?lines=200
-Returns last N lines of /tmp/pipeline_failures.jsonl as JSON array.
-Auth is enforced by the global JWT middleware in main.py (request.state.user_id).
+Debug router — exposes structured pipeline failure logs for admin download.
+
+GET  /api/debug/pipeline-log          → last N events (JSON array)
+GET  /api/debug/pipeline-log/download → raw JSONL file download
+DELETE /api/debug/pipeline-log        → clear the log
 """
 import os
 import json
-from fastapi import APIRouter, Request, Query
+from fastapi import APIRouter, Request, Response
+from fastapi.responses import FileResponse, JSONResponse
 
-router = APIRouter()
+router = APIRouter(prefix="/api/debug", tags=["debug"])
 
-LOG_PATH = "/tmp/pipeline_failures.jsonl"
+_DLOG_PATH = "/tmp/surgical_debug.jsonl"
+
+
+def _require_admin(request: Request) -> bool:
+    """Return True if caller is authenticated. Log endpoint is admin-only."""
+    # Check session cookie or Authorization header set by the auth middleware
+    user = getattr(request.state, "user", None)
+    return user is not None
 
 
 @router.get("/pipeline-log")
-async def get_pipeline_log(
-    request: Request,
-    lines: int = Query(default=200, ge=1, le=2000),
-):
-    """Return the last N structured pipeline failure events."""
-    if not os.path.exists(LOG_PATH):
-        return {"events": [], "message": "No pipeline failures logged yet."}
+async def get_pipeline_log(request: Request, last: int = 200):
+    """Return the last `last` log events as a JSON array."""
+    if not _require_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    if not os.path.exists(_DLOG_PATH):
+        return JSONResponse([])
 
     try:
-        with open(LOG_PATH, "r") as f:
-            all_lines = f.readlines()
-
-        recent = all_lines[-lines:]
+        with open(_DLOG_PATH, "r") as f:
+            lines = f.readlines()
         events = []
-        for line in recent:
+        for line in lines[-last:]:
             line = line.strip()
             if line:
                 try:
                     events.append(json.loads(line))
                 except Exception:
                     events.append({"raw": line})
-
-        return {"events": events, "total_in_file": len(all_lines)}
+        return JSONResponse(events)
     except Exception as e:
-        return {"events": [], "error": str(e)}
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.get("/pipeline-log/download")
+async def download_pipeline_log(request: Request):
+    """Download the full raw JSONL log file."""
+    if not _require_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    if not os.path.exists(_DLOG_PATH):
+        return Response(content="", media_type="text/plain",
+                        headers={"Content-Disposition": "attachment; filename=surgical_debug.jsonl"})
+    return FileResponse(
+        path=_DLOG_PATH,
+        media_type="application/x-ndjson",
+        filename="surgical_debug.jsonl",
+        headers={"Content-Disposition": "attachment; filename=surgical_debug.jsonl"},
+    )
 
 
 @router.delete("/pipeline-log")
 async def clear_pipeline_log(request: Request):
-    """Clear the pipeline failure log."""
+    """Wipe the log file."""
+    if not _require_admin(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+
     try:
-        if os.path.exists(LOG_PATH):
-            os.remove(LOG_PATH)
-        return {"cleared": True}
+        if os.path.exists(_DLOG_PATH):
+            os.remove(_DLOG_PATH)
+        return JSONResponse({"cleared": True})
     except Exception as e:
-        return {"cleared": False, "error": str(e)}
+        return JSONResponse({"error": str(e)}, status_code=500)

@@ -21,6 +21,41 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────────────────────
+# DEBUG LOGGING  (writes to /tmp/surgical_debug.jsonl — pulled via /api/debug/pipeline-log)
+# ─────────────────────────────────────────────────────────────────────────────
+import json as _json_mod
+import datetime as _dt
+import os as _os
+
+_DLOG_PATH = "/tmp/surgical_debug.jsonl"
+_DLOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB cap — rotate by truncating oldest half
+
+def _dlog(event: str, **kwargs):
+    """Append a structured debug record to the pipeline log file."""
+    try:
+        record = {
+            "ts": _dt.datetime.utcnow().isoformat() + "Z",
+            "event": event,
+            **kwargs,
+        }
+        line = _json_mod.dumps(record, default=str) + "\n"
+        # Rotate if too large
+        try:
+            if _os.path.exists(_DLOG_PATH) and _os.path.getsize(_DLOG_PATH) > _DLOG_MAX_BYTES:
+                with open(_DLOG_PATH, "r") as _f:
+                    _lines = _f.readlines()
+                with open(_DLOG_PATH, "w") as _f:
+                    _f.writelines(_lines[len(_lines)//2:])
+        except Exception:
+            pass
+        with open(_DLOG_PATH, "a") as _f:
+            _f.write(line)
+    except Exception:
+        pass  # logging must NEVER crash the pipeline
+
+
+
 from database import get_setting, get_user_api_key
 from crypto_utils import decrypt_api_key
 from models.schemas import (
@@ -7181,6 +7216,12 @@ async def run_natural_pipeline_stream(
             session_files, symbol_maps_by_name, user_request,
             project_memory=project_memory, session_summary=session_summary
         )
+        _dlog("file_context_built",
+              session_id=session_id,
+              num_files=len(session_files),
+              filenames=[sf["filename"] for sf in session_files],
+              context_chars=len(file_context),
+              context_preview=file_context[:2000])
 
         # ── Build system prompt (with Anthropic prompt caching) ───────────
         # This system prompt is re-sent on every Claude call in the natural
@@ -7481,6 +7522,11 @@ async def run_natural_pipeline_stream(
             if search_requested is not None:
                 raw_terms = search_requested.get("terms", [])
                 reason = search_requested.get("reason", "")
+                _dlog("search_requested",
+                      session_id=session_id,
+                      round=search_round,
+                      terms=raw_terms,
+                      reason=reason)
 
                 # Budget exhausted — do one forced-edit round, then stop
                 if search_round >= MAX_SEARCH_ROUNDS or _forced_edit_round_done:
@@ -7529,6 +7575,11 @@ async def run_natural_pipeline_stream(
                 )
                 searched_terms.extend(new_terms)
                 accumulated_search_results += search_results
+                _dlog("search_results_returned",
+                      session_id=session_id,
+                      terms=new_terms,
+                      results_chars=len(search_results),
+                      results_preview=search_results[:3000])
 
                 # On the last permitted search round, add a strong write-now warning
                 is_last_search_round = (search_round == MAX_SEARCH_ROUNDS - 1)
@@ -7589,6 +7640,10 @@ async def run_natural_pipeline_stream(
 
         MAX_SYMBOL_RETRIES = 2
         pending_edits = list(edit_blocks_raw)
+        _dlog("edit_blocks_collected",
+              session_id=session_id,
+              count=len(pending_edits),
+              blocks=[b[:800] for b in pending_edits])
         resolved_edits: list = []
         skipped_messages: list = []
         skipped_changes_struct: list = []  # structured {filename, symbol, reason} for the UI
@@ -7660,6 +7715,13 @@ async def run_natural_pipeline_stream(
                             edit_data["new_code"] = full_new
                             edit_data.pop("old_code", None)  # now a full-symbol edit
                         else:
+                            _dlog("snippet_apply_failed",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  symbol=symbol_name,
+                                  reason=snip_reason,
+                                  old_code_sent=old_code[:1000],
+                                  symbol_code_actual=_accum_base[:1000])
                             still_unresolved.append({
                                 "filename": filename,
                                 "symbol": symbol_name,
@@ -7752,6 +7814,12 @@ async def run_natural_pipeline_stream(
                        "content": f"Correcting symbol references ({resolve_round + 1}/{MAX_SYMBOL_RETRIES})..."})
 
             correction_text = _build_symbol_correction(still_unresolved, symbol_maps_by_name)
+            _dlog("correction_prompt_sent",
+                  session_id=session_id,
+                  resolve_round=resolve_round,
+                  unresolved_count=len(still_unresolved),
+                  unresolved=[{"f": x.get("filename"), "s": x.get("symbol"), "reason": x.get("_snippet_reason")} for x in still_unresolved],
+                  correction_prompt=correction_text[:3000])
             correction_msgs = messages + [
                 {"role": "assistant", "content": full_response or "(analyzing code...)"},
                 {"role": "user", "content": correction_text},
@@ -7775,6 +7843,11 @@ async def run_natural_pipeline_stream(
                 corr_text = "".join(
                     block.text for block in corr_resp.content if hasattr(block, "text")
                 )
+                _dlog("correction_response",
+                      session_id=session_id,
+                      resolve_round=resolve_round,
+                      response_chars=len(corr_text),
+                      response_preview=corr_text[:3000])
 
                 # Extract new edit blocks from correction response
                 new_pending = []

@@ -14,6 +14,7 @@ from database import init_db
 from auth_utils import decode_token
 from routers import settings, chat, files, surgical, git, context, session_files, github as github_router
 from routers import datalab as datalab_router
+from routers import debug as debug_router
 from routers import auth as auth_router
 from routers import linear as linear_router
 from routers import deploy as deploy_router
@@ -128,6 +129,7 @@ app.include_router(deploy_router.router, prefix="/api/deploy", tags=["deploy"])
 app.include_router(tests_router.router, prefix="/api/tests", tags=["tests"])
 app.include_router(tasks_router.router, prefix="/api/tasks", tags=["tasks"])
 app.include_router(datalab_router.router, prefix="/api/datalab", tags=["datalab"])
+app.include_router(debug_router.router)
 
 
 @app.on_event("startup")
