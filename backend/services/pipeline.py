@@ -6778,10 +6778,20 @@ def _build_symbol_correction(
                 f"(L{cand.start_line}–{cand.end_line}):\n{numbered}{suffix}"
             )
 
-    parts.append(
-        "\n\nPlease rewrite your <surgical_edit> blocks using the EXACT symbol names shown above. "
-        "Make sure new_code is the complete replacement for the symbol you choose."
-    )
+    # Footer branches on failure type so Claude knows what output is expected.
+    if _has_snippet and not _has_missing:
+        # Anchor mismatch: symbol name is right, code snippet didn't match.
+        # Tell Claude to emit blocks — no prose, no search calls, just blocks.
+        parts.append(
+            "\n\nRespond with ONLY your corrected <surgical_edit> blocks — no explanation, "
+            "no prose. Copy old_code VERBATIM from the lines shown above (or omit old_code "
+            "and put the entire updated symbol in new_code). Do NOT use <search_request>."
+        )
+    else:
+        parts.append(
+            "\n\nPlease rewrite your <surgical_edit> blocks using the EXACT symbol names shown above. "
+            "Make sure new_code is the complete replacement for the symbol you choose."
+        )
     return "\n".join(parts)
 
 
@@ -8047,6 +8057,7 @@ async def run_natural_pipeline_stream(
                             symbol=_item.get("symbol"),
                             filename=_item.get("filename"),
                             snippet_reason=_snip_r,
+                            corr_response=corr_text[:3000],
                         )
                     break
 
