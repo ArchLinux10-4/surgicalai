@@ -871,7 +871,16 @@ function DebugLogsPanel() {
   const [userFilter, setUserFilter] = useState('')
   const [totalCount, setTotalCount] = useState(0)
   const [filteredCount, setFilteredCount] = useState(0)
+  const [copied, setCopied] = useState(false)
   const { token } = useAuthStore()
+  const { activeSessions } = useAppStore()
+
+  // Pre-populate session filter with the active chat session
+  useEffect(() => {
+    if (activeSessions && !sessionFilter) {
+      setSessionFilter(activeSessions)
+    }
+  }, [activeSessions])
 
   const BASE = import.meta.env.VITE_API_URL || ''
 
@@ -928,8 +937,31 @@ function DebugLogsPanel() {
   const eventTypes = ['all', ...Array.from(new Set(events.map(e => e.event)))]
   const visible = filter === 'all' ? events : events.filter(e => e.event === filter)
 
+  const copySessionId = () => {
+    if (!activeSessions) return
+    navigator.clipboard.writeText(activeSessions).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
+
   return (
     <div className="flex flex-col h-full gap-4">
+      {/* Active session banner */}
+      {activeSessions && (
+        <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-overlay border border-border text-xs">
+          <span className="text-faint flex-shrink-0">Active session:</span>
+          <span className="font-mono text-accent flex-1 truncate">{activeSessions}</span>
+          <button onClick={copySessionId}
+            className="text-faint hover:text-ink transition-colors flex-shrink-0 text-[11px]">
+            {copied ? '✓ Copied' : 'Copy'}
+          </button>
+          <button onClick={() => { setSessionFilter(activeSessions); setTimeout(fetchLogs, 50) }}
+            className="text-faint hover:text-accent transition-colors flex-shrink-0 text-[11px] border border-border rounded px-2 py-0.5">
+            Filter to this
+          </button>
+        </div>
+      )}
       {/* Filter inputs */}
       <div className="flex gap-2 flex-wrap">
         <input
