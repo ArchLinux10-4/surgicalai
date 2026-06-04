@@ -1849,6 +1849,19 @@ def _apply_snippet_to_symbol(symbol_code: str, old_code: str, new_code: str):
     )
 
 
+# ── Pipeline failure structured logger ───────────────────────────────────────
+import json as _json, datetime as _datetime
+_PIPELINE_LOG_PATH = "/tmp/pipeline_failures.jsonl"
+
+def _plog(**kwargs):
+    """Append a structured failure event to the pipeline log file."""
+    try:
+        entry = {"ts": _datetime.datetime.utcnow().isoformat(), **kwargs}
+        with open(_PIPELINE_LOG_PATH, "a") as _lf:
+            _lf.write(_json.dumps(entry) + "\n")
+    except Exception:
+        pass  # logging must never crash the pipeline
+
 def _fragment_reason(symbol_code: str, new_code: str):
     """
     Detect a degenerate "fragment" edit.
@@ -6634,15 +6647,38 @@ def _build_symbol_correction(
     symbol_maps_by_name: dict,
 ) -> str:
     """
-    Build a correction message for Claude when it referenced symbols that don't exist.
-    Shows the actual available symbols with full code so Claude can revise precisely.
+    Build a correction message for Claude when edits could not be resolved.
+    Handles two cases:
+      - symbol_not_found: symbol name was wrong; show closest real symbols.
+      - fragment/anchor mismatch: symbol exists but new_code was a fragment or
+        old_code anchor didn't match; show actual symbol so Claude can anchor correctly.
 
     unresolved: list of dicts with keys: filename, symbol, new_code, description
     """
-    parts = [
-        "Some of the symbols you referenced don't exist in the files. "
-        "Here are the ACTUAL symbols available — please revise your edits to use these exact names:\n"
-    ]
+    _has_snippet = any(item.get("_snippet_reason") for item in unresolved)
+    _has_missing = any(not item.get("_snippet_reason") for item in unresolved)
+
+    if _has_snippet and not _has_missing:
+        # All failures are fragment/anchor issues — symbol exists, edit couldn't anchor.
+        # Using "symbols don't exist" preamble here misleads Claude into thinking it
+        # picked wrong symbol names, so it responds with name corrections instead of
+        # generating new edit blocks. Use anchor-focused preamble instead.
+        parts = [
+            "Some of your edits could not be anchored to the current file content. "
+            "The symbols exist but the code snippets did not match. "
+            "Please revise the edits using the EXACT current content shown below — "
+            "copy old_code verbatim (no paraphrasing) or emit the complete symbol:\n"
+        ]
+    elif _has_snippet and _has_missing:
+        parts = [
+            "Some edits had issues — some symbols were not found, and some edits could not be "
+            "anchored to the file. Please revise using the actual content shown below:\n"
+        ]
+    else:
+        parts = [
+            "Some of the symbols you referenced don't exist in the files. "
+            "Here are the ACTUAL symbols available — please revise your edits to use these exact names:\n"
+        ]
 
     for item in unresolved:
         filename = item.get("filename", "")
@@ -7907,7 +7943,18 @@ async def run_natural_pipeline_stream(
                                 f"anchored after {MAX_SYMBOL_RETRIES} correction attempts: {_snip_r}"
                             )
                             _reason = "edit_anchor_unmatched"
+                            _plog(
+                                event="edit_anchor_unmatched",
+                                symbol=item.get("symbol"),
+                                filename=item.get("filename"),
+                                snippet_reason=_snip_r,
+                            )
                         else:
+                            _plog(
+                                event="symbol_not_found",
+                                symbol=item.get("symbol"),
+                                filename=item.get("filename"),
+                            )
                             skipped_messages.append(
                                 f"Symbol '{item['symbol']}' not found in {item['filename']} after {MAX_SYMBOL_RETRIES} correction attempts"
                             )
@@ -7969,7 +8016,39 @@ async def run_natural_pipeline_stream(
                         if _cb.endswith(EDIT_CLOSE):
                             new_pending.append(_cb[:-len(EDIT_CLOSE)])
                             _cb, _cs = "", "normal"
-                pending_edits = new_pending or []
+                if new_pending:
+                    pending_edits = new_pending
+                else:
+                    # Correction produced no new edit blocks — record all still_unresolved
+                    # as failed immediately. If we fall through, the next round has nothing
+                    # to process, still_unresolved resets to [], and the items silently vanish
+                    # with no entry in skipped_messages (user sees generic fallback message).
+                    for _item in still_unresolved:
+                        _snip_r = _item.get("_snippet_reason")
+                        skipped_messages.append(
+                            f"Edit to '{_item.get('symbol', '')}' in {_item.get('filename', '')} "
+                            f"could not be resolved: the correction call produced no new edit blocks. "
+                            + (f"Fragment issue: {_snip_r}" if _snip_r else
+                               "The symbol reference could not be corrected.")
+                        )
+                        skipped_changes_struct.append({
+                            "filename": _item.get("filename", ""),
+                            "symbol": _item.get("symbol", ""),
+                            "reason": "correction_no_output",
+                        })
+                        print(
+                            f"[NATURAL][resolve] correction_no_output "
+                            f"symbol={_item.get('symbol')!r} file={_item.get('filename')!r} "
+                            f"snippet_reason={_snip_r!r}",
+                            flush=True,
+                        )
+                        _plog(
+                            event="correction_no_output",
+                            symbol=_item.get("symbol"),
+                            filename=_item.get("filename"),
+                            snippet_reason=_snip_r,
+                        )
+                    break
 
             except Exception:
                 for item in still_unresolved:

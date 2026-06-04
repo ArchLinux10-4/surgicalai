@@ -19,6 +19,7 @@ from routers import linear as linear_router
 from routers import deploy as deploy_router
 from routers import tests as tests_router
 from routers import tasks as tasks_router
+from routers import debug as debug_router
 
 app = FastAPI(
     title="SurgicalAI",
@@ -128,6 +129,7 @@ app.include_router(deploy_router.router, prefix="/api/deploy", tags=["deploy"])
 app.include_router(tests_router.router, prefix="/api/tests", tags=["tests"])
 app.include_router(tasks_router.router, prefix="/api/tasks", tags=["tasks"])
 app.include_router(datalab_router.router, prefix="/api/datalab", tags=["datalab"])
+app.include_router(debug_router.router, prefix="/api/debug", tags=["debug"])
 
 
 @app.on_event("startup")
