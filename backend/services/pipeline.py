@@ -6438,6 +6438,61 @@ def _smart_code_context(fname: str, content: str, smap, user_request: str,
     )
 
 
+def _resolve_session_filename(emitted: str, available_keys) -> str:
+    """Map an architect-emitted file path to the actual session-file key.
+
+    LLMs frequently trim leading path segments (e.g. they emit
+    'src/components/InlineDiffCard.tsx' when the stored key is
+    'frontend/src/components/InlineDiffCard.tsx'). The previous exact-key
+    lookup treated that drift as "file not found in session" and silently
+    dropped every drafted edit. This resolver tolerates the drift.
+
+    Resolution order — each step only resolves when UNAMBIGUOUS, so an edit is
+    never spliced into the wrong file:
+      1. Exact key match.
+      2. Normalized exact (strip leading './', backslashes -> '/').
+      3. Segment-boundary suffix match, either direction (one path is the
+         tail of the other on a '/' boundary).
+      4. Unique basename match.
+    Returns the resolved key, or '' when absent or ambiguous.
+    """
+    if not emitted:
+        return ""
+    keys = list(available_keys)
+    if emitted in keys:
+        return emitted
+
+    def _norm(p: str) -> str:
+        return p.replace("\\", "/").lstrip("./") if p else ""
+
+    e = _norm(emitted)
+
+    # 2. Normalized exact
+    for k in keys:
+        if _norm(k) == e:
+            return k
+
+    # 3. Segment-boundary suffix, bidirectional
+    def _seg_suffix(longer: str, shorter: str) -> bool:
+        return longer == shorter or longer.endswith("/" + shorter)
+
+    suffix_hits = [
+        k for k in keys
+        if _seg_suffix(_norm(k), e) or _seg_suffix(e, _norm(k))
+    ]
+    if len(suffix_hits) == 1:
+        return suffix_hits[0]
+    if len(suffix_hits) > 1:
+        return ""  # ambiguous -> do not guess
+
+    # 4. Unique basename
+    base = e.rsplit("/", 1)[-1]
+    base_hits = [k for k in keys if _norm(k).rsplit("/", 1)[-1] == base]
+    if len(base_hits) == 1:
+        return base_hits[0]
+    return ""
+
+
 def _fuzzy_find_symbol(smap, symbol_name: str):
     """
     Comprehensive symbol finder — tries 6 strategies before giving up.
@@ -7680,10 +7735,26 @@ async def run_natural_pipeline_stream(
                           f"(missing={_missing}, truncated={_arch_truncated})")
                     continue
 
+                # Resolve the architect-emitted path to the real session key.
+                # The architect is shown the exact stored filename but LLMs
+                # routinely trim leading path segments (e.g. emit
+                # 'src/components/InlineDiffCard.tsx' for a stored
+                # 'frontend/src/components/InlineDiffCard.tsx'). Without this
+                # the exact-key lookup misses and every edit is dropped as
+                # "file not found in session".
+                _resolved_fname = _resolve_session_filename(filename, symbol_maps_by_name.keys())
+                if _resolved_fname and _resolved_fname != filename:
+                    print(f"[NATURAL] path normalized: '{filename}' -> '{_resolved_fname}'", flush=True)
+                    filename = _resolved_fname
+
                 file_content = file_content_lookup.get(filename, "")
                 smap, sf_entry = symbol_maps_by_name.get(filename, (None, None))
 
                 if not file_content or not smap:
+                    _avail = list(symbol_maps_by_name.keys())
+                    print(f"[NATURAL] file_not_in_session: emitted='{filename}' "
+                          f"resolved='{_resolved_fname}' available={_avail[:20]}"
+                          f"{' ...' if len(_avail) > 20 else ''}", flush=True)
                     skipped_messages.append(f"File '{filename}' not found in session")
                     skipped_changes_struct.append({
                         "filename": filename,
