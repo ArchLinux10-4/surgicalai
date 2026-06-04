@@ -4742,12 +4742,31 @@ USER REQUEST:
                                             _round_hits.append((_fname_r, _label, _sym_numbered))
                                         break
 
-                        # Pass 2: keyword grep, expanded to enclosing AST symbol
+                        # Pass 2: keyword grep — surface EVERY occurrence (capped),
+                        # not just the first. A term such as a CSS class name or a
+                        # prop name commonly appears FIRST inside a large stylesheet
+                        # const / type block and only LATER at the actual JSX / markup
+                        # the user wants to edit. The previous logic broke after the
+                        # first hit and returned the whole enclosing symbol, so the
+                        # Architect only ever saw (e.g.) the CSS rules and never the
+                        # real edit site — forcing it to guess the anchor, which then
+                        # failed to byte-match (edit_anchor_unmatched → nothing applied).
+                        #
+                        # Now: collect up to _MAX_OCC_PER_TERM occurrences per term, and
+                        # for a LARGE enclosing symbol (or no symbol) emit a focused
+                        # window around THAT occurrence instead of the entire symbol.
+                        # Small symbols still emit in full (precise + cheap).
+                        _LARGE_SYMBOL_LINES = 120   # above this → focused window, not whole symbol
+                        _MATCH_WINDOW = 18          # ± lines of context around each occurrence
+                        _MAX_OCC_PER_TERM = 4       # cap occurrences per term per file
                         for _term_r in _new_terms:
                             _tl = _term_r.lower()
+                            _occ_count = 0
                             for _li, _ln in enumerate(_file_lines_r):
                                 if _tl not in _ln.lower():
                                     continue
+                                if _occ_count >= _MAX_OCC_PER_TERM:
+                                    break
                                 _lineno_r = _li + 1
                                 _enc = None
                                 if _smap_r:
@@ -4758,7 +4777,13 @@ USER REQUEST:
                                             if _sz < _best_size:
                                                 _best_size = _sz
                                                 _enc = _sym_r
-                                if _enc:
+                                # Emit the whole symbol only when it is small & precise;
+                                # otherwise emit a focused window around this occurrence.
+                                _emit_full = (
+                                    _enc is not None
+                                    and (_enc.end_line - _enc.start_line) <= _LARGE_SYMBOL_LINES
+                                )
+                                if _emit_full:
                                     _path_key = f"{_fname_r}::{_enc.full_path}"
                                     if _path_key not in _seen_sym_paths:
                                         _seen_sym_paths.add(_path_key)
@@ -4773,19 +4798,40 @@ USER REQUEST:
                                             f"L{_enc.start_line}–{_enc.end_line})]"
                                         )
                                         _round_hits.append((_fname_r, _label, _enc_numbered))
+                                        _occ_count += 1
                                 else:
-                                    _path_key = f"{_fname_r}::L{_lineno_r}"
+                                    # Focused window around the actual occurrence — gives
+                                    # the Architect the exact bytes to anchor a targeted edit.
+                                    _ws = max(0, _li - _MATCH_WINDOW)
+                                    _we = min(len(_file_lines_r), _li + _MATCH_WINDOW + 1)
+                                    _path_key = f"{_fname_r}::W{_ws}-{_we}"
                                     if _path_key not in _seen_sym_paths:
                                         _seen_sym_paths.add(_path_key)
-                                        _ws = max(0, _li - 15)
-                                        _we = min(len(_file_lines_r), _li + 16)
                                         _raw = "\n".join(
                                             f"{_ws + j + 1:5d}: {_file_lines_r[_ws + j]}"
                                             for j in range(_we - _ws)
                                         )
-                                        _label = f"GREP MATCH ('{_term_r}') [{_fname_r} L{_lineno_r}]"
+                                        if _enc is not None:
+                                            _label = (
+                                                f"GREP MATCH ('{_term_r}') [{_fname_r} L{_lineno_r} "
+                                                f"in {_enc.full_path} ({_enc.symbol_type.value}, "
+                                                f"L{_enc.start_line}–{_enc.end_line})]"
+                                            )
+                                        else:
+                                            _label = f"GREP MATCH ('{_term_r}') [{_fname_r} L{_lineno_r}]"
                                         _round_hits.append((_fname_r, _label, _raw))
-                                break
+                                        _occ_count += 1
+
+                    try:
+                        print(
+                            "[NATURAL][react] round={} terms={} hits={} files={}".format(
+                                _react_round, _new_terms[:6], len(_round_hits),
+                                sorted({h[0] for h in _round_hits})[:12]
+                            ),
+                            flush=True,
+                        )
+                    except Exception:
+                        pass
 
                     _round_text = ""
                     for _rh_fname, _rh_label, _rh_code in _round_hits:
@@ -7872,6 +7918,14 @@ async def run_natural_pipeline_stream(
                             "symbol": item.get("symbol", ""),
                             "reason": _reason,
                         })
+                        print(
+                            "[NATURAL][resolve] DROPPED edit symbol={!r} file={!r} "
+                            "reason={} snippet_reason={!r}".format(
+                                item.get("symbol", ""), item.get("filename", ""),
+                                _reason, item.get("_snippet_reason"),
+                            ),
+                            flush=True,
+                        )
                 break
 
             # ── Silent correction call ────────────────────────────────────
