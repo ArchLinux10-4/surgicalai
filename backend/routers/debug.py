@@ -12,6 +12,7 @@ import json
 from typing import Optional
 from fastapi import APIRouter, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response
+from auth_utils import decode_token
 
 router = APIRouter(prefix="/api/debug", tags=["debug"])
 
@@ -77,9 +78,22 @@ async def download_pipeline_log(
     request: Request,
     session_id: Optional[str] = Query(None),
     user_id: Optional[str] = Query(None),
+    token: Optional[str] = Query(None),
 ):
-    """Download the log as JSONL. Supports same session_id/user_id filters."""
-    if not _require_admin(request):
+    """Download the log as JSONL. Supports same session_id/user_id filters.
+    Also accepts ?token= so the browser can hit this URL directly without
+    an Authorization header (e.g. pasting the link in a new tab).
+    """
+    # Primary auth: middleware-populated state (Authorization: Bearer header)
+    authed = _require_admin(request)
+    # Fallback: ?token= query param (browser direct-link case)
+    if not authed and token:
+        try:
+            payload = decode_token(token)
+            authed = True  # any valid token is admin-gated by _require_admin logic
+        except Exception:
+            authed = False
+    if not authed:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
 
     if not os.path.exists(_DLOG_PATH):
