@@ -40,7 +40,6 @@ const CSS = `
   --e-txt3:#404060;
 }
 html{scroll-behavior:smooth}
-body{background:#ffffff;overflow:auto}
 
 /* NAV */
 .sai-nav{

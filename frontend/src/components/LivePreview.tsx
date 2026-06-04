@@ -86,20 +86,11 @@ function prepareCode(raw: string): string {
     /^import\s+(.+?)\s+from\s+['"](\.{1,2}[^'"]+)['"]\s*;?\s*$/gm,
     (_, spec, path) => buildStub(spec, path)
   )
-  code = neutralizeImportMeta(code)
+  if (/import\.meta\.env/.test(code)) {
+    const envStub = `const __import_meta_env__ = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : {};\n`
+    code = envStub + code.replace(/import\.meta\.env/g, '__import_meta_env__')
+  }
   return code
-}
-
-/* Sandpack's in-browser bundler cannot parse `import.meta` and throws
-   "Cannot use 'import.meta' outside a module". Real-world session files
-   commonly read `import.meta.env` (Vite) or `import.meta.url`, so rewrite
-   every `import.meta` reference to a safe, file-scoped stub before the code
-   reaches Sandpack. Applied to both the single-file fallback and every file
-   in the resolved module graph. */
-function neutralizeImportMeta(code: string): string {
-  if (!/import\.meta/.test(code)) return code
-  const stub = `const __IMPORT_META__: any = { env: {}, url: '', hot: undefined };\n`
-  return stub + code.replace(/import\.meta/g, '__IMPORT_META__')
 }
 
 function buildStub(spec: string, pathComment: string): string {
@@ -127,7 +118,7 @@ function buildStub(spec: string, pathComment: string): string {
 /* Base files always present in the Sandpack workspace. */
 const BASE_INDEX_CSS = [
   '*, *::before, *::after { box-sizing: border-box; }',
-  'html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #ffffff; }',
+  'html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; }',
   '#root { width: 100%; height: 100%; }',
 ].join(' ')
 
@@ -136,19 +127,6 @@ const BASE_DEPS: Record<string, string> = {
   'class-variance-authority': 'latest',
   'clsx': 'latest',
   'tailwind-merge': 'latest',
-}
-
-/* Prevent the preview from becoming transparent after applying code changes.
-   Sandpack iframes are transparent by default; when the parent card reduces
-   opacity (applied state) or Sandpack recompiles, the page behind bleeds through. */
-const PREVIEW_WRAPPER_STYLE: React.CSSProperties = {
-  background: '#ffffff',
-  minHeight: 200,
-  borderRadius: 8,
-  overflow: 'hidden',
-  position: 'relative',
-  isolation: 'isolate',
-  opacity: 1,
 }
 
 /* ─── Component ────────────────────────────────────────────────── */
@@ -308,13 +286,8 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
       `import App from '${bundle.entryImport}';`,
       "createRoot(document.getElementById('root')!).render(<App />);",
     ].join('\n')
-    // Neutralize `import.meta` in every bundled file so Sandpack can parse them.
-    const safeBundleFiles: Record<string, string> = {}
-    for (const [p, c] of Object.entries(bundle.files)) {
-      safeBundleFiles[p] = typeof c === 'string' ? neutralizeImportMeta(c) : c
-    }
     sandpackFiles = {
-      ...safeBundleFiles,
+      ...bundle.files,
       '/index.css': BASE_INDEX_CSS,
       '/index.tsx': harness,
     }

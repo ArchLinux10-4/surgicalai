@@ -198,7 +198,6 @@ export interface SessionFile {
   content?: string  // only present when explicitly fetched
   file_type?: string  // 'code' | 'image' | 'pdf' | 'csv' | 'excel' | 'text'
   origin?: 'uploaded' | 'created' | 'edited'  // 'created' = AI-generated net-new file; 'edited' = transform output
-  edited?: boolean  // authoritative AI-edited flag: true only while an applied change is in effect (cleared on undo)
   github_meta?: string  // JSON string with owner/repo/branch/path/sha
   github_pushed_at?: string  // timestamp of last push to GitHub
 }

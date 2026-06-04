@@ -8,7 +8,7 @@ import { useAppStore } from '../../stores/appStore'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import type { SessionFile } from '../../types'
-import { FileFilterTabs, NewBadge, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile, isSpreadsheetFile } from '../../lib/fileClassify'
+import { FileFilterTabs, NewBadge, matchesFileFilter, fileCounts, isCreatedFile, isSpreadsheetFile } from '../../lib/fileClassify'
 import { DataLabModal } from '../DataLabModal'
 
 const EXT_COLORS: Record<string, string> = {
@@ -50,6 +50,8 @@ export function MobileFilesPanel() {
   const { sessionFiles, setSessionFiles, activeSessions, fileFilter } = useAppStore()
   const counts = fileCounts(sessionFiles)
   const visibleFiles = sessionFiles.filter(f => matchesFileFilter(f, fileFilter))
+  // Track which files have applied changes in DB (for AI-Edited badge accuracy)
+  const [appliedFileIds, setAppliedFileIds] = useState<Set<string>>(new Set())
   const [datalabOn, setDatalabOn] = useState(false)
   const [transformFile, setTransformFile] = useState<SessionFile | null>(null)
 
@@ -57,6 +59,29 @@ export function MobileFilesPanel() {
   useEffect(() => {
     api.datalab.enabled().then(r => setDatalabOn(!!r?.enabled)).catch(() => setDatalabOn(false))
   }, [])
+
+  // Load applied change state from backend on mount / session change
+  useEffect(() => {
+    if (!activeSessions) return
+    // Get all applied change IDs for this session, then cross-reference to files
+    // We check localStorage keys matching sai-applied:{sessionId}: for file-level detection
+    // Also use updated_at heuristic as primary signal (matches desktop logic)
+    try {
+      const keys = Object.keys(localStorage)
+      const prefix = `sai-applied:${activeSessions}:`
+      const hasApplied = new Set<string>()
+      keys.forEach(k => {
+        if (k.startsWith(prefix) && localStorage.getItem(k) === '1') {
+          // Key format: sai-applied:{sessionId}:{changeId}
+          // We can't directly map changeId → fileId from localStorage alone,
+          // so we use updated_at heuristic (same as desktop) supplemented by
+          // the backend getApplied call
+          hasApplied.add(k)
+        }
+      })
+      setAppliedFileIds(hasApplied)
+    } catch {}
+  }, [activeSessions, sessionFiles])
 
   const removeFile = async (fileId: string, filename: string) => {
     if (!activeSessions) return
@@ -85,7 +110,7 @@ export function MobileFilesPanel() {
   }
 
   // Counts for header summary
-  const aiEditedCount  = sessionFiles.filter(f => isEditedFile(f)).length
+  const aiEditedCount  = sessionFiles.filter(f => f.updated_at && f.updated_at !== f.created_at).length
   const hasGithub      = sessionFiles.some(f => f.github_meta)
   const syncedCount    = sessionFiles.filter(f => syncStatus(f) === 'synced').length
   const modifiedCount  = sessionFiles.filter(f => syncStatus(f) === 'modified').length
@@ -144,7 +169,7 @@ export function MobileFilesPanel() {
           <div className="py-2">
             {visibleFiles.map(file => {
               const ext       = file.filename.split('.').pop()?.toLowerCase() || ''
-              const isEdited  = isEditedFile(file)
+              const isEdited  = !!(file.updated_at && file.updated_at !== file.created_at)
               const status    = syncStatus(file)
               const hasGH     = !!file.github_meta
 
