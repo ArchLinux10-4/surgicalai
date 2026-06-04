@@ -730,8 +730,16 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       setApplied(p => { const next = { ...p }; delete next[change.id]; return next })
       setSkipped(p => { const next = { ...p }; delete next[change.id]; return next })
       setModifiedCode(undefined)
+      // Refresh session files so the AI-edited badge clears in the drawer (sync both ways)
+      api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       onApplied?.(filename, result.content)
-      toast.success(`↩ Reverted ${filename} to previous version`)
+      // result.reverted === false means the file was already at its base content
+      // (a sibling change in this file was undone first — undo is file-level).
+      if (result.reverted === false) {
+        toast.success(`✓ ${filename} already reverted`)
+      } else {
+        toast.success(`↩ Reverted ${filename} to previous version`)
+      }
       onChangeApplied?.(-1)
     } catch (e: any) {
       toast.error(e.message || 'Undo failed')

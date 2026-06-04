@@ -590,8 +590,19 @@ def undo_session_file(session_id: str, file_id: str):
         current, prev, filename = row[0], row[1], row[2]
 
     if not prev:
+        # Nothing to revert. Undo is file-level, so a sibling change in the same
+        # file may already have reverted it (its per-row Undo button still shows).
+        # Return a graceful no-op instead of a 400 so the UI can clear that row's
+        # applied badge without surfacing an error.
         conn.close()
-        raise HTTPException(status_code=400, detail="No previous version to restore")
+        return {
+            "id": file_id,
+            "content": current,
+            "lines": len((current or "").splitlines()),
+            "symbol_count": 0,
+            "ok": True,
+            "reverted": False,
+        }
 
     lines = len(prev.splitlines())
     try:
@@ -609,7 +620,7 @@ def undo_session_file(session_id: str, file_id: str):
     )
     conn.commit()
     conn.close()
-    return {"id": file_id, "content": prev, "lines": lines, "symbol_count": symbol_count, "ok": True}
+    return {"id": file_id, "content": prev, "lines": lines, "symbol_count": symbol_count, "ok": True, "reverted": True}
 
 
 @router.delete("/{session_id}/files/{file_id}")
