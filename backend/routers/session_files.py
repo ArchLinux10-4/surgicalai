@@ -504,12 +504,22 @@ def list_session_files(session_id: str):
     """List files attached to a session (metadata only, no content)."""
     conn = get_db()
     rows = conn.execute(
-        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, origin, github_meta, created_at, updated_at, github_pushed_at
+        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, origin, github_meta, created_at, updated_at, github_pushed_at,
+                  CASE WHEN previous_content IS NOT NULL AND previous_content != '' THEN 1 ELSE 0 END AS edited
            FROM session_files WHERE session_id = ? ORDER BY created_at ASC""",
         (session_id,)
     ).fetchall()
     conn.close()
-    return [dict(r) for r in rows]
+    # `edited` is the authoritative AI-edited signal for the file drawer badge:
+    # previous_content is written only by the apply write-back (PUT) and cleared
+    # on undo — never by upload — so the badge appears on apply and disappears
+    # on undo, and never falsely fires for freshly-uploaded files.
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["edited"] = bool(d.get("edited"))
+        out.append(d)
+    return out
 
 
 @router.get("/{session_id}/files/{file_id}")
@@ -590,9 +600,12 @@ def undo_session_file(session_id: str, file_id: str):
     except Exception:
         symbol_count = 0
 
+    # Clear previous_content on undo so the file no longer reads as AI-edited
+    # (drives the file-drawer badge off). Re-applying recomputes from the change
+    # spec via the apply endpoint, so no usable redo state is lost here.
     conn.execute(
-        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ? WHERE id = ? AND session_id = ?",
-        (prev, current, lines, symbol_count, file_id, session_id)
+        "UPDATE session_files SET content = ?, previous_content = '', lines = ?, symbol_count = ? WHERE id = ? AND session_id = ?",
+        (prev, lines, symbol_count, file_id, session_id)
     )
     conn.commit()
     conn.close()

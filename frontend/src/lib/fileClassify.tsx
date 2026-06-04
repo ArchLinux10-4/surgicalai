@@ -22,10 +22,16 @@ export function isCreatedFile(f: SessionFile): boolean {
   return (f as any).origin === 'created'
 }
 
-/** File whose content changed after it was first added (AI edit or re-upload). */
+/**
+ * File the AI actually edited. Driven by the backend `edited` flag, which is
+ * true only while an applied change is in effect — it is set by the apply
+ * write-back and cleared on undo. This avoids false positives for files whose
+ * `updated_at` merely bumped during upload/symbol-extraction, and guarantees
+ * the badge disappears the moment an edit is undone. (`origin` kept as a
+ * defensive fallback for transform-produced files.)
+ */
 export function isEditedFile(f: SessionFile): boolean {
-  if ((f as any).origin === 'edited') return true
-  return !!(f.updated_at && f.updated_at !== f.created_at)
+  return (f as any).edited === true || (f as any).origin === 'edited'
 }
 
 /** Spreadsheet/CSV file — eligible for the DataLab transform affordance. */

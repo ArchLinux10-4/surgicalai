@@ -3,7 +3,7 @@ import { api } from '../api/client'
 import type { SessionFile } from '../types'
 import { GitHubCommitModal } from './GitHubCommitModal'
 import { useAppStore } from '../stores/appStore'
-import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isSpreadsheetFile } from '../lib/fileClassify'
+import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile, isSpreadsheetFile } from '../lib/fileClassify'
 import { DataLabModal } from './DataLabModal'
 import { GitHub } from '@mui/icons-material';
 
@@ -62,7 +62,6 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
   const [query, setQuery] = useState('')
   const [downloading, setDownloading] = useState<string | null>(null)
   const [showCommitModal, setShowCommitModal] = useState(false)
-  const [appliedIds, setAppliedIds] = useState<Set<string>>(new Set())
   const [datalabOn, setDatalabOn] = useState(false)
   const [transformFile, setTransformFile] = useState<SessionFile | null>(null)
   const { setSessionFiles } = useAppStore()
@@ -74,19 +73,8 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
     api.datalab.enabled().then(r => setDatalabOn(!!r?.enabled)).catch(() => setDatalabOn(false))
   }, [])
 
-  // Load applied change IDs so the AI-edited badge stays accurate after undo.
-  useEffect(() => {
-    if (!sessionId) return
-    api.surgical.getApplied(sessionId)
-      .then(({ applied_ids }) => setAppliedIds(new Set(applied_ids)))
-      .catch(() => {}) // fall back to updated_at heuristic silently
-  }, [sessionId, sessionFiles])
-
-  const isFileEdited = (file: SessionFile): boolean => {
-    const heuristic = !!(file.updated_at && file.updated_at !== file.created_at)
-    if (appliedIds.size === 0) return heuristic
-    return heuristic && appliedIds.size > 0
-  }
+  // Authoritative AI-edited signal (backend `edited` flag) — accurate on undo.
+  const isFileEdited = (file: SessionFile): boolean => isEditedFile(file)
 
   // Sort: modified-since-push first, then synced, then never; AI-edited before unedited.
   const sortedFiles = useMemo(() => {
@@ -94,8 +82,8 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
     return [...sessionFiles].sort((a, b) => {
       const so = order[syncStatus(a)] - order[syncStatus(b)]
       if (so !== 0) return so
-      const aEdited = a.updated_at && a.updated_at !== a.created_at ? 0 : 1
-      const bEdited = b.updated_at && b.updated_at !== b.created_at ? 0 : 1
+      const aEdited = isEditedFile(a) ? 0 : 1
+      const bEdited = isEditedFile(b) ? 0 : 1
       return aEdited - bEdited
     })
   }, [sessionFiles])

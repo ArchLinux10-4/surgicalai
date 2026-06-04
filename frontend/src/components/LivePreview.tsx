@@ -118,7 +118,7 @@ function buildStub(spec: string, pathComment: string): string {
 /* Base files always present in the Sandpack workspace. */
 const BASE_INDEX_CSS = [
   '*, *::before, *::after { box-sizing: border-box; }',
-  'html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; }',
+  'html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #ffffff; }',
   '#root { width: 100%; height: 100%; }',
 ].join(' ')
 
@@ -127,6 +127,19 @@ const BASE_DEPS: Record<string, string> = {
   'class-variance-authority': 'latest',
   'clsx': 'latest',
   'tailwind-merge': 'latest',
+}
+
+/* Prevent the preview from becoming transparent after applying code changes.
+   Sandpack iframes are transparent by default; when the parent card reduces
+   opacity (applied state) or Sandpack recompiles, the page behind bleeds through. */
+const PREVIEW_WRAPPER_STYLE: React.CSSProperties = {
+  background: '#ffffff',
+  minHeight: 200,
+  borderRadius: 8,
+  overflow: 'hidden',
+  position: 'relative',
+  isolation: 'isolate',
+  opacity: 1,
 }
 
 /* ─── Component ────────────────────────────────────────────────── */
