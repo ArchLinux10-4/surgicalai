@@ -1055,16 +1055,24 @@ class ASTParser:
         start_indent = len(start_line) - len(start_line.lstrip())
 
         # Try brace matching first
-        depth = 0
+        # Track paren depth so braces inside parameter destructuring
+        # e.g. function Foo({ a, b }: Props) { are NOT counted as block boundaries
+        depth_brace = 0
+        depth_paren = 0
         found_open = False
         for i in range(start_idx, min(start_idx + 2000, len(lines))):
             for ch in lines[i]:
-                if ch == "{":
-                    depth += 1
+                if ch == "(":
+                    depth_paren += 1
+                elif ch == ")":
+                    if depth_paren > 0:
+                        depth_paren -= 1
+                elif ch == "{" and depth_paren == 0:
+                    depth_brace += 1
                     found_open = True
-                elif ch == "}":
-                    depth -= 1
-                    if found_open and depth == 0:
+                elif ch == "}" and depth_paren == 0:
+                    depth_brace -= 1
+                    if found_open and depth_brace == 0:
                         return i + 1  # 1-based
 
         # Fallback: indentation-based (Python style)
