@@ -19,8 +19,8 @@ _DLOG_PATH = "/tmp/surgical_debug.jsonl"
 
 
 def _require_admin(request: Request) -> bool:
-    user = getattr(request.state, "user", None)
-    return user is not None
+    user_id = getattr(request.state, "user_id", None)
+    return user_id is not None
 
 
 @router.get("/pipeline-log")
