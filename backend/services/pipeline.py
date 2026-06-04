@@ -1849,19 +1849,6 @@ def _apply_snippet_to_symbol(symbol_code: str, old_code: str, new_code: str):
     )
 
 
-# ── Pipeline failure structured logger ───────────────────────────────────────
-import json as _json, datetime as _datetime
-_PIPELINE_LOG_PATH = "/tmp/pipeline_failures.jsonl"
-
-def _plog(**kwargs):
-    """Append a structured failure event to the pipeline log file."""
-    try:
-        entry = {"ts": _datetime.datetime.utcnow().isoformat(), **kwargs}
-        with open(_PIPELINE_LOG_PATH, "a") as _lf:
-            _lf.write(_json.dumps(entry) + "\n")
-    except Exception:
-        pass  # logging must never crash the pipeline
-
 def _fragment_reason(symbol_code: str, new_code: str):
     """
     Detect a degenerate "fragment" edit.
@@ -2196,7 +2183,7 @@ async def analyze_and_plan_stream(
                 "messages": messages,
             }
             if _supports_thinking(architect_model):
-                model_kwargs["thinking"] = {"type": "adaptive"}
+                model_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
 
             full_text = ""
             in_thinking = False
@@ -4193,7 +4180,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 async with aclient.messages.stream(
                     model=chat_model,
                     max_tokens=16000,
-                    **(({"thinking": {"type": "adaptive"}}) if _supports_thinking(chat_model) else {}),
+                    **(({"thinking": {"type": "enabled", "budget_tokens": 10000}}) if _supports_thinking(chat_model) else {}),
                     system=system,
                     messages=claude_msgs,
                 ) as astream:
@@ -4558,7 +4545,7 @@ USER REQUEST:
                         async with aclient.messages.stream(
                             model=arch_model,
                             max_tokens=16000,
-                            **({"thinking": {"type": "adaptive"}}
+                            **({"thinking": {"type": "enabled", "budget_tokens": 10000}}
                                if _supports_thinking(arch_model) else {}),
                             system=_architect_system,
                             messages=_arch_history_msgs + [{"role": "user",
@@ -4607,7 +4594,8 @@ USER REQUEST:
                                 async with aclient.messages.stream(
                                     model=arch_model,
                                     max_tokens=16000,
-                                    **({"thinking": {"type": "adaptive"}}
+                                    **({"thinking": {"type": "enabled",
+                                                    "budget_tokens": 10000}}
                                        if _supports_thinking(arch_model) else {}),
                                     system=_architect_system,
                                     messages=_arch_history_msgs + [{"role": "user",
@@ -4754,31 +4742,12 @@ USER REQUEST:
                                             _round_hits.append((_fname_r, _label, _sym_numbered))
                                         break
 
-                        # Pass 2: keyword grep — surface EVERY occurrence (capped),
-                        # not just the first. A term such as a CSS class name or a
-                        # prop name commonly appears FIRST inside a large stylesheet
-                        # const / type block and only LATER at the actual JSX / markup
-                        # the user wants to edit. The previous logic broke after the
-                        # first hit and returned the whole enclosing symbol, so the
-                        # Architect only ever saw (e.g.) the CSS rules and never the
-                        # real edit site — forcing it to guess the anchor, which then
-                        # failed to byte-match (edit_anchor_unmatched → nothing applied).
-                        #
-                        # Now: collect up to _MAX_OCC_PER_TERM occurrences per term, and
-                        # for a LARGE enclosing symbol (or no symbol) emit a focused
-                        # window around THAT occurrence instead of the entire symbol.
-                        # Small symbols still emit in full (precise + cheap).
-                        _LARGE_SYMBOL_LINES = 120   # above this → focused window, not whole symbol
-                        _MATCH_WINDOW = 18          # ± lines of context around each occurrence
-                        _MAX_OCC_PER_TERM = 4       # cap occurrences per term per file
+                        # Pass 2: keyword grep, expanded to enclosing AST symbol
                         for _term_r in _new_terms:
                             _tl = _term_r.lower()
-                            _occ_count = 0
                             for _li, _ln in enumerate(_file_lines_r):
                                 if _tl not in _ln.lower():
                                     continue
-                                if _occ_count >= _MAX_OCC_PER_TERM:
-                                    break
                                 _lineno_r = _li + 1
                                 _enc = None
                                 if _smap_r:
@@ -4789,13 +4758,7 @@ USER REQUEST:
                                             if _sz < _best_size:
                                                 _best_size = _sz
                                                 _enc = _sym_r
-                                # Emit the whole symbol only when it is small & precise;
-                                # otherwise emit a focused window around this occurrence.
-                                _emit_full = (
-                                    _enc is not None
-                                    and (_enc.end_line - _enc.start_line) <= _LARGE_SYMBOL_LINES
-                                )
-                                if _emit_full:
+                                if _enc:
                                     _path_key = f"{_fname_r}::{_enc.full_path}"
                                     if _path_key not in _seen_sym_paths:
                                         _seen_sym_paths.add(_path_key)
@@ -4810,40 +4773,19 @@ USER REQUEST:
                                             f"L{_enc.start_line}–{_enc.end_line})]"
                                         )
                                         _round_hits.append((_fname_r, _label, _enc_numbered))
-                                        _occ_count += 1
                                 else:
-                                    # Focused window around the actual occurrence — gives
-                                    # the Architect the exact bytes to anchor a targeted edit.
-                                    _ws = max(0, _li - _MATCH_WINDOW)
-                                    _we = min(len(_file_lines_r), _li + _MATCH_WINDOW + 1)
-                                    _path_key = f"{_fname_r}::W{_ws}-{_we}"
+                                    _path_key = f"{_fname_r}::L{_lineno_r}"
                                     if _path_key not in _seen_sym_paths:
                                         _seen_sym_paths.add(_path_key)
+                                        _ws = max(0, _li - 15)
+                                        _we = min(len(_file_lines_r), _li + 16)
                                         _raw = "\n".join(
                                             f"{_ws + j + 1:5d}: {_file_lines_r[_ws + j]}"
                                             for j in range(_we - _ws)
                                         )
-                                        if _enc is not None:
-                                            _label = (
-                                                f"GREP MATCH ('{_term_r}') [{_fname_r} L{_lineno_r} "
-                                                f"in {_enc.full_path} ({_enc.symbol_type.value}, "
-                                                f"L{_enc.start_line}–{_enc.end_line})]"
-                                            )
-                                        else:
-                                            _label = f"GREP MATCH ('{_term_r}') [{_fname_r} L{_lineno_r}]"
+                                        _label = f"GREP MATCH ('{_term_r}') [{_fname_r} L{_lineno_r}]"
                                         _round_hits.append((_fname_r, _label, _raw))
-                                        _occ_count += 1
-
-                    try:
-                        print(
-                            "[NATURAL][react] round={} terms={} hits={} files={}".format(
-                                _react_round, _new_terms[:6], len(_round_hits),
-                                sorted({h[0] for h in _round_hits})[:12]
-                            ),
-                            flush=True,
-                        )
-                    except Exception:
-                        pass
+                                break
 
                     _round_text = ""
                     for _rh_fname, _rh_label, _rh_code in _round_hits:
@@ -6496,61 +6438,6 @@ def _smart_code_context(fname: str, content: str, smap, user_request: str,
     )
 
 
-def _resolve_session_filename(emitted: str, available_keys) -> str:
-    """Map an architect-emitted file path to the actual session-file key.
-
-    LLMs frequently trim leading path segments (e.g. they emit
-    'src/components/InlineDiffCard.tsx' when the stored key is
-    'frontend/src/components/InlineDiffCard.tsx'). The previous exact-key
-    lookup treated that drift as "file not found in session" and silently
-    dropped every drafted edit. This resolver tolerates the drift.
-
-    Resolution order — each step only resolves when UNAMBIGUOUS, so an edit is
-    never spliced into the wrong file:
-      1. Exact key match.
-      2. Normalized exact (strip leading './', backslashes -> '/').
-      3. Segment-boundary suffix match, either direction (one path is the
-         tail of the other on a '/' boundary).
-      4. Unique basename match.
-    Returns the resolved key, or '' when absent or ambiguous.
-    """
-    if not emitted:
-        return ""
-    keys = list(available_keys)
-    if emitted in keys:
-        return emitted
-
-    def _norm(p: str) -> str:
-        return p.replace("\\", "/").lstrip("./") if p else ""
-
-    e = _norm(emitted)
-
-    # 2. Normalized exact
-    for k in keys:
-        if _norm(k) == e:
-            return k
-
-    # 3. Segment-boundary suffix, bidirectional
-    def _seg_suffix(longer: str, shorter: str) -> bool:
-        return longer == shorter or longer.endswith("/" + shorter)
-
-    suffix_hits = [
-        k for k in keys
-        if _seg_suffix(_norm(k), e) or _seg_suffix(e, _norm(k))
-    ]
-    if len(suffix_hits) == 1:
-        return suffix_hits[0]
-    if len(suffix_hits) > 1:
-        return ""  # ambiguous -> do not guess
-
-    # 4. Unique basename
-    base = e.rsplit("/", 1)[-1]
-    base_hits = [k for k in keys if _norm(k).rsplit("/", 1)[-1] == base]
-    if len(base_hits) == 1:
-        return base_hits[0]
-    return ""
-
-
 def _fuzzy_find_symbol(smap, symbol_name: str):
     """
     Comprehensive symbol finder — tries 6 strategies before giving up.
@@ -6647,38 +6534,15 @@ def _build_symbol_correction(
     symbol_maps_by_name: dict,
 ) -> str:
     """
-    Build a correction message for Claude when edits could not be resolved.
-    Handles two cases:
-      - symbol_not_found: symbol name was wrong; show closest real symbols.
-      - fragment/anchor mismatch: symbol exists but new_code was a fragment or
-        old_code anchor didn't match; show actual symbol so Claude can anchor correctly.
+    Build a correction message for Claude when it referenced symbols that don't exist.
+    Shows the actual available symbols with full code so Claude can revise precisely.
 
     unresolved: list of dicts with keys: filename, symbol, new_code, description
     """
-    _has_snippet = any(item.get("_snippet_reason") for item in unresolved)
-    _has_missing = any(not item.get("_snippet_reason") for item in unresolved)
-
-    if _has_snippet and not _has_missing:
-        # All failures are fragment/anchor issues — symbol exists, edit couldn't anchor.
-        # Using "symbols don't exist" preamble here misleads Claude into thinking it
-        # picked wrong symbol names, so it responds with name corrections instead of
-        # generating new edit blocks. Use anchor-focused preamble instead.
-        parts = [
-            "Some of your edits could not be anchored to the current file content. "
-            "The symbols exist but the code snippets did not match. "
-            "Please revise the edits using the EXACT current content shown below — "
-            "copy old_code verbatim (no paraphrasing) or emit the complete symbol:\n"
-        ]
-    elif _has_snippet and _has_missing:
-        parts = [
-            "Some edits had issues — some symbols were not found, and some edits could not be "
-            "anchored to the file. Please revise using the actual content shown below:\n"
-        ]
-    else:
-        parts = [
-            "Some of the symbols you referenced don't exist in the files. "
-            "Here are the ACTUAL symbols available — please revise your edits to use these exact names:\n"
-        ]
+    parts = [
+        "Some of the symbols you referenced don't exist in the files. "
+        "Here are the ACTUAL symbols available — please revise your edits to use these exact names:\n"
+    ]
 
     for item in unresolved:
         filename = item.get("filename", "")
@@ -6778,20 +6642,10 @@ def _build_symbol_correction(
                 f"(L{cand.start_line}–{cand.end_line}):\n{numbered}{suffix}"
             )
 
-    # Footer branches on failure type so Claude knows what output is expected.
-    if _has_snippet and not _has_missing:
-        # Anchor mismatch: symbol name is right, code snippet didn't match.
-        # Tell Claude to emit blocks — no prose, no search calls, just blocks.
-        parts.append(
-            "\n\nRespond with ONLY your corrected <surgical_edit> blocks — no explanation, "
-            "no prose. Copy old_code VERBATIM from the lines shown above (or omit old_code "
-            "and put the entire updated symbol in new_code). Do NOT use <search_request>."
-        )
-    else:
-        parts.append(
-            "\n\nPlease rewrite your <surgical_edit> blocks using the EXACT symbol names shown above. "
-            "Make sure new_code is the complete replacement for the symbol you choose."
-        )
+    parts.append(
+        "\n\nPlease rewrite your <surgical_edit> blocks using the EXACT symbol names shown above. "
+        "Make sure new_code is the complete replacement for the symbol you choose."
+    )
     return "\n".join(parts)
 
 
@@ -7437,15 +7291,12 @@ async def run_natural_pipeline_stream(
 
         stream_kwargs = {
             "model": arch_model,
-            # Raised from 16000: large multi-file edits (e.g. a full folder loaded
-            # from GitHub) were exhausting the output budget mid-edit-block, which
-            # truncated the response and silently dropped every drafted edit.
-            "max_tokens": 32000,
+            "max_tokens": 16000,
             "system": system_prompt,
             "messages": messages,
         }
         if _supports_thinking(arch_model):
-            stream_kwargs["thinking"] = {"type": "adaptive"}
+            stream_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
 
         # ── Streaming loop with ReAct search + edit/file/search tag parsing ─────
         # Claude can emit <search_request>, <surgical_edit>, or <new_file> tags.
@@ -7456,11 +7307,6 @@ async def run_natural_pipeline_stream(
         new_file_blocks_raw: list = []
         full_response = ""
         in_thinking = False
-        # Set when the architect response is cut off (max_tokens) or a tag block
-        # is still open when the stream ends — used to record an honest skip
-        # reason + surface an accurate "response was cut off" message instead of
-        # a misleading "could not be matched to the current code".
-        _arch_truncated = False
 
         # Build the per-file content lookup once (reused across search rounds)
         file_content_lookup_stream: dict = {
@@ -7607,17 +7453,6 @@ async def run_natural_pipeline_stream(
                                     yield sse({"type": "thinking_end", "content": ""})
                                     in_thinking = False
 
-                        # Detect a hard output-budget cutoff (truncation) so we can
-                        # record an honest skip reason and an accurate user message
-                        # rather than silently dropping a half-written edit block.
-                        if search_requested is None:
-                            try:
-                                _final_msg = await astream.get_final_message()
-                                if getattr(_final_msg, "stop_reason", None) == "max_tokens":
-                                    _arch_truncated = True
-                            except Exception:
-                                pass
-
                         # If a search was requested mid-stream, break out of the event loop
                         if search_requested is not None:
                             break
@@ -7728,13 +7563,9 @@ async def run_natural_pipeline_stream(
         if in_thinking:
             yield sse({"type": "thinking_end", "content": ""})
         if state == "in_edit" and edit_buf.strip():
-            # An edit tag was still open when the stream ended — the block is
-            # incomplete, which means the response was cut off mid-edit.
-            _arch_truncated = True
             edit_blocks_raw.append(edit_buf)
             yield sse({"type": "edit_end", "content": ""})
         elif state == "in_file" and file_buf.strip():
-            _arch_truncated = True
             new_file_blocks_raw.append(file_buf)
             yield sse({"type": "edit_end", "content": ""})
 
@@ -7782,23 +7613,6 @@ async def run_natural_pipeline_stream(
                     try:
                         edit_data = json.loads(_repair_json(edit_raw.strip()))
                     except Exception:
-                        # An edit block could not be parsed. Previously this was a
-                        # silent `continue`, so a truncated/garbled block vanished
-                        # with zero telemetry and the user got a misleading
-                        # "could not be matched" message. Record it instead.
-                        _reason = "edit_block_truncated" if _arch_truncated else "edit_block_malformed"
-                        _snippet = (edit_raw or "").strip()[:80]
-                        skipped_messages.append(
-                            "An edit was cut off before it finished"
-                            if _reason == "edit_block_truncated"
-                            else "An edit block was malformed and could not be read"
-                            + (f" (starts with `{_snippet}...`)" if _snippet else "")
-                        )
-                        skipped_changes_struct.append({
-                            "filename": "", "symbol": "", "reason": _reason,
-                        })
-                        print(f"[NATURAL] dropped unparseable edit block "
-                              f"(reason={_reason}, len={len(edit_raw or '')}, truncated={_arch_truncated})")
                         continue
 
                 filename = edit_data.get("filename", "")
@@ -7808,44 +7622,12 @@ async def run_natural_pipeline_stream(
                 old_code = edit_data.get("old_code", "")  # SNIPPET / targeted edit
 
                 if not filename or not symbol_name or not new_code:
-                    # Required field missing. Previously a silent `continue`; now
-                    # recorded so the failure is visible and the user message is honest.
-                    _missing = [k for k, v in (("filename", filename),
-                                               ("symbol", symbol_name),
-                                               ("new_code", new_code)) if not v]
-                    _reason = "edit_block_truncated" if _arch_truncated else "edit_block_incomplete"
-                    skipped_messages.append(
-                        "An edit was cut off before it finished"
-                        if _reason == "edit_block_truncated"
-                        else f"An edit was missing required field(s): {', '.join(_missing)}"
-                    )
-                    skipped_changes_struct.append({
-                        "filename": filename or "", "symbol": symbol_name or "", "reason": _reason,
-                    })
-                    print(f"[NATURAL] dropped incomplete edit block "
-                          f"(missing={_missing}, truncated={_arch_truncated})")
                     continue
-
-                # Resolve the architect-emitted path to the real session key.
-                # The architect is shown the exact stored filename but LLMs
-                # routinely trim leading path segments (e.g. emit
-                # 'src/components/InlineDiffCard.tsx' for a stored
-                # 'frontend/src/components/InlineDiffCard.tsx'). Without this
-                # the exact-key lookup misses and every edit is dropped as
-                # "file not found in session".
-                _resolved_fname = _resolve_session_filename(filename, symbol_maps_by_name.keys())
-                if _resolved_fname and _resolved_fname != filename:
-                    print(f"[NATURAL] path normalized: '{filename}' -> '{_resolved_fname}'", flush=True)
-                    filename = _resolved_fname
 
                 file_content = file_content_lookup.get(filename, "")
                 smap, sf_entry = symbol_maps_by_name.get(filename, (None, None))
 
                 if not file_content or not smap:
-                    _avail = list(symbol_maps_by_name.keys())
-                    print(f"[NATURAL] file_not_in_session: emitted='{filename}' "
-                          f"resolved='{_resolved_fname}' available={_avail[:20]}"
-                          f"{' ...' if len(_avail) > 20 else ''}", flush=True)
                     skipped_messages.append(f"File '{filename}' not found in session")
                     skipped_changes_struct.append({
                         "filename": filename,
@@ -7953,18 +7735,7 @@ async def run_natural_pipeline_stream(
                                 f"anchored after {MAX_SYMBOL_RETRIES} correction attempts: {_snip_r}"
                             )
                             _reason = "edit_anchor_unmatched"
-                            _plog(
-                                event="edit_anchor_unmatched",
-                                symbol=item.get("symbol"),
-                                filename=item.get("filename"),
-                                snippet_reason=_snip_r,
-                            )
                         else:
-                            _plog(
-                                event="symbol_not_found",
-                                symbol=item.get("symbol"),
-                                filename=item.get("filename"),
-                            )
                             skipped_messages.append(
                                 f"Symbol '{item['symbol']}' not found in {item['filename']} after {MAX_SYMBOL_RETRIES} correction attempts"
                             )
@@ -7974,14 +7745,6 @@ async def run_natural_pipeline_stream(
                             "symbol": item.get("symbol", ""),
                             "reason": _reason,
                         })
-                        print(
-                            "[NATURAL][resolve] DROPPED edit symbol={!r} file={!r} "
-                            "reason={} snippet_reason={!r}".format(
-                                item.get("symbol", ""), item.get("filename", ""),
-                                _reason, item.get("_snippet_reason"),
-                            ),
-                            flush=True,
-                        )
                 break
 
             # ── Silent correction call ────────────────────────────────────
@@ -8026,40 +7789,7 @@ async def run_natural_pipeline_stream(
                         if _cb.endswith(EDIT_CLOSE):
                             new_pending.append(_cb[:-len(EDIT_CLOSE)])
                             _cb, _cs = "", "normal"
-                if new_pending:
-                    pending_edits = new_pending
-                else:
-                    # Correction produced no new edit blocks — record all still_unresolved
-                    # as failed immediately. If we fall through, the next round has nothing
-                    # to process, still_unresolved resets to [], and the items silently vanish
-                    # with no entry in skipped_messages (user sees generic fallback message).
-                    for _item in still_unresolved:
-                        _snip_r = _item.get("_snippet_reason")
-                        skipped_messages.append(
-                            f"Edit to '{_item.get('symbol', '')}' in {_item.get('filename', '')} "
-                            f"could not be resolved: the correction call produced no new edit blocks. "
-                            + (f"Fragment issue: {_snip_r}" if _snip_r else
-                               "The symbol reference could not be corrected.")
-                        )
-                        skipped_changes_struct.append({
-                            "filename": _item.get("filename", ""),
-                            "symbol": _item.get("symbol", ""),
-                            "reason": "correction_no_output",
-                        })
-                        print(
-                            f"[NATURAL][resolve] correction_no_output "
-                            f"symbol={_item.get('symbol')!r} file={_item.get('filename')!r} "
-                            f"snippet_reason={_snip_r!r}",
-                            flush=True,
-                        )
-                        _plog(
-                            event="correction_no_output",
-                            symbol=_item.get("symbol"),
-                            filename=_item.get("filename"),
-                            snippet_reason=_snip_r,
-                            corr_response=corr_text[:3000],
-                        )
-                    break
+                pending_edits = new_pending or []
 
             except Exception:
                 for item in still_unresolved:
@@ -8787,23 +8517,15 @@ async def run_natural_pipeline_stream(
             if edit_blocks_raw or new_file_blocks_raw:
                 _attempted = len(edit_blocks_raw) + len(new_file_blocks_raw)
                 _reasons = skipped_messages or [
-                    "The response was cut off before the edits finished."
-                    if _arch_truncated else
                     "The proposed edits could not be matched to the current code."
                 ]
                 _detail = "\n".join(f"• {m}" for m in _reasons[:10])
                 _plural = "them" if _attempted > 1 else "it"
-                _tail = (
-                    "My response was cut off before the edits were complete, which usually "
-                    "happens when a request spans a lot of code at once. Point me at the specific "
-                    "file or area you want changed and I'll complete it."
-                    if _arch_truncated else
-                    "This usually means the target spot moved or the file is large enough that I "
-                    "need another pass. Tell me the specific area to focus on and I'll re-target it."
-                )
                 _msg = (
                     f"I drafted {_attempted} change(s) but couldn't safely apply {_plural} to "
-                    f"the current code, so nothing was shipped:\n\n{_detail}\n\n" + _tail
+                    f"the current code, so nothing was shipped:\n\n{_detail}\n\n"
+                    "This usually means the target spot moved or the file is large enough that I "
+                    "need another pass. Tell me the specific area to focus on and I'll re-target it."
                 )
                 _fail_result = {
                     "intent": "edit",
