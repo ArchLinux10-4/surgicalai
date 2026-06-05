@@ -7709,10 +7709,24 @@ async def run_natural_pipeline_stream(
 
         MAX_SYMBOL_RETRIES = 2
         pending_edits = list(edit_blocks_raw)
+        _eb_summary = []
+        for _b in pending_edits:
+            try:
+                _bd = json.loads(_b.strip()) if isinstance(_b, str) else _b
+                _eb_summary.append({
+                    "sym": _bd.get("symbol", "?"),
+                    "file": _bd.get("filename", "?"),
+                    "has_old_code": bool(_bd.get("old_code")),
+                    "old_len": len(_bd.get("old_code", "")),
+                    "new_len": len(_bd.get("new_code", "")),
+                })
+            except Exception:
+                _eb_summary.append({"error": "parse_failed"})
         _dlog("edit_blocks_collected",
               session_id=session_id,
               count=len(pending_edits),
               blocks=pending_edits,
+              summary=_eb_summary,
                   user_id=user_id)
         resolved_edits: list = []
         skipped_messages: list = []
@@ -7782,6 +7796,34 @@ async def run_natural_pipeline_stream(
                             _accum_base, old_code, new_code
                         )
                         if ok_snip:
+                            # Structural-balance guard: detect when new_code changes
+                            # the net brace balance vs old_code (e.g. drops a closing })
+                            _ob_delta = old_code.count("{") - old_code.count("}")
+                            _nb_delta = new_code.count("{") - new_code.count("}")
+                            if abs(_ob_delta - _nb_delta) >= 1:
+                                _snip_bal_reason = (
+                                    f"brace_imbalance: your old_code had net {_ob_delta:+d} braces but new_code has net {_nb_delta:+d} — you likely dropped a closing '}' or '{'. Copy your old_code closing lines verbatim into new_code."
+                                )
+                                _dlog("snippet_structural_imbalance",
+                                      session_id=session_id,
+                                      filename=filename,
+                                      symbol=symbol_name,
+                                      old_brace_delta=_ob_delta,
+                                      new_brace_delta=_nb_delta,
+                                      old_code_tail=old_code[-300:],
+                                      new_code_tail=new_code[-300:],
+                                      user_id=user_id)
+                                still_unresolved.append({
+                                    "filename": filename,
+                                    "symbol": symbol_name,
+                                    "new_code": new_code,
+                                    "description": description,
+                                    "_raw": edit_raw,
+                                    "_snippet_reason": _snip_bal_reason,
+                                    "_symbol_code": _accum_base,
+                                    "_symbol_start": symbol.start_line,
+                                })
+                                continue
                             edit_data["new_code"] = full_new
                             edit_data.pop("old_code", None)  # now a full-symbol edit
                         else:
