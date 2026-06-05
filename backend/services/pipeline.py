@@ -2193,7 +2193,7 @@ async def analyze_and_plan_stream(
         # ------------------------------------------------------------------
         # Step 3: Search loop — Claude can request symbols via "search" intent
         # ------------------------------------------------------------------
-        MAX_SEARCH_ROUNDS = 4
+        MAX_SEARCH_ROUNDS = 10
         search_results = []
         plan_data = None
 
@@ -7364,7 +7364,7 @@ async def run_natural_pipeline_stream(
             sf["filename"]: sf.get("content", "") for sf in session_files
         }
 
-        MAX_SEARCH_ROUNDS = 4
+        MAX_SEARCH_ROUNDS = 10
         searched_terms: list = []                # terms fetched so far (avoid re-fetching)
         accumulated_search_results = ""          # injected into context each round
         current_messages = list(messages)        # grows with search result turns
