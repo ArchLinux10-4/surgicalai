@@ -6917,7 +6917,7 @@ def _build_natural_file_context(
             if lines_count <= 2500:
                 header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
             else:
-                smart = _smart_code_context(fname, content, smap, "", max_code_lines=1500)
+                smart = _smart_code_context(fname, content, smap, "", max_code_lines=lines_count)
                 header += f"\n[FILE > 2500 lines — showing top symbols up to 1500 lines]\n{smart}\n"
             return header
         else:
