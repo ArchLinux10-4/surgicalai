@@ -573,6 +573,79 @@ html{scroll-behavior:smooth}
   .sai-badge-part1{white-space:nowrap}
   .sai-badge-part2{white-space:nowrap}
 }
+
+/* TS QA DEEP DIVE */
+.sai-tsqa{padding:100px 24px;background:linear-gradient(180deg,#f8f7ff 0%,#eef6f3 50%,#f6f7fb 100%);position:relative;overflow:hidden}
+.sai-tsqa::before{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:radial-gradient(ellipse 50% 50% at 75% 30%,rgba(49,120,198,.06) 0%,transparent 65%);pointer-events:none}
+.sai-tsqa::after{content:'';position:absolute;top:0;left:0;right:0;bottom:0;background:radial-gradient(ellipse 40% 45% at 20% 80%,rgba(15,168,118,.05) 0%,transparent 60%);pointer-events:none}
+.sai-tsqa-wrap{max-width:1100px;margin:0 auto;position:relative;z-index:1}
+.sai-tsqa-head{text-align:center;margin-bottom:64px}
+.sai-tsqa-pill{display:inline-flex;align-items:center;gap:6px;background:rgba(49,120,198,.1);border:1px solid rgba(49,120,198,.3);color:#3178c6;font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;padding:6px 16px;border-radius:100px;margin-bottom:24px}
+.sai-tsqa-pill-icon{font-size:14px;line-height:1}
+.sai-tsqa-h2{font-size:clamp(36px,5vw,58px);font-weight:800;letter-spacing:-1.5px;line-height:1.08;color:#0f0d1a;margin:0 0 20px}
+.sai-tsqa-h2 .ts-grad{background:linear-gradient(135deg,#3178c6 0%,#0fa876 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
+.sai-tsqa-sub{font-size:18px;color:#4b4768;max-width:620px;margin:0 auto;line-height:1.65}
+.sai-tsqa-body{display:grid;grid-template-columns:1fr 1fr;gap:56px;align-items:start}
+.sai-tsqa-mockup{background:#0f0d1a;border:1px solid rgba(49,120,198,.2);border-radius:16px;overflow:hidden;box-shadow:0 24px 64px rgba(49,120,198,.12),0 4px 16px rgba(0,0,0,.15),0 0 0 1px rgba(49,120,198,.08)}
+.sai-tsqa-bar{height:38px;background:#161628;border-bottom:1px solid rgba(255,255,255,.06);display:flex;align-items:center;padding:0 14px;gap:7px}
+.sai-tsqa-bar-title{margin-left:10px;font-size:12px;color:rgba(255,255,255,.3);font-weight:500;font-family:'JetBrains Mono',monospace}
+.sai-tsqa-code{padding:16px 18px;border-bottom:1px solid rgba(255,255,255,.06);font-family:'JetBrains Mono','Fira Code',monospace;font-size:12px;line-height:1.8;min-height:130px}
+.sai-tsqa-ln{display:flex;gap:12px;min-height:22px;padding:0 2px;border-left:2px solid transparent;transition:all .4s ease}
+.sai-tsqa-num{color:#404060;width:24px;text-align:right;flex-shrink:0;user-select:none;font-size:11px}
+.sai-tsqa-ct{white-space:pre;color:#e0e0f0;transition:color .3s}
+.sai-tsqa-ct .kw{color:#a78bfa}
+.sai-tsqa-ct .fn{color:#60a5fa}
+.sai-tsqa-ct .str{color:#34d399}
+.sai-tsqa-ct .ty{color:#fbbf24}
+.sai-tsqa-ct .op{color:#7090b0}
+.sai-tsqa-ct .cm{color:#4b6080}
+.sai-tsqa-ln.ts-err{background:rgba(248,113,113,.08);border-left-color:rgba(248,113,113,.5)}
+.sai-tsqa-ln.ts-err .sai-tsqa-ct{color:#fca5a5}
+.sai-tsqa-ln.ts-fix{background:rgba(15,168,118,.08);border-left-color:rgba(15,168,118,.4)}
+.sai-tsqa-ln.ts-fix .sai-tsqa-ct{color:#6ee7b7}
+.sai-tsqa-squiggle{text-decoration:wavy underline #f87171;text-decoration-skip-ink:none;text-underline-offset:3px}
+.sai-tsqa-compiler{padding:14px 18px;font-family:'JetBrains Mono','Fira Code',monospace;font-size:11.5px;line-height:1.7;min-height:120px;display:flex;flex-direction:column;gap:2px}
+.sai-tsqa-tl{display:block;white-space:pre-wrap;word-break:break-all}
+.sai-tsqa-tl.t-cmd{color:#7dd3fc;font-weight:600}
+.sai-tsqa-tl.t-dim{color:rgba(255,255,255,.4)}
+.sai-tsqa-tl.t-err{color:#fca5a5}
+.sai-tsqa-tl.t-ok{color:#6ee7b7}
+.sai-tsqa-tl.t-info{color:#60a5fa}
+.sai-tsqa-tl.t-blank{height:8px}
+.sai-tsqa-tl.t-heal{color:#a78bfa}
+.sai-tsqa-pass-badge{display:inline-flex;align-items:center;gap:6px;background:linear-gradient(135deg,rgba(49,120,198,.3),rgba(10,168,118,.25));border:1px solid rgba(52,211,153,.4);color:#fff;padding:5px 13px;border-radius:6px;font-size:11.5px;font-weight:700;letter-spacing:.03em;animation:tsqaGlow 2s ease-in-out infinite}
+@keyframes tsqaGlow{0%,100%{box-shadow:0 0 16px rgba(52,211,153,.15)}50%{box-shadow:0 0 32px rgba(52,211,153,.35),0 0 48px rgba(49,120,198,.15)}}
+.sai-tsqa-fail-badge{display:inline-flex;align-items:center;gap:5px;background:rgba(248,113,113,.15);border:1px solid rgba(248,113,113,.3);color:#fca5a5;padding:4px 10px;border-radius:6px;font-size:11px;font-weight:700}
+.sai-tsqa-cursor{display:inline-block;width:7px;height:13px;background:#3178c6;vertical-align:middle;margin-left:1px;animation:tsqaBlink .7s step-end infinite}
+@keyframes tsqaBlink{0%,100%{opacity:1}50%{opacity:0}}
+.sai-tsqa-checks-title{font-size:22px;font-weight:800;letter-spacing:-.5px;color:var(--txt);margin-bottom:8px;line-height:1.2}
+.sai-tsqa-checks-sub{font-size:14px;color:var(--txt2);line-height:1.6;margin-bottom:28px}
+.sai-tsqa-checks{display:flex;flex-direction:column;gap:8px}
+.sai-tsqa-check{display:flex;align-items:center;gap:14px;padding:14px 16px;background:#fff;border:1.5px solid var(--border2);border-radius:12px;opacity:0;transform:translateY(10px);transition:all .45s ease}
+.sai-tsqa-check.visible{opacity:1;transform:none}
+.sai-tsqa-check.ts-passing{border-color:rgba(15,168,118,.35);background:rgba(15,168,118,.03)}
+.sai-tsqa-check.ts-failing{border-color:rgba(248,113,113,.35);background:rgba(248,113,113,.03)}
+.sai-tsqa-check.ts-healed{border-color:rgba(124,106,247,.35);background:rgba(124,106,247,.03)}
+.sai-tsqa-check-icon{width:32px;height:32px;border-radius:9px;flex-shrink:0;display:flex;align-items:center;justify-content:center;font-size:14px;transition:all .35s ease}
+.sai-tsqa-check-icon.pending{background:var(--bg3);border:1.5px solid var(--border2);color:var(--txt3)}
+.sai-tsqa-check-icon.pass{background:rgba(15,168,118,.12);border:1.5px solid rgba(15,168,118,.3);color:#0fa876}
+.sai-tsqa-check-icon.fail{background:rgba(248,113,113,.12);border:1.5px solid rgba(248,113,113,.3);color:#ef4444}
+.sai-tsqa-check-icon.heal{background:rgba(124,106,247,.12);border:1.5px solid rgba(124,106,247,.3);color:#6d5ce6}
+.sai-tsqa-check-text{flex:1}
+.sai-tsqa-check-text strong{display:block;font-size:14px;color:var(--txt);margin-bottom:2px;transition:color .3s}
+.sai-tsqa-check-text span{font-size:12px;color:var(--txt2);transition:color .3s}
+.sai-tsqa-check-status{font-size:10px;padding:3px 9px;border-radius:5px;font-weight:700;letter-spacing:.3px;text-transform:uppercase;flex-shrink:0;transition:all .35s ease}
+.sai-tsqa-check-status.waiting{background:var(--bg3);color:var(--txt3)}
+.sai-tsqa-check-status.passed{background:rgba(15,168,118,.12);color:#0fa876}
+.sai-tsqa-check-status.failed{background:rgba(248,113,113,.12);color:#ef4444}
+.sai-tsqa-check-status.healed{background:rgba(124,106,247,.12);color:#6d5ce6}
+.sai-tsqa-stats{display:grid;grid-template-columns:repeat(3,1fr);gap:0;border-top:1px solid rgba(49,120,198,.12);padding-top:56px;margin-top:72px}
+.sai-tsqa-stat{text-align:center;padding:0 16px;position:relative}
+.sai-tsqa-stat+.sai-tsqa-stat::before{content:'';position:absolute;left:0;top:20%;height:60%;width:1px;background:rgba(49,120,198,.12)}
+.sai-tsqa-stat-n{display:block;font-size:48px;font-weight:800;letter-spacing:-2px;background:linear-gradient(135deg,#3178c6 0%,#0fa876 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1;margin-bottom:10px}
+.sai-tsqa-stat-l{font-size:13.5px;color:#4b4768;line-height:1.4}
+@media(max-width:900px){.sai-tsqa-body{grid-template-columns:1fr;gap:40px}}
+@media(max-width:600px){.sai-tsqa-stats{grid-template-columns:1fr;gap:28px}.sai-tsqa-stat+.sai-tsqa-stat::before{display:none}}
 `;
 
 export function LandingPage() {
@@ -1116,6 +1189,208 @@ export function LandingPage() {
     };
   }, []);
 
+  // ── TypeScript QA deep-dive animation ──────────────────────────────────
+  useEffect(() => {
+    const mockup = document.getElementById('tsqaMockup');
+    if (!mockup) return;
+
+    const compiler = document.getElementById('tsqaCompiler') as HTMLElement;
+    const errLine = document.getElementById('tsqaErrLine') as HTMLElement;
+    const fixLine = document.getElementById('tsqaFixLine') as HTMLElement;
+    if (!compiler || !errLine || !fixLine) return;
+
+    const checkIds = ['tsqaC1','tsqaC2','tsqaC3','tsqaC4','tsqaC5'];
+    let fired = false;
+    let cursorEl: HTMLElement | null = null;
+
+    function setCur(parent: HTMLElement) {
+      rmCur();
+      cursorEl = document.createElement('span');
+      cursorEl.className = 'sai-tsqa-cursor';
+      parent.appendChild(cursorEl);
+    }
+    function rmCur() {
+      if (cursorEl && cursorEl.parentNode) cursorEl.parentNode.removeChild(cursorEl);
+      cursorEl = null;
+    }
+    function addLine(cls: string, text?: string): HTMLElement {
+      const el = document.createElement('span');
+      el.className = 'sai-tsqa-tl ' + cls;
+      if (text) el.textContent = text;
+      compiler.appendChild(el);
+      compiler.scrollTop = compiler.scrollHeight;
+      return el;
+    }
+    function typeLine(cls: string, text: string, speed: number, done: () => void) {
+      rmCur();
+      const el = document.createElement('span');
+      el.className = 'sai-tsqa-tl ' + cls;
+      compiler.appendChild(el);
+      setCur(el);
+      let i = 0;
+      function step() {
+        if (i < text.length) {
+          el.insertBefore(document.createTextNode(text[i++]), cursorEl);
+          compiler.scrollTop = compiler.scrollHeight;
+          setTimeout(step, speed + Math.random() * speed * 0.35);
+        } else { rmCur(); done(); }
+      }
+      step();
+    }
+    function showCheck(idx: number, done?: () => void) {
+      const el = document.getElementById(checkIds[idx]);
+      if (el) el.classList.add('visible');
+      if (done) setTimeout(done, 120);
+    }
+    function setCheckState(idx: number, state: 'pass' | 'fail' | 'heal') {
+      const el = document.getElementById(checkIds[idx]);
+      const icon = document.getElementById(checkIds[idx] + 'Icon');
+      const status = document.getElementById(checkIds[idx] + 'Status');
+      if (!el || !icon || !status) return;
+      el.classList.remove('ts-passing','ts-failing','ts-healed');
+      icon.classList.remove('pending','pass','fail','heal');
+      status.classList.remove('waiting','passed','failed','healed');
+      if (state === 'pass') {
+        el.classList.add('ts-passing');
+        icon.classList.add('pass'); icon.textContent = '✓';
+        status.classList.add('passed'); status.textContent = 'Passed';
+      } else if (state === 'fail') {
+        el.classList.add('ts-failing');
+        icon.classList.add('fail'); icon.textContent = '✗';
+        status.classList.add('failed'); status.textContent = 'Failed';
+      } else {
+        el.classList.add('ts-healed');
+        icon.classList.add('heal'); icon.textContent = '↻';
+        status.classList.add('healed'); status.textContent = 'Healed';
+      }
+    }
+    function wait(ms: number, fn: () => void) { setTimeout(fn, ms); }
+
+    function run() {
+      compiler.innerHTML = '';
+
+      // Phase 1: Reveal checks one by one
+      let ci = 0;
+      function revealNext() {
+        if (ci >= checkIds.length) { wait(300, startCompile); return; }
+        showCheck(ci, () => { ci++; setTimeout(revealNext, 140); });
+      }
+      revealNext();
+
+      function startCompile() {
+        // Highlight error line
+        errLine.classList.add('ts-err');
+
+        typeLine('t-cmd', '$ tsc --noEmit --strict UserService.ts', 25, () => {
+          wait(200, () => {
+            addLine('t-blank');
+            // Checks 1 & 2 pass immediately
+            setCheckState(0, 'pass');
+            wait(300, () => {
+              setCheckState(1, 'pass');
+              wait(400, () => {
+                addLine('t-dim', 'Compiling with strictNullChecks...');
+                wait(700, () => {
+                  addLine('t-err', 'UserService.ts(8,23): error TS2532:');
+                  wait(120, () => {
+                    addLine('t-err', '  Object is possibly \'undefined\'.');
+                    wait(120, () => {
+                      addLine('t-err', '  user.email.toUpperCase()');
+                      wait(100, () => {
+                        addLine('t-err', '       ~~~~~');
+                        wait(350, () => {
+                          // Check 3 fails
+                          setCheckState(2, 'fail');
+                          wait(200, () => {
+                            // Check 4 also flags
+                            setCheckState(3, 'fail');
+                            wait(300, () => {
+                              const warnLine = addLine('t-err', '');
+                              const badge = document.createElement('span');
+                              badge.className = 'sai-tsqa-fail-badge';
+                              badge.textContent = '❌ 1 error · QA Score: 2 / 10';
+                              warnLine.appendChild(badge);
+                              compiler.scrollTop = compiler.scrollHeight;
+
+                              // Phase 2: Auto-heal
+                              wait(700, () => {
+                                addLine('t-blank');
+                                addLine('t-heal', '↻ Auto-heal attempt 1 / 3');
+                                wait(350, () => {
+                                  typeLine('t-heal', '  Claude: TS2532 → optional chaining + nullish coalescing', 15, () => {
+                                    wait(300, () => {
+                                      addLine('t-dim', '  Patching line 8...');
+                                      // Swap code lines
+                                      wait(400, () => {
+                                        errLine.classList.remove('ts-err');
+                                        errLine.style.display = 'none';
+                                        fixLine.style.display = '';
+                                        fixLine.classList.add('ts-fix');
+                                        setCheckState(2, 'heal');
+                                        setCheckState(3, 'heal');
+
+                                        // Phase 3: Re-run
+                                        wait(500, () => {
+                                          addLine('t-blank');
+                                          typeLine('t-cmd', '$ tsc --noEmit --strict UserService.ts', 25, () => {
+                                            wait(200, () => {
+                                              addLine('t-dim', 'Compiling with strictNullChecks...');
+                                              wait(800, () => {
+                                                addLine('t-ok', '✓  0 errors  ·  0 warnings');
+                                                setCheckState(0, 'pass');
+                                                setCheckState(1, 'pass');
+                                                setCheckState(2, 'pass');
+                                                wait(200, () => {
+                                                  setCheckState(3, 'pass');
+                                                  wait(200, () => {
+                                                    setCheckState(4, 'pass');
+                                                    wait(350, () => {
+                                                      addLine('t-blank');
+                                                      const passEl = addLine('t-ok', '');
+                                                      const passBadge = document.createElement('span');
+                                                      passBadge.className = 'sai-tsqa-pass-badge';
+                                                      passBadge.textContent = '✦ QA PASS · Score: 9.6 / 10 · Auto-healed';
+                                                      passEl.appendChild(passBadge);
+                                                      compiler.scrollTop = compiler.scrollHeight;
+                                                    });
+                                                  });
+                                                });
+                                              });
+                                            });
+                                          });
+                                        });
+                                      });
+                                    });
+                                  });
+                                });
+                              });
+                            });
+                          });
+                        });
+                      });
+                    });
+                  });
+                });
+              });
+            });
+          });
+        });
+      }
+    }
+
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting && !fired) {
+          fired = true;
+          obs.disconnect();
+          run();
+        }
+      });
+    }, { threshold: 0.2 });
+    obs.observe(mockup);
+    return () => obs.disconnect();
+  }, []);
+
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [formSuccess, setFormSuccess] = useState(false);
   const [formSubmitting, setFormSubmitting] = useState(false);
@@ -1523,6 +1798,97 @@ export function LandingPage() {
             <div className="sai-qa-stat"><span className="sai-qa-stat-n">0</span><span className="sai-qa-stat-l">Silent failures —<br/>every error surfaces</span></div>
             <div className="sai-qa-stat"><span className="sai-qa-stat-n">≤3</span><span className="sai-qa-stat-l">Hard-fail score on<br/>any TS error</span></div>
             <div className="sai-qa-stat"><span className="sai-qa-stat-n">10</span><span className="sai-qa-stat-l">Point scoring<br/>per change</span></div>
+          </div>
+        </div>
+      </section>
+
+      {/* TS QA DEEP DIVE */}
+      <section className="sai-tsqa">
+        <div className="sai-tsqa-wrap">
+          <div className="sai-tsqa-head">
+            <div className="sai-tsqa-pill">
+              <span className="sai-tsqa-pill-icon">TS</span>
+              TypeScript-First QA
+            </div>
+            <h2 className="sai-tsqa-h2">Strict mode. <span className="ts-grad">Zero escape hatches.</span></h2>
+            <p className="sai-tsqa-sub">Every surgical edit is compiled with TypeScript's strictest flags. Type errors don't slip through — they get caught, diagnosed, and auto-healed before your code is touched.</p>
+          </div>
+          <div className="sai-tsqa-body">
+            {/* Left: compiler mockup */}
+            <div className="sai-tsqa-mockup" id="tsqaMockup">
+              <div className="sai-tsqa-bar">
+                <span className="sai-term-btn r"></span>
+                <span className="sai-term-btn y"></span>
+                <span className="sai-term-btn g"></span>
+                <span className="sai-tsqa-bar-title">tsc — strict · UserService.ts</span>
+              </div>
+              <div className="sai-tsqa-code" id="tsqaCode">
+                <div className="sai-tsqa-ln"><span className="sai-tsqa-num">1</span><span className="sai-tsqa-ct"><span className="kw">interface</span> <span className="ty">User</span> {'{'}</span></div>
+                <div className="sai-tsqa-ln"><span className="sai-tsqa-num">2</span><span className="sai-tsqa-ct">  id: <span className="ty">string</span>;</span></div>
+                <div className="sai-tsqa-ln"><span className="sai-tsqa-num">3</span><span className="sai-tsqa-ct">  name: <span className="ty">string</span>;</span></div>
+                <div className="sai-tsqa-ln"><span className="sai-tsqa-num">4</span><span className="sai-tsqa-ct">  email?: <span className="ty">string</span>;</span></div>
+                <div className="sai-tsqa-ln"><span className="sai-tsqa-num">5</span><span className="sai-tsqa-ct">{'}'};</span></div>
+                <div className="sai-tsqa-ln"><span className="sai-tsqa-num">6</span><span className="sai-tsqa-ct"></span></div>
+                <div className="sai-tsqa-ln"><span className="sai-tsqa-num">7</span><span className="sai-tsqa-ct"><span className="kw">function</span> <span className="fn">getDisplayName</span>(user: <span className="ty">User</span>): <span className="ty">string</span> {'{'}</span></div>
+                <div className="sai-tsqa-ln" id="tsqaErrLine"><span className="sai-tsqa-num">8</span><span className="sai-tsqa-ct">  <span className="kw">const</span> label = <span className="sai-tsqa-squiggle">user.email.toUpperCase()</span>;</span></div>
+                <div className="sai-tsqa-ln" id="tsqaFixLine" style={{display:'none'}}><span className="sai-tsqa-num">8</span><span className="sai-tsqa-ct">  <span className="kw">const</span> label = user.email?.<span className="fn">toUpperCase</span>() ?? user.name;</span></div>
+                <div className="sai-tsqa-ln"><span className="sai-tsqa-num">9</span><span className="sai-tsqa-ct">  <span className="kw">return</span> <span className="str">`${'{'}</span><span className="str">label{'}'} (${'{'}</span><span className="str">user.id{'}'})`</span>;</span></div>
+                <div className="sai-tsqa-ln"><span className="sai-tsqa-num">10</span><span className="sai-tsqa-ct">{'}'};</span></div>
+              </div>
+              <div className="sai-tsqa-compiler" id="tsqaCompiler"></div>
+            </div>
+            {/* Right: checklist */}
+            <div>
+              <h3 className="sai-tsqa-checks-title">Every flag. Every check.<br/>Every time.</h3>
+              <p className="sai-tsqa-checks-sub">The QA gate runs the full TypeScript compiler against your edit — not a linter, not a regex. Real <code style={{background:'rgba(49,120,198,.1)',color:'#3178c6',padding:'2px 6px',borderRadius:'4px',fontFamily:"'JetBrains Mono',monospace",fontSize:'12px',border:'1px solid rgba(49,120,198,.2)'}}>tsc</code> with your project's tsconfig.</p>
+              <div className="sai-tsqa-checks">
+                <div className="sai-tsqa-check" id="tsqaC1">
+                  <div className="sai-tsqa-check-icon pending" id="tsqaC1Icon">⚙</div>
+                  <div className="sai-tsqa-check-text">
+                    <strong>--strict enabled</strong>
+                    <span>strictNullChecks, noImplicitAny, strictFunctionTypes</span>
+                  </div>
+                  <span className="sai-tsqa-check-status waiting" id="tsqaC1Status">Waiting</span>
+                </div>
+                <div className="sai-tsqa-check" id="tsqaC2">
+                  <div className="sai-tsqa-check-icon pending" id="tsqaC2Icon">📦</div>
+                  <div className="sai-tsqa-check-text">
+                    <strong>--noEmit validation</strong>
+                    <span>Type-checks without generating output files</span>
+                  </div>
+                  <span className="sai-tsqa-check-status waiting" id="tsqaC2Status">Waiting</span>
+                </div>
+                <div className="sai-tsqa-check" id="tsqaC3">
+                  <div className="sai-tsqa-check-icon pending" id="tsqaC3Icon">🔍</div>
+                  <div className="sai-tsqa-check-text">
+                    <strong>Null safety analysis</strong>
+                    <span>Optional chaining, nullish coalescing, strict null guards</span>
+                  </div>
+                  <span className="sai-tsqa-check-status waiting" id="tsqaC3Status">Waiting</span>
+                </div>
+                <div className="sai-tsqa-check" id="tsqaC4">
+                  <div className="sai-tsqa-check-icon pending" id="tsqaC4Icon">🧬</div>
+                  <div className="sai-tsqa-check-text">
+                    <strong>Type assignability</strong>
+                    <span>TS2322, TS2345 — argument and assignment mismatches</span>
+                  </div>
+                  <span className="sai-tsqa-check-status waiting" id="tsqaC4Status">Waiting</span>
+                </div>
+                <div className="sai-tsqa-check" id="tsqaC5">
+                  <div className="sai-tsqa-check-icon pending" id="tsqaC5Icon">🔄</div>
+                  <div className="sai-tsqa-check-text">
+                    <strong>Auto-heal verification</strong>
+                    <span>Claude re-reads error + live file, patches, and re-runs tsc</span>
+                  </div>
+                  <span className="sai-tsqa-check-status waiting" id="tsqaC5Status">Waiting</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div className="sai-tsqa-stats">
+            <div className="sai-tsqa-stat"><span className="sai-tsqa-stat-n">--strict</span><span className="sai-tsqa-stat-l">Full strict mode<br/>on every compile</span></div>
+            <div className="sai-tsqa-stat"><span className="sai-tsqa-stat-n">TS2345</span><span className="sai-tsqa-stat-l">Real error codes<br/>not regex guesses</span></div>
+            <div className="sai-tsqa-stat"><span className="sai-tsqa-stat-n">3×</span><span className="sai-tsqa-stat-l">Auto-heal retries<br/>fresh file each time</span></div>
           </div>
         </div>
       </section>
