@@ -114,7 +114,12 @@ export const useAppStore = create<AppState>((set) => ({
   setSessions: (sessions) => set({ sessions }),
   setActiveSession: (activeSessions) => set({ activeSessions }),
   setMessages: (messages) => set({ messages }),
-  addMessage: (m) => set((state) => ({ messages: [...state.messages, m] })),
+  addMessage: (m) => set((state) => {
+    // Guard: drop messages that belong to a different session (prevents
+    // cross-session bleed when the user switches tabs mid-stream)
+    if (m.session_id && state.activeSessions && m.session_id !== state.activeSessions) return {}
+    return { messages: [...state.messages, m] }
+  }),
   setLoading: (isLoading) => set({ isLoading }),
 
   surgicalAnalysis: null,

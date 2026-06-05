@@ -1124,7 +1124,7 @@ export function ChatPanel() {
         ) : (
           <div className="py-2">
             {messages.map((msg, i) => (
-              <Message key={msg.id || i} msg={msg} sessionId={activeSessions || ''} />
+              <Message key={msg.id || i} msg={msg} sessionId={msg.session_id || activeSessions || ''} />
             ))}
             <TaskListPanel />
             {isStreaming && (streamingMessage || streamProgress) && (

@@ -590,7 +590,7 @@ export function MobileChatPanel() {
               <MessageBubble
                 key={msg.id || i}
                 msg={msg}
-                sessionId={activeSessions || ''}
+                sessionId={msg.session_id || activeSessions || ''}
                 sessionFiles={sessionFiles}
                 setSessionFiles={setSessionFiles}
               />
