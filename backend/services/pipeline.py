@@ -7802,7 +7802,7 @@ async def run_natural_pipeline_stream(
                             _nb_delta = new_code.count("{") - new_code.count("}")
                             if abs(_ob_delta - _nb_delta) >= 1:
                                 _snip_bal_reason = (
-                                    f"brace_imbalance: your old_code had net {_ob_delta:+d} braces but new_code has net {_nb_delta:+d} — you likely dropped a closing '}' or '{'. Copy your old_code closing lines verbatim into new_code."
+                                    ("brace_imbalance: your old_code had net " + str(_ob_delta) + " braces " + "but new_code has net " + str(_nb_delta) + " braces " + " \u2014 you likely dropped a closing } or {. " + "Copy your old_code closing lines verbatim into new_code.")
                                 )
                                 _dlog("snippet_structural_imbalance",
                                       session_id=session_id,
