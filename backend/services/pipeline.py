@@ -6614,92 +6614,26 @@ def _build_symbol_correction(
             if _sym_code:
                 _sc_lines = _sym_code.splitlines()
                 _sc_start = item.get("_symbol_start", 1) or 1
-                # Large symbols: show head + tail so the model can pick a real
-                # anchor near either end without flooding the context.
-                _HEAD, _TAIL = 220, 80
-                if len(_sc_lines) > _HEAD + _TAIL + 10:
-                    head = "\n".join(
-                        f"   {_sc_start + i:5d}: {_sc_lines[i]}" for i in range(_HEAD)
-                    )
-                    tail_start = len(_sc_lines) - _TAIL
-                    tail = "\n".join(
-                        f"   {_sc_start + tail_start + i:5d}: {_sc_lines[tail_start + i]}"
-                        for i in range(_TAIL)
-                    )
-                    gap = len(_sc_lines) - _HEAD - _TAIL
+                # Always show full symbol — no head/tail truncation.
+                # Truncation was the root cause of repeated anchor misses:
+                # Claude invented anchors for the omitted middle it never saw.
+                # Tasklet model: see everything, copy exact text, splice targeted edit.
+                numbered = "\n".join(
+                    f"   {_sc_start + i:5d}: {_sc_lines[i]}" for i in range(len(_sc_lines))
+                )
+                parts.append(
+                    f"\n   ACTUAL current content of '{bad_name}' "
+                    f"(copy an \"old_code\" anchor VERBATIM from here):\n{numbered}"
+                )
+                if len(_sc_lines) > 100:
                     parts.append(
-                        f"\n   ACTUAL current content of '{bad_name}' "
-                        f"(copy an \"old_code\" anchor VERBATIM from here):\n"
-                        f"{head}\n   ... [{gap} more lines omitted] ...\n{tail}"
-                    )
-                    # ── Focused-anchor window ─────────────────────────────────
-                    # When the attempted old_code anchor falls in the omitted
-                    # middle, find the closest real line and show ±60 lines so
-                    # Claude can copy a verbatim anchor instead of re-inventing.
-                    _raw_edit = item.get("_raw", "")
-                    _old_tried = ""
-                    if _raw_edit:
-                        try:
-                            _old_tried = json.loads(_raw_edit.strip()).get("old_code", "")
-                        except Exception:
-                            pass
-                    if _old_tried:
-                        _needle_lines = [
-                            _ln.strip() for _ln in _old_tried.splitlines()
-                            if len(_ln.strip()) >= 15
-                        ]
-                        _anc_idx = -1
-                        # Step 1: exact substring match within omitted middle
-                        for _nl in _needle_lines[:6]:
-                            for _lj, _ltxt in enumerate(_sc_lines):
-                                if _HEAD <= _lj < len(_sc_lines) - _TAIL:
-                                    if _nl in _ltxt or _ltxt.strip() in _nl:
-                                        _anc_idx = _lj
-                                        break
-                            if _anc_idx >= 0:
-                                break
-                        # Step 2: fuzzy best-match (SequenceMatcher) in omitted middle
-                        if _anc_idx == -1 and _needle_lines:
-                            _best_r = 0.0
-                            for _nl_f in _needle_lines[:4]:
-                                for _lj, _ltxt in enumerate(_sc_lines):
-                                    if _HEAD <= _lj < len(_sc_lines) - _TAIL:
-                                        _r = difflib.SequenceMatcher(
-                                            None,
-                                            _nl_f.lower(),
-                                            _ltxt.strip().lower()
-                                        ).ratio()
-                                        if _r > _best_r:
-                                            _best_r = _r
-                                            _anc_idx = _lj
-                            if _best_r < 0.45:
-                                _anc_idx = -1
-                        if _anc_idx >= 0:
-                            _WIN = 60
-                            _ws = max(0, _anc_idx - _WIN)
-                            _we = min(len(_sc_lines), _anc_idx + _WIN + 1)
-                            _focused_win = "\n".join(
-                                f"   {_sc_start + _ws + _k:5d}: {_sc_lines[_ws + _k]}"
-                                for _k in range(_we - _ws)
-                            )
-                            parts.append(
-                                f"\n   ⚠️ INSERTION AREA — your attempted anchor was in the "
-                                f"omitted section. Copy \"old_code\" VERBATIM from this "
-                                f"focused window "
-                                f"(L{_sc_start + _ws}–L{_sc_start + _we - 1}):\n{_focused_win}"
-                            )
-                            parts.append(
-                                f"\n   ✏️  TARGETED EDIT REQUIRED — this symbol is {len(_sc_lines)} lines."
-                                f" DO NOT re-emit the entire symbol.\n"
-                                f"   In your <surgical_edit> use:\n"
-                                f"     \"old_code\": an EXACT verbatim snippet from the INSERTION AREA window above\n"
-                                f"     \"new_code\": only the replacement for that snippet\n"
-                                f"   The server splices it in — everything else is preserved automatically.\n"
-                                f"   ❌ Do NOT emit a <search_request>. The lines you need are already shown above."
-                            )
-                else:
-                    numbered = "\n".join(
-                        f"   {_sc_start + i:5d}: {_sc_lines[i]}" for i in range(len(_sc_lines))
+                        f"\n   ✏️  TARGETED EDIT REQUIRED — this symbol is {len(_sc_lines)} lines."
+                        f" DO NOT re-emit the entire symbol.\n"
+                        f"   In your <surgical_edit> use:\n"
+                        f"     \"old_code\": an EXACT verbatim snippet (≥3 lines) from the content above\n"
+                        f"     \"new_code\": only the replacement for that snippet\n"
+                        f"   The server splices it in — everything else is preserved automatically.\n"
+                        f"   ❌ Do NOT emit a <search_request>. The full symbol is shown above."
                     )
                     parts.append(
                         f"\n   ACTUAL current content of '{bad_name}' "
@@ -6975,16 +6909,10 @@ def _build_natural_file_context(
                 f"FILE: {fname} ({lines_count} lines)\n"
                 f"SYMBOL INDEX (use these EXACT names in surgical_edit):\n{sym_index}\n"
             )
-            if lines_count <= 300:
-                header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
-            else:
-                smart_ctx = _smart_code_context(fname, content, smap, user_request, max_code_lines=350)
-                if smart_ctx:
-                    header += smart_ctx + "\n"
-                else:
-                    grep_hit = _grep_relevant_sections(user_request, fname, content)
-                    if grep_hit:
-                        header += grep_hit + "\n"
+            # Always show full content for Tier-1 files — no truncation.
+            # Truncation caused anchor-miss failures: Claude invented anchors
+            # for lines it never saw. Tasklet model: see everything you edit.
+            header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
             return header
         else:
             preview = content[:1500] + (f"\n...[{len(content)-1500} chars]" if len(content) > 1500 else "")
