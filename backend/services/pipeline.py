@@ -2218,7 +2218,7 @@ async def analyze_and_plan_stream(
                 "messages": messages,
             }
             if _supports_thinking(architect_model):
-                model_kwargs["thinking"] = {"type": "adaptive", "budget_tokens": 8000}
+                model_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
 
             full_text = ""
             in_thinking = False
@@ -4215,7 +4215,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 async with aclient.messages.stream(
                     model=chat_model,
                     max_tokens=16000,
-                    **(({"thinking": {"type": "adaptive", "budget_tokens": 10000}}) if _supports_thinking(chat_model) else {}),
+                    **(({"thinking": {"type": "enabled", "budget_tokens": 10000}}) if _supports_thinking(chat_model) else {}),
                     system=system,
                     messages=claude_msgs,
                 ) as astream:
@@ -4580,7 +4580,7 @@ USER REQUEST:
                         async with aclient.messages.stream(
                             model=arch_model,
                             max_tokens=16000,
-                            **({"thinking": {"type": "adaptive", "budget_tokens": 10000}}
+                            **({"thinking": {"type": "enabled", "budget_tokens": 10000}}
                                if _supports_thinking(arch_model) else {}),
                             system=_architect_system,
                             messages=_arch_history_msgs + [{"role": "user",
@@ -4629,7 +4629,7 @@ USER REQUEST:
                                 async with aclient.messages.stream(
                                     model=arch_model,
                                     max_tokens=16000,
-                                    **({"thinking": {"type": "adaptive",
+                                    **({"thinking": {"type": "enabled",
                                                     "budget_tokens": 10000}}
                                        if _supports_thinking(arch_model) else {}),
                                     system=_architect_system,
@@ -7347,7 +7347,7 @@ async def run_natural_pipeline_stream(
             "messages": messages,
         }
         if _supports_thinking(arch_model):
-            stream_kwargs["thinking"] = {"type": "adaptive", "budget_tokens": 8000}
+            stream_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
 
         # ── Streaming loop with ReAct search + edit/file/search tag parsing ─────
         # Claude can emit <search_request>, <surgical_edit>, or <new_file> tags.
