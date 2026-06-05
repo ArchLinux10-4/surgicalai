@@ -242,12 +242,78 @@ def _expand_paths(repo, branch: str, paths: List[str]):
     return out, truncated
 
 
+def _fetch_and_store_file(r, path: str, body: "LoadFilesRequest", parser, lang_map: dict):
+    """Fetch a single file from GitHub, parse it, and write it to the DB.
+
+    Runs inside a thread — each call opens its own DB connection so there
+    are no SQLite cross-thread sharing issues.
+    Returns (file_dict, None) on success or (None, error_dict) on failure.
+    """
+    try:
+        content_file = r.get_contents(path, ref=body.branch)
+        raw = base64.b64decode(content_file.content).decode("utf-8", errors="replace")
+        filename = content_file.name
+        ext = Path(filename).suffix.lower()
+        language = lang_map.get(ext, "plaintext")
+        line_count = len(raw.splitlines())
+        try:
+            smap = parser.parse(raw, filename)
+            symbol_count = len(smap.symbols)
+        except Exception:
+            symbol_count = 0
+
+        github_meta = json.dumps({
+            "owner": body.owner,
+            "repo": body.repo,
+            "branch": body.branch,
+            "path": path,
+            "sha": content_file.sha,
+        })
+
+        conn = get_db()
+        existing = conn.execute(
+            "SELECT id FROM session_files WHERE session_id = ? AND filename = ?",
+            (body.session_id, filename)
+        ).fetchone()
+
+        if existing:
+            file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
+            conn.execute(
+                "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, github_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (raw, language, line_count, symbol_count, github_meta, file_id)
+            )
+        else:
+            file_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, github_meta, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'code', ?, CURRENT_TIMESTAMP)",
+                (file_id, body.session_id, filename, raw, language, line_count, symbol_count, github_meta)
+            )
+        conn.commit()
+        conn.close()
+
+        return ({
+            "id": file_id,
+            "session_id": body.session_id,
+            "filename": filename,
+            "language": language,
+            "lines": line_count,
+            "symbol_count": symbol_count,
+            "file_type": "code",
+            "github_meta": github_meta,
+            "updated_at": None,
+            "created_at": None,
+        }, None)
+    except Exception as e:
+        return (None, {"path": path, "error": str(e)})
+
+
 @router.post("/load")
 def load_files(body: LoadFilesRequest, request: Request):
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from services.ast_parser import ASTParser
+
     user_id = _get_user_id(request)
     g = _get_github_client(user_id)
-
-    from services.ast_parser import ASTParser
     parser = ASTParser()
 
     lang_map = {
@@ -263,69 +329,23 @@ def load_files(body: LoadFilesRequest, request: Request):
 
     try:
         r = g.get_repo(f"{body.owner}/{body.repo}")
-        # Expand any directory paths into their full recursive file list so
-        # that subdirectories are included, not just the top level.
         file_paths, truncated = _expand_paths(r, body.branch, body.paths)
         loaded = []
         errors = []
 
-        for path in file_paths:
-            try:
-                content_file = r.get_contents(path, ref=body.branch)
-                raw = base64.b64decode(content_file.content).decode("utf-8", errors="replace")
-                filename = content_file.name
-                ext = Path(filename).suffix.lower()
-                language = lang_map.get(ext, "plaintext")
-                lines = len(raw.splitlines())
-                try:
-                    smap = parser.parse(raw, filename)
-                    symbol_count = len(smap.symbols)
-                except Exception:
-                    symbol_count = 0
-
-                github_meta = json.dumps({
-                    "owner": body.owner,
-                    "repo": body.repo,
-                    "branch": body.branch,
-                    "path": path,
-                    "sha": content_file.sha,
-                })
-
-                conn = get_db()
-                existing = conn.execute(
-                    "SELECT id FROM session_files WHERE session_id = ? AND filename = ?",
-                    (body.session_id, filename)
-                ).fetchone()
-
-                if existing:
-                    file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
-                    conn.execute(
-                        "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, github_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                        (raw, language, lines, symbol_count, github_meta, file_id)
-                    )
-                else:
-                    file_id = str(uuid.uuid4())
-                    conn.execute(
-                        "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, github_meta, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'code', ?, CURRENT_TIMESTAMP)",
-                        (file_id, body.session_id, filename, raw, language, lines, symbol_count, github_meta)
-                    )
-                conn.commit()
-                conn.close()
-
-                loaded.append({
-                    "id": file_id,
-                    "session_id": body.session_id,
-                    "filename": filename,
-                    "language": language,
-                    "lines": lines,
-                    "symbol_count": symbol_count,
-                    "file_type": "code",
-                    "github_meta": github_meta,
-                    "updated_at": None,
-                    "created_at": None,
-                })
-            except Exception as e:
-                errors.append({"path": path, "error": str(e)})
+        # Fetch, parse, and store all files in parallel — each worker opens
+        # its own DB connection so SQLite cross-thread sharing is not an issue.
+        with ThreadPoolExecutor(max_workers=10) as pool:
+            futures = {
+                pool.submit(_fetch_and_store_file, r, path, body, parser, lang_map): path
+                for path in file_paths
+            }
+            for future in as_completed(futures):
+                file_dict, err = future.result()
+                if file_dict:
+                    loaded.append(file_dict)
+                elif err:
+                    errors.append(err)
 
         return {"loaded": loaded, "errors": errors, "truncated": truncated}
     except Exception as e:
