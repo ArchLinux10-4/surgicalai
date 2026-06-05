@@ -816,7 +816,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           .filter((l: string) => l.startsWith('-') && !l.startsWith('---')).length
 
         return (
-          <div key={change.id} className={`border-t border-border/60 ${isApplied ? 'opacity-60' : isSkipped ? 'opacity-40' : ''}`}>
+          <div key={change.id} className={`border-t border-border/60`}>
             {/* Row header — this IS the apply decision row */}
             <div className={`flex items-center gap-3 px-4 py-3 ${isApplied ? 'bg-success/5' : 'bg-base/60'}`}>
 
