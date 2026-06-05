@@ -7981,6 +7981,88 @@ async def run_natural_pipeline_stream(
                             _cb, _cs = "", "normal"
                 pending_edits = new_pending or []
 
+                # ── Correction search-and-retry ───────────────────────────
+                # When Claude asks for a <search_request> instead of emitting
+                # edit blocks, execute the search inline and issue one more
+                # Claude call so it can produce the edit with verbatim anchors.
+                if not new_pending:
+                    import re as _re_corr
+                    _csm = _re_corr.search(
+                        r'<search_request>\s*(\{.*?\})\s*</search_request>',
+                        corr_text, _re_corr.DOTALL
+                    )
+                    if _csm:
+                        try:
+                            _creq = json.loads(_csm.group(1))
+                            _cterms = _creq.get("terms", [])
+                            if _cterms:
+                                _csr = _resolve_search_multifile(
+                                    _cterms, symbol_maps_by_name,
+                                    file_content_lookup_stream
+                                )
+                                _dlog("correction_search_executed",
+                                      session_id=session_id,
+                                      resolve_round=resolve_round,
+                                      terms=_cterms,
+                                      results_chars=len(_csr),
+                                      results_preview=_csr,
+                                      user_id=user_id)
+                                _fu_msgs = correction_msgs + [
+                                    {"role": "assistant", "content": corr_text},
+                                    {"role": "user", "content": (
+                                        "Search results for your request:\n\n"
+                                        + _csr
+                                        + "\n\nNow write your corrected <surgical_edit> block(s). "
+                                        "Use the EXACT verbatim lines shown above as your "
+                                        "old_code anchor — copy them character-for-character."
+                                    )},
+                                ]
+                                _fu_task = asyncio.create_task(
+                                    aclient.messages.create(
+                                        model=arch_model,
+                                        max_tokens=8000,
+                                        system=system_prompt,
+                                        messages=_fu_msgs,
+                                    )
+                                )
+                                while not _fu_task.done():
+                                    try:
+                                        await asyncio.wait_for(
+                                            asyncio.shield(_fu_task), timeout=20.0
+                                        )
+                                    except asyncio.TimeoutError:
+                                        yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+                                _fu_resp = _fu_task.result()
+                                _fu_text = "".join(
+                                    b.text for b in _fu_resp.content
+                                    if hasattr(b, "text")
+                                )
+                                _dlog("correction_followup_response",
+                                      session_id=session_id,
+                                      resolve_round=resolve_round,
+                                      response_chars=len(_fu_text),
+                                      response_preview=_fu_text,
+                                      user_id=user_id)
+                                # Extract edit blocks from follow-up response
+                                _fup, _fcs, _fcb = [], "normal", ""
+                                for _fc in _fu_text:
+                                    if _fcs == "normal":
+                                        _fcb += _fc
+                                        if _fcb.endswith(EDIT_OPEN):
+                                            _fcb, _fcs = "", "in_edit"
+                                    else:
+                                        _fcb += _fc
+                                        if _fcb.endswith(EDIT_CLOSE):
+                                            _fup.append(_fcb[:-len(EDIT_CLOSE)])
+                                            _fcb, _fcs = "", "normal"
+                                if _fup:
+                                    pending_edits = _fup
+                        except Exception as _cse:
+                            _dlog("correction_search_failed",
+                                  session_id=session_id,
+                                  error=str(_cse),
+                                  user_id=user_id)
+
             except Exception:
                 for item in still_unresolved:
                     skipped_messages.append(f"Symbol '{item['symbol']}' not found in {item['filename']} — skipped")
