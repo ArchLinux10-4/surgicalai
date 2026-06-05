@@ -2218,7 +2218,7 @@ async def analyze_and_plan_stream(
                 "messages": messages,
             }
             if _supports_thinking(architect_model):
-                model_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+                model_kwargs["thinking"] = {"type": "adaptive", "budget_tokens": 8000}
 
             full_text = ""
             in_thinking = False
@@ -4215,7 +4215,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 async with aclient.messages.stream(
                     model=chat_model,
                     max_tokens=16000,
-                    **(({"thinking": {"type": "enabled", "budget_tokens": 10000}}) if _supports_thinking(chat_model) else {}),
+                    **(({"thinking": {"type": "adaptive", "budget_tokens": 10000}}) if _supports_thinking(chat_model) else {}),
                     system=system,
                     messages=claude_msgs,
                 ) as astream:
@@ -4580,7 +4580,7 @@ USER REQUEST:
                         async with aclient.messages.stream(
                             model=arch_model,
                             max_tokens=16000,
-                            **({"thinking": {"type": "enabled", "budget_tokens": 10000}}
+                            **({"thinking": {"type": "adaptive", "budget_tokens": 10000}}
                                if _supports_thinking(arch_model) else {}),
                             system=_architect_system,
                             messages=_arch_history_msgs + [{"role": "user",
@@ -4629,7 +4629,7 @@ USER REQUEST:
                                 async with aclient.messages.stream(
                                     model=arch_model,
                                     max_tokens=16000,
-                                    **({"thinking": {"type": "enabled",
+                                    **({"thinking": {"type": "adaptive",
                                                     "budget_tokens": 10000}}
                                        if _supports_thinking(arch_model) else {}),
                                     system=_architect_system,
@@ -6909,10 +6909,16 @@ def _build_natural_file_context(
                 f"FILE: {fname} ({lines_count} lines)\n"
                 f"SYMBOL INDEX (use these EXACT names in surgical_edit):\n{sym_index}\n"
             )
-            # Always show full content for Tier-1 files — no truncation.
+            # Show full content for Tier-1 files up to 2500 lines.
             # Truncation caused anchor-miss failures: Claude invented anchors
             # for lines it never saw. Tasklet model: see everything you edit.
-            header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
+            # Above 2500 lines: fall back to smart context (generous 1500-line
+            # per-symbol cap) to avoid overwhelming the context window.
+            if lines_count <= 2500:
+                header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
+            else:
+                smart = _smart_code_context(fname, content, smap, "", max_code_lines=1500)
+                header += f"\n[FILE > 2500 lines — showing top symbols up to 1500 lines]\n{smart}\n"
             return header
         else:
             preview = content[:1500] + (f"\n...[{len(content)-1500} chars]" if len(content) > 1500 else "")
@@ -7341,7 +7347,7 @@ async def run_natural_pipeline_stream(
             "messages": messages,
         }
         if _supports_thinking(arch_model):
-            stream_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+            stream_kwargs["thinking"] = {"type": "adaptive", "budget_tokens": 8000}
 
         # ── Streaming loop with ReAct search + edit/file/search tag parsing ─────
         # Claude can emit <search_request>, <surgical_edit>, or <new_file> tags.
