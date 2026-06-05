@@ -6688,6 +6688,15 @@ def _build_symbol_correction(
                                 f"focused window "
                                 f"(L{_sc_start + _ws}–L{_sc_start + _we - 1}):\n{_focused_win}"
                             )
+                            parts.append(
+                                f"\n   ✏️  TARGETED EDIT REQUIRED — this symbol is {len(_sc_lines)} lines."
+                                f" DO NOT re-emit the entire symbol.\n"
+                                f"   In your <surgical_edit> use:\n"
+                                f"     \"old_code\": an EXACT verbatim snippet from the INSERTION AREA window above\n"
+                                f"     \"new_code\": only the replacement for that snippet\n"
+                                f"   The server splices it in — everything else is preserved automatically.\n"
+                                f"   ❌ Do NOT emit a <search_request>. The lines you need are already shown above."
+                            )
                 else:
                     numbered = "\n".join(
                         f"   {_sc_start + i:5d}: {_sc_lines[i]}" for i in range(len(_sc_lines))
@@ -6698,7 +6707,7 @@ def _build_symbol_correction(
                     )
             else:
                 parts.append(
-                    "   Use <search_request> first if you need to see the exact current lines."
+                    "   Re-emit the COMPLETE symbol code in new_code with no old_code field."
                 )
             continue
 
