@@ -32,8 +32,8 @@ interface AppState {
   setSurgicalPanelOpen: (v: boolean) => void
 
   // UI
-  sidebarTab: 'files' | 'sessions' | 'context' | 'github' | 'linear'
-  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear') => void
+  sidebarTab: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel'
+  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel') => void
   sidebarPanelOpen: boolean
   setSidebarPanelOpen: (open: boolean) => void
   sendLinearIssue: ((issue: any) => void) | null
