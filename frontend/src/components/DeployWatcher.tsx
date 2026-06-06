@@ -80,7 +80,8 @@ function ElapsedBadge({ startedAt }: { startedAt: number }) {
 
 // ── DeployWatcher ─────────────────────────────────────────────────────────────
 
-export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWatcherProps) {
+// INTENTIONAL BREAK: missing `export` keyword
+function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWatcherProps) {
   const setPendingChatInput = useAppStore(s => s.setPendingChatInput)
 
   const [statuses, setStatuses] = useState<Record<string, TargetStatus>>(
@@ -282,7 +283,7 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
               {isFailed && (
                 <div className="ml-6 space-y-2">
 
-                  {/* Terminal window — shown when we have parsed lines */}
+                  {/* Terminal window */}
                   {st.errorLines.length > 0 ? (
                     <div className="rounded-lg overflow-hidden border border-red-900/50 bg-[#100808]">
                       <div className="flex items-center justify-between px-2.5 py-1 bg-[#1a0a0a] border-b border-red-900/30">
@@ -298,60 +299,38 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
                       </div>
                       <div className="p-2.5 max-h-40 overflow-y-auto space-y-px">
                         {st.errorLines.slice(0, 20).map((line, i) => (
-                          <p
-                            key={i}
-                            className={`text-[10px] font-mono leading-relaxed break-all ${lineColor(line)}`}
-                          >
+                          <p key={i} className={`text-[10px] font-mono leading-relaxed break-all ${lineColor(line)}`}>
                             {line}
                           </p>
                         ))}
                         {st.errorLines.length > 20 && (
-                          <p className="text-[9px] text-zinc-600 pt-1">
-                            …{st.errorLines.length - 20} more lines
-                          </p>
+                          <p className="text-[9px] text-zinc-600 pt-1">…{st.errorLines.length - 20} more lines</p>
                         )}
                       </div>
                     </div>
                   ) : (
-                    /* Fallback when log parsing yields nothing */
                     <div className="flex items-center justify-between px-2.5 py-2 rounded-lg bg-red-950/20 border border-red-900/30">
-                      <span className="text-[10px] text-red-400/80">
-                        Build failed — fetching full log…
-                      </span>
+                      <span className="text-[10px] text-red-400/80">Build failed — fetching full log…</span>
                       {st.dashboardUrl && (
-                        <a
-                          href={st.dashboardUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="text-[10px] text-accent hover:underline flex-shrink-0"
-                        >
-                          View ↗
-                        </a>
+                        <a href={st.dashboardUrl} target="_blank" rel="noreferrer" className="text-[10px] text-accent hover:underline flex-shrink-0">View ↗</a>
                       )}
                     </div>
                   )}
 
-                  {/* Circuit-breaker — shows when same error repeats across polls */}
+                  {/* Circuit-breaker */}
                   {st.sameCount > 0 && (
                     <div className="flex items-center gap-1.5">
                       <span className="text-[9px] text-faint">Retry</span>
                       <div className="flex gap-0.5">
                         {[1, 2, 3].map(n => (
-                          <span
-                            key={n}
-                            className={`h-1 w-4 rounded-full transition-colors ${
-                              n <= st.sameCount ? 'bg-red-400' : 'bg-border'
-                            }`}
-                          />
+                          <span key={n} className={`h-1 w-4 rounded-full transition-colors ${n <= st.sameCount ? 'bg-red-400' : 'bg-border'}`} />
                         ))}
                       </div>
-                      {st.sameCount >= 3 && (
-                        <span className="text-[9px] text-danger font-semibold">Blocked</span>
-                      )}
+                      {st.sameCount >= 3 && <span className="text-[9px] text-danger font-semibold">Blocked</span>}
                     </div>
                   )}
 
-                  {/* Actions — always visible when build has failed */}
+                  {/* Ask Claude — always visible on failure */}
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => askClaude(target, st)}
@@ -360,16 +339,10 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
                       🔧 Ask Claude to fix
                     </button>
                     {st.dashboardUrl && (
-                      <a
-                        href={st.dashboardUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="text-[10px] text-faint hover:text-ink transition-colors"
-                      >
-                        Dashboard ↗
-                      </a>
+                      <a href={st.dashboardUrl} target="_blank" rel="noreferrer" className="text-[10px] text-faint hover:text-ink transition-colors">Dashboard ↗</a>
                     )}
                   </div>
+
                 </div>
               )}
 
@@ -381,9 +354,7 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
       {/* ── Footer ────────────────────────────────────────────────────────── */}
       {allDone && (
         <div className="px-3 py-1.5 border-t border-border/40 bg-surface-alt/40">
-          <span className="text-[9px] text-faint">
-            All targets settled · polling stopped
-          </span>
+          <span className="text-[9px] text-faint">All targets settled · polling stopped</span>
         </div>
       )}
 
