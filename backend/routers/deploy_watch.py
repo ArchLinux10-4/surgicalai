@@ -1,6 +1,7 @@
 """Unified deploy-watch — poll Vercel and Railway deployment status."""
 from __future__ import annotations
 
+import json
 import os
 from typing import Optional
 
@@ -36,22 +37,72 @@ def _vercel_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
-# ── Error extraction ──────────────────────────────────────────────────────────
+# ── Event parsing ─────────────────────────────────────────────────────────────
 
 _ERROR_KEYWORDS = (
     "error", "failed", "cannot find", "ts2", "ts4", "ts1",
     "expected", "is not assignable", "module not found",
     "cannot resolve", "type error", "syntax error",
+    "exitcode", "exit code",
 )
 
 
+def _parse_events(response: _req.Response) -> list:
+    """Handle both JSON array and NDJSON from Vercel events API.
+
+    Vercel's /v3/deployments/{id}/events returns NDJSON (one JSON object per
+    line), NOT a JSON array.  Calling response.json() on NDJSON raises a
+    JSONDecodeError that was previously swallowed, leaving error_lines empty.
+    """
+    content_type = response.headers.get("content-type", "")
+
+    # Try JSON array / object first
+    if "application/json" in content_type:
+        try:
+            raw = response.json()
+            if isinstance(raw, list):
+                return raw
+            return raw.get("events", raw.get("data", []))
+        except Exception:
+            pass
+
+    # NDJSON fallback — one JSON object per line
+    events: list = []
+    for line in response.text.strip().split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            events.append(json.loads(line))
+        except Exception:
+            pass
+    return events
+
+
 def _extract_error_lines(events: list) -> list:
-    lines = []
+    lines: list = []
     for ev in events:
-        text = (ev.get("payload") or {}).get("text", "").strip()
-        if text and any(k in text.lower() for k in _ERROR_KEYWORDS):
-            lines.append(text)
-    return lines[:80]
+        # Standard events format: {payload: {text: "..."}}
+        payload = ev.get("payload") or {}
+        text = payload.get("text", "").strip()
+        # Some API versions put text at top level
+        if not text:
+            text = ev.get("text", "").strip()
+        if not text:
+            continue
+        for sub in text.splitlines():
+            sub = sub.strip()
+            if sub and any(k in sub.lower() for k in _ERROR_KEYWORDS):
+                lines.append(sub)
+
+    # Deduplicate preserving order
+    seen: set = set()
+    deduped: list = []
+    for ln in lines:
+        if ln not in seen:
+            seen.add(ln)
+            deduped.append(ln)
+    return deduped[:80]
 
 
 # ── Vercel watch ──────────────────────────────────────────────────────────────
@@ -100,9 +151,11 @@ def watch_vercel(
         "url": d.get("url", ""),
         "created_at": d.get("created"),
         "error_lines": [],
+        "dashboard_url": f"https://vercel.com/deployments/{dep_id}" if dep_id else "",
     }
 
     if state in ("ERROR", "FAILED"):
+        # Primary: events endpoint (NDJSON stream)
         try:
             log_res = _req.get(
                 f"{VERCEL_API}/v3/deployments/{dep_id}/events",
@@ -111,11 +164,29 @@ def watch_vercel(
                 timeout=20,
             )
             if log_res.status_code == 200:
-                raw = log_res.json()
-                events = raw if isinstance(raw, list) else raw.get("events", [])
+                events = _parse_events(log_res)
                 result["error_lines"] = _extract_error_lines(events)
         except Exception:
             pass
+
+        # Fallback: deployment-level errorMessage
+        if not result["error_lines"]:
+            try:
+                dep_res = _req.get(
+                    f"{VERCEL_API}/v13/deployments/{dep_id}",
+                    headers=headers,
+                    timeout=10,
+                )
+                if dep_res.status_code == 200:
+                    dep_data = dep_res.json()
+                    err_msg = (
+                        dep_data.get("errorMessage")
+                        or (dep_data.get("error") or {}).get("message", "")
+                    )
+                    if err_msg:
+                        result["error_lines"] = [err_msg]
+            except Exception:
+                pass
 
     return result
 

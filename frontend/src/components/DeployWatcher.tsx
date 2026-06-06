@@ -1,134 +1,163 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/appStore'
-import {
-  BugReport, CheckCircle, Error as ErrorIcon,
-  HourglassEmpty, OpenInNew, StopCircle,
-} from '@mui/icons-material'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
-type Target = 'vercel' | 'railway'
-type TargetState = 'waiting' | 'building' | 'ready' | 'error' | 'stuck' | 'stopped'
+export type WatchTarget = 'vercel' | 'railway'
+type Phase = 'waiting' | 'building' | 'ready' | 'error' | 'stuck' | 'stopped'
 
 interface TargetStatus {
-  state: TargetState
+  phase: Phase
   url: string
+  dashboardUrl: string
   errorLines: string[]
   lastFingerprint: string
   sameCount: number
-  dashboardUrl?: string
+  startedAt: number
+  deploymentId: string
 }
 
 export interface DeployWatcherProps {
-  /** Which platforms to watch */
-  targets: Target[]
-  /** Optional Vercel project ID filter */
+  targets: WatchTarget[]
   vercelProjectId?: string
   onDismiss: () => void
 }
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const POLL_MS: Record<Target, number> = { vercel: 8000, railway: 10000 }
+const POLL_MS: Record<WatchTarget, number> = { vercel: 8000, railway: 10000 }
+const TERMINAL: Phase[] = ['ready', 'stuck', 'stopped']
+const ICON: Record<WatchTarget, string> = { vercel: '▲', railway: '⬡' }
 
-const STATE_LABEL: Record<TargetState, string> = {
-  waiting:  'Waiting for deploy…',
-  building: 'Building…',
-  ready:    'Ready ✓',
-  error:    'Build failed',
-  stuck:    'Stuck — same error 3× in a row',
-  stopped:  'Stopped',
-}
-
-const TERMINAL: TargetState[] = ['ready', 'stuck', 'stopped']
-
-// ── Fingerprint helper ────────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fingerprint(lines: string[], fallback: string): string {
   if (!lines.length) return fallback
-  return lines
-    .slice(0, 8)
-    .join('\n')
+  return lines.slice(0, 8).join('\n')
     .replace(/:\d+:\d+/g, ':N:N')
     .replace(/\d+/g, '#')
 }
 
-// ── Default status ────────────────────────────────────────────────────────────
-
-function defaultStatus(state: TargetState = 'waiting'): TargetStatus {
-  return { state, url: '', errorLines: [], lastFingerprint: '', sameCount: 0 }
+function initStatus(): TargetStatus {
+  return {
+    phase: 'waiting',
+    url: '',
+    dashboardUrl: '',
+    errorLines: [],
+    lastFingerprint: '',
+    sameCount: 0,
+    startedAt: Date.now(),
+    deploymentId: '',
+  }
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+/** Color-classify a single build log line for the terminal display */
+function lineColor(text: string): string {
+  if (/error\s+ts\d+/i.test(text))                   return 'text-red-300 font-medium'
+  if (/\.(tsx?|jsx?|py|go|rs):\d+:\d+/.test(text))   return 'text-amber-300'
+  if (/^\s*[~^]+\s*$/.test(text))                    return 'text-red-500/60'
+  if (/\b(error|failed)\b/i.test(text))              return 'text-red-400'
+  return 'text-zinc-400'
+}
 
-function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWatcherProps) {
+// ── ElapsedBadge ──────────────────────────────────────────────────────────────
+
+function ElapsedBadge({ startedAt }: { startedAt: number }) {
+  const [secs, setSecs] = useState(() => Math.floor((Date.now() - startedAt) / 1000))
+  useEffect(() => {
+    const id = setInterval(() => setSecs(Math.floor((Date.now() - startedAt) / 1000)), 1000)
+    return () => clearInterval(id)
+  }, [startedAt])
+  const m = Math.floor(secs / 60)
+  const s = secs % 60
+  return (
+    <span className="text-[9px] font-mono text-faint tabular-nums">
+      {m > 0 ? `${m}m ${s}s` : `${s}s`}
+    </span>
+  )
+}
+
+// ── DeployWatcher ─────────────────────────────────────────────────────────────
+
+export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWatcherProps) {
   const setPendingChatInput = useAppStore(s => s.setPendingChatInput)
 
   const [statuses, setStatuses] = useState<Record<string, TargetStatus>>(
-    () => Object.fromEntries(targets.map(t => [t, defaultStatus()]))
+    () => Object.fromEntries(targets.map(t => [t, initStatus()]))
   )
+  const [copied, setCopied] = useState<string | null>(null)
 
   const activeRef = useRef<Record<string, boolean>>({})
-  const intervalRefs = useRef<Record<string, ReturnType<typeof setInterval>>>({})
+  const timersRef  = useRef<Record<string, ReturnType<typeof setInterval>>>({})
 
-  const stopTarget = (target: string) => {
-    activeRef.current[target] = false
-    clearInterval(intervalRefs.current[target])
-    delete intervalRefs.current[target]
-  }
+  const stopTarget = useCallback((t: string) => {
+    activeRef.current[t] = false
+    clearInterval(timersRef.current[t])
+    delete timersRef.current[t]
+  }, [])
 
-  const stopAll = () => {
+  const stopAll = useCallback(() => {
     targets.forEach(t => {
       stopTarget(t)
       setStatuses(prev => ({
         ...prev,
-        [t]: { ...(prev[t] || defaultStatus()), state: 'stopped' },
+        [t]: { ...(prev[t] ?? initStatus()), phase: 'stopped' },
       }))
     })
-  }
+  }, [targets, stopTarget])
 
-  const pollTarget = async (target: Target) => {
+  const poll = useCallback(async (target: WatchTarget) => {
     if (!activeRef.current[target]) return
     try {
       const data: any = target === 'vercel'
         ? await (api as any).deployWatch.vercel(vercelProjectId)
         : await (api as any).deployWatch.railway()
-
       if (!activeRef.current[target]) return
 
       setStatuses(prev => {
-        const cur = prev[target] || defaultStatus()
-        if (!data.found) return { ...prev, [target]: { ...cur, state: 'waiting' } }
+        const cur = prev[target] ?? initStatus()
+        if (!data?.found) return { ...prev, [target]: { ...cur, phase: 'waiting' } }
 
-        const raw = (data.state || '').toUpperCase()
+        const raw = (data.state ?? '').toUpperCase()
 
         if (['READY', 'SUCCESS'].includes(raw)) {
-          return { ...prev, [target]: { ...cur, state: 'ready', url: data.url || cur.url } }
-        }
-
-        if (['BUILDING', 'QUEUED', 'DEPLOYING', 'INITIALIZING'].includes(raw)) {
-          return { ...prev, [target]: { ...cur, state: 'building', url: data.url || cur.url } }
-        }
-
-        if (['ERROR', 'FAILED', 'CRASHED'].includes(raw)) {
-          const lines: string[] = data.error_lines || []
-          const fp = fingerprint(lines, raw)
-          const sameCount =
-            fp === cur.lastFingerprint && cur.lastFingerprint !== ''
-              ? cur.sameCount + 1
-              : 1
-          const newState: TargetState = sameCount >= 3 ? 'stuck' : 'error'
+          stopTarget(target)
           return {
             ...prev,
             [target]: {
               ...cur,
-              state: newState,
-              url: data.url || cur.url,
+              phase: 'ready',
+              url: data.url ?? '',
+              dashboardUrl: data.dashboard_url ?? '',
+            },
+          }
+        }
+
+        if (['BUILDING', 'QUEUED', 'DEPLOYING', 'INITIALIZING'].includes(raw)) {
+          return { ...prev, [target]: { ...cur, phase: 'building', url: data.url ?? '' } }
+        }
+
+        if (['ERROR', 'FAILED', 'CRASHED'].includes(raw)) {
+          const lines: string[] = data.error_lines ?? []
+          const fp   = fingerprint(lines, raw)
+          const same =
+            fp === cur.lastFingerprint && cur.lastFingerprint !== ''
+              ? cur.sameCount + 1
+              : 1
+          const phase: Phase = same >= 3 ? 'stuck' : 'error'
+          if (same >= 3) stopTarget(target)
+          return {
+            ...prev,
+            [target]: {
+              ...cur,
+              phase,
+              url: data.url ?? cur.url,
+              dashboardUrl: data.dashboard_url ?? cur.dashboardUrl,
               errorLines: lines,
               lastFingerprint: fp,
-              sameCount,
-              dashboardUrl: data.dashboard_url,
+              sameCount: same,
+              deploymentId: data.deployment_id ?? '',
             },
           }
         }
@@ -138,158 +167,226 @@ function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWatcherPro
     } catch {
       // Transient network error — keep polling
     }
-  }
+  }, [vercelProjectId, stopTarget])
 
   useEffect(() => {
-    for (const target of targets) {
-      const st = statuses[target]
-      if (st && TERMINAL.includes(st.state) && activeRef.current[target]) {
-        stopTarget(target)
-      }
-    }
-  }, [statuses])
+    targets.forEach(t => {
+      activeRef.current[t] = true
+      poll(t)
+      timersRef.current[t] = setInterval(() => poll(t), POLL_MS[t])
+    })
+    return () => targets.forEach(stopTarget)
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
-  useEffect(() => {
-    for (const target of targets) {
-      activeRef.current[target] = true
-      pollTarget(target)
-      intervalRefs.current[target] = setInterval(
-        () => pollTarget(target),
-        POLL_MS[target]
-      )
-    }
-    return () => { targets.forEach(stopTarget) }
-  }, [])
-
-  const askClaude = (target: Target, lines: string[]) => {
+  const askClaude = (target: WatchTarget, st: TargetStatus) => {
     const label = target === 'vercel' ? 'Vercel' : 'Railway'
-    const excerpt = lines.slice(0, 25).join('\n')
-    setPendingChatInput(
-      `🚨 ${label} build failed. Please diagnose and fix:\n\n\`\`\`\n${excerpt}\n\`\`\``
-    )
+    const msg = st.errorLines.length > 0
+      ? `My ${label} build failed. Here are the errors:\n\n\`\`\`\n${st.errorLines.slice(0, 30).join('\n')}\n\`\`\`\n\nPlease diagnose and fix.`
+      : `My ${label} build just failed (deploy ID: ${st.deploymentId || 'unknown'}). Can you look at recent changes and identify what's causing it?`
+    setPendingChatInput(msg)
+    onDismiss()
   }
 
-  const allDone = targets.every(t => TERMINAL.includes(statuses[t]?.state || 'waiting'))
+  const copyErrors = async (target: string, lines: string[]) => {
+    await navigator.clipboard.writeText(lines.join('\n'))
+    setCopied(target)
+    setTimeout(() => setCopied(null), 2000)
+  }
+
+  const allDone = targets.every(t => TERMINAL.includes(statuses[t]?.phase ?? 'waiting'))
 
   return (
-    <div className="mt-2 border border-border rounded-xl bg-surface/50 p-2.5 space-y-2.5">
-      <div className="flex items-center justify-between">
-        <span className="text-[11px] font-semibold text-ink">Deploy Watch</span>
-        <div className="flex items-center gap-1.5">
+    <div className="rounded-xl border border-border bg-surface shadow-xl overflow-hidden mt-2">
+
+      {/* ── Header ────────────────────────────────────────────────────────── */}
+      <div className="flex items-center justify-between px-3 py-2 bg-surface-alt/80 border-b border-border">
+        <div className="flex items-center gap-2">
+          <span className="text-[9px] font-bold tracking-widest uppercase text-muted">
+            Deploy Watch
+          </span>
+          {!allDone && (
+            <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse" />
+          )}
+        </div>
+        <div className="flex items-center gap-1">
           {!allDone && (
             <button
               onClick={stopAll}
-              className="flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[10px] text-danger/80 hover:text-danger border border-danger/20 hover:border-danger/40 transition-colors"
+              className="text-[10px] text-danger/70 hover:text-danger px-1.5 py-0.5 rounded border border-danger/20 hover:border-danger/40 transition-colors leading-none"
             >
-              <StopCircle sx={{ fontSize: 10 }} /> Stop
+              Stop
             </button>
           )}
           <button
             onClick={onDismiss}
-            className="text-faint hover:text-ink text-[11px] px-1 leading-none transition-colors"
+            className="w-5 h-5 flex items-center justify-center rounded hover:bg-overlay text-faint hover:text-ink transition-colors text-[11px] leading-none"
           >
             ✕
           </button>
         </div>
       </div>
 
-      {targets.map(target => {
-        const st = statuses[target] || defaultStatus()
-        const isBuilding = ['waiting', 'building'].includes(st.state)
-        const isFailed   = ['error', 'stuck'].includes(st.state)
+      {/* ── Target rows ───────────────────────────────────────────────────── */}
+      <div className="divide-y divide-border/40">
+        {targets.map(target => {
+          const st         = statuses[target] ?? initStatus()
+          const isBuilding = st.phase === 'waiting' || st.phase === 'building'
+          const isFailed   = st.phase === 'error'   || st.phase === 'stuck'
+          const isReady    = st.phase === 'ready'
 
-        return (
-          <div key={target} className="space-y-1">
-            <div className="flex items-center gap-2 min-w-0">
-              <span className="text-[10px] font-semibold text-muted capitalize w-12 flex-shrink-0">
-                {target}
-              </span>
-              <span className={`flex items-center gap-1 text-[10px] font-medium flex-1 min-w-0 truncate ${
-                st.state === 'ready'  ? 'text-emerald-400' :
-                isFailed             ? 'text-danger'       :
-                isBuilding           ? 'text-amber-400'    : 'text-faint'
-              }`}>
-                {isBuilding           && <HourglassEmpty sx={{ fontSize: 9 }} className="animate-spin flex-shrink-0" />}
-                {st.state === 'ready' && <CheckCircle    sx={{ fontSize: 9 }} className="flex-shrink-0" />}
-                {isFailed             && <ErrorIcon      sx={{ fontSize: 9 }} className="flex-shrink-0" />}
-                {STATE_LABEL[st.state]}
-              </span>
-              {st.url && (
-                <a
-                  href={`https://${st.url}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-0.5 text-[10px] text-accent hover:underline flex-shrink-0"
-                >
-                  <OpenInNew sx={{ fontSize: 9 }} />
-                </a>
-              )}
-            </div>
+          return (
+            <div key={target} className="p-3 space-y-2">
 
-            {isFailed && st.errorLines.length > 0 && (
-              <div className="ml-14 space-y-1">
-                <div className="bg-danger/5 border border-danger/20 rounded-lg p-1.5 max-h-28 overflow-y-auto">
-                  {st.errorLines.slice(0, 8).map((line, i) => (
-                    <p key={i} className="text-[10px] font-mono text-danger/90 leading-[1.4] break-words">
-                      {line}
-                    </p>
-                  ))}
-                  {st.errorLines.length > 8 && (
-                    <p className="text-[9px] text-faint mt-0.5">
-                      +{st.errorLines.length - 8} more lines
-                    </p>
+              {/* Status row */}
+              <div className="flex items-center gap-2.5 min-w-0">
+                <span className="text-[13px] leading-none w-4 text-center flex-shrink-0">
+                  {ICON[target]}
+                </span>
+                <div className="flex items-center gap-1.5 flex-1 min-w-0">
+                  <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                    isReady    ? 'bg-emerald-400' :
+                    isFailed   ? 'bg-red-400' :
+                    isBuilding ? 'bg-amber-400 animate-pulse' :
+                                 'bg-zinc-500'
+                  }`} />
+                  <span className={`text-[12px] font-semibold leading-none ${
+                    isReady    ? 'text-emerald-400' :
+                    isFailed   ? 'text-red-400'    :
+                    isBuilding ? 'text-amber-400'  :
+                                 'text-faint'
+                  }`}>
+                    {st.phase === 'waiting'  && 'Waiting for deploy…'}
+                    {st.phase === 'building' && 'Building…'}
+                    {st.phase === 'ready'    && 'Live ✓'}
+                    {st.phase === 'error'    && 'Build failed'}
+                    {st.phase === 'stuck'    && 'Stuck — same error 3×'}
+                    {st.phase === 'stopped'  && 'Stopped'}
+                  </span>
+                  {isBuilding && st.startedAt > 0 && (
+                    <ElapsedBadge startedAt={st.startedAt} />
                   )}
                 </div>
-                <div className="flex items-center gap-2 flex-wrap">
-                  <button
-                    onClick={() => askClaude(target, st.errorLines)}
-                    className="flex items-center gap-1 px-2 py-0.5 rounded text-[10px] font-medium bg-accent/10 text-accent border border-accent/20 hover:bg-accent/20 transition-colors"
-                  >
-                    <BugReport sx={{ fontSize: 10 }} /> Ask Claude to fix
-                  </button>
-                  {st.dashboardUrl && (
-                    <a
-                      href={st.dashboardUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center gap-0.5 text-[10px] text-faint hover:text-accent transition-colors"
-                    >
-                      <OpenInNew sx={{ fontSize: 9 }} /> Dashboard
-                    </a>
-                  )}
-                </div>
-                {st.state === 'stuck' && (
-                  <p className="text-[9px] text-danger/60 leading-tight">
-                    Same error across 3 consecutive deploys — Claude may need a different approach.
-                  </p>
-                )}
-              </div>
-            )}
-
-            {isFailed && st.errorLines.length === 0 && (
-              <div className="ml-14 space-y-0.5">
-                <p className="text-[10px] text-muted">Build failed. Check dashboard for full logs.</p>
-                {st.dashboardUrl && (
+                {isReady && st.url && (
                   <a
-                    href={st.dashboardUrl}
+                    href={`https://${st.url}`}
                     target="_blank"
-                    rel="noopener noreferrer"
-                    className="flex items-center gap-0.5 text-[10px] text-accent hover:underline"
+                    rel="noreferrer"
+                    className="text-[10px] text-accent hover:underline flex-shrink-0"
                   >
-                    <OpenInNew sx={{ fontSize: 9 }} /> Open Railway dashboard
+                    Open ↗
                   </a>
                 )}
               </div>
-            )}
-          </div>
-        )
-      })}
 
+              {/* ── Error block ─────────────────────────────────────────── */}
+              {isFailed && (
+                <div className="ml-6 space-y-2">
+
+                  {/* Terminal window — shown when we have parsed lines */}
+                  {st.errorLines.length > 0 ? (
+                    <div className="rounded-lg overflow-hidden border border-red-900/50 bg-[#100808]">
+                      <div className="flex items-center justify-between px-2.5 py-1 bg-[#1a0a0a] border-b border-red-900/30">
+                        <span className="text-[9px] font-mono text-red-500/80 uppercase tracking-widest">
+                          Build Error
+                        </span>
+                        <button
+                          onClick={() => copyErrors(target, st.errorLines)}
+                          className="text-[9px] font-medium text-faint hover:text-ink transition-colors"
+                        >
+                          {copied === target ? '✓ Copied' : 'Copy all'}
+                        </button>
+                      </div>
+                      <div className="p-2.5 max-h-40 overflow-y-auto space-y-px">
+                        {st.errorLines.slice(0, 20).map((line, i) => (
+                          <p
+                            key={i}
+                            className={`text-[10px] font-mono leading-relaxed break-all ${lineColor(line)}`}
+                          >
+                            {line}
+                          </p>
+                        ))}
+                        {st.errorLines.length > 20 && (
+                          <p className="text-[9px] text-zinc-600 pt-1">
+                            …{st.errorLines.length - 20} more lines
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                  ) : (
+                    /* Fallback when log parsing yields nothing */
+                    <div className="flex items-center justify-between px-2.5 py-2 rounded-lg bg-red-950/20 border border-red-900/30">
+                      <span className="text-[10px] text-red-400/80">
+                        Build failed — fetching full log…
+                      </span>
+                      {st.dashboardUrl && (
+                        <a
+                          href={st.dashboardUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="text-[10px] text-accent hover:underline flex-shrink-0"
+                        >
+                          View ↗
+                        </a>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Circuit-breaker — shows when same error repeats across polls */}
+                  {st.sameCount > 0 && (
+                    <div className="flex items-center gap-1.5">
+                      <span className="text-[9px] text-faint">Retry</span>
+                      <div className="flex gap-0.5">
+                        {[1, 2, 3].map(n => (
+                          <span
+                            key={n}
+                            className={`h-1 w-4 rounded-full transition-colors ${
+                              n <= st.sameCount ? 'bg-red-400' : 'bg-border'
+                            }`}
+                          />
+                        ))}
+                      </div>
+                      {st.sameCount >= 3 && (
+                        <span className="text-[9px] text-danger font-semibold">Blocked</span>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Actions — always visible when build has failed */}
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => askClaude(target, st)}
+                      className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[11px] font-semibold bg-accent text-white hover:bg-accent/90 active:scale-95 transition-all shadow-sm"
+                    >
+                      🔧 Ask Claude to fix
+                    </button>
+                    {st.dashboardUrl && (
+                      <a
+                        href={st.dashboardUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="text-[10px] text-faint hover:text-ink transition-colors"
+                      >
+                        Dashboard ↗
+                      </a>
+                    )}
+                  </div>
+                </div>
+              )}
+
+            </div>
+          )
+        })}
+      </div>
+
+      {/* ── Footer ────────────────────────────────────────────────────────── */}
       {allDone && (
-        <p className="text-[9px] text-faint text-center pt-0.5 border-t border-border/40">
-          All targets finished — polling stopped
-        </p>
+        <div className="px-3 py-1.5 border-t border-border/40 bg-surface-alt/40">
+          <span className="text-[9px] text-faint">
+            All targets settled · polling stopped
+          </span>
+        </div>
       )}
+
     </div>
   )
 }

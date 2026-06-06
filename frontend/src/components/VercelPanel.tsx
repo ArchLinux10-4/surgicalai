@@ -107,6 +107,15 @@ export function VercelPanel({ onOpenSettings }: { onOpenSettings?: () => void })
       .finally(() => setLoadingProjects(false))
   }, [status?.connected])
 
+  // Auto-start watching when the latest deployment is still in progress
+  useEffect(() => {
+    if (deployments.length === 0 || watching) return
+    const raw = (deployments[0]?.state || '').toUpperCase()
+    if (['BUILDING', 'QUEUED', 'INITIALIZING'].includes(raw)) {
+      setWatching(true)
+    }
+  }, [deployments])
+
   const selectProject = useCallback(async (project: VercelProject) => {
     setSelectedProject(project)
     setWatchProjectId(project.id)
