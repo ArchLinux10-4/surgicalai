@@ -4,7 +4,7 @@ import requests as _req
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from auth_utils import encrypt_api_key, decrypt_api_key
+from crypto_utils import encrypt_api_key, decrypt_api_key
 from database import get_user_api_key, set_user_api_key
 
 VERCEL_API = "https://api.vercel.com"
