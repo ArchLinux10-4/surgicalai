@@ -80,8 +80,7 @@ function ElapsedBadge({ startedAt }: { startedAt: number }) {
 
 // ── DeployWatcher ─────────────────────────────────────────────────────────────
 
-// INTENTIONAL BREAK: missing `export` keyword
-function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWatcherProps) {
+export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWatcherProps) {
   const setPendingChatInput = useAppStore(s => s.setPendingChatInput)
 
   const [statuses, setStatuses] = useState<Record<string, TargetStatus>>(
