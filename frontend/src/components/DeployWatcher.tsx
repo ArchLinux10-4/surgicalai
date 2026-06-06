@@ -47,7 +47,6 @@ const TERMINAL: TargetState[] = ['ready', 'stuck', 'stopped']
 
 function fingerprint(lines: string[], fallback: string): string {
   if (!lines.length) return fallback
-  // Strip column/line numbers so the same error matches across deploys
   return lines
     .slice(0, 8)
     .join('\n')
@@ -63,14 +62,13 @@ function defaultStatus(state: TargetState = 'waiting'): TargetStatus {
 
 // ── Component ─────────────────────────────────────────────────────────────────
 
-export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWatcherProps) {
+function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWatcherProps) {
   const setPendingChatInput = useAppStore(s => s.setPendingChatInput)
 
   const [statuses, setStatuses] = useState<Record<string, TargetStatus>>(
     () => Object.fromEntries(targets.map(t => [t, defaultStatus()]))
   )
 
-  // Mutable refs to control polling without triggering re-renders
   const activeRef = useRef<Record<string, boolean>>({})
   const intervalRefs = useRef<Record<string, ReturnType<typeof setInterval>>>({})
 
@@ -90,7 +88,6 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
     })
   }
 
-  // Single poll tick for a target
   const pollTarget = async (target: Target) => {
     if (!activeRef.current[target]) return
     try {
@@ -98,7 +95,7 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
         ? await (api as any).deployWatch.vercel(vercelProjectId)
         : await (api as any).deployWatch.railway()
 
-      if (!activeRef.current[target]) return  // stopped while awaiting
+      if (!activeRef.current[target]) return
 
       setStatuses(prev => {
         const cur = prev[target] || defaultStatus()
@@ -143,7 +140,6 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
     }
   }
 
-  // Auto-stop targets that reach a terminal state
   useEffect(() => {
     for (const target of targets) {
       const st = statuses[target]
@@ -153,20 +149,18 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
     }
   }, [statuses])
 
-  // Start polling on mount; clean up on unmount
   useEffect(() => {
     for (const target of targets) {
       activeRef.current[target] = true
-      pollTarget(target)  // immediate first poll
+      pollTarget(target)
       intervalRefs.current[target] = setInterval(
         () => pollTarget(target),
         POLL_MS[target]
       )
     }
     return () => { targets.forEach(stopTarget) }
-  }, [])  // eslint-disable-line react-hooks/exhaustive-deps
+  }, [])
 
-  // Pre-fill chat input with error context so user can review before sending
   const askClaude = (target: Target, lines: string[]) => {
     const label = target === 'vercel' ? 'Vercel' : 'Railway'
     const excerpt = lines.slice(0, 25).join('\n')
@@ -179,7 +173,6 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
 
   return (
     <div className="mt-2 border border-border rounded-xl bg-surface/50 p-2.5 space-y-2.5">
-      {/* Header row */}
       <div className="flex items-center justify-between">
         <span className="text-[11px] font-semibold text-ink">Deploy Watch</span>
         <div className="flex items-center gap-1.5">
@@ -200,7 +193,6 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
         </div>
       </div>
 
-      {/* Target status rows */}
       {targets.map(target => {
         const st = statuses[target] || defaultStatus()
         const isBuilding = ['waiting', 'building'].includes(st.state)
@@ -208,7 +200,6 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
 
         return (
           <div key={target} className="space-y-1">
-            {/* Status line */}
             <div className="flex items-center gap-2 min-w-0">
               <span className="text-[10px] font-semibold text-muted capitalize w-12 flex-shrink-0">
                 {target}
@@ -229,14 +220,12 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex items-center gap-0.5 text-[10px] text-accent hover:underline flex-shrink-0"
-                  title="Open deployment"
                 >
                   <OpenInNew sx={{ fontSize: 9 }} />
                 </a>
               )}
             </div>
 
-            {/* Error lines for Vercel */}
             {isFailed && st.errorLines.length > 0 && (
               <div className="ml-14 space-y-1">
                 <div className="bg-danger/5 border border-danger/20 rounded-lg p-1.5 max-h-28 overflow-y-auto">
@@ -277,7 +266,6 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
               </div>
             )}
 
-            {/* Failed but no error lines (Railway or unavailable) */}
             {isFailed && st.errorLines.length === 0 && (
               <div className="ml-14 space-y-0.5">
                 <p className="text-[10px] text-muted">Build failed. Check dashboard for full logs.</p>
@@ -297,7 +285,6 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
         )
       })}
 
-      {/* All terminal */}
       {allDone && (
         <p className="text-[9px] text-faint text-center pt-0.5 border-t border-border/40">
           All targets finished — polling stopped
