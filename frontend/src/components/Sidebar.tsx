@@ -7,6 +7,7 @@ import { toast } from '../lib/toast'
 import { ContextPanel } from './ContextPanel'
 import { GitHubPanel } from './GitHubPanel'
 import { LinearPanel } from './LinearPanel'
+import { VercelPanel } from './VercelPanel'
 import { useThemeStore } from '../stores/themeStore'
 import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, PushPin, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile } from '../lib/fileClassify'
@@ -484,14 +485,24 @@ function SessionFilesPanel() {
 }
 
 // ── Rail items config ─────────────────────────────────────────────────────────
-type TabId = 'sessions' | 'files' | 'github' | 'context' | 'linear'
+type TabId = 'sessions' | 'files' | 'github' | 'context' | 'linear' | 'vercel'
 const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
   { id: 'sessions', icon: Chat, label: 'Chats',  tooltip: 'Chats' },
   { id: 'files',    icon: Code,      label: 'Files',  tooltip: 'Session Files' },
   { id: 'github',   icon: GitHub,        label: 'GitHub', tooltip: 'GitHub' },
   { id: 'linear',   icon: LinearIcon,    label: 'Linear', tooltip: 'Linear Issues' },
+  { id: 'vercel',   icon: VercelIcon,         label: 'Vercel', tooltip: 'Vercel Deployments' },
   { id: 'context',  icon: PushPin,           label: 'Pinned', tooltip: 'Pinned & Memory' },
 ]
+
+// ── Vercel icon (inline SVG) ──────────────────────────────────────────────────
+function VercelIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 512 512" fill="currentColor">
+      <path d="M256 48L496 464H16L256 48Z" />
+    </svg>
+  )
+}
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
 // Linear icon (inline SVG)
@@ -662,6 +673,9 @@ export function Sidebar() {
           )}
           {sidebarTab === 'linear'   && (
             <LinearPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
+          )}
+          {sidebarTab === 'vercel'   && (
+            <VercelPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
           )}
         </div>
       </div>
