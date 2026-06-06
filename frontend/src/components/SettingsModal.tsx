@@ -204,7 +204,6 @@ export function SettingsModal() {
 
   const handleSave = async () => {
     try {
-      // If user typed an API key, verify+save it as part of the save flow
       if (apiKey.trim()) {
         setVerifying(true)
         try {
@@ -216,11 +215,10 @@ export function SettingsModal() {
           setKeyStatus('error')
           setKeyMessage(e.message)
           toast.error('API key invalid', e.message)
-          return // Don't save other settings if key is bad
+          return
         }
         setVerifying(false)
       }
-      // If user typed an Anthropic key, verify it too
       if (anthropicKey.trim()) {
         try {
           await api.settings.verifyAnthropicKey(anthropicKey.trim())
@@ -244,7 +242,6 @@ export function SettingsModal() {
 
   const upd = (k: string) => (v: any) => setForm((s) => ({ ...s, [k]: v }))
 
-  // Password strength — 0-4 based on criteria met
   const pwStrength = (pw: string): number => {
     if (!pw) return 0
     let score = 0
@@ -298,7 +295,7 @@ export function SettingsModal() {
         </div>
 
         <div className="flex flex-1 min-h-0 overflow-hidden max-sm:flex-col">
-          {/* Left tabs — sidebar on desktop, horizontal scroll strip on mobile */}
+          {/* Left tabs */}
           <div className="w-36 flex-shrink-0 border-r border-border py-2
             max-sm:w-full max-sm:border-r-0 max-sm:border-b max-sm:border-border max-sm:py-0
             max-sm:flex max-sm:flex-row max-sm:overflow-x-auto max-sm:flex-shrink-0">
@@ -323,60 +320,11 @@ export function SettingsModal() {
           <div className="flex-1 overflow-y-auto p-6 min-w-0">
             {tab === 'api' && (
               <div className="space-y-4">
-                {/* OpenAI hidden — app is optimised for Claude API only */}
-              {false && <>
-              <SectionHeader title="OpenAI API Key" subtitle="Required for all AI features" />
-                <div>
-                  <div className="flex gap-2">
-                    <div className="relative flex-1">
-                      <input
-                        type={showKey ? 'text' : 'password'}
-                        value={apiKey}
-                        onChange={(e) => { setApiKey(e.target.value); setKeyStatus('idle') }}
-                        onPaste={(e) => {
-                          // Explicit paste handler — ensures pasted text always lands
-                          e.preventDefault()
-                          const pasted = e.clipboardData.getData('text').trim()
-                          if (pasted) { setApiKey(pasted); setKeyStatus('idle') }
-                        }}
-                        placeholder={settings?.openai_api_key_set ? '••••••••••••••••••' : 'sk-proj-…'}
-                        className={`input pr-10 ${keyStatus === 'ok' ? 'border-success focus:border-success' : keyStatus === 'error' ? 'border-danger' : ''}`}
-                        onKeyDown={(e) => e.key === 'Enter' && handleVerifyKey()}
-                        autoComplete="off"
-                        spellCheck={false}
-                      />
-                      <button
-                        onClick={() => setShowKey(!showKey)}
-                        className="absolute right-3 top-1/2 -translate-y-1/2 text-faint hover:text-muted"
-                      >
-                        {showKey ? <VisibilityOff sx={{ fontSize: 14 }} /> : <Visibility sx={{ fontSize: 14 }} />}
-                      </button>
-                    </div>
-                    <button
-                      onClick={handleVerifyKey}
-                      disabled={verifying || !apiKey.trim()}
-                      className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed"
-                    >
-                      {verifying ? '…' : 'Verify'}
-                    </button>
-                  </div>
-                  {settings?.openai_api_key_set && keyStatus === 'idle' && (
-                    <div className="flex items-center gap-1.5 mt-2 text-success text-xs">
-                      <CheckCircle sx={{ fontSize: 12 }} /> API key configured
-                    </div>
-                  )}
-                  {keyStatus === 'ok' && <div className="text-success text-xs mt-2">{keyMessage}</div>}
-                  {keyStatus === 'error' && <div className="text-danger text-xs mt-2">{keyMessage}</div>}
-                  <div className="text-[11px] text-faint mt-2">
-                    Get your key at{' '}
-                    <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" className="text-accent hover:underline">
-                      platform.openai.com/api-keys
-                    </a>
-                  </div>
-                </div>
-              </>}
+                {false && <>
+                <SectionHeader title="OpenAI API Key" subtitle="Required for all AI features" />
+                </>}
 
-                {/* ── Anthropic / Claude Key ── */}
+                {/* Anthropic / Claude Key */}
                 <div>
                   <SectionHeader title="Anthropic API Key" subtitle="Required — SurgicalAI runs on Claude" />
                   <div className="mt-3">
@@ -391,7 +339,7 @@ export function SettingsModal() {
                             const pasted = e.clipboardData.getData('text').trim()
                             if (pasted) { setAnthropicKey(pasted); setAnthropicStatus('idle') }
                           }}
-                          placeholder={settings?.anthropic_api_key_set ? '••••••••••••••••••' : 'sk-ant-api03-…'}
+                          placeholder={settings?.anthropic_api_key_set ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' : 'sk-ant-api03-\u2026'}
                           className={`input pr-10 ${anthropicStatus === 'ok' ? 'border-success focus:border-success' : anthropicStatus === 'error' ? 'border-danger' : ''}`}
                           onKeyDown={(e) => e.key === 'Enter' && handleVerifyAnthropicKey()}
                           autoComplete="off"
@@ -409,7 +357,7 @@ export function SettingsModal() {
                         disabled={anthropicVerifying || !anthropicKey.trim()}
                         className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed"
                       >
-                        {anthropicVerifying ? '…' : 'Verify'}
+                        {anthropicVerifying ? '\u2026' : 'Verify'}
                       </button>
                     </div>
                     {settings?.anthropic_api_key_set && anthropicStatus === 'idle' && (
@@ -424,62 +372,13 @@ export function SettingsModal() {
                       <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener" className="text-accent hover:underline">
                         console.anthropic.com
                       </a>
-                      {' '}— enables Claude Sonnet 4 & Opus 4 with visible thinking
+                      {' '}\u2014 enables Claude Sonnet 4 & Opus 4 with visible thinking
                     </div>
                   </div>
                 </div>
 
-                {/* Google Gemini hidden — app is optimised for Claude API only */}
                 {false && <div className="mt-6 pt-5 border-t border-border">
-                  <SectionHeader title="Google Gemini API Key" subtitle="Enables Gemini 2.5 Pro/Flash — 1M context window with visible thinking" />
-                  <div className="mt-3">
-                    <div className="flex gap-2">
-                      <div className="relative flex-1">
-                        <input
-                          type={showGeminiKey ? 'text' : 'password'}
-                          value={geminiKey}
-                          onChange={(e) => { setGeminiKey(e.target.value); setGeminiStatus('idle') }}
-                          onPaste={(e) => {
-                            e.preventDefault()
-                            const pasted = e.clipboardData.getData('text').trim()
-                            if (pasted) { setGeminiKey(pasted); setGeminiStatus('idle') }
-                          }}
-                          placeholder={geminiConnected ? '••••••••••••••••••' : 'AIza…'}
-                          className={`input pr-10 ${geminiStatus === 'ok' ? 'border-success focus:border-success' : geminiStatus === 'error' ? 'border-danger' : ''}`}
-                          onKeyDown={(e) => e.key === 'Enter' && handleVerifyGeminiKey()}
-                          autoComplete="off"
-                          spellCheck={false}
-                        />
-                        <button
-                          onClick={() => setShowGeminiKey(!showGeminiKey)}
-                          className="absolute right-3 top-1/2 -translate-y-1/2 text-faint hover:text-muted"
-                        >
-                          {showGeminiKey ? <VisibilityOff sx={{ fontSize: 14 }} /> : <Visibility sx={{ fontSize: 14 }} />}
-                        </button>
-                      </div>
-                      <button
-                        onClick={handleVerifyGeminiKey}
-                        disabled={geminiVerifying || !geminiKey.trim()}
-                        className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed"
-                      >
-                        {geminiVerifying ? '…' : 'Verify'}
-                      </button>
-                    </div>
-                    {geminiConnected && geminiStatus === 'idle' && (
-                      <div className="flex items-center gap-1.5 mt-2 text-success text-xs">
-                        <CheckCircle sx={{ fontSize: 12 }} /> Gemini API key configured
-                      </div>
-                    )}
-                    {geminiStatus === 'ok' && <div className="text-success text-xs mt-2">{geminiMessage}</div>}
-                    {geminiStatus === 'error' && <div className="text-danger text-xs mt-2">{geminiMessage}</div>}
-                    <div className="text-[11px] text-faint mt-2">
-                      Get your key at{' '}
-                      <a href="https://aistudio.google.com/app/apikey" target="_blank" rel="noopener" className="text-accent hover:underline">
-                        aistudio.google.com
-                      </a>
-                      {' '}— enables Gemini 2.5 Pro (1M context) and Gemini 2.5 Flash
-                    </div>
-                  </div>
+                  <SectionHeader title="Google Gemini API Key" subtitle="Enables Gemini 2.5 Pro/Flash" />
                 </div>}
               </div>
             )}
@@ -489,34 +388,24 @@ export function SettingsModal() {
                 <SectionHeader title="Model Configuration" subtitle="Select which Claude model powers SurgicalAI" />
 
                 <Field label="Claude Model">
-                  <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect').map((m) => ({ value: m.id, label: `${m.name} — ${m.description}` }))} />
+                  <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect').map((m) => ({ value: m.id, label: `${m.name} \u2014 ${m.description}` }))} />
                 </Field>
 
-                {/* Surgeon model hidden — natural pipeline uses a single Claude model */}
-                {false && (
-                <Field label="Surgeon Model (code writing)">
-                  <Select value={form.surgeon_model} onChange={upd('surgeon_model')} options={models.filter((m) => m.role === 'surgeon' || m.role === 'fast').map((m) => ({ value: m.id, label: `${m.name} — ${m.description}` }))} />
-                </Field>
-                )}
-
-                {/* Temperature hidden for Claude models: extended thinking requires
-                    temperature=1, so the control is inert on Claude. Shown only if a
-                    non-Claude model is ever re-enabled. */}
                 {!form.architect_model.startsWith('claude-') && (
                 <Field label={`Temperature: ${form.temperature_architect}`}>
                   <input type="range" min="0" max="1" step="0.1" value={form.temperature_architect}
                     onChange={(e) => upd('temperature_architect')(parseFloat(e.target.value))} className="w-full accent-accent" />
                   <div className="flex justify-between text-[10px] text-faint mt-0.5">
-                    <span>0 — precise</span><span>1 — creative</span>
+                    <span>0 \u2014 precise</span><span>1 \u2014 creative</span>
                   </div>
                 </Field>
                 )}
 
-                <Field label={`Confidence Threshold: ${form.confidence_threshold}/10 (lower = more auto-applies)`}>
+                <Field label={`Confidence Threshold: ${form.confidence_threshold}/10`}>
                   <input type="range" min="1" max="10" step="1" value={form.confidence_threshold}
                     onChange={(e) => upd('confidence_threshold')(parseInt(e.target.value))} className="w-full accent-warning" />
                   <div className="flex justify-between text-[10px] text-faint mt-0.5">
-                    <span>1 — auto-apply all</span><span>10 — always manual review</span>
+                    <span>1 \u2014 auto-apply all</span><span>10 \u2014 always manual review</span>
                   </div>
                 </Field>
               </div>
@@ -539,7 +428,6 @@ export function SettingsModal() {
 
             {tab === 'editor' && (
               <div className="space-y-5">
-                {/* Theme */}
                 <div className="space-y-2">
                   <label className="text-xs font-semibold text-ink">Theme</label>
                   <div className="flex gap-2">
@@ -577,13 +465,12 @@ export function SettingsModal() {
                     className="mt-0.5 accent-accent" />
                   <div>
                     <div className="text-sm font-medium text-ink">Auto-backup before every surgical change</div>
-                    <div className="text-xs text-muted mt-0.5">Saves to <code className="font-mono text-[10px] bg-overlay px-1 rounded">.surgicalai_backups/</code> — always reversible</div>
+                    <div className="text-xs text-muted mt-0.5">Saves to <code className="font-mono text-[10px] bg-overlay px-1 rounded">.surgicalai_backups/</code> \u2014 always reversible</div>
                   </div>
                 </label>
               </div>
             )}
 
-            {/* Local AI tab hidden — app is optimised for Claude API only */}
             {tab === 'users' && (
               <div className="space-y-5">
                 <AdminUsersPanel />
@@ -597,7 +484,6 @@ export function SettingsModal() {
                   subtitle="Connect your GitHub account to browse repos, load files, and push commits directly from SurgicalAI"
                 />
 
-                {/* Connected state */}
                 {githubStatus?.connected ? (
                   <div className="space-y-4">
                     <div className="flex items-center gap-3 p-3 rounded-lg border border-green-500/30 bg-green-500/10 flex-wrap">
@@ -615,14 +501,11 @@ export function SettingsModal() {
                         Disconnect
                       </button>
                     </div>
-                    {githubStatusMsg && (
-                      <div className="text-xs text-muted">{githubStatusMsg}</div>
-                    )}
+                    {githubStatusMsg && <div className="text-xs text-muted">{githubStatusMsg}</div>}
                   </div>
                 ) : (
-                  /* Not connected state */
                   <div className="space-y-4">
-                    <Field label="Personal Access Token (Classic)">
+                    <Field label="Personal Access Token">
                       <div className="flex gap-2 max-sm:flex-col">
                         <input
                           type="password"
@@ -637,7 +520,7 @@ export function SettingsModal() {
                           disabled={githubConnecting || !githubPat.trim()}
                           className="btn-primary px-4 text-sm disabled:opacity-50 max-sm:w-full"
                         >
-                          {githubConnecting ? 'Connecting…' : 'Connect'}
+                          {githubConnecting ? 'Connecting\u2026' : 'Connect'}
                         </button>
                       </div>
                     </Field>
@@ -660,18 +543,16 @@ export function SettingsModal() {
               </div>
             )}
 
-            {tab === 'debug' && (
-              <DebugLogsPanel />
-            )}
-
             {tab === 'vercel' && (
-              <Section
-                title="Vercel Integration"
-                subtitle="Connect your Vercel account to monitor deployments and read build logs from SurgicalAI"
-              >
+              <div className="space-y-5">
+                <SectionHeader
+                  title="Vercel Integration"
+                  subtitle="Connect your Vercel account to monitor deployments and read build logs from SurgicalAI"
+                />
+
                 {vercelStatus?.connected ? (
                   <div className="flex flex-col gap-3">
-                    <div className="flex items-center gap-3">
+                    <div className="flex items-center gap-3 p-3 rounded-lg border border-green-500/30 bg-green-500/10 flex-wrap">
                       {vercelStatus.avatar_url && (
                         <img src={vercelStatus.avatar_url} alt="avatar" className="w-9 h-9 rounded-full border border-border flex-shrink-0" />
                       )}
@@ -681,23 +562,21 @@ export function SettingsModal() {
                       </div>
                       <button
                         onClick={handleDisconnectVercel}
-                        className="px-3 py-1.5 text-xs rounded-lg border border-border hover:bg-overlay text-muted transition-colors"
+                        className="text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded px-3 py-1.5 hover:bg-red-500/10 transition-colors flex-shrink-0"
                       >
                         Disconnect
                       </button>
                     </div>
-                    {vercelStatusMsg && (
-                      <div className="text-xs text-muted">{vercelStatusMsg}</div>
-                    )}
+                    {vercelStatusMsg && <div className="text-xs text-muted">{vercelStatusMsg}</div>}
                   </div>
                 ) : (
-                  <div className="flex flex-col gap-3">
+                  <div className="space-y-4">
                     <Field label="Personal Access Token">
                       <div className="flex gap-2">
                         <input
                           type="password"
-                          className="flex-1 px-3 py-2 rounded-lg bg-surface border border-border text-ink text-sm focus:outline-none focus:border-accent/60 font-mono"
-                          placeholder="vercel_pat_…"
+                          className="input flex-1 font-mono"
+                          placeholder="vercel_pat_\u2026"
                           value={vercelToken}
                           onChange={e => setVercelToken(e.target.value)}
                           onKeyDown={(e) => e.key === 'Enter' && handleConnectVercel()}
@@ -705,9 +584,9 @@ export function SettingsModal() {
                         <button
                           onClick={handleConnectVercel}
                           disabled={vercelConnecting || !vercelToken.trim()}
-                          className="px-4 py-2 rounded-lg bg-accent text-white text-sm font-semibold hover:bg-accent/90 disabled:opacity-50 transition-colors"
+                          className="btn-primary px-4 text-sm disabled:opacity-50"
                         >
-                          {vercelConnecting ? 'Connecting…' : 'Connect'}
+                          {vercelConnecting ? 'Connecting\u2026' : 'Connect'}
                         </button>
                       </div>
                     </Field>
@@ -716,17 +595,22 @@ export function SettingsModal() {
                         {vercelStatusMsg}
                       </div>
                     )}
-                    <div className="text-xs text-faint bg-surface-alt rounded-lg px-3 py-2 space-y-1 leading-relaxed">
+                    <div className="text-xs text-muted space-y-1 p-3 rounded-lg bg-surface border border-border">
                       <div className="font-medium text-ink mb-2">How to get a token:</div>
                       <div>1. Go to <a href="https://vercel.com/account/tokens" target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">vercel.com/account/tokens</a></div>
                       <div>2. Click <strong className="text-ink">Create Token</strong></div>
                       <div>3. Give it a name and set scope to your team</div>
-                      <div>4. Copy the token and paste it above</div>
+                      <div>4. Copy the token and paste it above — creating a new token does NOT deactivate existing ones</div>
                     </div>
                   </div>
                 )}
-              </Section>
+              </div>
             )}
+
+            {tab === 'debug' && (
+              <DebugLogsPanel />
+            )}
+
             {tab === 'security' && (
               <SecurityPanel
                 pwCurrent={pwCurrent} setPwCurrent={setPwCurrent}
@@ -757,9 +641,6 @@ export function SettingsModal() {
   )
 }
 
-// ── Security / Change Password panel ─────────────────────────────────────────
-// Extracted into its own component to avoid esbuild 0.25.x JSX nesting bugs
-// (IIFE-in-JSX and regex-in-template-literals both misparse at this nesting depth)
 interface SecurityPanelProps {
   pwCurrent: string; setPwCurrent: (v: string) => void
   pwNew: string; setPwNew: (v: string) => void
@@ -798,7 +679,6 @@ function SecurityPanel(props: SecurityPanelProps) {
     <div className="space-y-6 max-w-sm">
       <SectionHeader title="Change Password" subtitle="Enter your current password to set a new one" />
 
-      {/* Current password */}
       <div>
         <div className="text-xs text-muted mb-1.5 font-medium">Current Password</div>
         <div className="relative">
@@ -816,7 +696,6 @@ function SecurityPanel(props: SecurityPanelProps) {
         </div>
       </div>
 
-      {/* New password */}
       <div>
         <div className="text-xs text-muted mb-1.5 font-medium">New Password</div>
         <div className="relative">
@@ -847,7 +726,6 @@ function SecurityPanel(props: SecurityPanelProps) {
         )}
       </div>
 
-      {/* Confirm password */}
       <div>
         <div className="text-xs text-muted mb-1.5 font-medium">Confirm New Password</div>
         <div className="relative">
@@ -871,7 +749,6 @@ function SecurityPanel(props: SecurityPanelProps) {
         )}
       </div>
 
-      {/* Result banner */}
       {pwResult && (
         <div className={`flex items-start gap-2 px-3 py-2.5 rounded-lg text-xs ${pwResultCls}`}>
           {pwResult.ok ? <CheckCircle sx={{ fontSize: 13 }} className="mt-px shrink-0" /> : <ErrorOutline sx={{ fontSize: 13 }} className="mt-px shrink-0" />}
@@ -879,12 +756,10 @@ function SecurityPanel(props: SecurityPanelProps) {
         </div>
       )}
 
-      {/* Submit */}
       <button onClick={onChangePassword} disabled={pwSaving || !pwCurrent || !pwNew || !pwConfirm} className="btn-primary w-full disabled:opacity-50">
         {pwSaving ? 'Updating\u2026' : 'Update Password'}
       </button>
 
-      {/* Requirements callout */}
       <div className="text-[11px] text-faint space-y-0.5 p-3 rounded-lg bg-surface border border-border">
         <div className="font-medium text-muted mb-1">Requirements</div>
         <div className={`flex items-center gap-1.5 ${pwHas8 ? 'text-green-400' : ''}`}>
@@ -936,7 +811,6 @@ function Select({ value, onChange, options }: { value: string; onChange: (v: str
 
 
 // ── Debug Logs Panel ──────────────────────────────────────────────────────────
-// Admin-only tab: live view, download, and clear pipeline debug logs.
 
 interface LogEvent {
   ts: string
@@ -969,182 +843,172 @@ function DebugLogsPanel() {
   const { token } = useAuthStore()
   const { activeSessions } = useAppStore()
 
-  // Pre-populate session filter with the active chat session
   useEffect(() => {
     if (activeSessions && !sessionFilter) {
       setSessionFilter(activeSessions)
     }
   }, [activeSessions])
 
-  const BASE = import.meta.env.VITE_API_URL || ''
+  const BASE_URL = (import.meta.env.VITE_API_URL ?? '') + '/api'
 
-  const fetchLogs = async () => {
+  const load = async () => {
     setLoading(true)
     try {
-      const params = new URLSearchParams({ last: '500' })
+      const params = new URLSearchParams()
       if (sessionFilter.trim()) params.set('session_id', sessionFilter.trim())
       if (userFilter.trim()) params.set('user_id', userFilter.trim())
-      const res = await fetch(`${BASE}/api/debug/pipeline-log?${params}`, {
+      const res = await fetch(`${BASE_URL}/debug/pipeline-log?${params}`, {
         headers: { Authorization: `Bearer ${token}` },
       })
-      if (!res.ok) throw new Error(`${res.status}`)
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
       const data = await res.json()
-      setEvents((data.events || []).slice().reverse()) // newest first
-      setTotalCount(data.total ?? 0)
-      setFilteredCount(data.filtered ?? 0)
+      const all: LogEvent[] = data.events || []
+      setTotalCount(all.length)
+      const filtered = filter === 'all' ? all : all.filter(e => e.event === filter)
+      setFilteredCount(filtered.length)
+      setEvents(filtered)
     } catch (e: any) {
-      toast.error('Could not load debug logs', e.message)
+      toast.error('Failed to load debug logs', e.message)
     } finally {
       setLoading(false)
     }
   }
 
-  const clearLogs = async () => {
+  useEffect(() => { load() }, [filter, sessionFilter, userFilter])
+
+  useEffect(() => {
+    if (!autoRefresh) return
+    const id = setInterval(load, 5000)
+    return () => clearInterval(id)
+  }, [autoRefresh, filter, sessionFilter, userFilter])
+
+  const handleClear = async () => {
+    if (!confirm('Clear all pipeline debug logs?')) return
     try {
-      await fetch(`${BASE}/api/debug/pipeline-log`, {
+      await fetch(`${BASE_URL}/debug/pipeline-log`, {
         method: 'DELETE',
         headers: { Authorization: `Bearer ${token}` },
       })
       setEvents([])
-      toast.success('Debug log cleared')
+      setTotalCount(0)
+      setFilteredCount(0)
+      toast.success('Debug logs cleared')
     } catch (e: any) {
-      toast.error('Clear failed', e.message)
+      toast.error('Failed to clear logs', e.message)
     }
   }
 
-  const downloadLogs = () => {
+  const handleDownload = () => {
     const params = new URLSearchParams()
+    if (token) params.set('token', token)
     if (sessionFilter.trim()) params.set('session_id', sessionFilter.trim())
     if (userFilter.trim()) params.set('user_id', userFilter.trim())
-    const qs = params.toString()
-    window.open(`${BASE}/api/debug/pipeline-log/download${qs ? '?' + qs : ''}`, '_blank')
+    window.open(`${BASE_URL}/debug/pipeline-log/download?${params}`, '_blank')
   }
 
-  useEffect(() => { fetchLogs() }, [])
-
-  useEffect(() => {
-    if (!autoRefresh) return
-    const id = setInterval(fetchLogs, 5000)
-    return () => clearInterval(id)
-  }, [autoRefresh])
+  const handleCopy = async () => {
+    const text = events.map(e => JSON.stringify(e)).join('\n')
+    await navigator.clipboard.writeText(text)
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2000)
+  }
 
   const eventTypes = ['all', ...Array.from(new Set(events.map(e => e.event)))]
-  const visible = filter === 'all' ? events : events.filter(e => e.event === filter)
-
-  const copySessionId = () => {
-    if (!activeSessions) return
-    navigator.clipboard.writeText(activeSessions).then(() => {
-      setCopied(true)
-      setTimeout(() => setCopied(false), 2000)
-    })
-  }
 
   return (
-    <div className="flex flex-col h-full gap-4">
-      {/* Active session banner */}
-      {activeSessions && (
-        <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-overlay border border-border text-xs">
-          <span className="text-faint flex-shrink-0">Active session:</span>
-          <span className="font-mono text-accent flex-1 truncate">{activeSessions}</span>
-          <button onClick={copySessionId}
-            className="text-faint hover:text-ink transition-colors flex-shrink-0 text-[11px]">
-            {copied ? '✓ Copied' : 'Copy'}
+    <div className="flex flex-col gap-3 h-full">
+      <div className="flex items-center justify-between flex-wrap gap-2">
+        <div>
+          <div className="text-sm font-bold text-ink">Pipeline Debug Logs</div>
+          <div className="text-xs text-muted">{filteredCount} of {totalCount} events</div>
+        </div>
+        <div className="flex gap-1.5 flex-wrap">
+          <button onClick={load} disabled={loading} className="btn-ghost border border-border text-xs px-2.5 py-1.5">
+            {loading ? '\u2026' : '\u21bb Refresh'}
           </button>
-          <button onClick={() => { setSessionFilter(activeSessions); setTimeout(fetchLogs, 50) }}
-            className="text-faint hover:text-accent transition-colors flex-shrink-0 text-[11px] border border-border rounded px-2 py-0.5">
-            Filter to this
+          <button
+            onClick={() => setAutoRefresh(v => !v)}
+            className={`text-xs px-2.5 py-1.5 rounded border transition-colors ${
+              autoRefresh ? 'bg-accent/20 border-accent text-accent' : 'border-border text-muted hover:text-ink'
+            }`}
+          >
+            {autoRefresh ? 'Auto \u25a0' : 'Auto \u25b6'}
+          </button>
+          <button onClick={handleCopy} className="btn-ghost border border-border text-xs px-2.5 py-1.5">
+            {copied ? '\u2713 Copied' : 'Copy'}
+          </button>
+          <button onClick={handleDownload} className="btn-ghost border border-border text-xs px-2.5 py-1.5">
+            \u2193 Download
+          </button>
+          <button onClick={handleClear} className="text-xs px-2.5 py-1.5 rounded border border-red-500/30 text-red-400 hover:bg-red-500/10 transition-colors">
+            Clear
           </button>
         </div>
-      )}
-      {/* Filter inputs */}
+      </div>
+
       <div className="flex gap-2 flex-wrap">
         <input
-          type="text" value={sessionFilter} onChange={e => setSessionFilter(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && fetchLogs()}
-          placeholder="Filter by session ID…"
-          className="flex-1 min-w-[180px] bg-overlay border border-border rounded-lg px-3 py-1.5 text-xs text-ink placeholder:text-faint focus:outline-none focus:border-accent"
+          className="input flex-1 min-w-0 text-xs py-1"
+          placeholder="Filter by session ID\u2026"
+          value={sessionFilter}
+          onChange={e => setSessionFilter(e.target.value)}
         />
         <input
-          type="text" value={userFilter} onChange={e => setUserFilter(e.target.value)}
-          onKeyDown={e => e.key === 'Enter' && fetchLogs()}
-          placeholder="Filter by user ID…"
-          className="flex-1 min-w-[140px] bg-overlay border border-border rounded-lg px-3 py-1.5 text-xs text-ink placeholder:text-faint focus:outline-none focus:border-accent"
+          className="input flex-1 min-w-0 text-xs py-1"
+          placeholder="Filter by user ID\u2026"
+          value={userFilter}
+          onChange={e => setUserFilter(e.target.value)}
         />
-        <button onClick={fetchLogs} disabled={loading}
-          className="btn-primary px-3 py-1.5 text-xs rounded-lg disabled:opacity-50">
-          {loading ? '…' : 'Search'}
-        </button>
       </div>
 
-      {/* Header row */}
-      <div className="flex items-center gap-2 flex-wrap">
-        <button onClick={fetchLogs} disabled={loading}
-          className="btn-ghost border border-border px-3 py-1.5 text-xs rounded-lg disabled:opacity-50">
-          {loading ? 'Loading…' : '↻ Refresh'}
-        </button>
-        <button onClick={() => setAutoRefresh(v => !v)}
-          className={`border px-3 py-1.5 text-xs rounded-lg transition-colors ${autoRefresh ? 'bg-accent/20 border-accent text-accent' : 'btn-ghost border-border'}`}>
-          {autoRefresh ? '● Live (5s)' : 'Auto-refresh off'}
-        </button>
-        <button onClick={downloadLogs}
-          className="btn-ghost border border-border px-3 py-1.5 text-xs rounded-lg">
-          ⬇ Download JSONL
-        </button>
-        <button onClick={clearLogs}
-          className="btn-ghost border border-red-500/40 text-red-400 px-3 py-1.5 text-xs rounded-lg hover:bg-red-500/10">
-          🗑 Clear
-        </button>
-        <span className="text-xs text-muted ml-auto">
-          {totalCount > 0 && <span className="text-faint mr-1">{filteredCount}/{totalCount} total</span>}
-          {events.length} shown
-        </span>
-      </div>
-
-      {/* Filter chips */}
       <div className="flex gap-1.5 flex-wrap">
         {eventTypes.map(t => (
-          <button key={t} onClick={() => setFilter(t)}
-            className={`px-2.5 py-0.5 rounded-full text-[11px] font-medium border transition-colors ${
+          <button
+            key={t}
+            onClick={() => setFilter(t)}
+            className={`text-[10px] px-2 py-0.5 rounded-full border transition-colors ${
               filter === t
-                ? 'bg-accent text-white border-accent'
-                : 'border-border text-muted hover:text-ink hover:border-ink/30'
-            }`}>
+                ? 'bg-accent/20 border-accent text-accent'
+                : 'border-border text-faint hover:text-ink'
+            }`}
+          >
             {t}
           </button>
         ))}
       </div>
 
-      {/* Log list */}
-      <div className="flex-1 overflow-y-auto flex flex-col gap-1.5 min-h-0 font-mono text-xs">
-        {visible.length === 0 && (
-          <div className="text-muted text-center py-12">
-            {loading ? 'Loading…' : 'No log events yet. Run a pipeline edit to see debug output here.'}
+      <div className="flex-1 overflow-y-auto space-y-1 min-h-0">
+        {events.length === 0 && !loading && (
+          <div className="text-xs text-faint text-center py-8">
+            No events yet. Run a chat prompt to see pipeline activity.
           </div>
         )}
-        {visible.map((ev, i) => {
-          const color = EVENT_COLORS[ev.event] || 'text-ink'
-          const isOpen = expanded === i
-          const { ts, event, ...rest } = ev
-          return (
-            <div key={i}
-              onClick={() => setExpanded(isOpen ? null : i)}
-              className="bg-overlay border border-edge rounded-lg px-3 py-2 cursor-pointer hover:border-accent/40 transition-colors">
-              <div className="flex items-center gap-2">
-                <span className="text-faint text-[10px] shrink-0">{new Date(ts).toLocaleTimeString()}</span>
-                <span className={`font-semibold shrink-0 ${color}`}>{event}</span>
-                {ev.session_id && (
-                  <span className="text-faint text-[10px] truncate">{ev.session_id.slice(0, 8)}…</span>
-                )}
-                <span className="ml-auto text-faint text-[10px]">{isOpen ? '▲' : '▼'}</span>
-              </div>
-              {isOpen && (
-                <pre className="mt-2 text-[10px] text-ink/80 whitespace-pre-wrap break-all max-h-64 overflow-y-auto bg-surface rounded p-2 border border-edge">
-                  {JSON.stringify(rest, null, 2)}
+        {events.map((ev, i) => (
+          <div
+            key={i}
+            className="rounded-lg border border-border bg-surface-alt/30 overflow-hidden"
+          >
+            <button
+              onClick={() => setExpanded(expanded === i ? null : i)}
+              className="w-full flex items-center gap-2 px-3 py-2 text-left hover:bg-overlay/50 transition-colors"
+            >
+              <span className={`text-[10px] font-mono font-semibold flex-1 truncate ${EVENT_COLORS[ev.event] || 'text-ink'}`}>
+                {ev.event}
+              </span>
+              <span className="text-[10px] text-faint flex-shrink-0">
+                {ev.ts ? new Date(ev.ts).toLocaleTimeString() : ''}
+              </span>
+              <span className="text-[10px] text-faint flex-shrink-0">{expanded === i ? '\u25b2' : '\u25bc'}</span>
+            </button>
+            {expanded === i && (
+              <div className="px-3 pb-3 border-t border-border/40">
+                <pre className="text-[10px] text-muted font-mono whitespace-pre-wrap break-all mt-2 max-h-64 overflow-y-auto">
+                  {JSON.stringify(ev, null, 2)}
                 </pre>
-              )}
-            </div>
-          )
-        })}
+              </div>
+            )}
+          </div>
+        ))}
       </div>
     </div>
   )
