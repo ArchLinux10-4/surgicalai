@@ -447,4 +447,18 @@ export const api = {
     load: (body: any) => request<any>('/github/load', { method: 'POST', body: JSON.stringify(body) }),
     commit: (body: any) => request<any>('/github/commit', { method: 'POST', body: JSON.stringify(body) }),
   },
+
+  vercel: {
+    status: () => request<any>('/vercel/status'),
+    connect: (token: string) => request<any>('/vercel/connect', { method: 'POST', body: JSON.stringify({ token }) }),
+    disconnect: () => request<any>('/vercel/disconnect', { method: 'DELETE' }),
+    projects: () => request<any>('/vercel/projects'),
+    deployments: (projectId?: string, limit = 20) => {
+      const q = new URLSearchParams({ limit: String(limit) })
+      if (projectId) q.set('project_id', projectId)
+      return request<any>(`/vercel/deployments?${q}`)
+    },
+    deployment: (id: string) => request<any>(`/vercel/deployments/${id}`),
+    logs: (id: string, limit = 200) => request<any>(`/vercel/deployments/${id}/logs?limit=${limit}`),
+  },
 }

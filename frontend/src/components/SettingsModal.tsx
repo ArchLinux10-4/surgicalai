@@ -7,12 +7,13 @@ import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
 import { BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
-type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'security' | 'debug'
+type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'security' | 'debug'
 
 const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'api',       icon: <VpnKey sx={{ fontSize: 14 }} />,       label: 'API Keys' },
   { id: 'models',    icon: <Psychology sx={{ fontSize: 14 }} />,      label: 'Models' },
   { id: 'github',    icon: <GitHub sx={{ fontSize: 14 }} />,     label: 'GitHub' },
+  { id: 'vercel',    icon: <span style={{ fontSize: 12, fontWeight: 'bold' }}>▲</span>,     label: 'Vercel' },
   { id: 'workspace', icon: <FolderOpen sx={{ fontSize: 14 }} />, label: 'Workspace' },
   { id: 'editor',    icon: <Code sx={{ fontSize: 14 }} />,       label: 'Editor' },
   { id: 'users',     icon: <Group sx={{ fontSize: 14 }} />,      label: 'Users' },
@@ -41,6 +42,10 @@ export function SettingsModal() {
   const [geminiMessage, setGeminiMessage] = useState('')
   const [geminiConnected, setGeminiConnected] = useState(false)
   const [githubPat, setGithubPat] = useState('')
+  const [vercelToken, setVercelToken] = useState('')
+  const [vercelConnecting, setVercelConnecting] = useState(false)
+  const [vercelStatus, setVercelStatus] = useState<any>(null)
+  const [vercelStatusMsg, setVercelStatusMsg] = useState('')
   const [showGithubPat, setShowGithubPat] = useState(false)
   const [githubConnecting, setGithubConnecting] = useState(false)
   const [githubStatus, setGithubStatus] = useState<any>(null)
@@ -90,6 +95,7 @@ export function SettingsModal() {
     }
     api.settings.getModels().then((d) => setModels(d.models || [])).catch(() => {})
     try { (api as any).github.status().then((s: any) => setGithubStatus(s)).catch(() => {}) } catch(_) {}
+    try { (api as any).vercel.status().then((s: any) => setVercelStatus(s)).catch(() => {}) } catch(_) {}
     try { api.settings.geminiStatus().then((s: any) => setGeminiConnected(s?.connected || false)).catch(() => {}) } catch(_) {}
   }, [settings, settingsOpen])
 
@@ -109,6 +115,30 @@ export function SettingsModal() {
       setGeminiMessage(e.message || 'Invalid Gemini API key')
     } finally {
       setGeminiVerifying(false)
+    }
+  }
+
+  const handleConnectVercel = async () => {
+    if (!vercelToken.trim()) return
+    setVercelConnecting(true)
+    try {
+      const res: any = await (api as any).vercel.connect(vercelToken.trim())
+      setVercelStatus({ connected: true, username: res.username, email: res.email, avatar_url: res.avatar_url })
+      setVercelStatusMsg('Connected successfully!')
+    } catch (e: any) {
+      setVercelStatusMsg(e.message || 'Connection failed')
+    } finally {
+      setVercelConnecting(false)
+    }
+  }
+
+  const handleDisconnectVercel = async () => {
+    try {
+      await (api as any).vercel.disconnect()
+      setVercelStatus({ connected: false })
+      setVercelStatusMsg('Disconnected')
+    } catch (e: any) {
+      setVercelStatusMsg(e.message || 'Failed to disconnect')
     }
   }
 
@@ -632,6 +662,70 @@ export function SettingsModal() {
 
             {tab === 'debug' && (
               <DebugLogsPanel />
+            )}
+
+            {tab === 'vercel' && (
+              <Section
+                title="Vercel Integration"
+                subtitle="Connect your Vercel account to monitor deployments and read build logs from SurgicalAI"
+              >
+                {vercelStatus?.connected ? (
+                  <div className="flex flex-col gap-3">
+                    <div className="flex items-center gap-3">
+                      {vercelStatus.avatar_url && (
+                        <img src={vercelStatus.avatar_url} alt="avatar" className="w-9 h-9 rounded-full border border-border flex-shrink-0" />
+                      )}
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-semibold text-green-400">Connected as {vercelStatus.username || vercelStatus.email}</div>
+                        <div className="text-xs text-muted">Your projects are available in the Vercel sidebar tab</div>
+                      </div>
+                      <button
+                        onClick={handleDisconnectVercel}
+                        className="px-3 py-1.5 text-xs rounded-lg border border-border hover:bg-overlay text-muted transition-colors"
+                      >
+                        Disconnect
+                      </button>
+                    </div>
+                    {vercelStatusMsg && (
+                      <div className="text-xs text-muted">{vercelStatusMsg}</div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-3">
+                    <Field label="Personal Access Token">
+                      <div className="flex gap-2">
+                        <input
+                          type="password"
+                          className="flex-1 px-3 py-2 rounded-lg bg-surface border border-border text-ink text-sm focus:outline-none focus:border-accent/60 font-mono"
+                          placeholder="vercel_pat_…"
+                          value={vercelToken}
+                          onChange={e => setVercelToken(e.target.value)}
+                          onKeyDown={(e) => e.key === 'Enter' && handleConnectVercel()}
+                        />
+                        <button
+                          onClick={handleConnectVercel}
+                          disabled={vercelConnecting || !vercelToken.trim()}
+                          className="px-4 py-2 rounded-lg bg-accent text-white text-sm font-semibold hover:bg-accent/90 disabled:opacity-50 transition-colors"
+                        >
+                          {vercelConnecting ? 'Connecting…' : 'Connect'}
+                        </button>
+                      </div>
+                    </Field>
+                    {vercelStatusMsg && (
+                      <div className={`text-xs px-3 py-2 rounded ${vercelStatusMsg.includes('success') ? 'text-green-400 bg-green-500/10' : 'text-red-400 bg-red-500/10'}`}>
+                        {vercelStatusMsg}
+                      </div>
+                    )}
+                    <div className="text-xs text-faint bg-surface-alt rounded-lg px-3 py-2 space-y-1 leading-relaxed">
+                      <div className="font-medium text-ink mb-2">How to get a token:</div>
+                      <div>1. Go to <a href="https://vercel.com/account/tokens" target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">vercel.com/account/tokens</a></div>
+                      <div>2. Click <strong className="text-ink">Create Token</strong></div>
+                      <div>3. Give it a name and set scope to your team</div>
+                      <div>4. Copy the token and paste it above</div>
+                    </div>
+                  </div>
+                )}
+              </Section>
             )}
             {tab === 'security' && (
               <SecurityPanel
