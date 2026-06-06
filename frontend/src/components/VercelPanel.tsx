@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react'
+import { DeployWatcher } from './DeployWatcher'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import {
@@ -84,6 +85,8 @@ export function VercelPanel({ onOpenSettings }: { onOpenSettings?: () => void })
   const [expandedDeploy, setExpandedDeploy] = useState<string | null>(null)
   const [logs, setLogs] = useState<Record<string, VercelLog[]>>({})
   const [loadingLogs, setLoadingLogs] = useState<string | null>(null)
+  const [watching, setWatching] = useState(false)
+  const [watchProjectId, setWatchProjectId] = useState<string | undefined>(undefined)
 
   // Load status on mount
   useEffect(() => {
@@ -106,6 +109,7 @@ export function VercelPanel({ onOpenSettings }: { onOpenSettings?: () => void })
 
   const selectProject = useCallback(async (project: VercelProject) => {
     setSelectedProject(project)
+    setWatchProjectId(project.id)
     setDeployments([])
     setExpandedDeploy(null)
     setLoadingDeploys(true)
@@ -211,6 +215,26 @@ export function VercelPanel({ onOpenSettings }: { onOpenSettings?: () => void })
         >
           <Refresh sx={{ fontSize: 13 }} className="text-faint" />
         </button>
+      </div>
+
+      {/* Deploy Watch toggle */}
+      <div className="px-3 py-1.5 border-b border-border/60">
+        <button
+          onClick={() => setWatching(w => !w)}
+          className={`text-[11px] font-medium flex items-center gap-1.5 transition-colors ${
+            watching ? 'text-accent' : 'text-muted hover:text-ink'
+          }`}
+        >
+          <span>{watching ? '⏸' : '👁'}</span>
+          {watching ? 'Watching deploys…' : 'Watch latest deploy'}
+        </button>
+        {watching && (
+          <DeployWatcher
+            targets={['vercel', 'railway']}
+            vercelProjectId={watchProjectId}
+            onDismiss={() => setWatching(false)}
+          />
+        )}
       </div>
 
       {/* Project list */}

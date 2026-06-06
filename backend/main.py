@@ -19,6 +19,7 @@ from routers import debug as debug_router
 from routers import auth as auth_router
 from routers import linear as linear_router
 from routers import deploy as deploy_router
+from routers import deploy_watch as deploy_watch_router
 from routers import tests as tests_router
 from routers import tasks as tasks_router
 
@@ -128,6 +129,7 @@ app.include_router(github_router.router, prefix="/api/github", tags=["github"])
 app.include_router(vercel_router.router, prefix="/api/vercel", tags=["vercel"])
 app.include_router(linear_router.router, prefix="/api/linear", tags=["linear"])
 app.include_router(deploy_router.router, prefix="/api/deploy", tags=["deploy"])
+app.include_router(deploy_watch_router.router, prefix="/api/deploy-watch", tags=["deploy-watch"])
 app.include_router(tests_router.router, prefix="/api/tests", tags=["tests"])
 app.include_router(tasks_router.router, prefix="/api/tasks", tags=["tasks"])
 app.include_router(datalab_router.router, prefix="/api/datalab", tags=["datalab"])

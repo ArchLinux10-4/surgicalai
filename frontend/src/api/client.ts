@@ -461,4 +461,9 @@ export const api = {
     deployment: (id: string) => request<any>(`/vercel/deployments/${id}`),
     logs: (id: string, limit = 200) => request<any>(`/vercel/deployments/${id}/logs?limit=${limit}`),
   },
+deployWatch: {
+    vercel: (projectId?: string) =>
+      request<any>(`/deploy-watch/vercel${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`),
+    railway: () => request<any>('/deploy-watch/railway'),
+  },
 }

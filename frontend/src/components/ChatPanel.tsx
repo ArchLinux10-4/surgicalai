@@ -573,6 +573,7 @@ export function ChatPanel() {
     streamProgress, setStreamProgress, sessions, setSessions, settings,
     sessionFiles, setSessionFiles, addSessionFile, removeSessionFile,
     setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble,
+    pendingChatInput, setPendingChatInput,
   } = useAppStore()
 
   // Keep the agentic task list in sync with Claude's DB-backed progress while a
@@ -584,6 +585,16 @@ export function ChatPanel() {
   const [isDragging, setIsDragging] = useState(false)
   const [uploadingFiles, setUploadingFiles] = useState(false)
   const [isBuildingEdit, setIsBuildingEdit] = useState(false)
+
+  // Consume pending input injected from sidebar components (e.g. deploy watcher "Ask Claude to fix")
+  useEffect(() => {
+    if (pendingChatInput) {
+      setInput(pendingChatInput)
+      setPendingChatInput(null)
+      setTimeout(() => textareaRef.current?.focus(), 50)
+    }
+  }, [pendingChatInput])
+
   const [progressHistory, setProgressHistory] = useState<string[]>([])
   const [thinkingText, setThinkingText] = useState('')
   const [isThinking, setIsThinking] = useState(false)

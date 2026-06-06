@@ -94,6 +94,10 @@ interface AppState {
   clearAgentTasks: () => void
   setTaskRunId: (id: string | null) => void
   setTaskPreamble: (s: string) => void
+
+  // Pending chat input — set from sidebar components (e.g. deploy watcher)
+  pendingChatInput: string | null
+  setPendingChatInput: (msg: string | null) => void
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -186,4 +190,7 @@ export const useAppStore = create<AppState>((set) => ({
   clearAgentTasks: () => set({ agentTasks: [], taskRunId: null, taskPreamble: '' }),
   setTaskRunId: (taskRunId) => set({ taskRunId }),
   setTaskPreamble: (taskPreamble) => set({ taskPreamble }),
+
+  pendingChatInput: null,
+  setPendingChatInput: (pendingChatInput) => set({ pendingChatInput }),
 }))
