@@ -1,13 +1,13 @@
 """
 Linear integration router.
-Endpoints: connect, status, disconnect, teams, issues, issue detail, comment (link commit).
+Endpoints: connect, status, disconnect, teams, issues, issue detail, comment, complete.
 Uses Linear's GraphQL API via httpx — no extra SDK needed.
 Per-user encrypted PAT stored in user_api_keys (key_type='linear').
 """
 from fastapi import APIRouter, HTTPException, Request
 import httpx
 
-from database import get_user_api_key, set_user_api_key, get_setting, set_setting
+from database import get_user_api_key, set_user_api_key
 from crypto_utils import encrypt_api_key, decrypt_api_key
 from auth_utils import decode_token
 
@@ -26,6 +26,7 @@ def _get_user_id(request: Request) -> str:
 
 
 def _get_linear_key(user_id: str) -> str:
+    """Per-user only — no global fallback (multi-tenant safe)."""
     if user_id:
         encrypted = get_user_api_key(user_id, "linear")
         if encrypted:
@@ -33,7 +34,7 @@ def _get_linear_key(user_id: str) -> str:
                 return decrypt_api_key(encrypted)
             except Exception:
                 pass
-    return get_setting("linear_api_key", "")
+    return ""
 
 
 def _gql(key: str, query: str, variables: dict = None) -> dict:
@@ -57,33 +58,46 @@ def linear_status(request: Request):
     if not key:
         return {"connected": False}
     try:
-        data = _gql(key, "{ viewer { id name email avatarUrl } }")
+        data = _gql(key, "{ viewer { id name email avatarUrl } organization { id name } }")
         viewer = data.get("viewer", {})
-        return {"connected": True, "name": viewer.get("name"), "email": viewer.get("email"),
-                "avatar_url": viewer.get("avatarUrl")}
+        org = data.get("organization", {})
+        return {
+            "connected": True,
+            "name": viewer.get("name"),
+            "email": viewer.get("email"),
+            "avatar_url": viewer.get("avatarUrl"),
+            "workspace": org.get("name", ""),
+        }
     except Exception:
         return {"connected": False}
 
 
 @router.post("/connect")
 async def linear_connect(body: dict, request: Request):
-    key = (body.get("api_key") or "").strip()
+    # Accept both "api_key" and "token" — frontend sends "token"
+    key = (body.get("api_key") or body.get("token") or "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="API key required")
     try:
-        data = _gql(key, "{ viewer { id name email avatarUrl } }")
+        data = _gql(key, "{ viewer { id name email avatarUrl } organization { id name } }")
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid Linear API key: {e}")
     viewer = data.get("viewer", {})
+    org = data.get("organization", {})
     user_id = _get_user_id(request)
     if user_id:
         set_user_api_key(user_id, "linear", encrypt_api_key(key))
-    set_setting("linear_api_key", key)
-    return {"ok": True, "name": viewer.get("name"), "email": viewer.get("email"),
-            "avatar_url": viewer.get("avatarUrl")}
+    # Per-user only — no global key storage
+    return {
+        "ok": True,
+        "name": viewer.get("name"),
+        "email": viewer.get("email"),
+        "avatar_url": viewer.get("avatarUrl"),
+        "workspace": org.get("name", ""),
+    }
 
 
-@router.post("/disconnect")
+@router.delete("/disconnect")
 def linear_disconnect(request: Request):
     user_id = _get_user_id(request)
     if user_id:
@@ -102,7 +116,7 @@ def linear_teams(request: Request):
 
 
 @router.get("/issues")
-def linear_issues(request: Request, query: str = "", team_id: str = "", limit: int = 20):
+def linear_issues(request: Request, query: str = "", team_id: str = "", state: str = "", limit: int = 20):
     user_id = _get_user_id(request)
     key = _get_linear_key(user_id)
     if not key:
@@ -118,7 +132,12 @@ def linear_issues(request: Request, query: str = "", team_id: str = "", limit: i
         data = _gql(key, gql, {"query": query, "limit": limit})
         issues = data.get("issueSearch", {}).get("nodes", [])
     else:
-        filter_clause = f'filter: {{ team: {{ id: {{ eq: "{team_id}" }} }} }}' if team_id else ""
+        filters = []
+        if team_id:
+            filters.append(f'team: {{ id: {{ eq: "{team_id}" }} }}')
+        if state:
+            filters.append(f'state: {{ name: {{ eq: "{state}" }} }}')
+        filter_clause = f'filter: {{ {", ".join(filters)} }}' if filters else ""
         gql = f"""
         query RecentIssues($limit: Int!) {{
           issues(first: $limit, orderBy: updatedAt {filter_clause}) {{
@@ -127,6 +146,12 @@ def linear_issues(request: Request, query: str = "", team_id: str = "", limit: i
         }}"""
         data = _gql(key, gql, {"limit": limit})
         issues = data.get("issues", {}).get("nodes", [])
+
+    # Normalize state from {name, color} object to flat string for frontend
+    for issue in issues:
+        st = issue.get("state")
+        if isinstance(st, dict):
+            issue["state"] = st.get("name", "Unknown")
 
     return {"issues": issues}
 
@@ -148,6 +173,56 @@ def linear_issue_detail(issue_id: str, request: Request):
     }"""
     data = _gql(key, gql, {"id": issue_id})
     return data.get("issue", {})
+
+
+@router.post("/issues/{issue_id}/complete")
+async def linear_complete_issue(issue_id: str, body: dict, request: Request):
+    """Mark a Linear issue as done — finds the completed workflow state and transitions."""
+    user_id = _get_user_id(request)
+    key = _get_linear_key(user_id)
+    if not key:
+        raise HTTPException(status_code=401, detail="Not connected to Linear")
+
+    # 1) Get the issue's team
+    issue_data = _gql(key, """
+    query GetIssueTeam($id: String!) {
+      issue(id: $id) { team { id } }
+    }""", {"id": issue_id})
+    team_id_val = issue_data.get("issue", {}).get("team", {}).get("id")
+    if not team_id_val:
+        raise HTTPException(status_code=404, detail="Issue or team not found")
+
+    # 2) Find the "completed" type workflow state for this team
+    states_data = _gql(key, f"""
+    query {{
+      workflowStates(filter: {{ team: {{ id: {{ eq: "{team_id_val}" }} }}, type: {{ eq: "completed" }} }}) {{
+        nodes {{ id name }}
+      }}
+    }}""")
+    done_states = states_data.get("workflowStates", {}).get("nodes", [])
+    if not done_states:
+        raise HTTPException(status_code=400, detail="No completed state found for this team")
+    done_state_id = done_states[0]["id"]
+
+    # 3) Transition the issue
+    update_data = _gql(key, """
+    mutation CompleteIssue($id: String!, $stateId: String!) {
+      issueUpdate(id: $id, input: { stateId: $stateId }) {
+        success
+        issue { id identifier title state { name } }
+      }
+    }""", {"id": issue_id, "stateId": done_state_id})
+    result = update_data.get("issueUpdate", {})
+
+    # 4) Optionally add a comment
+    comment = (body.get("comment") or "").strip()
+    if comment and result.get("success"):
+        _gql(key, """
+        mutation AddComment($issueId: String!, $body: String!) {
+          commentCreate(input: { issueId: $issueId, body: $body }) { success }
+        }""", {"issueId": issue_id, "body": comment})
+
+    return {"ok": result.get("success", False), "issue": result.get("issue", {})}
 
 
 @router.post("/issues/{issue_id}/comment")
