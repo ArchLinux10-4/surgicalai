@@ -6236,6 +6236,23 @@ Rules for search_request:
 - After receiving results, write your edits immediately
 - Do NOT search for things already shown in the context above
 
+━━━ REQUESTING FILES BY NAME ━━━
+
+If you know the exact filename from the file list below, request it directly instead of searching:
+
+<file_request>
+LandingPage.tsx
+App.tsx
+</file_request>
+
+Rules for file_request:
+- Use exact filenames from the file listing below
+- Max 5 files per request
+- The system returns full file content instantly
+- Use this when you KNOW which file you need by name
+- Use <search_request> when you need to FIND where something is defined by keyword
+- Do NOT request files already shown in full context above
+
 ━━━ EDITING EXISTING FILES ━━━
 
 When the user wants to change code in an uploaded file, explain what you're doing and embed an edit block:
@@ -6875,7 +6892,7 @@ def _build_natural_file_context(
         parts.append(
             f"ℹ️  {len(session_files)} files total. Showing full context for the "
             f"{len(tier1)} most relevant. The other {len(tier2)} are listed below as "
-            f"lean indexes — use <search_request> to fetch their code if needed.\n"
+            f"lean indexes — use <file_request> (by name) or <search_request> (by keyword) to fetch their code.\n"
         )
 
     def _render_full(sf: dict) -> str:
@@ -6930,7 +6947,7 @@ def _build_natural_file_context(
         lines_count = sf.get("lines", sf.get("content", "") and len(sf["content"].splitlines()) or 0)
 
         if file_type in ("image", "pdf", "csv", "excel", "text"):
-            return f"  {fname} [{file_type.upper()}, {lines_count}L] — use <search_request> to view"
+            return f"  {fname} [{file_type.upper()}, {lines_count}L] — use <file_request> to view"
 
         smap, _ = symbol_maps_by_name.get(fname, (None, sf))
         symbols  = getattr(smap, "symbols", []) if smap else []
@@ -6951,8 +6968,8 @@ def _build_natural_file_context(
     # ── Render Tier 2: lean index ─────────────────────────────────────────
     if tier2:
         parts.append(
-            "\n━━━ OTHER UPLOADED FILES (lean index — search to get code) ━━━\n"
-            "Use <search_request> with a symbol name or keyword to fetch full code.\n"
+            "\n━━━ OTHER UPLOADED FILES (lean index) ━━━\n"
+            "Use <file_request> with exact filename, or <search_request> with keyword/symbol to fetch code.\n"
         )
         for sf in tier2:
             parts.append(_render_lean(sf))
@@ -7196,6 +7213,8 @@ async def run_natural_pipeline_stream(
     FILE_CLOSE = "</new_file>"
     SEARCH_OPEN = "<search_request>"
     SEARCH_CLOSE = "</search_request>"
+    FILE_REQ_OPEN = "<file_request>"
+    FILE_REQ_CLOSE = "</file_request>"
 
     try:
         anthropic_key = _get_anthropic_key(user_id)
@@ -7366,6 +7385,8 @@ async def run_natural_pipeline_stream(
 
         MAX_SEARCH_ROUNDS = 10
         searched_terms: list = []                # terms fetched so far (avoid re-fetching)
+        requested_files: set = set()             # files fetched via <file_request>
+        MAX_FILE_REQ_TOTAL = 15                  # cap total fetchable via <file_request>                # terms fetched so far (avoid re-fetching)
         accumulated_search_results = ""          # injected into context each round
         current_messages = list(messages)        # grows with search result turns
         _forced_edit_round_done = False          # only one forced-edit round allowed
@@ -7373,12 +7394,14 @@ async def run_natural_pipeline_stream(
         # +2: one extra slot for the forced-edit round when budget exhausted
         for search_round in range(MAX_SEARCH_ROUNDS + 2):
 
-            state = "normal"    # "normal" | "in_edit" | "in_file" | "in_search"
+            state = "normal"    # "normal" | "in_edit" | "in_file" | "in_search" | "in_filereq"
             normal_buf = ""
             edit_buf = ""
             file_buf = ""
             search_buf = ""
+            file_req_buf = ""
             search_requested: dict | None = None  # set when a search block completes
+            file_request_data: list | None = None  # set when a file_request block completes
 
             # Retry loop for transient API errors
             for _attempt in range(3):
@@ -7421,17 +7444,18 @@ async def run_natural_pipeline_stream(
                                             ei = normal_buf.find(EDIT_OPEN)
                                             fi = normal_buf.find(FILE_OPEN)
                                             si = normal_buf.find(SEARCH_OPEN)
+                                            fri = normal_buf.find(FILE_REQ_OPEN)
 
                                             # Find which tag comes first
                                             candidates = [
                                                 (i, tag) for i, tag in [
-                                                    (ei, "edit"), (fi, "file"), (si, "search")
+                                                    (ei, "edit"), (fi, "file"), (si, "search"), (fri, "filereq")
                                                 ] if i != -1
                                             ]
 
                                             if not candidates:
                                                 # No tags — yield safely (keep tail in case tag is split)
-                                                tail = max(len(EDIT_OPEN), len(FILE_OPEN), len(SEARCH_OPEN))
+                                                tail = max(len(EDIT_OPEN), len(FILE_OPEN), len(SEARCH_OPEN), len(FILE_REQ_OPEN))
                                                 safe = max(0, len(normal_buf) - tail)
                                                 if safe > 0:
                                                     yield sse({"type": "token", "content": normal_buf[:safe]})
@@ -7454,10 +7478,14 @@ async def run_natural_pipeline_stream(
                                                 state = "in_file"
                                                 file_buf = normal_buf[first_idx + len(FILE_OPEN):]
                                                 normal_buf = ""
-                                            else:  # search
+                                            elif first_tag == "search":
                                                 # Show search indicator — don't stream the JSON to user
                                                 state = "in_search"
                                                 search_buf = normal_buf[first_idx + len(SEARCH_OPEN):]
+                                                normal_buf = ""
+                                            else:  # filereq
+                                                state = "in_filereq"
+                                                file_req_buf = normal_buf[first_idx + len(FILE_REQ_OPEN):]
                                                 normal_buf = ""
                                             break
 
@@ -7499,13 +7527,36 @@ async def run_natural_pipeline_stream(
                                             # Stop streaming — we need to fetch code first
                                             break
 
+                                    elif state == "in_filereq":
+                                        file_req_buf += text_chunk
+                                        idx = file_req_buf.find(FILE_REQ_CLOSE)
+                                        if idx != -1:
+                                            raw = file_req_buf[:idx].strip()
+                                            # Parse: try JSON array first, fallback to newline/comma split
+                                            try:
+                                                parsed = json.loads(raw)
+                                                if isinstance(parsed, list):
+                                                    fnames = [str(f).strip() for f in parsed if str(f).strip()]
+                                                elif isinstance(parsed, str):
+                                                    fnames = [parsed.strip()]
+                                                else:
+                                                    fnames = []
+                                            except (json.JSONDecodeError, ValueError):
+                                                fnames = [f.strip() for f in raw.replace(",", "\n").split("\n") if f.strip()]
+                                            if fnames:
+                                                file_request_data = fnames[:5]  # cap per request
+                                            state = "normal"
+                                            normal_buf = file_req_buf[idx + len(FILE_REQ_CLOSE):]
+                                            file_req_buf = ""
+                                            break  # Stop streaming — fetch files first
+
                             elif etype == "content_block_stop":
                                 if in_thinking and current_block_type == "thinking":
                                     yield sse({"type": "thinking_end", "content": ""})
                                     in_thinking = False
 
-                        # If a search was requested mid-stream, break out of the event loop
-                        if search_requested is not None:
+                        # If a search or file request was made, break out of the event loop
+                        if search_requested is not None or file_request_data is not None:
                             break
 
                     break  # success — exit transient-error retry loop
@@ -7527,6 +7578,104 @@ async def run_natural_pipeline_stream(
             # Flush any normal text buffered at end of this round
             if state == "normal" and normal_buf.strip():
                 yield sse({"type": "token", "content": normal_buf})
+
+            # ── Handle file request ───────────────────────────────────────
+            if file_request_data is not None:
+                fnames_req = file_request_data
+                file_request_data = None
+
+                # Filter already-requested files
+                new_fnames = [fn for fn in fnames_req if fn not in requested_files]
+
+                if len(requested_files) >= MAX_FILE_REQ_TOTAL:
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": full_response or "(requesting files...)"},
+                        {"role": "user", "content":
+                            f"File request limit reached ({MAX_FILE_REQ_TOTAL} files already fetched). "
+                            "Write your <surgical_edit> blocks now using the code you have."},
+                    ]
+                    full_response = ""
+                    continue
+
+                if not new_fnames:
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": full_response or "(requesting files...)"},
+                        {"role": "user", "content":
+                            "Those files are already in your context. "
+                            "Write your <surgical_edit> blocks now."},
+                    ]
+                    full_response = ""
+                    continue
+
+                yield sse({"type": "progress",
+                           "content": f"Loading: {', '.join(new_fnames[:3])}{'...' if len(new_fnames)>3 else ''}"})
+
+                file_result_parts = []
+                for fn in new_fnames:
+                    content = file_content_lookup_stream.get(fn, "")
+                    if not content:
+                        # Fuzzy match — find closest filename
+                        candidates_f = [
+                            k for k in file_content_lookup_stream
+                            if fn.lower() in k.lower() or k.lower() in fn.lower()
+                        ]
+                        if candidates_f:
+                            file_result_parts.append(
+                                f"FILE NOT FOUND: '{fn}' — did you mean: {', '.join(candidates_f[:3])}?"
+                            )
+                        else:
+                            file_result_parts.append(
+                                f"FILE NOT FOUND: '{fn}' — not in uploaded files."
+                            )
+                        continue
+
+                    requested_files.add(fn)
+                    file_lines = content.splitlines()
+                    lines_count = len(file_lines)
+
+                    # Include symbol index if available
+                    smap_fr, _ = symbol_maps_by_name.get(fn, (None, None))
+                    if smap_fr and smap_fr.symbols:
+                        sym_lines = []
+                        for s in smap_fr.symbols:
+                            size = s.end_line - s.start_line + 1
+                            flag = " ⚠️LARGE" if size > 300 else ""
+                            sym_lines.append(
+                                f"  [{s.symbol_type.value}] {s.full_path:<45} "
+                                f"L{s.start_line}–{s.end_line}  ({size}L){flag}"
+                            )
+                        sym_index = "\n".join(sym_lines)
+                        header = (
+                            f"FILE: {fn} ({lines_count} lines)\n"
+                            f"SYMBOL INDEX (use these EXACT names in surgical_edit):\n{sym_index}\n"
+                        )
+                    else:
+                        header = f"FILE: {fn} ({lines_count} lines)\n"
+
+                    file_result_parts.append(
+                        f"{header}FULL CONTENT:\n```\n{content}\n```"
+                    )
+
+                _dlog("file_request_resolved",
+                      session_id=session_id,
+                      filenames=new_fnames,
+                      found=[fn for fn in new_fnames if fn in requested_files],
+                      total_requested=len(requested_files),
+                      user_id=user_id)
+
+                file_injection = (
+                    "Here are the files you requested:\n\n"
+                    + "\n\n".join(file_result_parts)
+                    + "\n\nWrite your complete <surgical_edit> or <new_file> blocks now. "
+                    "Use the EXACT symbol names shown above."
+                )
+
+                current_messages = current_messages + [
+                    {"role": "assistant", "content": full_response or "(requesting files...)"},
+                    {"role": "user", "content": file_injection},
+                ]
+                full_response = ""
+                continue
 
             # ── Handle search request ─────────────────────────────────────
             if search_requested is not None:
