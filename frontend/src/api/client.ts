@@ -471,6 +471,7 @@ export const api = {
 deployWatch: {
     vercel: (projectId?: string) =>
       request<any>(`/deploy-watch/vercel${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`),
-    railway: () => request<any>('/deploy-watch/railway'),
+    railway: (projectId?: string) =>
+      request<any>(`/deploy-watch/railway${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`),
   },
 }

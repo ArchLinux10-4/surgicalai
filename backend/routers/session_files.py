@@ -504,7 +504,7 @@ def list_session_files(session_id: str):
     """List files attached to a session (metadata only, no content)."""
     conn = get_db()
     rows = conn.execute(
-        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, origin, github_meta, created_at, updated_at, github_pushed_at
+        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, origin, github_meta, created_at, updated_at, github_pushed_at, edited
            FROM session_files WHERE session_id = ? ORDER BY created_at ASC""",
         (session_id,)
     ).fetchall()
@@ -552,7 +552,7 @@ def update_session_file(session_id: str, file_id: str, body: dict):
     prev_content = _sanitize_for_postgres(prev_content)
 
     conn.execute(
-        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ?",
+        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, edited = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ?",
         (new_content, prev_content, lines, symbol_count, file_id, session_id)
     )
     conn.commit()
@@ -591,7 +591,7 @@ def undo_session_file(session_id: str, file_id: str):
         symbol_count = 0
 
     conn.execute(
-        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ? WHERE id = ? AND session_id = ?",
+        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, edited = 0 WHERE id = ? AND session_id = ?",
         (prev, current, lines, symbol_count, file_id, session_id)
     )
     conn.commit()

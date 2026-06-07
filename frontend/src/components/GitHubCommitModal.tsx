@@ -28,7 +28,7 @@ export function GitHubCommitModal({ sessionFiles, onClose, onSuccess }: GitHubCo
     }).map(f => ({
       file: f,
       meta: JSON.parse(f.github_meta!) as GitHubMeta,
-      isModified: !!(f.updated_at && f.updated_at !== f.created_at),
+      isModified: !!(f as any).edited,
     }))
   }, [sessionFiles])
 

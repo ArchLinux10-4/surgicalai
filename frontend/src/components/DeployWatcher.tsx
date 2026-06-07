@@ -21,6 +21,7 @@ interface TargetStatus {
 export interface DeployWatcherProps {
   targets: WatchTarget[]
   vercelProjectId?: string
+  railwayProjectId?: string
   onDismiss: () => void
 }
 
@@ -80,7 +81,7 @@ function ElapsedBadge({ startedAt }: { startedAt: number }) {
 
 // ── DeployWatcher ─────────────────────────────────────────────────────────────
 
-export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWatcherProps) {
+export function DeployWatcher({ targets, vercelProjectId, railwayProjectId, onDismiss }: DeployWatcherProps) {
   const setPendingChatInput = useAppStore(s => s.setPendingChatInput)
 
   const [statuses, setStatuses] = useState<Record<string, TargetStatus>>(
@@ -112,7 +113,7 @@ export function DeployWatcher({ targets, vercelProjectId, onDismiss }: DeployWat
     try {
       const data: any = target === 'vercel'
         ? await (api as any).deployWatch.vercel(vercelProjectId)
-        : await (api as any).deployWatch.railway()
+        : await (api as any).deployWatch.railway(railwayProjectId)
       if (!activeRef.current[target]) return
 
       setStatuses(prev => {

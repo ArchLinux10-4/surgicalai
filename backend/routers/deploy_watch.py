@@ -218,8 +218,8 @@ _RAILWAY_QUERY = """
 
 
 @router.get("/railway")
-def watch_railway(request: Request):
-    """Return latest Railway deployment status for the surgicalai project."""
+def watch_railway(request: Request, project_id: Optional[str] = None):
+    """Return latest Railway deployment status."""
     _uid(request)  # auth gate only
 
     # Use per-user DB token (mirrors Vercel pattern)
@@ -260,25 +260,37 @@ def watch_railway(request: Request):
         .get("edges", [])
     )
 
+    # If project_id provided, find that specific project; otherwise pick the
+    # project with the most recent deployment (removes old hardcoded name filter).
+    best = None
+    best_ts = ""
     for edge in projects:
         node = edge.get("node", {})
-        name = (node.get("name") or "").lower()
-        if "surgical" not in name:
-            continue
+        pid = node.get("id", "")
         dep_edges = node.get("deployments", {}).get("edges", [])
         if not dep_edges:
             continue
         dep = dep_edges[0]["node"]
-        status = (dep.get("status") or "BUILDING").upper()
-        proj_id = node.get("id", "")
-        return {
-            "found": True,
-            "state": status,
-            "deployment_id": dep.get("id", ""),
-            "url": dep.get("staticUrl") or "",
-            "created_at": dep.get("createdAt"),
-            "error_lines": [],
-            "dashboard_url": f"https://railway.com/project/{proj_id}",
-        }
+        if project_id and pid == project_id:
+            best = (node, dep)
+            break
+        ts = dep.get("createdAt", "")
+        if ts > best_ts:
+            best_ts = ts
+            best = (node, dep)
 
-    return {"found": False, "state": "no_deployments"}
+    if not best:
+        return {"found": False, "state": "no_deployments"}
+
+    node, dep = best
+    status = (dep.get("status") or "BUILDING").upper()
+    proj_id = node.get("id", "")
+    return {
+        "found": True,
+        "state": status,
+        "deployment_id": dep.get("id", ""),
+        "url": dep.get("staticUrl") or "",
+        "created_at": dep.get("createdAt"),
+        "error_lines": [],
+        "dashboard_url": f"https://railway.com/project/{proj_id}",
+    }
