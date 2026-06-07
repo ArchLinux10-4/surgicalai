@@ -294,6 +294,14 @@ html{scroll-behavior:smooth}
 .sai-integ-badge-sm.done{background:rgba(15,168,118,.15);color:#34d399}
 .sai-integ-badge-sm.todo{background:rgba(255,255,255,.06);color:#7070a0}
 .sai-integ-badge-sm.cancelled{background:rgba(248,113,113,.1);color:#f87171}
+.sai-integ-badge-sm.ready{background:rgba(15,168,118,.15);color:#34d399}
+.sai-integ-badge-sm.building{background:rgba(251,191,36,.15);color:#fbbf24}
+.sai-integ-badge-sm.error{background:rgba(248,113,113,.12);color:#f87171}
+.sai-integ-badge-sm.success{background:rgba(15,168,118,.15);color:#34d399}
+.sai-integ-badge-sm.deploying{background:rgba(251,191,36,.15);color:#fbbf24}
+.sai-integ-badge-sm.crashed{background:rgba(248,113,113,.12);color:#f87171}
+.sai-integ-dot.red{background:#f87171}
+.sai-integ-dot.yellow{background:#fbbf24}
 .sai-integ-section-divider{height:1px;background:var(--e-border);margin:4px 0}
 .sai-integ-section-label{font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--e-txt3);padding:4px 12px 0}
 .sai-integ-bullets{display:flex;flex-direction:column;gap:16px;margin-top:32px}
@@ -2077,6 +2085,187 @@ export function LandingPage() {
         </div>
       </section>
 
+      {/* VERCEL INTEGRATION */}
+      <section className="sai-section">
+        <div className="sai-container">
+          <div className="sai-integ-grid">
+            <div>
+              <div className="sai-integ-logo-badge">
+                <svg width="20" height="20" viewBox="0 0 512 512" fill="var(--txt)"><path d="M256 48L496 464H16L256 48Z" /></svg>
+                Vercel Integration
+              </div>
+              <div className="sai-section-label">Deployment Monitoring</div>
+              <h2 className="sai-section-title">Deploy-aware.<br/>Error-ready.</h2>
+              <p className="sai-section-sub">SurgicalAI connects to your Vercel account to monitor deployments in real time. When a build fails, error lines are extracted and surfaced instantly — no tab switching.</p>
+              <div className="sai-integ-bullets">
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">📦</div>
+                  <div>
+                    <h4>Project &amp; deployment dashboard</h4>
+                    <p>Browse all Vercel projects with framework detection, deployment state, and live preview URLs — directly in the sidebar.</p>
+                  </div>
+                </div>
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">📋</div>
+                  <div>
+                    <h4>Build log streaming</h4>
+                    <p>Expand any deployment to read its full build log. Errors and warnings are highlighted — no need to leave your editor.</p>
+                  </div>
+                </div>
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">🔴</div>
+                  <div>
+                    <h4>Live deploy watcher</h4>
+                    <p>Active deployments are auto-detected and polled. When a build fails, SurgicalAI extracts the exact error lines so you can fix them in the next prompt.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div>
+              <div className="sai-integ-mockup">
+                <div className="sai-integ-titlebar">
+                  <div className="sai-dot sai-dot-r"></div>
+                  <div className="sai-dot sai-dot-y"></div>
+                  <div className="sai-dot sai-dot-g"></div>
+                  <span className="sai-integ-tbtitle">Vercel — Deployments</span>
+                </div>
+                <div className="sai-integ-body">
+                  <div className="sai-integ-section-label">Production</div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>surgicalai.vercel.app</span>
+                    <span className="sai-integ-badge-sm ready">Ready</span>
+                  </div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot yellow"></div>
+                    <span style={{flex:1}}>feat/landing-page</span>
+                    <span className="sai-integ-badge-sm building">Building</span>
+                  </div>
+                  <div className="sai-integ-section-divider"></div>
+                  <div className="sai-integ-section-label">Preview</div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>fix-qa-autoheal.vercel.app</span>
+                    <span className="sai-integ-badge-sm ready">Ready</span>
+                  </div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>pr-47-streaming.vercel.app</span>
+                    <span className="sai-integ-badge-sm ready">Ready</span>
+                  </div>
+                  <div className="sai-integ-section-divider"></div>
+                  <div className="sai-integ-section-label">Recent Failures</div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot red"></div>
+                    <span style={{flex:1}}>deploy-rollback-main</span>
+                    <span className="sai-integ-badge-sm error">Failed</span>
+                  </div>
+                  <div className="sai-integ-section-divider"></div>
+                  <div className="sai-integ-section-label">Framework</div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot blue"></div>
+                    <span style={{flex:1,fontFamily:'monospace',fontSize:'11px'}}>Next.js · React · TypeScript</span>
+                    <span className="sai-integ-meta">Auto-detected</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* RAILWAY INTEGRATION */}
+      <section className="sai-section" style={{background:'var(--bg2)'}}>
+        <div className="sai-container">
+          <div className="sai-integ-grid reverse">
+            <div>
+              <div className="sai-integ-logo-badge">
+                <svg width="20" height="20" viewBox="0 0 32 32" fill="var(--txt)"><path d="M6.4 4h19.2c.3 0 .5.1.7.3l1.4 1.4c.2.2.3.4.3.7v19.2c0 .3-.1.5-.3.7l-1.4 1.4c-.2.2-.4.3-.7.3H6.4c-.3 0-.5-.1-.7-.3l-1.4-1.4c-.2-.2-.3-.4-.3-.7V6.4c0-.3.1-.5.3-.7l1.4-1.4c.2-.2.4-.3.7-.3zM8 10v2h16v-2H8zm0 5v2h16v-2H8zm0 5v2h12v-2H8z"/></svg>
+                Railway Integration
+              </div>
+              <div className="sai-section-label">Infrastructure Monitoring</div>
+              <h2 className="sai-section-title">Services tracked.<br/>Deploys watched.</h2>
+              <p className="sai-section-sub">SurgicalAI connects to Railway via GraphQL to give you a live view of every project, service, and deployment — without leaving your editor.</p>
+              <div className="sai-integ-bullets">
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">🚂</div>
+                  <div>
+                    <h4>Multi-project overview</h4>
+                    <p>See all Railway projects at a glance with service counts, environments, and latest deployment status — no dashboard hopping.</p>
+                  </div>
+                </div>
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">⚙️</div>
+                  <div>
+                    <h4>Service-level deployments</h4>
+                    <p>Drill into any project to view per-service deployment history with environment labels — production, staging, or custom.</p>
+                  </div>
+                </div>
+                <div className="sai-integ-bullet">
+                  <div className="sai-integ-bullet-icon">👁</div>
+                  <div>
+                    <h4>Live deploy watcher</h4>
+                    <p>Active builds are auto-detected and polled. Failed or crashed deployments surface immediately with one-click links to the Railway dashboard.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+            <div>
+              <div className="sai-integ-mockup">
+                <div className="sai-integ-titlebar">
+                  <div className="sai-dot sai-dot-r"></div>
+                  <div className="sai-dot sai-dot-y"></div>
+                  <div className="sai-dot sai-dot-g"></div>
+                  <span className="sai-integ-tbtitle">Railway — Projects</span>
+                </div>
+                <div className="sai-integ-body">
+                  <div className="sai-integ-section-label">Projects</div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>surgicalai-api · 2 services</span>
+                    <span className="sai-integ-badge-sm success">Success</span>
+                  </div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot yellow"></div>
+                    <span style={{flex:1}}>surgicalai-worker · 1 service</span>
+                    <span className="sai-integ-badge-sm deploying">Deploying</span>
+                  </div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>surgicalai-tsc · 1 service</span>
+                    <span className="sai-integ-badge-sm success">Success</span>
+                  </div>
+                  <div className="sai-integ-section-divider"></div>
+                  <div className="sai-integ-section-label">Latest Deployments</div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>api-server · production</span>
+                    <span className="sai-integ-meta">12m ago</span>
+                  </div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot green"></div>
+                    <span style={{flex:1}}>tsc-service · production</span>
+                    <span className="sai-integ-meta">14m ago</span>
+                  </div>
+                  <div className="sai-integ-row active">
+                    <div className="sai-integ-dot yellow"></div>
+                    <span style={{flex:1}}>worker · staging</span>
+                    <span className="sai-integ-meta">just now</span>
+                  </div>
+                  <div className="sai-integ-section-divider"></div>
+                  <div className="sai-integ-section-label">Failed</div>
+                  <div className="sai-integ-row">
+                    <div className="sai-integ-dot red"></div>
+                    <span style={{flex:1}}>worker · production · v3.1.2</span>
+                    <span className="sai-integ-badge-sm crashed">Crashed</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
       {/* COMPARE */}
       <section id="compare" className="sai-section">
         <div className="sai-container">
@@ -2091,7 +2280,7 @@ export function LandingPage() {
                 <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>No QA step</strong> — TypeScript errors discovered at runtime</p></div>
                 <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>Single model</strong> — planning and editing collapsed into one role</p></div>
                 <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>No auto-heal</strong> — failed edits require manual retry</p></div>
-                <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>No integrations</strong> — no GitHub PR, no Linear ticket sync</p></div>
+                <div className="sai-compare-item"><span className="chk no">✗</span><p><strong>No integrations</strong> — no GitHub PR, no ticket sync, no deploy monitoring</p></div>
               </div>
             </div>
             <div className="sai-compare-card ours">
@@ -2101,7 +2290,7 @@ export function LandingPage() {
                 <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>TypeScript QA on every change</strong> — hard fail, not silent pass</p></div>
                 <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>Architect + Surgeon</strong> — dedicated roles, clear separation</p></div>
                 <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>3× auto-heal</strong> — Claude re-reads errors and retries automatically</p></div>
-                <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>GitHub + Linear</strong> — branch-aware, PR creation, ticket sync</p></div>
+                <div className="sai-compare-item"><span className="chk yes">✓</span><p><strong>GitHub + Linear + Vercel + Railway</strong> — branch-aware PRs, ticket sync, deploy monitoring</p></div>
               </div>
             </div>
           </div>
@@ -2221,7 +2410,7 @@ export function LandingPage() {
               <div className="sai-pricing-divider"></div>
               <div className="sai-pricing-features">
                 <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>Claude Opus</strong> — Anthropic's most intelligent model for both roles</p></div>
-                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>GitHub + Linear</strong> — full integration suite</p></div>
+                <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>GitHub + Linear + Vercel + Railway</strong> — full integration suite</p></div>
                 <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>Unlimited files</strong> per session</p></div>
                 <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>SEARCH/REPLACE + 32K direct rewrite</strong> for large files</p></div>
                 <div className="sai-pricing-feature"><span className="ck">✓</span><p><strong>QA auto-heal</strong> — 3 retry attempts, fresh error + live file each time</p></div>
@@ -2250,7 +2439,7 @@ export function LandingPage() {
             </div>
             <div className="sai-cta-detail">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><polyline points="20 6 9 17 4 12"/></svg>
-              GitHub + Linear integrations included
+              GitHub + Linear + Vercel + Railway integrations included
             </div>
             <div className="sai-cta-detail">
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2"><polyline points="20 6 9 17 4 12"/></svg>
