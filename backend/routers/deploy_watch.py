@@ -224,7 +224,21 @@ def watch_railway(request: Request):
     """Return latest Railway deployment status for the surgicalai project."""
     _uid(request)  # auth gate only
 
-    token = os.getenv("RAILWAY_API_TOKEN", "")
+    # Use per-user DB token (mirrors Vercel pattern)
+    uid = getattr(request.state, "user_id", None)
+    token = ""
+    if uid:
+        try:
+            from crypto_utils import decrypt_api_key
+            from database import get_user_api_key
+            enc = get_user_api_key(uid, "railway")
+            if enc:
+                token = decrypt_api_key(enc)
+        except Exception:
+            pass
+    # Fall back to env var for backward compat
+    if not token:
+        token = os.getenv("RAILWAY_API_TOKEN", "")
     if not token:
         return {"found": False, "state": "no_token"}
 

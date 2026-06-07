@@ -461,6 +461,13 @@ export const api = {
     deployment: (id: string) => request<any>(`/vercel/deployments/${id}`),
     logs: (id: string, limit = 200) => request<any>(`/vercel/deployments/${id}/logs?limit=${limit}`),
   },
+  railway: {
+    status: () => request<any>('/railway/status'),
+    connect: (token: string) => request<any>('/railway/connect', { method: 'POST', body: JSON.stringify({ token }) }),
+    disconnect: () => request<any>('/railway/disconnect', { method: 'DELETE' }),
+    projects: () => request<any>('/railway/projects'),
+    projectDeployments: (projectId: string) => request<any>(`/railway/projects/${projectId}/deployments`),
+  },
 deployWatch: {
     vercel: (projectId?: string) =>
       request<any>(`/deploy-watch/vercel${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`),

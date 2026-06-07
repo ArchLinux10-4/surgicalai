@@ -7,13 +7,14 @@ import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
 import { BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
-type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'security' | 'debug'
+type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'railway' | 'security' | 'debug'
 
 const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'api',       icon: <VpnKey sx={{ fontSize: 14 }} />,       label: 'API Keys' },
   { id: 'models',    icon: <Psychology sx={{ fontSize: 14 }} />,      label: 'Models' },
   { id: 'github',    icon: <GitHub sx={{ fontSize: 14 }} />,     label: 'GitHub' },
   { id: 'vercel',    icon: <span style={{ fontSize: 12, fontWeight: 'bold' }}>▲</span>,     label: 'Vercel' },
+  { id: 'railway',   icon: <span style={{ fontSize: 13, fontWeight: 'bold', color: '#dc2626' }}>⬡</span>,  label: 'Railway' },
   { id: 'workspace', icon: <FolderOpen sx={{ fontSize: 14 }} />, label: 'Workspace' },
   { id: 'editor',    icon: <Code sx={{ fontSize: 14 }} />,       label: 'Editor' },
   { id: 'users',     icon: <Group sx={{ fontSize: 14 }} />,      label: 'Users' },
@@ -46,6 +47,10 @@ export function SettingsModal() {
   const [vercelConnecting, setVercelConnecting] = useState(false)
   const [vercelStatus, setVercelStatus] = useState<any>(null)
   const [vercelStatusMsg, setVercelStatusMsg] = useState('')
+  const [railwayToken, setRailwayToken] = useState('')
+  const [railwayConnecting, setRailwayConnecting] = useState(false)
+  const [railwayStatus, setRailwayStatus] = useState<any>(null)
+  const [railwayStatusMsg, setRailwayStatusMsg] = useState('')
   const [showGithubPat, setShowGithubPat] = useState(false)
   const [githubConnecting, setGithubConnecting] = useState(false)
   const [githubStatus, setGithubStatus] = useState<any>(null)
@@ -96,6 +101,7 @@ export function SettingsModal() {
     api.settings.getModels().then((d) => setModels(d.models || [])).catch(() => {})
     try { (api as any).github.status().then((s: any) => setGithubStatus(s)).catch(() => {}) } catch(_) {}
     try { (api as any).vercel.status().then((s: any) => setVercelStatus(s)).catch(() => {}) } catch(_) {}
+    try { (api as any).railway.status().then((s: any) => setRailwayStatus(s)).catch(() => {}) } catch(_) {}
     try { api.settings.geminiStatus().then((s: any) => setGeminiConnected(s?.connected || false)).catch(() => {}) } catch(_) {}
   }, [settings, settingsOpen])
 
@@ -139,6 +145,30 @@ export function SettingsModal() {
       setVercelStatusMsg('Disconnected')
     } catch (e: any) {
       setVercelStatusMsg(e.message || 'Failed to disconnect')
+    }
+  }
+
+  const handleConnectRailway = async () => {
+    if (!railwayToken.trim()) return
+    setRailwayConnecting(true)
+    try {
+      const res: any = await (api as any).railway.connect(railwayToken.trim())
+      setRailwayStatus({ connected: true, name: res.name, email: res.email })
+      setRailwayStatusMsg('Connected successfully!')
+    } catch (e: any) {
+      setRailwayStatusMsg(e.message || 'Connection failed')
+    } finally {
+      setRailwayConnecting(false)
+    }
+  }
+
+  const handleDisconnectRailway = async () => {
+    try {
+      await (api as any).railway.disconnect()
+      setRailwayStatus({ connected: false })
+      setRailwayStatusMsg('Disconnected')
+    } catch (e: any) {
+      setRailwayStatusMsg(e.message || 'Failed to disconnect')
     }
   }
 
@@ -601,6 +631,68 @@ export function SettingsModal() {
                       <div>2. Click <strong className="text-ink">Create Token</strong></div>
                       <div>3. Give it a name and set scope to your team</div>
                       <div>4. Copy the token and paste it above — creating a new token does NOT deactivate existing ones</div>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {tab === 'railway' && (
+              <div className="space-y-5">
+                <SectionHeader
+                  title="Railway Integration"
+                  subtitle="Connect your Railway account to monitor services and deployments from SurgicalAI"
+                />
+
+                {railwayStatus?.connected ? (
+                  <div className="flex flex-col gap-3">
+                    <div className="flex items-center gap-3 p-3 rounded-lg border border-green-500/30 bg-green-500/10 flex-wrap">
+                      <div className="w-9 h-9 rounded-full bg-red-600/20 border border-red-500/30 flex items-center justify-center flex-shrink-0 text-red-400 font-bold text-sm">R</div>
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-semibold text-green-400">Connected as {railwayStatus.name || railwayStatus.email}</div>
+                        <div className="text-xs text-muted">Your projects are available in the Railway sidebar tab</div>
+                      </div>
+                      <button
+                        onClick={handleDisconnectRailway}
+                        className="text-xs text-red-400 hover:text-red-300 border border-red-500/30 rounded px-3 py-1.5 hover:bg-red-500/10 transition-colors flex-shrink-0"
+                      >
+                        Disconnect
+                      </button>
+                    </div>
+                    {railwayStatusMsg && <div className="text-xs text-muted">{railwayStatusMsg}</div>}
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    <Field label="Personal Access Token">
+                      <div className="flex gap-2">
+                        <input
+                          type="password"
+                          className="input flex-1 font-mono"
+                          placeholder="railway_token_…"
+                          value={railwayToken}
+                          onChange={e => setRailwayToken(e.target.value)}
+                          onKeyDown={(e) => e.key === 'Enter' && handleConnectRailway()}
+                        />
+                        <button
+                          onClick={handleConnectRailway}
+                          disabled={railwayConnecting || !railwayToken.trim()}
+                          className="btn-primary px-4 text-sm disabled:opacity-50"
+                        >
+                          {railwayConnecting ? 'Connecting…' : 'Connect'}
+                        </button>
+                      </div>
+                    </Field>
+                    {railwayStatusMsg && (
+                      <div className={`text-xs px-3 py-2 rounded ${railwayStatusMsg.includes('success') ? 'text-green-400 bg-green-500/10' : 'text-red-400 bg-red-500/10'}`}>
+                        {railwayStatusMsg}
+                      </div>
+                    )}
+                    <div className="text-xs text-muted space-y-1 p-3 rounded-lg bg-surface border border-border">
+                      <div className="font-medium text-ink mb-2">How to get a token:</div>
+                      <div>1. Go to <a href="https://railway.com/account/tokens" target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">railway.com/account/tokens</a></div>
+                      <div>2. Click <strong className="text-ink">New Token</strong></div>
+                      <div>3. Give it a name (e.g. "SurgicalAI")</div>
+                      <div>4. Copy the token and paste it above</div>
                     </div>
                   </div>
                 )}

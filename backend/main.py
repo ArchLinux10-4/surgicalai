@@ -14,6 +14,7 @@ from database import init_db
 from auth_utils import decode_token
 from routers import settings, chat, files, surgical, git, context, session_files, github as github_router
 from routers import vercel as vercel_router
+from routers import railway as railway_router
 from routers import datalab as datalab_router
 from routers import debug as debug_router
 from routers import auth as auth_router
@@ -127,6 +128,7 @@ app.include_router(context.router, prefix="/api/context", tags=["context"])
 app.include_router(session_files.router, prefix="/api/chat", tags=["session-files"])
 app.include_router(github_router.router, prefix="/api/github", tags=["github"])
 app.include_router(vercel_router.router, prefix="/api/vercel", tags=["vercel"])
+app.include_router(railway_router.router, prefix="/api/railway", tags=["railway"])
 app.include_router(linear_router.router, prefix="/api/linear", tags=["linear"])
 app.include_router(deploy_router.router, prefix="/api/deploy", tags=["deploy"])
 app.include_router(deploy_watch_router.router, prefix="/api/deploy-watch", tags=["deploy-watch"])

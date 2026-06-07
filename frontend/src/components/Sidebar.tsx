@@ -8,6 +8,7 @@ import { ContextPanel } from './ContextPanel'
 import { GitHubPanel } from './GitHubPanel'
 import { LinearPanel } from './LinearPanel'
 import { VercelPanel } from './VercelPanel'
+import { RailwayPanel } from './RailwayPanel'
 import { useThemeStore } from '../stores/themeStore'
 import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, PushPin, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile } from '../lib/fileClassify'
@@ -485,13 +486,14 @@ function SessionFilesPanel() {
 }
 
 // ── Rail items config ─────────────────────────────────────────────────────────
-type TabId = 'sessions' | 'files' | 'github' | 'context' | 'linear' | 'vercel'
+type TabId = 'sessions' | 'files' | 'github' | 'context' | 'linear' | 'vercel' | 'railway'
 const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
   { id: 'sessions', icon: Chat, label: 'Chats',  tooltip: 'Chats' },
   { id: 'files',    icon: Code,      label: 'Files',  tooltip: 'Session Files' },
   { id: 'github',   icon: GitHub,        label: 'GitHub', tooltip: 'GitHub' },
   { id: 'linear',   icon: LinearIcon,    label: 'Linear', tooltip: 'Linear Issues' },
   { id: 'vercel',   icon: VercelIcon,         label: 'Vercel', tooltip: 'Vercel Deployments' },
+  { id: 'railway',  icon: RailwayIcon,        label: 'Railway', tooltip: 'Railway Services' },
   { id: 'context',  icon: PushPin,           label: 'Pinned', tooltip: 'Pinned & Memory' },
 ]
 
@@ -500,6 +502,15 @@ function VercelIcon({ size = 16 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 512 512" fill="currentColor">
       <path d="M256 48L496 464H16L256 48Z" />
+    </svg>
+  )
+}
+
+// ── Railway icon (inline SVG) ─────────────────────────────────────────────────
+function RailwayIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 32 32" fill="currentColor">
+      <path d="M16 2C8.268 2 2 8.268 2 16s6.268 14 14 14 14-6.268 14-14S23.732 2 16 2zm0 2c6.627 0 12 5.373 12 12S22.627 28 16 28 4 22.627 4 16 9.373 4 16 4zm-5 5v14h3v-5h4l3 5h3.5l-3.2-5.3C23 17 24 15.2 24 13c0-2.2-1.8-4-4-4h-9zm3 2.5h6c.8 0 1.5.7 1.5 1.5s-.7 1.5-1.5 1.5h-6v-3z"/>
     </svg>
   )
 }
@@ -676,6 +687,9 @@ export function Sidebar() {
           )}
           {sidebarTab === 'vercel'   && (
             <VercelPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
+          )}
+          {sidebarTab === 'railway'  && (
+            <RailwayPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
           )}
         </div>
       </div>
