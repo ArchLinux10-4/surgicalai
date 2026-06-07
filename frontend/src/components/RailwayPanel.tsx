@@ -227,7 +227,7 @@ export function RailwayPanel({ onOpenSettings }: RailwayPanelProps) {
       <div className="flex flex-col h-full overflow-hidden">
         <DeployWatcher
           targets={['railway']}
-          railwayProjectId={expandedProject || undefined}
+          railwayProjectId={selectedProject?.id || undefined}
           onDismiss={() => { setWatching(false); loadProjects() }}
         />
       </div>

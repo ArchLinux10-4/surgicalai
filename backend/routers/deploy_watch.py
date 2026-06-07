@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 from typing import Optional
 
 import requests as _req
@@ -234,9 +233,6 @@ def watch_railway(request: Request, project_id: Optional[str] = None):
                 token = decrypt_api_key(enc)
         except Exception:
             pass
-    # Fall back to env var for backward compat
-    if not token:
-        token = os.getenv("RAILWAY_API_TOKEN", "")
     if not token:
         return {"found": False, "state": "no_token"}
 
