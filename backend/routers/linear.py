@@ -15,6 +15,10 @@ router = APIRouter()
 LINEAR_GQL = "https://api.linear.app/graphql"
 
 
+def _get_uid(request) -> str:
+    return getattr(request.state, "user_id", "") or ""
+
+
 
 
 
@@ -46,7 +50,7 @@ def _gql(key: str, query: str, variables: dict = None) -> dict:
 
 @router.get("/status")
 def linear_status(request: Request):
-    user_id = request.state.user["id"]
+    user_id = _get_uid(request)
     key = _get_linear_key(user_id)
     if not key:
         return {"connected": False}
@@ -77,7 +81,7 @@ async def linear_connect(body: dict, request: Request):
         raise HTTPException(status_code=401, detail=f"Invalid Linear API key: {e}")
     viewer = data.get("viewer", {})
     org = data.get("organization", {})
-    user_id = request.state.user["id"]
+    user_id = _get_uid(request)
     set_user_api_key(user_id, "linear", encrypt_api_key(key))
     # Per-user only — no global key storage
     return {
@@ -91,14 +95,14 @@ async def linear_connect(body: dict, request: Request):
 
 @router.delete("/disconnect")
 def linear_disconnect(request: Request):
-    user_id = request.state.user["id"]
+    user_id = _get_uid(request)
     set_user_api_key(user_id, "linear", "")
     return {"ok": True}
 
 
 @router.get("/teams")
 def linear_teams(request: Request):
-    user_id = request.state.user["id"]
+    user_id = _get_uid(request)
     key = _get_linear_key(user_id)
     if not key:
         raise HTTPException(status_code=401, detail="Not connected to Linear")
@@ -108,7 +112,7 @@ def linear_teams(request: Request):
 
 @router.get("/issues")
 def linear_issues(request: Request, query: str = "", team_id: str = "", state: str = "", limit: int = 20):
-    user_id = request.state.user["id"]
+    user_id = _get_uid(request)
     key = _get_linear_key(user_id)
     if not key:
         raise HTTPException(status_code=401, detail="Not connected to Linear")
@@ -149,7 +153,7 @@ def linear_issues(request: Request, query: str = "", team_id: str = "", state: s
 
 @router.get("/issues/{issue_id}")
 def linear_issue_detail(issue_id: str, request: Request):
-    user_id = request.state.user["id"]
+    user_id = _get_uid(request)
     key = _get_linear_key(user_id)
     if not key:
         raise HTTPException(status_code=401, detail="Not connected to Linear")
@@ -169,7 +173,7 @@ def linear_issue_detail(issue_id: str, request: Request):
 @router.post("/issues/{issue_id}/complete")
 async def linear_complete_issue(issue_id: str, body: dict, request: Request):
     """Mark a Linear issue as done — finds the completed workflow state and transitions."""
-    user_id = request.state.user["id"]
+    user_id = _get_uid(request)
     key = _get_linear_key(user_id)
     if not key:
         raise HTTPException(status_code=401, detail="Not connected to Linear")
@@ -219,7 +223,7 @@ async def linear_complete_issue(issue_id: str, body: dict, request: Request):
 @router.post("/issues/{issue_id}/comment")
 async def linear_add_comment(issue_id: str, body: dict, request: Request):
     """Add a comment to a Linear issue — used to link a GitHub commit."""
-    user_id = request.state.user["id"]
+    user_id = _get_uid(request)
     key = _get_linear_key(user_id)
     if not key:
         raise HTTPException(status_code=401, detail="Not connected to Linear")
