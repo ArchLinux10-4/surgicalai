@@ -33,7 +33,7 @@ interface AppState {
 
   // UI
   sidebarTab: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'railway'
-  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel') => void
+  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'railway') => void
   sidebarPanelOpen: boolean
   setSidebarPanelOpen: (open: boolean) => void
   sendLinearIssue: ((issue: any) => void) | null
