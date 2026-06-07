@@ -12,7 +12,7 @@ from crypto_utils import decrypt_api_key
 from database import get_user_api_key
 
 VERCEL_API = "https://api.vercel.com"
-RAILWAY_GQL = "https://api.railway.app/graphql/v2"
+RAILWAY_GQL = "https://backboard.railway.com/graphql/v2"
 
 router = APIRouter()
 
@@ -195,20 +195,18 @@ def watch_vercel(
 
 _RAILWAY_QUERY = """
 {
-  me {
-    projects {
-      edges {
-        node {
-          id
-          name
-          deployments(first: 1) {
-            edges {
-              node {
-                id
-                status
-                createdAt
-                staticUrl
-              }
+  projects {
+    edges {
+      node {
+        id
+        name
+        deployments(first: 1) {
+          edges {
+            node {
+              id
+              status
+              createdAt
+              staticUrl
             }
           }
         }
@@ -258,7 +256,6 @@ def watch_railway(request: Request):
 
     projects = (
         (data.get("data") or {})
-        .get("me", {})
         .get("projects", {})
         .get("edges", [])
     )

@@ -59,38 +59,33 @@ def _get_token(user_id: str) -> str:
 
 # ── GraphQL queries ───────────────────────────────────────────────────────────
 
-_Q_ME = "{ me { id name email } }"
+_Q_VERIFY = "{ projects { edges { node { id } } } }"
 
 _Q_PROJECTS = """
 {
-  me {
-    id
-    name
-    email
-    projects {
-      edges {
-        node {
-          id
-          name
-          description
-          createdAt
-          updatedAt
-          services {
-            edges {
-              node {
-                id
-                name
-              }
+  projects {
+    edges {
+      node {
+        id
+        name
+        description
+        createdAt
+        updatedAt
+        services {
+          edges {
+            node {
+              id
+              name
             }
           }
-          deployments(first: 1) {
-            edges {
-              node {
-                id
-                status
-                createdAt
-                staticUrl
-              }
+        }
+        deployments(first: 1) {
+          edges {
+            node {
+              id
+              status
+              createdAt
+              staticUrl
             }
           }
         }
@@ -141,14 +136,9 @@ def railway_status(request: Request):
         return {"connected": False}
     try:
         token = decrypt_api_key(encrypted)
-        data = _gql(token, _Q_ME)
-        me = data.get("me", {})
-        if me.get("id"):
-            return {
-                "connected": True,
-                "name": me.get("name", ""),
-                "email": me.get("email", ""),
-            }
+        data = _gql(token, _Q_VERIFY)
+        if data.get("projects") is not None:
+            return {"connected": True, "name": "", "email": ""}
         return {"connected": False}
     except Exception:
         return {"connected": False}
@@ -167,10 +157,9 @@ def railway_connect(body: ConnectRequest, request: Request):
         raise HTTPException(status_code=401, detail="Not authenticated")
     tok = body.token.strip()
     try:
-        data = _gql(tok, _Q_ME)
-        me = data.get("me", {})
-        if not me.get("id"):
-            raise HTTPException(status_code=401, detail="Invalid token — could not fetch user info.")
+        data = _gql(tok, _Q_VERIFY)
+        if data.get("projects") is None:
+            raise HTTPException(status_code=401, detail="Invalid Railway token.")
     except HTTPException:
         raise
     except Exception as e:
@@ -179,8 +168,8 @@ def railway_connect(body: ConnectRequest, request: Request):
     set_user_api_key(user_id, "railway", encrypt_api_key(tok))
     return {
         "ok": True,
-        "name": me.get("name", ""),
-        "email": me.get("email", ""),
+        "name": "",
+        "email": "",
     }
 
 
@@ -202,8 +191,7 @@ def list_projects(request: Request):
         raise HTTPException(status_code=401, detail="Not authenticated")
     token = _get_token(user_id)
     data = _gql(token, _Q_PROJECTS)
-    me = data.get("me", {})
-    raw_projects = (me.get("projects") or {}).get("edges", [])
+    raw_projects = (data.get("projects") or {}).get("edges", [])
     projects = []
     for edge in raw_projects:
         node = edge.get("node", {})
@@ -225,7 +213,7 @@ def list_projects(request: Request):
             "latest_url": latest_dep.get("staticUrl", ""),
             "latest_created": latest_dep.get("createdAt", ""),
         })
-    return {"projects": projects, "user_name": me.get("name", ""), "user_email": me.get("email", "")}
+    return {"projects": projects, "user_name": "", "user_email": ""}
 
 
 # ── Deployments for a project ─────────────────────────────────────────────────
