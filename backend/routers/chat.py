@@ -824,67 +824,92 @@ async def smart_stream(req: dict, request: Request):
         # ── End agentic task branch ───────────────────────────────────────
 
         _pipeline = run_natural_pipeline_stream if _use_natural else run_smart_pipeline_stream
+        _saved = False
 
-        async for chunk in _with_heartbeat(_pipeline(
-            session_files=session_files,
-            user_request=message,
-            conversation_history=conversation_history,
-            session_id=session_id,
-            project_memory=project_memory,
-            session_summary=current_summary,
-            user_id=current_user_id,
-        )):
-            if chunk.startswith("data: "):
+        try:
+            async for chunk in _with_heartbeat(_pipeline(
+                session_files=session_files,
+                user_request=message,
+                conversation_history=conversation_history,
+                session_id=session_id,
+                project_memory=project_memory,
+                session_summary=current_summary,
+                user_id=current_user_id,
+            )):
+                if chunk.startswith("data: "):
+                    try:
+                        data = _json.loads(chunk[6:])
+                        chunk_type = data.get("type", "")
+                        if chunk_type in ("token", "chat"):
+                            collected_tokens.append(data.get("content", ""))
+                        elif chunk_type == "smart_result":
+                            result_content = data.get("content", "")
+                        elif chunk_type in ("done", "error"):
+                            # Save assistant message — store both natural text AND result
+                            db = get_db()
+                            resp_id = str(uuid.uuid4())
+                            natural_text = "".join(collected_tokens).strip()
+
+                            if result_content:
+                                parsed_result = _json.loads(result_content)
+
+                                # Change 1: Surface QA warnings in the chat bubble text so
+                                # users see them in conversation flow, not only behind "Review".
+                                # Collect unique warning/blocked summaries from all changes.
+                                qa_warnings = []
+                                for _fdata in parsed_result.get("changes_by_file", {}).values():
+                                    for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
+                                        qr = ch.get("qa_result") or {}
+                                        verdict = qr.get("verdict", "")
+                                        summary = (qr.get("summary") or "").strip()
+                                        score   = qr.get("qa_score")
+                                        if verdict in ("warning", "blocked") and summary:
+                                            icon = "⚠️" if verdict == "warning" else "🚫"
+                                            sym  = (ch.get("symbol") or {})
+                                            sym_name = sym.get("name") or sym.get("full_path", "change")
+                                            qa_warnings.append(f"{icon} **{sym_name}** (QA {score}/10): {summary}")
+
+                                if qa_warnings:
+                                    natural_text = (
+                                        natural_text
+                                        + ("\n\n" if natural_text else "")
+                                        + "**QA Notes:**\n"
+                                        + "\n".join(f"- {w}" for w in qa_warnings)
+                                    )
+
+                                saved_content = "__NATURAL_AND_RESULT__:" + _json.dumps({
+                                    "text": natural_text,
+                                    "result": parsed_result,
+                                })
+                            else:
+                                saved_content = natural_text
+
+                            db.execute(
+                                "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+                                (resp_id, session_id, "assistant", saved_content)
+                            )
+                            db.execute(
+                                "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                (session_id,)
+                            )
+                            db.commit()
+                            db.close()
+                            _saved = True
+                    except Exception as _save_err:
+                        print(f"[STREAM] DB save failed: {_save_err}")
+                yield chunk
+        finally:
+            # Safety net: if stream ended without done/error (crash, timeout,
+            # client disconnect), persist whatever tokens were collected.
+            if not _saved and collected_tokens:
                 try:
-                    data = _json.loads(chunk[6:])
-                    chunk_type = data.get("type", "")
-                    if chunk_type in ("token", "chat"):
-                        collected_tokens.append(data.get("content", ""))
-                    elif chunk_type == "smart_result":
-                        result_content = data.get("content", "")
-                    elif chunk_type in ("done", "error"):
-                        # Save assistant message — store both natural text AND result
-                        db = get_db()
-                        resp_id = str(uuid.uuid4())
-                        natural_text = "".join(collected_tokens).strip()
-
-                        if result_content:
-                            parsed_result = _json.loads(result_content)
-
-                            # Change 1: Surface QA warnings in the chat bubble text so
-                            # users see them in conversation flow, not only behind "Review".
-                            # Collect unique warning/blocked summaries from all changes.
-                            qa_warnings = []
-                            for _fdata in parsed_result.get("changes_by_file", {}).values():
-                                for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
-                                    qr = ch.get("qa_result") or {}
-                                    verdict = qr.get("verdict", "")
-                                    summary = (qr.get("summary") or "").strip()
-                                    score   = qr.get("qa_score")
-                                    if verdict in ("warning", "blocked") and summary:
-                                        icon = "⚠️" if verdict == "warning" else "🚫"
-                                        sym  = (ch.get("symbol") or {})
-                                        sym_name = sym.get("name") or sym.get("full_path", "change")
-                                        qa_warnings.append(f"{icon} **{sym_name}** (QA {score}/10): {summary}")
-
-                            if qa_warnings:
-                                natural_text = (
-                                    natural_text
-                                    + ("\n\n" if natural_text else "")
-                                    + "**QA Notes:**\n"
-                                    + "\n".join(f"- {w}" for w in qa_warnings)
-                                )
-
-                            saved_content = "__NATURAL_AND_RESULT__:" + _json.dumps({
-                                "text": natural_text,
-                                "result": parsed_result,
-                            })
-                        else:
-                            saved_content = natural_text
-
+                    db = get_db()
+                    resp_id = str(uuid.uuid4())
+                    fallback_text = "".join(collected_tokens).strip()
+                    if fallback_text:
                         db.execute(
                             "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                            (resp_id, session_id, "assistant", saved_content)
+                            (resp_id, session_id, "assistant", fallback_text)
                         )
                         db.execute(
                             "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -892,9 +917,9 @@ async def smart_stream(req: dict, request: Request):
                         )
                         db.commit()
                         db.close()
-                except Exception as _save_err:
-                    print(f"[STREAM] DB save failed: {_save_err}")
-            yield chunk
+                        print(f"[STREAM] Safety-net save: {len(fallback_text)} chars for session {session_id}")
+                except Exception as _fallback_err:
+                    print(f"[STREAM] Safety-net save failed: {_fallback_err}")
 
     return StreamingResponse(stream_and_save(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",
