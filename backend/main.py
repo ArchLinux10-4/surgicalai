@@ -91,9 +91,12 @@ async def auth_middleware(request: Request, call_next):
     if any(p.match(path) for p in _OPEN_PATH_PATTERNS):
         return await call_next(request)
 
-    # Extract Bearer token
+    # Extract Bearer token, falling back to ?token= query param
+    # (allows browser direct-links like debug log download)
     auth_header = request.headers.get("Authorization", "")
     token = auth_header.removeprefix("Bearer ").strip()
+    if not token:
+        token = request.query_params.get("token", "")
 
     if not token:
         return JSONResponse(
