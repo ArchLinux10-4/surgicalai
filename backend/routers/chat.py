@@ -11,7 +11,7 @@ from services.pipeline import run_chat, run_chat_stream
 router = APIRouter()
 
 
-async def _with_heartbeat(aiter, interval: int = 20):
+async def _with_heartbeat(aiter, interval: int = 5):
     """Wrap an async iterator, yielding SSE keepalive comments when it stalls.
 
     Prevents Railway/nginx from closing idle SSE connections during long Claude

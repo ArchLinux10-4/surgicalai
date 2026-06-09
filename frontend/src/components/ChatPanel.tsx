@@ -999,6 +999,13 @@ export function ChatPanel() {
           gotResult = true
         }
         setError(err); stopStream(); setIsBuildingEdit(false)
+        // Auto-recover: fetch the backend's safety-net saved response (may be more complete)
+        setTimeout(async () => {
+          try {
+            const saved = await api.chat.getMessages(sessionId)
+            if (saved?.length) setMessages(saved)
+          } catch {}
+        }, 3000)
       },
       // onThinking
       (text, phase) => {
