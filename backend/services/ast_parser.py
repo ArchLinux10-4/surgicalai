@@ -309,6 +309,94 @@ class ASTParser:
                 )
             )
 
+        # ── React HOC wrappers: React.memo(), forwardRef(), lazy() ──
+        # These wrap a function/component in a higher-order call.  The inner
+        # braces live inside the memo() paren, so _find_block_end's brace
+        # tracker misses them.  Instead we scan forward for the closing ");".
+        hoc_re = re.compile(
+            r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*"
+            r"(?:React\.)?(?:memo|forwardRef|lazy)\s*\(",
+            re.MULTILINE,
+        )
+        _hoc_existing = {s.start_line for s in symbols}
+        closing_re = re.compile(r"^\}?\s*\)\s*;?\s*$")
+        for m in hoc_re.finditer(source):
+            line_no = source[: m.start()].count("\n") + 1
+            if line_no in _hoc_existing:
+                continue
+            name = m.group(1)
+            decl_line = lines[line_no - 1]
+            start_indent = len(decl_line) - len(decl_line.lstrip())
+            # Skip one-liners where parens balance on the same line
+            paren_depth = 0
+            for ch in decl_line:
+                if ch == "(":
+                    paren_depth += 1
+                elif ch == ")":
+                    paren_depth -= 1
+            if paren_depth == 0:
+                continue
+            # Scan forward for closing "})" or ")" at start indent
+            end_line = len(lines)
+            for scan_i in range(line_no, len(lines)):
+                ln = lines[scan_i]
+                stripped = ln.strip()
+                if not stripped:
+                    continue
+                cur_indent = len(ln) - len(ln.lstrip())
+                if cur_indent <= start_indent and closing_re.match(stripped):
+                    end_line = scan_i + 1
+                    break
+            symbols.append(
+                SymbolInfo(
+                    name=name,
+                    symbol_type=SymbolType.FUNCTION,
+                    start_line=line_no,
+                    end_line=end_line,
+                    parent=None,
+                    indentation=0,
+                    code="\n".join(lines[line_no - 1 : end_line]),
+                    signature=m.group(0).strip(),
+                )
+            )
+
+        # ── Multi-line destructured arrow functions ──
+        # Catches `const X = (\n  prop1,\n) => {` where the opening paren
+        # is on the declaration line but `=>` is on a subsequent line.
+        # _find_block_end already handles these correctly (brace at paren
+        # depth 0 on the `=> {` line).
+        ml_arrow_re = re.compile(
+            r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*\(",
+            re.MULTILINE,
+        )
+        _ml_existing = {s.start_line for s in symbols}
+        for m in ml_arrow_re.finditer(source):
+            line_no = source[: m.start()].count("\n") + 1
+            if line_no in _ml_existing:
+                continue
+            name = m.group(1)
+            # Confirm `=>` exists within 20 lines
+            is_arrow = False
+            for scan_i in range(line_no - 1, min(line_no + 19, len(lines))):
+                if re.search(r"\)\s*=>", lines[scan_i]):
+                    is_arrow = True
+                    break
+            if not is_arrow:
+                continue
+            end_line = self._find_block_end(lines, line_no - 1)
+            symbols.append(
+                SymbolInfo(
+                    name=name,
+                    symbol_type=SymbolType.ARROW_FUNCTION,
+                    start_line=line_no,
+                    end_line=end_line,
+                    parent=None,
+                    indentation=0,
+                    code="\n".join(lines[line_no - 1 : end_line]),
+                    signature=m.group(0).strip(),
+                )
+            )
+
         # Module-level VALUE constants — template literals and large object/array
         # literals that are NOT arrow functions. e.g. `const CSS = \`...500 lines...\``
         # or a big config object. Without this pass such a constant is invisible to
