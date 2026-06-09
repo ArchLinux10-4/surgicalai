@@ -984,7 +984,22 @@ export function ChatPanel() {
         else api.chat.getSessions().then(setSessions).catch(() => {})
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
-      (err) => { setError(err); stopStream(); setIsBuildingEdit(false) },
+      (err) => {
+        // Preserve any streamed text before clearing the bubble
+        if (accumulated.trim() && !gotResult) {
+          addMessage({
+            id: Date.now().toString() + '_ai_err',
+            session_id: sessionId,
+            role: 'assistant',
+            content: accumulated.trim(),
+            created_at: new Date().toISOString(),
+            _thinking: thinkingTextRef.current,
+            _steps: [...progressHistoryRef.current],
+          })
+          gotResult = true
+        }
+        setError(err); stopStream(); setIsBuildingEdit(false)
+      },
       // onThinking
       (text, phase) => {
         if (phase === 'start') { setIsThinking(true); setThinkingText(''); thinkingTextRef.current = '' }

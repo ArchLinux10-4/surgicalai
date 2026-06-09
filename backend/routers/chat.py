@@ -842,7 +842,7 @@ async def smart_stream(req: dict, request: Request):
                         collected_tokens.append(data.get("content", ""))
                     elif chunk_type == "smart_result":
                         result_content = data.get("content", "")
-                    elif chunk_type == "done":
+                    elif chunk_type in ("done", "error"):
                         # Save assistant message — store both natural text AND result
                         db = get_db()
                         resp_id = str(uuid.uuid4())
@@ -892,8 +892,8 @@ async def smart_stream(req: dict, request: Request):
                         )
                         db.commit()
                         db.close()
-                except Exception:
-                    pass
+                except Exception as _save_err:
+                    print(f"[STREAM] DB save failed: {_save_err}")
             yield chunk
 
     return StreamingResponse(stream_and_save(), media_type="text/event-stream", headers={

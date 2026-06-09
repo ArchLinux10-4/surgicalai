@@ -153,10 +153,10 @@ export const api = {
             }
           }
           pump()
-        }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
+        }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
 
         pump()
-      }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
+      }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
 
       return controller
     },
@@ -228,10 +228,10 @@ export const api = {
             processLine(line.trimEnd())
           }
           pump()
-        }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
+        }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
 
         pump()
-      }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
+      }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
 
       return controller
     },
