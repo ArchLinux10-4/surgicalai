@@ -6341,6 +6341,13 @@ user how to wire it up manually. If the symbol is large or only partially visibl
 <search_request> to load the exact region, then make a TARGETED edit (old_code/new_code)
 on the real symbol. A new file is only correct when genuinely net-new code is requested.
 
+━━━ CONVERSATION RECENCY ━━━
+
+When the user says "the fix", "the change", "the edit", or "that" without naming a file,
+they mean the MOST RECENT [Applied changes to: ...] marker in the conversation history.
+Always answer about that file and symbol — never reference an older edit unless the user
+explicitly names a different file.
+
 ━━━ ALWAYS PRODUCE VISIBLE OUTPUT ━━━
 
 You MUST always produce visible text — never respond with only internal reasoning.
@@ -7039,10 +7046,14 @@ def _clean_history_content(content: str) -> str:
                         summary = (qr.get("summary") or "").strip()
                         if verdict in ("warning", "blocked") and summary and name:
                             qa_flags.append(f"{name}: {summary}")
+            # ── Markers go FIRST so [:4000] truncation never chops them ──
+            prefix = ""
             if changes:
-                text += f"\n[Applied changes to: {', '.join(changes[:6])}]"
+                prefix += f"[Applied changes to: {', '.join(changes[:6])}]\n"
             if qa_flags:
-                text += f"\n[QA flagged: {'; '.join(qa_flags[:4])}]"
+                prefix += f"[QA flagged: {'; '.join(qa_flags[:4])}]\n"
+            if prefix:
+                text = prefix + text
             return text or "I made code changes to your files."
         except Exception:
             return content
