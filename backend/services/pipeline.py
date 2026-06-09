@@ -6341,6 +6341,15 @@ user how to wire it up manually. If the symbol is large or only partially visibl
 <search_request> to load the exact region, then make a TARGETED edit (old_code/new_code)
 on the real symbol. A new file is only correct when genuinely net-new code is requested.
 
+━━━ ALWAYS PRODUCE VISIBLE OUTPUT ━━━
+
+You MUST always produce visible text — never respond with only internal reasoning.
+- Need a file? → emit <file_request> immediately, don't just say "let me pull it"
+- Need code? → emit <search_request> immediately
+- Answering a question? → respond in plain text
+- Need clarification? → ask directly
+Never promise an action ("Let me pull that") without actually doing it in the same response.
+
 ━━━ EXAMPLE — EDIT ━━━
 
 "I'll change the button to blue:
@@ -7390,6 +7399,7 @@ async def run_natural_pipeline_stream(
         accumulated_search_results = ""          # injected into context each round
         current_messages = list(messages)        # grows with search result turns
         _forced_edit_round_done = False          # only one forced-edit round allowed
+        _thinking_only_retries = 0               # max 1 auto-retry for thinking-only responses
 
         # +2: one extra slot for the forced-edit round when budget exhausted
         for search_round in range(MAX_SEARCH_ROUNDS + 2):
@@ -7402,6 +7412,7 @@ async def run_natural_pipeline_stream(
             file_req_buf = ""
             search_requested: dict | None = None  # set when a search block completes
             file_request_data: list | None = None  # set when a file_request block completes
+            had_thinking = False                    # track if Claude produced thinking this round
 
             # Retry loop for transient API errors
             for _attempt in range(3):
@@ -7420,6 +7431,7 @@ async def run_natural_pipeline_stream(
                                 )
                                 if current_block_type == "thinking":
                                     in_thinking = True
+                                    had_thinking = True
                                     yield sse({"type": "thinking_start", "content": ""})
 
                             elif etype == "content_block_delta":
@@ -7768,6 +7780,52 @@ async def run_natural_pipeline_stream(
                 search_requested = None
                 continue  # Next search round
 
+            # ── Thinking-only detection ───────────────────────────────────
+            # Claude produced thinking blocks but zero visible text, zero tags.
+            # Auto-retry once with a nudge instead of silently dropping.
+            if (not full_response.strip()
+                    and had_thinking
+                    and not edit_blocks_raw
+                    and not new_file_blocks_raw):
+                if _thinking_only_retries < 1:
+                    _thinking_only_retries += 1
+                    _dlog("thinking_only_response",
+                          session_id=session_id, user_id=user_id,
+                          search_round=search_round,
+                          retries=_thinking_only_retries)
+                    yield sse({"type": "progress",
+                               "content": "Formulating response..."})
+                    # Close any open thinking block before retry
+                    if in_thinking:
+                        yield sse({"type": "thinking_end", "content": ""})
+                        in_thinking = False
+                    current_messages = current_messages + [
+                        {"role": "assistant",
+                         "content": "(internal reasoning completed)"},
+                        {"role": "user",
+                         "content":
+                            "You completed your reasoning but didn't produce a visible response. "
+                            "Please respond now: if you need a file, emit <file_request>. "
+                            "If you need to search code, emit <search_request>. "
+                            "If you're answering a question or discussing code, just respond naturally. "
+                            "You must always produce visible text for the user."},
+                    ]
+                    full_response = ""
+                    had_thinking = False
+                    continue  # Retry round
+                else:
+                    # Retry exhausted — send a visible message instead of silent drop
+                    _dlog("thinking_only_retry_exhausted",
+                          session_id=session_id, user_id=user_id)
+                    if in_thinking:
+                        yield sse({"type": "thinking_end", "content": ""})
+                    yield sse({"type": "token",
+                               "content": "I was reasoning about your request but couldn't "
+                                          "formulate a complete response. Could you rephrase "
+                                          "or provide more detail?"})
+                    yield sse({"type": "done", "content": ""})
+                    return
+
             # ── No search request — streaming is done ─────────────────────
             break
 
@@ -7783,6 +7841,10 @@ async def run_natural_pipeline_stream(
 
         # ── Process edit blocks ───────────────────────────────────────────
         if not edit_blocks_raw and not new_file_blocks_raw:
+            _dlog("no_edits_produced",
+                  session_id=session_id, user_id=user_id,
+                  response_length=len(full_response),
+                  had_thinking=had_thinking)
             yield sse({"type": "done", "content": ""})
             return
 
