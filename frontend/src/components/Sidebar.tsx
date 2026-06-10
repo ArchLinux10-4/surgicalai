@@ -86,9 +86,10 @@ function relativeTime(iso: string): string {
 }
 
 // ── Session Item ──────────────────────────────────────────────────────────────
-function SessionItem({ session, active, onLoad, onDelete, onRename }: {
+function SessionItem({ session, active, onLoad, onDelete, onRename, selectMode, selected, onToggleSelect }: {
   session: any; active: boolean
   onLoad: () => void; onDelete: () => void; onRename: (title: string) => void
+  selectMode?: boolean; selected?: boolean; onToggleSelect?: () => void
 }) {
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState(session.title)
@@ -101,16 +102,41 @@ function SessionItem({ session, active, onLoad, onDelete, onRename }: {
     setEditing(false)
   }
 
+  const handleClick = () => {
+    if (editing) return
+    if (selectMode && onToggleSelect) {
+      onToggleSelect()
+      return
+    }
+    onLoad()
+  }
+
   return (
     <div
       className={`group relative flex items-start gap-2.5 px-3 py-2.5 cursor-pointer border-l-2 transition-all ${
-        active
-          ? 'bg-overlay border-accent text-ink'
-          : 'border-transparent hover:bg-overlay/60 text-muted hover:text-ink'
+        selected
+          ? 'bg-accent/10 border-accent text-ink'
+          : active
+            ? 'bg-overlay border-accent text-ink'
+            : 'border-transparent hover:bg-overlay/60 text-muted hover:text-ink'
       }`}
-      onClick={() => !editing && onLoad()}
+      onClick={handleClick}
     >
-      <Chat sx={{ fontSize: 13 }} className={`flex-shrink-0 mt-0.5 ${active ? 'text-accent' : 'text-faint'}`} />
+      {selectMode ? (
+        <div className={`flex-shrink-0 mt-0.5 w-4 h-4 rounded border-2 flex items-center justify-center transition-all ${
+          selected
+            ? 'bg-accent border-accent'
+            : 'border-faint hover:border-accent/60'
+        }`}>
+          {selected && (
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+              <polyline points="20 6 9 17 4 12" />
+            </svg>
+          )}
+        </div>
+      ) : (
+        <Chat sx={{ fontSize: 13 }} className={`flex-shrink-0 mt-0.5 ${active ? 'text-accent' : 'text-faint'}`} />
+      )}
       <div className="flex-1 min-w-0">
         {editing ? (
           <input
@@ -131,7 +157,7 @@ function SessionItem({ session, active, onLoad, onDelete, onRename }: {
           <span>{relativeTime(session.created_at)}</span>
         </div>
       </div>
-      {!editing && (
+      {!editing && !selectMode && (
         <div className="flex items-center gap-0.5 opacity-0 group-hover:opacity-100 transition-opacity flex-shrink-0">
           <button
             onClick={(e) => { e.stopPropagation(); setEditing(true) }}
@@ -155,6 +181,13 @@ function SessionList() {
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
   const [pendingDeleteFileCount, setPendingDeleteFileCount] = useState(0)
   const [deleteConfirmLoading, setDeleteConfirmLoading] = useState(false)
+
+  // Multi-select state
+  const [selectMode, setSelectMode] = useState(false)
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
+  const [pendingBulkDelete, setPendingBulkDelete] = useState(false)
+  const [bulkDeleteFileCount, setBulkDeleteFileCount] = useState(0)
+  const [bulkDeleteLoading, setBulkDeleteLoading] = useState(false)
 
   const loadSessions = () => api.chat.getSessions().then(setSessions).catch(() => {})
   useEffect(() => { loadSessions() }, [])
@@ -214,6 +247,65 @@ function SessionList() {
     }
   }
 
+  // ── Multi-select handlers ───────────────────────────────────
+  const toggleSelectMode = () => {
+    if (selectMode) {
+      setSelectedIds(new Set())
+    }
+    setSelectMode(!selectMode)
+  }
+
+  const toggleSelect = (id: string) => {
+    setSelectedIds(prev => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }
+
+  const selectAll = () => {
+    setSelectedIds(new Set(filteredSessions.map(s => s.id)))
+  }
+
+  const deselectAll = () => {
+    setSelectedIds(new Set())
+  }
+
+  const promptBulkDelete = async () => {
+    if (selectedIds.size === 0) return
+    let totalFiles = 0
+    for (const id of selectedIds) {
+      try {
+        const files = await api.sessionFiles.list(id)
+        totalFiles += files.length
+      } catch { /* ignore */ }
+    }
+    setBulkDeleteFileCount(totalFiles)
+    setPendingBulkDelete(true)
+  }
+
+  const confirmBulkDelete = async () => {
+    setBulkDeleteLoading(true)
+    try {
+      for (const id of selectedIds) {
+        await api.chat.deleteSession(id)
+        if (activeSessions === id) { setActiveSession(null); setMessages([]) }
+      }
+      await loadSessions()
+      const count = selectedIds.size
+      toast.success(`Deleted ${count} chat${count > 1 ? 's' : ''}`)
+      setSelectedIds(new Set())
+      setSelectMode(false)
+    } catch (e: any) {
+      toast.error('Bulk delete failed', e.message)
+    } finally {
+      setBulkDeleteLoading(false)
+      setPendingBulkDelete(false)
+      setBulkDeleteFileCount(0)
+    }
+  }
+
   useEffect(() => {
     if (searchQuery.trim() === '') { setSearchResults([]); return }
     const timer = setTimeout(async () => {
@@ -232,12 +324,47 @@ function SessionList() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="p-2 border-b border-border">
-        <button onClick={newSession} className="btn-primary w-full gap-2">
+      <div className="p-2 border-b border-border flex gap-2">
+        <button onClick={newSession} className="btn-primary flex-1 gap-2">
           <Add sx={{ fontSize: 14 }} /> New Chat
           <kbd className="ml-auto text-[10px] opacity-50 font-mono bg-accent-dark/30 px-1 rounded">⌘N</kbd>
         </button>
+        <button
+          onClick={toggleSelectMode}
+          className={`flex items-center justify-center px-2.5 rounded-lg text-[12px] font-semibold transition-all ${
+            selectMode
+              ? 'bg-accent/15 text-accent border border-accent/30'
+              : 'bg-overlay text-muted border border-border hover:text-ink hover:bg-surface'
+          }`}
+          title={selectMode ? 'Cancel selection' : 'Select chats'}
+        >
+          {selectMode ? 'Done' : 'Select'}
+        </button>
       </div>
+
+      {/* Multi-select action bar */}
+      {selectMode && (
+        <div className="px-3 py-2 border-b border-border bg-surface/80 flex items-center gap-2">
+          <button
+            onClick={selectedIds.size === filteredSessions.length && filteredSessions.length > 0 ? deselectAll : selectAll}
+            className="text-[11px] text-accent font-semibold hover:underline"
+          >
+            {selectedIds.size === filteredSessions.length && filteredSessions.length > 0 ? 'Deselect All' : 'Select All'}
+          </button>
+          <span className="text-[11px] text-muted ml-auto">
+            {selectedIds.size} selected
+          </span>
+          {selectedIds.size > 0 && (
+            <button
+              onClick={promptBulkDelete}
+              className="flex items-center gap-1 text-[11px] font-semibold text-danger hover:bg-danger/10 px-2 py-1 rounded-md transition-colors"
+            >
+              <Delete sx={{ fontSize: 12 }} /> Delete
+            </button>
+          )}
+        </div>
+      )}
+
       <div className="relative px-2 py-1.5">
         <span className="absolute left-4 top-1/2 -translate-y-1/2 text-muted-foreground">
           <Search sx={{ fontSize: 13 }} className="opacity-60" />
@@ -277,6 +404,9 @@ function SessionList() {
               onLoad={() => loadSession(s.id)}
               onDelete={() => promptDeleteSession(s.id)}
               onRename={(title) => renameSession(s.id, title)}
+              selectMode={selectMode}
+              selected={selectedIds.has(s.id)}
+              onToggleSelect={() => toggleSelect(s.id)}
             />
           ))
         )}
@@ -331,6 +461,42 @@ function SessionList() {
                 disabled={deleteConfirmLoading}
                 className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-red-500/90 hover:bg-red-500 text-white border border-red-500/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >{deleteConfirmLoading ? 'Deleting…' : 'Delete Chat'}</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk delete confirmation modal */}
+      {pendingBulkDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="bg-surface border border-border rounded-2xl shadow-2xl shadow-black/40 p-6 w-full max-w-sm mx-4">
+            <div className="flex items-start gap-3 mb-4">
+              <div className="shrink-0 w-10 h-10 rounded-full bg-red-500/15 border border-red-500/25 flex items-center justify-center">
+                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                  <path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="text-[15px] font-semibold text-ink mb-1">Delete {selectedIds.size} chat{selectedIds.size > 1 ? 's' : ''}?</h3>
+                <p className="text-[13px] text-muted leading-relaxed">
+                  This will permanently delete all chat history
+                  {bulkDeleteFileCount > 0 && (
+                    <> and <span className="text-red-400 font-medium">{bulkDeleteFileCount} file{bulkDeleteFileCount !== 1 ? 's' : ''}</span> across {selectedIds.size} session{selectedIds.size > 1 ? 's' : ''}</>
+                  )}{bulkDeleteFileCount === 0 && <> for {selectedIds.size} session{selectedIds.size > 1 ? 's' : ''}</>}.
+                  {' '}This cannot be undone.
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-2 justify-end">
+              <button
+                onClick={() => { setPendingBulkDelete(false); setBulkDeleteFileCount(0) }}
+                className="px-4 py-2 rounded-lg text-[13px] font-medium text-muted border border-border hover:bg-surface-alt transition-colors"
+              >Cancel</button>
+              <button
+                onClick={confirmBulkDelete}
+                disabled={bulkDeleteLoading}
+                className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-red-500/90 hover:bg-red-500 text-white border border-red-500/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              >{bulkDeleteLoading ? 'Deleting…' : `Delete ${selectedIds.size} Chat${selectedIds.size > 1 ? 's' : ''}`}</button>
             </div>
           </div>
         </div>
