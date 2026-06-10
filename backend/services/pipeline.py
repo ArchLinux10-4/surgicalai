@@ -3791,7 +3791,9 @@ OTHER FILES IN SESSION (for cross-file checking):
 ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 {_risks_block}"""
 
-    try:
+    _last_qa_err = None
+    for _qa_attempt in range(2):
+      try:
         if _qa_use_claude:
             _qa_msg = await _qa_aclient.messages.create(
                 model=_qa_model,
@@ -3857,16 +3859,23 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 
         return result
 
-    except Exception as e:
+      except Exception as _qa_e:
+        _last_qa_err = _qa_e
+        if _qa_attempt == 0:
+            await asyncio.sleep(1)
+            continue  # retry once
+        # Both attempts failed — surface the real error type
+        _err_type = type(_qa_e).__name__
+        _err_short = str(_qa_e)[:120]
         skipped = {
             "verdict":          "skipped",
             "qa_score":         None,
-            "summary":          "QA check could not run — review manually",
+            "summary":          f"QA check could not run ({_err_type}) — review manually",
             "import_issues":    [],
             "downstream_risks": [],
             "type_errors":      [],
             "plan_deviation":   "",
-            "skipped_reason":   str(e)[:200],
+            "skipped_reason":   f"{_err_type}: {_err_short}",
         }
         try:
             _log_qa_result(session_id, filename, symbol_path, skipped)
