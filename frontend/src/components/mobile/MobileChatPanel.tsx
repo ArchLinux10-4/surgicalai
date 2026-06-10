@@ -17,6 +17,7 @@ import { VoiceButton } from '../VoiceButton'
 import { useCodeRain } from '../../hooks/useCodeRain'
 import { useThemeStore } from '../../stores/themeStore'
 import type { SessionFile, SmartResult } from '../../types'
+import { validateFileSize } from '../../utils/fileValidation'
 
 // ── Thin progress steps component ───────────────────────────────────────────
 function ProgressSteps({ steps }: { steps: string[] }) {
@@ -555,6 +556,10 @@ export function MobileChatPanel() {
     if (!files?.length) return
     const sessionId = await ensureSession()
     for (const file of Array.from(files)) {
+      // ── File size validation ─────────────────────────────────────────
+      const sizeErr = validateFileSize(file.name, file.size)
+      if (sizeErr) { toast.error(sizeErr); continue }
+
       try {
         const content = await file.text()
         const body = { filename: file.name, content, file_type: 'code' as const }

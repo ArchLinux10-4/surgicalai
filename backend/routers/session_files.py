@@ -10,6 +10,7 @@ import mimetypes
 from fastapi import APIRouter, HTTPException, File, UploadFile, Form
 from fastapi.responses import Response
 from database import get_db
+from middleware.file_validator import validate_file_size, validate_session_total
 from services.ast_parser import ASTParser
 
 logger = logging.getLogger(__name__)
@@ -277,6 +278,17 @@ def upload_session_file(session_id: str, body: dict):
     filename = body.get("filename", "untitled")
     raw_content = body.get("content", "")
     base64_data = body.get("base64_data", "")
+
+    # ── File size validation ──────────────────────────────────────────────
+    _payload_bytes = len(base64_data) if base64_data else len(raw_content.encode("utf-8", errors="replace"))
+    validate_file_size(filename, _payload_bytes)
+    _vconn = get_db()
+    _session_total = _vconn.execute(
+        "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM session_files WHERE session_id = ?",
+        (session_id,)
+    ).fetchone()[0]
+    _vconn.close()
+    validate_session_total(_session_total, _payload_bytes)
     file_type = body.get("file_type") or _get_file_type(filename)
     language = body.get("language") or _get_language(filename)
     # 'created' = AI-generated net-new file (added from a New File card);
@@ -398,6 +410,17 @@ async def upload_session_file_multipart(
     """Multipart file upload — correct approach for iOS / Android / WKWebView."""
     actual_filename = filename or file.filename or "upload"
     raw_bytes = await file.read()
+
+    # ── File size validation ──────────────────────────────────────────────
+    validate_file_size(actual_filename, len(raw_bytes))
+    _vconn = get_db()
+    _session_total = _vconn.execute(
+        "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM session_files WHERE session_id = ?",
+        (session_id,)
+    ).fetchone()[0]
+    _vconn.close()
+    validate_session_total(_session_total, len(raw_bytes))
+
     file_type = _get_file_type(actual_filename)
     language = _get_language(actual_filename)
 

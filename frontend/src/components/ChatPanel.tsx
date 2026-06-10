@@ -13,6 +13,7 @@ import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
 import { VoiceButton } from './VoiceButton'
+import { validateFileSize } from '../utils/fileValidation'
 
 // ── Apply All Button — applies every unapplied change across all messages ─────
 function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: {
@@ -747,6 +748,10 @@ export function ChatPanel() {
     const sessionId = await ensureSession()
     setUploadingFiles(true)
     const promises = files.map(async (file) => {
+      // ── File size validation ─────────────────────────────────────────
+      const sizeErr = validateFileSize(file.name, file.size)
+      if (sizeErr) { toast.error(sizeErr); return null }
+
       const language = getLanguage(file.name)
       const ext = file.name.split('.').pop()?.toLowerCase() || ''
       const IMAGE_EXTS = ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'svg', 'heic', 'heif']
