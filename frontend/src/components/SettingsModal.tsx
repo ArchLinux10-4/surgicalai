@@ -431,13 +431,7 @@ export function SettingsModal() {
                 </Field>
                 )}
 
-                <Field label={`Confidence Threshold: ${form.confidence_threshold}/10`}>
-                  <input type="range" min="1" max="10" step="1" value={form.confidence_threshold}
-                    onChange={(e) => upd('confidence_threshold')(parseInt(e.target.value))} className="w-full accent-warning" />
-                  <div className="flex justify-between text-[10px] text-faint mt-0.5">
-                    <span>1 \u2014 auto-apply all</span><span>10 \u2014 always manual review</span>
-                  </div>
-                </Field>
+                {/* Confidence Threshold slider hidden — not wired to pipeline (uses hardcoded 8/10 gate) */}
               </div>
             )}
 
