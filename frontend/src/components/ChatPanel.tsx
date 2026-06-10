@@ -603,6 +603,7 @@ export function ChatPanel() {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
+  const streamSessionRef = useRef<string | null>(null)
   const thinkingTextRef = useRef('')
   const progressHistoryRef = useRef<string[]>([])
 
@@ -613,6 +614,12 @@ export function ChatPanel() {
 
   // Load session files when session changes
   useEffect(() => {
+    // Abort any stream from a previous session to prevent cross-session bleed
+    if (streamSessionRef.current && streamSessionRef.current !== activeSessions) {
+      abortRef.current?.abort()
+      stopStream()
+      streamSessionRef.current = null
+    }
     if (activeSessions) {
       api.sessionFiles.list(activeSessions)
         .then(files => setSessionFiles(files))
@@ -662,6 +669,10 @@ export function ChatPanel() {
   }
 
   const newChat = async () => {
+    // Abort any running stream from the previous session
+    abortRef.current?.abort()
+    stopStream()
+    streamSessionRef.current = null
     try {
       const s = await api.chat.createSession({ title: 'New Chat' })
       const updated = await api.chat.getSessions()
@@ -874,6 +885,7 @@ export function ChatPanel() {
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
 
     const sessionId = await ensureSession()
+    streamSessionRef.current = sessionId
 
     // Capture whether this is the first message so we can auto-name the session
     const isFirstMessage = messages.length === 0
@@ -911,6 +923,7 @@ export function ChatPanel() {
     const ctrl = api.stream.smart(
       { session_id: sessionId, message: text, file_ids: sessionFiles.map(f => f.id) },
       (progress) => {
+        if (useAppStore.getState().activeSessions !== sessionId) return
         setStreamProgress(progress)
         setProgressHistory(prev => {
           if (prev[prev.length - 1] !== progress) {
@@ -921,7 +934,7 @@ export function ChatPanel() {
           return prev
         })
       },
-      (token) => { accumulated += token; setStreamingMessage(accumulated) },
+      (token) => { if (useAppStore.getState().activeSessions !== sessionId) return; accumulated += token; setStreamingMessage(accumulated) },
       (result) => {
         // Result arrived — may come with natural text already streamed
         gotResult = true
@@ -1002,6 +1015,7 @@ export function ChatPanel() {
         // Auto-recover: fetch the backend's safety-net saved response (may be more complete)
         setTimeout(async () => {
           try {
+            if (useAppStore.getState().activeSessions !== sessionId) return // Guard: session changed
             const saved = await api.chat.getMessages(sessionId)
             if (saved?.length) setMessages(saved)
           } catch {}
@@ -1009,6 +1023,7 @@ export function ChatPanel() {
       },
       // onThinking
       (text, phase) => {
+        if (useAppStore.getState().activeSessions !== sessionId) return
         if (phase === 'start') { setIsThinking(true); setThinkingText(''); thinkingTextRef.current = '' }
         else if (phase === 'delta') { setThinkingText(prev => { const next = prev + text; thinkingTextRef.current = next; return next }) }
         else if (phase === 'end') { setIsThinking(false) }
