@@ -571,8 +571,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   // Diff expand/collapse per change — collapsed by default
   const [diffExpanded, setDiffExpanded] = useState<Record<string, boolean>>({})
 
-  // Preview toggle per change — hidden by default, shown on click
-  const [showPreview, setShowPreview] = useState<Record<string, boolean>>({})
+  // Preview toggle — one per file, not per change (Live Preview renders the whole file)
+  const [showFilePreview, setShowFilePreview] = useState(false)
 
   const { setSessionFiles } = useAppStore()
   const [applying, setApplying] = useState(false)
@@ -795,12 +795,36 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         <span className="text-[11px] text-muted/70 ml-1">
           {realChanges.length} change{realChanges.length !== 1 ? 's' : ''}
         </span>
+        {/* File-level Live Preview button */}
+        {isVisualFile(filename) && (
+          <button
+            onClick={() => setShowFilePreview(p => !p)}
+            className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors ml-auto"
+            title={showFilePreview ? 'Hide live preview' : 'Show live preview of this file'}
+          >
+            <Visibility sx={{ fontSize: 11 }} />
+            {showFilePreview ? 'Hide Preview' : 'Preview'}
+          </button>
+        )}
         {allApplied && (
-          <span className="ml-auto flex items-center gap-1.5 text-[12px] text-success font-semibold">
+          <span className={`${isVisualFile(filename) ? '' : 'ml-auto '}flex items-center gap-1.5 text-[12px] text-success font-semibold`}>
             <CheckCircle sx={{ fontSize: 13 }} /> All applied
           </span>
         )}
       </div>
+
+      {/* File-level Live Preview — one preview for the entire file */}
+      {isVisualFile(filename) && showFilePreview && (
+        <div className="border-t border-border">
+          <LivePreview
+            code={originalCode || '// Loading...'}
+            filename={filename}
+            modifiedCode={modifiedCode}
+            sessionId={sessionId}
+            fileId={fileData.file_id}
+          />
+        </div>
+      )}
 
       {/* ── Change rows ─────────────────────────────────────────────────── */}
       {realChanges.map((change: any, idx: number) => {
@@ -893,16 +917,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     {undoing[change.id] ? 'Reverting...' : 'Undo'}
                   </button>
                 )}
-                {isVisualFile(filename) && (
-                  <button
-                    onClick={() => setShowPreview(p => ({ ...p, [change.id]: !p[change.id] }))}
-                    className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
-                    title={showPreview[change.id] ? 'Hide live preview' : 'Show live preview'}
-                  >
-                    <Visibility sx={{ fontSize: 11 }} />
-                    {showPreview[change.id] ? 'Hide' : 'Preview'}
-                  </button>
-                )}
+
                 <button
                   onClick={() => toggleDiff(change.id)}
                   className="flex items-center gap-1 px-2.5 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
@@ -914,18 +929,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               </div>
             </div>
 
-            {/* Live preview panel — rendered below header row, only when toggled */}
-            {isVisualFile(filename) && showPreview[change.id] && (
-              <div className="border-t border-border">
-                <LivePreview
-                  code={originalCode || '// Loading...'}
-                  filename={filename}
-                  modifiedCode={isApplied ? modifiedCode : undefined}
-                  sessionId={sessionId}
-                  fileId={fileData.file_id}
-                />
-              </div>
-            )}
+
 
             {/* Expandable diff — only shown when toggled */}
             {isExpanded && (
@@ -1043,7 +1047,7 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
                 <code className="text-[11px] text-accent/70">{s.symbol}</code>
                 {s.reason === 'already_matches'
                   ? ' — code already matches'
-                  : ` — ${s.reason}`}
+                  : ' — no visible diff produced'}
                 {i < (result.skipped_changes?.length ?? 0) - 1 ? '; ' : ''}
               </span>
             ))}
