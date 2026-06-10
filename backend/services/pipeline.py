@@ -7381,12 +7381,12 @@ async def run_natural_pipeline_stream(
 
         stream_kwargs = {
             "model": arch_model,
-            "max_tokens": 16000,
+            "max_tokens": 32000,
             "system": system_prompt,
             "messages": messages,
         }
         if _supports_thinking(arch_model):
-            stream_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+            stream_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
 
         # ── Streaming loop with ReAct search + edit/file/search tag parsing ─────
         # Claude can emit <search_request>, <surgical_edit>, or <new_file> tags.
@@ -7404,6 +7404,7 @@ async def run_natural_pipeline_stream(
         }
 
         MAX_SEARCH_ROUNDS = 10
+        _last_stop_reason: str | None = None     # capture Claude's stop_reason per round
         searched_terms: list = []                # terms fetched so far (avoid re-fetching)
         requested_files: set = set()             # files fetched via <file_request>
         MAX_FILE_REQ_TOTAL = 15                  # cap total fetchable via <file_request>                # terms fetched so far (avoid re-fetching)
@@ -7581,6 +7582,13 @@ async def run_natural_pipeline_stream(
                         # If a search or file request was made, break out of the event loop
                         if search_requested is not None or file_request_data is not None:
                             break
+
+                    # Capture stop_reason from the stream
+                    try:
+                        _final = await astream.get_final_message()
+                        _last_stop_reason = _final.stop_reason if _final else None
+                    except Exception:
+                        _last_stop_reason = None
 
                     break  # success — exit transient-error retry loop
 
@@ -7850,6 +7858,21 @@ async def run_natural_pipeline_stream(
             new_file_blocks_raw.append(file_buf)
             yield sse({"type": "edit_end", "content": ""})
 
+        # ── Truncation detection ─────────────────────────────────────────
+        if _last_stop_reason == "max_tokens":
+            _dlog("response_truncated",
+                  session_id=session_id, user_id=user_id,
+                  full_response_len=len(full_response),
+                  edit_blocks=len(edit_blocks_raw),
+                  new_file_blocks=len(new_file_blocks_raw))
+            yield sse({"type": "progress",
+                       "content": "⚠️ Response was truncated (output limit reached) — some edits may be incomplete"})
+            skipped_changes_struct.append({
+                "filename": "(output limit)",
+                "symbol": "(truncated)",
+                "reason": "Claude hit the output token limit — response was cut short. Try with fewer files or a simpler request.",
+            })
+
         # ── Process edit blocks ───────────────────────────────────────────
         if not edit_blocks_raw and not new_file_blocks_raw:
             _dlog("no_edits_produced",
@@ -7917,6 +7940,11 @@ async def run_natural_pipeline_stream(
                     try:
                         edit_data = json.loads(_repair_json(edit_raw.strip()))
                     except Exception:
+                        skipped_changes_struct.append({
+                            "filename": "(unknown)",
+                            "symbol": "(truncated)",
+                            "reason": "Edit block was truncated or malformed — Claude may have hit the output token limit",
+                        })
                         continue
 
                 filename = edit_data.get("filename", "")
@@ -8987,12 +9015,13 @@ async def run_natural_pipeline_stream(
         if has_new_files and has_edits:
             intent = "create"  # mixed create+edit — NewFileCard handles both
 
-        # Strip edit blocks from display text
-        _display_text = full_response
-        for _raw in edit_blocks_raw:
-            _display_text = _display_text.replace(EDIT_OPEN + _raw + EDIT_CLOSE, "").strip()
-        for _raw in new_file_blocks_raw:
-            _display_text = _display_text.replace(FILE_OPEN + _raw + FILE_CLOSE, "").strip()
+        # Strip edit blocks from display text (regex handles truncated/unclosed tags)
+        import re as _re_strip
+        _display_text = _re_strip.sub(r'<surgical_edit>.*?</surgical_edit>', '', full_response, flags=_re_strip.DOTALL)
+        _display_text = _re_strip.sub(r'<surgical_edit>[^<]*$', '', _display_text, flags=_re_strip.DOTALL)
+        _display_text = _re_strip.sub(r'<new_file>.*?</new_file>', '', _display_text, flags=_re_strip.DOTALL)
+        _display_text = _re_strip.sub(r'<new_file>[^<]*$', '', _display_text, flags=_re_strip.DOTALL)
+        _display_text = _display_text.strip()
 
         result = {
             "intent": intent,

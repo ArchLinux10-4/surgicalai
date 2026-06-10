@@ -1043,7 +1043,7 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
                 <code className="text-[11px] text-accent/70">{s.symbol}</code>
                 {s.reason === 'already_matches'
                   ? ' — code already matches'
-                  : ' — no visible diff produced'}
+                  : ` — ${s.reason}`}
                 {i < (result.skipped_changes?.length ?? 0) - 1 ? '; ' : ''}
               </span>
             ))}
