@@ -8303,22 +8303,50 @@ async def run_natural_pipeline_stream(
                 description = edit_data.get("description", "")
                 old_code = edit_data.get("old_code", "")  # SNIPPET / targeted edit
 
-                if not filename or not symbol_name or not new_code:
+                if not filename or not new_code:
                     continue
 
                 file_content = file_content_lookup.get(filename, "")
                 smap, sf_entry = symbol_maps_by_name.get(filename, (None, None))
 
-                if not file_content or not smap:
+                if not file_content:
                     skipped_messages.append(f"File '{filename}' not found in session")
                     skipped_changes_struct.append({
                         "filename": filename,
-                        "symbol": symbol_name,
+                        "symbol": symbol_name or "(whole file)",
                         "reason": "file_not_in_session",
                     })
                     continue
 
-                symbol, match_method = _fuzzy_find_symbol(smap, symbol_name)
+                # ── Whole-file edit for non-code files ──────────────────
+                # When Claude sends symbol=null (YAML, DNS zones, plaintext,
+                # etc.), there are no AST symbols.  Create a virtual symbol
+                # spanning the entire file so existing snippet-apply + QA
+                # paths work unchanged.
+                if not symbol_name:
+                    _wf_lines = file_content.split("\n")
+                    from models.schemas import SymbolInfo as _SI_wf, SymbolType as _ST_wf
+                    symbol = _SI_wf(
+                        name=filename.rsplit("/", 1)[-1],
+                        symbol_type=_ST_wf.VARIABLE,
+                        start_line=1,
+                        end_line=len(_wf_lines),
+                        parent=None,
+                        indentation=0,
+                        code=file_content,
+                        signature=filename,
+                    )
+                    match_method = "whole_file"
+                else:
+                    if not smap:
+                        skipped_messages.append(f"File '{filename}' could not be parsed")
+                        skipped_changes_struct.append({
+                            "filename": filename,
+                            "symbol": symbol_name,
+                            "reason": "file_not_parseable",
+                        })
+                        continue
+                    symbol, match_method = _fuzzy_find_symbol(smap, symbol_name)
 
                 if symbol:
                     # ── Targeted (snippet) edit ──────────────────────────────
