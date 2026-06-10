@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from database import init_db
 from auth_utils import decode_token
+from middleware.rate_limiter import check_rate_limit
 from routers import settings, chat, files, surgical, git, context, session_files, github as github_router
 from routers import vercel as vercel_router
 from routers import railway as railway_router
@@ -116,6 +117,11 @@ async def auth_middleware(request: Request, call_next):
             content={"detail": "Invalid or expired token"},
             headers=_get_cors_headers(request),
         )
+
+    # ── Per-user rate limiting (after auth, before routing) ────────────────
+    rate_resp = check_rate_limit(request.state.user_id, path, _get_cors_headers(request))
+    if rate_resp:
+        return rate_resp
 
     return await call_next(request)
 

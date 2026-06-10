@@ -133,7 +133,13 @@ export const api = {
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify(data),
         signal: controller.signal,
-      }).then(res => {
+      }).then(async res => {
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }))
+          onError(err.detail || `HTTP ${res.status}`)
+          fireDone()
+          return
+        }
         const reader = res.body!.getReader()
         const decoder = new TextDecoder()
 
@@ -184,7 +190,13 @@ export const api = {
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify(data),
         signal: controller.signal,
-      }).then(res => {
+      }).then(async res => {
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }))
+          onError(err.detail || `HTTP ${res.status}`)
+          fireDone()
+          return
+        }
         const reader = res.body!.getReader()
         const decoder = new TextDecoder()
         let lineBuffer = ''
@@ -244,7 +256,12 @@ export const api = {
         headers: { 'Content-Type': 'application/json', ...authHeaders() },
         body: JSON.stringify(data),
         signal: controller.signal,
-      }).then(res => {
+      }).then(async res => {
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }))
+          onError(err.detail || `HTTP ${res.status}`)
+          return
+        }
         const reader = res.body!.getReader()
         const decoder = new TextDecoder()
         let lineBuffer = ''
