@@ -22,25 +22,47 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DEBUG LOGGING  (writes to /tmp/surgical_debug.jsonl — pulled via /api/debug/pipeline-log)
+# DEBUG LOGGING  (writes to DB for persistence + /tmp file for fast fallback)
 # ─────────────────────────────────────────────────────────────────────────────
 import json as _json_mod
 import datetime as _dt
 import os as _os
+import uuid as _uuid_dlog
+import random as _rnd_dlog
 
 _DLOG_PATH = "/tmp/surgical_debug.jsonl"
 _DLOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB cap — rotate by truncating oldest half
+_DLOG_EXPIRE_DAYS = 7               # auto-expire DB entries older than this
 
 def _dlog(event: str, **kwargs):
-    """Append a structured debug record to the pipeline log file."""
+    """Append a structured debug record to the database (persistent) and /tmp file (fast fallback)."""
     try:
-        record = {
-            "ts": _dt.datetime.utcnow().isoformat() + "Z",
-            "event": event,
-            **kwargs,
-        }
+        ts = _dt.datetime.utcnow().isoformat() + "Z"
+        record = {"ts": ts, "event": event, **kwargs}
         line = _json_mod.dumps(record, default=str) + "\n"
-        # Rotate if too large
+
+        # ── Primary: write to database (survives deploys/restarts) ──
+        try:
+            from database import get_db
+            conn = get_db()
+            session_id = str(kwargs.get("session_id", ""))
+            user_id = str(kwargs.get("user_id", ""))
+            data_json = _json_mod.dumps(record, default=str)
+            conn.execute(
+                "INSERT INTO debug_events (id, event, session_id, user_id, data, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (str(_uuid_dlog.uuid4()), event, session_id, user_id, data_json, ts),
+            )
+            # Probabilistic cleanup: ~1 in 50 calls, expire old entries
+            if _rnd_dlog.random() < 0.02:
+                cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=_DLOG_EXPIRE_DAYS)).isoformat()
+                conn.execute("DELETE FROM debug_events WHERE created_at < ?", (cutoff,))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass  # DB write failed — file fallback still works
+
+        # ── Secondary: write to /tmp file (backward compat + fast grep) ──
         try:
             if _os.path.exists(_DLOG_PATH) and _os.path.getsize(_DLOG_PATH) > _DLOG_MAX_BYTES:
                 with open(_DLOG_PATH, "r") as _f:

@@ -346,6 +346,18 @@ def _init_sqlite():
         )
     """)
 
+    # debug_events — persistent pipeline debug log (survives deploys/restarts)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS debug_events (
+            id TEXT PRIMARY KEY,
+            event TEXT NOT NULL,
+            session_id TEXT DEFAULT '',
+            user_id TEXT DEFAULT '',
+            data TEXT DEFAULT '{}',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
     _seed_defaults_sqlite(cur)
     conn.commit()
     conn.close()
@@ -586,6 +598,25 @@ def _init_postgres():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+        # debug_events — persistent pipeline debug log (survives deploys/restarts)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS debug_events (
+                id TEXT PRIMARY KEY,
+                event TEXT NOT NULL,
+                session_id TEXT DEFAULT '',
+                user_id TEXT DEFAULT '',
+                data TEXT DEFAULT '{}',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_debug_events_created
+            ON debug_events(created_at)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_debug_events_session
+            ON debug_events(session_id)
         """)
         conn.commit()
 
