@@ -7193,6 +7193,95 @@ def _resolve_search_multifile(
     )
 
 
+
+
+async def _retry_truncated_edit(
+    aclient,
+    arch_model: str,
+    filename: str,
+    symbol_name: str,
+    file_content: str,
+    smap,
+    user_request: str,
+    session_id: str = "",
+    user_id: str = "",
+) -> str | None:
+    """
+    Retry a single truncated edit with a focused Claude call.
+    
+    Instead of asking Claude to produce ALL edits in one response,
+    this gives it just ONE file and asks for ONE edit block.
+    Returns the raw edit block JSON string, or None on failure.
+    """
+    import json as _json
+
+    # Build a focused symbol index for this file
+    sym_index = ""
+    if smap:
+        lines = []
+        for sym in smap.symbols:
+            lines.append(f"  {sym.kind}: {sym.name} (L{sym.start_line}-L{sym.end_line})")
+        sym_index = "SYMBOL INDEX:\n" + "\n".join(lines) + "\n\n"
+
+    focused_system = (
+        "You are SurgicalAI. Write EXACTLY ONE <surgical_edit> block for the "
+        f"symbol '{symbol_name}' in '{filename}'. No explanation — just the edit block.\n\n"
+        "Format:\n"
+        "<surgical_edit>\n"
+        '{"filename": "...", "symbol": "...", "description": "...", "new_code": "..."}\n'
+        "</surgical_edit>\n\n"
+        "For large symbols, use a targeted edit with old_code + new_code instead of "
+        "rewriting the entire symbol."
+    )
+
+    focused_messages = [{
+        "role": "user",
+        "content": (
+            f"User request: {user_request}\n\n"
+            f"━━━ FILE: {filename} ━━━\n"
+            f"{sym_index}"
+            f"{file_content}"
+        ),
+    }]
+
+    try:
+        resp = await aclient.messages.create(
+            model=arch_model,
+            max_tokens=16000,
+            system=focused_system,
+            messages=focused_messages,
+        )
+
+        text = resp.content[0].text.strip()
+
+        EDIT_OPEN = "<surgical_edit>"
+        EDIT_CLOSE = "</surgical_edit>"
+        start = text.find(EDIT_OPEN)
+        end = text.find(EDIT_CLOSE)
+
+        if start != -1 and end != -1:
+            raw = text[start + len(EDIT_OPEN):end].strip()
+            _json.loads(raw)  # validate parseable
+            _dlog("retry_truncated_success",
+                  session_id=session_id, user_id=user_id,
+                  filename=filename, symbol=symbol_name,
+                  raw_len=len(raw))
+            return raw
+
+        _dlog("retry_truncated_no_block",
+              session_id=session_id, user_id=user_id,
+              filename=filename, symbol=symbol_name,
+              response_preview=text[:200])
+        return None
+
+    except Exception as e:
+        _dlog("retry_truncated_error",
+              session_id=session_id, user_id=user_id,
+              filename=filename, symbol=symbol_name,
+              error=str(e))
+        return None
+
+
 async def run_natural_pipeline_stream(
     session_files: list,
     user_request: str,
@@ -7858,7 +7947,7 @@ async def run_natural_pipeline_stream(
             new_file_blocks_raw.append(file_buf)
             yield sse({"type": "edit_end", "content": ""})
 
-        # ── Truncation detection ─────────────────────────────────────────
+        # ── Truncation detection + auto-retry ────────────────────────────
         if _last_stop_reason == "max_tokens":
             _dlog("response_truncated",
                   session_id=session_id, user_id=user_id,
@@ -7866,12 +7955,63 @@ async def run_natural_pipeline_stream(
                   edit_blocks=len(edit_blocks_raw),
                   new_file_blocks=len(new_file_blocks_raw))
             yield sse({"type": "progress",
-                       "content": "⚠️ Response was truncated (output limit reached) — some edits may be incomplete"})
-            skipped_changes_struct.append({
-                "filename": "(output limit)",
-                "symbol": "(truncated)",
-                "reason": "Claude hit the output token limit — response was cut short. Try with fewer files or a simpler request.",
-            })
+                       "content": "⚠️ Response was truncated — retrying incomplete edits individually..."})
+
+            # Find which edit blocks failed to parse (truncated ones)
+            _good_blocks = []
+            _bad_blocks_raw = []
+            for _eb_raw in edit_blocks_raw:
+                try:
+                    json.loads(_eb_raw.strip())
+                    _good_blocks.append(_eb_raw)
+                except Exception:
+                    try:
+                        json.loads(_repair_json(_eb_raw.strip()))
+                        _good_blocks.append(_eb_raw)
+                    except Exception:
+                        _bad_blocks_raw.append(_eb_raw)
+
+            if _bad_blocks_raw:
+                _dlog("retry_truncated_blocks",
+                      session_id=session_id, user_id=user_id,
+                      good=len(_good_blocks), bad=len(_bad_blocks_raw))
+
+                # Try to identify which symbols the truncated blocks were for
+                # by scanning the partial JSON for filename/symbol hints
+                import re as _re_retry
+                for _bad_raw in _bad_blocks_raw:
+                    _fname_match = _re_retry.search(r'"filename"\s*:\s*"([^"]+)"', _bad_raw)
+                    _sym_match = _re_retry.search(r'"symbol"\s*:\s*"([^"]+)"', _bad_raw)
+                    if _fname_match and _sym_match:
+                        _retry_fname = _fname_match.group(1)
+                        _retry_sym = _sym_match.group(1)
+                        _retry_content = file_content_lookup_stream.get(_retry_fname, "")
+                        _retry_smap = symbol_maps_by_name.get(_retry_fname, (None, None))[0]
+
+                        if _retry_content:
+                            yield sse({"type": "progress",
+                                       "content": f"Retrying {_retry_sym} in {_retry_fname}..."})
+                            _retried = await _retry_truncated_edit(
+                                aclient, arch_model,
+                                _retry_fname, _retry_sym, _retry_content,
+                                _retry_smap, user_request,
+                                session_id, user_id
+                            )
+                            if _retried:
+                                _good_blocks.append(_retried)
+                                yield sse({"type": "progress",
+                                           "content": f"✅ {_retry_sym} recovered"})
+                                continue
+
+                    # If retry failed or couldn't identify the symbol
+                    skipped_changes_struct.append({
+                        "filename": _fname_match.group(1) if _fname_match else "(unknown)",
+                        "symbol": _sym_match.group(1) if _sym_match else "(truncated)",
+                        "reason": "Edit was truncated by output limit and retry failed",
+                    })
+
+                # Replace edit_blocks_raw with only the good (+ retried) blocks
+                edit_blocks_raw = _good_blocks
 
         # ── Process edit blocks ───────────────────────────────────────────
         if not edit_blocks_raw and not new_file_blocks_raw:
