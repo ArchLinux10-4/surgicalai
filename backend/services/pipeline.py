@@ -8339,14 +8339,33 @@ async def run_natural_pipeline_stream(
                     match_method = "whole_file"
                 else:
                     if not smap:
-                        skipped_messages.append(f"File '{filename}' could not be parsed")
-                        skipped_changes_struct.append({
-                            "filename": filename,
-                            "symbol": symbol_name,
-                            "reason": "file_not_parseable",
-                        })
-                        continue
-                    symbol, match_method = _fuzzy_find_symbol(smap, symbol_name)
+                        # ── Non-code fallback: Claude used filename as symbol ──
+                        # If the symbol name matches/contains the filename and
+                        # the file has no AST symbols, treat as whole-file edit
+                        # instead of skipping.
+                        _bare = filename.rsplit("/", 1)[-1] if "/" in filename else filename
+                        if symbol_name in (filename, _bare) and filename in file_content_lookup:
+                            _wf_lines = file_content_lookup[filename].split("\n")
+                            symbol = SymbolInfo(
+                                name=_bare,
+                                symbol_type=SymbolType.VARIABLE,
+                                start_line=1,
+                                end_line=len(_wf_lines),
+                                parent=None,
+                                indentation=0,
+                                code=file_content_lookup[filename],
+                            )
+                            match_method = "whole_file"
+                        else:
+                            skipped_messages.append(f"File '{filename}' could not be parsed")
+                            skipped_changes_struct.append({
+                                "filename": filename,
+                                "symbol": symbol_name,
+                                "reason": "file_not_parseable",
+                            })
+                            continue
+                    else:
+                        symbol, match_method = _fuzzy_find_symbol(smap, symbol_name)
 
                 if symbol:
                     # ── Targeted (snippet) edit ──────────────────────────────
