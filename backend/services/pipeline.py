@@ -6341,6 +6341,22 @@ user how to wire it up manually. If the symbol is large or only partially visibl
 <search_request> to load the exact region, then make a TARGETED edit (old_code/new_code)
 on the real symbol. A new file is only correct when genuinely net-new code is requested.
 
+━━━ MULTI-EDIT PLANNING (3+ EDITS) ━━━
+
+When your response requires 3 or more <surgical_edit> blocks, do NOT produce them all inline.
+Instead, first explain your approach naturally, then emit an <edit_plan> block:
+
+<edit_plan>
+[
+  {"filename": "exact_filename.tsx", "symbol": "ComponentName", "description": "What to change and why"},
+  {"filename": "other_file.py", "symbol": "function_name", "description": "What to change and why"}
+]
+</edit_plan>
+
+After emitting the plan, STOP writing. The system will execute each edit individually with
+focused context, preventing output truncation. For 1-2 edits, produce <surgical_edit> blocks
+directly as usual. You may still produce <new_file> blocks alongside an <edit_plan>.
+
 ━━━ CONVERSATION RECENCY ━━━
 
 When the user says "the fix", "the change", "the edit", or "that" without naming a file,
@@ -7282,6 +7298,97 @@ async def _retry_truncated_edit(
         return None
 
 
+
+async def _execute_single_edit(
+    aclient, model: str,
+    filename: str, symbol_name: str, change_description: str,
+    file_content: str, symbol_map, user_request: str,
+    session_id: str = "", user_id: str = "",
+) -> str | None:
+    """
+    Focused single-symbol edit call for Plan→Execute orchestration.
+    Sends only the relevant file's content and asks Claude to produce
+    exactly ONE <surgical_edit> block. Returns the raw edit JSON string
+    or None if the call fails.
+    """
+    import json as _json
+
+    # Build symbol index for this file
+    sym_index = ""
+    if symbol_map and hasattr(symbol_map, "symbols") and symbol_map.symbols:
+        sym_lines = []
+        for s in symbol_map.symbols:
+            size = s.end_line - s.start_line + 1
+            sym_lines.append(
+                f"  [{s.symbol_type.value}] {s.full_path:<45} "
+                f"L{s.start_line}\u2013{s.end_line}  ({size}L)"
+            )
+        sym_index = "SYMBOL INDEX:\n" + "\n".join(sym_lines) + "\n\n"
+
+    focused_system = (
+        "You are SurgicalAI. Produce exactly ONE <surgical_edit> block for the requested change.\n\n"
+        "Rules:\n"
+        "- Include the COMPLETE edited symbol (or use targeted old_code/new_code for large symbols)\n"
+        "- Match original indentation exactly\n"
+        "- Copy ALL unchanged lines verbatim\n"
+        "- The JSON must have: filename, symbol, description, new_code (and optionally old_code)\n"
+        "- Do NOT produce explanatory text outside the <surgical_edit> block\n"
+    )
+
+    focused_user = (
+        f"Edit the symbol `{symbol_name}` in `{filename}`.\n\n"
+        f"Change: {change_description}\n\n"
+        f"User\'s original request: {user_request}\n\n"
+        f"{sym_index}"
+        f"File content:\n```\n{file_content}\n```\n\n"
+        "Produce exactly ONE <surgical_edit> block now."
+    )
+
+    try:
+        call_kwargs = {
+            "model": model,
+            "max_tokens": 16000,
+            "system": focused_system,
+            "messages": [{"role": "user", "content": focused_user}],
+        }
+        if _supports_thinking(model):
+            call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4000}
+
+        resp = await aclient.messages.create(**call_kwargs)
+
+        text = ""
+        for block in resp.content:
+            if hasattr(block, "text"):
+                text += block.text
+
+        EDIT_OPEN = "<surgical_edit>"
+        EDIT_CLOSE = "</surgical_edit>"
+        start = text.find(EDIT_OPEN)
+        end = text.find(EDIT_CLOSE)
+
+        if start != -1 and end != -1:
+            raw = text[start + len(EDIT_OPEN):end].strip()
+            _json.loads(raw)  # validate parseable
+            _dlog("plan_execute_success",
+                  session_id=session_id, user_id=user_id,
+                  filename=filename, symbol=symbol_name,
+                  raw_len=len(raw))
+            return raw
+
+        _dlog("plan_execute_no_block",
+              session_id=session_id, user_id=user_id,
+              filename=filename, symbol=symbol_name,
+              response_preview=text[:300])
+        return None
+
+    except Exception as e:
+        _dlog("plan_execute_error",
+              session_id=session_id, user_id=user_id,
+              filename=filename, symbol=symbol_name,
+              error=str(e))
+        return None
+
+
 async def run_natural_pipeline_stream(
     session_files: list,
     user_request: str,
@@ -7324,6 +7431,8 @@ async def run_natural_pipeline_stream(
     SEARCH_CLOSE = "</search_request>"
     FILE_REQ_OPEN = "<file_request>"
     FILE_REQ_CLOSE = "</file_request>"
+    PLAN_OPEN = "<edit_plan>"
+    PLAN_CLOSE = "</edit_plan>"
 
     try:
         anthropic_key = _get_anthropic_key(user_id)
@@ -7484,6 +7593,7 @@ async def run_natural_pipeline_stream(
 
         edit_blocks_raw: list = []
         new_file_blocks_raw: list = []
+        edit_plan_data: list | None = None
         full_response = ""
         in_thinking = False
 
@@ -7505,12 +7615,13 @@ async def run_natural_pipeline_stream(
         # +2: one extra slot for the forced-edit round when budget exhausted
         for search_round in range(MAX_SEARCH_ROUNDS + 2):
 
-            state = "normal"    # "normal" | "in_edit" | "in_file" | "in_search" | "in_filereq"
+            state = "normal"    # "normal" | "in_edit" | "in_file" | "in_search" | "in_filereq" | "in_plan"
             normal_buf = ""
             edit_buf = ""
             file_buf = ""
             search_buf = ""
             file_req_buf = ""
+            plan_buf = ""
             search_requested: dict | None = None  # set when a search block completes
             file_request_data: list | None = None  # set when a file_request block completes
             had_thinking = False                    # track if Claude produced thinking this round
@@ -7558,11 +7669,12 @@ async def run_natural_pipeline_stream(
                                             fi = normal_buf.find(FILE_OPEN)
                                             si = normal_buf.find(SEARCH_OPEN)
                                             fri = normal_buf.find(FILE_REQ_OPEN)
+                                            pi = normal_buf.find(PLAN_OPEN)
 
                                             # Find which tag comes first
                                             candidates = [
                                                 (i, tag) for i, tag in [
-                                                    (ei, "edit"), (fi, "file"), (si, "search"), (fri, "filereq")
+                                                    (ei, "edit"), (fi, "file"), (si, "search"), (fri, "filereq"), (pi, "plan")
                                                 ] if i != -1
                                             ]
 
@@ -7596,9 +7708,13 @@ async def run_natural_pipeline_stream(
                                                 state = "in_search"
                                                 search_buf = normal_buf[first_idx + len(SEARCH_OPEN):]
                                                 normal_buf = ""
-                                            else:  # filereq
+                                            elif first_tag == "filereq":
                                                 state = "in_filereq"
                                                 file_req_buf = normal_buf[first_idx + len(FILE_REQ_OPEN):]
+                                                normal_buf = ""
+                                            else:  # plan
+                                                state = "in_plan"
+                                                plan_buf = normal_buf[first_idx + len(PLAN_OPEN):]
                                                 normal_buf = ""
                                             break
 
@@ -7663,13 +7779,30 @@ async def run_natural_pipeline_stream(
                                             file_req_buf = ""
                                             break  # Stop streaming — fetch files first
 
+                                    elif state == "in_plan":
+                                        plan_buf += text_chunk
+                                        idx = plan_buf.find(PLAN_CLOSE)
+                                        if idx != -1:
+                                            plan_json_raw = plan_buf[:idx]
+                                            remainder = plan_buf[idx + len(PLAN_CLOSE):]
+                                            try:
+                                                plan_data = json.loads(plan_json_raw.strip())
+                                                if isinstance(plan_data, list):
+                                                    edit_plan_data = plan_data
+                                            except Exception:
+                                                pass
+                                            state = "normal"
+                                            normal_buf = remainder
+                                            plan_buf = ""
+                                            break  # Stop streaming — enter execute phase
+
                             elif etype == "content_block_stop":
                                 if in_thinking and current_block_type == "thinking":
                                     yield sse({"type": "thinking_end", "content": ""})
                                     in_thinking = False
 
                         # If a search or file request was made, break out of the event loop
-                        if search_requested is not None or file_request_data is not None:
+                        if search_requested is not None or file_request_data is not None or edit_plan_data is not None:
                             break
 
                     # Capture stop_reason from the stream
@@ -7698,6 +7831,14 @@ async def run_natural_pipeline_stream(
             # Flush any normal text buffered at end of this round
             if state == "normal" and normal_buf.strip():
                 yield sse({"type": "token", "content": normal_buf})
+
+            # ── Handle edit plan ──────────────────────────────────────────
+            if edit_plan_data is not None:
+                _dlog("edit_plan_received",
+                      session_id=session_id, user_id=user_id,
+                      plan_items=len(edit_plan_data),
+                      plan=edit_plan_data)
+                break  # Exit search_round loop — enter execute phase
 
             # ── Handle file request ───────────────────────────────────────
             if file_request_data is not None:
@@ -7894,7 +8035,8 @@ async def run_natural_pipeline_stream(
             if (not full_response.strip()
                     and had_thinking
                     and not edit_blocks_raw
-                    and not new_file_blocks_raw):
+                    and not new_file_blocks_raw
+                    and not edit_plan_data):
                 if _thinking_only_retries < 1:
                     _thinking_only_retries += 1
                     _dlog("thinking_only_response",
@@ -7946,6 +8088,9 @@ async def run_natural_pipeline_stream(
         elif state == "in_file" and file_buf.strip():
             new_file_blocks_raw.append(file_buf)
             yield sse({"type": "edit_end", "content": ""})
+
+        # Initialize skipped_changes early — truncation detection may append to it
+        skipped_changes_struct: list = []
 
         # ── Truncation detection + auto-retry ────────────────────────────
         if _last_stop_reason == "max_tokens":
@@ -8013,6 +8158,62 @@ async def run_natural_pipeline_stream(
                 # Replace edit_blocks_raw with only the good (+ retried) blocks
                 edit_blocks_raw = _good_blocks
 
+
+        # ── Plan→Execute: focused per-symbol edit calls ──────────────────
+        if edit_plan_data:
+            yield sse({"type": "progress",
+                       "content": f"Executing {len(edit_plan_data)} planned edit(s) individually..."})
+            for plan_idx, plan_item in enumerate(edit_plan_data):
+                p_filename = plan_item.get("filename", "")
+                p_symbol = plan_item.get("symbol", "")
+                p_description = plan_item.get("description", "")
+                if not p_filename or not p_symbol:
+                    continue
+
+                p_content = file_content_lookup_stream.get(p_filename, "")
+                if not p_content:
+                    skipped_changes_struct.append({
+                        "filename": p_filename,
+                        "symbol": p_symbol,
+                        "reason": f"File not found in session: {p_filename}",
+                    })
+                    continue
+
+                p_smap = symbol_maps_by_name.get(p_filename, (None, None))[0]
+
+                yield sse({"type": "progress",
+                           "content": f"Editing {p_symbol} in {p_filename} ({plan_idx+1}/{len(edit_plan_data)})..."})
+
+                try:
+                    result_raw = await _execute_single_edit(
+                        aclient, arch_model,
+                        p_filename, p_symbol, p_description,
+                        p_content, p_smap, user_request,
+                        session_id, user_id
+                    )
+                    if result_raw:
+                        edit_blocks_raw.append(result_raw)
+                        yield sse({"type": "progress",
+                                   "content": f"✅ {p_symbol} complete"})
+                    else:
+                        skipped_changes_struct.append({
+                            "filename": p_filename,
+                            "symbol": p_symbol,
+                            "reason": "Focused edit call produced no valid edit block",
+                        })
+                        yield sse({"type": "progress",
+                                   "content": f"⚠️ {p_symbol} — no edit produced"})
+                except Exception as exec_err:
+                    _dlog("plan_execute_error",
+                          session_id=session_id, user_id=user_id,
+                          filename=p_filename, symbol=p_symbol,
+                          error=str(exec_err))
+                    skipped_changes_struct.append({
+                        "filename": p_filename,
+                        "symbol": p_symbol,
+                        "reason": f"Edit execution failed: {str(exec_err)[:100]}",
+                    })
+
         # ── Process edit blocks ───────────────────────────────────────────
         if not edit_blocks_raw and not new_file_blocks_raw:
             _dlog("no_edits_produced",
@@ -8058,7 +8259,7 @@ async def run_natural_pipeline_stream(
                   user_id=user_id)
         resolved_edits: list = []
         skipped_messages: list = []
-        skipped_changes_struct: list = []  # structured {filename, symbol, reason} for the UI
+        # skipped_changes_struct already initialized above (before truncation detection)
 
         # ── Same-symbol cumulative merge ──────────────────────────────────
         # When several edits target the SAME symbol, each must be spliced into
