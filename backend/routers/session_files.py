@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 parser = ASTParser()
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".svg", ".heic", ".heif"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif"}
 PDF_EXTENSIONS = {".pdf"}
 CSV_EXTENSIONS = {".csv"}
 EXCEL_EXTENSIONS = {".xlsx", ".xls"}
@@ -86,7 +86,7 @@ def _get_language(filename: str) -> str:
         ".go": "go", ".rs": "rust", ".java": "java", ".cs": "csharp",
         ".cpp": "cpp", ".c": "c", ".h": "c", ".hpp": "cpp",
         ".rb": "ruby", ".php": "php", ".swift": "swift", ".kt": "kotlin",
-        ".html": "html", ".css": "css", ".json": "json", ".yaml": "yaml",
+        ".svg": "xml", ".html": "html", ".css": "css", ".json": "json", ".yaml": "yaml",
         ".yml": "yaml", ".md": "markdown", ".sh": "bash", ".sql": "sql",
         ".toml": "toml", ".csv": "csv", ".xlsx": "excel", ".xls": "excel",
         ".pdf": "pdf",
