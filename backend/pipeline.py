@@ -8545,7 +8545,7 @@ async def run_natural_pipeline_stream(
                     )
                     match_method = "whole_file"
                 else:
-                    if not smap:
+                    if not smap or not getattr(smap, 'symbols', None):
                         # ── Non-code fallback: Claude used filename as symbol ──
                         # If the symbol name matches/contains the filename and
                         # the file has no AST symbols, treat as whole-file edit
