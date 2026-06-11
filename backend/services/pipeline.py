@@ -1880,20 +1880,20 @@ def _apply_snippet_to_symbol(symbol_code: str, old_code: str, new_code: str):
             return None, False, "old_code (after stripping line numbers) is ambiguous"
         old_code = stripped_old  # fall through to whitespace-tolerant below
 
-    # 2. Whitespace-tolerant match (ignore trailing whitespace on each line).
+    # 2. Whitespace-tolerant match (tabs→spaces + trailing whitespace per line).
     def _norm(s: str) -> str:
-        return "\n".join(line.rstrip() for line in s.splitlines())
+        return "\n".join(line.expandtabs(4).rstrip() for line in s.splitlines())
 
     norm_sym = _norm(symbol_code)
     norm_old = _norm(old_code)
     if norm_old and norm_sym.count(norm_old) == 1:
         # Locate the matching region in the ORIGINAL (un-normalised) symbol so we
-        # preserve exact trailing whitespace outside the edit.
+        # preserve exact indentation and trailing whitespace outside the edit.
         sym_lines = symbol_code.splitlines(keepends=True)
         old_line_count = len(norm_old.split("\n"))
         target_norm = norm_old.split("\n")
         for i in range(0, len(sym_lines) - old_line_count + 1):
-            window = [sym_lines[i + k].rstrip("\n").rstrip("\r").rstrip()
+            window = [sym_lines[i + k].expandtabs(4).rstrip("\n").rstrip("\r").rstrip()
                       for k in range(old_line_count)]
             if window == target_norm:
                 before = "".join(sym_lines[:i])
@@ -1910,6 +1910,61 @@ def _apply_snippet_to_symbol(symbol_code: str, old_code: str, new_code: str):
         "old_code was not found verbatim in the target symbol. Copy the exact lines "
         "(no line-number prefix) from the file/search results you were shown."
     )
+
+
+# ---------------------------------------------------------------------------
+# Helper: _apply_snippet_by_lines  (Option B — line-number targeted edit)
+# ---------------------------------------------------------------------------
+
+def _apply_snippet_by_lines(
+    symbol_code: str,
+    symbol_start_line: int,
+    edit_start_line: int,
+    edit_end_line: int,
+    new_code: str,
+):
+    """
+    Replace lines edit_start_line..edit_end_line (1-indexed ABSOLUTE file line
+    numbers) with new_code, spliced into the symbol that starts at
+    symbol_start_line.
+
+    This is Option B for targeted edits — zero string matching.  Claude reads
+    the line numbers shown in search results / symbol listings and emits
+    ``edit_start_line`` / ``edit_end_line`` instead of an ``old_code`` snippet.
+    The pipeline extracts the exact bytes by index, so tabs-vs-spaces and any
+    other whitespace representation differences are completely irrelevant.
+
+    Returns (full_new_code, ok, reason).
+      ok=True  -> full_new_code is the complete new symbol body.
+      ok=False -> reason explains the bounds error.
+    """
+    if not symbol_code:
+        return None, False, "empty symbol"
+
+    lines = symbol_code.splitlines(keepends=True)
+    n = len(lines)
+
+    # Convert absolute file line numbers to 0-based indices within the symbol.
+    rel_start = edit_start_line - symbol_start_line   # 0-based, inclusive
+    rel_end   = edit_end_line   - symbol_start_line   # 0-based, inclusive
+
+    if rel_start < 0 or rel_end >= n or rel_start > rel_end:
+        return None, False, (
+            f"edit_start_line={edit_start_line}, edit_end_line={edit_end_line} "
+            f"is out of bounds for symbol at file lines "
+            f"{symbol_start_line}–{symbol_start_line + n - 1}. "
+            f"Check the line numbers from the search results."
+        )
+
+    before = "".join(lines[:rel_start])
+    after  = "".join(lines[rel_end + 1:])
+
+    replacement = new_code
+    if replacement and not replacement.endswith("\n"):
+        replacement += "\n"
+
+    full_new = before + replacement + after
+    return full_new, True, f"line-number-splice:{edit_start_line}-{edit_end_line}"
 
 
 def _fragment_reason(symbol_code: str, new_code: str):
@@ -6326,11 +6381,31 @@ Rules for new_code:
 
 ━━━ TARGETED EDITS FOR LARGE SYMBOLS (PREFERRED for big files) ━━━
 
-For a large symbol (e.g. a 900-line React component) re-emitting the entire body is
-wasteful and error-prone — and you may only have been shown PART of it. In that case,
-do NOT replace the whole symbol and do NOT create a new file. Instead make a TARGETED
-edit: provide the small "old_code" snippet you want to change plus its "new_code"
-replacement. The system splices it into the full symbol and runs the same QA gate.
+For a large symbol (e.g. a 900-line React component or a large <script> block)
+re-emitting the entire body is wasteful and error-prone. Make a TARGETED edit
+instead. The system splices it in and runs the same QA gate.
+
+PREFERRED: Use line-number targeting — immune to tabs-vs-spaces and any other
+whitespace representation differences. Use the absolute file line numbers shown
+in the symbol listing or search results (e.g. "script_11 (lines 1243–1456)").
+
+<surgical_edit>
+{
+  "filename": "Market_Rate_Report-6.html",
+  "symbol": "script_11",
+  "description": "Fix color format — prefix RGB values with FF for ARGB",
+  "edit_start_line": 1248,
+  "edit_end_line": 1255,
+  "new_code": "        var toARGB = function(hex) { ... };\n        var thinBorder = function(rgb) { ... };"
+}
+</surgical_edit>
+
+- edit_start_line / edit_end_line: the ABSOLUTE file line numbers of the region
+  you want to replace (inclusive). Read them from the line numbers in your context.
+- new_code: the complete replacement for exactly those lines.
+
+ALTERNATIVE: String-based targeting with old_code (use only when line numbers
+are not visible in your context):
 
 <surgical_edit>
 {
@@ -6343,12 +6418,17 @@ replacement. The system splices it into the full symbol and runs the same QA gat
 </surgical_edit>
 
 Rules for targeted edits:
-- "old_code" must be copied VERBATIM from the file/search results (NO line-number prefix)
-  and must match EXACTLY ONE place in the symbol — include a few surrounding lines if needed
-- "new_code" is the full replacement for just that snippet (include the old lines you keep)
-- If you can't see the region you need, emit a <search_request> for a nearby string literal
-  FIRST — you'll get a focused window around it — then write the targeted edit
-- Use a full-symbol new_code (no old_code) only for small symbols you can see entirely
+- PREFER edit_start_line/edit_end_line whenever you can see line numbers — it
+  never fails due to whitespace differences
+- If using old_code: copy it VERBATIM (no line-number prefix); it must match
+  EXACTLY ONE place in the symbol — include a few surrounding lines if needed
+- "new_code" is the full replacement for just that region (include unchanged
+  lines you want to keep)
+- If you can't see the region you need, emit a <search_request> for a nearby
+  string literal FIRST — you'll get a windowed view with line numbers — then
+  write a targeted edit using edit_start_line/edit_end_line
+- Use a full-symbol new_code (no old_code / no line range) only for small
+  symbols you can see entirely
 
 Rules for symbol:
 - Must exactly match a name from the SYMBOL INDEX in the file context
@@ -6699,7 +6779,9 @@ def _build_symbol_correction(
             parts.append(
                 f"\n❌ Targeted edit on symbol '{bad_name}' in {filename} could not be applied: "
                 f"{snippet_reason}\n"
-                f"   Fix it by EITHER:\n"
+                f"   Fix it by EITHER (in order of preference):\n"
+                f"   • BEST: use \"edit_start_line\" + \"edit_end_line\" (absolute file line numbers "
+                f"from the listing below) — zero whitespace issues, never fails; OR\n"
                 f"   • providing an \"old_code\" snippet copied verbatim (no line-number prefix) "
                 f"from the symbol below, that matches exactly one location, with its \"new_code\" replacement; OR\n"
                 f"   • emitting the COMPLETE symbol in \"new_code\" with no \"old_code\"."
@@ -6719,13 +6801,17 @@ def _build_symbol_correction(
                 )
                 parts.append(
                     f"\n   ACTUAL current content of '{bad_name}' "
-                    f"(copy an \"old_code\" anchor VERBATIM from here):\n{numbered}"
+                    f"(line numbers are ABSOLUTE file lines — use them for edit_start_line/edit_end_line):\n{numbered}"
                 )
                 if len(_sc_lines) > 100:
                     parts.append(
                         f"\n   ✏️  TARGETED EDIT REQUIRED — this symbol is {len(_sc_lines)} lines."
                         f" DO NOT re-emit the entire symbol.\n"
-                        f"   In your <surgical_edit> use:\n"
+                        f"   PREFERRED — use line-number targeting (no whitespace drift):\n"
+                        f"     \"edit_start_line\": first line number of the region to replace (from the listing above)\n"
+                        f"     \"edit_end_line\": last line number of the region to replace (inclusive)\n"
+                        f"     \"new_code\": the replacement lines\n"
+                        f"   ALTERNATIVE — use string-based targeting:\n"
                         f"     \"old_code\": an EXACT verbatim snippet (≥3 lines) from the content above\n"
                         f"     \"new_code\": only the replacement for that snippet\n"
                         f"   The server splices it in — everything else is preserved automatically.\n"
@@ -6733,7 +6819,7 @@ def _build_symbol_correction(
                     )
                     parts.append(
                         f"\n   ACTUAL current content of '{bad_name}' "
-                        f"(copy an \"old_code\" anchor VERBATIM from here):\n{numbered}"
+                        f"(line numbers are ABSOLUTE — use for edit_start_line/edit_end_line):\n{numbered}"
                     )
             else:
                 parts.append(
@@ -8339,7 +8425,9 @@ async def run_natural_pipeline_stream(
                 symbol_name = edit_data.get("symbol", "")
                 new_code = edit_data.get("new_code", "")
                 description = edit_data.get("description", "")
-                old_code = edit_data.get("old_code", "")  # SNIPPET / targeted edit
+                old_code = edit_data.get("old_code", "")  # SNIPPET / targeted edit (string-match path)
+                edit_start_line = edit_data.get("edit_start_line")   # Option B: line-number path
+                edit_end_line   = edit_data.get("edit_end_line")
 
                 if not filename or not new_code:
                     continue
@@ -8415,7 +8503,47 @@ async def run_natural_pipeline_stream(
                     # Multiple edits to the same symbol splice cumulatively and
                     # collapse into ONE change (see _symbol_accum below).
                     _akey = (filename, symbol.full_path)
-                    if old_code:
+                    if edit_start_line and edit_end_line:
+                        # ── Option B: line-number splice (preferred) ─────────
+                        # Claude supplied edit_start_line / edit_end_line instead
+                        # of an old_code string.  We extract the exact bytes by
+                        # index — zero string matching, immune to whitespace drift.
+                        _accum_base = _symbol_accum.get(_akey, symbol.code)
+                        _sym_abs_start = getattr(symbol, "start_line", 1) or 1
+                        full_new, ok_snip, snip_reason = _apply_snippet_by_lines(
+                            _accum_base, _sym_abs_start,
+                            int(edit_start_line), int(edit_end_line),
+                            new_code,
+                        )
+                        if ok_snip:
+                            edit_data["new_code"] = full_new
+                            edit_data.pop("old_code", None)
+                            edit_data.pop("edit_start_line", None)
+                            edit_data.pop("edit_end_line", None)
+                        else:
+                            _dlog("snippet_apply_failed",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  symbol=symbol_name,
+                                  reason=snip_reason,
+                                  edit_start_line=edit_start_line,
+                                  edit_end_line=edit_end_line,
+                                  symbol_start_line=_sym_abs_start,
+                                  symbol_code_len=len(_accum_base),
+                                      user_id=user_id)
+                            still_unresolved.append({
+                                "filename": filename,
+                                "symbol": symbol_name,
+                                "new_code": new_code,
+                                "description": description,
+                                "_raw": edit_raw,
+                                "_snippet_reason": snip_reason,
+                                "_symbol_code": symbol.code,
+                                "_symbol_start": symbol.start_line,
+                            })
+                            continue
+                    elif old_code:
+                        # ── Option A: string-match splice (legacy fallback) ──
                         # Splice into the running (cumulative) symbol so a second
                         # edit to the same symbol builds on the first, not the
                         # pristine original.
