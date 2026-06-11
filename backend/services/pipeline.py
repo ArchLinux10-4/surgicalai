@@ -143,9 +143,17 @@ def _is_gemini_model(model: str) -> bool:
 _THINKING_CAPABLE_PATTERNS = ("claude-opus-4", "claude-sonnet-4", "claude-haiku-4-5", "claude-3-7")
 
 # Specific model versions that match a thinking-capable pattern above but do
-# NOT actually support extended thinking in the Anthropic API.  Checked first
-# inside _supports_thinking() so they are never sent thinking={type:enabled}.
+# NOT actually support manual extended thinking (type:enabled / budget_tokens).
+# Checked first inside _supports_thinking() so they are never sent that shape.
+# NOTE: 4-7 and 4-8 use ADAPTIVE thinking only — handled by _uses_adaptive_thinking().
 _THINKING_EXCLUDED_MODELS = ("claude-opus-4-7", "claude-opus-4-8")
+
+# Models that require adaptive thinking (type:"adaptive") instead of manual
+# budget_tokens.  On these models, type:"enabled" returns a 400 error.
+# Adaptive mode also auto-enables interleaved thinking (no beta header needed).
+# display defaults to "omitted" on these models — must set "summarized" explicitly
+# or thinking panel content will come back as empty strings (silent bug).
+_ADAPTIVE_THINKING_MODELS = ("claude-opus-4-8", "claude-opus-4-7")
 
 # -- ReAct agentic search: per-session grep cache ----------------------------
 # Keyed by session_cache_key -> accumulated grep text from prior search rounds.
@@ -297,7 +305,9 @@ def _grep_relevant_sections(
     return header + "\n\n".join(output_parts)
 
 def _supports_thinking(model: str) -> bool:
-    """Return True for models that support extended thinking blocks."""
+    """Return True for models that support MANUAL extended thinking (type:enabled / budget_tokens).
+    Adaptive thinking models (4.8, 4.7) are excluded here — they use _get_thinking_kwargs() instead.
+    """
     if _is_claude_model(model):
         # Exclude specific versions that match a capable pattern but lack thinking support
         if any(excl in model for excl in _THINKING_EXCLUDED_MODELS):
@@ -307,6 +317,45 @@ def _supports_thinking(model: str) -> bool:
         # Gemini 2.5+ models support thinking
         return "gemini-2.5" in model
     return False
+
+
+def _uses_adaptive_thinking(model: str) -> bool:
+    """Return True for Claude models that require adaptive thinking (type:'adaptive').
+    These models reject type:'enabled'/budget_tokens with a 400 error.
+    """
+    return _is_claude_model(model) and any(m in model for m in _ADAPTIVE_THINKING_MODELS)
+
+
+def _get_thinking_kwargs(model: str, budget: int) -> dict:
+    """Return the correct `thinking` kwarg dict for any model.
+
+    - Adaptive models (4.8, 4.7): {"thinking": {"type": "adaptive", "display": "summarized"}}
+      IMPORTANT: display defaults to "omitted" on these models — must be set to "summarized"
+      explicitly or thinking blocks come back as empty strings (silent failure).
+      No budget_tokens parameter — effort is set separately via _get_effort_kwargs().
+
+    - Manual thinking models (4.6, 3.7): {"thinking": {"type": "enabled", "budget_tokens": N}}
+
+    - All other models: {} (no thinking params, safe to ** spread)
+    """
+    if _uses_adaptive_thinking(model):
+        return {"thinking": {"type": "adaptive", "display": "summarized"}}
+    if _supports_thinking(model):
+        return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+    return {}
+
+
+def _get_effort_kwargs(model: str) -> dict:
+    """Return output_config kwargs for models that support effort control.
+
+    Adaptive thinking models benefit greatly from effort='xhigh' for coding tasks.
+    Anthropic changed the default effort from 'high' to 'medium' which caused a
+    significant quality regression — explicitly set xhigh for agentic/coding work.
+    Returns {} for all other models (safe to ** spread).
+    """
+    if _uses_adaptive_thinking(model):
+        return {"output_config": {"effort": "xhigh"}}
+    return {}
 
 
 def _resolve_key(user_id: str, key_type: str) -> str:
@@ -2307,8 +2356,8 @@ async def analyze_and_plan_stream(
                 "system": CLAUDE_EDITOR_SYSTEM,
                 "messages": messages,
             }
-            if _supports_thinking(architect_model):
-                model_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 8000}
+            model_kwargs.update(_get_thinking_kwargs(architect_model, 8000))
+            model_kwargs.update(_get_effort_kwargs(architect_model))
 
             full_text = ""
             in_thinking = False
@@ -4314,7 +4363,8 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 async with aclient.messages.stream(
                     model=chat_model,
                     max_tokens=16000,
-                    **(({"thinking": {"type": "enabled", "budget_tokens": 10000}}) if _supports_thinking(chat_model) else {}),
+                    **_get_thinking_kwargs(chat_model, 10000),
+                    **_get_effort_kwargs(chat_model),
                     system=system,
                     messages=claude_msgs,
                 ) as astream:
@@ -4679,8 +4729,8 @@ USER REQUEST:
                         async with aclient.messages.stream(
                             model=arch_model,
                             max_tokens=16000,
-                            **({"thinking": {"type": "enabled", "budget_tokens": 10000}}
-                               if _supports_thinking(arch_model) else {}),
+                            **_get_thinking_kwargs(arch_model, 10000),
+                            **_get_effort_kwargs(arch_model),
                             system=_architect_system,
                             messages=_arch_history_msgs + [{"role": "user",
                                                             "content": user_content}],
@@ -4728,9 +4778,8 @@ USER REQUEST:
                                 async with aclient.messages.stream(
                                     model=arch_model,
                                     max_tokens=16000,
-                                    **({"thinking": {"type": "enabled",
-                                                    "budget_tokens": 10000}}
-                                       if _supports_thinking(arch_model) else {}),
+                                    **_get_thinking_kwargs(arch_model, 10000),
+                                    **_get_effort_kwargs(arch_model),
                                     system=_architect_system,
                                     messages=_arch_history_msgs + [{"role": "user",
                                                                     "content": _react_context}],
@@ -7491,8 +7540,8 @@ async def _execute_single_edit(
             "system": focused_system,
             "messages": [{"role": "user", "content": focused_user}],
         }
-        if _supports_thinking(model):
-            call_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 4000}
+        call_kwargs.update(_get_thinking_kwargs(model, 4000))
+        call_kwargs.update(_get_effort_kwargs(model))
 
         resp = await aclient.messages.create(**call_kwargs)
 
@@ -7723,8 +7772,8 @@ async def run_natural_pipeline_stream(
             "system": system_prompt,
             "messages": messages,
         }
-        if _supports_thinking(arch_model):
-            stream_kwargs["thinking"] = {"type": "enabled", "budget_tokens": 10000}
+        stream_kwargs.update(_get_thinking_kwargs(arch_model, 10000))
+        stream_kwargs.update(_get_effort_kwargs(arch_model))
 
         # ── Streaming loop with ReAct search + edit/file/search tag parsing ─────
         # Claude can emit <search_request>, <surgical_edit>, or <new_file> tags.
