@@ -602,6 +602,12 @@ IF ALREADY CORRECT (the code already does exactly what was requested AND nothing
 >>>>>>> REPLACE
 NEVER use this for deletions — if the task says "remove", "delete", or "unused", you MUST emit a non-empty SEARCH block.
 
+VERIFICATION RULE — BEFORE concluding "already correct":
+You MUST confirm you are looking at the exact named function/symbol, not just nearby code.
+Search for the function definition by its literal name (e.g. `function exportRspProjectsXLSX(` or `def export_rsp_projects`).
+A correct pattern appearing NEAR the target symbol does NOT mean the target symbol is correct.
+If you cannot locate the exact definition, emit a SEARCH/REPLACE block rather than an empty pair.
+
 Output ONLY the SEARCH/REPLACE blocks. No JSON. No markdown fences around the blocks. No explanation outside the blocks."""
 
 
@@ -6126,6 +6132,16 @@ USER REQUEST:
                     "symbol": c.symbol.full_path if c.symbol else "unknown",
                     "reason": reason,
                 })
+                if reason == "no_visible_diff":
+                    # this is NOT a confirmed "already correct"; it is UNVERIFIED and needs manual review.
+                    import logging as _logging
+                    _logging.warning(
+                        "[SurgicalAI] UNVERIFIED symbol '%s' in '%s': Surgeon produced non-identical "
+                        "code but diff has no +/- lines. Manual inspection required. "
+                        "Likely cause: confirmation bias — Surgeon matched a nearby pattern instead "
+                        "of verifying the exact function definition.",
+                        c.symbol.full_path if c.symbol else "unknown", fname
+                    )
                 _dlog("ghost_diff_suppressed",
                       session_id=session_id,
                       user_id=user_id,

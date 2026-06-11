@@ -1038,21 +1038,40 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
 
       {/* Skipped changes notice */}
       {result.skipped_changes && result.skipped_changes.length > 0 && (
-        <div className="mt-2 flex items-start gap-2 px-3 py-2 bg-surface/60 border border-border/50 rounded-lg">
-          <SkipNext sx={{ fontSize: 13 }} className="text-muted/60 mt-0.5 flex-shrink-0" />
-          <div className="text-[12px] text-muted/80">
-            <strong className="text-ink/60">Skipped {result.skipped_changes.length} symbol{result.skipped_changes.length !== 1 ? 's' : ''}:</strong>{' '}
-            {result.skipped_changes.map((s: any, i: number) => (
-              <span key={i}>
-                <code className="text-[11px] text-accent/70">{s.symbol}</code>
-                {s.reason === 'already_matches'
-                  ? ' — code already matches'
-                  : ' — no visible diff produced'}
-                {i < (result.skipped_changes?.length ?? 0) - 1 ? '; ' : ''}
-              </span>
-            ))}
-          </div>
-        </div>
+        <>
+          {/* already_matches — quiet grey, genuinely already done */}
+          {result.skipped_changes.filter((s: any) => s.reason === 'already_matches').length > 0 && (
+            <div className="mt-2 flex items-start gap-2 px-3 py-2 bg-surface/60 border border-border/50 rounded-lg">
+              <SkipNext sx={{ fontSize: 13 }} className="text-muted/60 mt-0.5 flex-shrink-0" />
+              <div className="text-[12px] text-muted/80">
+                <strong className="text-ink/60">Skipped {result.skipped_changes.filter((s: any) => s.reason === 'already_matches').length} symbol{result.skipped_changes.filter((s: any) => s.reason === 'already_matches').length !== 1 ? 's' : ''}:</strong>{' '}
+                {result.skipped_changes.filter((s: any) => s.reason === 'already_matches').map((s: any, i: number, arr: any[]) => (
+                  <span key={i}>
+                    <code className="text-[11px] text-accent/70">{s.symbol}</code>
+                    {' — code already matches'}
+                    {i < arr.length - 1 ? '; ' : ''}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+          {/* no_visible_diff — yellow warning, needs manual review */}
+          {result.skipped_changes.filter((s: any) => s.reason === 'no_visible_diff').length > 0 && (
+            <div className="mt-2 flex items-start gap-2 px-3 py-2 bg-warning/10 border border-warning/40 rounded-lg">
+              <Warning sx={{ fontSize: 13 }} className="text-warning mt-0.5 flex-shrink-0" />
+              <div className="text-[12px] text-warning">
+                <strong>⚠️ Unverified {result.skipped_changes.filter((s: any) => s.reason === 'no_visible_diff').length} symbol{result.skipped_changes.filter((s: any) => s.reason === 'no_visible_diff').length !== 1 ? 's' : ''}:</strong>{' '}
+                {result.skipped_changes.filter((s: any) => s.reason === 'no_visible_diff').map((s: any, i: number, arr: any[]) => (
+                  <span key={i}>
+                    <code className="text-[11px] text-warning/80">{s.symbol}</code>
+                    {' — Surgeon produced no diff. The AI may have matched a nearby pattern instead of verifying this exact function. Please inspect it manually.'}
+                    {i < arr.length - 1 ? '; ' : ''}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
       )}
 
       {/* Test runner — shown after apply */}
