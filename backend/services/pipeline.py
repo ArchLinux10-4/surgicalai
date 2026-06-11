@@ -9701,9 +9701,9 @@ async def run_natural_pipeline_stream(
         # Strip edit blocks from display text (regex handles truncated/unclosed tags)
         import re as _re_strip
         _display_text = _re_strip.sub(r'<surgical_edit>.*?</surgical_edit>', '', full_response, flags=_re_strip.DOTALL)
-        _display_text = _re_strip.sub(r'<surgical_edit>[^<]*$', '', _display_text, flags=_re_strip.DOTALL)
+        _display_text = _re_strip.sub(r'<surgical_edit>[\s\S]*$', '', _display_text)
         _display_text = _re_strip.sub(r'<new_file>.*?</new_file>', '', _display_text, flags=_re_strip.DOTALL)
-        _display_text = _re_strip.sub(r'<new_file>[^<]*$', '', _display_text, flags=_re_strip.DOTALL)
+        _display_text = _re_strip.sub(r'<new_file>[\s\S]*$', '', _display_text)
         _display_text = _display_text.strip()
 
         result = {

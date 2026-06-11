@@ -977,7 +977,12 @@ export function ChatPanel() {
         gotResult = true
         const _thinking = thinkingTextRef.current
         const _steps = [...progressHistoryRef.current]
-        const naturalText = result.natural_text || accumulated
+        // Strip any leaked <new_file> blocks from the display text — the files are already
+        // in result.new_files; this guards against backend regex failing on HTML content.
+        const naturalText = (result.natural_text || accumulated)
+          .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
+          .replace(/<new_file>[\s\S]*$/, '')
+          .trim()
 
         stopStream()
         setIsBuildingEdit(false)
