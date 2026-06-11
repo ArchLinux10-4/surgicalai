@@ -8371,6 +8371,26 @@ async def run_natural_pipeline_stream(
 
         MAX_SYMBOL_RETRIES = 2
         pending_edits = list(edit_blocks_raw)
+
+        # ── Bottom-to-top sort for line-number edits ──────────────────────────
+        # When multiple line-number edits target the same symbol, applying them
+        # from the highest source line downward keeps every edit's positions
+        # valid: a bottom-of-symbol edit cannot shift the line indices of an
+        # upper edit that hasn't run yet.  This mirrors how Cursor re-applies
+        # against current file state — but without a re-prompt, we achieve the
+        # same invariant deterministically by processing bottom-to-top.
+        # Non-line-number edits keep their relative order (Python's sort is
+        # stable; they receive key=-1 and sort after all line-number edits).
+        # Edits to different symbols or different files are always independent.
+        def _ln_sort_key(raw):
+            try:
+                d = json.loads(raw.strip()) if isinstance(raw, str) else raw
+                sl = d.get("edit_start_line")
+                return int(sl) if sl else -1
+            except Exception:
+                return -1
+        pending_edits.sort(key=_ln_sort_key, reverse=True)
+
         _eb_summary = []
         for _b in pending_edits:
             try:
@@ -8403,6 +8423,11 @@ async def run_natural_pipeline_stream(
         # failure mode). Keyed by (filename, symbol.full_path).
         _symbol_accum: dict = {}        # key -> latest merged symbol code
         _resolved_by_symbol: dict = {}  # key -> the single resolved_edit entry
+
+        # Tracks (abs_start, abs_end) ranges already applied per (filename, symbol)
+        # key. Used by the overlap guard to reject conflicting line-number edits
+        # before they can corrupt the accumulated symbol body.
+        _ln_applied_ranges: dict = {}   # _akey -> [(abs_start, abs_end), ...]
 
         for resolve_round in range(MAX_SYMBOL_RETRIES + 1):
             still_unresolved = []
@@ -8508,14 +8533,49 @@ async def run_natural_pipeline_stream(
                         # Claude supplied edit_start_line / edit_end_line instead
                         # of an old_code string.  We extract the exact bytes by
                         # index — zero string matching, immune to whitespace drift.
+                        _isl, _iel = int(edit_start_line), int(edit_end_line)
+
+                        # ── Overlap guard ─────────────────────────────────────
+                        # Two line-number edits to the same symbol must not target
+                        # overlapping source ranges.  The bottom-to-top sort above
+                        # ensures non-overlapping ranges apply in the correct order;
+                        # overlapping ones are a generation error — skip with a
+                        # clear message rather than silently corrupt the symbol.
+                        _overlap_reason = None
+                        for (_ps, _pe) in _ln_applied_ranges.get(_akey, []):
+                            if _isl <= _pe and _iel >= _ps:
+                                _overlap_reason = (
+                                    f"lines {_isl}\u2013{_iel} overlap with already-applied "
+                                    f"range {_ps}\u2013{_pe} in '{symbol_name}'. "
+                                    "Two line-number edits to the same symbol must not "
+                                    "target overlapping source regions."
+                                )
+                                break
+                        if _overlap_reason:
+                            logging.warning(
+                                "line_range_overlap: %s %s", filename, _overlap_reason
+                            )
+                            _dlog("line_range_overlap", session_id=session_id,
+                                  filename=filename, symbol=symbol_name,
+                                  conflict=_overlap_reason, user_id=user_id)
+                            skipped_changes_struct.append({
+                                "filename": filename,
+                                "symbol": symbol_name,
+                                "reason": _overlap_reason,
+                            })
+                            continue
+
                         _accum_base = _symbol_accum.get(_akey, symbol.code)
                         _sym_abs_start = getattr(symbol, "start_line", 1) or 1
                         full_new, ok_snip, snip_reason = _apply_snippet_by_lines(
                             _accum_base, _sym_abs_start,
-                            int(edit_start_line), int(edit_end_line),
+                            _isl, _iel,
                             new_code,
                         )
                         if ok_snip:
+                            # Record the applied range so subsequent edits to
+                            # this symbol can detect overlaps.
+                            _ln_applied_ranges.setdefault(_akey, []).append((_isl, _iel))
                             edit_data["new_code"] = full_new
                             edit_data.pop("old_code", None)
                             edit_data.pop("edit_start_line", None)
@@ -8526,8 +8586,8 @@ async def run_natural_pipeline_stream(
                                   filename=filename,
                                   symbol=symbol_name,
                                   reason=snip_reason,
-                                  edit_start_line=edit_start_line,
-                                  edit_end_line=edit_end_line,
+                                  edit_start_line=_isl,
+                                  edit_end_line=_iel,
                                   symbol_start_line=_sym_abs_start,
                                   symbol_code_len=len(_accum_base),
                                       user_id=user_id)
