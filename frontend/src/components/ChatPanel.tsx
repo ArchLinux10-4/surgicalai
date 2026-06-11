@@ -586,7 +586,7 @@ export function ChatPanel() {
   const {
     activeSessions, setActiveSession, messages, addMessage, setMessages,
     isStreaming, setIsStreaming, streamingMessage, setStreamingMessage,
-    streamProgress, setStreamProgress, sessions, setSessions, settings,
+    streamProgress, setStreamProgress, sessions, setSessions, settings, setSettings,
     sessionFiles, setSessionFiles, addSessionFile, removeSessionFile,
     setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble,
     pendingChatInput, setPendingChatInput,
