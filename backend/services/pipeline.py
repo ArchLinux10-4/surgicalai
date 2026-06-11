@@ -138,10 +138,14 @@ def _is_gemini_model(model: str) -> bool:
 
 
 # Models confirmed to support extended thinking (budget_tokens).
-# claude-opus-4-7 and others without native thinking support must be excluded.
 # Extended-thinking support. All Claude 4.x families (Opus/Sonnet/Haiku 4.5+)
 # emit thinking blocks; 3.7 also supports it. 3.5 does NOT and is excluded.
 _THINKING_CAPABLE_PATTERNS = ("claude-opus-4", "claude-sonnet-4", "claude-haiku-4-5", "claude-3-7")
+
+# Specific model versions that match a thinking-capable pattern above but do
+# NOT actually support extended thinking in the Anthropic API.  Checked first
+# inside _supports_thinking() so they are never sent thinking={type:enabled}.
+_THINKING_EXCLUDED_MODELS = ("claude-opus-4-7", "claude-opus-4-8")
 
 # -- ReAct agentic search: per-session grep cache ----------------------------
 # Keyed by session_cache_key -> accumulated grep text from prior search rounds.
@@ -295,6 +299,9 @@ def _grep_relevant_sections(
 def _supports_thinking(model: str) -> bool:
     """Return True for models that support extended thinking blocks."""
     if _is_claude_model(model):
+        # Exclude specific versions that match a capable pattern but lack thinking support
+        if any(excl in model for excl in _THINKING_EXCLUDED_MODELS):
+            return False
         return any(model.startswith(p) or p in model for p in _THINKING_CAPABLE_PATTERNS)
     if _is_gemini_model(model):
         # Gemini 2.5+ models support thinking
