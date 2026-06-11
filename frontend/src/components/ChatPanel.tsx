@@ -625,6 +625,13 @@ export function ChatPanel() {
   const thinkingTextRef = useRef('')
   const progressHistoryRef = useRef<string[]>([])
 
+  // Mid-thought injection state
+  const [injectionInput, setInjectionInput] = useState('')
+  const [injectionQueued, setInjectionQueued] = useState(false)
+  const pendingInjectionRef = useRef<string>('')
+  const sentMessageRef = useRef<string>('')
+  const [restartSignal, setRestartSignal] = useState<{ msg: string; sid: string } | null>(null)
+
   // Scroll to bottom on new messages
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -690,6 +697,211 @@ export function ChatPanel() {
     setStreamingMessage('')
     setStreamProgress('')
   }
+
+  // ── Core stream launcher — shared by handleSend and injection restart ─────
+  const doStream = useCallback((
+    sessionId: string,
+    messageText: string,
+    isFirst: boolean,
+    autoRename: () => void,
+  ) => {
+    let accumulated = ''
+    let gotResult = false
+
+    const ctrl = api.stream.smart(
+      { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id) },
+      (progress) => {
+        if (useAppStore.getState().activeSessions !== sessionId) return
+        setStreamProgress(progress)
+        setProgressHistory(prev => {
+          if (prev[prev.length - 1] !== progress) {
+            const next = [...prev, progress]
+            progressHistoryRef.current = next
+            return next
+          }
+          return prev
+        })
+      },
+      (token) => { if (useAppStore.getState().activeSessions !== sessionId) return; accumulated += token; setStreamingMessage(accumulated) },
+      (result) => {
+        gotResult = true
+        const _thinking = thinkingTextRef.current
+        const _steps = [...progressHistoryRef.current]
+        const naturalText = (result.natural_text || accumulated)
+          .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
+          .replace(/<new_file>[\s\S]*$/, '')
+          .trim()
+
+        setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
+        setIsBuildingEdit(false)
+
+        if (naturalText.trim()) {
+          addMessage({
+            id: Date.now().toString() + '_ai',
+            session_id: sessionId,
+            role: 'assistant',
+            message_type: 'natural_result',
+            surgical_data: JSON.stringify(result),
+            content: naturalText.trim(),
+            created_at: new Date().toISOString(),
+            _thinking,
+            _steps,
+          })
+        } else {
+          addMessage({
+            id: Date.now().toString() + '_ai',
+            session_id: sessionId,
+            role: 'assistant',
+            message_type: 'surgical_result',
+            surgical_data: JSON.stringify(result),
+            content: '',
+            created_at: new Date().toISOString(),
+            _thinking,
+            _steps,
+          })
+        }
+        if (isFirst) autoRename()
+        else api.chat.getSessions().then(setSessions).catch(() => {})
+        api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
+      },
+      (fullText) => {
+        if (gotResult) return
+        const _thinking = thinkingTextRef.current
+        const _steps = [...progressHistoryRef.current]
+        setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
+        setIsBuildingEdit(false)
+        if (fullText.trim()) {
+          addMessage({
+            id: Date.now().toString() + '_ai',
+            session_id: sessionId,
+            role: 'assistant',
+            content: fullText,
+            created_at: new Date().toISOString(),
+            _thinking,
+            _steps,
+          })
+        }
+        if (isFirst) autoRename()
+        else api.chat.getSessions().then(setSessions).catch(() => {})
+        api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
+      },
+      (err) => {
+        if (accumulated.trim() && !gotResult) {
+          addMessage({
+            id: Date.now().toString() + '_ai_err',
+            session_id: sessionId,
+            role: 'assistant',
+            content: accumulated.trim(),
+            created_at: new Date().toISOString(),
+            _thinking: thinkingTextRef.current,
+            _steps: [...progressHistoryRef.current],
+          })
+          gotResult = true
+        }
+        setError(err)
+        setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
+        setIsBuildingEdit(false)
+        setTimeout(async () => {
+          try {
+            if (useAppStore.getState().activeSessions !== sessionId) return
+            const saved = await api.chat.getMessages(sessionId)
+            if (saved?.length) setMessages(saved)
+          } catch {}
+        }, 3000)
+      },
+      // onThinking — injection point: when thinking ends and injection is queued, restart
+      (thinkToken, phase) => {
+        if (useAppStore.getState().activeSessions !== sessionId) return
+        if (phase === 'start') {
+          setIsThinking(true); setThinkingText(''); thinkingTextRef.current = ''
+        } else if (phase === 'delta') {
+          setThinkingText(prev => { const next = prev + thinkToken; thinkingTextRef.current = next; return next })
+        } else if (phase === 'end') {
+          setIsThinking(false)
+          if (pendingInjectionRef.current) {
+            const inj = pendingInjectionRef.current
+            pendingInjectionRef.current = ''
+            setInjectionQueued(false)
+            abortRef.current?.abort()
+            setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
+            const combined = sentMessageRef.current + '\n\n[Context added while thinking]: ' + inj
+            setRestartSignal({ msg: combined, sid: sessionId })
+          }
+        }
+      },
+      // onCompacting
+      (phase) => {
+        if (phase === 'start') {
+          setIsCompacting(true)
+        } else {
+          setIsCompacting(false)
+          addMessage({
+            id: Date.now().toString() + '_compact',
+            session_id: sessionId,
+            role: 'system' as any,
+            message_type: 'compact_marker',
+            content: '',
+            created_at: new Date().toISOString(),
+          })
+        }
+      },
+      // onEditStart
+      () => { setIsBuildingEdit(true) },
+      // onEditEnd
+      () => { setIsBuildingEdit(false) },
+      // onTask
+      (event) => {
+        switch (event.type) {
+          case 'task_plan':
+            setTaskRunId(event.run_id)
+            setTaskPreamble(event.preamble || '')
+            setAgentTasks((event.tasks || []).map((t: any) => ({
+              id: t.id, seq: t.seq, title: t.title, detail: t.detail,
+              kind: t.kind || 'code',
+              status: t.status || 'pending', qa_score: null, verdict: null,
+              run_id: event.run_id,
+            })))
+            break
+          case 'task_start':
+            updateAgentTask(event.id, { status: 'running', progress: undefined })
+            break
+          case 'task_progress':
+            updateAgentTask(event.id, { progress: event.content })
+            break
+          case 'task_done':
+            updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict })
+            break
+          case 'task_blocked':
+            updateAgentTask(event.id, { status: 'blocked', qa_score: event.qa_score, verdict: event.verdict })
+            break
+          case 'task_cancelled':
+            updateAgentTask(event.id, { status: 'cancelled' })
+            break
+          case 'tasks_complete':
+            break
+        }
+      }
+    )
+    abortRef.current = ctrl
+  }, [sessionFiles]) // all setters are stable; only sessionFiles can change
+
+  // Restart stream when an injection was queued — fires once isStreaming settles to false
+  useEffect(() => {
+    if (!restartSignal || isStreaming) return
+    const { msg, sid } = restartSignal
+    setRestartSignal(null)
+    setIsStreaming(true)
+    setStreamProgress('Applying your context...')
+    setStreamingMessage('')
+    setProgressHistory(['Applying your context...'])
+    setThinkingText('')
+    setIsThinking(false)
+    thinkingTextRef.current = ''
+    progressHistoryRef.current = ['Applying your context...']
+    doStream(sid, msg, false, () => {
+      api.chat.getSessions().then(setSessions).catch(() => {})
+    })
+  }, [restartSignal, isStreaming, doStream])
 
   const handleModelChange = async (modelId: string) => {
     if (!settings) return
@@ -918,6 +1130,7 @@ export function ChatPanel() {
     }
     setError(null)
     const text = input.trim()
+    sentMessageRef.current = text
     setInput('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
 
@@ -954,179 +1167,8 @@ export function ChatPanel() {
     thinkingTextRef.current = ''
     progressHistoryRef.current = ['Thinking...']
 
-    let accumulated = ''
-    let gotResult = false
-
-    const ctrl = api.stream.smart(
-      { session_id: sessionId, message: text, file_ids: sessionFiles.map(f => f.id) },
-      (progress) => {
-        if (useAppStore.getState().activeSessions !== sessionId) return
-        setStreamProgress(progress)
-        setProgressHistory(prev => {
-          if (prev[prev.length - 1] !== progress) {
-            const next = [...prev, progress]
-            progressHistoryRef.current = next
-            return next
-          }
-          return prev
-        })
-      },
-      (token) => { if (useAppStore.getState().activeSessions !== sessionId) return; accumulated += token; setStreamingMessage(accumulated) },
-      (result) => {
-        // Result arrived — may come with natural text already streamed
-        gotResult = true
-        const _thinking = thinkingTextRef.current
-        const _steps = [...progressHistoryRef.current]
-        // Strip any leaked <new_file> blocks from the display text — the files are already
-        // in result.new_files; this guards against backend regex failing on HTML content.
-        const naturalText = (result.natural_text || accumulated)
-          .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
-          .replace(/<new_file>[\s\S]*$/, '')
-          .trim()
-
-        stopStream()
-        setIsBuildingEdit(false)
-
-        if (naturalText.trim()) {
-          // Natural pipeline: show both the text and the diff card together
-          addMessage({
-            id: Date.now().toString() + '_ai',
-            session_id: sessionId,
-            role: 'assistant',
-            message_type: 'natural_result',
-            surgical_data: JSON.stringify(result),
-            content: naturalText.trim(),
-            created_at: new Date().toISOString(),
-            _thinking,
-            _steps,
-          })
-        } else {
-          // Legacy pipeline: show only diff card
-          addMessage({
-            id: Date.now().toString() + '_ai',
-            session_id: sessionId,
-            role: 'assistant',
-            message_type: 'surgical_result',
-            surgical_data: JSON.stringify(result),
-            content: '',
-            created_at: new Date().toISOString(),
-            _thinking,
-            _steps,
-          })
-        }
-        if (isFirstMessage) autoNameSession()
-        else api.chat.getSessions().then(setSessions).catch(() => {})
-        api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
-      },
-      (fullText) => {
-        if (gotResult) return
-        const _thinking = thinkingTextRef.current
-        const _steps = [...progressHistoryRef.current]
-        stopStream()
-        setIsBuildingEdit(false)
-        if (fullText.trim()) {
-          addMessage({
-            id: Date.now().toString() + '_ai',
-            session_id: sessionId,
-            role: 'assistant',
-            content: fullText,
-            created_at: new Date().toISOString(),
-            _thinking,
-            _steps,
-          })
-        }
-        if (isFirstMessage) autoNameSession()
-        else api.chat.getSessions().then(setSessions).catch(() => {})
-        api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
-      },
-      (err) => {
-        // Preserve any streamed text before clearing the bubble
-        if (accumulated.trim() && !gotResult) {
-          addMessage({
-            id: Date.now().toString() + '_ai_err',
-            session_id: sessionId,
-            role: 'assistant',
-            content: accumulated.trim(),
-            created_at: new Date().toISOString(),
-            _thinking: thinkingTextRef.current,
-            _steps: [...progressHistoryRef.current],
-          })
-          gotResult = true
-        }
-        setError(err); stopStream(); setIsBuildingEdit(false)
-        // Auto-recover: fetch the backend's safety-net saved response (may be more complete)
-        setTimeout(async () => {
-          try {
-            if (useAppStore.getState().activeSessions !== sessionId) return // Guard: session changed
-            const saved = await api.chat.getMessages(sessionId)
-            if (saved?.length) setMessages(saved)
-          } catch {}
-        }, 3000)
-      },
-      // onThinking
-      (text, phase) => {
-        if (useAppStore.getState().activeSessions !== sessionId) return
-        if (phase === 'start') { setIsThinking(true); setThinkingText(''); thinkingTextRef.current = '' }
-        else if (phase === 'delta') { setThinkingText(prev => { const next = prev + text; thinkingTextRef.current = next; return next }) }
-        else if (phase === 'end') { setIsThinking(false) }
-      },
-      // onCompacting
-      (phase) => {
-        if (phase === 'start') {
-          setIsCompacting(true)
-        } else {
-          setIsCompacting(false)
-          addMessage({
-            id: Date.now().toString() + '_compact',
-            session_id: sessionId,
-            role: 'system' as any,
-            message_type: 'compact_marker',
-            content: '',
-            created_at: new Date().toISOString(),
-          })
-        }
-      },
-      // onEditStart — Claude is writing a <surgical_edit> block
-      () => { setIsBuildingEdit(true) },
-      // onEditEnd — block complete, QA running
-      () => { setIsBuildingEdit(false) },
-      // onTask — agentic task lifecycle (instant channel; polling reconciles)
-      (event) => {
-        switch (event.type) {
-          case 'task_plan':
-            setTaskRunId(event.run_id)
-            setTaskPreamble(event.preamble || '')
-            setAgentTasks((event.tasks || []).map((t: any) => ({
-              id: t.id, seq: t.seq, title: t.title, detail: t.detail,
-              kind: t.kind || 'code',
-              status: t.status || 'pending', qa_score: null, verdict: null,
-              run_id: event.run_id,
-            })))
-            break
-          case 'task_start':
-            updateAgentTask(event.id, { status: 'running', progress: undefined })
-            break
-          case 'task_progress':
-            updateAgentTask(event.id, { progress: event.content })
-            break
-          case 'task_done':
-            updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict })
-            break
-          case 'task_blocked':
-            updateAgentTask(event.id, { status: 'blocked', qa_score: event.qa_score, verdict: event.verdict })
-            break
-          case 'task_cancelled':
-            updateAgentTask(event.id, { status: 'cancelled' })
-            break
-          case 'tasks_complete':
-            // Final reconcile pass; the polling hook will also catch this.
-            break
-        }
-      }
-    )
-
-    abortRef.current = ctrl
-  }, [input, isStreaming, settings, activeSessions, sessionFiles])
+    doStream(sessionId, text, isFirstMessage, autoNameSession)
+  }, [input, isStreaming, settings, activeSessions, sessionFiles, doStream])
 
   const handleKey = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); handleSend() }
@@ -1237,6 +1279,34 @@ export function ChatPanel() {
             <TaskListPanel />
             {isStreaming && (streamingMessage || streamProgress) && (
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} />
+            )}
+            {/* Mid-thought injection input — visible only during the thinking phase */}
+            {isThinking && !injectionQueued && (
+              <div className="mx-4 mt-2">
+                <div className="flex items-center gap-2 bg-surface/50 border border-purple/20 rounded-xl px-3 py-2 focus-within:border-purple/40 transition-colors">
+                  <span className="text-[10px] font-semibold text-purple/60 uppercase tracking-wide whitespace-nowrap select-none">Steer</span>
+                  <input
+                    autoFocus
+                    value={injectionInput}
+                    onChange={e => setInjectionInput(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter' && injectionInput.trim()) {
+                        pendingInjectionRef.current = injectionInput.trim()
+                        setInjectionQueued(true)
+                        setInjectionInput('')
+                      }
+                    }}
+                    placeholder="Add context before Claude writes code... (Enter to queue)"
+                    className="flex-1 bg-transparent text-xs text-ink placeholder:text-muted/40 focus:outline-none"
+                  />
+                </div>
+              </div>
+            )}
+            {injectionQueued && isStreaming && (
+              <div className="mx-4 mt-1.5 flex items-center gap-1.5 text-[11px] text-purple/60">
+                <span className="w-1.5 h-1.5 rounded-full bg-purple/50 animate-pulse flex-shrink-0" />
+                Context queued — will apply when thinking ends
+              </div>
             )}
             {error && (
               <div className="mx-4 my-3 flex items-start gap-2.5 px-3.5 py-3 bg-danger/10 border border-danger/30 rounded-xl text-sm text-danger">
