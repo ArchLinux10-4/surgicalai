@@ -6513,10 +6513,11 @@ Rules for new_file content:
 
 ━━━ WHEN TO USE BLOCKS ━━━
 
-Use <surgical_edit> when: user wants changes to an existing uploaded file
-Use <new_file> when: user wants a new file that doesn't exist yet
+Use <surgical_edit> when: user wants changes to an existing uploaded CODE file
+Use <new_file> when: user wants a new file that doesn't exist yet, OR when replacing an image/SVG/font/binary asset
 Use both when: creating a new file AND updating an existing one (e.g. new component + registering it in App.tsx)
 Just chat (no blocks) when: answering a question, explaining code, or you need clarification first
+NEVER use <surgical_edit> for image, SVG, font, or binary asset files — always use <new_file> to replace them
 
 NEVER do this: when the user asks to change behavior that lives in an existing uploaded
 file, do NOT create a brand-new file as a substitute, and do NOT fall back to telling the
@@ -8511,6 +8512,25 @@ async def run_natural_pipeline_stream(
                 edit_end_line   = edit_data.get("edit_end_line")
 
                 if not filename or not new_code:
+                    continue
+
+                # Skip binary/asset files — surgical edits make no sense for
+                # images, fonts, or media.  The model should use <new_file>
+                # to replace these, not <surgical_edit>.
+                _ASSET_EXTS = {
+                    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico',
+                    '.bmp', '.tiff', '.tif', '.svg',
+                    '.woff', '.woff2', '.ttf', '.eot', '.otf',
+                    '.mp4', '.webm', '.mov', '.mp3', '.wav', '.ogg',
+                    '.pdf',
+                }
+                import os as _os
+                if _os.path.splitext(filename)[1].lower() in _ASSET_EXTS:
+                    skipped_changes_struct.append({
+                        "filename": filename,
+                        "symbol": symbol_name or "(whole file)",
+                        "reason": "asset_file_skipped — use new_file to replace assets",
+                    })
                     continue
 
                 file_content = file_content_lookup.get(filename, "")
