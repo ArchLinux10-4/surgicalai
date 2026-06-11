@@ -15,6 +15,21 @@ import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Cl
 import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
 
+// ── Strip internal protocol tags from model output ────────────────────────────
+function stripInternalTags(text: string, streaming = false): string {
+  if (!text) return text
+  let result = text
+    .replace(/<edit_plan>[\s\S]*?<\/edit_plan>/g, '')
+    .replace(/<search_request>[\s\S]*?<\/search_request>/g, '')
+  if (streaming) {
+    // During streaming: hide from start of any incomplete opening tag
+    result = result
+      .replace(/<edit_plan>[\s\S]*$/, '')
+      .replace(/<search_request>[\s\S]*$/, '')
+  }
+  return result.trim()
+}
+
 // ── Apply All Button — applies every unapplied change across all messages ─────
 function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: {
   messages: any[]
@@ -293,7 +308,7 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
             {msg.content && (
               <div className="prose-ai">
                 <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                  {msg.content}
+                  {stripInternalTags(msg.content)}
                 </ReactMarkdown>
               </div>
             )}
@@ -310,7 +325,7 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
         ) : (
           <div className="prose-ai">
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-              {msg.content}
+              {stripInternalTags(msg.content)}
             </ReactMarkdown>
           </div>
         )}
@@ -460,7 +475,7 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
         {content ? (
           <div className="prose-ai">
             <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-              {content}
+              {stripInternalTags(content, true)}
             </ReactMarkdown>
           </div>
         ) : null}
@@ -600,6 +615,8 @@ export function ChatPanel() {
   const [thinkingText, setThinkingText] = useState('')
   const [isThinking, setIsThinking] = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
+  const [availableModels, setAvailableModels] = useState<{id: string; name: string; role: string; description?: string}[]>([])
+  const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -663,10 +680,25 @@ export function ChatPanel() {
     return () => window.removeEventListener('keydown', handler)
   }, [isStreaming])
 
+  // Load available models for inline model picker
+  useEffect(() => {
+    api.settings.getModels().then((d: any) => setAvailableModels(d.models || [])).catch(() => {})
+  }, [])
+
   const stopStream = () => {
     setIsStreaming(false)
     setStreamingMessage('')
     setStreamProgress('')
+  }
+
+  const handleModelChange = async (modelId: string) => {
+    if (!settings) return
+    setModelPickerOpen(false)
+    try {
+      await api.settings.update({ ...settings, architect_model: modelId })
+      const updated = await api.settings.get()
+      setSettings(updated)
+    } catch { toast.error('Failed to update model') }
   }
 
   const newChat = async () => {
@@ -1143,16 +1175,34 @@ export function ChatPanel() {
               {activeSessions.slice(0, 8)}
             </button>
           )}
-          <span className="text-[11px] text-muted/70">{(() => {
-            const m = settings?.architect_model || 'gpt-4.1'
-            if (m.includes('claude-opus')) return 'Claude Opus'
-            if (m.includes('claude-sonnet')) return 'Claude Sonnet'
-            if (m.includes('claude-haiku')) return 'Claude Haiku'
-            if (m.includes('gpt-4.1')) return 'GPT-4.1'
-            if (m.includes('gpt-5') || m.includes('gpt5')) return 'GPT-5'
-            if (m.startsWith('o3') || m.startsWith('o4')) return m.toUpperCase()
-            return m
-          })()}</span>
+          {/* Inline model picker */}
+          <div className="relative">
+            <button
+              onClick={() => setModelPickerOpen(v => !v)}
+              className="text-[11px] font-mono text-muted/70 hover:text-accent bg-overlay/40 hover:bg-overlay px-1.5 py-0.5 rounded transition-colors leading-none flex items-center gap-1"
+              title="Change model"
+            >
+              {settings?.architect_model || 'gpt-4.1'}
+              <span className="text-[9px]">▾</span>
+            </button>
+            {modelPickerOpen && (
+              <>
+                <div className="fixed inset-0 z-40" onClick={() => setModelPickerOpen(false)} />
+                <div className="absolute right-0 top-full mt-1 z-50 bg-surface border border-border rounded-lg shadow-xl py-1 min-w-[220px] max-h-[300px] overflow-y-auto">
+                  {availableModels.filter(m => m.role === 'architect').map(m => (
+                    <button
+                      key={m.id}
+                      onClick={() => handleModelChange(m.id)}
+                      className={`w-full text-left px-3 py-1.5 text-[12px] hover:bg-overlay transition-colors ${settings?.architect_model === m.id ? 'text-accent font-medium' : 'text-ink'}`}
+                    >
+                      <div className="font-mono">{m.id}</div>
+                      {m.description && <div className="text-[10px] text-muted/70 mt-0.5 truncate">{m.description}</div>}
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
           <button onClick={() => fileInputRef.current?.click()} className="p-1.5 rounded-lg hover:bg-overlay text-muted hover:text-ink transition-colors" title="Upload files">
             <AttachFile sx={{ fontSize: 13 }} />
           </button>
