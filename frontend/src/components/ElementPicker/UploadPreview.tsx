@@ -137,7 +137,6 @@ export function UploadPreview() {
                 filename={filename}
                 sessionId={activeSessions || ''}
                 fileId={activeFileId || ''}
-                pickMode={pickMode}
               />
             </div>
           ) : (

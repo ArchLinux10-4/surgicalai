@@ -1294,7 +1294,7 @@ export function ChatPanel() {
     progressHistoryRef.current = ['Thinking...']
 
     // Prepend element picker context if any elements are selected
-    const elementContext = useElementPickerStore.getState().formattedContext()
+    const elementContext = useElementPickerStore.getState().getFormattedContext()
     const finalText = elementContext ? `${elementContext}\n\n${text}` : text
 
     doStream(sessionId, finalText, isFirstMessage, autoNameSession)

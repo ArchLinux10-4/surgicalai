@@ -843,7 +843,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 filename={filename}
                 sessionId={sessionId}
                 fileId={fileData.file_id}
-                pickMode={true}
               />
               <ElementPickerToolbar />
             </>
