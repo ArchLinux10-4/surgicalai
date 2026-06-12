@@ -656,6 +656,9 @@ export function ChatPanel() {
   const [injectionQueued, setInjectionQueued] = useState(false)
   const pendingInjectionRef = useRef<string>('')
   const sentMessageRef = useRef<string>('')
+  // v1.4: holds the planned run while the planning stream closes, so the
+  // per-task execution queue can start once /smart-stream returns.
+  const pendingRunRef = useRef<{ runId: string; tasks: any[] } | null>(null)
   const [restartSignal, setRestartSignal] = useState<{ msg: string; sid: string } | null>(null)
 
   // Scroll to bottom on new messages
@@ -734,6 +737,77 @@ export function ChatPanel() {
     let accumulated = ''
     let gotResult = false
 
+    // ── v1.4 per-task execution ───────────────────────────────────────────
+    // /smart-stream now ends right after planning. We then run each task in
+    // its own short-lived SSE stream, sequentially, so no single connection
+    // can hit the proxy/process timeout that previously killed long runs.
+    const addTaskResultCard = (result: any) => {
+      const naturalText = (result.natural_text || '')
+        .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
+        .replace(/<new_file>[\s\S]*$/, '')
+        .trim()
+      addMessage({
+        id: Date.now().toString() + '_task_' + Math.random().toString(36).slice(2, 7),
+        session_id: sessionId,
+        role: 'assistant',
+        message_type: naturalText ? 'natural_result' : 'surgical_result',
+        surgical_data: JSON.stringify(result),
+        content: naturalText,
+        created_at: new Date().toISOString(),
+      })
+      api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
+    }
+
+    const handleTaskEvent = (event: any) => {
+      switch (event.type) {
+        case 'task_start':
+          updateAgentTask(event.id, { status: 'running', progress: undefined }); break
+        case 'task_progress':
+          updateAgentTask(event.id, { progress: event.content }); break
+        case 'task_done':
+          updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict }); break
+        case 'task_blocked':
+          updateAgentTask(event.id, { status: 'blocked', qa_score: event.qa_score, verdict: event.verdict }); break
+        case 'task_cancelled':
+          updateAgentTask(event.id, { status: 'cancelled' }); break
+        case 'tasks_complete':
+          setAgentPhase('complete'); break
+      }
+    }
+
+    const finishTaskRun = () => {
+      setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
+      setIsBuildingEdit(false)
+      setAgentPhase('complete')
+      if (isFirst) autoRename()
+      else api.chat.getSessions().then(setSessions).catch(() => {})
+      api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
+    }
+
+    const runTaskQueue = (sid: string, runId: string, tasks: any[]) => {
+      let idx = 0
+      const runNext = () => {
+        if (useAppStore.getState().activeSessions !== sid || idx >= tasks.length) {
+          finishTaskRun(); return
+        }
+        const t = tasks[idx++]
+        const ctrl = api.stream.executeTask(
+          { session_id: sid, run_id: runId, task_id: t.id },
+          (progress) => { if (useAppStore.getState().activeSessions === sid) setStreamProgress(progress) },
+          (result) => addTaskResultCard(result),
+          () => {},  // per-task stream closed; queue advances on task_done
+          (err) => { setError(err); finishTaskRun() },
+          (event) => {
+            handleTaskEvent(event)
+            if (event.type === 'task_done') runNext()
+            else if (event.type === 'task_blocked' || event.type === 'task_cancelled') finishTaskRun()
+          },
+        )
+        abortRef.current = ctrl
+      }
+      runNext()
+    }
+
     const ctrl = api.stream.smart(
       { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id) },
       (progress) => {
@@ -791,6 +865,15 @@ export function ChatPanel() {
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
       (fullText) => {
+        // Planning stream closed — if a task run was planned, start executing
+        // tasks one at a time (each in its own SSE stream) instead of the
+        // single-pass teardown below.
+        if (pendingRunRef.current) {
+          const run = pendingRunRef.current
+          pendingRunRef.current = null
+          runTaskQueue(sessionId, run.runId, run.tasks)
+          return
+        }
         if (gotResult) return
         const _thinking = thinkingTextRef.current
         const _steps = [...progressHistoryRef.current]
@@ -891,6 +974,8 @@ export function ChatPanel() {
               status: t.status || 'pending', qa_score: null, verdict: null,
               run_id: event.run_id,
             })))
+            // Stash the plan; the queue starts once the planning stream closes.
+            pendingRunRef.current = { runId: event.run_id, tasks: event.tasks || [] }
             break
           case 'task_start':
             updateAgentTask(event.id, { status: 'running', progress: undefined })

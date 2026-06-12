@@ -249,6 +249,70 @@ export const api = {
       return controller
     },
 
+    // v1.4: execute one planned task in its own short-lived SSE stream.
+    // The client calls this once per task, in sequence, after /smart-stream
+    // returns the plan. Routes task lifecycle events to the same UI handlers.
+    executeTask: (
+      data: { session_id: string; run_id: string; task_id: string },
+      onProgress: (msg: string) => void,
+      onResult: (result: any) => void,
+      onDone: () => void,
+      onError: (err: string) => void,
+      onTask: (event: any) => void,
+    ): AbortController => {
+      const controller = new AbortController()
+      let doneCalled = false
+      const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone() } }
+
+      fetch(`${BASE}/chat/execute-task`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify(data),
+        signal: controller.signal,
+      }).then(async res => {
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }))
+          onError(err.detail || `HTTP ${res.status}`)
+          fireDone()
+          return
+        }
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+        let lineBuffer = ''
+
+        const processLine = (line: string) => {
+          if (!line.startsWith('data: ')) return
+          try {
+            const chunk = JSON.parse(line.slice(6))
+            if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
+            else if (chunk.type === 'done') fireDone()
+            else if (chunk.type === 'error') onError(chunk.content)
+            else if (
+              chunk.type === 'task_start' || chunk.type === 'task_progress' ||
+              chunk.type === 'task_done' || chunk.type === 'task_blocked' ||
+              chunk.type === 'task_cancelled' || chunk.type === 'tasks_complete'
+            ) {
+              if (chunk.type === 'task_progress') onProgress(chunk.content)
+              onTask(chunk)
+            }
+          } catch {}
+        }
+
+        const pump = () => reader.read().then(({ done, value }) => {
+          if (done) { fireDone(); return }
+          lineBuffer += decoder.decode(value, { stream: true })
+          const parts = lineBuffer.split('\n')
+          lineBuffer = parts.pop() ?? ''
+          for (const line of parts) processLine(line.trimEnd())
+          pump()
+        }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
+
+        pump()
+      }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
+
+      return controller
+    },
+
     surgical: (data: any, onProgress: (msg: string) => void, onResult: (result: any) => void, onError: (err: string) => void): AbortController => {
       const controller = new AbortController()
 

@@ -685,64 +685,6 @@ async def smart_stream(req: dict, request: Request):
 
             _planned = _plan.get("tasks", []) or []
             if len(_planned) >= 2:
-                # ---- helpers (closure over session_id) ----
-                _VERDICT_ORDER = {"safe": 0, "skipped": 0, "verified_safe": 0, "warning": 1, "blocked": 2}
-
-                def _eval_result(parsed):
-                    scores, worst = [], "safe"
-                    for _fd in (parsed or {}).get("changes_by_file", {}).values():
-                        for _ch in (_fd.get("changes", []) if isinstance(_fd, dict) else []):
-                            _qr = _ch.get("qa_result") or {}
-                            _s = _qr.get("qa_score")
-                            if isinstance(_s, (int, float)):
-                                scores.append(int(_s))
-                            _v = _qr.get("verdict", "")
-                            if _VERDICT_ORDER.get(_v, 0) > _VERDICT_ORDER.get(worst, 0):
-                                worst = _v
-                    return (min(scores) if scores else None, worst)
-
-                def _save_task_message(natural_text, parsed):
-                    db = get_db()
-                    rid = str(uuid.uuid4())
-                    if parsed:
-                        qa_warnings = []
-                        for _fd in parsed.get("changes_by_file", {}).values():
-                            for _ch in (_fd.get("changes", []) if isinstance(_fd, dict) else []):
-                                _qr = _ch.get("qa_result") or {}
-                                _vd = _qr.get("verdict", "")
-                                _sm = (_qr.get("summary") or "").strip()
-                                _sc = _qr.get("qa_score")
-                                if _vd in ("warning", "blocked") and _sm:
-                                    _ic = "⚠️" if _vd == "warning" else "🚫"
-                                    _sy = (_ch.get("symbol") or {})
-                                    _nm = _sy.get("name") or _sy.get("full_path", "change")
-                                    qa_warnings.append(f"{_ic} **{_nm}** (QA {_sc}/10): {_sm}")
-                        _txt = natural_text
-                        if qa_warnings:
-                            _txt = (_txt + ("\n\n" if _txt else "") + "**QA Notes:**\n"
-                                    + "\n".join(f"- {w}" for w in qa_warnings))
-                        saved = "__NATURAL_AND_RESULT__:" + _json.dumps({"text": _txt, "result": parsed})
-                    else:
-                        saved = natural_text
-                    db.execute(
-                        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                        (rid, session_id, "assistant", saved),
-                    )
-                    db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
-                    db.commit()
-                    db.close()
-
-                def _save_note(text):
-                    db = get_db()
-                    rid = str(uuid.uuid4())
-                    db.execute(
-                        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                        (rid, session_id, "assistant", text),
-                    )
-                    db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
-                    db.commit()
-                    db.close()
-
                 run_id = str(uuid.uuid4())
                 tasks = create_tasks(session_id, run_id, _planned)
                 _dlog("sse_tasks_created", session_id=session_id, user_id=current_user_id,
@@ -759,126 +701,15 @@ async def smart_stream(req: dict, request: Request):
                     ],
                 })
 
-                completed, blocked_task, cancelled = 0, None, False
-                total = len(tasks)
-
-                for _task_idx, t in enumerate(tasks):
-                    if cancel_requested_for_run(session_id, run_id):
-                        cancelled = True
-                        break
-                    _phase = f"task:{_task_idx+1}/{total}:{t['id'][:8]}"
-                    _task_t0 = time.time()
-                    _dlog("sse_task_start", session_id=session_id, user_id=current_user_id,
-                          task_id=t["id"], task_seq=_task_idx+1, task_total=total,
-                          title=t["title"][:80], elapsed_s=round(time.time() - _stream_t0, 1))
-                    update_task(t["id"], status="running")
-                    yield _sse({"type": "task_start", "id": t["id"]})
-
-                    collected, result_content, poll, aborted = [], None, 0, False
-                    async for chunk in _with_heartbeat(run_natural_pipeline_stream(
-                        session_files=session_files,
-                        user_request=t["detail"],
-                        conversation_history=conversation_history,
-                        session_id=session_id,
-                        project_memory=project_memory,
-                        session_summary=current_summary,
-                        user_id=current_user_id,
-                    )):
-                        poll += 1
-                        if poll % 20 == 0 and cancel_requested_for_run(session_id, run_id):
-                            aborted = True
-                            break
-                        if chunk.startswith(": "):
-                            yield chunk  # forward SSE keepalive comment to client
-                            continue
-                        if chunk.startswith("data: "):
-                            try:
-                                _d = _json.loads(chunk[6:])
-                                _ct = _d.get("type", "")
-                                if _ct in ("token", "chat"):
-                                    collected.append(_d.get("content", ""))
-                                elif _ct == "smart_result":
-                                    result_content = _d.get("content", "")
-                                elif _ct == "progress":
-                                    yield _sse({"type": "task_progress", "id": t["id"], "content": _d.get("content", "")})
-                                elif _ct == "error":
-                                    yield _sse({"type": "task_progress", "id": t["id"], "content": "⚠️ " + _d.get("content", "")})
-                            except Exception:
-                                pass
-
-                    if aborted:
-                        _dlog("sse_task_done", session_id=session_id, user_id=current_user_id,
-                              task_id=t["id"], task_seq=_task_idx+1, status="cancelled",
-                              duration_s=round(time.time() - _task_t0, 1))
-                        update_task(t["id"], status="cancelled")
-                        yield _sse({"type": "task_cancelled", "id": t["id"]})
-                        cancelled = True
-                        break
-
-                    natural_text = "".join(collected).strip()
-                    parsed = None
-                    if result_content:
-                        try:
-                            parsed = _json.loads(result_content)
-                        except Exception:
-                            parsed = None
-                    score, worst = _eval_result(parsed) if parsed else (None, "safe")
-                    _save_task_message(natural_text, parsed)
-
-                    # Non-code ("answer") tasks edit nothing, so they skip the
-                    # 8/10 QA gate entirely and report a "skipped" verdict.
-                    _is_answer = t.get("kind") == "answer"
-                    if parsed and worst == "blocked" and not _is_answer:
-                        _dlog("sse_task_done", session_id=session_id, user_id=current_user_id,
-                              task_id=t["id"], task_seq=_task_idx+1, status="blocked",
-                              qa_score=score, duration_s=round(time.time() - _task_t0, 1))
-                        update_task(t["id"], status="blocked", qa_score=score,
-                                    verdict=worst, result_summary=natural_text[:500])
-                        yield _sse({"type": "task_blocked", "id": t["id"], "qa_score": score, "verdict": worst})
-                        blocked_task = t
-                        break
-                    else:
-                        _verdict = "skipped" if _is_answer else (worst or "safe")
-                        _score = None if _is_answer else score
-                        _dlog("sse_task_done", session_id=session_id, user_id=current_user_id,
-                              task_id=t["id"], task_seq=_task_idx+1, status="done",
-                              qa_score=_score, verdict=_verdict,
-                              duration_s=round(time.time() - _task_t0, 1))
-                        update_task(t["id"], status="done", qa_score=_score,
-                                    verdict=_verdict, result_summary=natural_text[:500])
-                        # Emit the diff result so the frontend renders the code card.
-                        # Without this the result is saved to DB but never shown in chat.
-                        if parsed and not _is_answer:
-                            _result_payload = dict(parsed)
-                            _result_payload["natural_text"] = natural_text
-                            yield _sse({"type": "smart_result", "content": _json.dumps(_result_payload)})
-                        yield _sse({"type": "task_done", "id": t["id"], "qa_score": _score, "verdict": _verdict})
-                        completed += 1
-
-                if cancelled:
-                    mark_pending_cancelled(session_id, run_id)
-                    note = f"⛔ Task run cancelled. Completed {completed} of {total} task(s); the remaining were cancelled."
-                    _save_note(note)
-                    yield _sse({"type": "tasks_complete", "status": "cancelled",
-                                "completed": completed, "total": total, "summary": note})
-                elif blocked_task is not None:
-                    mark_pending_cancelled(session_id, run_id)
-                    note = (f"🚫 Task run paused. Completed {completed} of {total}. "
-                            f"Task “{blocked_task['title']}” did not pass the 8/10 QA gate, "
-                            f"so the remaining tasks were halted for your review.")
-                    _save_note(note)
-                    yield _sse({"type": "tasks_complete", "status": "blocked",
-                                "completed": completed, "total": total, "summary": note})
-                else:
-                    note = f"✅ Completed all {total} task(s)."
-                    _save_note(note)
-                    yield _sse({"type": "tasks_complete", "status": "done",
-                                "completed": completed, "total": total, "summary": note})
-
-                _phase = "done"
+                # Tasks are persisted. Execution is delegated to per-task SSE
+                # streams (POST /chat/execute-task), driven by the client one
+                # task at a time. Each task runs in its own short-lived
+                # connection, so no single stream can approach the proxy /
+                # process timeout that previously killed long multi-task runs.
+                _phase = "tasks_planned"
                 _dlog("sse_stream_done", session_id=session_id, user_id=current_user_id,
-                      path="task_branch", total_duration_s=round(time.time() - _stream_t0, 1),
-                      completed=completed, total=total)
+                      path="task_plan", total_duration_s=round(time.time() - _stream_t0, 1),
+                      task_count=len(tasks))
                 yield _sse({"type": "done"})
                 return
         # ── End agentic task branch ───────────────────────────────────────
@@ -992,6 +823,302 @@ async def smart_stream(req: dict, request: Request):
                     print(f"[STREAM] Safety-net save failed: {_fallback_err}")
 
     return StreamingResponse(stream_and_save(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+    })
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Per-task execution (v1.4)
+#
+# Task planning/creation happens in /smart-stream, which now ends right after
+# persisting the plan. The client then calls /execute-task once per task, in
+# sequence. Each task runs in its own short-lived SSE stream, so no single
+# connection approaches the proxy/process time limit that previously killed
+# long multi-task runs (a task dying now costs one task, not the whole run).
+# ──────────────────────────────────────────────────────────────────────────
+
+_VERDICT_ORDER = {"safe": 0, "skipped": 0, "verified_safe": 0, "warning": 1, "blocked": 2}
+
+
+def _eval_task_result(parsed):
+    """Return (min_qa_score, worst_verdict) across all changes in a result."""
+    scores, worst = [], "safe"
+    for _fd in (parsed or {}).get("changes_by_file", {}).values():
+        for _ch in (_fd.get("changes", []) if isinstance(_fd, dict) else []):
+            _qr = _ch.get("qa_result") or {}
+            _s = _qr.get("qa_score")
+            if isinstance(_s, (int, float)):
+                scores.append(int(_s))
+            _v = _qr.get("verdict", "")
+            if _VERDICT_ORDER.get(_v, 0) > _VERDICT_ORDER.get(worst, 0):
+                worst = _v
+    return (min(scores) if scores else None, worst)
+
+
+def _save_task_message(session_id, natural_text, parsed):
+    """Persist a task's assistant message (natural text + optional diff result)."""
+    db = get_db()
+    rid = str(uuid.uuid4())
+    if parsed:
+        qa_warnings = []
+        for _fd in parsed.get("changes_by_file", {}).values():
+            for _ch in (_fd.get("changes", []) if isinstance(_fd, dict) else []):
+                _qr = _ch.get("qa_result") or {}
+                _vd = _qr.get("verdict", "")
+                _sm = (_qr.get("summary") or "").strip()
+                _sc = _qr.get("qa_score")
+                if _vd in ("warning", "blocked") and _sm:
+                    _ic = "⚠️" if _vd == "warning" else "🚫"
+                    _sy = (_ch.get("symbol") or {})
+                    _nm = _sy.get("name") or _sy.get("full_path", "change")
+                    qa_warnings.append(f"{_ic} **{_nm}** (QA {_sc}/10): {_sm}")
+        _txt = natural_text
+        if qa_warnings:
+            _txt = (_txt + ("\n\n" if _txt else "") + "**QA Notes:**\n"
+                    + "\n".join(f"- {w}" for w in qa_warnings))
+        saved = "__NATURAL_AND_RESULT__:" + json.dumps({"text": _txt, "result": parsed})
+    else:
+        saved = natural_text
+    db.execute(
+        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+        (rid, session_id, "assistant", saved),
+    )
+    db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
+    db.commit()
+    db.close()
+
+
+def _save_run_note(session_id, text):
+    """Persist a plain assistant note (run summary lines)."""
+    db = get_db()
+    rid = str(uuid.uuid4())
+    db.execute(
+        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+        (rid, session_id, "assistant", text),
+    )
+    db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
+    db.commit()
+    db.close()
+
+
+def _run_counts(session_id, run_id):
+    from services.task_planner import list_tasks
+    tasks = list_tasks(session_id, run_id)
+    return {
+        "completed": sum(1 for t in tasks if t.get("status") == "done"),
+        "total": len(tasks),
+    }
+
+
+def _run_summary_note(session_id, run_id, status, blocked_title=None):
+    c = _run_counts(session_id, run_id)
+    completed, total = c["completed"], c["total"]
+    if status == "cancelled":
+        return (f"⛔ Task run cancelled. Completed {completed} of {total} task(s); "
+                f"the remaining were cancelled.")
+    if status == "blocked":
+        return (f"🚫 Task run paused. Completed {completed} of {total}. "
+                f"Task “{blocked_title}” did not pass the 8/10 QA gate, "
+                f"so the remaining tasks were halted for your review.")
+    return f"✅ Completed all {total} task(s)."
+
+
+@router.post("/execute-task")
+async def execute_task(req: dict, request: Request):
+    """
+    Execute a single planned task in its own short-lived SSE stream.
+
+    Body: { session_id, run_id, task_id }
+    Emits the same task lifecycle events the old in-stream loop did
+    (task_start / task_progress / smart_result / task_done | task_blocked |
+    task_cancelled), plus tasks_complete when the run reaches a terminal state.
+    """
+    from fastapi.responses import StreamingResponse
+    from services.pipeline import run_natural_pipeline_stream
+    from services.task_planner import (
+        update_task, list_tasks, cancel_requested_for_run, mark_pending_cancelled,
+    )
+
+    session_id = req.get("session_id")
+    run_id = req.get("run_id")
+    task_id = req.get("task_id")
+    current_user_id = getattr(request.state, "user_id", "") or ""
+
+    # Load fresh session state. Reloading per task means each task sees edits
+    # and the compacted summary persisted by prior tasks in the run.
+    conn = get_db()
+    sess_row = conn.execute(
+        "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
+    history = conn.execute(
+        "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 ORDER BY created_at ASC",
+        (session_id,)
+    ).fetchall()
+    conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
+    file_rows = conn.execute(
+        "SELECT id, filename, content, language, lines, symbol_count, file_type FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
+        (session_id,)
+    ).fetchall()
+    session_files = [dict(r) for r in file_rows]
+    project_memory = _load_effective_memory(conn, session_id)
+    conn.close()
+
+    async def stream_one_task():
+        _t0 = time.time()
+
+        def _sse(obj):
+            return "data: " + json.dumps(obj) + "\n\n"
+
+        all_tasks = list_tasks(session_id, run_id)
+        task = next((t for t in all_tasks if t["id"] == task_id), None)
+        total = len(all_tasks)
+
+        if task is None:
+            _dlog("sse_exec_task_missing", session_id=session_id, user_id=current_user_id,
+                  task_id=task_id, run_id=run_id)
+            yield _sse({"type": "error", "content": "Task not found."})
+            yield _sse({"type": "done"})
+            return
+
+        seq = task.get("seq", 0)
+        _phase = f"exec_task:{seq+1}/{total}:{str(task_id)[:8]}"
+
+        # Cancellation requested before this task ran → stop the whole run.
+        if cancel_requested_for_run(session_id, run_id) or task.get("status") == "cancelled":
+            update_task(task_id, status="cancelled")
+            mark_pending_cancelled(session_id, run_id)
+            _dlog("sse_exec_task_done", session_id=session_id, user_id=current_user_id,
+                  task_id=task_id, task_seq=seq+1, status="cancelled",
+                  duration_s=round(time.time() - _t0, 1))
+            yield _sse({"type": "task_cancelled", "id": task_id})
+            note = _run_summary_note(session_id, run_id, status="cancelled")
+            _save_run_note(session_id, note)
+            yield _sse({"type": "tasks_complete", "status": "cancelled",
+                        **_run_counts(session_id, run_id), "summary": note})
+            yield _sse({"type": "done"})
+            return
+
+        _dlog("sse_exec_task_start", session_id=session_id, user_id=current_user_id,
+              task_id=task_id, task_seq=seq+1, task_total=total, title=task["title"][:80])
+        update_task(task_id, status="running")
+        yield _sse({"type": "task_start", "id": task_id})
+
+        collected, result_content, poll, aborted = [], None, 0, False
+        try:
+            async for chunk in _with_heartbeat(run_natural_pipeline_stream(
+                session_files=session_files,
+                user_request=task["detail"],
+                conversation_history=conversation_history,
+                session_id=session_id,
+                project_memory=project_memory,
+                session_summary=session_summary,
+                user_id=current_user_id,
+            )):
+                poll += 1
+                if poll % 20 == 0 and cancel_requested_for_run(session_id, run_id):
+                    aborted = True
+                    break
+                if chunk.startswith(": "):
+                    yield chunk  # forward keepalive comment to client
+                    continue
+                if chunk.startswith("data: "):
+                    try:
+                        _d = json.loads(chunk[6:])
+                        _ct = _d.get("type", "")
+                        if _ct in ("token", "chat"):
+                            collected.append(_d.get("content", ""))
+                        elif _ct == "smart_result":
+                            result_content = _d.get("content", "")
+                        elif _ct == "progress":
+                            yield _sse({"type": "task_progress", "id": task_id, "content": _d.get("content", "")})
+                        elif _ct == "error":
+                            yield _sse({"type": "task_progress", "id": task_id, "content": "⚠️ " + _d.get("content", "")})
+                    except Exception:
+                        pass
+        except Exception as _ee:
+            _dlog("sse_exec_task_error", session_id=session_id, user_id=current_user_id,
+                  task_id=task_id, task_seq=seq+1, phase=_phase,
+                  duration_s=round(time.time() - _t0, 1), error=str(_ee))
+            update_task(task_id, status="blocked", verdict="error",
+                        result_summary=("".join(collected))[:500])
+            mark_pending_cancelled(session_id, run_id)
+            yield _sse({"type": "task_blocked", "id": task_id, "qa_score": None, "verdict": "error"})
+            note = _run_summary_note(session_id, run_id, status="blocked", blocked_title=task["title"])
+            _save_run_note(session_id, note)
+            yield _sse({"type": "tasks_complete", "status": "blocked",
+                        **_run_counts(session_id, run_id), "summary": note})
+            yield _sse({"type": "done"})
+            return
+
+        if aborted:
+            update_task(task_id, status="cancelled")
+            mark_pending_cancelled(session_id, run_id)
+            _dlog("sse_exec_task_done", session_id=session_id, user_id=current_user_id,
+                  task_id=task_id, task_seq=seq+1, status="cancelled",
+                  duration_s=round(time.time() - _t0, 1))
+            yield _sse({"type": "task_cancelled", "id": task_id})
+            note = _run_summary_note(session_id, run_id, status="cancelled")
+            _save_run_note(session_id, note)
+            yield _sse({"type": "tasks_complete", "status": "cancelled",
+                        **_run_counts(session_id, run_id), "summary": note})
+            yield _sse({"type": "done"})
+            return
+
+        natural_text = "".join(collected).strip()
+        parsed = None
+        if result_content:
+            try:
+                parsed = json.loads(result_content)
+            except Exception:
+                parsed = None
+        score, worst = _eval_task_result(parsed) if parsed else (None, "safe")
+        _save_task_message(session_id, natural_text, parsed)
+
+        # Non-code ("answer") tasks edit nothing → skip the 8/10 QA gate.
+        _is_answer = task.get("kind") == "answer"
+        if parsed and worst == "blocked" and not _is_answer:
+            update_task(task_id, status="blocked", qa_score=score,
+                        verdict=worst, result_summary=natural_text[:500])
+            mark_pending_cancelled(session_id, run_id)
+            _dlog("sse_exec_task_done", session_id=session_id, user_id=current_user_id,
+                  task_id=task_id, task_seq=seq+1, status="blocked",
+                  qa_score=score, duration_s=round(time.time() - _t0, 1))
+            yield _sse({"type": "task_blocked", "id": task_id, "qa_score": score, "verdict": worst})
+            note = _run_summary_note(session_id, run_id, status="blocked", blocked_title=task["title"])
+            _save_run_note(session_id, note)
+            yield _sse({"type": "tasks_complete", "status": "blocked",
+                        **_run_counts(session_id, run_id), "summary": note})
+            yield _sse({"type": "done"})
+            return
+
+        _verdict = "skipped" if _is_answer else (worst or "safe")
+        _score = None if _is_answer else score
+        update_task(task_id, status="done", qa_score=_score,
+                    verdict=_verdict, result_summary=natural_text[:500])
+        _dlog("sse_exec_task_done", session_id=session_id, user_id=current_user_id,
+              task_id=task_id, task_seq=seq+1, status="done",
+              qa_score=_score, verdict=_verdict, duration_s=round(time.time() - _t0, 1))
+        if parsed and not _is_answer:
+            _rp = dict(parsed)
+            _rp["natural_text"] = natural_text
+            yield _sse({"type": "smart_result", "content": json.dumps(_rp)})
+        yield _sse({"type": "task_done", "id": task_id, "qa_score": _score, "verdict": _verdict})
+
+        # Run is complete once no pending tasks remain.
+        remaining = [t for t in list_tasks(session_id, run_id) if t.get("status") == "pending"]
+        if not remaining:
+            note = _run_summary_note(session_id, run_id, status="done")
+            _save_run_note(session_id, note)
+            yield _sse({"type": "tasks_complete", "status": "done",
+                        **_run_counts(session_id, run_id), "summary": note})
+
+        _dlog("sse_exec_stream_done", session_id=session_id, user_id=current_user_id,
+              task_id=task_id, task_seq=seq+1, duration_s=round(time.time() - _t0, 1))
+        yield _sse({"type": "done"})
+
+    return StreamingResponse(stream_one_task(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
     })
