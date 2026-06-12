@@ -684,7 +684,13 @@ async def smart_stream(req: dict, request: Request):
                 _plan = {"tasks": []}
 
             _planned = _plan.get("tasks", []) or []
-            if len(_planned) >= 2:
+            # User explicitly said "create tasks" — always honour that.
+            # The >= 2 guard only matters for auto-detection (currently unused).
+            # When only 1 task, pass the original user message as the detail
+            # so the agent gets the full request, not a lossy planner summary.
+            if len(_planned) == 1:
+                _planned[0]["detail"] = message
+            if len(_planned) >= 1:
                 run_id = str(uuid.uuid4())
                 tasks = create_tasks(session_id, run_id, _planned)
                 _dlog("sse_tasks_created", session_id=session_id, user_id=current_user_id,
