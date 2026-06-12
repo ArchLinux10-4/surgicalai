@@ -90,6 +90,9 @@ Rules:
 - Prefer 2–8 tasks. Never exceed 12. If the request is genuinely a single step, return exactly one task.
 - "title" = short imperative label (max ~8 words). "detail" = a clear, standalone instruction the agent will receive as its prompt for that task (describe the goal/outcome, no line numbers).
 - "kind" = "code" if the task edits/creates code or files; "answer" if it only researches, explains, summarizes, or plans with no file changes. When unsure, use "code".
+- NEVER split edits to the same file across multiple tasks. All changes to one file belong in one task.
+- NEVER split work on the same function, class, or symbol across tasks. Rewriting one function is one task, not many.
+- Fewer tasks is better. If the whole request touches 1–2 files, prefer 1–2 tasks. Only create many tasks for genuinely independent pieces of work across different files.
 - Do NOT include meta tasks like "review" or "test" unless the user explicitly asked for them.
 
 Respond with ONLY a JSON object, no prose, in exactly this shape:
