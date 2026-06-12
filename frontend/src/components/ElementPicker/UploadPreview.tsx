@@ -32,10 +32,11 @@ export function UploadPreview() {
   const pickMode = useElementPickerStore(s => s.pickMode)
   const setPickMode = useElementPickerStore(s => s.setPickMode)
 
-  // Auto-select first visual file when one appears
+  // Auto-expand + select first visual file when one appears
   useEffect(() => {
     if (visualFiles.length > 0 && !activeFileId) {
       setActiveFileId(visualFiles[0].id)
+      setExpanded(true)  // auto-open preview when visual files uploaded
     }
     // Clear if the active file was removed
     if (activeFileId && !visualFiles.find(f => f.id === activeFileId)) {
@@ -46,24 +47,34 @@ export function UploadPreview() {
   // Fetch file content when active file changes
   useEffect(() => {
     if (!activeFileId || !activeSessions) {
+      console.log('[UploadPreview] no activeFileId or activeSessions', { activeFileId, activeSessions })
       setFileContent('')
       return
     }
 
     const file = visualFiles.find(f => f.id === activeFileId)
+    console.log('[UploadPreview] active file:', file?.filename, 'id:', activeFileId, 'has content:', !!file?.content)
     if (!file) return
 
     // Use local content if available (sidebar upload path)
     if (file.content) {
+      console.log('[UploadPreview] using local content, length:', file.content.length)
       setFileContent(file.content)
       return
     }
 
-    // Otherwise fetch from API
+    // Otherwise fetch from API (upload response doesn't include content)
+    console.log('[UploadPreview] fetching content from API...')
     setLoading(true)
     api.sessionFiles.get(activeSessions, activeFileId)
-      .then((f: any) => setFileContent(f.content || ''))
-      .catch(() => setFileContent(''))
+      .then((f: any) => {
+        console.log('[UploadPreview] fetched content, length:', f?.content?.length || 0)
+        setFileContent(f.content || '')
+      })
+      .catch((err: any) => {
+        console.error('[UploadPreview] fetch failed:', err)
+        setFileContent('')
+      })
       .finally(() => setLoading(false))
   }, [activeFileId, activeSessions]) // eslint-disable-line react-hooks/exhaustive-deps
 
