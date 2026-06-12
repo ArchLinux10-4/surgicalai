@@ -610,6 +610,24 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       .catch(() => {})
   }, [sessionId]) // eslint-disable-line react-hooks/exhaustive-deps
 
+
+  // Re-sync applied state when Apply All fires from ChatPanel
+  useEffect(() => {
+    const refresh = () => {
+      if (!sessionId) return
+      api.surgical.getApplied(sessionId)
+        .then(({ applied_ids }) => {
+          const fromDB: Record<string, boolean> = {}
+          for (const id of applied_ids) {
+            if (changeIds.includes(id)) fromDB[id] = true
+          }
+          if (Object.keys(fromDB).length > 0) setApplied(prev => ({ ...fromDB, ...prev }))
+        })
+        .catch(() => {})
+    }
+    window.addEventListener('sai-applied-refresh', refresh)
+    return () => window.removeEventListener('sai-applied-refresh', refresh)
+  }, [sessionId]) // eslint-disable-line react-hooks/exhaustive-deps
   const langFromFilename = getLangFromFilename(filename)
 
   if (realChanges.length === 0) return null

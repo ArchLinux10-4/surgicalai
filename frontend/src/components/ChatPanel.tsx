@@ -104,6 +104,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
 
       if (failed === 0) {
         toast.success(`Applied all changes across ${appliedFiles} file${appliedFiles !== 1 ? 's' : ''}`)
+        window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
         setDone(true)
       } else {
         toast.error(`Applied ${appliedFiles} file(s) — ${failed} failed`)
