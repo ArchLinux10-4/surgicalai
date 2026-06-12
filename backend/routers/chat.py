@@ -684,6 +684,15 @@ async def smart_stream(req: dict, request: Request):
                 _plan = {"tasks": []}
 
             _planned = _plan.get("tasks", []) or []
+
+            # ── Post-plan merge: collapse tasks that target the same file ──
+            from services.plan_validator import validate_and_merge
+            _pre_merge = len(_planned)
+            _planned = validate_and_merge(_planned)
+            if len(_planned) != _pre_merge:
+                _dlog("plan_merged", session_id=session_id,
+                      before=_pre_merge, after=len(_planned))
+
             # User explicitly said "create tasks" — always honour that.
             # The >= 2 guard only matters for auto-detection (currently unused).
             # When only 1 task, pass the original user message as the detail
