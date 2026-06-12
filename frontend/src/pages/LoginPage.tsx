@@ -96,18 +96,22 @@ function TypingText({ text, delay = 0 }: { text: string; delay?: number }) {
   const [shown, setShown] = useState('');
   useEffect(() => {
     let i = 0;
+    let interval: ReturnType<typeof setInterval> | null = null;
     const timeout = setTimeout(() => {
-      const interval = setInterval(() => {
+      interval = setInterval(() => {
         if (i < text.length) {
           setShown(text.slice(0, i + 1));
           i++;
         } else {
-          clearInterval(interval);
+          clearInterval(interval!);
+          interval = null;
         }
       }, 45);
-      return () => clearInterval(interval);
     }, delay);
-    return () => clearTimeout(timeout);
+    return () => {
+      clearTimeout(timeout);
+      if (interval) clearInterval(interval);
+    };
   }, [text, delay]);
   return (
     <span>
