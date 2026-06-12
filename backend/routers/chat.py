@@ -637,9 +637,17 @@ async def smart_stream(req: dict, request: Request):
             return "data: " + _json.dumps(obj) + "\n\n"
 
         if _use_natural and wants_task_breakdown(message):
+            yield _sse({"type": "planning_started"})
             yield _sse({"type": "progress", "content": "Planning tasks..."})
             try:
-                _plan = await plan_tasks(message, session_files, current_user_id)
+                _plan_task = asyncio.create_task(
+                    plan_tasks(message, session_files, current_user_id)
+                )
+                while not _plan_task.done():
+                    done, _ = await asyncio.wait({_plan_task}, timeout=5)
+                    if not done:
+                        yield ": keepalive\n\n"
+                _plan = _plan_task.result()
             except Exception as _pe:
                 print(f"[tasks] planning failed: {_pe}")
                 _plan = {"tasks": []}

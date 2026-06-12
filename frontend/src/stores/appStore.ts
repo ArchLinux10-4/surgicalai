@@ -95,6 +95,10 @@ interface AppState {
   setTaskRunId: (id: string | null) => void
   setTaskPreamble: (s: string) => void
 
+  // Agent phase (dual-agent mission control)
+  agentPhase: 'idle' | 'planning' | 'executing' | 'complete'
+  setAgentPhase: (phase: 'idle' | 'planning' | 'executing' | 'complete') => void
+
   // Pending chat input — set from sidebar components (e.g. deploy watcher)
   pendingChatInput: string | null
   setPendingChatInput: (msg: string | null) => void
@@ -187,9 +191,12 @@ export const useAppStore = create<AppState>((set) => ({
   updateAgentTask: (id, patch) => set((state) => ({
     agentTasks: state.agentTasks.map(t => t.id === id ? { ...t, ...patch } : t)
   })),
-  clearAgentTasks: () => set({ agentTasks: [], taskRunId: null, taskPreamble: '' }),
+  clearAgentTasks: () => set({ agentTasks: [], taskRunId: null, taskPreamble: '', agentPhase: 'idle' }),
   setTaskRunId: (taskRunId) => set({ taskRunId }),
   setTaskPreamble: (taskPreamble) => set({ taskPreamble }),
+
+  agentPhase: 'idle',
+  setAgentPhase: (agentPhase) => set({ agentPhase }),
 
   pendingChatInput: null,
   setPendingChatInput: (pendingChatInput) => set({ pendingChatInput }),

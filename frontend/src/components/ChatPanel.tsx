@@ -8,7 +8,7 @@ import { InlineDiffCard } from './InlineDiffCard'
 import { NewFileCard } from './NewFileCard'
 import { MarkdownCode } from './CodeBlock'
 import { SessionFilesTray } from './SessionFilesTray'
-import { TaskListPanel } from './TaskListPanel'
+import { AgentMissionControl } from './AgentMissionControl'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
@@ -614,7 +614,7 @@ export function ChatPanel() {
     isStreaming, setIsStreaming, streamingMessage, setStreamingMessage,
     streamProgress, setStreamProgress, sessions, setSessions, settings, setSettings,
     sessionFiles, setSessionFiles, addSessionFile, removeSessionFile,
-    setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble,
+    setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble, setAgentPhase,
     pendingChatInput, setPendingChatInput,
   } = useAppStore()
 
@@ -878,7 +878,11 @@ export function ChatPanel() {
       // onTask
       (event) => {
         switch (event.type) {
+          case 'planning_started':
+            setAgentPhase('planning')
+            break
           case 'task_plan':
+            setAgentPhase('executing')
             setTaskRunId(event.run_id)
             setTaskPreamble(event.preamble || '')
             setAgentTasks((event.tasks || []).map((t: any) => ({
@@ -904,6 +908,7 @@ export function ChatPanel() {
             updateAgentTask(event.id, { status: 'cancelled' })
             break
           case 'tasks_complete':
+            setAgentPhase('complete')
             break
         }
       }
@@ -1302,7 +1307,7 @@ export function ChatPanel() {
             {messages.map((msg, i) => (
               <Message key={msg.id || i} msg={msg} sessionId={msg.session_id || activeSessions || ''} />
             ))}
-            <TaskListPanel />
+            <AgentMissionControl />
             {isStreaming && (streamingMessage || streamProgress) && (
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} />
             )}

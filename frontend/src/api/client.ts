@@ -223,6 +223,7 @@ export const api = {
             else if (chunk.type === 'edit_start') onEditStart?.()
             else if (chunk.type === 'edit_end') onEditEnd?.()
             else if (
+              chunk.type === 'planning_started' ||
               chunk.type === 'task_plan' || chunk.type === 'task_start' ||
               chunk.type === 'task_progress' || chunk.type === 'task_done' ||
               chunk.type === 'task_blocked' || chunk.type === 'task_cancelled' ||

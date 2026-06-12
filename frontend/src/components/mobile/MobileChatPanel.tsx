@@ -11,7 +11,7 @@ import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import { MobileDiffCard } from './MobileDiffCard'
 import { SessionFilesTray } from '../SessionFilesTray'
-import { TaskListPanel } from '../TaskListPanel'
+import { AgentMissionControl } from '../AgentMissionControl'
 import { useTaskPolling } from '../../hooks/useTaskPolling'
 import { VoiceButton } from '../VoiceButton'
 import { useCodeRain } from '../../hooks/useCodeRain'
@@ -326,7 +326,7 @@ export function MobileChatPanel() {
     activeSessions, setActiveSession, messages, addMessage, setMessages,
     sessions, setSessions, settings,
     sessionFiles, setSessionFiles,
-    setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble,
+    setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble, setAgentPhase,
   } = useAppStore()
 
   // Keep the task list in sync with the DB-backed source of truth while a run
@@ -519,7 +519,11 @@ export function MobileChatPanel() {
       // onTask — agentic task lifecycle (instant channel; polling reconciles)
       (event) => {
         switch (event.type) {
+          case 'planning_started':
+            setAgentPhase('planning')
+            break
           case 'task_plan':
+            setAgentPhase('executing')
             setTaskRunId(event.run_id)
             setTaskPreamble(event.preamble || '')
             setAgentTasks((event.tasks || []).map((t: any) => ({
@@ -543,6 +547,9 @@ export function MobileChatPanel() {
             break
           case 'task_cancelled':
             updateAgentTask(event.id, { status: 'cancelled' })
+            break
+          case 'tasks_complete':
+            setAgentPhase('complete')
             break
         }
       },
@@ -600,9 +607,7 @@ export function MobileChatPanel() {
                 setSessionFiles={setSessionFiles}
               />
             ))}
-            <div className="px-3">
-              <TaskListPanel />
-            </div>
+            <AgentMissionControl />
             {isStreaming && (
               <StreamingBubble
                 text={streamingMsg}
