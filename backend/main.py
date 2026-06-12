@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from database import init_db
 from auth_utils import decode_token
+from services.presence import touch as _presence_touch
 from middleware.rate_limiter import check_rate_limit
 from routers import settings, chat, files, surgical, git, context, session_files, github as github_router
 from routers import vercel as vercel_router
@@ -117,6 +118,12 @@ async def auth_middleware(request: Request, call_next):
             content={"detail": "Invalid or expired token"},
             headers=_get_cors_headers(request),
         )
+
+    # ── Presence tracking (in-memory, zero overhead) ──────────────────────
+    try:
+        _presence_touch(request.state.user_id, request.state.username, path)
+    except Exception:
+        pass  # never break auth over presence
 
     # ── Per-user rate limiting (after auth, before routing) ────────────────
     rate_resp = check_rate_limit(request.state.user_id, path, _get_cors_headers(request))

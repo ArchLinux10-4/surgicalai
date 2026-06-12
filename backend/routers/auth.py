@@ -328,6 +328,15 @@ def self_change_password(req: SelfChangePasswordRequest, request: Request):
     return {"ok": True}
 
 
+
+@router.get("/presence")
+def get_presence(request: Request):
+    """Return online/idle/offline status for all recently-seen users. Admin only."""
+    _require_admin(request)
+    from services.presence import get_all as _get_presence
+    return _get_presence()
+
+
 @router.delete("/users/{user_id}")
 def delete_user(user_id: str, request: Request):
     """Delete a user. Admin only. Cannot delete yourself."""

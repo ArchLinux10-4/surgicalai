@@ -35,6 +35,7 @@ export function AdminUsersPanel() {
   const [form, setForm] = useState<CreateForm>({ username: '', email: '', password: '', is_admin: false })
   const [formError, setFormError] = useState('')
   const [deletingId, setDeletingId] = useState<string | null>(null)
+  const [presence, setPresence] = useState<Record<string, {status: string, last_seen_seconds_ago: number, last_path: string}>>({})
 
   async function loadUsers() {
     setLoading(true)
@@ -48,7 +49,22 @@ export function AdminUsersPanel() {
     }
   }
 
-  useEffect(() => { loadUsers() }, [])
+  async function loadPresence() {
+    try {
+      const data = await api.auth.getPresence()
+      const map: Record<string, any> = {}
+      for (const p of data) map[p.user_id] = p
+      setPresence(map)
+    } catch { /* ignore — admin-only, may 403 for non-admin */ }
+  }
+
+  useEffect(() => { loadUsers(); loadPresence() }, [])
+
+  // Auto-refresh presence every 30s
+  useEffect(() => {
+    const interval = setInterval(loadPresence, 30_000)
+    return () => clearInterval(interval)
+  }, [])
 
   async function handleCreate(e: React.FormEvent) {
     e.preventDefault()
@@ -221,9 +237,17 @@ export function AdminUsersPanel() {
                 </div>
               </div>
               <div className="flex items-center gap-1 flex-shrink-0">
-                <span className="text-[10px] text-faint mr-2 hidden sm:inline">
-                  {u.last_login ? `Last login ${new Date(u.last_login).toLocaleDateString()}` : 'Never logged in'}
-                </span>
+                {(() => {
+                  const p = presence[u.id]
+                  const statusColor = p?.status === 'active' ? 'bg-green-400' : p?.status === 'idle' ? 'bg-yellow-400' : 'bg-gray-500'
+                  const statusLabel = p?.status === 'active' ? 'Active now' : p?.status === 'idle' ? `Idle ${Math.round((p?.last_seen_seconds_ago || 0) / 60)}m` : u.last_login ? `Last login ${new Date(u.last_login).toLocaleDateString()}` : 'Never logged in'
+                  return (
+                    <span className="flex items-center gap-1.5 text-[10px] text-faint mr-2 hidden sm:inline-flex">
+                      <span className={`w-2 h-2 rounded-full ${statusColor} ${p?.status === 'active' ? 'animate-pulse' : ''} flex-shrink-0`} />
+                      {statusLabel}
+                    </span>
+                  )
+                })()}
                 {u.id !== user?.id && (
                   <button
                     onClick={() => handleDelete(u.id, u.username)}
