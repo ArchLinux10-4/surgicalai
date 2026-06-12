@@ -1640,66 +1640,104 @@ export function LandingPage() {
           <div className="sai-pipeline-grid">
             <div>
               <div className="sai-section-label">How it works</div>
-              <h2 className="sai-section-title">Two agents.<br/>One source of truth.</h2>
+              <h2 className="sai-section-title">Symbol-anchored&nbsp;edits.<br/>One source of truth.</h2>
               <p className="sai-section-sub" style={{marginBottom:'48px'}}>Every change passes through a strict four-stage pipeline. No shortcuts, no guessing.</p>
               <div className="sai-pipeline-steps">
                 <div className="sai-pipe-step">
                   <div className="sai-pipe-step-num">1</div>
                   <div>
-                    <h3>Architect plans the change</h3>
-                    <p>Claude reads your request, identifies the exact symbol and line range, and decides whether to route to the Surgeon or trigger a full rewrite.</p>
-                    <span className="sai-pipe-tag sai-tag-arch">Claude — Architect</span>
+                    <h3>Live symbol index, not line numbers</h3>
+                    <p>Before writing a single character, Surgical AI parses every uploaded file into a symbol map of every function, class, interface, and export by name. Edits are anchored to those symbols, not stale line ranges that break with every rebase.</p>
+                    <span className="sai-pipe-tag sai-tag-arch">Surgical AI · powered by Claude</span>
                   </div>
                 </div>
                 <div className="sai-pipe-step">
                   <div className="sai-pipe-step-num">2</div>
                   <div>
                     <h3>Size-based routing</h3>
-                    <p>Small, focused changes (&lt;250 lines, 1 region) go to the Surgeon for precise SEARCH/REPLACE. Large multi-region changes go to direct rewrite at 32K tokens.</p>
+                    <p>Changes under 250 lines route to the precise XML edit path. Larger multi-region changes, or anything containing redesign or rewrite keywords, escalate to a full 32K token context pass automatically.</p>
                     <span className="sai-pipe-tag sai-tag-surg">Auto-routed</span>
                   </div>
                 </div>
                 <div className="sai-pipe-step">
                   <div className="sai-pipe-step-num">3</div>
                   <div>
-                    <h3>Surgeon applies the operation</h3>
-                    <p>The Surgeon operates on a focused window of the live file — never a stale copy. SEARCH strings are validated before any change is committed.</p>
-                    <span className="sai-pipe-tag sai-tag-surg">Claude — Surgeon</span>
+                    <h3>Structured XML edits, streamed live</h3>
+                    <p>Surgical AI generates structured <code style={{fontSize:'12px',color:'var(--accent)'}}>{'<surgical_edit>'}</code> XML blocks as it streams, machine-parsed and applied to the live file. No full-file overwrites. Every change anchored to the symbol resolved at runtime.</p>
+                    <span className="sai-pipe-tag sai-tag-surg">Surgical AI · powered by Claude</span>
                   </div>
                 </div>
                 <div className="sai-pipe-step">
                   <div className="sai-pipe-step-num">4</div>
                   <div>
                     <h3>QA auto-heals on failure</h3>
-                    <p>TypeScript is compiled after every change. Any error triggers up to 3 auto-heal attempts — Claude sees the fresh error output and the live file each time.</p>
+                    <p>After every change, <code style={{fontSize:'12px',color:'var(--accent)'}}>tsc</code> or <code style={{fontSize:'12px',color:'var(--accent)'}}>pyflakes</code> runs immediately. Any error triggers up to 3 auto-heal rounds. Each attempt feeds the raw linter output and the live file back into Claude, not a snapshot.</p>
                     <span className="sai-pipe-tag sai-tag-qa">QA · Auto-heal</span>
                   </div>
                 </div>
               </div>
             </div>
             <div className="sai-pipeline-visual">
-              <div className="sai-pipe-card">
-                <div className="sai-pipe-card-label">Step 1 · Architect</div>
-                <div className="sai-pipe-card-title">📋 Analyzing request…</div>
-                <div className="sai-pipe-card-desc">Symbol: <code style={{color:'var(--accent)',fontSize:'12px'}}>handleSend()</code> · File: ChatPanel.tsx · Lines 50–55<br/>Decision: Surgeon path — focused window extracted</div>
-              </div>
-              <div className="sai-pipe-connector"></div>
-              <div className="sai-pipe-card">
-                <div className="sai-pipe-card-label">Step 2 · Routing</div>
-                <div className="sai-pipe-card-title">⚡ Surgeon path selected</div>
-                <div className="sai-pipe-card-desc">Region size: 6 lines · Threshold: 250 lines<br/>Focused window: lines 47–60 passed to Surgeon</div>
-              </div>
-              <div className="sai-pipe-connector"></div>
-              <div className="sai-pipe-card">
-                <div className="sai-pipe-card-label">Step 3 · Surgeon</div>
-                <div className="sai-pipe-card-title">🔬 SEARCH/REPLACE applied</div>
-                <div className="sai-pipe-card-desc">3 lines replaced · SEARCH string validated ✓<br/>File written to disk → session updated</div>
-              </div>
-              <div className="sai-pipe-connector"></div>
-              <div className="sai-pipe-card" style={{borderColor:'rgba(15,168,118,.3)'}}>
-                <div className="sai-pipe-card-label">Step 4 · QA</div>
-                <div className="sai-pipe-card-title" style={{color:'var(--green)'}}>✅ TypeScript: 0 errors</div>
-                <div className="sai-pipe-card-desc">Build clean · Change committed · Stream complete</div>
+              <div style={{background:'#0d0d14',border:'1px solid rgba(255,255,255,.08)',borderRadius:'12px',overflow:'hidden',fontFamily:"'JetBrains Mono','Fira Code',monospace",boxShadow:'0 24px 60px rgba(0,0,0,.5)'}}>
+                <div style={{background:'#1a1a2e',padding:'10px 16px',display:'flex',alignItems:'center',gap:'8px',borderBottom:'1px solid rgba(255,255,255,.06)'}}>
+                  <span style={{width:'12px',height:'12px',borderRadius:'50%',background:'#ff5f57',display:'inline-block'}}></span>
+                  <span style={{width:'12px',height:'12px',borderRadius:'50%',background:'#febc2e',display:'inline-block'}}></span>
+                  <span style={{width:'12px',height:'12px',borderRadius:'50%',background:'#28c840',display:'inline-block'}}></span>
+                  <span style={{flex:1,textAlign:'center',fontSize:'11px',color:'rgba(255,255,255,.3)',letterSpacing:'.5px'}}>surgical-ai / pipeline · live</span>
+                </div>
+                <div style={{position:'relative'}}>
+                  <div style={{position:'absolute',left:'29px',top:'24px',bottom:'24px',width:'2px',background:'linear-gradient(to bottom,#7c3aed,#3b82f6,#10b981,#f59e0b)',opacity:.35,borderRadius:'2px'}}></div>
+
+                  {/* Step 1 — Symbol Index */}
+                  <div style={{padding:'20px 20px 20px 56px',borderBottom:'1px solid rgba(255,255,255,.05)',position:'relative'}}>
+                    <div style={{position:'absolute',left:'22px',top:'22px',width:'16px',height:'16px',borderRadius:'50%',background:'#7c3aed',boxShadow:'0 0 8px rgba(124,58,237,.6)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'9px',color:'#fff',fontWeight:'700'}}>1</div>
+                    <div style={{fontSize:'10px',color:'rgba(124,58,237,.9)',fontWeight:'700',letterSpacing:'.6px',textTransform:'uppercase',marginBottom:'6px'}}>Symbol Index</div>
+                    <div style={{fontSize:'11px',color:'rgba(255,255,255,.8)',marginBottom:'6px',lineHeight:'1.6'}}>
+                      <span style={{color:'#7c3aed'}}>$</span> <span style={{color:'#a78bfa'}}>parse</span> ChatPanel.tsx UserService.ts pipeline.py
+                    </div>
+                    <div style={{fontSize:'10px',color:'rgba(255,255,255,.4)',lineHeight:'1.7'}}>
+                      <span style={{color:'#34d399'}}>✓</span> handleSend() · UserService · run_surgeon()<br/>
+                      <span style={{color:'#34d399'}}>✓</span> 847 symbols indexed · anchors resolved
+                    </div>
+                  </div>
+
+                  {/* Step 2 — Routing */}
+                  <div style={{padding:'20px 20px 20px 56px',borderBottom:'1px solid rgba(255,255,255,.05)',position:'relative'}}>
+                    <div style={{position:'absolute',left:'22px',top:'22px',width:'16px',height:'16px',borderRadius:'50%',background:'#3b82f6',boxShadow:'0 0 8px rgba(59,130,246,.6)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'9px',color:'#fff',fontWeight:'700'}}>2</div>
+                    <div style={{fontSize:'10px',color:'rgba(59,130,246,.9)',fontWeight:'700',letterSpacing:'.6px',textTransform:'uppercase',marginBottom:'6px'}}>Routing</div>
+                    <div style={{fontSize:'11px',color:'rgba(255,255,255,.8)',marginBottom:'6px',lineHeight:'1.6'}}>
+                      <span style={{color:'#3b82f6'}}>~</span> region_size=<span style={{color:'#93c5fd'}}>6</span> threshold=<span style={{color:'#93c5fd'}}>250</span> keywords=<span style={{color:'#fbbf24'}}>none</span>
+                    </div>
+                    <div style={{fontSize:'10px',color:'rgba(255,255,255,.4)'}}>
+                      <span style={{color:'#60a5fa'}}>&gt;</span> XML edit path selected
+                    </div>
+                  </div>
+
+                  {/* Step 3 — Applying Edit */}
+                  <div style={{padding:'20px 20px 20px 56px',borderBottom:'1px solid rgba(255,255,255,.05)',position:'relative'}}>
+                    <div style={{position:'absolute',left:'22px',top:'22px',width:'16px',height:'16px',borderRadius:'50%',background:'#10b981',boxShadow:'0 0 8px rgba(16,185,129,.6)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'9px',color:'#fff',fontWeight:'700'}}>3</div>
+                    <div style={{fontSize:'10px',color:'rgba(16,185,129,.9)',fontWeight:'700',letterSpacing:'.6px',textTransform:'uppercase',marginBottom:'6px'}}>Applying Edit</div>
+                    <div style={{fontSize:'11px',color:'rgba(255,255,255,.8)',marginBottom:'6px',lineHeight:'1.6'}}>
+                      <span style={{color:'#f87171'}}>-</span> {'  const res = await fetch(\'/api/chat\'...'}<br/>
+                      <span style={{color:'#34d399'}}>+</span> {'  const res = await streamSurgicalEdit({'}
+                    </div>
+                    <div style={{fontSize:'10px',color:'rgba(255,255,255,.4)'}}>
+                      anchor: <span style={{color:'#6ee7b7'}}>handleSend()</span> · 3 lines · live file <span className="sai-cursor-blink" style={{background:'#10b981'}}></span>
+                    </div>
+                  </div>
+
+                  {/* Step 4 — QA */}
+                  <div style={{padding:'20px 20px 20px 56px',position:'relative'}}>
+                    <div style={{position:'absolute',left:'22px',top:'22px',width:'16px',height:'16px',borderRadius:'50%',background:'#f59e0b',boxShadow:'0 0 8px rgba(245,158,11,.6)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'9px',color:'#fff',fontWeight:'700'}}>4</div>
+                    <div style={{fontSize:'10px',color:'rgba(245,158,11,.9)',fontWeight:'700',letterSpacing:'.6px',textTransform:'uppercase',marginBottom:'6px'}}>QA</div>
+                    <div style={{fontSize:'11px',color:'rgba(255,255,255,.8)',marginBottom:'6px',lineHeight:'1.6'}}>
+                      <span style={{color:'#f59e0b'}}>$</span> tsc --strict --noEmit ChatPanel.tsx
+                    </div>
+                    <div style={{fontSize:'10px',color:'rgba(255,255,255,.4)'}}>
+                      <span style={{color:'#34d399'}}>✓</span> <span style={{color:'#34d399',fontWeight:'700'}}>0 errors</span> · score 9/10 · change committed
+                    </div>
+                  </div>
+                </div>
               </div>
             </div>
           </div>
@@ -1739,12 +1777,12 @@ export function LandingPage() {
           <div className="sai-section-label" style={{marginBottom:'16px'}}>Capabilities</div>
           <h2 className="sai-section-title" style={{marginBottom:'48px'}}>Built for real codebases</h2>
           <div className="sai-features-grid">
-            <div className="sai-feat-card"><div className="sai-feat-icon">🏛</div><h3>Dual-role AI pipeline</h3><p>The Architect plans and routes. The Surgeon operates. Two models, two jobs, zero role confusion.</p></div>
-            <div className="sai-feat-card"><div className="sai-feat-icon">🔬</div><h3>SEARCH/REPLACE precision</h3><p>Changes are applied by finding and replacing exact strings in a focused window — not overwriting entire files.</p></div>
-            <div className="sai-feat-card"><div className="sai-feat-icon">⚡</div><h3>Size-based routing</h3><p>Small changes go to the Surgeon. Large multi-region rewrites go direct at 32K tokens. Routing is automatic.</p></div>
-            <div className="sai-feat-card"><div className="sai-feat-icon">✅</div><h3>QA with auto-heal</h3><p>TypeScript is compiled after every change. Hard errors trigger up to 3 Claude-powered heal attempts automatically.</p></div>
-            <div className="sai-feat-card"><div className="sai-feat-icon">🔁</div><h3>Retry &amp; backoff</h3><p>Anthropic 529 overload errors are retried with exponential backoff — 10s, 20s, 40s — before surfacing a failure.</p></div>
-            <div className="sai-feat-card"><div className="sai-feat-icon">📡</div><h3>Real-time streaming</h3><p>Every pipeline stage — plan, route, operate, QA — streams live to the UI. You see the thinking as it happens.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">🏛</div><h3>Symbol-anchored edits</h3><p>Every change is anchored to a named function, class, or export in the live file, not a line number that breaks on the next rebase.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">🔬</div><h3>Structured XML edits</h3><p>Surgical AI generates structured <code>{'<surgical_edit>'}</code> XML streamed live, machine-parsed and applied to the exact symbol location in the live file.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">⚡</div><h3>Size-based routing</h3><p>Small changes route to the XML edit path. Large multi-region rewrites escalate to a full 32K token pass. Routing is automatic.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">✅</div><h3>QA with auto-heal</h3><p><code>tsc</code> or <code>pyflakes</code> runs after every change. Hard errors trigger up to 3 auto-heal attempts, each with the raw linter output and live file.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">🔁</div><h3>Retry &amp; backoff</h3><p>Anthropic 529 overload errors are retried with exponential backoff (10s, 20s, 40s) before surfacing a failure. Your pipeline keeps running.</p></div>
+            <div className="sai-feat-card"><div className="sai-feat-icon">📡</div><h3>Real-time streaming</h3><p>Every pipeline stage (symbol resolution, routing decision, XML edits, QA) streams live to the UI. You see the thinking as it happens.</p></div>
           </div>
         </div>
       </section>
