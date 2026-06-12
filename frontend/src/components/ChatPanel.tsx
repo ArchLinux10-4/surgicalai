@@ -880,6 +880,9 @@ export function ChatPanel() {
           return
         }
         if (gotResult) return
+        // Planning was started but fell back to single_pass (< 2 tasks) —
+        // reset the mission-control panel so the Architect card disappears.
+        clearAgentTasks()
         const _thinking = thinkingTextRef.current
         const _steps = [...progressHistoryRef.current]
         setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
