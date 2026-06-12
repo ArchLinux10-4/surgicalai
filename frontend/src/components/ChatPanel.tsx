@@ -14,6 +14,8 @@ import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
 import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
+import { UploadPreview } from './ElementPicker'
+import { useElementPickerStore } from '../stores/elementPickerStore'
 
 // ── Strip internal protocol tags from model output ────────────────────────────
 function stripInternalTags(text: string, streaming = false): string {
@@ -1291,7 +1293,11 @@ export function ChatPanel() {
     thinkingTextRef.current = ''
     progressHistoryRef.current = ['Thinking...']
 
-    doStream(sessionId, text, isFirstMessage, autoNameSession)
+    // Prepend element picker context if any elements are selected
+    const elementContext = useElementPickerStore.getState().formattedContext()
+    const finalText = elementContext ? `${elementContext}\n\n${text}` : text
+
+    doStream(sessionId, finalText, isFirstMessage, autoNameSession)
   }, [input, isStreaming, settings, activeSessions, sessionFiles, doStream])
 
   const handleKey = (e: React.KeyboardEvent) => {
@@ -1390,6 +1396,9 @@ export function ChatPanel() {
           <span className="text-[12px] text-accent font-medium">Compacting conversation history…</span>
         </div>
       )}
+
+      {/* Upload preview with element picker */}
+      <UploadPreview />
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto">

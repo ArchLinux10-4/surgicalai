@@ -8,6 +8,8 @@ import { TestRunnerPanel } from './TestRunnerPanel'
 import { toast } from '../lib/toast'
 import type { SmartResult, QAResult } from '../types'
 import { LivePreview, isVisualFile } from './LivePreview'
+import { PickablePreview, ElementPickerToolbar } from './ElementPicker'
+import { useElementPickerStore } from '../stores/elementPickerStore'
 import { useAppStore } from '../stores/appStore'
 import { Cancel, CheckCircle, Description, FileDownload, KeyboardArrowDown, KeyboardArrowUp, Replay, SkipNext, Visibility, Warning } from '@mui/icons-material';
 
@@ -834,13 +836,26 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       {/* File-level Live Preview — one preview for the entire file */}
       {isVisualFile(filename) && showFilePreview && (
         <div className="border-t border-border">
-          <LivePreview
-            code={originalCode || '// Loading...'}
-            filename={filename}
-            modifiedCode={modifiedCode}
-            sessionId={sessionId}
-            fileId={fileData.file_id}
-          />
+          {useElementPickerStore.getState().pickMode ? (
+            <>
+              <PickablePreview
+                code={modifiedCode ?? originalCode ?? '// Loading...'}
+                filename={filename}
+                sessionId={sessionId}
+                fileId={fileData.file_id}
+                pickMode={true}
+              />
+              <ElementPickerToolbar />
+            </>
+          ) : (
+            <LivePreview
+              code={originalCode || '// Loading...'}
+              filename={filename}
+              modifiedCode={modifiedCode}
+              sessionId={sessionId}
+              fileId={fileData.file_id}
+            />
+          )}
         </div>
       )}
 
