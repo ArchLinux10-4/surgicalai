@@ -70,6 +70,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
     let appliedFiles = 0
     let failed       = 0
 
+    const markPromises: Promise<any>[] = []
     try {
       for (const msg of pendingMessages) {
         let result: SmartResult
@@ -91,7 +92,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
               appliedFiles++
               // Track every applied change in DB so state survives refresh
               for (const ch of fd.changes) {
-                if (ch?.id) api.surgical.markApplied(sessionId, ch.id).catch(() => {})
+                if (ch?.id) markPromises.push(api.surgical.markApplied(sessionId, ch.id).catch(() => {}))
               }
             }
           } catch { failed++ }
@@ -101,6 +102,9 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       // Refresh file list
       const fresh = await api.sessionFiles.list(sessionId)
       setSessionFiles(fresh)
+
+      // Wait for all DB marks to land before telling diff cards refresh
+      await Promise.all(markPromises)
 
       if (failed === 0) {
         toast.success(`Applied all changes across ${appliedFiles} file${appliedFiles !== 1 ? 's' : ''}`)
