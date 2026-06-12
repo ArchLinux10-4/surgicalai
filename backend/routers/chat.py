@@ -595,6 +595,14 @@ async def smart_stream(req: dict, request: Request):
     ).fetchall()
     session_files = [dict(r) for r in file_rows]
 
+    # File-awareness hint: prepend attached file list to user message so
+    # all models (including smaller ones) notice files immediately.
+    if session_files:
+        _fnames = [f['filename'] for f in session_files]
+        _file_hint = (f"[{len(_fnames)} file(s) attached: {', '.join(_fnames)}. "
+                      "Examine their contents before responding.]")
+        message = f"{_file_hint}\n\n{message}"
+
     # Project memory — GLOBAL team conventions (every prompt) + any per-session memory
     project_memory = _load_effective_memory(conn, session_id)
 
@@ -1078,8 +1086,32 @@ async def execute_task(req: dict, request: Request):
                   error=str(_pex)[:200])
             _prior_ctx = ""
         _task_request = (_prior_ctx + "\n\n" + task["detail"]) if _prior_ctx else task["detail"]
+
+        # ── No-files guardrail ────────────────────────────────────────
+        # If task is code-type but no files exist in this session, tell
+        # the model explicitly so it can ask the user to upload files
+        # instead of silently producing zero edits.
+        _task_kind = task.get("kind", "code")
+        if not session_files and _task_kind == "code":
+            _task_request = (
+                "IMPORTANT: There are NO files uploaded in this session. "
+                "You cannot make code edits without files. Tell the user "
+                "to upload the relevant file(s) first, then retry.\n\n"
+                + _task_request
+            )
+            _dlog("exec_task_no_files", session_id=session_id, task_id=task_id,
+                  task_seq=seq+1, task_kind=_task_kind)
+
+        # File-awareness hint for task execution (mirrors smart-stream hint)
+        if session_files:
+            _fnames = [f['filename'] for f in session_files]
+            _file_hint = (f"[{len(_fnames)} file(s) attached: {', '.join(_fnames)}. "
+                          "Examine their contents before responding.]")
+            _task_request = f"{_file_hint}\n\n{_task_request}"
+
         _dlog("sse_exec_task_context", session_id=session_id, task_id=task_id,
               task_seq=seq+1, has_prior_ctx=bool(_prior_ctx),
+              has_files=bool(session_files), num_files=len(session_files),
               request_len=len(_task_request))
 
         collected, result_content, poll, aborted = [], None, 0, False

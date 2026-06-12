@@ -126,6 +126,10 @@ async def plan_tasks(message: str, session_files: list, user_id: str = "") -> di
 
     user_block = f"User request:\n{message}{file_hint}"
 
+    print(f"[task_planner] planning with model={model}, num_files={len(session_files)}, "
+          f"files={[sf.get('filename','') for sf in session_files][:10]}, "
+          f"msg_len={len(message)}")
+
     try:
         client = AsyncAnthropic(api_key=anthropic_key)
         resp = await client.messages.create(
