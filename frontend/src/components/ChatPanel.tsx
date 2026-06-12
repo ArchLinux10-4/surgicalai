@@ -242,6 +242,14 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
   const time = msg.created_at
     ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : ''
+  const [copied, setCopied] = useState(false)
+  const handleCopy = () => {
+    const text = stripInternalTags(msg.content || '')
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+    })
+  }
 
   // Compact marker chip
   if (msg.message_type === 'compact_marker') {
@@ -329,6 +337,23 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
             </ReactMarkdown>
           </div>
         )}
+
+        {/* Copy button — hover-reveal, bottom-right of AI bubble */}
+        {!isUser && msg.content && (
+          <div className="flex justify-end mt-1.5 opacity-0 group-hover:opacity-100 transition-opacity">
+            <button
+              onClick={handleCopy}
+              className="flex items-center gap-1 text-[11px] text-muted/60 hover:text-ink/70 transition-colors px-2 py-0.5 rounded hover:bg-overlay/50"
+              title="Copy response"
+            >
+              {copied ? (
+                <><span>✓</span><span>Copied</span></>
+              ) : (
+                <><span>⎘</span><span>Copy</span></>
+              )}
+            </button>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -341,6 +366,7 @@ function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boole
 
   useEffect(() => {
     if (isStreaming) setExpanded(true)
+    else setExpanded(false)
   }, [isStreaming])
 
   if (!text && !isStreaming) return null
