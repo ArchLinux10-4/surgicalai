@@ -2,11 +2,12 @@
 import asyncio
 import uuid
 import json
+import time
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from models.schemas import ChatRequest, NewSessionRequest, ChatSession
 from database import get_db, get_setting, get_user_api_key, GLOBAL_MEMORY_KEY
-from services.pipeline import run_chat, run_chat_stream
+from services.pipeline import run_chat, run_chat_stream, _dlog
 
 router = APIRouter()
 
@@ -606,15 +607,35 @@ async def smart_stream(req: dict, request: Request):
         collected_tokens = []
         result_content = None
         current_summary = session_summary
+        _stream_t0 = time.time()
+        _phase = "init"
+        _dlog("sse_stream_start", session_id=session_id, user_id=current_user_id,
+              needs_compaction=needs_compaction, msg_len=len(message))
 
-        # --- Rolling compaction ---
+        # --- Rolling compaction (with keepalive) ---
         if needs_compaction:
+            _phase = "compaction"
+            _compact_t0 = time.time()
+            _compact_ka = 0
+            _dlog("sse_compaction_start", session_id=session_id, user_id=current_user_id)
             yield "data: " + _json.dumps({"type": "compacting", "content": "Compacting conversation history..."}) + "\n\n"
             try:
-                new_sum = await _compact_session(session_id, current_user_id)
+                _compact_task = asyncio.create_task(
+                    _compact_session(session_id, current_user_id)
+                )
+                while not _compact_task.done():
+                    done, _ = await asyncio.wait({_compact_task}, timeout=5)
+                    if not done:
+                        _compact_ka += 1
+                        yield ": keepalive\n\n"
+                new_sum = _compact_task.result()
                 if new_sum:
                     current_summary = new_sum
+                _dlog("sse_compaction_done", session_id=session_id, user_id=current_user_id,
+                      duration_s=round(time.time() - _compact_t0, 1), keepalives=_compact_ka)
             except Exception as _ce:
+                _dlog("sse_compaction_error", session_id=session_id, user_id=current_user_id,
+                      duration_s=round(time.time() - _compact_t0, 1), error=str(_ce))
                 print(f"[compact] failed: {_ce}")
             yield "data: " + _json.dumps({"type": "compacting_done", "content": "History compacted"}) + "\n\n"
 
@@ -637,6 +658,10 @@ async def smart_stream(req: dict, request: Request):
             return "data: " + _json.dumps(obj) + "\n\n"
 
         if _use_natural and wants_task_breakdown(message):
+            _phase = "planning"
+            _plan_t0 = time.time()
+            _plan_ka = 0
+            _dlog("sse_planning_start", session_id=session_id, user_id=current_user_id)
             yield _sse({"type": "planning_started"})
             yield _sse({"type": "progress", "content": "Planning tasks..."})
             try:
@@ -646,9 +671,15 @@ async def smart_stream(req: dict, request: Request):
                 while not _plan_task.done():
                     done, _ = await asyncio.wait({_plan_task}, timeout=5)
                     if not done:
+                        _plan_ka += 1
                         yield ": keepalive\n\n"
                 _plan = _plan_task.result()
+                _dlog("sse_planning_done", session_id=session_id, user_id=current_user_id,
+                      duration_s=round(time.time() - _plan_t0, 1), keepalives=_plan_ka,
+                      task_count=len((_plan.get("tasks") or [])))
             except Exception as _pe:
+                _dlog("sse_planning_error", session_id=session_id, user_id=current_user_id,
+                      duration_s=round(time.time() - _plan_t0, 1), error=str(_pe))
                 print(f"[tasks] planning failed: {_pe}")
                 _plan = {"tasks": []}
 
@@ -714,6 +745,8 @@ async def smart_stream(req: dict, request: Request):
 
                 run_id = str(uuid.uuid4())
                 tasks = create_tasks(session_id, run_id, _planned)
+                _dlog("sse_tasks_created", session_id=session_id, user_id=current_user_id,
+                      run_id=run_id, task_count=len(tasks))
                 yield _sse({
                     "type": "task_plan",
                     "run_id": run_id,
@@ -729,10 +762,15 @@ async def smart_stream(req: dict, request: Request):
                 completed, blocked_task, cancelled = 0, None, False
                 total = len(tasks)
 
-                for t in tasks:
+                for _task_idx, t in enumerate(tasks):
                     if cancel_requested_for_run(session_id, run_id):
                         cancelled = True
                         break
+                    _phase = f"task:{_task_idx+1}/{total}:{t['id'][:8]}"
+                    _task_t0 = time.time()
+                    _dlog("sse_task_start", session_id=session_id, user_id=current_user_id,
+                          task_id=t["id"], task_seq=_task_idx+1, task_total=total,
+                          title=t["title"][:80], elapsed_s=round(time.time() - _stream_t0, 1))
                     update_task(t["id"], status="running")
                     yield _sse({"type": "task_start", "id": t["id"]})
 
@@ -769,6 +807,9 @@ async def smart_stream(req: dict, request: Request):
                                 pass
 
                     if aborted:
+                        _dlog("sse_task_done", session_id=session_id, user_id=current_user_id,
+                              task_id=t["id"], task_seq=_task_idx+1, status="cancelled",
+                              duration_s=round(time.time() - _task_t0, 1))
                         update_task(t["id"], status="cancelled")
                         yield _sse({"type": "task_cancelled", "id": t["id"]})
                         cancelled = True
@@ -788,6 +829,9 @@ async def smart_stream(req: dict, request: Request):
                     # 8/10 QA gate entirely and report a "skipped" verdict.
                     _is_answer = t.get("kind") == "answer"
                     if parsed and worst == "blocked" and not _is_answer:
+                        _dlog("sse_task_done", session_id=session_id, user_id=current_user_id,
+                              task_id=t["id"], task_seq=_task_idx+1, status="blocked",
+                              qa_score=score, duration_s=round(time.time() - _task_t0, 1))
                         update_task(t["id"], status="blocked", qa_score=score,
                                     verdict=worst, result_summary=natural_text[:500])
                         yield _sse({"type": "task_blocked", "id": t["id"], "qa_score": score, "verdict": worst})
@@ -796,6 +840,10 @@ async def smart_stream(req: dict, request: Request):
                     else:
                         _verdict = "skipped" if _is_answer else (worst or "safe")
                         _score = None if _is_answer else score
+                        _dlog("sse_task_done", session_id=session_id, user_id=current_user_id,
+                              task_id=t["id"], task_seq=_task_idx+1, status="done",
+                              qa_score=_score, verdict=_verdict,
+                              duration_s=round(time.time() - _task_t0, 1))
                         update_task(t["id"], status="done", qa_score=_score,
                                     verdict=_verdict, result_summary=natural_text[:500])
                         # Emit the diff result so the frontend renders the code card.
@@ -827,10 +875,17 @@ async def smart_stream(req: dict, request: Request):
                     yield _sse({"type": "tasks_complete", "status": "done",
                                 "completed": completed, "total": total, "summary": note})
 
+                _phase = "done"
+                _dlog("sse_stream_done", session_id=session_id, user_id=current_user_id,
+                      path="task_branch", total_duration_s=round(time.time() - _stream_t0, 1),
+                      completed=completed, total=total)
                 yield _sse({"type": "done"})
                 return
         # ── End agentic task branch ───────────────────────────────────────
 
+        _phase = "single_pass"
+        _dlog("sse_single_pass_start", session_id=session_id, user_id=current_user_id,
+              elapsed_s=round(time.time() - _stream_t0, 1))
         _pipeline = run_natural_pipeline_stream if _use_natural else run_smart_pipeline_stream
         _saved = False
 
@@ -907,6 +962,13 @@ async def smart_stream(req: dict, request: Request):
                         print(f"[STREAM] DB save failed: {_save_err}")
                 yield chunk
         finally:
+            if not _saved:
+                _dlog("sse_stream_disconnect", session_id=session_id, user_id=current_user_id,
+                      phase=_phase, total_duration_s=round(time.time() - _stream_t0, 1),
+                      tokens_collected=len(collected_tokens))
+            else:
+                _dlog("sse_stream_done", session_id=session_id, user_id=current_user_id,
+                      path="single_pass", total_duration_s=round(time.time() - _stream_t0, 1))
             # Safety net: if stream ended without done/error (crash, timeout,
             # client disconnect), persist whatever tokens were collected.
             if not _saved and collected_tokens:
