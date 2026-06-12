@@ -856,6 +856,56 @@ def _eval_task_result(parsed):
     return (min(scores) if scores else None, worst)
 
 
+
+def _extract_edit_summary(parsed):
+    """Extract a compact 'files -> symbols' summary from a parsed smart_result."""
+    if not parsed:
+        return ""
+    parts = []
+    for fname, fdata in (parsed.get("changes_by_file") or {}).items():
+        symbols = []
+        if isinstance(fdata, dict):
+            for ch in fdata.get("changes", []):
+                sym = ch.get("symbol") or {}
+                name = sym.get("name") or sym.get("full_path", "")
+                if name:
+                    symbols.append(name)
+        if symbols:
+            parts.append(f"  {fname}: {', '.join(symbols)}")
+        else:
+            parts.append(f"  {fname}")
+    return "\n".join(parts) if parts else ""
+
+
+def _build_prior_work_context(session_id, run_id, current_seq):
+    """Build a context block summarising what earlier tasks in this run already produced."""
+    from services.task_planner import list_tasks as _lt
+    tasks = _lt(session_id, run_id)
+    done = [t for t in tasks if t.get("status") == "done" and t.get("seq", 999) < current_seq]
+    if not done:
+        _dlog("prior_work_empty", session_id=session_id, run_id=run_id, current_seq=current_seq)
+        return ""
+    lines = [
+        "[PRIOR COMPLETED TASKS IN THIS RUN — do NOT redo work that is already done]",
+        "",
+    ]
+    for t in sorted(done, key=lambda x: x.get("seq", 0)):
+        summary = (t.get("result_summary") or "").strip()
+        lines.append(f"Task {t['seq']+1}: {t['title']}")
+        if summary:
+            lines.append(f"  Result: {summary}")
+        lines.append("")
+    lines.append(
+        "If a file or symbol listed above was already modified, "
+        "build on that work — do NOT rewrite it from scratch."
+    )
+    ctx = "\n".join(lines)
+    _dlog("prior_work_built", session_id=session_id, run_id=run_id,
+          current_seq=current_seq, prior_task_count=len(done),
+          context_len=len(ctx))
+    return ctx
+
+
 def _save_task_message(session_id, natural_text, parsed):
     """Persist a task's assistant message (natural text + optional diff result)."""
     db = get_db()
@@ -1005,11 +1055,23 @@ async def execute_task(req: dict, request: Request):
         update_task(task_id, status="running")
         yield _sse({"type": "task_start", "id": task_id})
 
+        # --- Prior-work context injection (Issue 2 fix) ---
+        try:
+            _prior_ctx = _build_prior_work_context(session_id, run_id, seq)
+        except Exception as _pex:
+            _dlog("prior_work_error", session_id=session_id, task_id=task_id,
+                  error=str(_pex)[:200])
+            _prior_ctx = ""
+        _task_request = (_prior_ctx + "\n\n" + task["detail"]) if _prior_ctx else task["detail"]
+        _dlog("sse_exec_task_context", session_id=session_id, task_id=task_id,
+              task_seq=seq+1, has_prior_ctx=bool(_prior_ctx),
+              request_len=len(_task_request))
+
         collected, result_content, poll, aborted = [], None, 0, False
         try:
             async for chunk in _with_heartbeat(run_natural_pipeline_stream(
                 session_files=session_files,
-                user_request=task["detail"],
+                user_request=_task_request,
                 conversation_history=conversation_history,
                 session_id=session_id,
                 project_memory=project_memory,
@@ -1095,8 +1157,14 @@ async def execute_task(req: dict, request: Request):
 
         _verdict = "skipped" if _is_answer else (worst or "safe")
         _score = None if _is_answer else score
+        _edit_summary = _extract_edit_summary(parsed) if parsed else ""
+        _rsummary = natural_text[:500]
+        if _edit_summary:
+            _rsummary += "\nEdited:\n" + _edit_summary
+            _dlog("sse_exec_task_edit_summary", session_id=session_id,
+                  task_id=task_id, edit_summary=_edit_summary[:300])
         update_task(task_id, status="done", qa_score=_score,
-                    verdict=_verdict, result_summary=natural_text[:500])
+                    verdict=_verdict, result_summary=_rsummary[:800])
         _dlog("sse_exec_task_done", session_id=session_id, user_id=current_user_id,
               task_id=task_id, task_seq=seq+1, status="done",
               qa_score=_score, verdict=_verdict, duration_s=round(time.time() - _t0, 1))
