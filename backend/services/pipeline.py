@@ -2352,7 +2352,7 @@ async def analyze_and_plan_stream(
 
             model_kwargs = {
                 "model": architect_model,
-                "max_tokens": 16000,
+                "max_tokens": 64000,
                 "system": CLAUDE_EDITOR_SYSTEM,
                 "messages": messages,
             }
@@ -2588,7 +2588,7 @@ async def analyze_and_plan_stream(
                     ]
                     _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
                         model=architect_model,
-                        max_tokens=16000,
+                        max_tokens=64000,
                         system=CLAUDE_EDITOR_SYSTEM,
                         messages=_retry_msgs,
                     )
@@ -4362,7 +4362,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 claude_msgs = conversation_history[-HISTORY_WINDOW:] + [{"role": "user", "content": user_request}]
                 async with aclient.messages.stream(
                     model=chat_model,
-                    max_tokens=16000,
+                    max_tokens=64000,
                     **_get_thinking_kwargs(chat_model, 10000),
                     **_get_effort_kwargs(chat_model),
                     system=system,
@@ -4728,7 +4728,7 @@ USER REQUEST:
                     try:
                         async with aclient.messages.stream(
                             model=arch_model,
-                            max_tokens=16000,
+                            max_tokens=64000,
                             **_get_thinking_kwargs(arch_model, 10000),
                             **_get_effort_kwargs(arch_model),
                             system=_architect_system,
@@ -4777,7 +4777,7 @@ USER REQUEST:
                             try:
                                 async with aclient.messages.stream(
                                     model=arch_model,
-                                    max_tokens=16000,
+                                    max_tokens=64000,
                                     **_get_thinking_kwargs(arch_model, 10000),
                                     **_get_effort_kwargs(arch_model),
                                     system=_architect_system,
@@ -7452,7 +7452,7 @@ async def _retry_truncated_edit(
     try:
         resp = await aclient.messages.create(
             model=arch_model,
-            max_tokens=16000,
+            max_tokens=64000,
             system=focused_system,
             messages=focused_messages,
         )
@@ -7536,11 +7536,11 @@ async def _execute_single_edit(
     try:
         call_kwargs = {
             "model": model,
-            "max_tokens": 16000,
+            "max_tokens": 64000,
             "system": focused_system,
             "messages": [{"role": "user", "content": focused_user}],
         }
-        call_kwargs.update(_get_thinking_kwargs(model, 4000))
+        call_kwargs.update(_get_thinking_kwargs(model, 10000))
         call_kwargs.update(_get_effort_kwargs(model))
 
         resp = await aclient.messages.create(**call_kwargs)
@@ -8765,6 +8765,16 @@ async def run_natural_pipeline_stream(
                         }
                         _resolved_by_symbol[_akey] = _entry
                         resolved_edits.append(_entry)
+                    _dlog("edit_resolved",
+                          session_id=session_id,
+                          filename=filename,
+                          symbol=symbol_name,
+                          symbol_start=symbol.start_line,
+                          symbol_end=symbol.end_line,
+                          symbol_lines=symbol.end_line - symbol.start_line + 1,
+                          had_old_code=bool(old_code),
+                          had_line_numbers=bool(edit_start_line and edit_end_line),
+                          user_id=user_id)
                 else:
                     still_unresolved.append({
                         "filename": filename,
@@ -8950,6 +8960,14 @@ async def run_natural_pipeline_stream(
         # same time as 1. Send SSE keepalive pings every 20 s so Railway/Vercel
         # doesn't kill the connection during long QA runs.
 
+        _dlog("resolution_summary",
+              session_id=session_id,
+              resolved_count=len(resolved_edits),
+              skipped_count=len(skipped_changes_struct),
+              resolved_symbols=[(r["filename"], r["symbol"].name, r["symbol"].start_line, r["symbol"].end_line) for r in resolved_edits],
+              skipped_details=skipped_changes_struct[:10],
+              user_id=user_id)
+
         yield sse({"type": "progress", "content": f"Running QA on {len(resolved_edits)} change(s)..."})
 
         # Build shared context once — same view the architect had
@@ -9093,6 +9111,18 @@ async def run_natural_pipeline_stream(
                     "downstream_risks": [], "type_errors": [],
                     "plan_deviation": "", "risk_verdicts": [],
                 })
+
+        _dlog("qa_results_collected",
+              session_id=session_id,
+              count=len(qa_results),
+              results=[{
+                  "symbol": change_shells[_qi]["symbol"].name if _qi < len(change_shells) else "?",
+                  "filename": change_shells[_qi]["filename"] if _qi < len(change_shells) else "?",
+                  "verdict": _qr.get("verdict", "?"),
+                  "score": _qr.get("qa_score"),
+                  "summary": (_qr.get("summary") or "")[:200],
+              } for _qi, _qr in enumerate(qa_results)],
+              user_id=user_id)
 
         # ── Structural QA — deterministic pre-check ────────────────────────
         # Run fast, zero-LLM checks (missing imports, duplicate defs, wrong
@@ -9386,7 +9416,7 @@ async def run_natural_pipeline_stream(
                     idx,
                     asyncio.create_task(aclient.messages.create(
                         model=arch_model,
-                        max_tokens=16000,
+                        max_tokens=64000,
                         system=system_prompt,
                         messages=correction_messages,
                     ))
@@ -9539,6 +9569,14 @@ async def run_natural_pipeline_stream(
                 yield sse({"type": "progress",
                            "content": f"🚫 Blocked by 8/10 gate — {symbol.name} "
                                       f"(verdict: {_gv}, score: {_gscore_txt}/10); not shipped"})
+                _dlog("qa_gate_blocked",
+                      session_id=session_id,
+                      filename=filename,
+                      symbol=symbol.name,
+                      verdict=_gv,
+                      score=_gs,
+                      reason=_greason[:300],
+                      user_id=user_id)
                 try:
                     _log_qa_result(session_id, filename, symbol.name, qa_dict)
                 except Exception:
@@ -9572,6 +9610,13 @@ async def run_natural_pipeline_stream(
                 ),
             })
 
+            _dlog("qa_gate_passed",
+                  session_id=session_id,
+                  filename=filename,
+                  symbol=symbol.name,
+                  verdict=_gv,
+                  score=_gs,
+                  user_id=user_id)
             change = SurgicalChange(
                 id=str(uuid.uuid4()),
                 symbol=symbol,
@@ -9662,6 +9707,12 @@ async def run_natural_pipeline_stream(
             # QA gate is bypassed entirely (it ran on 0 changes). Instead surface
             # the dropped edits explicitly so the failure is visible and is never
             # silently shipped as success.
+            _dlog("degenerate_drop",
+                  session_id=session_id,
+                  edit_blocks=len(edit_blocks_raw) if 'edit_blocks_raw' in dir() else 0,
+                  new_file_blocks=len(new_file_blocks_raw) if 'new_file_blocks_raw' in dir() else 0,
+                  skipped_changes=skipped_changes_struct[:10],
+                  user_id=user_id)
             if edit_blocks_raw or new_file_blocks_raw:
                 _attempted = len(edit_blocks_raw) + len(new_file_blocks_raw)
                 _reasons = skipped_messages or [
@@ -9717,8 +9768,20 @@ async def run_natural_pipeline_stream(
             "natural_text": _display_text,
         }
 
+        _dlog("smart_result_emitted",
+              session_id=session_id,
+              changes_count=sum(len(v.get("changes", [])) for v in changes_by_file.values()),
+              new_files_count=len(new_files),
+              skipped_count=len(skipped_changes_struct),
+              files=list(changes_by_file.keys()),
+              user_id=user_id)
         yield sse({"type": "smart_result", "content": json.dumps(result)})
         yield sse({"type": "done", "content": ""})
 
     except Exception as e:
+        _dlog("execute_task_exception",
+              session_id=session_id,
+              error=str(e)[:500],
+              error_type=type(e).__name__,
+              user_id=user_id)
         yield f"data: {json.dumps({'type': 'error', 'content': _friendly_error(e)})}\n\n"

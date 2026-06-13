@@ -7,6 +7,15 @@ import ast
 import re
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+# tree-sitter imports (soft dependency — regex fallback if unavailable)
+try:
+    import tree_sitter as _tree_sitter
+    import tree_sitter_typescript as _tree_sitter_ts
+    _TREE_SITTER_AVAILABLE = True
+except ImportError:
+    _TREE_SITTER_AVAILABLE = False
+
 from models.schemas import SymbolInfo, SymbolMap, SymbolType
 
 
@@ -199,32 +208,253 @@ class ASTParser:
 
     # ─── JavaScript / TypeScript Parser ──────────────────────────────────────
 
+
+    # ─── JavaScript / TypeScript Parser (tree-sitter) ────────────────────────
+
     def _parse_js_ts(self, source: str, lines: List[str]) -> List[SymbolInfo]:
+        """
+        Parse JS/TS/JSX/TSX using tree-sitter for exact AST boundaries.
+        Replaces the regex + brace-counting heuristic that failed on template
+        literals, deep nesting, and large files (e.g. 2685-line LandingPage.tsx).
+        """
+        try:
+            return self._parse_js_ts_treesitter(source, lines)
+        except Exception:
+            # tree-sitter unavailable or parse error — fall back to regex
+            return self._parse_js_ts_regex(source, lines)
+
+    def _parse_js_ts_treesitter(self, source: str, lines: List[str]) -> List[SymbolInfo]:
+        import tree_sitter
+        import tree_sitter_typescript as _tsts
+
+        # TSX parser handles JS, JSX, TS, and TSX (superset grammar)
+        _TSX_LANG = tree_sitter.Language(_tsts.language_tsx())
+        parser = tree_sitter.Parser(_TSX_LANG)
+        tree = parser.parse(source.encode("utf-8"))
+        root = tree.root_node
+
+        symbols: List[SymbolInfo] = []
+        # Track class spans for method parent resolution
+        class_spans: List[tuple] = []  # (name, start_line, end_line)
+
+        def _node_name(node) -> str:
+            """Extract identifier from a declaration node."""
+            for child in node.children:
+                if child.type in ("identifier", "type_identifier", "property_identifier"):
+                    return child.text.decode()
+            return ""
+
+        def _sig(node) -> str:
+            """Build a human-readable signature from the node's first lines."""
+            start = node.start_point[0]
+            sig = lines[start].strip()
+            for i in range(start + 1, min(start + 5, len(lines))):
+                ln = lines[i].strip()
+                sig += " " + ln
+                if "{" in ln or "=>" in ln:
+                    break
+            return sig[:200]
+
+        def _classify_value(decl_node) -> str:
+            """What does a variable_declarator's RHS look like?"""
+            for child in decl_node.children:
+                if child.type == "variable_declarator":
+                    # Walk the declarator's children to find the value
+                    past_eq = False
+                    for vc in child.children:
+                        if not past_eq:
+                            if vc.type == "=" or vc.text == b"=":
+                                past_eq = True
+                            continue
+                        if vc.type == "arrow_function":
+                            return "arrow"
+                        elif vc.type == "call_expression":
+                            return "call"
+                        elif vc.type in ("template_string", "object", "array"):
+                            return "value"
+                        elif vc.type == "parenthesized_expression":
+                            # Check inside: could be an IIFE or wrapped arrow
+                            for pc in vc.children:
+                                if pc.type == "arrow_function":
+                                    return "arrow"
+                            return "other"
+                        else:
+                            return "other"
+            return "unknown"
+
+        def _add(name: str, sym_type_str: str, node, parent: Optional[str] = None):
+            start_line = node.start_point[0] + 1
+            end_line = node.end_point[0] + 1
+            indent = node.start_point[1]
+            code = "\n".join(lines[start_line - 1 : end_line])
+            stype_map = {
+                "CLASS": SymbolType.CLASS,
+                "FUNCTION": SymbolType.FUNCTION,
+                "ARROW_FUNCTION": SymbolType.ARROW_FUNCTION,
+                "METHOD": SymbolType.METHOD,
+                "VARIABLE": SymbolType.VARIABLE,
+            }
+            symbols.append(
+                SymbolInfo(
+                    name=name,
+                    symbol_type=stype_map.get(sym_type_str, SymbolType.VARIABLE),
+                    start_line=start_line,
+                    end_line=end_line,
+                    parent=parent,
+                    indentation=indent,
+                    code=code,
+                    signature=_sig(node),
+                )
+            )
+
+        def _process_class(cls_node, cls_name, outer=None):
+            target = outer or cls_node
+            _add(cls_name, "CLASS", target)
+            class_spans.append((cls_name, target.start_point[0] + 1, target.end_point[0] + 1))
+            for child in cls_node.children:
+                if child.type == "class_body":
+                    for member in child.children:
+                        if member.type == "method_definition":
+                            mname = _node_name(member)
+                            if mname:
+                                _add(mname, "METHOD", member, parent=cls_name)
+
+        def _process_decl(decl_node, outer=None):
+            target = outer or decl_node
+
+            if decl_node.type in ("function_declaration", "generator_function_declaration"):
+                name = _node_name(decl_node)
+                if name:
+                    _add(name, "FUNCTION", target)
+
+            elif decl_node.type in ("class_declaration", "abstract_class_declaration"):
+                name = _node_name(decl_node)
+                if name:
+                    _process_class(decl_node, name, outer=target)
+
+            elif decl_node.type in ("lexical_declaration", "variable_declaration"):
+                val_type = _classify_value(decl_node)
+                # Get the name from the first variable_declarator
+                name = ""
+                for child in decl_node.children:
+                    if child.type == "variable_declarator":
+                        for vc in child.children:
+                            if vc.type == "identifier":
+                                name = vc.text.decode()
+                                break
+                        break
+                if not name:
+                    return
+
+                start_l = target.start_point[0] + 1
+                end_l = target.end_point[0] + 1
+                size = end_l - start_l + 1
+
+                if val_type == "arrow":
+                    _add(name, "ARROW_FUNCTION", target)
+                elif val_type == "call":
+                    # HOC wrappers: React.memo(), forwardRef(), styled(), etc.
+                    if size >= 3:
+                        _add(name, "FUNCTION", target)
+                elif val_type == "value":
+                    # Template literals, objects, arrays — only if multi-line
+                    if size >= 3:
+                        _add(name, "VARIABLE", target)
+                else:
+                    if size >= 3:
+                        _add(name, "VARIABLE", target)
+
+        # ── Walk top-level statements ──────────────────────────────────
+        for child in root.children:
+            if child.type == "export_statement":
+                # Unwrap: export [default] <declaration>
+                inner = None
+                for ec in child.children:
+                    if ec.type in (
+                        "function_declaration", "generator_function_declaration",
+                        "class_declaration", "abstract_class_declaration",
+                        "lexical_declaration", "variable_declaration",
+                    ):
+                        inner = ec
+                        break
+                if inner:
+                    _process_decl(inner, outer=child)
+                else:
+                    # export default <expression> — check for inline fn/class
+                    for ec in child.children:
+                        if ec.type in ("function_declaration", "class_declaration"):
+                            _process_decl(ec, outer=child)
+
+            elif child.type in (
+                "function_declaration", "generator_function_declaration",
+                "class_declaration", "abstract_class_declaration",
+                "lexical_declaration", "variable_declaration",
+            ):
+                _process_decl(child)
+
+            elif child.type == "expression_statement":
+                # Route handlers: app.get('/path', (req, res) => { ... })
+                self._extract_route_handler(child, lines, symbols)
+
+        return symbols
+
+    def _extract_route_handler(self, expr_node, lines: List[str], symbols: List[SymbolInfo]):
+        """Extract Express/Fastify route handlers from expression_statements."""
+        # Look for: <obj>.<method>(<string>, <handler>)
+        import re as _re_rt
+        text = expr_node.text.decode()
+        m = _re_rt.match(
+            r"\s*(?:export\s+(?:default\s+)?)?(?:const\s+\w+\s*=\s*)?"
+            r"\w+\s*\.\s*(get|post|put|patch|delete|options|head|all)\s*\(\s*"
+            r"[`'\"]([^`'\"]+)[`'\"]",
+            text,
+        )
+        if not m:
+            return
+        if "{" not in text:
+            return
+
+        method = m.group(1).lower()
+        path = m.group(2)
+        slug = _re_rt.sub(r"[^A-Za-z0-9]+", "_", path).strip("_").lower()
+        name = f"route_{method}_{slug}" if slug else f"route_{method}"
+
+        start_line = expr_node.start_point[0] + 1
+        end_line = expr_node.end_point[0] + 1
+        code = "\n".join(lines[start_line - 1 : end_line])
+        sig_line = lines[start_line - 1].strip()
+
+        symbols.append(
+            SymbolInfo(
+                name=name,
+                symbol_type=SymbolType.FUNCTION,
+                start_line=start_line,
+                end_line=end_line,
+                parent=None,
+                indentation=0,
+                code=code,
+                signature=f"{method.upper()} {path}  —  {sig_line}",
+            )
+        )
+
+    # ─── JS/TS Regex Fallback (legacy) ───────────────────────────────────────
+
+    def _parse_js_ts_regex(self, source: str, lines: List[str]) -> List[SymbolInfo]:
+        """Regex + brace-counting fallback when tree-sitter is unavailable."""
         symbols: List[SymbolInfo] = []
 
-        # Class declarations
         class_re = re.compile(
             r"^(export\s+)?(abstract\s+)?class\s+(\w+)", re.MULTILINE
         )
-        # Function declarations
         func_re = re.compile(
             r"^(export\s+)?(export\s+default\s+)?(async\s+)?function\s*\*?\s*(\w+)\s*\(",
             re.MULTILINE,
         )
-        # Arrow functions assigned to const/let/var
-        # FIX v3.11.3: Added (?:\s*:\s*[^=\n]+?)? to handle TypeScript type annotations
-        # e.g. `export const LoginPage: React.FC = () => {` was previously invisible
         arrow_re = re.compile(
             r"^(export\s+)?(const|let|var)\s+(\w+)(?:\s*:\s*[^=\n]+?)?\s*=\s*(async\s+)?\(.*?\)\s*=>",
             re.MULTILINE,
         )
-        # Class methods (indented) — handles TS modifiers + return type annotations
-        method_re = re.compile(
-            r"^(\s+)(?:private\s+|protected\s+|public\s+|static\s+|abstract\s+|override\s+|readonly\s+)*(async\s+)?(\w+)\s*\([^)]*\)(?:\s*:\s*[^{\n]+)?\s*\{",
-            re.MULTILINE,
-        )
 
-        # Build class spans list: (class_name, start_line, end_line)
         class_spans = []
         for m in class_re.finditer(source):
             line_no = source[: m.start()].count("\n") + 1
@@ -239,37 +469,6 @@ class ASTParser:
                     end_line=end_line,
                     parent=None,
                     indentation=0,
-                    code="\n".join(lines[line_no - 1 : end_line]),
-                    signature=m.group(0).strip(),
-                )
-            )
-
-        def _class_for_line(lnum: int) -> Optional[str]:
-            for cname, cstart, cend in class_spans:
-                if cstart < lnum <= cend:
-                    return cname
-            return None
-
-        # Extract class methods (indented) — iterate method_re
-        _SKIP = {"if", "for", "while", "switch", "catch", "else", "return", "function", "class"}
-        for m in method_re.finditer(source):
-            line_no = source[: m.start()].count("\n") + 1
-            parent = _class_for_line(line_no)
-            if parent is None:
-                continue
-            method_name = m.group(3)
-            if method_name in _SKIP:
-                continue
-            end_line = self._find_block_end(lines, line_no - 1)
-            indent = len(m.group(1))
-            symbols.append(
-                SymbolInfo(
-                    name=method_name,
-                    symbol_type=SymbolType.METHOD,
-                    start_line=line_no,
-                    end_line=end_line,
-                    parent=parent,
-                    indentation=indent,
                     code="\n".join(lines[line_no - 1 : end_line]),
                     signature=m.group(0).strip(),
                 )
@@ -309,249 +508,7 @@ class ASTParser:
                 )
             )
 
-        # ── React HOC wrappers: React.memo(), forwardRef(), lazy() ──
-        # These wrap a function/component in a higher-order call.  The inner
-        # braces live inside the memo() paren, so _find_block_end's brace
-        # tracker misses them.  Instead we scan forward for the closing ");".
-        hoc_re = re.compile(
-            r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*"
-            r"(?:React\.)?(?:memo|forwardRef|lazy)\s*\(",
-            re.MULTILINE,
-        )
-        _hoc_existing = {s.start_line for s in symbols}
-        closing_re = re.compile(r"^\}?\s*\)\s*;?\s*$")
-        for m in hoc_re.finditer(source):
-            line_no = source[: m.start()].count("\n") + 1
-            if line_no in _hoc_existing:
-                continue
-            name = m.group(1)
-            decl_line = lines[line_no - 1]
-            start_indent = len(decl_line) - len(decl_line.lstrip())
-            # Skip one-liners where parens balance on the same line
-            paren_depth = 0
-            for ch in decl_line:
-                if ch == "(":
-                    paren_depth += 1
-                elif ch == ")":
-                    paren_depth -= 1
-            if paren_depth == 0:
-                continue
-            # Scan forward for closing "})" or ")" at start indent
-            end_line = len(lines)
-            for scan_i in range(line_no, len(lines)):
-                ln = lines[scan_i]
-                stripped = ln.strip()
-                if not stripped:
-                    continue
-                cur_indent = len(ln) - len(ln.lstrip())
-                if cur_indent <= start_indent and closing_re.match(stripped):
-                    end_line = scan_i + 1
-                    break
-            symbols.append(
-                SymbolInfo(
-                    name=name,
-                    symbol_type=SymbolType.FUNCTION,
-                    start_line=line_no,
-                    end_line=end_line,
-                    parent=None,
-                    indentation=0,
-                    code="\n".join(lines[line_no - 1 : end_line]),
-                    signature=m.group(0).strip(),
-                )
-            )
-
-        # ── Multi-line destructured arrow functions ──
-        # Catches `const X = (\n  prop1,\n) => {` where the opening paren
-        # is on the declaration line but `=>` is on a subsequent line.
-        # _find_block_end already handles these correctly (brace at paren
-        # depth 0 on the `=> {` line).
-        ml_arrow_re = re.compile(
-            r"^(?:export\s+)?(?:const|let|var)\s+(\w+)\s*=\s*\(",
-            re.MULTILINE,
-        )
-        _ml_existing = {s.start_line for s in symbols}
-        for m in ml_arrow_re.finditer(source):
-            line_no = source[: m.start()].count("\n") + 1
-            if line_no in _ml_existing:
-                continue
-            name = m.group(1)
-            # Confirm `=>` exists within 20 lines
-            is_arrow = False
-            for scan_i in range(line_no - 1, min(line_no + 19, len(lines))):
-                if re.search(r"\)\s*=>", lines[scan_i]):
-                    is_arrow = True
-                    break
-            if not is_arrow:
-                continue
-            end_line = self._find_block_end(lines, line_no - 1)
-            symbols.append(
-                SymbolInfo(
-                    name=name,
-                    symbol_type=SymbolType.ARROW_FUNCTION,
-                    start_line=line_no,
-                    end_line=end_line,
-                    parent=None,
-                    indentation=0,
-                    code="\n".join(lines[line_no - 1 : end_line]),
-                    signature=m.group(0).strip(),
-                )
-            )
-
-        # Module-level VALUE constants — template literals and large object/array
-        # literals that are NOT arrow functions. e.g. `const CSS = \`...500 lines...\``
-        # or a big config object. Without this pass such a constant is invisible to
-        # the editor, so any edit that targets it (a CSS block, a config map) can
-        # never resolve and is silently dropped. Only sizeable multi-line values
-        # are indexed so the symbol map is not flooded with trivial scalars.
-        value_const_re = re.compile(
-            r"^(?:export\s+)?(?:export\s+default\s+)?(const|let|var)\s+(\w+)"
-            r"(?:\s*:\s*[^=\n]+?)?\s*=\s*([`{\[])",
-            re.MULTILINE,
-        )
-        _value_existing = {s.start_line for s in symbols}
-        for m in value_const_re.finditer(source):
-            line_no = source[: m.start()].count("\n") + 1
-            if line_no in _value_existing:
-                continue  # already captured (e.g. arrow-function const)
-            opener_off = m.end() - 1  # offset of the ` { or [ opener
-            end_line = self._find_value_end(source, opener_off)
-            if end_line - line_no + 1 < 3:
-                continue  # too small to be worth indexing — avoid map bloat
-            name = m.group(2)
-            symbols.append(
-                SymbolInfo(
-                    name=name,
-                    symbol_type=SymbolType.VARIABLE,
-                    start_line=line_no,
-                    end_line=end_line,
-                    parent=None,
-                    indentation=0,
-                    code="\n".join(lines[line_no - 1 : end_line]),
-                    signature=lines[line_no - 1].strip()[:120],
-                )
-            )
-
-        # Express / Fastify / Koa-style route handlers passed as anonymous callbacks.
-        # e.g. router.post('/api/batch-search', async (req, res) => { ... })
-        # These hold the bulk of the logic in a routes file, yet none of the patterns
-        # above match them (there is no name binding). We synthesize a stable,
-        # targetable name from the HTTP verb + route path so the surgeon can edit
-        # them with full QA instead of degrading to manual instructions.
-        route_re = re.compile(
-            r"^\s*(?:export\s+(?:default\s+)?)?(?:const\s+\w+\s*=\s*)?"
-            r"\w+\s*\.\s*(get|post|put|patch|delete|options|head|all)\s*\(\s*"
-            r"[`'\"]([^`'\"]+)[`'\"]\s*,",
-            re.MULTILINE,
-        )
-        _existing_starts = {s.start_line for s in symbols}
-        _route_seen: dict = {}
-        for m in route_re.finditer(source):
-            line_no = source[: m.start()].count("\n") + 1
-            if line_no in _existing_starts:
-                continue  # already captured by another pattern
-            end_line = self._find_block_end(lines, line_no - 1)
-            code = "\n".join(lines[line_no - 1 : end_line])
-            if "{" not in code:
-                continue  # not a real handler body (e.g. a router mount)
-            method = m.group(1).lower()
-            path = m.group(2)
-            slug = re.sub(r"[^A-Za-z0-9]+", "_", path).strip("_").lower()
-            base = f"route_{method}_{slug}" if slug else f"route_{method}"
-            if base in _route_seen:
-                _route_seen[base] += 1
-                name = f"{base}_{_route_seen[base]}"
-            else:
-                _route_seen[base] = 0
-                name = base
-            symbols.append(
-                SymbolInfo(
-                    name=name,
-                    symbol_type=SymbolType.FUNCTION,
-                    start_line=line_no,
-                    end_line=end_line,
-                    parent=None,
-                    indentation=0,
-                    code=code,
-                    signature=f"{method.upper()} {path}  —  {lines[line_no - 1].strip()}",
-                )
-            )
-
         return symbols
-
-    def _skip_template(self, source: str, i: int) -> int:
-        """Given i at an opening backtick, return the index of the matching
-        closing backtick (handles \\ escapes and nested ${ } interpolations,
-        which may themselves contain template literals). If unterminated,
-        returns the last index."""
-        n = len(source)
-        i += 1  # past opening backtick
-        while i < n:
-            c = source[i]
-            if c == "\\":
-                i += 2
-                continue
-            if c == "`":
-                return i
-            if c == "$" and i + 1 < n and source[i + 1] == "{":
-                depth = 1
-                i += 2
-                while i < n and depth > 0:
-                    cc = source[i]
-                    if cc == "\\":
-                        i += 2
-                        continue
-                    if cc == "`":
-                        i = self._skip_template(source, i)
-                    elif cc == "{":
-                        depth += 1
-                    elif cc == "}":
-                        depth -= 1
-                    i += 1
-                continue
-            i += 1
-        return n - 1
-
-    def _find_value_end(self, source: str, start_offset: int) -> int:
-        """Given start_offset at an opening delimiter (` { or [) of a value
-        expression, return the 1-based line number of the matching close.
-        String- and template-literal-aware so delimiters inside strings are
-        ignored. Falls back to end-of-file when unbalanced."""
-        n = len(source)
-        opener = source[start_offset]
-        if opener == "`":
-            end = self._skip_template(source, start_offset)
-            return source[:end].count("\n") + 1
-        # object / array literal — balance braces/brackets, skipping string
-        # and template-literal contents.
-        i = start_offset
-        depth = 0
-        while i < n:
-            c = source[i]
-            if c == "\\":
-                i += 2
-                continue
-            if c in ('"', "'"):
-                q = c
-                i += 1
-                while i < n:
-                    if source[i] == "\\":
-                        i += 2
-                        continue
-                    if source[i] == q:
-                        break
-                    i += 1
-            elif c == "`":
-                i = self._skip_template(source, i)
-            elif c in "{[":
-                depth += 1
-            elif c in "}]":
-                depth -= 1
-                if depth == 0:
-                    return source[:i].count("\n") + 1
-            i += 1
-        return source.count("\n") + 1
-
-    # ─── Go Parser ───────────────────────────────────────────────────────────
 
     def _parse_go(self, source: str, lines: List[str]) -> List[SymbolInfo]:
         symbols: List[SymbolInfo] = []
