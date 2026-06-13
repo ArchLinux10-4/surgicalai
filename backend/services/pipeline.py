@@ -3925,7 +3925,7 @@ NEW CODE (complete — this is what the Surgeon produced):
 OTHER FILES IN SESSION (for cross-file checking):
 {other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_qa_feedback_block}
 
-{("\n\nOTHER CHANGES IN THIS SAME REQUEST (planned but reviewed separately — cross-symbol deps covered by these should be scored as warnings, not blocks):\n" + same_run_context + "\n") if same_run_context else ""}Compare ORIGINAL CODE → NEW CODE directly. Run all 8 checks and return the JSON verdict.
+{("\n\nOTHER CHANGES IN THIS SAME REQUEST (these companion edits are shipping together with this one):\nIMPORTANT: If a concern you find (e.g. missing import, missing CDN tag, missing function) is RESOLVED by one of the companion edits listed below, do NOT lower the score for it. Score this edit as if the companion changes are already applied.\n" + same_run_context + "\n") if same_run_context else ""}Compare ORIGINAL CODE → NEW CODE directly. Run all 8 checks and return the JSON verdict.
 
 ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 {_risks_block}"""
@@ -5932,10 +5932,15 @@ USER REQUEST:
                 # Build context for QA about other changes in this same request
                 _same_run_ctx = ""
                 if len(targets) > 1:
-                    _other_descs = [_ot.description for _oj, _ot in enumerate(targets)
-                                    if _oj != i and getattr(_ot, "description", "")]
-                    if _other_descs:
-                        _same_run_ctx = "\n".join(f"  \u2022 {_d}" for _d in _other_descs[:6])
+                    _other_summaries = []
+                    for _oj, _ot in enumerate(targets):
+                        if _oj != i and getattr(_ot, "description", ""):
+                            _ot_sym = getattr(_ot, "symbol_path", "unknown")
+                            _other_summaries.append(
+                                f"  \u2022 [{_ot_sym} in {matched_name}] {_ot.description}"
+                            )
+                    if _other_summaries:
+                        _same_run_ctx = "\n".join(_other_summaries[:6])
 
                 _qa_result = await run_qa_agent(
                     original_code=_effective_original,
@@ -9078,6 +9083,18 @@ async def run_natural_pipeline_stream(
             for r in resolved_edits if r["edit_data"].get("description")
         ]
 
+        # v3.13.0: Richer companion-edit context for QA cross-dependency awareness
+        _all_edit_summaries = []
+        for _re in resolved_edits:
+            _ed = _re["edit_data"]
+            _sym_name = _re["symbol"].name if _re.get("symbol") else "unknown"
+            _fname = _re.get("filename", "")
+            _all_edit_summaries.append({
+                "symbol": _sym_name,
+                "filename": _fname,
+                "description": _ed.get("description", ""),
+            })
+
         from models.schemas import QAResult as _QAResult
 
         # Pre-build diffs and change shells (no I/O — instant)
@@ -9113,7 +9130,8 @@ async def run_natural_pipeline_stream(
             _tgt, _repl = _compute_target_element(symbol.code, new_code)
 
             _same_run = "\n".join(
-                f"  \u2022 {d}" for j, d in enumerate(_all_descriptions) if j != i and d
+                f"  \u2022 [{s['symbol']} in {s['filename']}] {s['description']}"
+                for j, s in enumerate(_all_edit_summaries) if j != i and s["description"]
             )
 
             _targeted_ctx = ""
@@ -9633,6 +9651,53 @@ async def run_natural_pipeline_stream(
         # skipped (QA could not run), unscored, or below 8 after every retry is
         # excluded from changes_by_file and surfaced in skipped_changes so the
         # user sees exactly what was withheld and why. Nothing below 8 ships.
+        # ── v3.13.0: Same-file companion gate elevation ─────────────────
+        # If edits to the same file form a batch, and at least one edit in
+        # that batch passes the hard gate (>=8), elevate companion edits
+        # from warning (score 5-7) to pass. Edits scored "blocked" (1-4)
+        # stay blocked — those have real bugs, not cross-dependency issues.
+        # This prevents half-done states (e.g. CDN tag ships but the
+        # function that uses it gets blocked).
+        _file_groups = {}  # filename -> list of indices
+        for _gi, _cs in enumerate(change_shells):
+            _file_groups.setdefault(_cs["filename"], []).append(_gi)
+
+        for _gfname, _gindices in _file_groups.items():
+            if len(_gindices) < 2:
+                continue  # single edit, no companion logic needed
+            # Check if any edit in this file group already passes
+            _any_passed = any(
+                qa_results[_gi].get("qa_score") is not None
+                and qa_results[_gi].get("qa_score") >= 8
+                and qa_results[_gi].get("verdict") not in ("blocked", "skipped")
+                for _gi in _gindices
+            )
+            if not _any_passed:
+                continue
+            for _gi in _gindices:
+                _gqa = qa_results[_gi]
+                _gscore = _gqa.get("qa_score")
+                _gverdict = _gqa.get("verdict", "skipped")
+                # Elevate warning (5-7) to safe — companion already passed
+                if _gscore is not None and 5 <= _gscore <= 7 and _gverdict == "warning":
+                    _old_score = _gscore
+                    _gqa["qa_score"] = 8
+                    _gqa["verdict"] = "safe"
+                    _gqa["summary"] = (
+                        f"[companion-elevated from {_old_score}/10] "
+                        + _gqa.get("summary", "")
+                    )
+                    _dlog("qa_companion_elevation",
+                          session_id=session_id,
+                          filename=_gfname,
+                          symbol=change_shells[_gi]["symbol"].name,
+                          old_score=_old_score,
+                          new_score=8,
+                          companion_group=[
+                              change_shells[_cgi]["symbol"].name for _cgi in _gindices
+                          ],
+                          user_id=user_id)
+
         _GATE_MIN = 8
         for i, (cs, qa_dict) in enumerate(zip(change_shells, qa_results)):
             symbol = cs["symbol"]
