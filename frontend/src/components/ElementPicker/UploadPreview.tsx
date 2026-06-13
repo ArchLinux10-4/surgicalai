@@ -253,10 +253,17 @@ export function UploadPreview() {
           </div>
         ) : fileContent ? (
           <div className="h-full bg-white">
-            {/* No sessionId/fileId — forces single-file stub mode, avoids import resolution errors */}
+            {/* Pass sessionId/fileId so the preview uses the backend bundle
+                endpoint — exactly like LivePreview. This resolves real npm deps
+                (e.g. @mui/icons-material) instead of stubbing them, which is the
+                only way the file renders correctly. fillHeight makes it fill the
+                modal instead of the inline 440px default. */}
             <PickablePreview
               code={fileContent}
               filename={filename}
+              sessionId={activeSessions ?? undefined}
+              fileId={activeFileId ?? undefined}
+              fillHeight
             />
           </div>
         ) : (

@@ -28,6 +28,10 @@ interface PickablePreviewProps {
   modifiedCode?: string
   sessionId?: string
   fileId?: string
+  /* When true, the preview fills its parent's height instead of the fixed
+     440px used inline. Used by the full-height Element Picker modal. This only
+     affects outer container sizing — the Sandpack rendering is unchanged. */
+  fillHeight?: boolean
 }
 
 /* The resolved import graph returned by the backend preview-bundle endpoint. */
@@ -197,7 +201,7 @@ function usePickModeBroadcast() {
 }
 
 /* ─── Component ────────────────────────────────────────────────── */
-export function PickablePreview({ code, filename, modifiedCode, sessionId, fileId }: PickablePreviewProps) {
+export function PickablePreview({ code, filename, modifiedCode, sessionId, fileId, fillHeight }: PickablePreviewProps) {
   const { theme } = useThemeStore()
   const [expanded, setExpanded] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
@@ -243,12 +247,12 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
     }
   }, [isHtml, sessionId, fileId, src, refreshKey])
 
-  const previewStyle: React.CSSProperties = expanded
+  const previewStyle: React.CSSProperties = (expanded || fillHeight)
     ? { flex: 1, minHeight: 0, width: '100%' }
     : { height: '440px', width: '100%' }
 
   const containerCls = `flex flex-col rounded-lg border border-border overflow-hidden${
-    expanded ? ' fixed inset-4 z-50 bg-base' : ''
+    expanded ? ' fixed inset-4 z-50 bg-base' : fillHeight ? ' h-full rounded-none border-0' : ''
   }`
 
   const resolvedCount = bundle ? Object.keys(bundle.files).length : 0
