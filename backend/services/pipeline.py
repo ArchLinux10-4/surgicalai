@@ -7450,14 +7450,17 @@ async def _retry_truncated_edit(
     }]
 
     try:
-        resp = await aclient.messages.create(
+        _chunks = []
+        async with aclient.messages.stream(
             model=arch_model,
             max_tokens=64000,
             system=focused_system,
             messages=focused_messages,
-        )
+        ) as _stream:
+            async for _t in _stream.text_stream:
+                _chunks.append(_t)
 
-        text = resp.content[0].text.strip()
+        text = "".join(_chunks).strip()
 
         EDIT_OPEN = "<surgical_edit>"
         EDIT_CLOSE = "</surgical_edit>"
@@ -7543,12 +7546,12 @@ async def _execute_single_edit(
         call_kwargs.update(_get_thinking_kwargs(model, 10000))
         call_kwargs.update(_get_effort_kwargs(model))
 
-        resp = await aclient.messages.create(**call_kwargs)
+        _chunks = []
+        async with aclient.messages.stream(**call_kwargs) as _stream:
+            async for _t in _stream.text_stream:
+                _chunks.append(_t)
 
-        text = ""
-        for block in resp.content:
-            if hasattr(block, "text"):
-                text += block.text
+        text = "".join(_chunks)
 
         EDIT_OPEN = "<surgical_edit>"
         EDIT_CLOSE = "</surgical_edit>"
@@ -8424,7 +8427,32 @@ async def run_natural_pipeline_stream(
             _dlog("no_edits_produced",
                   session_id=session_id, user_id=user_id,
                   response_length=len(full_response),
-                  had_thinking=had_thinking)
+                  had_thinking=had_thinking,
+                  skipped_count=len(skipped_changes_struct),
+                  skipped_details=skipped_changes_struct[:10])
+            # If plan tasks ran but all failed, report the errors to the user
+            if skipped_changes_struct:
+                _sk_detail = "\n".join(
+                    f"• **{s.get('symbol', '?')}** in `{s.get('filename', '?')}`: {s.get('reason', 'unknown')}"
+                    for s in skipped_changes_struct[:10]
+                )
+                _fail_msg = (
+                    f"I planned {len(skipped_changes_struct)} change(s) but all of them failed:\n\n"
+                    f"{_sk_detail}\n\n"
+                    "This usually means the file is very large. Try pointing me at a specific "
+                    "section or symbol to edit, and I\'ll take a more focused approach."
+                )
+                _fail_result = {
+                    "intent": "edit",
+                    "summary": f"{len(skipped_changes_struct)} planned change(s) — all failed",
+                    "reasoning": "All planned edits failed before producing any code.",
+                    "risks": [],
+                    "skipped_changes": skipped_changes_struct,
+                    "changes_by_file": {},
+                    "new_files": [],
+                    "natural_text": _fail_msg,
+                }
+                yield sse({"type": "smart_result", "content": json.dumps(_fail_result)})
             yield sse({"type": "done", "content": ""})
             return
 
