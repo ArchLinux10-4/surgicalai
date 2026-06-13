@@ -8137,6 +8137,16 @@ async def run_natural_pipeline_stream(
                       terms=raw_terms,
                       reason=reason,
                           user_id=user_id)
+                # --- debug: context size tracking per search round ---
+                if search_round > 0:
+                    _ctx_chars = sum(len(str(m.get("content",""))) for m in current_messages)
+                    _dlog("search_round_context",
+                          session_id=session_id,
+                          round=search_round,
+                          message_count=len(current_messages),
+                          total_chars=_ctx_chars,
+                          estimated_tokens=_ctx_chars // 4,
+                          user_id=user_id)
 
                 # Budget exhausted — do one forced-edit round, then stop
                 if search_round >= MAX_SEARCH_ROUNDS or _forced_edit_round_done:
@@ -8273,6 +8283,12 @@ async def run_natural_pipeline_stream(
             yield sse({"type": "thinking_end", "content": ""})
         if state == "in_edit" and edit_buf.strip():
             edit_blocks_raw.append(edit_buf)
+            _dlog("edit_buf_edge_flush",
+                  session_id=session_id,
+                  length=len(edit_buf),
+                  first_200=edit_buf[:200],
+                  last_200=edit_buf[-200:],
+                  user_id=user_id)
             yield sse({"type": "edit_end", "content": ""})
         elif state == "in_file" and file_buf.strip():
             new_file_blocks_raw.append(file_buf)
@@ -8447,6 +8463,22 @@ async def run_natural_pipeline_stream(
                 return -1
         pending_edits.sort(key=_ln_sort_key, reverse=True)
 
+        _block_inventory = []
+        for _bi, _braw in enumerate(edit_blocks_raw):
+            _block_inventory.append({
+                "idx": _bi,
+                "length": len(_braw),
+                "has_xml_tags": "<function_calls>" in _braw or "<invoke" in _braw,
+                "has_json_brace": "{" in _braw,
+                "first_120": _braw[:120],
+                "last_120": _braw[-120:],
+            })
+        if _block_inventory:
+            _dlog("raw_block_inventory",
+                  session_id=session_id,
+                  blocks=_block_inventory,
+                  user_id=user_id)
+
         _eb_summary = []
         for _b in pending_edits:
             try:
@@ -8489,18 +8521,45 @@ async def run_natural_pipeline_stream(
             still_unresolved = []
 
             for edit_raw in pending_edits:
+                _parse_err_1 = _parse_err_2 = _parse_err_3 = None
                 try:
                     edit_data = json.loads(edit_raw.strip())
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as _e1:
+                    _parse_err_1 = str(_e1)
                     try:
                         edit_data = json.loads(_repair_json(edit_raw.strip()))
-                    except Exception:
-                        skipped_changes_struct.append({
-                            "filename": "(unknown)",
-                            "symbol": "(truncated)",
-                            "reason": "Edit block was truncated or malformed — Claude may have hit the output token limit",
-                        })
-                        continue
+                    except Exception as _e2:
+                        _parse_err_2 = str(_e2)
+                        # Third fallback: strip XML/text prefix, then repair
+                        try:
+                            _cleaned = _extract_json_from_text(edit_raw)
+                            edit_data = json.loads(_repair_json(_cleaned.strip() if isinstance(_cleaned, str) else json.dumps(_cleaned)))
+                            _dlog("edit_parse_recovered",
+                                  session_id=session_id,
+                                  method="extract_json_from_text+repair",
+                                  raw_len=len(edit_raw),
+                                  user_id=user_id)
+                        except Exception as _e3:
+                            _parse_err_3 = str(_e3)
+                            _fn_m = re.search(r'"filename"\s*:\s*"([^"]+)"', edit_raw)
+                            _sym_m = re.search(r'"symbol"\s*:\s*"([^"]+)"', edit_raw)
+                            _dlog("edit_parse_failed",
+                                  session_id=session_id,
+                                  raw_preview=edit_raw[:300],
+                                  raw_tail=edit_raw[-200:],
+                                  raw_len=len(edit_raw),
+                                  err_direct=_parse_err_1,
+                                  err_repair=_parse_err_2,
+                                  err_extract=_parse_err_3,
+                                  filename_hint=_fn_m.group(1) if _fn_m else None,
+                                  symbol_hint=_sym_m.group(1) if _sym_m else None,
+                                  user_id=user_id)
+                            skipped_changes_struct.append({
+                                "filename": _fn_m.group(1) if _fn_m else "(unknown)",
+                                "symbol": _sym_m.group(1) if _sym_m else "(truncated)",
+                                "reason": "Edit block was truncated or malformed — Claude may have hit the output token limit",
+                            })
+                            continue
 
                 filename = edit_data.get("filename", "")
                 symbol_name = edit_data.get("symbol", "")
