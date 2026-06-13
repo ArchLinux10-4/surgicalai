@@ -2352,7 +2352,7 @@ async def analyze_and_plan_stream(
 
             model_kwargs = {
                 "model": architect_model,
-                "max_tokens": 16000,
+                "max_tokens": 64000,
                 "system": CLAUDE_EDITOR_SYSTEM,
                 "messages": messages,
             }
@@ -2588,7 +2588,7 @@ async def analyze_and_plan_stream(
                     ]
                     _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
                         model=architect_model,
-                        max_tokens=16000,
+                        max_tokens=64000,
                         system=CLAUDE_EDITOR_SYSTEM,
                         messages=_retry_msgs,
                     )
@@ -4362,7 +4362,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 claude_msgs = conversation_history[-HISTORY_WINDOW:] + [{"role": "user", "content": user_request}]
                 async with aclient.messages.stream(
                     model=chat_model,
-                    max_tokens=16000,
+                    max_tokens=64000,
                     **_get_thinking_kwargs(chat_model, 10000),
                     **_get_effort_kwargs(chat_model),
                     system=system,
@@ -4728,7 +4728,7 @@ USER REQUEST:
                     try:
                         async with aclient.messages.stream(
                             model=arch_model,
-                            max_tokens=16000,
+                            max_tokens=64000,
                             **_get_thinking_kwargs(arch_model, 10000),
                             **_get_effort_kwargs(arch_model),
                             system=_architect_system,
@@ -4777,7 +4777,7 @@ USER REQUEST:
                             try:
                                 async with aclient.messages.stream(
                                     model=arch_model,
-                                    max_tokens=16000,
+                                    max_tokens=64000,
                                     **_get_thinking_kwargs(arch_model, 10000),
                                     **_get_effort_kwargs(arch_model),
                                     system=_architect_system,
@@ -7453,7 +7453,7 @@ async def _retry_truncated_edit(
     try:
         resp = await aclient.messages.create(
             model=arch_model,
-            max_tokens=16000,
+            max_tokens=64000,
             system=focused_system,
             messages=focused_messages,
         )
@@ -7537,11 +7537,11 @@ async def _execute_single_edit(
     try:
         call_kwargs = {
             "model": model,
-            "max_tokens": 16000,
+            "max_tokens": 64000,
             "system": focused_system,
             "messages": [{"role": "user", "content": focused_user}],
         }
-        call_kwargs.update(_get_thinking_kwargs(model, 4000))
+        call_kwargs.update(_get_thinking_kwargs(model, 10000))
         call_kwargs.update(_get_effort_kwargs(model))
 
         resp = await aclient.messages.create(**call_kwargs)
@@ -8643,33 +8643,6 @@ async def run_natural_pipeline_stream(
 
                         _accum_base = _symbol_accum.get(_akey, symbol.code)
                         _sym_abs_start = getattr(symbol, "start_line", 1) or 1
-                        _sym_abs_end = getattr(symbol, "end_line", None) or (_sym_abs_start + len(_accum_base.splitlines()) - 1)
-
-                        # ── Out-of-symbol fallback ────────────────────────
-                        # If the edit targets lines outside the matched symbol
-                        # (e.g. file-header comments, top-level imports before
-                        # the first AST symbol), promote to a whole-file virtual
-                        # symbol so the splice can succeed.  This prevents the
-                        # correction loop that fails when no symbol covers the
-                        # target lines.
-                        _total_lines = len(file_content.splitlines())
-                        if (_isl < _sym_abs_start or _iel > _sym_abs_end) and 1 <= _isl <= _iel <= _total_lines:
-                            _dlog("line_edit_outside_symbol_fallback",
-                                  session_id=session_id,
-                                  filename=filename,
-                                  symbol=symbol_name,
-                                  edit_lines=f"{_isl}-{_iel}",
-                                  symbol_lines=f"{_sym_abs_start}-{_sym_abs_end}",
-                                  action="promoting to whole-file virtual symbol",
-                                  user_id=user_id)
-                            _accum_base = file_content
-                            _sym_abs_start = 1
-                            # Re-key accumulator so future edits to this virtual
-                            # symbol use the updated whole-file content.
-                            _akey = (filename, filename.rsplit("/", 1)[-1])
-                            symbol_name = filename.rsplit("/", 1)[-1]
-                            edit_data["symbol"] = symbol_name
-
                         full_new, ok_snip, snip_reason = _apply_snippet_by_lines(
                             _accum_base, _sym_abs_start,
                             _isl, _iel,
@@ -9443,7 +9416,7 @@ async def run_natural_pipeline_stream(
                     idx,
                     asyncio.create_task(aclient.messages.create(
                         model=arch_model,
-                        max_tokens=16000,
+                        max_tokens=64000,
                         system=system_prompt,
                         messages=correction_messages,
                     ))
