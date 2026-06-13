@@ -1460,6 +1460,7 @@ export function LandingPage() {
     }
 
     function run() {
+      if (!container) return;
       container.innerHTML = '';
 
       // Phase 1: type a status line like the QA terminal
