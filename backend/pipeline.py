@@ -8643,6 +8643,33 @@ async def run_natural_pipeline_stream(
 
                         _accum_base = _symbol_accum.get(_akey, symbol.code)
                         _sym_abs_start = getattr(symbol, "start_line", 1) or 1
+                        _sym_abs_end = getattr(symbol, "end_line", None) or (_sym_abs_start + len(_accum_base.splitlines()) - 1)
+
+                        # ── Out-of-symbol fallback ────────────────────────
+                        # If the edit targets lines outside the matched symbol
+                        # (e.g. file-header comments, top-level imports before
+                        # the first AST symbol), promote to a whole-file virtual
+                        # symbol so the splice can succeed.  This prevents the
+                        # correction loop that fails when no symbol covers the
+                        # target lines.
+                        _total_lines = len(file_content.splitlines())
+                        if (_isl < _sym_abs_start or _iel > _sym_abs_end) and 1 <= _isl <= _iel <= _total_lines:
+                            _dlog("line_edit_outside_symbol_fallback",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  symbol=symbol_name,
+                                  edit_lines=f"{_isl}-{_iel}",
+                                  symbol_lines=f"{_sym_abs_start}-{_sym_abs_end}",
+                                  action="promoting to whole-file virtual symbol",
+                                  user_id=user_id)
+                            _accum_base = file_content
+                            _sym_abs_start = 1
+                            # Re-key accumulator so future edits to this virtual
+                            # symbol use the updated whole-file content.
+                            _akey = (filename, filename.rsplit("/", 1)[-1])
+                            symbol_name = filename.rsplit("/", 1)[-1]
+                            edit_data["symbol"] = symbol_name
+
                         full_new, ok_snip, snip_reason = _apply_snippet_by_lines(
                             _accum_base, _sym_abs_start,
                             _isl, _iel,
