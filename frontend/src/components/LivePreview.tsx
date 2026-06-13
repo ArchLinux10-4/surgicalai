@@ -313,7 +313,7 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
   }
 
   // Re-mount Sandpack whenever the file set or refresh key changes.
-  const sandpackKey = `${refreshKey}-${bundle ? 'graph' : 'single'}-${Object.keys(sandpackFiles).length}`
+  const sandpackKey = `${refreshKey}-${bundle ? 'graph' : 'single'}-${Object.keys(sandpackFiles).length}-${src.length}`
 
   return (
     <div className={containerCls}>
