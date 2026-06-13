@@ -1,25 +1,27 @@
 /**
- * PickablePreview — near-duplicate of LivePreview with element picker layered on top.
+ * PickablePreview — LivePreview + element picker.
  *
- * ALL rendering logic (prepareCode, buildStub, detectComponent, bundle fetching,
- * Sandpack config) is copied verbatim from LivePreview.tsx so behavior is identical.
- * The only additions are:
- *   1. Picker script injection into Sandpack / HTML iframe
- *   2. postMessage handling for element selection
- *   3. Pick-mode state from elementPickerStore
+ * This file is a COPY of LivePreview.tsx with only picker additions.
+ * ALL rendering logic (helpers, Sandpack config, bundle fetching, toolbar,
+ * fullscreen, error boundary) is identical to LivePreview.
  *
- * DO NOT refactor these helpers into a shared file — keeping them duplicated
- * ensures this file never diverges from LivePreview's proven rendering path.
+ * DO NOT modify rendering logic here — if LivePreview changes, copy it here too.
  */
 
-import React, { useState, useCallback, useEffect, useRef, useMemo, Component } from 'react'
+import React, { useState, useCallback, useEffect, useMemo, Component } from 'react'
 import { SandpackProvider, SandpackPreview } from '@codesandbox/sandpack-react'
 import { useThemeStore } from '../../stores/themeStore'
-import { useElementPickerStore } from '../../stores/elementPickerStore'
+import { Fullscreen, FullscreenExit, Refresh } from '@mui/icons-material'
 import { api } from '../../api/client'
+import { useElementPickerStore } from '../../stores/elementPickerStore'
 import { PICKER_SCRIPT } from './pickerScript'
 
-/* ─── Types ────────────────────────────────────────────────────── */
+/* ─── Public API ───────────────────────────────────────────────── */
+// isVisualFile is exported from LivePreview, not duplicated here
+function _isVisualFile(filename: string): boolean {
+  return /\.(tsx|jsx|html|htm)$/i.test(filename)
+}
+
 interface PickablePreviewProps {
   code: string
   filename: string
@@ -28,6 +30,7 @@ interface PickablePreviewProps {
   fileId?: string
 }
 
+/* The resolved import graph returned by the backend preview-bundle endpoint. */
 interface PreviewBundle {
   entry: string
   entryImport: string
@@ -38,7 +41,7 @@ interface PreviewBundle {
   component: string
 }
 
-/* ─── Error boundary — identical to LivePreview ────────────────── */
+/* ─── Error boundary — shows compile errors instead of a blank screen ── */
 interface EBState { error: string | null }
 class PreviewErrorBoundary extends Component<
   { children: React.ReactNode; onError?: (msg: string) => void },
@@ -67,7 +70,7 @@ class PreviewErrorBoundary extends Component<
   }
 }
 
-/* ─── Helpers — COPIED VERBATIM from LivePreview.tsx ───────────── */
+/* ─── Fallback helpers (used only when no session graph is available) ───── */
 function detectComponent(code: string): string {
   return (
     code.match(/export\s+default\s+(?:function|class)\s+([A-Z]\w*)/)?.[1] ||
@@ -95,13 +98,6 @@ function prepareCode(raw: string): string {
   code = code.replace(
     /^import\s+(.+?)\s+from\s+['"](\.{1,2}[^'"]+)['"]\s*;?\s*$/gm,
     (_, spec, path) => buildStub(spec, path)
-  )
-
-  // Catch-all: stub any remaining npm imports (not handled above)
-  // Skips react/react-dom (provided by Sandpack template)
-  code = code.replace(
-    /^import\s+(.+?)\s+from\s+['"](?!react['"\/]|react-dom['"\/])([^'".][^'"]*)['"]\s*;?\s*$/gm,
-    (_, spec, path) => buildStub(spec, `npm: ${path}`)
   )
   if (/import\.meta\.env/.test(code)) {
     const envStub = `const __import_meta_env__ = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : {};\n`
@@ -146,7 +142,8 @@ const BASE_DEPS: Record<string, string> = {
   'tailwind-merge': 'latest',
 }
 
-/* ─── Picker message hooks ─────────────────────────────────────── */
+
+/* ─── Picker message hooks (ONLY additions over LivePreview) ──── */
 function usePickerMessages() {
   const addElement = useElementPickerStore((s) => s.addElement)
   const removeElement = useElementPickerStore((s) => s.removeElement)
@@ -170,11 +167,9 @@ function usePickerMessages() {
   }, [addElement, removeElement, setPickMode])
 }
 
-/* ── Broadcast pick-mode changes to all Sandpack iframes ───────── */
 function usePickModeBroadcast() {
   const pickMode = useElementPickerStore((s) => s.pickMode)
 
-  // Listen for sai-picker-ready from Sandpack iframe, then send mode
   useEffect(() => {
     function onReady(e: MessageEvent) {
       if (e.data?.type === 'sai-picker-ready' && e.source) {
@@ -188,7 +183,6 @@ function usePickModeBroadcast() {
     return () => window.removeEventListener('message', onReady)
   }, [pickMode])
 
-  // Broadcast to existing iframes on mode change
   useEffect(() => {
     const iframes = document.querySelectorAll('iframe')
     iframes.forEach((f) => {
@@ -197,7 +191,7 @@ function usePickModeBroadcast() {
           { type: pickMode ? 'sai-picker-enable' : 'sai-picker-disable' },
           '*'
         )
-      } catch { /* cross-origin — picker will catch via sai-picker-ready */ }
+      } catch { /* cross-origin */ }
     })
   }, [pickMode])
 }
@@ -211,6 +205,8 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
   const [bundle, setBundle] = useState<PreviewBundle | null>(null)
   const [bundleLoading, setBundleLoading] = useState(false)
 
+
+  // ── Picker hooks (ONLY addition over LivePreview) ──────────────
   usePickerMessages()
   usePickModeBroadcast()
 
@@ -223,7 +219,7 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
   const isHtml = /\.html?$/i.test(filename)
   const apiBase = (import.meta as any).env?.VITE_API_URL || ''
 
-  /* ── Resolve the full import graph from the session ───────────── */
+  /* ── Resolve the full import graph from the session (components + CSS + deps) ── */
   useEffect(() => {
     if (isHtml || !sessionId || !fileId) {
       setBundle(null)
@@ -237,7 +233,7 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
         if (!cancelled) setBundle(b && b.files ? b : null)
       })
       .catch(() => {
-        if (!cancelled) setBundle(null)
+        if (!cancelled) setBundle(null) // graceful fall back to single-file mode
       })
       .finally(() => {
         if (!cancelled) setBundleLoading(false)
@@ -258,11 +254,10 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
   const resolvedCount = bundle ? Object.keys(bundle.files).length : 0
   const unresolvedCount = bundle ? bundle.unresolved.length : 0
 
-  /* ── Toolbar — identical to LivePreview ──────────────────────── */
   const toolbar = (
     <div className="flex items-center justify-between px-3 py-1.5 bg-surface border-b border-border flex-shrink-0">
       <div className="flex items-center gap-2 min-w-0">
-        <span className="text-[11px] text-muted font-mono truncate">🎯 {filename}</span>
+        <span className="text-[11px] text-muted font-mono truncate">👁 {filename}</span>
         {resolvedCount > 1 && (
           <span
             className="text-[10px] text-accent/80 bg-accent/10 px-1.5 py-0.5 rounded flex-shrink-0"
@@ -288,23 +283,24 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
       <div className="flex gap-1">
         <button
           onClick={handleRefresh}
-          className="p-1 rounded hover:bg-hover text-muted hover:text-fg text-[11px]"
+          className="p-1 rounded hover:bg-hover text-muted hover:text-fg"
           title="Reload preview"
         >
-          ↻
+          <Refresh sx={{ fontSize: 11 }} />
         </button>
         <button
           onClick={() => setExpanded((e) => !e)}
-          className="p-1 rounded hover:bg-hover text-muted hover:text-fg text-[11px]"
-          title={expanded ? 'Collapse' : 'Fullscreen'}
+          className="p-1 rounded hover:bg-hover text-muted hover:text-fg"
+          title={expanded ? 'Collapse' : 'Expand'}
         >
-          {expanded ? '⊡' : '⛶'}
+          {expanded ? <FullscreenExit sx={{ fontSize: 11 }} /> : <Fullscreen sx={{ fontSize: 11 }} />}
         </button>
       </div>
     </div>
   )
 
-  /* ── HTML: inject picker into srcDoc ───────────────────────────── */
+
+  /* ── Picker: inject script into HTML srcDoc ──────────────────── */
   const htmlWithPicker = useMemo(() => {
     if (!isHtml) return ''
     const scriptTag = `<script>${PICKER_SCRIPT}<\/script>`
@@ -313,6 +309,7 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
     return src + scriptTag
   }, [src, isHtml])
 
+  /* ── Option A: HTML via backend URL or srcdoc ─────────────────── */
   if (isHtml) {
     const previewUrl =
       sessionId && fileId
@@ -329,7 +326,7 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
               src={previewUrl}
               sandbox="allow-scripts allow-same-origin"
               style={{ width: '100%', height: '100%', border: 'none', background: 'transparent', display: 'block' }}
-              title={`Pick elements: ${filename}`}
+              title={`Preview: ${filename}`}
             />
           ) : (
             <iframe
@@ -337,7 +334,7 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
               sandbox="allow-scripts"
               srcDoc={htmlWithPicker}
               style={{ width: '100%', height: '100%', border: 'none', background: 'transparent', display: 'block' }}
-              title={`Pick elements: ${filename}`}
+              title={`Preview: ${filename}`}
             />
           )}
         </div>
@@ -345,7 +342,8 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
     )
   }
 
-  /* ── Loading state while bundle resolves ─────────────────────── */
+  /* ── While the graph is resolving, hold the frame (avoids a flash of the
+        single-file fallback that then remounts as the full bundle). ── */
   if (sessionId && fileId && bundleLoading && !bundle) {
     return (
       <div className={containerCls}>
@@ -357,12 +355,12 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
     )
   }
 
-  /* ── TSX/JSX via Sandpack — identical to LivePreview + picker ── */
+  /* ── Option B: TSX/JSX via Sandpack ──────────────────────────── */
   let sandpackFiles: Record<string, string>
   let sandpackDeps: Record<string, string>
 
   if (bundle && bundle.files) {
-    // Full module graph — same as LivePreview, with picker added
+    // Full module graph: real components + CSS + declared npm deps.
     const harness = [
       "import './sai-picker';",
       "import React from 'react';",
@@ -379,7 +377,7 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
     }
     sandpackDeps = { ...BASE_DEPS, ...(bundle.dependencies || {}) }
   } else {
-    // Single-file stub mode — same as LivePreview, with picker added
+    // Fallback: single-file stub mode (no session context available).
     const componentName = detectComponent(src)
     const hasDefault = /export\s+default\s+/.test(src)
     const processedCode = prepareCode(src)
@@ -400,6 +398,7 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
     sandpackDeps = BASE_DEPS
   }
 
+  // Re-mount Sandpack whenever the file set or refresh key changes.
   const sandpackKey = `${refreshKey}-${bundle ? 'graph' : 'single'}-${Object.keys(sandpackFiles).length}`
 
   return (
@@ -415,6 +414,8 @@ export function PickablePreview({ code, filename, modifiedCode, sessionId, fileI
             theme={theme === 'dark' ? 'dark' : 'light'}
             customSetup={{ dependencies: sandpackDeps }}
             options={{
+              // Load Tailwind synchronously before first paint so utility
+              // classes are present on the initial render, not a frame late.
               externalResources: ['https://cdn.tailwindcss.com/3.4.1'],
             }}
           >
