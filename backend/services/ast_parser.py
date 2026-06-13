@@ -1148,7 +1148,7 @@ class ASTParser:
         depth_brace = 0
         depth_paren = 0
         found_open = False
-        for i in range(start_idx, min(start_idx + 2000, len(lines))):
+        for i in range(start_idx, len(lines)):
             for ch in lines[i]:
                 if ch == "(":
                     depth_paren += 1
@@ -1164,7 +1164,7 @@ class ASTParser:
                         return i + 1  # 1-based
 
         # Fallback: indentation-based (Python style)
-        for i in range(start_idx + 1, min(start_idx + 2000, len(lines))):
+        for i in range(start_idx + 1, len(lines)):
             line = lines[i]
             if line.strip() == "":
                 continue
