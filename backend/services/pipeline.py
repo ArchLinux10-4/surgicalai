@@ -5135,21 +5135,25 @@ USER REQUEST:
                         if not _sfcontent:
                             continue
                         # Pass 1: exact AST symbol match
+                        if _sm is None or not hasattr(_sm, "symbols") or not _sm.symbols:
+                            # No symbol map — skip to Pass 2 grep
+                            pass
                         _matched_sym = None
-                        for _sym_name, _sym_info in _sm.items():
-                            if _st_oai.lower() in _sym_name.lower():
-                                _matched_sym = _sym_info
-                                break
+                        if _sm is not None and hasattr(_sm, "symbols") and _sm.symbols:
+                            for _sym_info in _sm.symbols:
+                                if _st_oai.lower() in _sym_info.name.lower() or _st_oai.lower() in _sym_info.full_path.lower():
+                                    _matched_sym = _sym_info
+                                    break
                         if _matched_sym:
-                            _sym_start = _matched_sym.get("start_line", 1) - 1
-                            _sym_end = _matched_sym.get("end_line", _sym_start + 1)
+                            _sym_start = _matched_sym.start_line - 1
+                            _sym_end = _matched_sym.end_line
                             _sf_lines = _sfcontent.split("\n")
                             _snippet = "\n".join(
                                 f"L{_sym_start+i+1}: {_sf_lines[_sym_start+i]}"
                                 for i in range(min(_sym_end - _sym_start, 80))
                                 if _sym_start + i < len(_sf_lines)
                             )
-                            _term_result += f"\n--- {_sfname}: symbol '{_sym_name}' (L{_sym_start+1}-{_sym_end}) ---\n{_snippet}\n"
+                            _term_result += f"\n--- {_sfname}: symbol '{_matched_sym.full_path}' (L{_sym_start+1}-{_sym_end}) ---\n{_snippet}\n"
                             continue
 
                         # Pass 2: keyword grep, expand to enclosing symbol
@@ -5157,9 +5161,9 @@ USER REQUEST:
                         for _li, _ln in enumerate(_sf_lines):
                             if _st_oai.lower() in _ln.lower():
                                 _enc_start, _enc_end = max(0, _li - 15), min(len(_sf_lines), _li + 25)
-                                for _sym_name2, _sym_info2 in _sm.items():
-                                    s2 = _sym_info2.get("start_line", 0) - 1
-                                    e2 = _sym_info2.get("end_line", 0)
+                                for _sym_info2 in (_sm.symbols if _sm is not None and hasattr(_sm, "symbols") and _sm.symbols else []):
+                                    s2 = _sym_info2.start_line - 1
+                                    e2 = _sym_info2.end_line
                                     if s2 <= _li < e2:
                                         _enc_start = s2
                                         _enc_end = min(e2, s2 + 80)
