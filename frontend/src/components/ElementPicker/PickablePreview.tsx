@@ -93,8 +93,15 @@ function prepareCode(raw: string): string {
     (_, spec, path) => buildStub(spec, `@/ alias: ${path}`)
   )
   code = code.replace(
-    /^import\s+(.+?)\s+from\s+['"](\\.{1,2}[^'"]+)['"]\s*;?\s*$/gm,
+    /^import\s+(.+?)\s+from\s+['"](\.{1,2}[^'"]+)['"]\s*;?\s*$/gm,
     (_, spec, path) => buildStub(spec, path)
+  )
+
+  // Catch-all: stub any remaining npm imports (not handled above)
+  // Skips react/react-dom (provided by Sandpack template)
+  code = code.replace(
+    /^import\s+(.+?)\s+from\s+['"](?!react['"\/]|react-dom['"\/])([^'".][^'"]*)['"]\s*;?\s*$/gm,
+    (_, spec, path) => buildStub(spec, `npm: ${path}`)
   )
   if (/import\.meta\.env/.test(code)) {
     const envStub = `const __import_meta_env__ = typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env : {};\n`
@@ -125,6 +132,7 @@ function buildStub(spec: string, pathComment: string): string {
   ).join('\n')
 }
 
+/* Base files always present in the Sandpack workspace. */
 const BASE_INDEX_CSS = [
   '*, *::before, *::after { box-sizing: border-box; }',
   'html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; }',
