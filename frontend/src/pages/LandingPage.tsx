@@ -1490,7 +1490,7 @@ export function LandingPage() {
                 badge.style.opacity = '0';
                 badge.style.transform = 'translateY(6px)';
                 badge.style.transition = 'opacity .5s ease, transform .5s ease';
-                container.appendChild(badge);
+                container!.appendChild(badge);
                 requestAnimationFrame(() => requestAnimationFrame(() => {
                   badge.style.opacity = '1';
                   badge.style.transform = 'none';
@@ -1514,7 +1514,7 @@ export function LandingPage() {
 
             line.appendChild(sign);
             line.appendChild(code);
-            container.appendChild(line);
+            container!.appendChild(line);
 
             // Trigger reflow then animate visible
             requestAnimationFrame(() => requestAnimationFrame(() => line.classList.add('visible')));
