@@ -105,7 +105,27 @@ except ImportError:
 parser = ASTParser()
 
 # Models that do NOT accept a temperature parameter (reasoning / latest-gen models)
-NO_TEMPERATURE_MODELS = {"gpt-5", "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini"}
+NO_TEMPERATURE_MODELS = {
+    "gpt-5", "gpt-5-mini", "gpt-5-nano",
+    "gpt-5.1", "gpt-5.1-mini", "gpt-5.1-codex",
+    "gpt-5.2", "gpt-5.2-pro",
+    "gpt-5.3",
+    "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
+    "gpt-5.5", "gpt-5.5-pro",
+    "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini",
+}
+
+# Models that support the reasoning_effort parameter (none/low/medium/high/xhigh).
+# When set in settings, _chat_create will pass it automatically.
+REASONING_EFFORT_MODELS = {
+    "gpt-5", "gpt-5-mini", "gpt-5-nano",
+    "gpt-5.1", "gpt-5.1-mini", "gpt-5.1-codex",
+    "gpt-5.2", "gpt-5.2-pro",
+    "gpt-5.3",
+    "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
+    "gpt-5.5", "gpt-5.5-pro",
+    "o3", "o3-mini", "o4-mini",
+}
 
 # ── Prompt engineering constants ──────────────────────────────────────────────
 HISTORY_WINDOW       = 20   # turns of conversation history passed to every prompt
@@ -438,9 +458,14 @@ def _friendly_error(e: Exception) -> str:
 
 def _chat_create(client: OpenAI, model: str, messages: list, temperature: float = 0.3, **kwargs):
     """Wrapper around client.chat.completions.create that drops temperature
-    for models that don't support it (GPT-5, o-series reasoning models)."""
+    for reasoning models and injects reasoning_effort when configured."""
     base_model = model.split(":")[0].lower()
     if base_model in NO_TEMPERATURE_MODELS:
+        # Inject reasoning_effort for models that support it, unless caller overrode it
+        if base_model in REASONING_EFFORT_MODELS and "reasoning_effort" not in kwargs:
+            _re = get_setting("reasoning_effort", "")
+            if _re and _re.lower() in ("none", "low", "medium", "high", "xhigh"):
+                kwargs["reasoning_effort"] = _re.lower()
         return client.chat.completions.create(model=model, messages=messages, **kwargs)
     return client.chat.completions.create(model=model, messages=messages, temperature=temperature, **kwargs)
 
