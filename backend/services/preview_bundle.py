@@ -76,7 +76,7 @@ _RE_SIDE = re.compile(
 )
 _RE_DYNAMIC = re.compile(r"""\b(?:import|require)\s*\(\s*['"]([^'"]+)['"]\s*\)""")
 
-_RE_HAS_DEFAULT = re.compile(r"export\s+default\b")
+_RE_HAS_DEFAULT = re.compile(r"^\s*export\s+default\b", re.MULTILINE)
 
 
 def is_bare(spec: str) -> bool:
