@@ -274,6 +274,25 @@ def _transform(
             return f"/* [type import removed: {spec}] */"
 
         if is_bare(spec):
+            # MUI icon deep imports (e.g. @mui/icons-material/Login) fail in
+            # Sandpack's in-browser bundler — the package is too large and deep
+            # subpath resolution breaks, leaving the import as `undefined`.
+            # Stub them as lightweight SVG placeholder components instead.
+            if spec.startswith("@mui/icons-material/"):
+                names = re.findall(r"\b([A-Za-z_]\w*)\b", clause.split(" as ")[-1])
+                local = names[0] if names else "_Icon"
+                return (
+                    f"import React from 'react';\n"
+                    f"const {local} = (props: any) => React.createElement('svg', "
+                    f"{{...props, viewBox: '0 0 24 24', "
+                    f"width: props?.sx?.fontSize || props?.style?.fontSize || 24, "
+                    f"height: props?.sx?.fontSize || props?.style?.fontSize || 24, "
+                    f"fill: 'currentColor', "
+                    f"style: {{...(props?.style || {{}}), display: 'inline-block', verticalAlign: 'middle'}}}}, "
+                    f"React.createElement('rect', {{width: 18, height: 18, x: 3, y: 3, rx: 3, fill: 'currentColor', opacity: 0.18}})"
+                    f");  /* icon stub: {spec} */"
+                )
+
             pkg = package_name(spec)
             if pkg not in _PROVIDED:
                 deps.setdefault(pkg, "latest")
