@@ -350,10 +350,6 @@ export function SettingsModal() {
           <div className="flex-1 overflow-y-auto p-6 min-w-0">
             {tab === 'api' && (
               <div className="space-y-4">
-                {false && <>
-                <SectionHeader title="OpenAI API Key" subtitle="Required for all AI features" />
-                </>}
-
                 {/* Anthropic / Claude Key */}
                 <div>
                   <SectionHeader title="Anthropic API Key" subtitle="Required — SurgicalAI runs on Claude" />
@@ -407,6 +403,59 @@ export function SettingsModal() {
                   </div>
                 </div>
 
+                {/* OpenAI Key */}
+                <div className="mt-6 pt-5 border-t border-border">
+                  <SectionHeader title="OpenAI API Key" subtitle="Optional — enables GPT-5, o3, o4-mini" />
+                  <div className="mt-3">
+                    <div className="flex gap-2">
+                      <div className="relative flex-1">
+                        <input
+                          type={showKey ? 'text' : 'password'}
+                          value={apiKey}
+                          onChange={(e) => { setApiKey(e.target.value); setKeyStatus('idle') }}
+                          onPaste={(e) => {
+                            e.preventDefault()
+                            const pasted = e.clipboardData.getData('text').trim()
+                            if (pasted) { setApiKey(pasted); setKeyStatus('idle') }
+                          }}
+                          placeholder={settings?.openai_api_key_set ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' : 'sk-proj-\u2026'}
+                          className={`input pr-10 ${keyStatus === 'ok' ? 'border-success focus:border-success' : keyStatus === 'error' ? 'border-danger' : ''}`}
+                          onKeyDown={(e) => e.key === 'Enter' && handleVerifyKey()}
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                        <button
+                          onClick={() => setShowKey(!showKey)}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-faint hover:text-muted"
+                        >
+                          {showKey ? <VisibilityOff sx={{ fontSize: 14 }} /> : <Visibility sx={{ fontSize: 14 }} />}
+                        </button>
+                      </div>
+                      <button
+                        onClick={handleVerifyKey}
+                        disabled={verifying || !apiKey.trim()}
+                        className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {verifying ? '\u2026' : 'Verify'}
+                      </button>
+                    </div>
+                    {settings?.openai_api_key_set && keyStatus === 'idle' && (
+                      <div className="flex items-center gap-1.5 mt-2 text-success text-xs">
+                        <CheckCircle sx={{ fontSize: 12 }} /> OpenAI API key configured
+                      </div>
+                    )}
+                    {keyStatus === 'ok' && <div className="text-success text-xs mt-2">{keyMessage}</div>}
+                    {keyStatus === 'error' && <div className="text-danger text-xs mt-2">{keyMessage}</div>}
+                    <div className="text-[11px] text-faint mt-2">
+                      Get your key at{' '}
+                      <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" className="text-accent hover:underline">
+                        platform.openai.com
+                      </a>
+                      {' '}\u2014 enables GPT-5, o3 & o4-mini
+                    </div>
+                  </div>
+                </div>
+
                 {false && <div className="mt-6 pt-5 border-t border-border">
                   <SectionHeader title="Google Gemini API Key" subtitle="Enables Gemini 2.5 Pro/Flash" />
                 </div>}
@@ -415,9 +464,9 @@ export function SettingsModal() {
 
             {tab === 'models' && (
               <div className="space-y-5">
-                <SectionHeader title="Model Configuration" subtitle="Select which Claude model powers SurgicalAI" />
+                <SectionHeader title="Model Configuration" subtitle="Select which AI model powers SurgicalAI" />
 
-                <Field label="Claude Model">
+                <Field label="AI Model">
                   <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect').map((m) => ({ value: m.id, label: `${m.name} \u2014 ${m.description}` }))} />
                 </Field>
 

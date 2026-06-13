@@ -90,8 +90,21 @@ def get_available_models(request: Request):
          "description": "Fastest Claude — great for quick edits and simple changes", "provider": "anthropic"},
     ]
 
+    # OpenAI models — only shown when an OpenAI key is configured
+    openai_models = []
+    has_openai = bool(_resolve_api_key(user_id, "openai"))
+    if has_openai:
+        openai_models = [
+            {"id": "gpt-5", "name": "GPT-5", "role": "architect",
+             "description": "Latest GPT — powerful general-purpose model", "provider": "openai"},
+            {"id": "o3", "name": "o3", "role": "architect",
+             "description": "Advanced reasoning — best for complex logic and analysis", "provider": "openai"},
+            {"id": "o4-mini", "name": "o4-mini", "role": "architect",
+             "description": "Fast reasoning — quick and cost-effective", "provider": "openai"},
+        ]
+
     return {
-        "models": claude_models,
+        "models": claude_models + openai_models,
         "pipeline_modes": [
             {"id": "auto", "name": "Auto", "description": "SurgicalAI natural pipeline (recommended)"},
         ]

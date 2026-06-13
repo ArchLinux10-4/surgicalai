@@ -1353,7 +1353,7 @@ export function ChatPanel() {
               className="text-[11px] font-mono text-muted/70 hover:text-accent bg-overlay/40 hover:bg-overlay px-1.5 py-0.5 rounded transition-colors leading-none flex items-center gap-1"
               title="Change model"
             >
-              {settings?.architect_model || 'gpt-4.1'}
+              {settings?.architect_model || 'claude-sonnet-4-6'}
               <span className="text-[9px]">▾</span>
             </button>
             {modelPickerOpen && (
