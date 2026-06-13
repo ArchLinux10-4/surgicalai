@@ -131,6 +131,7 @@ REASONING_EFFORT_MODELS = {
 HISTORY_WINDOW       = 20   # turns of conversation history passed to every prompt
 TEXT_SEARCH_WINDOW   = 75   # ±lines around a text hit when no symbol contains the line
 SYMBOL_FOCUS_WINDOW  = 100  # ±lines to slice when a symbol is huge but text is inside it
+LARGE_FILE_WINDOW    = 500  # files above this get windowed context instead of full dump
 
 # ── Shared chat persona ───────────────────────────────────────────────────────
 CHAT_PERSONA = (
@@ -6746,6 +6747,119 @@ def _smart_code_context(fname: str, content: str, smap, user_request: str,
     )
 
 
+def _build_focused_window(
+    fname: str, content: str, smap, user_request: str,
+    window_size: int = 300,
+    session_id: str = "", user_id: str = "",
+) -> str:
+    """
+    Tasklet-style windowed context for large files.
+
+    Instead of dumping the entire file (which causes model output truncation
+    on files >500 lines), show a focused window around the most relevant
+    section with absolute line numbers.  The model can then make precise
+    edits using edit_start_line / edit_end_line — zero string-matching risk.
+
+    Strategy:
+      1. Extract search terms from user_request
+      2. Score every line by term matches
+      3. Find the densest cluster via sliding window
+      4. Show that window with line numbers + summary of what's outside
+      5. Fall back to symbol-based centering, then first lines
+
+    The model can always use <search_request> to see other parts of the file.
+    """
+    lines = content.splitlines()
+    total = len(lines)
+
+    if total <= window_size:
+        # File fits in window — show everything with line numbers
+        numbered = "\n".join(f"{i+1:5d}: {line}" for i, line in enumerate(lines))
+        _dlog("focused_window_full",
+              session_id=session_id, user_id=user_id,
+              filename=fname, total_lines=total,
+              reason="file_fits_in_window")
+        return numbered
+
+    # ── Extract search terms ─────────────────────────────────────────────
+    terms = _extract_search_terms(user_request)
+    _STOP = {'the', 'a', 'an', 'is', 'it', 'in', 'on', 'to', 'fix', 'bug',
+             'add', 'make', 'get', 'set', 'and', 'for', 'not', 'are', 'was',
+             'has', 'had', 'but', 'can', 'all', 'any', 'new', 'use'}
+    for word in re.findall(r'\b[a-zA-Z]{3,6}\b', user_request):
+        wl = word.lower()
+        if wl not in _STOP and wl not in {t.lower() for t in terms}:
+            terms.append(word)
+
+    # ── Score every line by term matches ──────────────────────────────────
+    line_scores = [0] * total
+    if terms:
+        for i, line in enumerate(lines):
+            ll = line.lower()
+            for term in terms:
+                if term.lower() in ll:
+                    line_scores[i] += 1
+
+    # ── Find densest cluster via sliding window ──────────────────────────
+    best_score = 0
+    best_start = 0
+    window_reason = "default_start"
+
+    if terms and any(s > 0 for s in line_scores):
+        current = sum(line_scores[:window_size])
+        best_score = current
+        for i in range(1, total - window_size + 1):
+            current = current - line_scores[i - 1] + line_scores[i + window_size - 1]
+            if current > best_score:
+                best_score = current
+                best_start = i
+        window_reason = "term_cluster"
+
+    # If no term matches, try to center on most relevant symbol
+    if best_score == 0 and smap and hasattr(smap, 'symbols') and smap.symbols:
+        scored_syms = []
+        for sym in smap.symbols:
+            sc = _score_symbol_relevance(sym, terms) if terms else 0
+            scored_syms.append((sc, sym))
+        scored_syms.sort(key=lambda x: -x[0])
+
+        if scored_syms and scored_syms[0][0] > 0:
+            target = scored_syms[0][1]
+            center = (target.start_line + target.end_line) // 2
+            best_start = max(0, center - window_size // 2)
+            window_reason = f"symbol:{target.full_path}"
+        else:
+            # No relevance signal — show first portion (imports/setup at top
+            # provides orientation for the model)
+            best_start = 0
+            window_reason = "no_signal_start"
+
+    ws = best_start
+    we = min(total, ws + window_size)
+
+    # ── Build output with line numbers ────────────────────────────────────
+    parts = []
+    if ws > 0:
+        parts.append(f"... [{ws} lines above — use <search_request> to view] ...\n")
+
+    numbered = "\n".join(f"{i+1:5d}: {lines[i]}" for i in range(ws, we))
+    parts.append(numbered)
+
+    if we < total:
+        parts.append(f"\n... [{total - we} lines below — use <search_request> to view] ...")
+
+    _dlog("focused_window_built",
+          session_id=session_id, user_id=user_id,
+          filename=fname, total_lines=total,
+          window_start=ws + 1, window_end=we,
+          window_size_actual=we - ws,
+          window_reason=window_reason,
+          terms_used=terms[:10],
+          best_score=best_score)
+
+    return "\n".join(parts)
+
+
 def _fuzzy_find_symbol(smap, symbol_name: str):
     """
     Comprehensive symbol finder — tries 6 strategies before giving up.
@@ -7062,6 +7176,8 @@ def _build_natural_file_context(
     project_memory: str = None,
     session_summary: str = "",
     full_context_limit: int = 8,
+    session_id: str = "",
+    user_id: str = "",
 ) -> str:
     """
     Build the file context string for the natural pipeline.
@@ -7177,16 +7293,26 @@ def _build_natural_file_context(
                 f"FILE: {fname} ({lines_count} lines)\n"
                 f"SYMBOL INDEX (use these EXACT names in surgical_edit):\n{sym_index}\n"
             )
-            # Show full content for Tier-1 files up to 2500 lines.
-            # Truncation caused anchor-miss failures: Claude invented anchors
-            # for lines it never saw. Tasklet model: see everything you edit.
-            # Above 2500 lines: fall back to smart context (generous 1500-line
-            # per-symbol cap) to avoid overwhelming the context window.
-            if lines_count <= 2500:
+            if lines_count <= LARGE_FILE_WINDOW:
+                # Small-to-medium file — show full content (no truncation risk)
                 header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
             else:
-                smart = _smart_code_context(fname, content, smap, "", max_code_lines=lines_count)
-                header += f"\n[FILE > 2500 lines — showing top symbols up to 1500 lines]\n{smart}\n"
+                # Large file — Tasklet-style windowed context with line numbers.
+                # Instead of dumping thousands of lines (which causes model
+                # output truncation), show a focused window around the likely
+                # edit zone.  The model uses edit_start_line/edit_end_line for
+                # precise edits and <search_request> to explore other sections.
+                window = _build_focused_window(
+                    fname, content, smap, user_request,
+                    window_size=300,
+                    session_id=session_id, user_id=user_id,
+                )
+                header += (
+                    f"\n⚠️ LARGE FILE ({lines_count} lines) — showing focused window with line numbers.\n"
+                    f"Use edit_start_line/edit_end_line for precise edits. "
+                    f"Use <search_request> to see other sections.\n\n"
+                    f"```\n{window}\n```\n"
+                )
             return header
         else:
             preview = content[:1500] + (f"\n...[{len(content)-1500} chars]" if len(content) > 1500 else "")
@@ -7550,21 +7676,83 @@ async def _execute_single_edit(
     focused_system = (
         "You are SurgicalAI. Produce exactly ONE <surgical_edit> block for the requested change.\n\n"
         "Rules:\n"
-        "- Include the COMPLETE edited symbol (or use targeted old_code/new_code for large symbols)\n"
+        "- For large files: use edit_start_line/edit_end_line (absolute line numbers shown in context)\n"
+        "- For small symbols you can see entirely: include the COMPLETE edited symbol in new_code\n"
+        "- For large symbols: use targeted old_code/new_code or edit_start_line/edit_end_line\n"
         "- Match original indentation exactly\n"
         "- Copy ALL unchanged lines verbatim\n"
-        "- The JSON must have: filename, symbol, description, new_code (and optionally old_code)\n"
+        "- The JSON must have: filename, symbol, description, new_code (and optionally old_code, "
+        "or edit_start_line + edit_end_line)\n"
         "- Do NOT produce explanatory text outside the <surgical_edit> block\n"
     )
 
-    focused_user = (
-        f"Edit the symbol `{symbol_name}` in `{filename}`.\n\n"
-        f"Change: {change_description}\n\n"
-        f"User\'s original request: {user_request}\n\n"
-        f"{sym_index}"
-        f"File content:\n```\n{file_content}\n```\n\n"
-        "Produce exactly ONE <surgical_edit> block now."
-    )
+    # For large files, show a focused window around the target symbol
+    # instead of the full file content (prevents output truncation).
+    file_lines = file_content.splitlines()
+    file_line_count = len(file_lines)
+
+    if file_line_count > LARGE_FILE_WINDOW and symbol_map and hasattr(symbol_map, 'symbols'):
+        # Find target symbol to center the window
+        target_sym = None
+        for s in symbol_map.symbols:
+            if getattr(s, 'full_path', '') == symbol_name or getattr(s, 'name', '') == symbol_name:
+                target_sym = s
+                break
+
+        if target_sym:
+            # Show the full symbol + 50 lines padding for surrounding context
+            padding = 50
+            ws = max(0, target_sym.start_line - 1 - padding)
+            we = min(file_line_count, target_sym.end_line + padding)
+            window_parts = []
+            if ws > 0:
+                window_parts.append(f"... [{ws} lines above] ...\n")
+            numbered = "\n".join(
+                f"{i+1:5d}: {file_lines[i]}" for i in range(ws, we)
+            )
+            window_parts.append(numbered)
+            if we < file_line_count:
+                window_parts.append(
+                    f"\n... [{file_line_count - we} lines below] ..."
+                )
+            file_display = "\n".join(window_parts)
+
+            _dlog("execute_task_windowed",
+                  session_id=session_id, user_id=user_id,
+                  filename=filename, symbol=symbol_name,
+                  total_lines=file_line_count,
+                  window_start=ws + 1, window_end=we,
+                  symbol_start=target_sym.start_line,
+                  symbol_end=target_sym.end_line)
+        else:
+            # Symbol not found in map — show full content as fallback
+            file_display = file_content
+            _dlog("execute_task_no_window",
+                  session_id=session_id, user_id=user_id,
+                  filename=filename, symbol=symbol_name,
+                  total_lines=file_line_count,
+                  reason="symbol_not_found_in_map")
+
+        focused_user = (
+            f"Edit the symbol `{symbol_name}` in `{filename}`.\n\n"
+            f"Change: {change_description}\n\n"
+            f"User's original request: {user_request}\n\n"
+            f"{sym_index}"
+            f"⚠️ LARGE FILE ({file_line_count} lines) — showing focused window "
+            f"with absolute line numbers.\n"
+            f"Use edit_start_line/edit_end_line for precise edits.\n\n"
+            f"File content (focused):\n```\n{file_display}\n```\n\n"
+            "Produce exactly ONE <surgical_edit> block now."
+        )
+    else:
+        focused_user = (
+            f"Edit the symbol `{symbol_name}` in `{filename}`.\n\n"
+            f"Change: {change_description}\n\n"
+            f"User's original request: {user_request}\n\n"
+            f"{sym_index}"
+            f"File content:\n```\n{file_content}\n```\n\n"
+            "Produce exactly ONE <surgical_edit> block now."
+        )
 
     try:
         call_kwargs = {
@@ -7682,7 +7870,8 @@ async def run_natural_pipeline_stream(
         # ── Build file context ────────────────────────────────────────────
         file_context = _build_natural_file_context(
             session_files, symbol_maps_by_name, user_request,
-            project_memory=project_memory, session_summary=session_summary
+            project_memory=project_memory, session_summary=session_summary,
+            session_id=session_id, user_id=user_id,
         )
         _dlog("file_context_built",
               session_id=session_id,
