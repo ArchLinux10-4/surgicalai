@@ -256,6 +256,19 @@ html{scroll-behavior:smooth}
 .sai-diff-code{color:var(--e-txt)}
 .sai-diff-line.minus .sai-diff-code{color:rgba(248,113,113,.85)}
 .sai-diff-line.plus .sai-diff-code{color:rgba(52,211,153,.9)}
+.sai-diff-line.anim{opacity:0;transform:translateX(-10px);transition:opacity .45s ease,transform .45s ease}
+.sai-diff-line.anim.visible{opacity:1;transform:none}
+.sai-diff-line.anim:nth-child(1){transition-delay:.1s}
+.sai-diff-line.anim:nth-child(2){transition-delay:.2s}
+.sai-diff-line.anim:nth-child(3){transition-delay:.4s}
+.sai-diff-line.anim:nth-child(4){transition-delay:.55s}
+.sai-diff-line.anim:nth-child(5){transition-delay:.7s}
+.sai-diff-line.anim:nth-child(6){transition-delay:.95s}
+.sai-diff-line.anim:nth-child(7){transition-delay:1.1s}
+.sai-diff-line.anim:nth-child(8){transition-delay:1.25s}
+.sai-diff-line.anim:nth-child(9){transition-delay:1.4s}
+.sai-diff-cursor{display:inline-block;width:7px;height:14px;background:#a78bfa;vertical-align:middle;margin-left:2px;border-radius:1px;animation:sai-diff-blink 1s step-end infinite}
+@keyframes sai-diff-blink{0%,100%{opacity:1}50%{opacity:0}}
 
 /* INTEGRATIONS */
 .sai-integ-grid{display:grid;grid-template-columns:1fr 1fr;gap:64px;align-items:center}
@@ -1399,6 +1412,135 @@ export function LandingPage() {
     return () => obs.disconnect();
   }, []);
 
+  // ── Diff demo animation ─────────────────────────────────────────────────
+  useEffect(() => {
+    const container = document.getElementById('diffDemo');
+    if (!container) return;
+
+    let fired = false;
+    let cursorEl: HTMLElement | null = null;
+
+    function setCursor(parent: HTMLElement) {
+      removeCursor();
+      cursorEl = document.createElement('span');
+      cursorEl.className = 'sai-diff-cursor';
+      parent.appendChild(cursorEl);
+    }
+    function removeCursor() {
+      if (cursorEl && cursorEl.parentNode) cursorEl.parentNode.removeChild(cursorEl);
+      cursorEl = null;
+    }
+
+    const diffLines: { sign: string; signCls: string; code: string; lineCls: string; codeStyle: string }[] = [
+      { sign: '·', signCls: 'n', code: '  if (!input.trim()) return;', lineCls: '', codeStyle: 'color:#404060' },
+      { sign: '·', signCls: 'n', code: '  setIsLoading(true);', lineCls: '', codeStyle: 'color:#404060' },
+      { sign: '−', signCls: 'm', code: "  const res = await fetch('/api/chat', {", lineCls: 'minus', codeStyle: '' },
+      { sign: '−', signCls: 'm', code: "    method: 'POST', body: input", lineCls: 'minus', codeStyle: '' },
+      { sign: '−', signCls: 'm', code: '  });', lineCls: 'minus', codeStyle: '' },
+      { sign: '+', signCls: 'p', code: '  const res = await streamSurgicalEdit({', lineCls: 'plus', codeStyle: '' },
+      { sign: '+', signCls: 'p', code: '    prompt: input, fileIds: sessionFiles', lineCls: 'plus', codeStyle: '' },
+      { sign: '+', signCls: 'p', code: '  });', lineCls: 'plus', codeStyle: '' },
+      { sign: '·', signCls: 'n', code: '  const data = await res.json();', lineCls: '', codeStyle: 'color:#404060' },
+    ];
+
+    function typeText(parent: HTMLElement, text: string, speed: number, done: () => void) {
+      removeCursor();
+      setCursor(parent);
+      let i = 0;
+      function step() {
+        if (i < text.length) {
+          parent.insertBefore(document.createTextNode(text[i++]), cursorEl);
+          setTimeout(step, speed + Math.random() * speed * 0.3);
+        } else {
+          removeCursor();
+          done();
+        }
+      }
+      step();
+    }
+
+    function run() {
+      container.innerHTML = '';
+
+      // Phase 1: type a status line like the QA terminal
+      const statusLine = document.createElement('div');
+      statusLine.style.cssText = 'font-size:11px;color:#a78bfa;font-weight:600;margin-bottom:12px;padding:0 8px;min-height:18px;';
+      container.appendChild(statusLine);
+
+      typeText(statusLine, '▶ Surgeon · SEARCH/REPLACE on ChatPanel.tsx lines 50–52', 18, () => {
+        // Phase 2: add a small gap
+        setTimeout(() => {
+          const spacer = document.createElement('div');
+          spacer.style.height = '4px';
+          container.appendChild(spacer);
+
+          // Phase 3: reveal diff lines one by one
+          let idx = 0;
+          function addNext() {
+            if (idx >= diffLines.length) {
+              // Phase 4: show applied badge after all lines
+              setTimeout(() => {
+                const badge = document.createElement('div');
+                badge.style.cssText = 'margin-top:14px;padding:0 8px;';
+                const inner = document.createElement('span');
+                inner.style.cssText = 'display:inline-flex;align-items:center;gap:6px;background:rgba(52,211,153,.12);border:1px solid rgba(52,211,153,.3);color:#34d399;padding:4px 12px;border-radius:6px;font-size:11.5px;font-weight:700;animation:passGlow 1.8s ease-in-out infinite;';
+                inner.textContent = '✓ 3 lines replaced · Patch applied · QA passed';
+                badge.appendChild(inner);
+                badge.style.opacity = '0';
+                badge.style.transform = 'translateY(6px)';
+                badge.style.transition = 'opacity .5s ease, transform .5s ease';
+                container.appendChild(badge);
+                requestAnimationFrame(() => requestAnimationFrame(() => {
+                  badge.style.opacity = '1';
+                  badge.style.transform = 'none';
+                }));
+              }, 300);
+              return;
+            }
+
+            const d = diffLines[idx];
+            const line = document.createElement('div');
+            line.className = 'sai-diff-line ' + d.lineCls + ' anim';
+
+            const sign = document.createElement('span');
+            sign.className = 'sai-diff-sign ' + d.signCls;
+            sign.textContent = d.sign;
+
+            const code = document.createElement('span');
+            code.className = 'sai-diff-code';
+            code.textContent = d.code;
+            if (d.codeStyle) code.style.cssText = d.codeStyle;
+
+            line.appendChild(sign);
+            line.appendChild(code);
+            container.appendChild(line);
+
+            // Trigger reflow then animate visible
+            requestAnimationFrame(() => requestAnimationFrame(() => line.classList.add('visible')));
+
+            idx++;
+            // Deletions and additions get more dramatic timing
+            const delay = d.lineCls === 'minus' ? 220 : d.lineCls === 'plus' ? 200 : 120;
+            setTimeout(addNext, delay);
+          }
+          addNext();
+        }, 250);
+      });
+    }
+
+    const obs = new IntersectionObserver((entries) => {
+      entries.forEach(e => {
+        if (e.isIntersecting && !fired) {
+          fired = true;
+          obs.disconnect();
+          run();
+        }
+      });
+    }, { threshold: 0.25 });
+    obs.observe(container);
+    return () => obs.disconnect();
+  }, []);
+
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [formSuccess, setFormSuccess] = useState(false);
   const [formSubmitting, setFormSubmitting] = useState(false);
@@ -1756,17 +1898,7 @@ export function LandingPage() {
               <span style={{color:'#404060',fontSize:'12px'}}>lines 50–52</span>
               <span className="sai-diff-badge surg">Surgeon · SEARCH/REPLACE</span>
             </div>
-            <div className="sai-diff-body">
-              <div className="sai-diff-line"><span className="sai-diff-sign n">·</span><span className="sai-diff-code" style={{color:'#404060'}}>{'  if (!input.trim()) return;'}</span></div>
-              <div className="sai-diff-line"><span className="sai-diff-sign n">·</span><span className="sai-diff-code" style={{color:'#404060'}}>{'  setIsLoading(true);'}</span></div>
-              <div className="sai-diff-line minus"><span className="sai-diff-sign m">−</span><span className="sai-diff-code">{"  const res = await fetch('/api/chat', {"}</span></div>
-              <div className="sai-diff-line minus"><span className="sai-diff-sign m">−</span><span className="sai-diff-code">{'    method: \'POST\', body: input'}</span></div>
-              <div className="sai-diff-line minus"><span className="sai-diff-sign m">−</span><span className="sai-diff-code">{'  });'}</span></div>
-              <div className="sai-diff-line plus"><span className="sai-diff-sign p">+</span><span className="sai-diff-code">{'  const res = await streamSurgicalEdit({'}</span></div>
-              <div className="sai-diff-line plus"><span className="sai-diff-sign p">+</span><span className="sai-diff-code">{'    prompt: input, fileIds: sessionFiles'}</span></div>
-              <div className="sai-diff-line plus"><span className="sai-diff-sign p">+</span><span className="sai-diff-code">{'  });'}</span></div>
-              <div className="sai-diff-line"><span className="sai-diff-sign n">·</span><span className="sai-diff-code" style={{color:'#404060'}}>{'  const data = await res.json();'}</span></div>
-            </div>
+            <div id="diffDemo" className="sai-diff-body"></div>
           </div>
         </div>
       </section>
