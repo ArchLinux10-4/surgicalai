@@ -124,6 +124,21 @@ def _find_nearest(file_content: str, find_text: str, hint_line: int) -> int:
     return min(occurrences, key=lambda idx: abs(_line_of(idx) - hint_line))
 
 
+def _relocate_original_code(file_content: str, original_code: str, hint_start: int) -> tuple:
+    """
+    Relocate original_code in the current file when stale line numbers
+    don't match.  Returns (new_start, new_end) or None if not found.
+    Uses _find_nearest for proximity-aware search.
+    """
+    if not original_code or not original_code.strip():
+        return None
+    idx = _find_nearest(file_content, original_code.strip(), hint_start)
+    if idx == -1:
+        return None
+    new_start = file_content[:idx].count("\n") + 1
+    new_end = new_start + original_code.strip().count("\n")
+    return (new_start, new_end)
+
 def apply_operations(
     file_content: str,
     operations: list,
@@ -263,16 +278,43 @@ def apply_change(file_content: str, change) -> str:
                     can_use_line_replace = True
 
     # ------------------------------------------------------------------
-    # Path 1: Symbol-replacement (line numbers)
+    # Path 1: Symbol-replacement (line numbers) — with stale-line guard
     # ------------------------------------------------------------------
     if can_use_line_replace:
-        updated = apply_symbol_replacement(file_content, start_line, end_line, new_code)
-        if updated != file_content:
+        # ── Stale line-number detection ──
+        # When edits are applied one-at-a-time (not via applyAll), previous
+        # edits shift line numbers.  Detect and relocate before slicing.
+        file_lines = file_content.split("\n")
+        slice_content = "\n".join(file_lines[start_line - 1 : end_line]).strip()
+        anchor = (original_code or "").strip()
+        _effective_start, _effective_end = start_line, end_line
+
+        if anchor and slice_content != anchor:
+            relocated = _relocate_original_code(file_content, anchor, start_line)
+            if relocated:
+                _effective_start, _effective_end = relocated
+                import logging as _logging
+                _logging.getLogger("surgical_editor").info(
+                    "Stale line-number fix: relocated %d-%d → %d-%d",
+                    start_line, end_line, _effective_start, _effective_end
+                )
+            else:
+                # Could not relocate — fall through to Path 2/3
+                import logging as _logging
+                _logging.getLogger("surgical_editor").warning(
+                    "Stale lines %d-%d: content mismatch, relocation failed — falling through",
+                    start_line, end_line
+                )
+                can_use_line_replace = False
+
+        if can_use_line_replace:
+            updated = apply_symbol_replacement(file_content, _effective_start, _effective_end, new_code)
+            if updated != file_content:
+                change.applied = True
+                return updated
+            # If content didn't change (new == old), still mark applied
             change.applied = True
             return updated
-        # If content didn't change (new == old), still mark applied
-        change.applied = True
-        return updated
 
     # ------------------------------------------------------------------
     # Path 2: SEARCH/REPLACE operations

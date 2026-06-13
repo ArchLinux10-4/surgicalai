@@ -5087,82 +5087,188 @@ USER REQUEST:
                 )
                 plan = json.loads(resp_oai.choices[0].message.content)
         else:
-            # ── OpenAI Architect (original logic) ──
+            # ── OpenAI Architect with ReAct search loop ──
+            # Mirrors the Claude ReAct loop: multi-round grep search
+            # until the model has enough context to plan.
             client = _get_client(user_id)
 
-            # Build user message content — text + optional vision blocks
-            if image_files:
-                # Multi-modal content array
-                user_content = [{"type": "text", "text": context_msg}]
-                for img_sf in image_files:
-                    img_data = img_sf["content"]
-                    # Ensure it's a valid data URL
-                    if not img_data.startswith("data:"):
-                        # Try to infer MIME type from filename
-                        ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
-                        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                                    "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}
-                        mime = mime_map.get(ext, "image/png")
-                        img_data = f"data:{mime};base64,{img_data}"
-                    user_content.append({
-                        "type": "image_url",
-                        "image_url": {"url": img_data}
-                    })
-                architect_messages = [
-                    {"role": "system", "content": _architect_system},
-                    {"role": "user", "content": user_content}
-                ]
+            # ReAct loop state — scale limits by file size (same as Claude path)
+            _largest_file_lines_oai = max(
+                (len(sf.get("content", "").split("\n")) for _, (_, sf) in symbol_maps_by_name.items()),
+                default=0
+            )
+            if _largest_file_lines_oai > 5000:
+                _OAI_REACT_MAX = 8
+            elif _largest_file_lines_oai > 2000:
+                _OAI_REACT_MAX = 6
             else:
-                architect_messages = [
-                    {"role": "system", "content": _architect_system},
-                    {"role": "user", "content": context_msg}
-                ]
+                _OAI_REACT_MAX = 4
 
-            # ── Run Architect in background thread so we can yield elapsed ticks ──
-            async def _call_architect(msgs):
-                return await asyncio.to_thread(
-                    lambda: _chat_create(client,
-                        model=arch_model,
-                        messages=msgs,
-                        temperature=0.3,
-                        response_format={"type": "json_object"}
+            _oai_round = 0
+            _oai_searched_terms = set()
+            _oai_accumulated_context = ""
+            _oai_react_cache = getattr(session_files[0], "_react_grep_cache", {}) if session_files else {}
+            plan = {"intent": "search"}  # seed to enter loop
+
+            while _oai_round < _OAI_REACT_MAX:
+                _this_intent = plan.get("intent", "chat")
+                if _this_intent != "search":
+                    break  # Architect has enough context — exit loop
+
+                _oai_round += 1
+                _search_terms_oai = plan.get("search_terms", [])
+                _new_terms = [t for t in _search_terms_oai if t not in _oai_searched_terms]
+
+                if _oai_round > 1 and not _new_terms:
+                    break
+
+                # ── Grep pass (same 2-pass logic as Claude path) ──
+                _grep_results_oai = ""
+                for _st_oai in (_new_terms or _search_terms_oai)[:6]:
+                    _oai_searched_terms.add(_st_oai)
+                    if _st_oai in _oai_react_cache:
+                        _grep_results_oai += _oai_react_cache[_st_oai]
+                        continue
+                    _term_result = ""
+                    for _sfname, (_sm, _sf) in symbol_maps_by_name.items():
+                        _sfcontent = _sf.get("content", "")
+                        if not _sfcontent:
+                            continue
+                        # Pass 1: exact AST symbol match
+                        _matched_sym = None
+                        for _sym_name, _sym_info in _sm.items():
+                            if _st_oai.lower() in _sym_name.lower():
+                                _matched_sym = _sym_info
+                                break
+                        if _matched_sym:
+                            _sym_start = _matched_sym.get("start_line", 1) - 1
+                            _sym_end = _matched_sym.get("end_line", _sym_start + 1)
+                            _sf_lines = _sfcontent.split("\n")
+                            _snippet = "\n".join(
+                                f"L{_sym_start+i+1}: {_sf_lines[_sym_start+i]}"
+                                for i in range(min(_sym_end - _sym_start, 80))
+                                if _sym_start + i < len(_sf_lines)
+                            )
+                            _term_result += f"\n--- {_sfname}: symbol '{_sym_name}' (L{_sym_start+1}-{_sym_end}) ---\n{_snippet}\n"
+                            continue
+
+                        # Pass 2: keyword grep, expand to enclosing symbol
+                        _sf_lines = _sfcontent.split("\n")
+                        for _li, _ln in enumerate(_sf_lines):
+                            if _st_oai.lower() in _ln.lower():
+                                _enc_start, _enc_end = max(0, _li - 15), min(len(_sf_lines), _li + 25)
+                                for _sym_name2, _sym_info2 in _sm.items():
+                                    s2 = _sym_info2.get("start_line", 0) - 1
+                                    e2 = _sym_info2.get("end_line", 0)
+                                    if s2 <= _li < e2:
+                                        _enc_start = s2
+                                        _enc_end = min(e2, s2 + 80)
+                                        break
+                                _window = "\n".join(
+                                    f"L{_enc_start+j+1}: {_sf_lines[_enc_start+j]}"
+                                    for j in range(min(_enc_end - _enc_start, 80))
+                                    if _enc_start + j < len(_sf_lines)
+                                )
+                                if _window not in _term_result:
+                                    _term_result += f"\n--- {_sfname}: matches for '{_st_oai}' ---\n{_window}\n"
+                                break
+                    _oai_react_cache[_st_oai] = _term_result
+                    _grep_results_oai += _term_result
+
+                if _grep_results_oai:
+                    _oai_accumulated_context += _grep_results_oai
+
+                # ── Build architect message with accumulated context ──
+                _round_label = f" (search round {_oai_round}/{_OAI_REACT_MAX})" if _oai_round > 1 else ""
+                if _oai_round > 1 and _new_terms:
+                    elapsed = int(time.time() - start_time) if 'start_time' in dir() else 0
+                    yield sse({"type": "progress", "content": f"Architect thinking{_round_label}... ({elapsed}s)"})
+
+                _budget_note = ""
+                if _oai_round >= _OAI_REACT_MAX:
+                    _budget_note = (
+                        "\n\n⚠️ SEARCH BUDGET EXHAUSTED — you MUST produce your final plan now. "
+                        "Use the code context you have gathered so far. Do NOT return intent=search again."
                     )
-                )
 
-            arch_task = asyncio.create_task(_call_architect(architect_messages))
-            start_time = time.time()
-            tick = 0
-            while not arch_task.done():
-                await asyncio.sleep(1)
-                tick += 1
-                if tick % 3 == 0:
-                    elapsed = int(time.time() - start_time)
-                    yield sse({"type": "progress", "content": f"Architect thinking... ({elapsed}s)"})
+                _oai_context_msg = context_msg
+                if _oai_accumulated_context:
+                    _oai_context_msg += (
+                        f"\n\n=== SEARCH RESULTS (round {_oai_round}) ===\n"
+                        f"{_oai_accumulated_context[:8000]}"
+                        f"\nAlready searched: {', '.join(sorted(_oai_searched_terms))}"
+                        f"{_budget_note}"
+                    )
 
-            try:
-                response = arch_task.result()
-            except Exception as img_err:
-                err_str = str(img_err).lower()
-                if image_files and ("image" in err_str or "unsupported" in err_str or "invalid" in err_str):
-                    # GPT rejected one or more images — fall back gracefully to text-only
-                    yield sse({"type": "progress", "content": "⚠️ Images couldn't be read — falling back to text context..."})
+                if image_files:
+                    user_content = [{"type": "text", "text": _oai_context_msg}]
+                    for img_sf in image_files:
+                        img_data = img_sf["content"]
+                        if not img_data.startswith("data:"):
+                            ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
+                            mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                                        "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}
+                            mime = mime_map.get(ext, "image/png")
+                            img_data = f"data:{mime};base64,{img_data}"
+                        user_content.append({
+                            "type": "image_url",
+                            "image_url": {"url": img_data}
+                        })
                     architect_messages = [
                         {"role": "system", "content": _architect_system},
-                        {"role": "user", "content": context_msg}
+                        {"role": "user", "content": user_content}
                     ]
-                    arch_task2 = asyncio.create_task(_call_architect(architect_messages))
-                    start_time = time.time()
-                    while not arch_task2.done():
-                        await asyncio.sleep(1)
-                        tick += 1
-                        if tick % 3 == 0:
-                            elapsed = int(time.time() - start_time)
-                            yield sse({"type": "progress", "content": f"Architect retrying... ({elapsed}s)"})
-                    response = arch_task2.result()
                 else:
-                    raise
+                    architect_messages = [
+                        {"role": "system", "content": _architect_system},
+                        {"role": "user", "content": _oai_context_msg}
+                    ]
 
-            plan = json.loads(response.choices[0].message.content)
+                async def _call_architect_oai(msgs):
+                    return await asyncio.to_thread(
+                        lambda: _chat_create(client,
+                            model=arch_model,
+                            messages=msgs,
+                            temperature=0.3,
+                            response_format={"type": "json_object"}
+                        )
+                    )
+
+                arch_task = asyncio.create_task(_call_architect_oai(architect_messages))
+                start_time = time.time()
+                tick = 0
+                while not arch_task.done():
+                    await asyncio.sleep(1)
+                    tick += 1
+                    if tick % 3 == 0:
+                        elapsed = int(time.time() - start_time)
+                        yield sse({"type": "progress", "content": f"Architect thinking{_round_label}... ({elapsed}s)"})
+
+                try:
+                    response = arch_task.result()
+                except Exception as img_err:
+                    err_str = str(img_err).lower()
+                    if image_files and ("image" in err_str or "unsupported" in err_str or "invalid" in err_str):
+                        yield sse({"type": "progress", "content": "⚠️ Images couldn't be read — falling back to text context..."})
+                        architect_messages = [
+                            {"role": "system", "content": _architect_system},
+                            {"role": "user", "content": _oai_context_msg}
+                        ]
+                        arch_task2 = asyncio.create_task(_call_architect_oai(architect_messages))
+                        start_time = time.time()
+                        while not arch_task2.done():
+                            await asyncio.sleep(1)
+                            tick += 1
+                            if tick % 3 == 0:
+                                elapsed = int(time.time() - start_time)
+                                yield sse({"type": "progress", "content": f"Architect retrying{_round_label}... ({elapsed}s)"})
+                        response = arch_task2.result()
+                    else:
+                        raise
+
+                plan = json.loads(response.choices[0].message.content)
+            # End of OpenAI ReAct while loop
+
         intent = plan.get("intent", "chat")
         compliance.set_intent(intent)
         compliance.mark("architect_routing", ran=True, output_summary=f"intent={intent}")
@@ -5175,50 +5281,15 @@ USER REQUEST:
         # ── NEEDS CLARIFICATION: Architect doesn't have enough info to plan ──
         # Stream the clarification questions back as tokens.
         # On the next turn, conversation history carries the Q&A context
-        # and the Architect will proceed with a real plan.
-        # Safety: 'search' intent should be consumed inside the ReAct loop.
-        # If it leaks through (OpenAI/GPT path), run ONE grep round then re-call.
+        # Safety: if 'search' intent leaked through any path, degrade gracefully.
+        # Claude and OpenAI now have proper ReAct loops; this is a last-resort guard.
         if intent == "search":
-            _leak_search_terms = plan.get("search_terms", [])
-            _leak_grep_result = ""
-            for _sfname, (_sm, _sf) in symbol_maps_by_name.items():
-                _sfcontent = _sf.get("content", "")
-                if not _sfcontent:
-                    continue
-                for _st in _leak_search_terms[:6]:
-                    _lines = _sfcontent.split("\n")
-                    for _li, _ln in enumerate(_lines):
-                        if _st.lower() in _ln.lower():
-                            start = max(0, _li - 15)
-                            end = min(len(_lines), _li + 25)
-                            _window = "\n".join(f"L{start+i+1}: {_lines[start+i]}" for i in range(end - start))
-                            if _window not in _leak_grep_result:
-                                _leak_grep_result += f"\n--- {_sfname}: matches for '{_st}' ---\n{_window}\n"
-                            break
-            if _leak_grep_result:
-                # Re-call architect with grep results
-                _leak_context = context_msg + f"\n\n=== SEARCH RESULTS ===\n{_leak_grep_result[:3000]}"
-                _leak_msgs = [
-                    {"role": "system", "content": _architect_system},
-                    {"role": "user", "content": _leak_context}
-                ]
-                _leak_resp = await asyncio.to_thread(
-                    lambda: _chat_create(_get_client(user_id), model=arch_model,
-                                         messages=_leak_msgs, temperature=0.3,
-                                         response_format={"type": "json_object"})
-                )
-                try:
-                    plan = json.loads(_leak_resp.choices[0].message.content)
-                    intent = plan.get("intent", "chat")
-                except Exception:
-                    pass
-            if intent == "search":
-                # Still search after one round — give up gracefully
-                intent = "needs_clarification"
-                plan.setdefault("clarification_response",
-                    "I searched the file but need a bit more context. "
-                    "Could you paste the function or element name you'd like to change?")
+            intent = "needs_clarification"
+            plan.setdefault("clarification_response",
+                "I searched the file but need a bit more context. "
+                "Could you paste the function or element name you'd like to change?")
             compliance.set_intent(intent)
+
 
         if intent == "needs_clarification":
             clarification_response = plan.get(
