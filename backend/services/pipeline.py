@@ -8099,7 +8099,10 @@ async def _execute_single_edit(
 
         if start != -1 and end != -1:
             raw = text[start + len(EDIT_OPEN):end].strip()
-            _json.loads(raw)  # validate parseable
+            # Don't validate with json.loads here — Claude's JSX/CSS
+            # output often contains unescaped quotes that break JSON.
+            # The downstream edit parse chain has 4 fallbacks including
+            # regex extraction that handles these cases.
             _dlog("plan_execute_success",
                   session_id=session_id, user_id=user_id,
                   filename=filename, symbol=symbol_name,
