@@ -611,7 +611,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   }, [sessionId]) // eslint-disable-line react-hooks/exhaustive-deps
 
 
-  // Re-sync applied state when Apply All fires from ChatPanel
+  // Re-sync applied state AND file content when Apply All fires from ChatPanel
   useEffect(() => {
     const refresh = () => {
       if (!sessionId) return
@@ -622,6 +622,13 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             if (changeIds.includes(id)) fromDB[id] = true
           }
           if (Object.keys(fromDB).length > 0) setApplied(prev => ({ ...fromDB, ...prev }))
+        })
+        .catch(() => {})
+      // Also re-fetch file content so LivePreview shows updated code
+      api.sessionFiles.get(sessionId, fileData.file_id)
+        .then(f => {
+          setOriginalCode(f.content)
+          setModifiedCode(f.content)
         })
         .catch(() => {})
     }
