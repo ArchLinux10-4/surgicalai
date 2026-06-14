@@ -247,6 +247,18 @@ def _grep_relevant_sections(
             if et and et.lower() not in {t.lower() for t in terms}:
                 terms.append(et)
 
+    # Short-word fallback — _extract_search_terms only catches 7+ char words.
+    # "Claude", "Opus", "Sonnet", "model", "GPT" are all < 7 chars and get missed.
+    # Same fallback as _build_natural_file_context (line ~6794).
+    _STOP_SHORT_GREP = {"the", "a", "an", "is", "it", "in", "on", "to", "fix", "bug",
+                        "add", "make", "get", "set", "and", "for", "not", "are", "was",
+                        "new", "old", "use", "run", "put", "all", "can", "has", "had",
+                        "did", "do", "so", "up", "if", "or", "no", "be", "we", "my"}
+    for word in re.findall(r"\b[a-zA-Z]{3,6}\b", user_request):
+        wl = word.lower()
+        if wl not in _STOP_SHORT_GREP and wl not in {t.lower() for t in terms}:
+            terms.append(word)
+
     if not terms:
         return ""
 
@@ -6540,6 +6552,16 @@ Rules for file_request:
 - Use <search_request> when you need to FIND where something is defined by keyword
 - Do NOT request files already shown in full context above
 
+━━━ CRITICAL: NEVER EDIT UNSEEN CODE ━━━
+
+NEVER edit, replace, or rewrite code you haven't seen in the context above.
+If a file is large and you only see partial content or grep snippets:
+1. Use <search_request> with specific terms from the user's request to find the exact code.
+2. Read and verify the code you plan to change.
+3. Only then emit a <surgical_edit> with edit_start_line/edit_end_line matching the real content.
+
+Guessing what code looks like — even if you're confident — leads to hallucinated edits that break the codebase.
+
 ━━━ EDITING EXISTING FILES ━━━
 
 When the user wants to change code in an uploaded file, explain what you're doing and embed an edit block:
@@ -7395,22 +7417,33 @@ def _build_natural_file_context(
                 # Small-to-medium file — show full content (no truncation risk)
                 header += f"\nFULL CONTENT:\n```\n{content}\n```\n"
             else:
-                # Large file — Tasklet-style windowed context with line numbers.
-                # Instead of dumping thousands of lines (which causes model
-                # output truncation), show a focused window around the likely
-                # edit zone.  The model uses edit_start_line/edit_end_line for
-                # precise edits and <search_request> to explore other sections.
-                window = _build_focused_window(
-                    fname, content, smap, user_request,
-                    window_size=300,
-                    session_id=session_id, user_id=user_id,
+                # Large file — Tasklet-style: grep for relevant terms, show
+                # compact snippets with line numbers.  No pre-selected window.
+                # Claude uses <search_request> to explore further — exactly
+                # like Tasklet: structure → grep → read → edit.
+                _grep_sections = _grep_relevant_sections(
+                    user_request, fname, content,
+                    window=3, max_lines=150,
                 )
-                header += (
-                    f"\n⚠️ LARGE FILE ({lines_count} lines) — showing focused window with line numbers.\n"
-                    f"Use edit_start_line/edit_end_line for precise edits. "
-                    f"Use <search_request> to see other sections.\n\n"
-                    f"```\n{window}\n```\n"
-                )
+                if _grep_sections:
+                    header += (
+                        f"\n⚠️ LARGE FILE ({lines_count} lines) — showing grep results for your request.\n"
+                        f"You MUST use <search_request> to view full context before editing.\n"
+                        f"Use edit_start_line/edit_end_line for precise edits.\n\n"
+                        f"KEYWORD MATCHES:\n```\n{_grep_sections}\n```\n"
+                    )
+                else:
+                    header += (
+                        f"\n⚠️ LARGE FILE ({lines_count} lines) — no keyword matches found.\n"
+                        f"You MUST use <search_request> with specific terms from the user\'s request "
+                        f"(e.g. actual text, variable names, function names) to find the code to edit.\n"
+                        f"NEVER guess or invent code you haven\'t seen.\n"
+                    )
+                _dlog("natural_large_file_context",
+                      session_id=session_id, user_id=user_id,
+                      filename=fname, total_lines=lines_count,
+                      grep_found=bool(_grep_sections),
+                      grep_chars=len(_grep_sections) if _grep_sections else 0)
             return header
         else:
             preview = content[:1500] + (f"\n...[{len(content)-1500} chars]" if len(content) > 1500 else "")
