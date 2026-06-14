@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, Component } from 'react'
+import React, { useState, useCallback, useEffect, useMemo, Component } from 'react'
 import { SandpackProvider, SandpackPreview } from '@codesandbox/sandpack-react'
 import { useThemeStore } from '../stores/themeStore'
 import { Fullscreen, FullscreenExit, Refresh } from '@mui/icons-material'
@@ -147,6 +147,14 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
   const isHtml = /\.html?$/i.test(filename)
   const apiBase = (import.meta as any).env?.VITE_API_URL || ''
 
+  // Content fingerprint — forces re-mount of iframes/Sandpack when content changes
+  // (replicates what a page refresh does: fresh mount with new content)
+  const srcHash = useMemo(() => {
+    let h = 5381
+    for (let i = 0; i < src.length; i++) h = ((h << 5) + h + src.charCodeAt(i)) & 0x7fffffff
+    return h
+  }, [src])
+
   /* ── Resolve the full import graph from the session (components + CSS + deps) ── */
   useEffect(() => {
     if (isHtml || !sessionId || !fileId) {
@@ -154,6 +162,9 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
       return
     }
     let cancelled = false
+    // Clear stale bundle so loading state shows while re-fetching.
+    // Replicates fresh mount (refresh): bundle starts null → loading → correct content.
+    setBundle(null)
     setBundleLoading(true)
     api.sessionFiles
       .previewBundle(sessionId, fileId, src)
@@ -240,15 +251,15 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
         <div style={previewStyle}>
           {previewUrl ? (
             <iframe
-              key={`${refreshKey}-url`}
-              src={previewUrl}
+              key={`${refreshKey}-${srcHash}-url`}
+              src={`${previewUrl}?_v=${srcHash}`}
               sandbox="allow-scripts allow-same-origin"
               style={{ width: '100%', height: '100%', border: 'none', background: 'transparent', display: 'block' }}
               title={`Preview: ${filename}`}
             />
           ) : (
             <iframe
-              key={`${refreshKey}-doc`}
+              key={`${refreshKey}-${srcHash}-doc`}
               sandbox="allow-scripts"
               srcDoc={src}
               style={{ width: '100%', height: '100%', border: 'none', background: 'transparent', display: 'block' }}
@@ -313,7 +324,7 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
   }
 
   // Re-mount Sandpack whenever the file set or refresh key changes.
-  const sandpackKey = `${refreshKey}-${bundle ? 'graph' : 'single'}-${Object.keys(sandpackFiles).length}-${src.length}`
+  const sandpackKey = `${refreshKey}-${bundle ? 'graph' : 'single'}-${Object.keys(sandpackFiles).length}-${srcHash}`
 
   return (
     <div className={containerCls}>

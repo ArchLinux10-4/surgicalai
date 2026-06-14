@@ -737,6 +737,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         onApplied?.(filename, newContent)
       }
       for (const change of selectedChanges) markApplied(change.id)
+      // Signal ApplyAllButton to re-check applied state (replicates refresh sync)
+      window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
     } catch (e: any) {
       const errMsg: string = e?.message || 'Apply failed'
       // If code couldn't be found, it was likely already applied — auto-mark it
@@ -757,6 +759,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           console.warn('[InlineDiffCard] originalCode re-fetch failed (non-fatal):', refetchErr?.message)
         }
         toast.success('These changes appear to already be applied ✓')
+        window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
       } else {
         toast.error(errMsg)
       }
