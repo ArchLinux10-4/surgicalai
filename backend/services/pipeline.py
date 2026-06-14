@@ -5092,6 +5092,25 @@ USER REQUEST:
             # until the model has enough context to plan.
             client = _get_client(user_id)
 
+            # ── OpenAI reasoning model override ──
+            # Reasoning models (o3, o4-mini) are overly cautious with needs_clarification.
+            # This addendum biases them toward action when they can see the code.
+            _OAI_EXEC_OVERRIDE = (
+                "\n\n━━━ EXECUTION OVERRIDE (ACTIVE) ━━━\n\n"
+                "You are in EXECUTION MODE. Apply these overrides to the decision tree above:\n\n"
+                "1. SEARCH: Use ONLY on the first round when you haven\'t seen the target code yet.\n"
+                "   Once search results show you the code region you need to edit, you MUST proceed to \"edit\".\n"
+                "   Do NOT search again for minor details — make reasonable choices and produce the edit plan.\n\n"
+                "2. NEEDS_CLARIFICATION: DISABLED in execution mode. You may NOT use this intent.\n"
+                "   If you are unsure about a detail, make the most reasonable professional choice and note\n"
+                "   it in your \"reasoning\" field. The user will refine if needed.\n\n"
+                "3. After seeing search results: Your ONLY valid intents are \"edit\", \"create\", or \"chat\".\n"
+                "   Returning \"search\" after round 1 is allowed ONLY if the search results were completely\n"
+                "   irrelevant (wrong file region). If you can see ANY of the target code, proceed with \"edit\"."
+            )
+            _oai_architect_system = _architect_system + _OAI_EXEC_OVERRIDE
+
+
             # ReAct loop state — scale limits by file size (same as Claude path)
             _largest_file_lines_oai = max(
                 (len(sf.get("content", "").split("\n")) for _, (_, sf) in symbol_maps_by_name.items()),
@@ -5194,6 +5213,11 @@ USER REQUEST:
                         "\n\n⚠️ SEARCH BUDGET EXHAUSTED — you MUST produce your final plan now. "
                         "Use the code context you have gathered so far. Do NOT return intent=search again."
                     )
+                elif _oai_round > 1 and _oai_accumulated_context:
+                    _budget_note = (
+                        "\n\nYou have seen the target code. Produce your \"edit\" plan now. "
+                        "Only return \"search\" if the results above were completely irrelevant to the request."
+                    )
 
                 _oai_context_msg = context_msg
                 if _oai_accumulated_context:
@@ -5219,12 +5243,12 @@ USER REQUEST:
                             "image_url": {"url": img_data}
                         })
                     architect_messages = [
-                        {"role": "system", "content": _architect_system},
+                        {"role": "system", "content": _oai_architect_system},
                         {"role": "user", "content": user_content}
                     ]
                 else:
                     architect_messages = [
-                        {"role": "system", "content": _architect_system},
+                        {"role": "system", "content": _oai_architect_system},
                         {"role": "user", "content": _oai_context_msg}
                     ]
 
@@ -5255,7 +5279,7 @@ USER REQUEST:
                     if image_files and ("image" in err_str or "unsupported" in err_str or "invalid" in err_str):
                         yield sse({"type": "progress", "content": "⚠️ Images couldn't be read — falling back to text context..."})
                         architect_messages = [
-                            {"role": "system", "content": _architect_system},
+                            {"role": "system", "content": _oai_architect_system},
                             {"role": "user", "content": _oai_context_msg}
                         ]
                         arch_task2 = asyncio.create_task(_call_architect_oai(architect_messages))
@@ -5271,6 +5295,12 @@ USER REQUEST:
                         raise
 
                 plan = json.loads(response.choices[0].message.content)
+                _oai_intent = plan.get("intent", "unknown")
+                print(f"[OAI_REACT] Round {_oai_round}/{_OAI_REACT_MAX} → intent={_oai_intent}"
+                      f" | search_terms={plan.get('search_terms', [])}"
+                      f" | confidence={plan.get('confidence_if_found', plan.get('confidence', '?'))}"
+                      f" | targets={len(plan.get('targets', []))}"
+                      f" | reasoning={plan.get('reasoning', '')[:120]}")
             # End of OpenAI ReAct while loop
 
         intent = plan.get("intent", "chat")
