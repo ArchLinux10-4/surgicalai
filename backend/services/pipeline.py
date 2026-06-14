@@ -8970,6 +8970,7 @@ async def run_natural_pipeline_stream(
             _dlog("no_edits_produced",
                   session_id=session_id, user_id=user_id,
                   response_length=len(full_response),
+                  response_preview=full_response[:500],
                   had_thinking=had_thinking,
                   skipped_count=len(skipped_changes_struct),
                   skipped_details=skipped_changes_struct[:10])
@@ -10148,10 +10149,30 @@ async def run_natural_pipeline_stream(
                         continue
                     if ei != -1 and ec != -1:
                         raw_edit = corr_text[ei + len(EDIT_OPEN):ec]
-                        try:
-                            edit_data = json.loads(raw_edit.strip())
-                        except json.JSONDecodeError:
-                            edit_data = json.loads(_repair_json(raw_edit.strip()))
+                        edit_data = None
+                        for _parse_attempt_label, _parse_fn in [
+                            ("json.loads", lambda t: json.loads(t)),
+                            ("repair_json", lambda t: json.loads(_repair_json(t))),
+                            ("extract_json", lambda t: (lambda r: json.loads(r) if isinstance(r, str) else r)(_extract_json_from_text(t))),
+                            ("regex_extract", lambda t: _regex_extract_edit_block(t)),
+                        ]:
+                            try:
+                                edit_data = _parse_fn(raw_edit.strip())
+                                if isinstance(edit_data, dict) and edit_data.get("new_code"):
+                                    _dlog("qa_retry_correction_parse_method", session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          method=_parse_attempt_label)
+                                    break
+                                edit_data = None
+                            except Exception:
+                                edit_data = None
+                        if not isinstance(edit_data, dict) or not edit_data.get("new_code"):
+                            _dlog("qa_retry_correction_all_parsers_failed", session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  raw_preview=raw_edit.strip()[:300])
+                            continue
                         corrected_code = edit_data.get("new_code", "")
                         corrected_old  = edit_data.get("old_code", "")
                         _sym_code = change_shells[idx]["symbol"].code

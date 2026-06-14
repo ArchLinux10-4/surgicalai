@@ -697,9 +697,26 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       if (newContent) {
         try {
           await api.sessionFiles.update(sessionId, fileData.file_id, newContent)
-          // Refresh session files so GitHub sync status reflects the new updated_at
+          console.debug('[InlineDiffCard] DB updated OK, re-syncing originalCode from DB')
+          // Re-fetch originalCode from DB — replicates what page refresh does on mount.
+          // This ensures the next round of edits starts from the true DB state.
+          try {
+            const freshFile = await api.sessionFiles.get(sessionId, fileData.file_id)
+            if (freshFile?.content) {
+              setOriginalCode(freshFile.content)
+              console.debug('[InlineDiffCard] originalCode re-synced, len=', freshFile.content.length)
+            }
+          } catch (refetchErr: any) {
+            // Non-fatal: originalCode may be stale but DB is correct.
+            // Next refresh will fix it. Log for diagnosis.
+            console.warn('[InlineDiffCard] originalCode re-fetch failed (non-fatal):', refetchErr?.message)
+          }
+          // Refresh session files list so GitHub sync status reflects new updated_at
           api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
-        } catch {}
+        } catch (err: any) {
+          console.error('[InlineDiffCard] sessionFiles.update FAILED:', err?.message || err)
+          toast.error('Changes applied but failed to save to session — try refreshing')
+        }
       }
 
       if (result.cloud_mode || result.modified_content) {
@@ -728,6 +745,17 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           saveApplied(sessionId, change.id)
           setApplied(p => ({ ...p, [change.id]: true }))
         }
+        // Re-sync originalCode from DB — the file is already modified,
+        // so our in-memory originalCode is stale. Replicate refresh.
+        try {
+          const freshFile = await api.sessionFiles.get(sessionId, fileData.file_id)
+          if (freshFile?.content) {
+            setOriginalCode(freshFile.content)
+            console.debug('[InlineDiffCard] originalCode re-synced after auto-mark, len=', freshFile.content.length)
+          }
+        } catch (refetchErr: any) {
+          console.warn('[InlineDiffCard] originalCode re-fetch failed (non-fatal):', refetchErr?.message)
+        }
         toast.success('These changes appear to already be applied ✓')
       } else {
         toast.error(errMsg)
@@ -748,6 +776,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       setApplied(p => { const next = { ...p }; delete next[change.id]; return next })
       setSkipped(p => { const next = { ...p }; delete next[change.id]; return next })
       setModifiedCode(undefined)
+      // Sync originalCode to reverted content — replicates refresh behavior
+      if (result.content) setOriginalCode(result.content)
       onApplied?.(filename, result.content)
       toast.success(`↩ Reverted ${filename} to previous version`)
       onChangeApplied?.(-1)
