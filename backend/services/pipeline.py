@@ -2449,8 +2449,9 @@ async def analyze_and_plan_stream(
 
             # Parse JSON from response
             try:
-                plan_data = _extract_json_from_text(full_text)
-            except ValueError as parse_err:
+                _raw_plan = _extract_json_from_text(full_text)
+                plan_data = json.loads(_raw_plan) if isinstance(_raw_plan, str) else _raw_plan
+            except (ValueError, json.JSONDecodeError) as parse_err:
                 yield sse({
                     "type": "error",
                     "content": (
@@ -2655,7 +2656,8 @@ async def analyze_and_plan_stream(
                     _retry_text = "".join(
                         b.text for b in _retry_resp.content if hasattr(b, "text")
                     )
-                    _retry_data = _extract_json_from_text(_retry_text)
+                    _raw_retry = _extract_json_from_text(_retry_text)
+                    _retry_data = json.loads(_raw_retry) if isinstance(_raw_retry, str) else _raw_retry
                     _retry_changes_data = _retry_data.get("changes", [])
 
                     if _retry_changes_data:
@@ -4021,7 +4023,8 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
                   raw_preview=_qa_raw_text[:500],
                   user_id=user_id)
             # Robust JSON extraction — Claude sometimes adds preamble or markdown fences
-            data = _extract_json_from_text(_qa_raw_text)
+            _raw_qa = _extract_json_from_text(_qa_raw_text)
+            data = json.loads(_raw_qa) if isinstance(_raw_qa, str) else _raw_qa
         else:
             client = _get_client(user_id)
 
@@ -4247,6 +4250,103 @@ class ComplianceTracker:
                 conn.close()
         except Exception:
             pass  # Never let compliance logging kill the pipeline
+
+
+def _regex_extract_edit_block(raw: str) -> dict | None:
+    """
+    Regex-based fallback for extracting edit block fields when JSON parsing
+    fails due to unescaped quotes (className="...") or literal newlines in
+    code content.
+
+    Handles two formats Claude produces:
+      1. JSON-style:  "field": "...code..."  (with unescaped internal quotes)
+      2. Hybrid XML:  "field">...code...</field>
+
+    Returns a dict with at least 'filename' and 'new_code', or None if
+    extraction fails.
+    """
+    result = {}
+    KNOWN_KEYS = ("filename", "symbol", "description", "old_code", "new_code",
+                  "edit_start_line", "edit_end_line")
+
+    # ── Find all field key positions to establish boundaries ──
+    key_positions = []
+    for key in KNOWN_KEYS:
+        for m in re.finditer(rf'"{key}"\s*', raw):
+            key_positions.append((m.start(), key, m.end()))
+    key_positions.sort(key=lambda x: x[0])
+
+    # ── Simple string fields ──
+    for field in ("filename", "symbol", "description"):
+        m = re.search(rf'"{field}"\s*:\s*"([^"]*)"', raw)
+        if m:
+            result[field] = m.group(1)
+
+    # ── Integer fields ──
+    for field in ("edit_start_line", "edit_end_line"):
+        m = re.search(rf'"{field}"\s*:\s*(\d+)', raw)
+        if m:
+            result[field] = int(m.group(1))
+
+    # ── Code fields ──
+    for field in ("old_code", "new_code"):
+        # Try XML-style first: "field">...code...</field>
+        m_xml = re.search(rf'"{field}"[^>]*>(.*?)</{field}>', raw, re.DOTALL)
+        if m_xml:
+            result[field] = m_xml.group(1).strip("\n")
+            continue
+
+        # JSON-style: "field": "...code..."
+        m_json = re.search(rf'"{field}"\s*:\s*"', raw)
+        if not m_json:
+            continue
+
+        code_start = m_json.end()
+
+        # Find next key boundary after this field
+        next_boundary = len(raw)
+        for pos, kname, _ in key_positions:
+            if pos > m_json.start() and kname != field:
+                next_boundary = pos
+                break
+
+        segment = raw[code_start:next_boundary]
+
+        # Strip from the end in phases:
+        # Phase 1: Remove trailing whitespace-only and JSON-structural lines
+        #          (}, ]) — these are OUTSIDE the string value
+        # Phase 2: Remove the closing quote line (" or ",) — ends the string
+        # Phase 3: STOP — everything above is code (even } on its own line)
+        lines = segment.split('\n')
+
+        # Phase 1
+        while lines:
+            s = lines[-1].strip()
+            if s in ('', '}', ']', '},', '],'):
+                lines.pop()
+            else:
+                break
+
+        # Phase 2
+        if lines:
+            s = lines[-1].strip()
+            if s in ('"', '",'):
+                lines.pop()
+            else:
+                # Single-line case: closing "} or ", stuck to code
+                last = lines[-1]
+                if last.endswith('"}') or last.endswith('",'):
+                    lines[-1] = last[:-2]
+                elif last.endswith('"'):
+                    lines[-1] = last[:-1]
+
+        code = '\n'.join(lines).strip('\n')
+        if code:
+            result[field] = code
+
+    if result.get("filename") and result.get("new_code"):
+        return result
+    return None
 
 
 def _repair_json(text: str) -> str:
@@ -9009,25 +9109,39 @@ async def run_natural_pipeline_stream(
                                   user_id=user_id)
                         except Exception as _e3:
                             _parse_err_3 = str(_e3)
-                            _fn_m = re.search(r'"filename"\s*:\s*"([^"]+)"', edit_raw)
-                            _sym_m = re.search(r'"symbol"\s*:\s*"([^"]+)"', edit_raw)
-                            _dlog("edit_parse_failed",
-                                  session_id=session_id,
-                                  raw_preview=edit_raw[:300],
-                                  raw_tail=edit_raw[-200:],
-                                  raw_len=len(edit_raw),
-                                  err_direct=_parse_err_1,
-                                  err_repair=_parse_err_2,
-                                  err_extract=_parse_err_3,
-                                  filename_hint=_fn_m.group(1) if _fn_m else None,
-                                  symbol_hint=_sym_m.group(1) if _sym_m else None,
-                                  user_id=user_id)
-                            skipped_changes_struct.append({
-                                "filename": _fn_m.group(1) if _fn_m else "(unknown)",
-                                "symbol": _sym_m.group(1) if _sym_m else "(truncated)",
-                                "reason": "Edit block was truncated or malformed — Claude may have hit the output token limit",
-                            })
-                            continue
+                            # Fallback 4: regex-based field extraction (handles
+                            # unescaped quotes in JSX and hybrid XML tags)
+                            _regex_result = _regex_extract_edit_block(edit_raw)
+                            if _regex_result:
+                                edit_data = _regex_result
+                                _dlog("edit_parse_recovered",
+                                      session_id=session_id,
+                                      method="regex_extract",
+                                      raw_len=len(edit_raw),
+                                      filename=_regex_result.get("filename"),
+                                      symbol=_regex_result.get("symbol"),
+                                      new_code_len=len(_regex_result.get("new_code", "")),
+                                      user_id=user_id)
+                            else:
+                                _fn_m = re.search(r'"filename"\s*:\s*"([^"]+)"', edit_raw)
+                                _sym_m = re.search(r'"symbol"\s*:\s*"([^"]+)"', edit_raw)
+                                _dlog("edit_parse_failed",
+                                      session_id=session_id,
+                                      raw_preview=edit_raw[:300],
+                                      raw_tail=edit_raw[-200:],
+                                      raw_len=len(edit_raw),
+                                      err_direct=_parse_err_1,
+                                      err_repair=_parse_err_2,
+                                      err_extract=_parse_err_3,
+                                      filename_hint=_fn_m.group(1) if _fn_m else None,
+                                      symbol_hint=_sym_m.group(1) if _sym_m else None,
+                                      user_id=user_id)
+                                skipped_changes_struct.append({
+                                    "filename": _fn_m.group(1) if _fn_m else "(unknown)",
+                                    "symbol": _sym_m.group(1) if _sym_m else "(truncated)",
+                                    "reason": "Edit block was truncated or malformed — Claude may have hit the output token limit",
+                                })
+                                continue
 
                 filename = edit_data.get("filename", "")
                 symbol_name = edit_data.get("symbol", "")
