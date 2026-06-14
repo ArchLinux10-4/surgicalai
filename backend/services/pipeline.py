@@ -9863,10 +9863,16 @@ async def run_natural_pipeline_stream(
                 # server-side. Small symbols may still be re-emitted whole.
                 _sym_line_count = len(symbol.code.splitlines())
                 _qa_score_val = qa_d.get("qa_score") or 0
-                # When QA says the code is fundamentally incomplete (score ≤ 4),
-                # allow full-symbol replacement — a targeted snippet can't add
-                # 10 missing features scattered across a 190-line symbol.
-                _is_large_symbol = _sym_line_count > 60 and _qa_score_val > 4
+                # Very large symbols (300+ lines) MUST always use targeted edits —
+                # Claude physically cannot re-emit thousands of lines in a
+                # correction response; it will produce a fragment that gets
+                # rejected.  For medium symbols (60-300 lines), allow full
+                # replacement when QA says the code is fundamentally incomplete
+                # (score ≤ 4) since a targeted snippet can't add 10 missing
+                # features scattered across a 190-line symbol.
+                _is_large_symbol = _sym_line_count > 300 or (
+                    _sym_line_count > 60 and _qa_score_val > 4
+                )
 
                 if _is_large_symbol:
                     _format_instructions = (
