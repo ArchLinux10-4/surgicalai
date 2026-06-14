@@ -95,12 +95,8 @@ def get_available_models(request: Request):
     has_openai = bool(_resolve_api_key(user_id, "openai"))
     if has_openai:
         openai_models = [
-            {"id": "gpt-5", "name": "GPT-5", "role": "architect",
+            {"id": "gpt-5.5", "name": "GPT-5.5", "role": "architect",
              "description": "Latest GPT — powerful general-purpose model", "provider": "openai"},
-            {"id": "o3", "name": "o3", "role": "architect",
-             "description": "Advanced reasoning — best for complex logic and analysis", "provider": "openai"},
-            {"id": "o4-mini", "name": "o4-mini", "role": "architect",
-             "description": "Fast reasoning — quick and cost-effective", "provider": "openai"},
         ]
 
     return {

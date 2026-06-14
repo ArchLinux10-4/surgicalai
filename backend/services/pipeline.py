@@ -5092,23 +5092,8 @@ USER REQUEST:
             # until the model has enough context to plan.
             client = _get_client(user_id)
 
-            # ── OpenAI reasoning model override ──
-            # Reasoning models (o3, o4-mini) are overly cautious with needs_clarification.
-            # This addendum biases them toward action when they can see the code.
-            _OAI_EXEC_OVERRIDE = (
-                "\n\n━━━ EXECUTION OVERRIDE (ACTIVE) ━━━\n\n"
-                "You are in EXECUTION MODE. Apply these overrides to the decision tree above:\n\n"
-                "1. SEARCH: Use ONLY on the first round when you haven\'t seen the target code yet.\n"
-                "   Once search results show you the code region you need to edit, you MUST proceed to \"edit\".\n"
-                "   Do NOT search again for minor details — make reasonable choices and produce the edit plan.\n\n"
-                "2. NEEDS_CLARIFICATION: DISABLED in execution mode. You may NOT use this intent.\n"
-                "   If you are unsure about a detail, make the most reasonable professional choice and note\n"
-                "   it in your \"reasoning\" field. The user will refine if needed.\n\n"
-                "3. After seeing search results: Your ONLY valid intents are \"edit\", \"create\", or \"chat\".\n"
-                "   Returning \"search\" after round 1 is allowed ONLY if the search results were completely\n"
-                "   irrelevant (wrong file region). If you can see ANY of the target code, proceed with \"edit\"."
-            )
-            _oai_architect_system = _architect_system + _OAI_EXEC_OVERRIDE
+            # OpenAI uses the same system prompt as Claude — no overrides needed
+            _oai_architect_system = _architect_system
 
 
             # ReAct loop state — scale limits by file size (same as Claude path)
@@ -5201,6 +5186,18 @@ USER REQUEST:
                 if _grep_results_oai:
                     _oai_accumulated_context += _grep_results_oai
 
+                # ── "No matches" feedback: tell the model explicitly when search found nothing ──
+                _no_match_terms = [t for t in (_new_terms or _search_terms_oai)[:6]
+                                   if not _oai_react_cache.get(t, "")]
+                if _no_match_terms:
+                    _no_match_msg = (
+                        f"\n⚠️ No matches found in any file for: "
+                        f"{', '.join(repr(t) for t in _no_match_terms)}\n"
+                        "These elements may not exist in the codebase. "
+                        "Try different search terms, or proceed with what you can see.\n"
+                    )
+                    _oai_accumulated_context += _no_match_msg
+
                 # ── Build architect message with accumulated context ──
                 _round_label = f" (search round {_oai_round}/{_OAI_REACT_MAX})" if _oai_round > 1 else ""
                 if _oai_round > 1 and _new_terms:
@@ -5213,11 +5210,7 @@ USER REQUEST:
                         "\n\n⚠️ SEARCH BUDGET EXHAUSTED — you MUST produce your final plan now. "
                         "Use the code context you have gathered so far. Do NOT return intent=search again."
                     )
-                elif _oai_round > 1 and _oai_accumulated_context:
-                    _budget_note = (
-                        "\n\nYou have seen the target code. Produce your \"edit\" plan now. "
-                        "Only return \"search\" if the results above were completely irrelevant to the request."
-                    )
+
 
                 _oai_context_msg = context_msg
                 if _oai_accumulated_context:

@@ -405,7 +405,7 @@ export function SettingsModal() {
 
                 {/* OpenAI Key */}
                 <div className="mt-6 pt-5 border-t border-border">
-                  <SectionHeader title="OpenAI API Key" subtitle="Optional — enables GPT-5, o3, o4-mini" />
+                  <SectionHeader title="OpenAI API Key" subtitle="Optional — enables GPT-5.5" />
                   <div className="mt-3">
                     <div className="flex gap-2">
                       <div className="relative flex-1">
@@ -451,7 +451,7 @@ export function SettingsModal() {
                       <a href="https://platform.openai.com/api-keys" target="_blank" rel="noopener" className="text-accent hover:underline">
                         platform.openai.com
                       </a>
-                      {' '}\u2014 enables GPT-5, o3 & o4-mini
+                      {' '}\u2014 enables GPT-5.5
                     </div>
                   </div>
                 </div>
