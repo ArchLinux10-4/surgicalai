@@ -9701,7 +9701,7 @@ async def run_natural_pipeline_stream(
                     try:
                         qa_results[idx] = task.result()
                     except Exception:
-                        pass  # stays unscored -> excluded by the hard gate below
+                        pass  # stays unscored -> ships with advisory warning
 
             # Find all still-blocked changes.
             # Trigger retry when:
