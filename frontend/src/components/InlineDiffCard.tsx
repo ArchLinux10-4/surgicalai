@@ -585,6 +585,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   )
   const [originalCode, setOriginalCode] = useState<string>('')
   const [modifiedCode, setModifiedCode] = useState<string | undefined>(undefined)
+  const [previewKey, setPreviewKey] = useState(0)
 
   // Pre-fetch original file content so Preview works before Apply
   useEffect(() => {
@@ -729,11 +730,13 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           ? `Applied & downloaded ${filename} (${selectedChanges.length} changes)`
           : `Applied & downloaded ${filename}`
         toast.success(`✅ ${label}`)
-        setModifiedCode(newContent)
+        setModifiedCode(undefined)  // clear so LivePreview falls back to originalCode (fresh from DB)
+        setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
         onApplied?.(filename, newContent)
       } else {
         toast.success(`Applied ${selectedChanges.length} change${selectedChanges.length !== 1 ? 's' : ''} to ${filename}`)
-        setModifiedCode(newContent)
+        setModifiedCode(undefined)  // clear so LivePreview falls back to originalCode (fresh from DB)
+        setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
         onApplied?.(filename, newContent)
       }
       for (const change of selectedChanges) markApplied(change.id)
@@ -868,6 +871,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       {isVisualFile(filename) && showFilePreview && (
         <div className="border-t border-border">
           <LivePreview
+            key={previewKey}
             code={originalCode || '// Loading...'}
             filename={filename}
             modifiedCode={modifiedCode}
