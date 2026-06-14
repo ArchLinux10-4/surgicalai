@@ -1460,6 +1460,11 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
     except (ValueError, Exception) as _apply_err:
         # Operations couldn't be applied to full file — fall back to symbol.code matching
         print(f"[MATCH] apply_operations failed ({_apply_err}), falling back to symbol.code")
+        _dlog("apply_operations_failed",
+              error_type=type(_apply_err).__name__,
+              error=str(_apply_err)[:300],
+              op_count=len(operations),
+              user_id=user_id)
         new_code = symbol.code
         for op in operations:
             find_text = op.get("find", "")
@@ -1697,6 +1702,9 @@ async def run_chat_stream(
                 if delta.content:
                     yield f"data: {json.dumps({'type': 'token', 'content': delta.content})}\n\n"
     except Exception as e:
+        _dlog("streaming_error",
+              error_type=type(e).__name__,
+              error=str(e)[:300], user_id=user_id)
         yield sse({"type": "error", "content": _friendly_error(e)})
 
     yield f"data: {json.dumps({'type': 'done', 'content': ''})}\n\n"
@@ -1893,8 +1901,9 @@ def _build_claude_context(
             if grep_sections:
                 parts.append("RELEVANT SECTIONS (grep):")
                 parts.append(grep_sections)
-        except Exception:
-            pass  # _grep_relevant_sections not available yet — skip silently
+        except Exception as _grep_exc:
+            _dlog("grep_relevant_sections_failed",
+                  error=str(_grep_exc)[:200], user_id=user_id)
 
     parts.append("")
 
@@ -2712,8 +2721,12 @@ async def analyze_and_plan_stream(
                                 yield sse({"type": "progress",
                                            "content": f"✅ Retry {_aps_attempt + 1} passed QA (score: {qa.get('qa_score', '?')})"})
                                 break
-                except Exception:
-                    pass  # Keep current changes if retry fails
+                except Exception as _retry_exc:
+                    _dlog("auto_heal_retry_failed",
+                          session_id=session_id,
+                          error_type=type(_retry_exc).__name__,
+                          error=str(_retry_exc)[:300],
+                          user_id=user_id)
 
         # ------------------------------------------------------------------
         # Build final response object and yield
@@ -3333,10 +3346,13 @@ async def _run_qa_for_new_file(file_result: dict, codebase_context: str, user_id
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _use_claude = True
         _model = "claude-sonnet-4-6"
-    except Exception:
+    except Exception as _qc_key_err:
         _qa_aclient = None
         _use_claude = False
         _model = "gpt-4.1"
+        _dlog("qa_create_claude_fallback",
+              reason=str(_qc_key_err)[:120], fallback_model=_model,
+              user_id=user_id)
 
     filename = file_result.get("filename", "new_file")
     content  = file_result.get("content", "")[:6000]
@@ -3383,6 +3399,9 @@ Run all 5 checks and return the JSON verdict."""
             "risk_verdicts":        [],
         }
     except Exception as e:
+        _dlog("qa_create_error",
+              filename=filename, error_type=type(e).__name__,
+              error=str(e)[:300], user_id=user_id)
         return {
             "verdict": "skipped", "qa_score": None,
             "summary": f"QA skipped: {str(e)[:100]}",
@@ -3904,10 +3923,13 @@ async def run_qa_agent(
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _qa_use_claude = True
         _qa_model = "claude-sonnet-4-6"
-    except Exception:
+    except Exception as _qa_key_err:
         _qa_aclient = None
         _qa_use_claude = False
         _qa_model = "gpt-4.1"  # full GPT-4.1, not mini — QA must not be weakest link
+        _dlog("qa_agent_claude_fallback",
+              session_id=session_id, reason=str(_qa_key_err)[:120],
+              fallback_model=_qa_model, user_id=user_id)
 
     # v3.12.0: QA receives FULL code — no truncation, no diff confusion.
     # Claude Sonnet has a 200K-token context. Real-world symbols (e.g. a large
@@ -3991,9 +4013,15 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
                 system=QA_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
             )
-            raw = (_qa_msg.content[0].text or "").strip()
+            _qa_raw_text = (_qa_msg.content[0].text or "").strip()
+            _dlog("qa_agent_raw_response",
+                  session_id=session_id, filename=filename,
+                  symbol=symbol_path, model=_qa_model,
+                  raw_len=len(_qa_raw_text),
+                  raw_preview=_qa_raw_text[:500],
+                  user_id=user_id)
             # Robust JSON extraction — Claude sometimes adds preamble or markdown fences
-            raw = _extract_json_from_text(raw)
+            data = _extract_json_from_text(_qa_raw_text)
         else:
             client = _get_client(user_id)
 
@@ -4010,8 +4038,14 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
                 )
 
             response = await asyncio.to_thread(_call)
-            raw = response.choices[0].message.content
-        data = json.loads(raw)
+            _qa_raw_text = response.choices[0].message.content
+            _dlog("qa_agent_raw_response",
+                  session_id=session_id, filename=filename,
+                  symbol=symbol_path, model=_qa_model,
+                  raw_len=len(_qa_raw_text or ""),
+                  raw_preview=(_qa_raw_text or "")[:500],
+                  user_id=user_id)
+            data = json.loads(_qa_raw_text)
 
         result = {
             "verdict":          data.get("verdict", "warning"),
@@ -4024,6 +4058,15 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
             "plan_deviation":   data.get("plan_deviation", ""),
             "skipped_reason":   None,
         }
+        _dlog("qa_agent_parsed",
+              session_id=session_id, filename=filename,
+              symbol=symbol_path,
+              verdict=result["verdict"],
+              qa_score=result["qa_score"],
+              summary=result["summary"][:200],
+              has_import_issues=bool(result["import_issues"]),
+              has_type_errors=bool(result["type_errors"]),
+              user_id=user_id)
 
         # Enforce verdict/score consistency
         # If QA found hard blockers (missing imports, logic errors, type errors)
@@ -4051,6 +4094,12 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 
       except Exception as _qa_e:
         _last_qa_err = _qa_e
+        _dlog("qa_agent_error",
+              session_id=session_id, filename=filename,
+              symbol=symbol_path, attempt=_qa_attempt,
+              error_type=type(_qa_e).__name__,
+              error=str(_qa_e)[:300],
+              user_id=user_id)
         if _qa_attempt == 0:
             await asyncio.sleep(1)
             continue  # retry once
@@ -5895,6 +5944,11 @@ USER REQUEST:
                 except Exception as _dr_exc:
                     _dr_err_msg = str(_dr_exc)[:160]
                     print(f"[DIRECT_REWRITE] Failed: {_dr_exc} — falling back to Surgeon")
+                    _dlog("direct_rewrite_failed",
+                          session_id=session_id,
+                          error_type=type(_dr_exc).__name__,
+                          error=str(_dr_exc)[:300],
+                          user_id=user_id)
                     yield sse({"type": "progress", "content": f"⚠️ Direct rewrite failed ({type(_dr_exc).__name__}: {_dr_err_msg}) — falling back to Surgeon"})
                     _use_direct_rewrite = False
 
@@ -6502,6 +6556,12 @@ USER REQUEST:
 
     except Exception as e:
         import traceback
+        _dlog("pipeline_top_level_error",
+              session_id=session_id,
+              error_type=type(e).__name__,
+              error=str(e)[:500],
+              traceback=traceback.format_exc()[-800:],
+              user_id=user_id)
         try:
             compliance.mark("pipeline_error", ran=False, reason=str(e)[:200])
             compliance.save()
@@ -9584,7 +9644,12 @@ async def run_natural_pipeline_stream(
         for t in qa_tasks:
             try:
                 qa_results.append(t.result())
-            except Exception:
+            except Exception as _qa_task_err:
+                _dlog("qa_task_collection_error",
+                      session_id=session_id,
+                      error_type=type(_qa_task_err).__name__,
+                      error=str(_qa_task_err)[:300],
+                      user_id=user_id)
                 qa_results.append({
                     "verdict": "warning", "qa_score": 7,
                     "summary": "QA could not run", "import_issues": [],
