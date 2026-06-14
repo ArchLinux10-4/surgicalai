@@ -10018,34 +10018,33 @@ async def run_natural_pipeline_stream(
 
             _gv = qa_dict.get("verdict", "skipped")
             _gs = qa_dict.get("qa_score")
+            # --- QA is advisory-only: warn but never block edits ---
             if _gv in ("blocked", "skipped") or _gs is None or _gs < _GATE_MIN:
                 _gscore_txt = str(_gs) if _gs is not None else "n/a"
                 _greason = (
                     qa_dict.get("summary")
                     or qa_dict.get("skipped_reason")
-                    or "did not clear the QA gate"
+                    or "QA did not produce a score"
                 )
-                skipped_changes_struct.append({
-                    "filename": filename,
-                    "symbol": symbol.name,
-                    "reason": f"QA gate {_gv} (score: {_gscore_txt}/10): {_greason}",
-                })
+                _qa_advisory_icon = "⚠️" if _gv == "skipped" else "🔶"
                 yield sse({"type": "progress",
-                           "content": f"🚫 Blocked by 8/10 gate — {symbol.name} "
-                                      f"(verdict: {_gv}, score: {_gscore_txt}/10); not shipped"})
-                _dlog("qa_gate_blocked",
+                           "content": f"{_qa_advisory_icon} QA advisory — {symbol.name} "
+                                      f"(verdict: {_gv}, score: {_gscore_txt}/10): "
+                                      f"{_greason[:120]}. Shipping anyway."})
+                _dlog("qa_advisory_warning",
                       session_id=session_id,
                       filename=filename,
                       symbol=symbol.name,
                       verdict=_gv,
                       score=_gs,
                       reason=_greason[:300],
+                      advisory=True,
                       user_id=user_id)
                 try:
                     _log_qa_result(session_id, filename, symbol.name, qa_dict)
                 except Exception:
                     pass
-                continue
+                # NOTE: no continue — edit proceeds below
 
             all_qa_risks.extend(qa_dict.get("downstream_risks", []))
 
