@@ -2586,7 +2586,7 @@ async def analyze_and_plan_stream(
                     _sq_has_errors = True
                     _sq_msgs = [si["message"] for si in _sq_issues if si["severity"] == "error"]
                     qa["verdict"] = "blocked"
-                    qa["qa_score"] = min(qa.get("qa_score", 10), 3)
+                    qa["qa_score"] = min(qa.get("qa_score", 10) or 10, 3)
                     qa_risks.extend([f"[STRUCTURAL] {m}" for m in _sq_msgs])
                     yield sse({"type": "progress",
                                "content": f"🔍 Structural QA: {len(_sq_msgs)} blocking issue(s) found"})
@@ -2689,7 +2689,7 @@ async def analyze_and_plan_stream(
                                         _sq_still_bad = True
                                         _sq_m2 = [x["message"] for x in _sq_i2 if x["severity"] == "error"]
                                         qa["verdict"] = "blocked"
-                                        qa["qa_score"] = min(qa.get("qa_score", 10), 3)
+                                        qa["qa_score"] = min(qa.get("qa_score", 10) or 10, 3)
                                         qa_risks.extend([f"[STRUCTURAL] {m}" for m in _sq_m2])
                                 if not _sq_still_bad and qa.get("verdict") != "blocked":
                                     yield sse({"type": "progress",
@@ -4024,8 +4024,8 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
         # If LLM said "blocked", respect it — never soften to "warning".
         # If hard issues exist, downgrade score to guarantee retry fires.
         if result["verdict"] == "blocked" and _has_hard_issues:
-            result["qa_score"] = min(result["qa_score"], 4)
-        if result["qa_score"] <= 7 and result["verdict"] == "safe":
+            result["qa_score"] = min(result["qa_score"] or 10, 4)
+        if (result["qa_score"] or 10) <= 7 and result["verdict"] == "safe":
             result["verdict"] = "warning"
 
         # Log to DB (non-blocking — fire and forget)
@@ -9598,7 +9598,7 @@ async def run_natural_pipeline_stream(
                         qa_results[_sq_i].get("import_issues", []) + _sq_msgs
                     )
                     qa_results[_sq_i]["verdict"] = "blocked"
-                    qa_results[_sq_i]["qa_score"] = min(qa_results[_sq_i].get("qa_score", 10), 3)
+                    qa_results[_sq_i]["qa_score"] = min(qa_results[_sq_i].get("qa_score", 10) or 10, 3)
                     qa_results[_sq_i]["summary"] = (
                         f"Structural QA: {len(_sq_msgs)} blocking issue(s). "
                         + qa_results[_sq_i].get("summary", "")
