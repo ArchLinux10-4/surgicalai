@@ -8563,6 +8563,69 @@ async def run_natural_pipeline_stream(
                         continue
                     raise
 
+            # ── End-of-stream close-check ────────────────────────────────
+            # When a short response has both opening AND closing tags in the
+            # same/final streaming chunk, the state machine transitions to
+            # in_filereq / in_search / in_plan but no further text_chunk
+            # events arrive to trigger the close-check.  Handle that here.
+            if state == "in_filereq":
+                idx = file_req_buf.find(FILE_REQ_CLOSE)
+                if idx != -1:
+                    raw = file_req_buf[:idx].strip()
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, list):
+                            fnames = [str(f).strip() for f in parsed if str(f).strip()]
+                        elif isinstance(parsed, str):
+                            fnames = [parsed.strip()]
+                        else:
+                            fnames = []
+                    except (json.JSONDecodeError, ValueError):
+                        fnames = [f.strip() for f in raw.replace(",", "\n").split("\n") if f.strip()]
+                    if fnames:
+                        file_request_data = fnames[:5]
+                    state = "normal"
+                    normal_buf = file_req_buf[idx + len(FILE_REQ_CLOSE):]
+                    file_req_buf = ""
+                    _dlog("filereq_late_close",
+                          session_id=session_id, user_id=user_id,
+                          filenames=file_request_data)
+                else:
+                    _dlog("filereq_incomplete",
+                          session_id=session_id, user_id=user_id,
+                          buf_preview=file_req_buf[:200])
+
+            elif state == "in_search":
+                idx = search_buf.find(SEARCH_CLOSE)
+                if idx != -1:
+                    search_json_raw = search_buf[:idx]
+                    try:
+                        search_data = json.loads(search_json_raw.strip())
+                        search_requested = search_data
+                    except Exception:
+                        pass
+                    state = "normal"
+                    normal_buf = search_buf[idx + len(SEARCH_CLOSE):]
+                    search_buf = ""
+                    _dlog("search_late_close",
+                          session_id=session_id, user_id=user_id)
+
+            elif state == "in_plan":
+                idx = plan_buf.find(PLAN_CLOSE)
+                if idx != -1:
+                    plan_json_raw = plan_buf[:idx]
+                    try:
+                        plan_data = json.loads(plan_json_raw.strip())
+                        if isinstance(plan_data, list):
+                            edit_plan_data = plan_data
+                    except Exception:
+                        pass
+                    state = "normal"
+                    normal_buf = plan_buf[idx + len(PLAN_CLOSE):]
+                    plan_buf = ""
+                    _dlog("plan_late_close",
+                          session_id=session_id, user_id=user_id)
+
             # Flush any normal text buffered at end of this round
             if state == "normal" and normal_buf.strip():
                 yield sse({"type": "token", "content": normal_buf})
