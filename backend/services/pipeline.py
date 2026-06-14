@@ -9693,6 +9693,11 @@ async def run_natural_pipeline_stream(
         MAX_QA_RETRIES = 2
 
         for _qa_retry_round in range(MAX_QA_RETRIES):
+            _dlog("qa_retry_loop_start", session_id=session_id, user_id=user_id,
+                  retry_round=_qa_retry_round, max_retries=MAX_QA_RETRIES,
+                  total_changes=len(qa_results),
+                  verdicts=[q.get("verdict") for q in qa_results],
+                  scores=[q.get("qa_score") for q in qa_results])
             # ── Re-run QA for any change whose QA could not execute ───────────
             # A "skipped"/None-score result means the QA *check* failed to run
             # (transient LLM/API error) — NOT that the code is bad. Re-running
@@ -9703,6 +9708,8 @@ async def run_natural_pipeline_stream(
                 _ui for _ui, _uqd in enumerate(qa_results)
                 if _uqd.get("verdict") == "skipped" or _uqd.get("qa_score") is None
             ]
+            _dlog("qa_retry_unscored", session_id=session_id, user_id=user_id,
+                  retry_round=_qa_retry_round, unscored_indices=_unscored)
             if _unscored:
                 yield sse({"type": "progress",
                            "content": f"🔁 Re-running QA on {len(_unscored)} unscored change(s) — "
@@ -9733,8 +9740,10 @@ async def run_natural_pipeline_stream(
                 for idx, task in _reqa_sk:
                     try:
                         qa_results[idx] = task.result()
-                    except Exception:
-                        pass  # stays unscored -> ships with advisory warning
+                    except Exception as _usc_exc:
+                        _dlog("qa_retry_unscored_reqa_error", session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=idx,
+                              error=str(_usc_exc), error_type=type(_usc_exc).__name__)
 
             # Find all still-blocked changes.
             # Trigger retry when:
@@ -9753,7 +9762,20 @@ async def run_natural_pipeline_stream(
                     blocked_indices.append(_bi)
                 elif _bs <= 7:
                     blocked_indices.append(_bi)
+            _dlog("qa_retry_blocked_indices", session_id=session_id, user_id=user_id,
+                  retry_round=_qa_retry_round,
+                  blocked_count=len(blocked_indices),
+                  blocked_indices=blocked_indices,
+                  blocked_details=[{
+                      "idx": bi,
+                      "symbol": change_shells[bi]["symbol"].name,
+                      "verdict": qa_results[bi].get("verdict"),
+                      "score": qa_results[bi].get("qa_score"),
+                      "summary": qa_results[bi].get("summary", "")[:200],
+                  } for bi in blocked_indices])
             if not blocked_indices:
+                _dlog("qa_retry_no_blocked_breaking", session_id=session_id, user_id=user_id,
+                      retry_round=_qa_retry_round)
                 break
 
             yield sse({"type": "progress",
@@ -9872,6 +9894,11 @@ async def run_natural_pipeline_stream(
                     ))
                 ))
 
+            _dlog("qa_retry_correction_tasks_created", session_id=session_id, user_id=user_id,
+                  retry_round=_qa_retry_round,
+                  task_count=len(correction_tasks),
+                  model=arch_model,
+                  indices=[idx for idx, _ in correction_tasks])
             # Wait for all correction calls with keepalives
             pending_corr = {t for _, t in correction_tasks}
             while pending_corr:
@@ -9933,10 +9960,20 @@ async def run_natural_pipeline_stream(
                                 _sym_code, accepted, change_shells[idx]["symbol"].name
                             )
                             fixed_indices.append(idx)
-                except Exception:
-                    pass  # keep original if correction call fails
+                except Exception as _corr_exc:
+                    _dlog("qa_retry_correction_parse_error", session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round, idx=idx,
+                          symbol=change_shells[idx]["symbol"].name,
+                          error=str(_corr_exc), error_type=type(_corr_exc).__name__)
 
+            _dlog("qa_retry_fixed_indices", session_id=session_id, user_id=user_id,
+                  retry_round=_qa_retry_round,
+                  fixed_count=len(fixed_indices),
+                  fixed_indices=fixed_indices,
+                  fixed_symbols=[change_shells[i]["symbol"].name for i in fixed_indices] if fixed_indices else [])
             if not fixed_indices:
+                _dlog("qa_retry_no_fixes_breaking", session_id=session_id, user_id=user_id,
+                      retry_round=_qa_retry_round)
                 break  # No code actually changed — stop retrying
 
             # Re-run QA on all fixed changes in parallel
@@ -9974,8 +10011,11 @@ async def run_natural_pipeline_stream(
                     yield sse({"type": "progress",
                                "content": f"Re-QA {icon} {change_shells[idx]['symbol'].name}: "
                                           f"{qa_results[idx].get('summary', '')} (score: {new_score})"})
-                except Exception:
-                    pass  # keep prior result if re-QA fails
+                except Exception as _reqa_exc:
+                    _dlog("qa_retry_reqa_error", session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round, idx=idx,
+                          symbol=change_shells[idx]["symbol"].name,
+                          error=str(_reqa_exc), error_type=type(_reqa_exc).__name__)
 
         # ── tsc compile gate — final verification after all retries ───────────
         # Re-run tsc on the FINAL content of every change. Anything that still

@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useMemo, Component } from 'react'
+import React, { useState, useCallback, useEffect, Component } from 'react'
 import { SandpackProvider, SandpackPreview } from '@codesandbox/sandpack-react'
 import { useThemeStore } from '../stores/themeStore'
 import { Fullscreen, FullscreenExit, Refresh } from '@mui/icons-material'
@@ -141,16 +141,6 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
   const handleRefresh = useCallback(() => {
     setSandpackError(null)
     setRefreshKey((k) => k + 1)
-  }, [])
-
-  // Auto-refresh when Apply All fires from ChatPanel
-  useEffect(() => {
-    const onApplied = () => {
-      setSandpackError(null)
-      setRefreshKey((k) => k + 1)
-    }
-    window.addEventListener('sai-applied-refresh', onApplied)
-    return () => window.removeEventListener('sai-applied-refresh', onApplied)
   }, [])
 
   const src = modifiedCode ?? code
@@ -323,13 +313,7 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
   }
 
   // Re-mount Sandpack whenever the file set or refresh key changes.
-  // Content hash so Sandpack remounts on any edit (not just length changes)
-  const srcHash = useMemo(() => {
-    let h = 5381
-    for (let i = 0; i < src.length; i++) h = ((h << 5) + h + src.charCodeAt(i)) | 0
-    return h
-  }, [src])
-  const sandpackKey = `${refreshKey}-${bundle ? 'graph' : 'single'}-${Object.keys(sandpackFiles).length}-${srcHash}`
+  const sandpackKey = `${refreshKey}-${bundle ? 'graph' : 'single'}-${Object.keys(sandpackFiles).length}-${src.length}`
 
   return (
     <div className={containerCls}>
