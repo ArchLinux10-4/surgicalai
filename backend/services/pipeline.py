@@ -148,6 +148,18 @@ CHAT_PERSONA = (
 )
 
 
+
+async def _stream_and_collect(aclient, **kwargs):
+    """Stream a Claude call and return the final Message object.
+
+    Used instead of aclient.messages.create() for large-token calls that would
+    exceed the Anthropic SDK's 10-minute non-streaming limit (e.g. Opus 4.5
+    with max_tokens=64000).  Returns the same Message object as .create().
+    """
+    async with aclient.messages.stream(**kwargs) as strm:
+        return await strm.get_final_message()
+
+
 def _is_claude_model(model: str) -> bool:
     """Check if a model ID is a Claude/Anthropic model."""
     return bool(model and model.startswith("claude-"))
@@ -9886,7 +9898,8 @@ async def run_natural_pipeline_stream(
 
                 correction_tasks.append((
                     idx,
-                    asyncio.create_task(aclient.messages.create(
+                    asyncio.create_task(_stream_and_collect(
+                        aclient,
                         model=arch_model,
                         max_tokens=64000,
                         system=system_prompt,
