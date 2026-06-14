@@ -9930,6 +9930,14 @@ async def run_natural_pipeline_stream(
                     # Extract first <surgical_edit> block from response
                     ei = corr_text.find(EDIT_OPEN)
                     ec = corr_text.find(EDIT_CLOSE, ei) if ei != -1 else -1
+                    if ei == -1 or ec == -1:
+                        _dlog("qa_retry_correction_no_edit_block", session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=idx,
+                              symbol=change_shells[idx]["symbol"].name,
+                              edit_open_pos=ei, edit_close_pos=ec,
+                              response_len=len(corr_text),
+                              response_preview=corr_text[:500])
+                        continue
                     if ei != -1 and ec != -1:
                         raw_edit = corr_text[ei + len(EDIT_OPEN):ec]
                         try:
@@ -9939,6 +9947,14 @@ async def run_natural_pipeline_stream(
                         corrected_code = edit_data.get("new_code", "")
                         corrected_old  = edit_data.get("old_code", "")
                         _sym_code = change_shells[idx]["symbol"].code
+                        _dlog("qa_retry_correction_parsed", session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=idx,
+                              symbol=change_shells[idx]["symbol"].name,
+                              has_new_code=bool(corrected_code),
+                              new_code_len=len(corrected_code),
+                              has_old_code=bool(corrected_old),
+                              old_code_len=len(corrected_old),
+                              sym_code_len=len(_sym_code))
 
                         # Reconstruct a FULL symbol from the correction before it can be
                         # stored. This loop must NEVER replace a change with a degenerate
@@ -9953,15 +9969,38 @@ async def run_natural_pipeline_stream(
                                 )
                                 if _ok_snip:
                                     accepted = _full
+                                else:
+                                    _dlog("qa_retry_correction_splice_failed", session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          old_code_preview=corrected_old[:200],
+                                          new_code_preview=corrected_code[:200])
                                 # splice failed (snippet not found/ambiguous) -> keep prior,
                                 # do NOT store a fragment.
                             else:
                                 # No old_code: only accept as a full-symbol replacement when
                                 # it is NOT a degenerate fragment of a large symbol.
-                                if _fragment_reason(_sym_code, corrected_code) is None:
+                                _frag_reason = _fragment_reason(_sym_code, corrected_code)
+                                if _frag_reason is None:
                                     accepted = corrected_code
-                                # else: degenerate fragment -> reject, keep prior change.
+                                else:
+                                    _dlog("qa_retry_correction_fragment_rejected", session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          fragment_reason=_frag_reason,
+                                          sym_len=len(_sym_code), corrected_len=len(corrected_code))
+                                # degenerate fragment -> reject, keep prior change.
 
+                        if accepted is None:
+                            _dlog("qa_retry_correction_not_accepted", session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  reason="no_valid_correction_produced")
+                        elif accepted == change_shells[idx]["new_code"]:
+                            _dlog("qa_retry_correction_not_accepted", session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  reason="corrected_code_identical_to_original")
                         if accepted is not None and accepted != change_shells[idx]["new_code"]:
                             change_shells[idx]["new_code"] = accepted
                             # Keep target_element/replacement consistent with the new full
