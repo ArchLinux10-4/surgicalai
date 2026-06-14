@@ -2282,13 +2282,14 @@ async def run_qa_for_changes(
             original = getattr(ch, "original_code", "") or ""
             new_code = getattr(ch, "new_code", "") or ""
 
-            # Truncate very long code to 200 lines
+            # Truncate very long code to 500 lines (must be large enough for
+            # QA to see structural breaks in big JSX components)
             orig_lines = original.splitlines()
             new_lines = new_code.splitlines()
-            if len(orig_lines) > 200:
-                original = "\n".join(orig_lines[:200]) + "\n... (truncated)"
-            if len(new_lines) > 200:
-                new_code = "\n".join(new_lines[:200]) + "\n... (truncated)"
+            if len(orig_lines) > 500:
+                original = "\n".join(orig_lines[:500]) + "\n... (truncated)"
+            if len(new_lines) > 500:
+                new_code = "\n".join(new_lines[:500]) + "\n... (truncated)"
 
             user_parts.append(
                 f"--- CHANGE: {symbol_name} ---\n"
@@ -6752,6 +6753,20 @@ Before including any block, verify:
 - No syntax errors or unclosed brackets
 - Logic exactly matches what was requested
 - All unchanged parts are preserved exactly
+
+━━━ JSX / HTML STRUCTURAL INTEGRITY (CRITICAL) ━━━
+
+For JSX, TSX, or HTML edits — BEFORE writing your edit block, do this:
+1. Count every opening tag (<div>, <section>, <ul>, <li>, etc.) in your new_code
+2. Verify each opening tag has EXACTLY ONE matching closing tag at the correct nesting level
+3. If inserting a new block between existing elements:
+   - Do NOT add extra closing tags for elements you did not open
+   - Do NOT leave your new elements unclosed
+   - The parent container's tag balance must be unchanged
+4. For targeted old_code → new_code edits: the net tag balance of new_code MUST
+   match old_code (same count of unmatched openers/closers) unless you are
+   intentionally adding or removing a container element
+Failure to balance tags is the #1 cause of rejected edits. Count twice, emit once.
 """
 
 
@@ -7729,7 +7744,10 @@ async def _retry_truncated_edit(
 
     focused_system = (
         "You are SurgicalAI. Write EXACTLY ONE <surgical_edit> block for the "
-        f"symbol '{symbol_name}' in '{filename}'. No explanation — just the edit block.\n\n"
+        f"symbol '{symbol_name}' in '{filename}'.\n\n"
+        "For JSX/TSX/HTML: before writing the edit, verify your tag balance — "
+        "count opening vs closing tags at each nesting level and confirm they match. "
+        "Then emit the edit block.\n\n"
         "Format:\n"
         "<surgical_edit>\n"
         '{"filename": "...", "symbol": "...", "description": "...", "new_code": "..."}\n'
@@ -9888,7 +9906,9 @@ async def run_natural_pipeline_stream(
                     f"3. Preserve everything you are not explicitly changing\n"
                     f"4. Use the exact symbol name: `{symbol.name}`\n\n"
                     f"{_format_instructions}\n\n"
-                    f"Return ONLY the <surgical_edit> block, nothing else."
+                    f"For JSX/TSX/HTML: first verify your corrected code has balanced tags — "
+                    f"count every opening tag and confirm it has a matching closing tag at "
+                    f"the correct nesting level. Then return the <surgical_edit> block."
                 )
 
                 correction_messages = current_messages + [
