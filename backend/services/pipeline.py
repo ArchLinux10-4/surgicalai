@@ -1020,6 +1020,67 @@ AGENTIC_TOOLS_V2 = [
 ]
 
 
+# Phase 4: Correction handler tool definitions (tool_use migration)
+CORRECTION_TOOLS = [
+    {
+        "name": "submit_fix",
+        "description": "Submit a corrected version of a symbol to fix QA issues. new_code must be the COMPLETE replacement for the entire symbol — all imports, all functions, nothing omitted.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol_path": {
+                    "type": "string",
+                    "description": "Full path or name of the symbol to fix (e.g., 'MyComponent', 'calculatePrice')"
+                },
+                "new_code": {
+                    "type": "string",
+                    "description": "Complete corrected code for the entire symbol"
+                },
+                "description": {
+                    "type": "string",
+                    "description": "What was fixed in this correction"
+                },
+                "confidence": {
+                    "type": "integer",
+                    "description": "Confidence score 1-10 that this fix is correct"
+                }
+            },
+            "required": ["symbol_path", "new_code"]
+        }
+    },
+    {
+        "name": "request_symbol_code",
+        "description": "Request the current code of a symbol to see its state before fixing.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol_path": {
+                    "type": "string",
+                    "description": "Name or full path of the symbol to inspect"
+                }
+            },
+            "required": ["symbol_path"]
+        }
+    },
+    {
+        "name": "done_fixing",
+        "description": "Signal that all QA fixes are complete.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "Summary of what was fixed"
+                }
+            },
+            "required": ["summary"]
+        }
+    }
+]
+
+
+
+
 
 
 
@@ -3342,70 +3403,188 @@ async def analyze_and_plan_stream(
                     _fb_parts.append(f"• {_fb_i}")
                 _fb_text = "\n".join(_fb_parts)
 
-                # Re-call Claude with QA feedback injected
-                try:
-                    _retry_msgs = [
-                        {"role": "user", "content": user_message},
-                        {"role": "assistant", "content": full_text},
-                        {"role": "user", "content": (
-                            f"Your code changes were rejected by QA:\n\n{_fb_text}\n\n"
-                            f"Please fix all issues and return the corrected JSON with the "
-                            f"same structure (changes array with symbol_path, new_code, description, confidence). "
-                            f"The new_code must be COMPLETE — include all imports, all functions, nothing omitted."
-                        )},
-                    ]
-                    _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
-                        model=architect_model,
-                        max_tokens=64000,
-                        system=CLAUDE_EDITOR_SYSTEM,
-                        messages=_retry_msgs,
-                    )
-                    _retry_text = "".join(
-                        b.text for b in _retry_resp.content if hasattr(b, "text")
-                    )
-                    _raw_retry = _extract_json_from_text(_retry_text)
-                    _retry_data = json.loads(_raw_retry) if isinstance(_raw_retry, str) else _raw_retry
-                    _retry_changes_data = _retry_data.get("changes", [])
-
-                    if _retry_changes_data:
-                        # Rebuild changes from retry
-                        _new_changes = []
-                        for _rc in _retry_changes_data:
-                            _rc_sp = _rc.get("symbol_path", "")
-                            _rc_nc = _rc.get("new_code", "")
-                            _rc_desc = _rc.get("description", "")
-                            _rc_conf = _rc.get("confidence", 9)
-                            if not _rc_sp or not _rc_nc:
-                                continue
-                            _rc_sym = None
-                            for s in symbol_map.symbols:
-                                if getattr(s, "full_path", None) == _rc_sp or getattr(s, "name", None) == _rc_sp:
-                                    _rc_sym = s
+                # Phase 4: tool_use vs free-text correction path
+                _use_correction_tool_use = str(get_setting("correction_tool_use", "false")).lower() == "true"
+                if _use_correction_tool_use:
+                    # ── Multi-turn tool_use correction ──────────────────────────
+                    try:
+                        _dlog("correction_tool_use_start",
+                              session_id=session_id, user_id=user_id,
+                              attempt=_aps_attempt + 1,
+                              qa_score=qa.get("qa_score"),
+                              qa_verdict=qa.get("verdict"),
+                              model=architect_model)
+                        _corr_msgs = [
+                            {"role": "user", "content": user_message},
+                            {"role": "assistant", "content": full_text},
+                            {"role": "user", "content": (
+                                f"Your code changes were rejected by QA:\n\n{_fb_text}\n\n"
+                                f"Fix all issues. Use submit_fix() for each corrected symbol. "
+                                f"Use request_symbol_code() to see the current state of any symbol first. "
+                                f"Call done_fixing() when all fixes are complete.\n\n"
+                                f"The new_code must be COMPLETE — include all imports, all functions, nothing omitted."
+                            )},
+                        ]
+                        _corr_changes = []
+                        _CORR_MAX_TURNS = 5
+                        _corr_done = False
+                
+                        for _corr_turn in range(_CORR_MAX_TURNS):
+                            _dlog("correction_tool_use_turn",
+                                  session_id=session_id, turn=_corr_turn + 1,
+                                  msg_count=len(_corr_msgs),
+                                  fixes_so_far=len(_corr_changes))
+                            try:
+                                _corr_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
+                                    model=architect_model,
+                                    max_tokens=64000,
+                                    system=CLAUDE_EDITOR_SYSTEM,
+                                    messages=_corr_msgs,
+                                    tools=CORRECTION_TOOLS,
+                                    tool_choice={"type": "auto"},
+                                )
+                            except Exception as _corr_api_err:
+                                _dlog("correction_tool_use_api_error",
+                                      session_id=session_id, turn=_corr_turn + 1,
+                                      error_type=type(_corr_api_err).__name__,
+                                      error=str(_corr_api_err)[:300],
+                                      fixes_so_far=len(_corr_changes))
+                                break
+                
+                            _tool_results = []
+                
+                            for _cblk in _corr_resp.content:
+                                if not hasattr(_cblk, "type") or _cblk.type != "tool_use":
+                                    continue
+                
+                                if _cblk.name == "done_fixing":
+                                    _corr_done = True
+                                    _dlog("correction_tool_use_done",
+                                          session_id=session_id, turn=_corr_turn + 1,
+                                          summary=(_cblk.input or {}).get("summary", ""),
+                                          total_fixes=len(_corr_changes))
+                                    _tool_results.append({"type": "tool_result", "tool_use_id": _cblk.id,
+                                                          "content": json.dumps({"status": "ok"})})
                                     break
-                            if not _rc_sym:
-                                for s in symbol_map.symbols:
-                                    if _rc_sp in (getattr(s, "full_path", "") or "") or (getattr(s, "name", "") or "") in _rc_sp:
-                                        _rc_sym = s
-                                        break
-                            if not _rc_sym:
-                                continue
-                            _rc_diff = _make_diff(_rc_sym.code, _rc_nc, _rc_sp)
-                            _rc_tgt, _rc_repl = _compute_target_element(_rc_sym.code, _rc_nc)
-                            _new_changes.append(SurgicalChange(
-                                id=str(uuid.uuid4()),
-                                symbol=_rc_sym,
-                                original_code=_rc_sym.code,
-                                new_code=_rc_nc,
-                                diff=_rc_diff,
-                                confidence=_rc_conf,
-                                description=_rc_desc,
-                                applied=False,
-                                operations=[{"find": _rc_sym.code, "replace": _rc_nc}],
-                                target_element=_rc_tgt,
-                                replacement=_rc_repl,
-                            ))
-                        if _new_changes:
-                            changes = _new_changes
+                
+                                elif _cblk.name == "request_symbol_code":
+                                    _req_sp = (_cblk.input or {}).get("symbol_path", "")
+                                    _found_sym = None
+                                    for _s in symbol_map.symbols:
+                                        if getattr(_s, "full_path", None) == _req_sp or getattr(_s, "name", None) == _req_sp:
+                                            _found_sym = _s
+                                            break
+                                    if not _found_sym:
+                                        for _s in symbol_map.symbols:
+                                            if _req_sp in (getattr(_s, "full_path", "") or "") or (getattr(_s, "name", "") or "") in _req_sp:
+                                                _found_sym = _s
+                                                break
+                                    if _found_sym:
+                                        _dlog("correction_tool_use_symbol_requested",
+                                              session_id=session_id, symbol=_found_sym.full_path,
+                                              code_lines=len((_found_sym.code or "").splitlines()))
+                                        _tool_results.append({"type": "tool_result", "tool_use_id": _cblk.id,
+                                                              "content": json.dumps({
+                                                                  "symbol_path": _found_sym.full_path,
+                                                                  "code": _found_sym.code,
+                                                                  "lines": len((_found_sym.code or "").splitlines())
+                                                              })})
+                                    else:
+                                        _available = [getattr(_s, "full_path", getattr(_s, "name", "?")) for _s in symbol_map.symbols[:20]]
+                                        _dlog("correction_tool_use_symbol_not_found",
+                                              session_id=session_id, requested=_req_sp,
+                                              available_count=len(symbol_map.symbols))
+                                        _tool_results.append({"type": "tool_result", "tool_use_id": _cblk.id,
+                                                              "content": json.dumps({
+                                                                  "error": f"Symbol '{_req_sp}' not found",
+                                                                  "available_symbols": _available
+                                                              }), "is_error": True})
+                
+                                elif _cblk.name == "submit_fix":
+                                    _fix_sp = (_cblk.input or {}).get("symbol_path", "")
+                                    _fix_nc = (_cblk.input or {}).get("new_code", "")
+                                    _fix_desc = (_cblk.input or {}).get("description", "")
+                                    _fix_conf = (_cblk.input or {}).get("confidence", 9)
+                
+                                    # Symbol lookup — exact match first, then fuzzy
+                                    _fix_sym = None
+                                    for _s in symbol_map.symbols:
+                                        if getattr(_s, "full_path", None) == _fix_sp or getattr(_s, "name", None) == _fix_sp:
+                                            _fix_sym = _s
+                                            break
+                                    if not _fix_sym:
+                                        for _s in symbol_map.symbols:
+                                            if _fix_sp in (getattr(_s, "full_path", "") or "") or (getattr(_s, "name", "") or "") in _fix_sp:
+                                                _fix_sym = _s
+                                                break
+                
+                                    if _fix_sym and _fix_nc:
+                                        _fix_diff = _make_diff(_fix_sym.code, _fix_nc, _fix_sp)
+                                        _fix_tgt, _fix_repl = _compute_target_element(_fix_sym.code, _fix_nc)
+                                        _corr_changes.append(SurgicalChange(
+                                            id=str(uuid.uuid4()),
+                                            symbol=_fix_sym,
+                                            original_code=_fix_sym.code,
+                                            new_code=_fix_nc,
+                                            diff=_fix_diff,
+                                            confidence=_fix_conf,
+                                            description=_fix_desc,
+                                            applied=False,
+                                            operations=[{"find": _fix_sym.code, "replace": _fix_nc}],
+                                            target_element=_fix_tgt,
+                                            replacement=_fix_repl,
+                                        ))
+                                        _dlog("correction_tool_use_fix_accepted",
+                                              session_id=session_id, symbol=_fix_sym.full_path,
+                                              new_code_lines=len(_fix_nc.splitlines()),
+                                              confidence=_fix_conf,
+                                              description=_fix_desc[:80])
+                                        _tool_results.append({"type": "tool_result", "tool_use_id": _cblk.id,
+                                                              "content": json.dumps({
+                                                                  "status": "accepted",
+                                                                  "symbol": _fix_sym.full_path,
+                                                                  "new_code_lines": len(_fix_nc.splitlines())
+                                                              })})
+                                    elif not _fix_sym:
+                                        _available = [getattr(_s, "full_path", getattr(_s, "name", "?")) for _s in symbol_map.symbols[:20]]
+                                        _dlog("correction_tool_use_fix_symbol_not_found",
+                                              session_id=session_id, requested=_fix_sp,
+                                              available_count=len(symbol_map.symbols))
+                                        _tool_results.append({"type": "tool_result", "tool_use_id": _cblk.id,
+                                                              "content": json.dumps({
+                                                                  "error": f"Symbol '{_fix_sp}' not found. Use request_symbol_code to see available symbols.",
+                                                                  "available_symbols": _available
+                                                              }), "is_error": True})
+                                    else:
+                                        _dlog("correction_tool_use_fix_empty_code",
+                                              session_id=session_id, symbol=_fix_sp)
+                                        _tool_results.append({"type": "tool_result", "tool_use_id": _cblk.id,
+                                                              "content": json.dumps({"error": "new_code is empty"}),
+                                                              "is_error": True})
+                
+                            # Check exit conditions
+                            if _corr_done:
+                                break
+                            if _corr_resp.stop_reason == "end_turn" and not _tool_results:
+                                _dlog("correction_tool_use_end_turn_no_tools",
+                                      session_id=session_id, turn=_corr_turn + 1)
+                                break
+                
+                            # Continue conversation for next turn
+                            if _tool_results:
+                                _corr_msgs.append({"role": "assistant", "content": _corr_resp.content})
+                                _corr_msgs.append({"role": "user", "content": _tool_results})
+                            else:
+                                _dlog("correction_tool_use_no_tool_results",
+                                      session_id=session_id, turn=_corr_turn + 1,
+                                      stop_reason=_corr_resp.stop_reason)
+                                break
+                
+                        # Apply correction results
+                        if _corr_changes:
+                            changes = _corr_changes
+                            _dlog("correction_tool_use_applying",
+                                  session_id=session_id, num_fixes=len(_corr_changes))
                             # Re-run QA on the fix
                             qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model)
                             qa_risks = qa.get("risks", [])
@@ -3430,12 +3609,113 @@ async def analyze_and_plan_stream(
                                 yield sse({"type": "progress",
                                            "content": f"✅ Retry {_aps_attempt + 1} passed QA (score: {qa.get('qa_score', '?')})"})
                                 break
-                except Exception as _retry_exc:
-                    _dlog("auto_heal_retry_failed",
-                          session_id=session_id,
-                          error_type=type(_retry_exc).__name__,
-                          error=str(_retry_exc)[:300],
-                          user_id=user_id)
+                        else:
+                            _dlog("correction_tool_use_no_fixes",
+                                  session_id=session_id, attempt=_aps_attempt + 1)
+                
+                    except Exception as _corr_exc:
+                        _dlog("correction_tool_use_failed",
+                              session_id=session_id,
+                              error_type=type(_corr_exc).__name__,
+                              error=str(_corr_exc)[:300],
+                              attempt=_aps_attempt + 1,
+                              user_id=user_id)
+                else:
+                    # ── Existing free-text correction path ──────────────────────
+
+                    try:
+                        _retry_msgs = [
+                            {"role": "user", "content": user_message},
+                            {"role": "assistant", "content": full_text},
+                            {"role": "user", "content": (
+                                f"Your code changes were rejected by QA:\n\n{_fb_text}\n\n"
+                                f"Please fix all issues and return the corrected JSON with the "
+                                f"same structure (changes array with symbol_path, new_code, description, confidence). "
+                                f"The new_code must be COMPLETE — include all imports, all functions, nothing omitted."
+                            )},
+                        ]
+                        _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
+                            model=architect_model,
+                            max_tokens=64000,
+                            system=CLAUDE_EDITOR_SYSTEM,
+                            messages=_retry_msgs,
+                        )
+                        _retry_text = "".join(
+                            b.text for b in _retry_resp.content if hasattr(b, "text")
+                        )
+                        _raw_retry = _extract_json_from_text(_retry_text)
+                        _retry_data = json.loads(_raw_retry) if isinstance(_raw_retry, str) else _raw_retry
+                        _retry_changes_data = _retry_data.get("changes", [])
+
+                        if _retry_changes_data:
+                            # Rebuild changes from retry
+                            _new_changes = []
+                            for _rc in _retry_changes_data:
+                                _rc_sp = _rc.get("symbol_path", "")
+                                _rc_nc = _rc.get("new_code", "")
+                                _rc_desc = _rc.get("description", "")
+                                _rc_conf = _rc.get("confidence", 9)
+                                if not _rc_sp or not _rc_nc:
+                                    continue
+                                _rc_sym = None
+                                for s in symbol_map.symbols:
+                                    if getattr(s, "full_path", None) == _rc_sp or getattr(s, "name", None) == _rc_sp:
+                                        _rc_sym = s
+                                        break
+                                if not _rc_sym:
+                                    for s in symbol_map.symbols:
+                                        if _rc_sp in (getattr(s, "full_path", "") or "") or (getattr(s, "name", "") or "") in _rc_sp:
+                                            _rc_sym = s
+                                            break
+                                if not _rc_sym:
+                                    continue
+                                _rc_diff = _make_diff(_rc_sym.code, _rc_nc, _rc_sp)
+                                _rc_tgt, _rc_repl = _compute_target_element(_rc_sym.code, _rc_nc)
+                                _new_changes.append(SurgicalChange(
+                                    id=str(uuid.uuid4()),
+                                    symbol=_rc_sym,
+                                    original_code=_rc_sym.code,
+                                    new_code=_rc_nc,
+                                    diff=_rc_diff,
+                                    confidence=_rc_conf,
+                                    description=_rc_desc,
+                                    applied=False,
+                                    operations=[{"find": _rc_sym.code, "replace": _rc_nc}],
+                                    target_element=_rc_tgt,
+                                    replacement=_rc_repl,
+                                ))
+                            if _new_changes:
+                                changes = _new_changes
+                                # Re-run QA on the fix
+                                qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model)
+                                qa_risks = qa.get("risks", [])
+                                # Re-run structural QA
+                                if _sq_blocking is not None:
+                                    _sq_still_bad = False
+                                    for _sq_ch2 in changes:
+                                        _sq_n2 = getattr(_sq_ch2, "new_code", "") or ""
+                                        _sq_o2 = getattr(_sq_ch2, "original_code", "") or ""
+                                        _sq_i2 = run_structural_qa(_sq_n2, _sq_o2, file_path or "")
+                                        if _sq_blocking(_sq_i2):
+                                            _sq_still_bad = True
+                                            _sq_m2 = [x["message"] for x in _sq_i2 if x["severity"] == "error"]
+                                            qa["verdict"] = "blocked"
+                                            qa["qa_score"] = min(qa.get("qa_score", 10) or 10, 3)
+                                            qa_risks.extend([f"[STRUCTURAL] {m}" for m in _sq_m2])
+                                    if not _sq_still_bad and qa.get("verdict") != "blocked":
+                                        yield sse({"type": "progress",
+                                                   "content": f"✅ Retry {_aps_attempt + 1} passed QA (score: {qa.get('qa_score', '?')})"})
+                                        break
+                                elif qa.get("verdict") != "blocked" and (qa.get("qa_score", 0) or 0) >= 5:
+                                    yield sse({"type": "progress",
+                                               "content": f"✅ Retry {_aps_attempt + 1} passed QA (score: {qa.get('qa_score', '?')})"})
+                                    break
+                    except Exception as _retry_exc:
+                        _dlog("auto_heal_retry_failed",
+                              session_id=session_id,
+                              error_type=type(_retry_exc).__name__,
+                              error=str(_retry_exc)[:300],
+                              user_id=user_id)
 
         # ------------------------------------------------------------------
         # Build final response object and yield
