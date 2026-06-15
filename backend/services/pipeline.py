@@ -12062,29 +12062,39 @@ async def run_natural_pipeline_stream(
                     # This eliminates verbatim-match failures on large/minified symbols.
                     _numbered_original = _number_lines(symbol.code)
                     _format_instructions = (
-                        f"This symbol is {_sym_line_count} lines — DO NOT re-emit the whole symbol.\n"
-                        f"Use LINE-TARGETED fixes. In your <surgical_edit> JSON, provide a \"fixes\" array:\n"
+                        f"⚠️ CRITICAL FORMAT REQUIREMENT — READ CAREFULLY ⚠️\n\n"
+                        f"This symbol is {_sym_line_count} lines. DO NOT re-emit the whole symbol.\n"
+                        f"DO NOT use the standard {{\"filename\", \"symbol\", \"new_code\"}} format.\n\n"
+                        f"You MUST return a <surgical_edit> block with a \"fixes\" array.\n"
+                        f"Each fix targets specific line numbers from the ORIGINAL CODE above.\n\n"
+                        f"REQUIRED FORMAT (inside <surgical_edit> tags):\n"
                         f'{{\n'
-                        f'  "symbol": "{symbol.name}",\n'
                         f'  "fixes": [\n'
                         f'    {{\n'
-                        f'      "start_line": <first line to replace (1-indexed, from ORIGINAL CODE above)>,\n'
-                        f'      "end_line": <last line to replace (1-indexed, inclusive)>,\n'
-                        f'      "new_code": "<replacement code — NO line numbers, just raw code>",\n'
-                        f'      "reason": "<what was fixed>"\n'
+                        f'      "start_line": <first line to replace (1-indexed from ORIGINAL CODE)>,\n'
+                        f'      "end_line": <last line to replace (inclusive)>,\n'
+                        f'      "new_code": "<replacement for those lines — raw code, NO line-number prefixes>",\n'
+                        f'      "reason": "<what this fix does>"\n'
                         f'    }}\n'
                         f'  ]\n'
                         f'}}\n\n'
+                        f"EXAMPLE — to remove a stray closing tag on line 500:\n"
+                        f"<surgical_edit>\n"
+                        f'{{"fixes": [{{"start_line": 500, "end_line": 500, "new_code": "", "reason": "Remove stray </div>"}}]}}\n'
+                        f"</surgical_edit>\n\n"
+                        f"EXAMPLE — to fix lines 120-122:\n"
+                        f"<surgical_edit>\n"
+                        f'{{"fixes": [{{"start_line": 120, "end_line": 122, "new_code": "  const x = calculateValue();\\n  return x;", "reason": "Fix logic error"}}]}}\n'
+                        f"</surgical_edit>\n\n"
                         f"RULES:\n"
-                        f"- start_line/end_line are 1-indexed line numbers from the ORIGINAL CODE listing above\n"
-                        f"- new_code is the replacement for ONLY those lines — everything else is preserved automatically\n"
-                        f"- You can include multiple fixes in the array (one per QA issue)\n"
-                        f"- new_code must NOT contain line-number prefixes — just raw code\n"
-                        f"- To DELETE lines: set new_code to empty string\n\n"
-                        f"FALLBACK: if you cannot determine exact line numbers, you may instead use\n"
-                        f"old_code/new_code format (old_code = exact verbatim snippet, new_code = replacement).\n\n"
-                        f"NOTE: file-level imports, other functions, and module exports live OUTSIDE this symbol — "
-                        f"you do NOT need to add them. Only fix issues that are genuinely inside the symbol."
+                        f"- Use line numbers from the ORIGINAL CODE listing above\n"
+                        f"- new_code replaces ONLY those lines — everything else is preserved automatically\n"
+                        f"- Multiple fixes: add multiple objects to the fixes array\n"
+                        f"- To DELETE lines: set new_code to empty string\n"
+                        f"- new_code must NOT contain line-number prefixes\n\n"
+                        f"FALLBACK: if you truly cannot determine exact line numbers, use old_code/new_code format:\n"
+                        f"{{\"old_code\": \"<exact verbatim text to find>\", \"new_code\": \"<replacement>\"}}\n\n"
+                        f"NOTE: imports, other functions, and exports are OUTSIDE this symbol — do not add them."
                     )
                     _dlog("correction_line_targeted_prompt",
                           session_id=session_id, user_id=user_id,
@@ -12381,18 +12391,20 @@ async def run_natural_pipeline_stream(
                         ]:
                             try:
                                 edit_data = _parse_fn(raw_edit.strip())
-                                if isinstance(edit_data, dict) and edit_data.get("new_code"):
+                                if isinstance(edit_data, dict) and (edit_data.get("new_code") or (isinstance(edit_data.get("fixes"), list) and len(edit_data["fixes"]) > 0)):
                                     _corr_ext_fmt = edit_data.pop("_extraction_format", None)
                                     _dlog("qa_retry_correction_parse_method", session_id=session_id, user_id=user_id,
                                           retry_round=_qa_retry_round, idx=idx,
                                           symbol=change_shells[idx]["symbol"].name,
                                           method=_parse_attempt_label,
-                                          extraction_format=_corr_ext_fmt)
+                                          extraction_format=_corr_ext_fmt,
+                                          has_fixes=isinstance(edit_data.get("fixes"), list),
+                                          has_new_code=bool(edit_data.get("new_code")))
                                     break
                                 edit_data = None
                             except Exception:
                                 edit_data = None
-                        if not isinstance(edit_data, dict) or not edit_data.get("new_code"):
+                        if not isinstance(edit_data, dict) or not (edit_data.get("new_code") or (isinstance(edit_data.get("fixes"), list) and len(edit_data["fixes"]) > 0)):
                             _dlog("qa_retry_correction_all_parsers_failed", session_id=session_id, user_id=user_id,
                                   retry_round=_qa_retry_round, idx=idx,
                                   symbol=change_shells[idx]["symbol"].name,
@@ -12518,6 +12530,53 @@ async def run_natural_pipeline_stream(
                                       old_code_preview=corrected_old[:200],
                                       new_code_preview=corrected_code[:200],
                                       splice_reason=_snip_reason)
+
+                        # ── Path 2.5: Fragment-as-correction ──
+                        # Model returned new_code that's a small fragment (not full symbol).
+                        # Treat it as a corrected version of the ORIGINAL BROKEN edit.
+                        # Find the broken edit in the current symbol and replace it.
+                        if accepted is None and corrected_code and not corrected_old and not isinstance(corrected_fixes, list):
+                            _original_edit = change_shells[idx]["new_code"]
+                            _frag_reason_25 = _fragment_reason(_sym_code, corrected_code)
+                            _can_splice = (
+                                _frag_reason_25 is not None  # corrected_code IS a fragment
+                                and _original_edit  # we have the original broken edit
+                                and corrected_code != _original_edit  # correction is actually different
+                                and _original_edit in _sym_code  # broken edit is in the symbol
+                            )
+                            if _can_splice:
+                                _spliced = _sym_code.replace(_original_edit, corrected_code, 1)
+                                _splice_frag = _fragment_reason(_sym_code, _spliced)
+                                _dlog("correction_fragment_as_fix_attempt",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      original_edit_len=len(_original_edit),
+                                      corrected_fragment_len=len(corrected_code),
+                                      sym_code_len=len(_sym_code),
+                                      spliced_len=len(_spliced),
+                                      splice_is_fragment=_splice_frag is not None)
+                                if _splice_frag is None:
+                                    accepted = _spliced
+                                    _dlog("correction_fragment_as_fix_accepted",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name)
+                                else:
+                                    _dlog("correction_fragment_as_fix_rejected",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          splice_fragment_reason=_splice_frag)
+                            elif _frag_reason_25 is not None:
+                                _dlog("correction_fragment_as_fix_skipped",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      reason="precondition_failed",
+                                      has_original_edit=bool(_original_edit),
+                                      edits_differ=corrected_code != _original_edit if _original_edit else False,
+                                      original_in_sym=_original_edit in _sym_code if _original_edit else False)
 
                         # ── Path 3: Full new_code replacement (fragment-checked) ──
                         if accepted is None and corrected_code and not corrected_old:
