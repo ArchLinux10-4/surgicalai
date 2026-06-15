@@ -2999,6 +2999,158 @@ def _find_changed_window(original_code: str, edited_code: str, context_lines: in
 
 
 # ---------------------------------------------------------------------------
+# Helper: _find_changed_windows  (multi-cluster windowed diff for scattered edits)
+# ---------------------------------------------------------------------------
+
+def _find_changed_windows(original_code: str, edited_code: str, context_lines: int = 20, merge_gap: int = None):
+    """Diff original vs edited code, return focused windows around change clusters.
+
+    Unlike _find_changed_window (singular) which always returns ONE window
+    spanning all changes, this clusters scattered changes into SEPARATE windows
+    when they're far apart.  Two changes at lines 50 and 1900 of a 2000-line
+    symbol produce two ~60-line windows instead of one 1870-line mega-window.
+
+    merge_gap: minimum gap between consecutive changed lines to split into
+               separate clusters.  Default = 2 * context_lines (so context
+               zones of adjacent clusters don't overlap).
+
+    Returns a list of window dicts (same fields as _find_changed_window, plus
+    cluster_index and total_clusters).
+    Empty list on identical codes or internal error.
+    """
+    if merge_gap is None:
+        merge_gap = context_lines * 2
+
+    try:
+        if not original_code or not edited_code:
+            _dlog("find_changed_windows_empty_input",
+                  original_len=len(original_code) if original_code else 0,
+                  edited_len=len(edited_code) if edited_code else 0)
+            return []
+
+        orig_lines = original_code.splitlines()
+        edit_lines = edited_code.splitlines()
+
+        if not orig_lines or not edit_lines:
+            _dlog("find_changed_windows_no_lines",
+                  orig_count=len(orig_lines), edit_count=len(edit_lines))
+            return []
+
+        sm = difflib.SequenceMatcher(None, orig_lines, edit_lines)
+        opcodes = sm.get_opcodes()
+
+        # Collect change regions with BOTH edit-space and orig-space coords
+        change_regions = []  # [(edit_start, edit_end, orig_start, orig_end)]
+        for tag, i1, i2, j1, j2 in opcodes:
+            if tag != "equal":
+                # j = edited, i = original; use inclusive end indices
+                change_regions.append((
+                    j1, max(j1, j2 - 1),   # edit range (inclusive)
+                    i1, max(i1, i2 - 1),    # orig range (inclusive)
+                ))
+
+        if not change_regions:
+            _dlog("find_changed_windows_identical",
+                  orig_lines=len(orig_lines), edit_lines=len(edit_lines))
+            return []
+
+        # ── Cluster change regions by gap in edit-space ──
+        clusters = [[change_regions[0]]]
+        for region in change_regions[1:]:
+            prev_end = clusters[-1][-1][1]  # edit_end of last region in cluster
+            gap = region[0] - prev_end
+            if gap > merge_gap:
+                clusters.append([region])
+            else:
+                clusters[-1].append(region)
+
+        _dlog("find_changed_windows_clustering",
+              total_change_regions=len(change_regions),
+              merge_gap=merge_gap,
+              cluster_count=len(clusters),
+              cluster_sizes=[len(c) for c in clusters])
+
+        # ── Build window dicts from clusters ──
+        windows = []
+        for ci, cluster in enumerate(clusters):
+            e_first = min(r[0] for r in cluster)
+            e_last  = max(r[1] for r in cluster)
+            o_first = min(r[2] for r in cluster)
+            o_last  = max(r[3] for r in cluster)
+
+            # Window with context in edited version
+            ws = max(0, e_first - context_lines)
+            we = min(len(edit_lines) - 1, e_last + context_lines)
+
+            if ws > we:
+                _dlog("find_changed_windows_bad_edit_range",
+                      ci=ci, ws=ws, we=we, e_first=e_first, e_last=e_last)
+                continue
+
+            window_lines = edit_lines[ws:we + 1]
+            numbered_broken = "\n".join(
+                f"{ws + i + 1:4d} | {line}" for i, line in enumerate(window_lines)
+            )
+
+            # Corresponding window in original version
+            ows = max(0, o_first - context_lines)
+            owe = min(len(orig_lines) - 1, o_last + context_lines)
+
+            if ows <= owe and owe < len(orig_lines):
+                orig_window = orig_lines[ows:owe + 1]
+                numbered_original = "\n".join(
+                    f"{ows + i + 1:4d} | {line}" for i, line in enumerate(orig_window)
+                )
+            else:
+                numbered_original = "(no corresponding original lines)"
+                ows, owe = ws, we
+
+            wl = we - ws + 1
+            _changed_count = sum(r[1] - r[0] + 1 for r in cluster)
+
+            windows.append({
+                "window_start": ws,           # 0-indexed in edited_code
+                "window_end": we,             # 0-indexed in edited_code (inclusive)
+                "numbered_broken": numbered_broken,
+                "numbered_original": numbered_original,
+                "window_line_count": wl,
+                "total_edit_lines": len(edit_lines),
+                "total_orig_lines": len(orig_lines),
+                "changed_line_count": _changed_count,
+                "cluster_index": ci,
+                "total_clusters": len(clusters),
+            })
+
+        _total_wl = sum(w["window_line_count"] for w in windows)
+        _dlog("find_changed_windows_result",
+              orig_lines=len(orig_lines),
+              edit_lines=len(edit_lines),
+              total_change_regions=len(change_regions),
+              cluster_count=len(clusters),
+              window_count=len(windows),
+              merge_gap=merge_gap,
+              context_lines=context_lines,
+              windows_summary=[{
+                  "ci": w["cluster_index"],
+                  "ws": w["window_start"] + 1,
+                  "we": w["window_end"] + 1,
+                  "lines": w["window_line_count"],
+                  "changed": w["changed_line_count"],
+              } for w in windows],
+              total_window_lines=_total_wl,
+              compression=f"{_total_wl}/{len(edit_lines)} = {_total_wl/max(len(edit_lines),1)*100:.0f}%")
+
+        return windows
+
+    except Exception as exc:
+        _dlog("find_changed_windows_error",
+              error=str(exc), error_type=type(exc).__name__,
+              original_len=len(original_code) if original_code else 0,
+              edited_len=len(edited_code) if edited_code else 0)
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Helper: _apply_line_targeted_fixes  (line-number correction splice)
 # ---------------------------------------------------------------------------
 
@@ -12112,6 +12264,8 @@ async def run_natural_pipeline_stream(
             correction_tasks = []
             _corr_msgs_by_idx = {}  # Save per-correction messages for ReAct follow-ups
             _correction_window_info = {}  # Per-idx window info for windowed corrections
+            _multi_window_pending = []   # Indices that need multi-window sequential correction
+            _multi_window_meta = {}      # Per-idx saved prompt metadata for multi-window
             for idx in blocked_indices:
                 cs     = change_shells[idx]
                 qa_d   = qa_results[idx]
@@ -12190,8 +12344,9 @@ async def run_natural_pipeline_stream(
                     #   2. Show only that region ± 20 lines of context
                     #   3. Model returns corrected window (standard format)
                     #   4. Server splices window back (deterministic, no matching)
-                    _window_info = _find_changed_window(symbol.code, cs["new_code"])
-                    if _window_info:
+                    _all_windows = _find_changed_windows(symbol.code, cs["new_code"])
+                    if len(_all_windows) == 1:
+                        _window_info = _all_windows[0]
                         _correction_window_info[idx] = _window_info
                         _wl = _window_info["window_line_count"]
                         _ws1 = _window_info["window_start"] + 1   # 1-indexed
@@ -12232,8 +12387,34 @@ async def run_natural_pipeline_stream(
                               total_orig_lines=_window_info["total_orig_lines"],
                               prompt_original_chars=len(_window_info["numbered_original"]),
                               prompt_broken_chars=len(_window_info["numbered_broken"]))
+                    elif len(_all_windows) > 1:
+                        # ── Multi-window: scattered changes need N independent corrections ──
+                        # Don't build prompt or create task here — defer to
+                        # sequential processing after the main parallel correction loop.
+                        _correction_window_info[idx] = _all_windows  # store LIST
+                        _multi_window_pending.append(idx)
+                        _multi_window_meta[idx] = {
+                            "issues_block": issues_block,
+                            "diff_block": diff_block,
+                        }
+                        _dlog("correction_multi_window_deferred",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round,
+                              symbol=symbol.name,
+                              sym_line_count=_sym_line_count,
+                              window_count=len(_all_windows),
+                              windows_summary=[{
+                                  "ci": w["cluster_index"],
+                                  "ws": w["window_start"] + 1,
+                                  "we": w["window_end"] + 1,
+                                  "lines": w["window_line_count"],
+                                  "changed": w["changed_line_count"],
+                              } for w in _all_windows],
+                              total_window_lines=sum(w["window_line_count"] for w in _all_windows),
+                              note="deferred to sequential multi-window processing")
+                        continue  # Skip prompt building + task creation for this idx
                     else:
-                        # _find_changed_window returned None — diff found no
+                        # _find_changed_windows returned empty — diff found no
                         # changes, or an internal error.  Shouldn't happen during
                         # correction (we know codes differ), but degrade safely.
                         _dlog("correction_windowed_fallback_null_window",
@@ -12810,6 +12991,280 @@ async def run_natural_pipeline_stream(
                           retry_round=_qa_retry_round, idx=idx,
                           symbol=change_shells[idx]["symbol"].name,
                           error=str(_corr_exc), error_type=type(_corr_exc).__name__)
+
+            # ── Multi-window sequential corrections ──────────────────────────
+            # When scattered changes produced N>1 clusters, each window gets
+            # its own API call.  Process bottom-to-top so line numbers stay
+            # stable across splices.
+            for _mw_idx in _multi_window_pending:
+                _mw_windows = _correction_window_info.get(_mw_idx)
+                if not isinstance(_mw_windows, list) or not _mw_windows:
+                    _dlog("correction_multi_window_skip_invalid",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round, idx=_mw_idx,
+                          reason="window info missing or not a list")
+                    continue
+
+                _mw_cs = change_shells[_mw_idx]
+                _mw_qa = qa_results[_mw_idx]
+                _mw_sym = _mw_cs["symbol"]
+                _mw_meta = _multi_window_meta.get(_mw_idx, {})
+                _mw_issues = _mw_meta.get("issues_block", "  • See QA summary.")
+                _mw_diff = _mw_meta.get("diff_block", "")
+                _mw_running_code = _mw_cs["new_code"]
+                _mw_all_ok = True
+                _mw_correction_model = "claude-sonnet-4-6"
+
+                _dlog("correction_multi_window_start",
+                      session_id=session_id, user_id=user_id,
+                      retry_round=_qa_retry_round, idx=_mw_idx,
+                      symbol=_mw_sym.name,
+                      window_count=len(_mw_windows),
+                      windows_summary=[{
+                          "ci": w["cluster_index"],
+                          "ws": w["window_start"] + 1,
+                          "we": w["window_end"] + 1,
+                          "lines": w["window_line_count"],
+                      } for w in _mw_windows])
+
+                # Process windows BOTTOM-TO-TOP — splicing later windows first
+                # keeps earlier window line numbers valid.
+                for _mw_wi in range(len(_mw_windows) - 1, -1, -1):
+                    _mw_winfo = _mw_windows[_mw_wi]
+                    _mw_ws1 = _mw_winfo["window_start"] + 1   # 1-indexed for display
+                    _mw_we1 = _mw_winfo["window_end"] + 1
+                    _mw_wl = _mw_winfo["window_line_count"]
+                    _mw_sym_lc = len(_mw_sym.code.splitlines())
+
+                    # Build per-window prompt (same format as single-window)
+                    _mw_format = (
+                        f"This symbol is {_mw_sym_lc} lines. You are seeing ONLY "
+                        f"window {_mw_wi + 1} of {len(_mw_windows)} "
+                        f"(lines {_mw_ws1}–{_mw_we1}, {_mw_wl} lines) plus context.\n\n"
+                        f"Return a <surgical_edit> block with the CORRECTED version of this "
+                        f"window. The server will splice it back automatically.\n\n"
+                        f"Format:\n"
+                        f"<surgical_edit>\n"
+                        f'{{"filename": "{_mw_cs["filename"]}", "symbol": "{_mw_sym.name}", '
+                        f'"new_code": "<corrected lines {_mw_ws1}–{_mw_we1}>"}}\n'
+                        f"</surgical_edit>\n\n"
+                        f"RULES:\n"
+                        f"- Return ALL {_mw_wl} lines of the window (context + corrected changes)\n"
+                        f"- Do NOT return the entire {_mw_sym_lc}-line symbol\n"
+                        f"- Do NOT include line-number prefixes (the \"1234 | \" part) in new_code\n"
+                        f"- Fix issues in THIS window while preserving the original request\n"
+                        f"- Adding or removing lines within the window is fine"
+                    )
+                    _mw_orig_block = (
+                        f"ORIGINAL CODE (window {_mw_wi + 1} — lines {_mw_ws1}–{_mw_we1} before your edit):\n"
+                        f"```\n{_mw_winfo['numbered_original']}\n```"
+                    )
+                    _mw_broken_block = (
+                        f"YOUR BROKEN EDIT (window {_mw_wi + 1} — lines {_mw_ws1}–{_mw_we1} — fix this):\n"
+                        f"```\n{_mw_winfo['numbered_broken']}\n```"
+                    )
+                    _mw_prompt = (
+                        f"QA reviewed your <surgical_edit> for `{_mw_sym.name}` in "
+                        f"`{_mw_cs['filename']}` and found it BLOCKED (score "
+                        f"{_mw_qa.get('qa_score', '?')}/10). You must fix all issues.\n\n"
+                        f"Issues to fix:\n{_mw_issues}"
+                        f"{_mw_diff}\n\n"
+                        f"{_mw_orig_block}\n\n"
+                        f"{_mw_broken_block}\n\n"
+                        f"Requirements:\n"
+                        f"1. Fix every issue listed above\n"
+                        f"2. Still implement the original request: {_mw_cs['description']}\n"
+                        f"3. Preserve everything you are not explicitly changing\n"
+                        f"4. Use the exact symbol name: `{_mw_sym.name}`\n\n"
+                        f"{_mw_format}\n\n"
+                        f"For JSX/TSX/HTML: verify balanced tags before returning."
+                    )
+
+                    _dlog("correction_multi_window_call",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round, idx=_mw_idx,
+                          symbol=_mw_sym.name,
+                          window_idx=_mw_wi,
+                          total_windows=len(_mw_windows),
+                          window_start=_mw_ws1, window_end=_mw_we1,
+                          window_lines=_mw_wl,
+                          prompt_chars=len(_mw_prompt),
+                          prompt_est_tokens=len(_mw_prompt) // 4)
+
+                    try:
+                        _mw_task = asyncio.create_task(_stream_and_collect(
+                            aclient, model=_mw_correction_model,
+                            max_tokens=64000, system=system_prompt,
+                            messages=[{"role": "user", "content": _mw_prompt}],
+                        ))
+                        while not _mw_task.done():
+                            try:
+                                await asyncio.wait_for(asyncio.shield(_mw_task), timeout=20.0)
+                            except asyncio.TimeoutError:
+                                yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+
+                        _mw_resp = _mw_task.result()
+                        _mw_text = "".join(
+                            b.text for b in _mw_resp.content if hasattr(b, "text")
+                        )
+
+                        _dlog("correction_multi_window_response",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=_mw_idx,
+                              symbol=_mw_sym.name, window_idx=_mw_wi,
+                              response_chars=len(_mw_text),
+                              has_edit=EDIT_OPEN in _mw_text)
+
+                        # Parse edit block
+                        _mw_ei = _mw_text.find(EDIT_OPEN)
+                        _mw_ec = _mw_text.find(EDIT_CLOSE, _mw_ei) if _mw_ei != -1 else -1
+
+                        if _mw_ei == -1 or _mw_ec == -1:
+                            _dlog("correction_multi_window_no_edit",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=_mw_idx,
+                                  symbol=_mw_sym.name, window_idx=_mw_wi,
+                                  response_len=len(_mw_text),
+                                  response_preview=_mw_text[:300])
+                            _mw_all_ok = False
+                            break
+
+                        _mw_raw = _mw_text[_mw_ei + len(EDIT_OPEN):_mw_ec]
+                        _mw_edit = None
+                        _mw_parse_method = None
+                        for _mw_pl, _mw_pf in [
+                            ("json.loads", lambda t: json.loads(t)),
+                            ("repair_json", lambda t: json.loads(_repair_json(t))),
+                            ("extract_json", lambda t: (lambda r: json.loads(r) if isinstance(r, str) else r)(_extract_json_from_text(t))),
+                            ("regex_extract", lambda t: _regex_extract_edit_block(t)),
+                        ]:
+                            try:
+                                _mw_edit = _mw_pf(_mw_raw.strip())
+                                if isinstance(_mw_edit, dict) and _mw_edit.get("new_code"):
+                                    _mw_parse_method = _mw_pl
+                                    break
+                                _mw_edit = None
+                            except Exception:
+                                _mw_edit = None
+
+                        if not _mw_edit or not _mw_edit.get("new_code"):
+                            _dlog("correction_multi_window_parse_failed",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=_mw_idx,
+                                  symbol=_mw_sym.name, window_idx=_mw_wi,
+                                  raw_preview=_mw_raw[:300])
+                            _mw_all_ok = False
+                            break
+
+                        _dlog("correction_multi_window_parsed",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=_mw_idx,
+                              symbol=_mw_sym.name, window_idx=_mw_wi,
+                              parse_method=_mw_parse_method,
+                              new_code_len=len(_mw_edit["new_code"]))
+
+                        # ── Line prefix stripping (same majority check) ──
+                        _mw_new = _mw_edit["new_code"]
+                        _mw_raw_lines = _mw_new.splitlines()
+                        _mw_prefix_pat = re.compile(r'^\s*\d+\s*\|\s?')
+                        _mw_nonempty = [l for l in _mw_raw_lines if l.strip()]
+                        _mw_hits = sum(1 for l in _mw_nonempty if _mw_prefix_pat.match(l))
+                        _mw_ratio = _mw_hits / max(len(_mw_nonempty), 1)
+                        _mw_strip = _mw_ratio >= 0.7 and _mw_hits >= 3
+
+                        _dlog("correction_multi_window_prefix_check",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=_mw_idx,
+                              symbol=_mw_sym.name, window_idx=_mw_wi,
+                              total_lines=len(_mw_raw_lines),
+                              nonempty=len(_mw_nonempty),
+                              prefix_hits=_mw_hits,
+                              prefix_ratio=f"{_mw_ratio:.2f}",
+                              will_strip=_mw_strip)
+
+                        if _mw_strip:
+                            _mw_corrected = [
+                                l[_mw_prefix_pat.match(l).end():] if _mw_prefix_pat.match(l) else l
+                                for l in _mw_raw_lines
+                            ]
+                        else:
+                            _mw_corrected = list(_mw_raw_lines)
+
+                        # ── Splice into running code ──
+                        _mw_broken_lines = _mw_running_code.splitlines()
+                        _mw_ws0 = _mw_winfo["window_start"]
+                        _mw_we0 = _mw_winfo["window_end"]
+
+                        if _mw_we0 >= len(_mw_broken_lines) or _mw_ws0 < 0 or _mw_ws0 > _mw_we0:
+                            _dlog("correction_multi_window_bounds_invalid",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=_mw_idx,
+                                  symbol=_mw_sym.name, window_idx=_mw_wi,
+                                  ws0=_mw_ws0, we0=_mw_we0,
+                                  broken_lines=len(_mw_broken_lines))
+                            _mw_all_ok = False
+                            break
+
+                        _mw_expected = _mw_we0 - _mw_ws0 + 1
+                        _mw_delta = len(_mw_corrected) - _mw_expected
+                        _mw_broken_lines[_mw_ws0:_mw_we0 + 1] = _mw_corrected
+                        _mw_running_code = "\n".join(_mw_broken_lines)
+
+                        _dlog("correction_multi_window_splice_done",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=_mw_idx,
+                              symbol=_mw_sym.name, window_idx=_mw_wi,
+                              window_start=_mw_ws1, window_end=_mw_we1,
+                              corrected_lines=len(_mw_corrected),
+                              expected_lines=_mw_expected,
+                              line_delta=_mw_delta,
+                              had_prefix=_mw_strip,
+                              running_total_lines=len(_mw_broken_lines))
+
+                    except Exception as _mw_exc:
+                        _dlog("correction_multi_window_error",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=_mw_idx,
+                              symbol=_mw_sym.name, window_idx=_mw_wi,
+                              error=str(_mw_exc), error_type=type(_mw_exc).__name__)
+                        _mw_all_ok = False
+                        break
+
+                # ── Final result for this multi-window idx ──
+                if _mw_all_ok:
+                    _mw_frag = _fragment_reason(_mw_sym.code, _mw_running_code)
+                    if _mw_frag is None:
+                        change_shells[_mw_idx]["new_code"] = _mw_running_code
+                        _new_tgt, _new_repl = _compute_target_element(
+                            _mw_sym.code, _mw_running_code
+                        )
+                        change_shells[_mw_idx]["_tgt"]  = _new_tgt
+                        change_shells[_mw_idx]["_repl"] = _new_repl
+                        change_shells[_mw_idx]["diff"]  = _make_diff(
+                            _mw_sym.code, _mw_running_code, _mw_sym.name
+                        )
+                        fixed_indices.append(_mw_idx)
+                        _dlog("correction_multi_window_accepted",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=_mw_idx,
+                              symbol=_mw_sym.name,
+                              window_count=len(_mw_windows),
+                              original_lines=len(_mw_sym.code.splitlines()),
+                              result_lines=len(_mw_running_code.splitlines()))
+                    else:
+                        _dlog("correction_multi_window_fragment_rejected",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=_mw_idx,
+                              symbol=_mw_sym.name,
+                              fragment_reason=_mw_frag,
+                              running_len=len(_mw_running_code),
+                              sym_len=len(_mw_sym.code))
+                else:
+                    _dlog("correction_multi_window_failed",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round, idx=_mw_idx,
+                          symbol=_mw_sym.name,
+                          note="one or more window corrections failed — no changes applied")
 
             _dlog("qa_retry_fixed_indices", session_id=session_id, user_id=user_id,
                   retry_round=_qa_retry_round,
