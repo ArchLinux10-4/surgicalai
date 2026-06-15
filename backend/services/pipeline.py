@@ -8507,6 +8507,11 @@ For JSX, TSX, or HTML edits — BEFORE writing your edit block, do this:
 Failure to balance tags is the #1 cause of rejected edits. Count twice, emit once.
 """
 
+# ── Inject comprehensive quality rules into single-pass prompt ────────────
+# _CODE_QUALITY_SECTION covers CSS, React, TypeScript, state, error handling,
+# and structural integrity — same rules the agentic architect gets.
+NATURAL_SYSTEM = NATURAL_SYSTEM + "\n" + _CODE_QUALITY_SECTION
+
 
 def _score_symbol_relevance(sym, terms: list) -> int:
     """
@@ -9821,6 +9826,20 @@ async def run_natural_pipeline_stream(
                     "cache_control": {"type": "ephemeral"},
                 }
             )
+
+        # ── Debug: confirm quality rules and project memory reached the prompt ──
+        _total_sys_chars = sum(b.get("text", "") if isinstance(b, dict) else b for b in system_prompt if isinstance(b, dict)) if False else sum(len(b["text"]) for b in system_prompt if isinstance(b, dict) and "text" in b)
+        _has_quality = "CODE QUALITY RULES" in NATURAL_SYSTEM
+        _has_project_memory = "PROJECT MEMORY" in file_context if file_context else False
+        _dlog("single_pass_system_prompt",
+              session_id=session_id,
+              has_code_quality_rules=_has_quality,
+              quality_rules_in_natural_system=len(_CODE_QUALITY_SECTION),
+              natural_system_len=len(NATURAL_SYSTEM),
+              has_project_memory=_has_project_memory,
+              project_memory_len=len(file_context) if _has_project_memory else 0,
+              total_system_chars=_total_sys_chars,
+              system_blocks=len(system_prompt))
 
         # ── Clean conversation history — strip JSON artifacts ─────────────
         clean_history = []
