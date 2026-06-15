@@ -4822,11 +4822,12 @@ def _qa_fallback_from_prose(raw_text: str, session_id: str = "", user_id: str = 
     Last-resort fallback: when QA returns prose analysis instead of JSON,
     try to extract verdict and score from the text itself.
     Returns a dict with verdict/qa_score/summary or None if nothing found.
+    PRIORITY: numeric score > explicit verdict keyword > keyword-in-context.
     """
     import re
     text_lower = raw_text.lower()
 
-    # Try to find score mentions like "score: 3", "score 3/10", "qa_score: 3"
+    # ── Step 1: find numeric score ────────────────────────────────────────────
     score = None
     score_patterns = [
         r'(?:score|qa_score)[:\s]+\s*(\d{1,2})(?:\s*/\s*10)?',
@@ -4841,17 +4842,19 @@ def _qa_fallback_from_prose(raw_text: str, session_id: str = "", user_id: str = 
                 score = val
                 break
 
-    # Try to find verdict mentions
+    # ── Step 2: find explicit "verdict: <value>" patterns ─────────────────────
+    # These are high-confidence — the model explicitly stated a verdict.
     verdict = None
-    if "blocked" in text_lower or "critical" in text_lower or "syntax error" in text_lower:
-        verdict = "blocked"
-    elif "warning" in text_lower:
-        verdict = "warning"
-    elif "safe" in text_lower and "unsafe" not in text_lower:
-        verdict = "safe"
+    _explicit_verdict_match = re.search(
+        r'verdict[:\s]+\s*"?(blocked|safe|warning)"?', text_lower
+    )
+    if _explicit_verdict_match:
+        verdict = _explicit_verdict_match.group(1)
 
-    # If we found a score but no verdict, derive it
-    if score is not None and verdict is None:
+    # ── Step 3: if score found, ALWAYS derive verdict from score ──────────────
+    # Numeric score is the most reliable signal. Keyword matches like "critical"
+    # or "blocked" appearing anywhere in the prose are too noisy.
+    if score is not None:
         if score >= 7:
             verdict = "safe"
         elif score >= 5:
@@ -4859,9 +4862,26 @@ def _qa_fallback_from_prose(raw_text: str, session_id: str = "", user_id: str = 
         else:
             verdict = "blocked"
 
-    # If we found a verdict but no score, derive it
-    if verdict is not None and score is None:
-        score = {"blocked": 3, "warning": 5, "safe": 8}.get(verdict, 5)
+    # ── Step 4: no score found — try keyword matching (last resort) ───────────
+    if score is None and verdict is None:
+        # Only match keywords in verdict-like contexts, not casual mentions
+        _verdict_line_patterns = [
+            r'\bverdict\b.*?\b(blocked|safe|warning)\b',
+            r'\b(blocked|safe|warning)\b.*?\bverdict\b',
+        ]
+        for _vp in _verdict_line_patterns:
+            _vm = re.search(_vp, text_lower)
+            if _vm:
+                verdict = _vm.group(1)
+                break
+
+        # Broader keyword match only if nothing else worked
+        if verdict is None:
+            if "syntax error" in text_lower:
+                verdict = "blocked"
+
+        if verdict is not None:
+            score = {"blocked": 3, "warning": 5, "safe": 8}.get(verdict, 5)
 
     if verdict is None and score is None:
         return None
@@ -4873,7 +4893,8 @@ def _qa_fallback_from_prose(raw_text: str, session_id: str = "", user_id: str = 
           session_id=session_id, user_id=user_id,
           verdict=verdict, score=score,
           raw_len=len(raw_text),
-          summary_preview=summary_line[:100])
+          summary_preview=summary_line[:100],
+          raw_text_full=raw_text)
 
     return {
         "verdict": verdict,
@@ -5092,7 +5113,7 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
                   session_id=session_id, filename=filename,
                   symbol=symbol_path, model=_qa_model,
                   raw_len=len(_qa_raw_text),
-                  raw_preview=_qa_raw_text[:500],
+                  raw_preview=_qa_raw_text,
                   user_id=user_id)
             # Robust JSON extraction — Claude sometimes adds preamble or markdown fences
             _raw_qa = _extract_json_from_text(_qa_raw_text)
