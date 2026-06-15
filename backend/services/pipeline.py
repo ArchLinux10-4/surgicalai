@@ -3083,8 +3083,10 @@ async def run_qa_for_changes(
         user_message = "\n".join(user_parts)
 
         aclient = AsyncAnthropic(api_key=anthropic_key)
+        # QA always uses Sonnet — cheaper than user's model, accurate for review
+        _qa_model_legacy = "claude-sonnet-4-6"
         response = await aclient.messages.create(
-            model=model,
+            model=_qa_model_legacy,
             max_tokens=1000,
             system=_QA_SYSTEM,
             messages=[{"role": "user", "content": user_message}],
@@ -3447,7 +3449,7 @@ async def analyze_and_plan_stream(
                                   fixes_so_far=len(_corr_changes))
                             try:
                                 _corr_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
-                                    model=architect_model,
+                                    model="claude-sonnet-4-6",  # correction uses Sonnet — cheaper + accurate
                                     max_tokens=64000,
                                     system=CLAUDE_EDITOR_SYSTEM,
                                     messages=_corr_msgs,
@@ -3646,7 +3648,7 @@ async def analyze_and_plan_stream(
                             )},
                         ]
                         _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
-                            model=architect_model,
+                            model="claude-sonnet-4-6",  # correction uses Sonnet — cheaper + accurate
                             max_tokens=64000,
                             system=CLAUDE_EDITOR_SYSTEM,
                             messages=_retry_msgs,
@@ -5054,6 +5056,33 @@ async def run_qa_agent(
     # Unchanged flag for QA awareness
     _no_change = _orig_snippet.strip() == _new_snippet.strip()
 
+    # ── Changed-region highlight — guide QA to focus on what actually changed ─
+    # Compute first/last changed line numbers in NEW CODE so QA knows where to
+    # look instead of scanning 2000 blind lines.
+    _changed_region_hint = ""
+    try:
+        _orig_lines = (original_code or "").splitlines()
+        _new_lines = (new_code or "").splitlines()
+        import difflib as _difflib
+        _sm = _difflib.SequenceMatcher(None, _orig_lines, _new_lines)
+        _changed_new_lines = set()
+        for _tag, _i1, _i2, _j1, _j2 in _sm.get_opcodes():
+            if _tag != "equal":
+                for _ln in range(_j1, _j2):
+                    _changed_new_lines.add(_ln + 1)  # 1-indexed
+        if _changed_new_lines:
+            _first_changed = min(_changed_new_lines)
+            _last_changed = max(_changed_new_lines)
+            _total_new = len(_new_lines)
+            _changed_region_hint = (
+                f"\n\n📍 CHANGED REGION: Lines {_first_changed}–{_last_changed} of {_total_new} "
+                f"in NEW CODE ({_last_changed - _first_changed + 1} lines modified).\n"
+                f"Focus your structural verification on this region and its immediate "
+                f"surroundings. The rest of the symbol should be unchanged from ORIGINAL."
+            )
+    except Exception:
+        pass  # degrade gracefully — QA still works without the hint
+
     # Targeted cross-file context: actual callers/usages of changed symbol
     _targeted_block = ""
     if targeted_context and targeted_context.strip():
@@ -5080,7 +5109,7 @@ Symbol: {symbol_path}
 File: {filename}
 Description: {change_description}
 Expected behavior: {new_logic}
-{"⚠️ NOTE: No code changes detected — original and new are identical." if _no_change else ""}
+{"⚠️ NOTE: No code changes detected — original and new are identical." if _no_change else ""}{_changed_region_hint}
 
 ORIGINAL CODE (complete — compare this directly against NEW CODE):
 {_orig_snippet}
@@ -11696,11 +11725,16 @@ async def run_natural_pipeline_stream(
                 ]
                 _corr_msgs_by_idx[idx] = correction_messages
 
+                # Correction uses Sonnet — cheaper + less prone to hallucination
+                # on large symbols than Opus.  Architect model stays for the
+                # initial edit; only the *fix* loop is downgraded.
+                _correction_model = "claude-sonnet-4-6"
+
                 correction_tasks.append((
                     idx,
                     asyncio.create_task(_stream_and_collect(
                         aclient,
-                        model=arch_model,
+                        model=_correction_model,
                         max_tokens=64000,
                         system=system_prompt,
                         messages=correction_messages,
@@ -11710,7 +11744,7 @@ async def run_natural_pipeline_stream(
             _dlog("qa_retry_correction_tasks_created", session_id=session_id, user_id=user_id,
                   retry_round=_qa_retry_round,
                   task_count=len(correction_tasks),
-                  model=arch_model,
+                  model=_correction_model,
                   indices=[idx for idx, _ in correction_tasks])
             # Wait for all correction calls with keepalives
             pending_corr = {t for _, t in correction_tasks}
@@ -11860,7 +11894,7 @@ async def run_natural_pipeline_stream(
                         try:
                             _fu_task = asyncio.create_task(
                                 _stream_and_collect(
-                                    aclient, model=arch_model,
+                                    aclient, model=_correction_model,
                                     max_tokens=64000,
                                     system=system_prompt,
                                     messages=_react_msgs,
