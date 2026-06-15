@@ -789,7 +789,7 @@ def run_architect(
     Never sees raw code — works from the symbol map for efficiency and accuracy.
     """
     arch_model = model or get_setting("architect_model", "gpt-4.1")
-    temp = float(get_setting("temperature_architect", "0.3"))
+    temp = float(get_setting("temperature_architect", "0.0"))
     client = _get_client_for_model(arch_model, user_id)
 
     # Build a compact symbol map summary (not the raw code)
@@ -1614,7 +1614,7 @@ def run_chat(
     response = _chat_create(client,
         model=chat_model,
         messages=all_messages,
-        temperature=float(get_setting("temperature_architect", "0.3")),
+        temperature=float(get_setting("temperature_architect", "0.0")),
         stream=False
     )
 
@@ -1704,7 +1704,7 @@ async def run_chat_stream(
             # Fallback: Gemini via OpenAI-compat (no native thinking)
             gclient_oai = _get_client_for_model(chat_model, user_id)
             stream = _chat_create(gclient_oai, model=chat_model, messages=all_messages,
-                                  temperature=float(get_setting("temperature_architect", "0.3")), stream=True)
+                                  temperature=float(get_setting("temperature_architect", "0.0")), stream=True)
             for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta.content:
@@ -1754,7 +1754,7 @@ async def run_chat_stream(
             stream = _chat_create(client,
                 model=chat_model,
                 messages=all_messages,
-                temperature=float(get_setting("temperature_architect", "0.3")),
+                temperature=float(get_setting("temperature_architect", "0.0")),
                 stream=True
             )
             for chunk in stream:
@@ -2856,7 +2856,7 @@ Add "file_path" to each target object."""
             {"role": "system", "content": ARCHITECT_SYSTEM + '\nIMPORTANT: Add "file_path" field to each target indicating which file the change belongs to.'},
             {"role": "user", "content": multi_user_msg}
         ],
-        temperature=float(get_setting("temperature_architect", "0.3")),
+        temperature=float(get_setting("temperature_architect", "0.0")),
         response_format={"type": "json_object"}
     )
 
