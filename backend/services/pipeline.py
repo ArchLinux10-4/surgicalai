@@ -5744,19 +5744,35 @@ def _regex_extract_edit_block(raw: str) -> dict | None:
         m = re.search(rf'"{field}"\s*:\s*"([^"]*)"', raw)
         if m:
             result[field] = m.group(1)
+        else:
+            # Pure XML fallback: <field>value</field>
+            m_xml = re.search(rf'<{field}>(.*?)</{field}>', raw)
+            if m_xml:
+                result[field] = m_xml.group(1).strip()
 
     # ── Integer fields ──
     for field in ("edit_start_line", "edit_end_line"):
         m = re.search(rf'"{field}"\s*:\s*(\d+)', raw)
         if m:
             result[field] = int(m.group(1))
+        else:
+            # Pure XML fallback: <field>123</field>
+            m_xml = re.search(rf'<{field}>(\d+)</{field}>', raw)
+            if m_xml:
+                result[field] = int(m_xml.group(1))
 
     # ── Code fields ──
     for field in ("old_code", "new_code"):
-        # Try XML-style first: "field">...code...</field>
+        # Try hybrid XML first: "field">...code...</field>
         m_xml = re.search(rf'"{field}"[^>]*>(.*?)</{field}>', raw, re.DOTALL)
         if m_xml:
             result[field] = m_xml.group(1).strip("\n")
+            continue
+
+        # Pure XML fallback: <field>...code...</field>
+        m_pure_xml = re.search(rf'<{field}>\n?(.*?)\n?</{field}>', raw, re.DOTALL)
+        if m_pure_xml:
+            result[field] = m_pure_xml.group(1).strip("\n")
             continue
 
         # JSON-style: "field": "...code..."
@@ -5808,6 +5824,17 @@ def _regex_extract_edit_block(raw: str) -> dict | None:
             result[field] = code
 
     if result.get("filename") and result.get("new_code"):
+        # Tag which extraction formats were used for debugging
+        _json_keys_found = len(key_positions)
+        _xml_tags_used = any(
+            re.search(rf'<{f}>', raw) for f in KNOWN_KEYS
+            if f in result and not any(k == f for _, k, _ in key_positions)
+        )
+        result["_extraction_format"] = (
+            "pure_xml" if _xml_tags_used and _json_keys_found == 0
+            else "hybrid" if _xml_tags_used
+            else "json_regex"
+        )
         return result
     return None
 
@@ -11043,9 +11070,12 @@ async def run_natural_pipeline_stream(
                                 _dlog("edit_parse_recovered",
                                       session_id=session_id,
                                       method="regex_extract",
+                                      extraction_format=_regex_result.pop("_extraction_format", "unknown"),
                                       raw_len=len(edit_raw),
                                       filename=_regex_result.get("filename"),
                                       symbol=_regex_result.get("symbol"),
+                                      has_edit_lines=bool(_regex_result.get("edit_start_line")),
+                                      has_old_code=bool(_regex_result.get("old_code")),
                                       new_code_len=len(_regex_result.get("new_code", "")),
                                       user_id=user_id)
                             else:
@@ -12352,10 +12382,12 @@ async def run_natural_pipeline_stream(
                             try:
                                 edit_data = _parse_fn(raw_edit.strip())
                                 if isinstance(edit_data, dict) and edit_data.get("new_code"):
+                                    _corr_ext_fmt = edit_data.pop("_extraction_format", None)
                                     _dlog("qa_retry_correction_parse_method", session_id=session_id, user_id=user_id,
                                           retry_round=_qa_retry_round, idx=idx,
                                           symbol=change_shells[idx]["symbol"].name,
-                                          method=_parse_attempt_label)
+                                          method=_parse_attempt_label,
+                                          extraction_format=_corr_ext_fmt)
                                     break
                                 edit_data = None
                             except Exception:
