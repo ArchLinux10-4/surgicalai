@@ -8253,6 +8253,15 @@ async def run_natural_pipeline_stream(
     PLAN_OPEN = "<edit_plan>"
     PLAN_CLOSE = "</edit_plan>"
 
+    # ── Tag definitions table (Phase 2: unified tag handling) ──
+    TAG_DEFS = {
+        "edit":    {"open": EDIT_OPEN,     "close": EDIT_CLOSE},
+        "file":    {"open": FILE_OPEN,     "close": FILE_CLOSE},
+        "search":  {"open": SEARCH_OPEN,   "close": SEARCH_CLOSE},
+        "filereq": {"open": FILE_REQ_OPEN, "close": FILE_REQ_CLOSE},
+        "plan":    {"open": PLAN_OPEN,     "close": PLAN_CLOSE},
+    }
+
     try:
         anthropic_key = _get_anthropic_key(user_id)
         arch_model = get_setting("architect_model", "claude-sonnet-4-5")
@@ -8437,11 +8446,7 @@ async def run_natural_pipeline_stream(
 
             state = "normal"    # "normal" | "in_edit" | "in_file" | "in_search" | "in_filereq" | "in_plan"
             normal_buf = ""
-            edit_buf = ""
-            file_buf = ""
-            search_buf = ""
-            file_req_buf = ""
-            plan_buf = ""
+            tag_buf = ""        # unified buffer for all non-normal tag states
             search_requested: dict | None = None  # set when a search block completes
             file_request_data: list | None = None  # set when a file_request block completes
             had_thinking = False                    # track if Claude produced thinking this round
@@ -8480,108 +8485,87 @@ async def run_natural_pipeline_stream(
                                 elif text_chunk:
                                     full_response += text_chunk
 
+                                    # Append chunk to appropriate buffer (once per chunk)
                                     if state == "normal":
                                         normal_buf += text_chunk
+                                    else:
+                                        tag_buf += text_chunk
 
-                                        # Drain buffer watching for any opening tag
-                                        while True:
-                                            ei = normal_buf.find(EDIT_OPEN)
-                                            fi = normal_buf.find(FILE_OPEN)
-                                            si = normal_buf.find(SEARCH_OPEN)
-                                            fri = normal_buf.find(FILE_REQ_OPEN)
-                                            pi = normal_buf.find(PLAN_OPEN)
+                                    # ── Processing loop: open→close→re-scan until stable ──
+                                    while True:
+                                        if state == "normal":
+                                            # Drain buffer watching for any opening tag
+                                            _found_open = False
+                                            while True:
+                                                # Table-driven open-tag scan
+                                                candidates = []
+                                                for _tname, _tdef in TAG_DEFS.items():
+                                                    _ti = normal_buf.find(_tdef["open"])
+                                                    if _ti != -1:
+                                                        candidates.append((_ti, _tname))
 
-                                            # Find which tag comes first
-                                            candidates = [
-                                                (i, tag) for i, tag in [
-                                                    (ei, "edit"), (fi, "file"), (si, "search"), (fri, "filereq"), (pi, "plan")
-                                                ] if i != -1
-                                            ]
+                                                if not candidates:
+                                                    # No tags — yield safely (keep tail in case tag is split)
+                                                    tail = max(len(td["open"]) for td in TAG_DEFS.values())
+                                                    safe = max(0, len(normal_buf) - tail)
+                                                    if safe > 0:
+                                                        yield sse({"type": "token", "content": normal_buf[:safe]})
+                                                        normal_buf = normal_buf[safe:]
+                                                    break
 
-                                            if not candidates:
-                                                # No tags — yield safely (keep tail in case tag is split)
-                                                tail = max(len(EDIT_OPEN), len(FILE_OPEN), len(SEARCH_OPEN), len(FILE_REQ_OPEN))
-                                                safe = max(0, len(normal_buf) - tail)
-                                                if safe > 0:
-                                                    yield sse({"type": "token", "content": normal_buf[:safe]})
-                                                    normal_buf = normal_buf[safe:]
+                                                first_idx, first_tag = min(candidates, key=lambda x: x[0])
+
+                                                # Yield text before the tag
+                                                if first_idx > 0:
+                                                    yield sse({"type": "token", "content": normal_buf[:first_idx]})
+
+                                                # Emit edit_start SSE for edit/file types
+                                                if first_tag in ("edit", "file"):
+                                                    yield sse({"type": "edit_start", "content": ""})
+
+                                                state = f"in_{first_tag}"
+                                                tag_buf = normal_buf[first_idx + len(TAG_DEFS[first_tag]["open"]):]
+                                                normal_buf = ""
+                                                _found_open = True
+                                                _dlog("tag_opened",
+                                                      session_id=session_id, user_id=user_id,
+                                                      tag_type=first_tag, state=state)
                                                 break
 
-                                            first_idx, first_tag = min(candidates, key=lambda x: x[0])
+                                            if not _found_open:
+                                                break  # No tag found — stable, wait for next chunk
 
-                                            # Yield text before the tag
-                                            if first_idx > 0:
-                                                yield sse({"type": "token", "content": normal_buf[:first_idx]})
+                                        # ── Unified close-tag handler for ALL tag states ──
+                                        _tag_name = state[3:]  # "in_edit" → "edit"
+                                        _close_tag = TAG_DEFS[_tag_name]["close"]
+                                        idx = tag_buf.find(_close_tag)
+                                        if idx == -1:
+                                            break  # No close tag yet — wait for next chunk
 
-                                            if first_tag == "edit":
-                                                yield sse({"type": "edit_start", "content": ""})
-                                                state = "in_edit"
-                                                edit_buf = normal_buf[first_idx + len(EDIT_OPEN):]
-                                                normal_buf = ""
-                                            elif first_tag == "file":
-                                                yield sse({"type": "edit_start", "content": ""})
-                                                state = "in_file"
-                                                file_buf = normal_buf[first_idx + len(FILE_OPEN):]
-                                                normal_buf = ""
-                                            elif first_tag == "search":
-                                                # Show search indicator — don't stream the JSON to user
-                                                state = "in_search"
-                                                search_buf = normal_buf[first_idx + len(SEARCH_OPEN):]
-                                                normal_buf = ""
-                                            elif first_tag == "filereq":
-                                                state = "in_filereq"
-                                                file_req_buf = normal_buf[first_idx + len(FILE_REQ_OPEN):]
-                                                normal_buf = ""
-                                            else:  # plan
-                                                state = "in_plan"
-                                                plan_buf = normal_buf[first_idx + len(PLAN_OPEN):]
-                                                normal_buf = ""
-                                            break
+                                        _content = tag_buf[:idx]
+                                        _remainder = tag_buf[idx + len(_close_tag):]
 
-                                    elif state == "in_edit":
-                                        edit_buf += text_chunk
-                                        idx = edit_buf.find(EDIT_CLOSE)
-                                        if idx != -1:
-                                            edit_blocks_raw.append(edit_buf[:idx])
+                                        # ── Tag-specific processing ──
+                                        _break_stream = False
+
+                                        if _tag_name == "edit":
+                                            edit_blocks_raw.append(_content)
                                             yield sse({"type": "edit_end", "content": ""})
-                                            state = "normal"
-                                            normal_buf = edit_buf[idx + len(EDIT_CLOSE):]
-                                            edit_buf = ""
 
-                                    elif state == "in_file":
-                                        file_buf += text_chunk
-                                        idx = file_buf.find(FILE_CLOSE)
-                                        if idx != -1:
-                                            new_file_blocks_raw.append(file_buf[:idx])
+                                        elif _tag_name == "file":
+                                            new_file_blocks_raw.append(_content)
                                             yield sse({"type": "edit_end", "content": ""})
-                                            state = "normal"
-                                            normal_buf = file_buf[idx + len(FILE_CLOSE):]
-                                            file_buf = ""
 
-                                    elif state == "in_search":
-                                        search_buf += text_chunk
-                                        idx = search_buf.find(SEARCH_CLOSE)
-                                        if idx != -1:
-                                            search_json_raw = search_buf[:idx]
-                                            remainder = search_buf[idx + len(SEARCH_CLOSE):]
+                                        elif _tag_name == "search":
                                             try:
-                                                search_data = json.loads(search_json_raw.strip())
-                                                search_requested = search_data
+                                                _sd = json.loads(_content.strip())
+                                                search_requested = _sd
                                             except Exception:
                                                 pass
-                                            # Put remainder back into normal stream
-                                            state = "normal"
-                                            normal_buf = remainder
-                                            search_buf = ""
-                                            # Stop streaming — we need to fetch code first
-                                            break
+                                            _break_stream = True
 
-                                    elif state == "in_filereq":
-                                        file_req_buf += text_chunk
-                                        idx = file_req_buf.find(FILE_REQ_CLOSE)
-                                        if idx != -1:
-                                            raw = file_req_buf[:idx].strip()
-                                            # Parse: try JSON array first, fallback to newline/comma split
+                                        elif _tag_name == "filereq":
+                                            raw = _content.strip()
                                             try:
                                                 parsed = json.loads(raw)
                                                 if isinstance(parsed, list):
@@ -8593,28 +8577,33 @@ async def run_natural_pipeline_stream(
                                             except (json.JSONDecodeError, ValueError):
                                                 fnames = [f.strip() for f in raw.replace(",", "\n").split("\n") if f.strip()]
                                             if fnames:
-                                                file_request_data = fnames[:5]  # cap per request
-                                            state = "normal"
-                                            normal_buf = file_req_buf[idx + len(FILE_REQ_CLOSE):]
-                                            file_req_buf = ""
-                                            break  # Stop streaming — fetch files first
+                                                file_request_data = fnames[:5]
+                                            _break_stream = True
 
-                                    elif state == "in_plan":
-                                        plan_buf += text_chunk
-                                        idx = plan_buf.find(PLAN_CLOSE)
-                                        if idx != -1:
-                                            plan_json_raw = plan_buf[:idx]
-                                            remainder = plan_buf[idx + len(PLAN_CLOSE):]
+                                        elif _tag_name == "plan":
                                             try:
-                                                plan_data = json.loads(plan_json_raw.strip())
-                                                if isinstance(plan_data, list):
-                                                    edit_plan_data = plan_data
+                                                _pd = json.loads(_content.strip())
+                                                if isinstance(_pd, list):
+                                                    edit_plan_data = _pd
                                             except Exception:
                                                 pass
-                                            state = "normal"
-                                            normal_buf = remainder
-                                            plan_buf = ""
-                                            break  # Stop streaming — enter execute phase
+                                            _break_stream = True
+
+                                        state = "normal"
+                                        normal_buf = _remainder
+                                        tag_buf = ""
+                                        _dlog("tag_closed",
+                                              session_id=session_id, user_id=user_id,
+                                              tag_type=_tag_name,
+                                              content_len=len(_content),
+                                              break_stream=_break_stream)
+
+                                        if _break_stream:
+                                            break  # Exit processing loop; event-loop break via check below
+
+                                        if not _remainder:
+                                            break  # Nothing more to process
+                                        # else: continue loop — re-scan remainder for more tags
 
                             elif etype == "content_block_stop":
                                 if in_thinking and current_block_type == "thinking":
@@ -8681,7 +8670,7 @@ async def run_natural_pipeline_stream(
                         if fnames:
                             file_request_data = fnames[:5]
                         state = "normal"
-                        file_req_buf = ""
+                        tag_buf = ""
                         _dlog("eos_filereq_recovered",
                               session_id=session_id, user_id=user_id,
                               filenames=file_request_data,
@@ -8689,7 +8678,7 @@ async def run_natural_pipeline_stream(
                     else:
                         _dlog("eos_filereq_no_close_tag",
                               session_id=session_id, user_id=user_id,
-                              buf_preview=file_req_buf[:300])
+                              buf_preview=tag_buf[:300])
 
                 # ── search_request recovery ──
                 elif state == "in_search":
@@ -8704,14 +8693,14 @@ async def run_natural_pipeline_stream(
                         except Exception:
                             pass
                         state = "normal"
-                        search_buf = ""
+                        tag_buf = ""
                         _dlog("eos_search_recovered",
                               session_id=session_id, user_id=user_id,
                               search_data=str(search_requested)[:200])
                     else:
                         _dlog("eos_search_no_close_tag",
                               session_id=session_id, user_id=user_id,
-                              buf_preview=search_buf[:300])
+                              buf_preview=tag_buf[:300])
 
                 # ── edit_plan recovery ──
                 elif state == "in_plan":
@@ -8727,14 +8716,14 @@ async def run_natural_pipeline_stream(
                         except Exception:
                             pass
                         state = "normal"
-                        plan_buf = ""
+                        tag_buf = ""
                         _dlog("eos_plan_recovered",
                               session_id=session_id, user_id=user_id,
                               plan_items=len(edit_plan_data) if edit_plan_data else 0)
                     else:
                         _dlog("eos_plan_no_close_tag",
                               session_id=session_id, user_id=user_id,
-                              buf_preview=plan_buf[:300])
+                              buf_preview=tag_buf[:300])
 
                 # ── surgical_edit recovery ──
                 elif state == "in_edit":
@@ -8749,15 +8738,15 @@ async def run_natural_pipeline_stream(
                             if _eblock not in edit_blocks_raw:
                                 edit_blocks_raw.append(_eblock)
                                 _new_count += 1
-                        # Also preserve partial edit_buf (unclosed last edit)
+                        # Also preserve partial tag_buf (unclosed last edit)
                         # — truncation detector downstream needs it.
                         # Only if close tag is NOT in buf (otherwise findall
                         # already captured the clean content).
                         _partial_kept = False
-                        if (edit_buf.strip()
-                                and EDIT_CLOSE not in edit_buf
-                                and edit_buf not in edit_blocks_raw):
-                            edit_blocks_raw.append(edit_buf)
+                        if (tag_buf.strip()
+                                and EDIT_CLOSE not in tag_buf
+                                and tag_buf not in edit_blocks_raw):
+                            edit_blocks_raw.append(tag_buf)
                             _partial_kept = True
                         state = "normal"
                         _dlog("eos_edit_recovered",
@@ -8765,14 +8754,14 @@ async def run_natural_pipeline_stream(
                               recovered_count=_new_count,
                               partial_kept=_partial_kept,
                               total_edit_blocks=len(edit_blocks_raw))
-                        edit_buf = ""
+                        tag_buf = ""
                     else:
                         # No close tag at all — append raw buffer (existing behavior)
-                        if edit_buf.strip():
-                            edit_blocks_raw.append(edit_buf)
+                        if tag_buf.strip():
+                            edit_blocks_raw.append(tag_buf)
                         _dlog("eos_edit_no_close_tag",
                               session_id=session_id, user_id=user_id,
-                              buf_len=len(edit_buf))
+                              buf_len=len(tag_buf))
                     yield sse({"type": "edit_end", "content": ""})
 
                 # ── new_file recovery ──
@@ -8787,13 +8776,13 @@ async def run_natural_pipeline_stream(
                             if _fblock not in new_file_blocks_raw:
                                 new_file_blocks_raw.append(_fblock)
                                 _new_count += 1
-                        # Also preserve partial file_buf (unclosed last new_file)
+                        # Also preserve partial tag_buf (unclosed last new_file)
                         # Only if close tag is NOT in buf (same reason as edit).
                         _partial_kept = False
-                        if (file_buf.strip()
-                                and FILE_CLOSE not in file_buf
-                                and file_buf not in new_file_blocks_raw):
-                            new_file_blocks_raw.append(file_buf)
+                        if (tag_buf.strip()
+                                and FILE_CLOSE not in tag_buf
+                                and tag_buf not in new_file_blocks_raw):
+                            new_file_blocks_raw.append(tag_buf)
                             _partial_kept = True
                         state = "normal"
                         _dlog("eos_newfile_recovered",
@@ -8801,13 +8790,13 @@ async def run_natural_pipeline_stream(
                               recovered_count=_new_count,
                               partial_kept=_partial_kept,
                               total_file_blocks=len(new_file_blocks_raw))
-                        file_buf = ""
+                        tag_buf = ""
                     else:
-                        if file_buf.strip():
-                            new_file_blocks_raw.append(file_buf)
+                        if tag_buf.strip():
+                            new_file_blocks_raw.append(tag_buf)
                         _dlog("eos_newfile_no_close_tag",
                               session_id=session_id, user_id=user_id,
-                              buf_len=len(file_buf))
+                              buf_len=len(tag_buf))
                     yield sse({"type": "edit_end", "content": ""})
 
                 else:
