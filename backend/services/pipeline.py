@@ -3818,6 +3818,78 @@ def _extract_json_from_text(text: str) -> str:
     return extracted  # Return as-is and let caller surface the error
 
 
+
+def _qa_fallback_from_prose(raw_text: str, session_id: str = "", user_id: str = "") -> dict:
+    """
+    Last-resort fallback: when QA returns prose analysis instead of JSON,
+    try to extract verdict and score from the text itself.
+    Returns a dict with verdict/qa_score/summary or None if nothing found.
+    """
+    import re
+    text_lower = raw_text.lower()
+
+    # Try to find score mentions like "score: 3", "score 3/10", "qa_score: 3"
+    score = None
+    score_patterns = [
+        r'(?:score|qa_score)[:\s]+\s*(\d{1,2})(?:\s*/\s*10)?',
+        r'(\d{1,2})\s*/\s*10',
+        r'score\s+(?:of\s+)?(\d{1,2})',
+    ]
+    for pat in score_patterns:
+        m = re.search(pat, text_lower)
+        if m:
+            val = int(m.group(1))
+            if 1 <= val <= 10:
+                score = val
+                break
+
+    # Try to find verdict mentions
+    verdict = None
+    if "blocked" in text_lower or "critical" in text_lower or "syntax error" in text_lower:
+        verdict = "blocked"
+    elif "warning" in text_lower:
+        verdict = "warning"
+    elif "safe" in text_lower and "unsafe" not in text_lower:
+        verdict = "safe"
+
+    # If we found a score but no verdict, derive it
+    if score is not None and verdict is None:
+        if score >= 7:
+            verdict = "safe"
+        elif score >= 5:
+            verdict = "warning"
+        else:
+            verdict = "blocked"
+
+    # If we found a verdict but no score, derive it
+    if verdict is not None and score is None:
+        score = {"blocked": 3, "warning": 5, "safe": 8}.get(verdict, 5)
+
+    if verdict is None and score is None:
+        return None
+
+    # Extract a summary — first sentence or first 200 chars
+    summary_line = raw_text.strip().split("\n")[0][:200]
+
+    _dlog("qa_prose_fallback_extracted",
+          session_id=session_id, user_id=user_id,
+          verdict=verdict, score=score,
+          raw_len=len(raw_text),
+          summary_preview=summary_line[:100])
+
+    return {
+        "verdict": verdict,
+        "qa_score": score,
+        "summary": f"[QA prose fallback] {summary_line}",
+        "import_issues": [],
+        "downstream_risks": [],
+        "type_errors": [],
+        "logic_errors": [],
+        "plan_deviation": "",
+        "risk_verdicts": [],
+    }
+
+
 QA_SYSTEM = """You are the QA agent in a surgical code editing pipeline.
 The Surgeon has produced a code change. Your job: verify the new code is correct, complete, and safe.
 
@@ -4024,7 +4096,20 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
                   user_id=user_id)
             # Robust JSON extraction — Claude sometimes adds preamble or markdown fences
             _raw_qa = _extract_json_from_text(_qa_raw_text)
-            data = json.loads(_raw_qa) if isinstance(_raw_qa, str) else _raw_qa
+            try:
+                data = json.loads(_raw_qa) if isinstance(_raw_qa, str) else _raw_qa
+            except json.JSONDecodeError:
+                # JSON parse failed — try extracting verdict/score from prose
+                _prose_result = _qa_fallback_from_prose(_qa_raw_text, session_id=session_id, user_id=user_id)
+                if _prose_result is not None:
+                    _dlog("qa_prose_fallback_used",
+                          session_id=session_id, filename=filename,
+                          symbol=symbol_path,
+                          verdict=_prose_result["verdict"],
+                          score=_prose_result["qa_score"],
+                          user_id=user_id)
+                    return _prose_result
+                raise  # No prose extraction possible — let original error propagate
         else:
             client = _get_client(user_id)
 
@@ -10163,9 +10248,22 @@ async def run_natural_pipeline_stream(
                     f"the correct nesting level. Then return the <surgical_edit> block."
                 )
 
-                correction_messages = current_messages + [
-                    {"role": "assistant", "content": full_response or "(writing code...)"},
-                    {"role": "user",      "content": correction_prompt},
+                # Slim context — correction_prompt is self-contained (includes
+                # original code, broken code, diff, QA issues, description).
+                # Using full current_messages risks token overflow in large
+                # sessions (65-file context + search round-trips can exceed
+                # model's max input tokens and kill auto-heal entirely).
+                _corr_prompt_chars = len(correction_prompt)
+                _dlog("correction_context_size",
+                      session_id=session_id, user_id=user_id,
+                      correction_prompt_chars=_corr_prompt_chars,
+                      correction_prompt_est_tokens=_corr_prompt_chars // 4,
+                      current_messages_chars=sum(len(m.get("content","")) for m in current_messages),
+                      current_messages_count=len(current_messages),
+                      symbol_name=symbol.name,
+                      retry_round=_qa_retry_round)
+                correction_messages = [
+                    {"role": "user", "content": correction_prompt},
                 ]
 
                 correction_tasks.append((
