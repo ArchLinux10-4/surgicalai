@@ -160,6 +160,66 @@ async def _stream_and_collect(aclient, **kwargs):
         return await strm.get_final_message()
 
 
+
+# ── Phase 3: shared parse helpers (used by both mid-stream + EOS) ──────
+
+def _parse_filereq_content(raw: str) -> list:
+    """Parse file_request tag content — JSON array/string with plain-text fallback."""
+    raw = raw.strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, list):
+            return [str(f).strip() for f in parsed if str(f).strip()]
+        elif isinstance(parsed, str):
+            return [parsed.strip()]
+        return []
+    except (json.JSONDecodeError, ValueError):
+        return [f.strip() for f in raw.replace(",", "\n").split("\n") if f.strip()]
+
+
+def _parse_search_content(raw: str):
+    """Parse search_request tag content — JSON dict. Returns parsed dict or None."""
+    try:
+        return json.loads(raw.strip())
+    except Exception:
+        return None
+
+
+def _parse_plan_content(raw: str):
+    """Parse edit_plan tag content — JSON list. Returns list or None."""
+    try:
+        result = json.loads(raw.strip())
+        return result if isinstance(result, list) else None
+    except Exception:
+        return None
+
+
+def _eos_recover_blocks(open_tag: str, close_tag: str, full_response: str,
+                        tag_buf: str, blocks_list: list) -> tuple:
+    """EOS recovery: findall complete blocks in full_response, dedup, keep partial.
+    Mutates blocks_list in place. Returns (new_count, partial_kept, had_matches)."""
+    pattern = re.escape(open_tag) + r"(.*?)" + re.escape(close_tag)
+    all_matches = re.findall(pattern, full_response, re.DOTALL)
+    new_count = 0
+    partial_kept = False
+    if all_matches:
+        for block in all_matches:
+            if block not in blocks_list:
+                blocks_list.append(block)
+                new_count += 1
+        if (tag_buf.strip()
+                and close_tag not in tag_buf
+                and tag_buf not in blocks_list):
+            blocks_list.append(tag_buf)
+            partial_kept = True
+    else:
+        if tag_buf.strip():
+            blocks_list.append(tag_buf)
+    return new_count, partial_kept, bool(all_matches)
+
+
 def _is_claude_model(model: str) -> bool:
     """Check if a model ID is a Claude/Anthropic model."""
     return bool(model and model.startswith("claude-"))
@@ -8557,36 +8617,21 @@ async def run_natural_pipeline_stream(
                                             yield sse({"type": "edit_end", "content": ""})
 
                                         elif _tag_name == "search":
-                                            try:
-                                                _sd = json.loads(_content.strip())
+                                            _sd = _parse_search_content(_content)
+                                            if _sd is not None:
                                                 search_requested = _sd
-                                            except Exception:
-                                                pass
                                             _break_stream = True
 
                                         elif _tag_name == "filereq":
-                                            raw = _content.strip()
-                                            try:
-                                                parsed = json.loads(raw)
-                                                if isinstance(parsed, list):
-                                                    fnames = [str(f).strip() for f in parsed if str(f).strip()]
-                                                elif isinstance(parsed, str):
-                                                    fnames = [parsed.strip()]
-                                                else:
-                                                    fnames = []
-                                            except (json.JSONDecodeError, ValueError):
-                                                fnames = [f.strip() for f in raw.replace(",", "\n").split("\n") if f.strip()]
+                                            fnames = _parse_filereq_content(_content)
                                             if fnames:
                                                 file_request_data = fnames[:5]
                                             _break_stream = True
 
                                         elif _tag_name == "plan":
-                                            try:
-                                                _pd = json.loads(_content.strip())
-                                                if isinstance(_pd, list):
-                                                    edit_plan_data = _pd
-                                            except Exception:
-                                                pass
+                                            _pd = _parse_plan_content(_content)
+                                            if _pd is not None:
+                                                edit_plan_data = _pd
                                             _break_stream = True
 
                                         state = "normal"
@@ -8656,17 +8701,7 @@ async def run_natural_pipeline_stream(
                         full_response, re.DOTALL
                     )
                     if _fr_match:
-                        raw = _fr_match.group(1).strip()
-                        try:
-                            parsed = json.loads(raw)
-                            if isinstance(parsed, list):
-                                fnames = [str(f).strip() for f in parsed if str(f).strip()]
-                            elif isinstance(parsed, str):
-                                fnames = [parsed.strip()]
-                            else:
-                                fnames = []
-                        except (json.JSONDecodeError, ValueError):
-                            fnames = [f.strip() for f in raw.replace(",", "\n").split("\n") if f.strip()]
+                        fnames = _parse_filereq_content(_fr_match.group(1))
                         if fnames:
                             file_request_data = fnames[:5]
                         state = "normal"
@@ -8687,11 +8722,9 @@ async def run_natural_pipeline_stream(
                         full_response, re.DOTALL
                     )
                     if _sr_match:
-                        try:
-                            search_data = json.loads(_sr_match.group(1).strip())
-                            search_requested = search_data
-                        except Exception:
-                            pass
+                        _sd = _parse_search_content(_sr_match.group(1))
+                        if _sd is not None:
+                            search_requested = _sd
                         state = "normal"
                         tag_buf = ""
                         _dlog("eos_search_recovered",
@@ -8709,12 +8742,9 @@ async def run_natural_pipeline_stream(
                         full_response, re.DOTALL
                     )
                     if _pl_match:
-                        try:
-                            _plan_parsed = json.loads(_pl_match.group(1).strip())
-                            if isinstance(_plan_parsed, list):
-                                edit_plan_data = _plan_parsed
-                        except Exception:
-                            pass
+                        _pd = _parse_plan_content(_pl_match.group(1))
+                        if _pd is not None:
+                            edit_plan_data = _pd
                         state = "normal"
                         tag_buf = ""
                         _dlog("eos_plan_recovered",
@@ -8727,38 +8757,17 @@ async def run_natural_pipeline_stream(
 
                 # ── surgical_edit recovery ──
                 elif state == "in_edit":
-                    _all_edits = re.findall(
-                        r"<surgical_edit>(.*?)</surgical_edit>",
-                        full_response, re.DOTALL
-                    )
-                    if _all_edits:
-                        # Recover any complete edits the mid-stream parser missed
-                        _new_count = 0
-                        for _eblock in _all_edits:
-                            if _eblock not in edit_blocks_raw:
-                                edit_blocks_raw.append(_eblock)
-                                _new_count += 1
-                        # Also preserve partial tag_buf (unclosed last edit)
-                        # — truncation detector downstream needs it.
-                        # Only if close tag is NOT in buf (otherwise findall
-                        # already captured the clean content).
-                        _partial_kept = False
-                        if (tag_buf.strip()
-                                and EDIT_CLOSE not in tag_buf
-                                and tag_buf not in edit_blocks_raw):
-                            edit_blocks_raw.append(tag_buf)
-                            _partial_kept = True
+                    _new_count, _partial_kept, _had_matches = _eos_recover_blocks(
+                        EDIT_OPEN, EDIT_CLOSE, full_response, tag_buf, edit_blocks_raw)
+                    if _had_matches:
                         state = "normal"
+                        tag_buf = ""
                         _dlog("eos_edit_recovered",
                               session_id=session_id, user_id=user_id,
                               recovered_count=_new_count,
                               partial_kept=_partial_kept,
                               total_edit_blocks=len(edit_blocks_raw))
-                        tag_buf = ""
                     else:
-                        # No close tag at all — append raw buffer (existing behavior)
-                        if tag_buf.strip():
-                            edit_blocks_raw.append(tag_buf)
                         _dlog("eos_edit_no_close_tag",
                               session_id=session_id, user_id=user_id,
                               buf_len=len(tag_buf))
@@ -8766,34 +8775,17 @@ async def run_natural_pipeline_stream(
 
                 # ── new_file recovery ──
                 elif state == "in_file":
-                    _all_files = re.findall(
-                        r"<new_file>(.*?)</new_file>",
-                        full_response, re.DOTALL
-                    )
-                    if _all_files:
-                        _new_count = 0
-                        for _fblock in _all_files:
-                            if _fblock not in new_file_blocks_raw:
-                                new_file_blocks_raw.append(_fblock)
-                                _new_count += 1
-                        # Also preserve partial tag_buf (unclosed last new_file)
-                        # Only if close tag is NOT in buf (same reason as edit).
-                        _partial_kept = False
-                        if (tag_buf.strip()
-                                and FILE_CLOSE not in tag_buf
-                                and tag_buf not in new_file_blocks_raw):
-                            new_file_blocks_raw.append(tag_buf)
-                            _partial_kept = True
+                    _new_count, _partial_kept, _had_matches = _eos_recover_blocks(
+                        FILE_OPEN, FILE_CLOSE, full_response, tag_buf, new_file_blocks_raw)
+                    if _had_matches:
                         state = "normal"
+                        tag_buf = ""
                         _dlog("eos_newfile_recovered",
                               session_id=session_id, user_id=user_id,
                               recovered_count=_new_count,
                               partial_kept=_partial_kept,
                               total_file_blocks=len(new_file_blocks_raw))
-                        tag_buf = ""
                     else:
-                        if tag_buf.strip():
-                            new_file_blocks_raw.append(tag_buf)
                         _dlog("eos_newfile_no_close_tag",
                               session_id=session_id, user_id=user_id,
                               buf_len=len(tag_buf))
