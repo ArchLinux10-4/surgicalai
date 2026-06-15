@@ -776,6 +776,156 @@ If you cannot locate the exact definition, emit a SEARCH/REPLACE block rather th
 
 Output ONLY the SEARCH/REPLACE blocks. No JSON. No markdown fences around the blocks. No explanation outside the blocks."""
 
+# ── Phase 1: Tool-use Surgeon definitions ────────────────────────────────────
+# Feature-flagged via get_setting("surgeon_tool_use", "false").
+# When enabled, Claude/GPT call structured tools instead of producing
+# free-text SEARCH/REPLACE blocks. Eliminates regex parsing entirely.
+
+SURGEON_TOOL_USE_SYSTEM = """You are the SURGEON in a two-model coding system.
+
+The ARCHITECT has already analyzed the codebase and created a precise change plan.
+Your job: implement that plan by calling the provided tools.
+
+You will receive:
+- FILE HEADER: top of the file (imports, key state/variables) for reference
+- CONTEXT BEFORE: lines just before the target symbol
+- TARGET CODE: the exact symbol you are editing
+- CONTEXT AFTER: lines just after the target symbol
+
+RULES:
+1. Use edit_code for targeted changes. The old_code must be an EXACT substring of TARGET CODE — copy it verbatim including all whitespace and indentation.
+2. Use the MINIMUM lines in old_code needed to uniquely identify the location (usually 2-6 lines).
+3. new_code is the replacement. Preserve the original indentation style.
+4. Each tool call = ONE logical change. Multiple changes = multiple calls.
+5. CRITICAL: Every line in old_code that is absent from new_code gets permanently deleted. Never include trailing context lines you want to keep.
+6. TO DELETE code: set old_code to the exact code to remove, set new_code to empty string.
+
+FOR REDESIGN / RESTYLE / COMPLETE REWRITE (> ~30% of symbol changing):
+Use replace_symbol with the complete new symbol code.
+
+FOR TARGETED CHANGES (bug fix, add a field, change a color):
+Use edit_code — one call per change location.
+
+STYLE RULES:
+- Targeted tweaks: prefer existing color values/CSS variables.
+- Redesign/restyle/modernize: freely introduce new colors, gradients, glassmorphism, modern patterns.
+- Preserve TypeScript types. Match indentation exactly (spaces vs tabs, 2 vs 4 spaces).
+
+IF ALREADY CORRECT (the code already does exactly what was requested AND nothing should be deleted):
+Call no_change_needed. NEVER use this for deletions.
+
+VERIFICATION RULE — BEFORE concluding no change needed:
+You MUST confirm you are looking at the exact named function/symbol, not just nearby code.
+If you cannot locate the exact definition, make an edit rather than calling no_change_needed."""
+
+SURGEON_TOOLS_ANTHROPIC = [
+    {
+        "name": "edit_code",
+        "description": "Replace a specific code region in the target symbol. The old_code must exactly match a substring of the TARGET CODE.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "old_code": {
+                    "type": "string",
+                    "description": "Exact code to find — copy character-for-character from TARGET CODE including whitespace."
+                },
+                "new_code": {
+                    "type": "string",
+                    "description": "The replacement code. Use empty string to delete."
+                }
+            },
+            "required": ["old_code", "new_code"]
+        }
+    },
+    {
+        "name": "replace_symbol",
+        "description": "Replace the entire target symbol with new code. Use for rewrites affecting more than 30 percent of the symbol.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "new_code": {
+                    "type": "string",
+                    "description": "Complete new code for the entire symbol."
+                }
+            },
+            "required": ["new_code"]
+        }
+    },
+    {
+        "name": "no_change_needed",
+        "description": "The code already implements the requested change correctly. Never use for deletions.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "reason": {
+                    "type": "string",
+                    "description": "Brief explanation of why no change is needed."
+                }
+            },
+            "required": ["reason"]
+        }
+    }
+]
+
+SURGEON_TOOLS_OPENAI = [
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_code",
+            "description": "Replace a specific code region in the target symbol. The old_code must exactly match a substring of the TARGET CODE.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "old_code": {
+                        "type": "string",
+                        "description": "Exact code to find — copy character-for-character from TARGET CODE including whitespace."
+                    },
+                    "new_code": {
+                        "type": "string",
+                        "description": "The replacement code. Use empty string to delete."
+                    }
+                },
+                "required": ["old_code", "new_code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "replace_symbol",
+            "description": "Replace the entire target symbol with new code. Use for rewrites affecting more than 30 percent of the symbol.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "new_code": {
+                        "type": "string",
+                        "description": "Complete new code for the entire symbol."
+                    }
+                },
+                "required": ["new_code"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "no_change_needed",
+            "description": "The code already implements the requested change correctly. Never use for deletions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "reason": {
+                        "type": "string",
+                        "description": "Brief explanation of why no change is needed."
+                    }
+                },
+                "required": ["reason"]
+            }
+        }
+    }
+]
+
+
 
 def run_architect(
     symbol_map: SymbolMap,
@@ -1414,79 +1564,199 @@ CONTEXT AFTER (read-only reference, do NOT include in operations):
 
 Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
 
-    if _is_claude_model(surg_model):
-        # Claude Surgeon path — Anthropic SDK (OpenAI client cannot call Claude models)
-        _anthropic_key = _get_anthropic_key(user_id)
-        from anthropic import Anthropic as _AnthropicSync
-        _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
-        _claude_surgeon_resp = _sync_aclient.messages.create(
-            model=surg_model,
-            max_tokens=8192,
-            system=SURGEON_SYSTEM,
-            messages=[{"role": "user", "content": user_msg}],
+    # ── Feature flag: tool_use vs text SEARCH/REPLACE ───────────────────────────
+    _use_tool_use = get_setting("surgeon_tool_use", "false") == "true"
+
+    if _use_tool_use:
+        # ── TOOL USE PATH (Phase 1) ─────────────────────────────────────────────
+        # Claude/GPT call structured tools instead of writing free-text blocks.
+        # Zero regex parsing. Zero tag recovery. Structured JSON from the SDK.
+        _tu_user_msg = user_msg.replace(
+            "Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks.",
+            "Use the provided tools to make your changes. Do not output any text — only tool calls."
         )
-        raw = _claude_surgeon_resp.content[0].text
+        print(f"[SURGEON][TOOL_USE] Enabled — calling {surg_model} with structured tools")
+
+        operations = []
+        confidence = target.confidence
+        surgeon_notes = []
+        import_needed_lines = []
+
+        if _is_claude_model(surg_model):
+            _anthropic_key = _get_anthropic_key(user_id)
+            from anthropic import Anthropic as _AnthropicSync
+            _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
+            try:
+                _tu_resp = _sync_aclient.messages.create(
+                    model=surg_model,
+                    max_tokens=8192,
+                    system=SURGEON_TOOL_USE_SYSTEM,
+                    messages=[{"role": "user", "content": _tu_user_msg}],
+                    tools=SURGEON_TOOLS_ANTHROPIC,
+                )
+                _tu_stop = _tu_resp.stop_reason
+                print(f"[SURGEON][TOOL_USE] Claude response: stop_reason={_tu_stop}, "
+                      f"content_blocks={len(_tu_resp.content)}")
+                for _blk in _tu_resp.content:
+                    if _blk.type == "tool_use":
+                        print(f"[SURGEON][TOOL_USE]   tool={_blk.name}, "
+                              f"input_keys={list(_blk.input.keys()) if isinstance(_blk.input, dict) else '?'}")
+                        if _blk.name == "edit_code":
+                            _old = _blk.input.get("old_code", "")
+                            _new = _blk.input.get("new_code", "")
+                            operations.append({"find": _old, "replace": _new})
+                        elif _blk.name == "replace_symbol":
+                            _new = _blk.input.get("new_code", "")
+                            operations.append({"find": symbol.code, "replace": _new})
+                        elif _blk.name == "no_change_needed":
+                            _reason = _blk.input.get("reason", "")
+                            print(f"[SURGEON][TOOL_USE]   no_change_needed: {_reason[:200]}")
+                            if forbid_noop:
+                                print("[SURGEON][TOOL_USE] Rejected no_change_needed after QA failure")
+                                return symbol.code, 0, ["Surgeon: refused noop after QA rejection"], [], []
+                            return symbol.code, 10, [f"Surgeon: already implemented — {_reason[:100]}"], [], []
+                    elif _blk.type == "text":
+                        print(f"[SURGEON][TOOL_USE]   text block ({len(_blk.text)} chars) — ignored")
+            except Exception as _tu_err:
+                print(f"[SURGEON][TOOL_USE] Claude tool_use call failed: {_tu_err}")
+                _dlog("surgeon_tool_use_error",
+                      error=str(_tu_err)[:500],
+                      model=surg_model,
+                      user_id=user_id)
+                return symbol.code, 0, [f"Surgeon: tool_use API error — {str(_tu_err)[:100]}"], [], []
+        else:
+            # GPT / OpenAI-compatible tool_use path
+            try:
+                _tu_resp = _chat_create(client,
+                    model=surg_model,
+                    messages=[
+                        {"role": "system", "content": SURGEON_TOOL_USE_SYSTEM},
+                        {"role": "user", "content": _tu_user_msg}
+                    ],
+                    temperature=temp,
+                    tools=SURGEON_TOOLS_OPENAI,
+                )
+                _tu_calls = _tu_resp.choices[0].message.tool_calls or []
+                print(f"[SURGEON][TOOL_USE] GPT response: {len(_tu_calls)} tool call(s)")
+                for _tc in _tu_calls:
+                    import json as _json_tu
+                    try:
+                        _tc_args = _json_tu.loads(_tc.function.arguments)
+                    except Exception as _jpe:
+                        print(f"[SURGEON][TOOL_USE] Failed to parse tool args: {_jpe}")
+                        continue
+                    print(f"[SURGEON][TOOL_USE]   tool={_tc.function.name}, "
+                          f"arg_keys={list(_tc_args.keys())}")
+                    if _tc.function.name == "edit_code":
+                        _old = _tc_args.get("old_code", "")
+                        _new = _tc_args.get("new_code", "")
+                        operations.append({"find": _old, "replace": _new})
+                    elif _tc.function.name == "replace_symbol":
+                        _new = _tc_args.get("new_code", "")
+                        operations.append({"find": symbol.code, "replace": _new})
+                    elif _tc.function.name == "no_change_needed":
+                        _reason = _tc_args.get("reason", "")
+                        print(f"[SURGEON][TOOL_USE]   no_change_needed: {_reason[:200]}")
+                        if forbid_noop:
+                            print("[SURGEON][TOOL_USE] Rejected no_change_needed after QA failure")
+                            return symbol.code, 0, ["Surgeon: refused noop after QA rejection"], [], []
+                        return symbol.code, 10, [f"Surgeon: already implemented — {_reason[:100]}"], [], []
+            except Exception as _tu_err:
+                print(f"[SURGEON][TOOL_USE] GPT tool_use call failed: {_tu_err}")
+                _dlog("surgeon_tool_use_error",
+                      error=str(_tu_err)[:500],
+                      model=surg_model,
+                      user_id=user_id)
+                return symbol.code, 0, [f"Surgeon: tool_use API error — {str(_tu_err)[:100]}"], [], []
+
+        print(f"[SURGEON][TOOL_USE] Final: {len(operations)} operation(s) extracted")
+
+        # Noop check: if QA rejected and all ops are empty, refuse
+        if forbid_noop and operations:
+            _all_empty = all(
+                not (op.get("find", "") or "").strip() and not (op.get("replace", "") or "").strip()
+                for op in operations
+            )
+            if _all_empty:
+                print("[SURGEON][TOOL_USE] Rejected all-empty ops after QA failure")
+                return symbol.code, 0, ["Surgeon: refused empty-block noop after QA rejection"], [], []
+
     else:
-        response = _chat_create(client,
-            model=surg_model,
-            messages=[
-                {"role": "system", "content": SURGEON_SYSTEM},
-                {"role": "user", "content": user_msg}
-            ],
-            temperature=temp
-        )
-        raw = response.choices[0].message.content
+        # ── ORIGINAL TEXT PATH (unchanged) ───────────────────────────────────────
 
-    # Parse Aider-style SEARCH/REPLACE blocks
-    operations = []
-    confidence = target.confidence
-    surgeon_notes = []
-    import_needed_lines = []
+        if _is_claude_model(surg_model):
+            # Claude Surgeon path — Anthropic SDK (OpenAI client cannot call Claude models)
+            _anthropic_key = _get_anthropic_key(user_id)
+            from anthropic import Anthropic as _AnthropicSync
+            _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
+            _claude_surgeon_resp = _sync_aclient.messages.create(
+                model=surg_model,
+                max_tokens=8192,
+                system=SURGEON_SYSTEM,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            raw = _claude_surgeon_resp.content[0].text
+        else:
+            response = _chat_create(client,
+                model=surg_model,
+                messages=[
+                    {"role": "system", "content": SURGEON_SYSTEM},
+                    {"role": "user", "content": user_msg}
+                ],
+                temperature=temp
+            )
+            raw = response.choices[0].message.content
 
-    raw = raw.strip()
+        # Parse Aider-style SEARCH/REPLACE blocks
+        operations = []
+        confidence = target.confidence
+        surgeon_notes = []
+        import_needed_lines = []
 
-    # Already-correct shortcut — but if QA just rejected this exact code,
-    # "already correct" is a lie. Force a retry instead of silently passing.
-    if raw.startswith("ALREADY_CORRECT"):
-        if forbid_noop:
-            print("[SURGEON] Rejected ALREADY_CORRECT after QA failure — Surgeon must produce real edits")
-            return symbol.code, 0, ["Surgeon: refused noop after QA rejection"], [], []
-        return symbol.code, 10, ["Surgeon: already implemented"], [], []
+        raw = raw.strip()
 
-    # Extract all <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks
-    _sr_pattern = re.compile(r"<{7} SEARCH\r?\n(.*?)\r?\n={7}\r?\n(.*?)\r?\n>{7} REPLACE", re.DOTALL)
-    _matches = _sr_pattern.findall(raw)
+        # Already-correct shortcut — but if QA just rejected this exact code,
+        # "already correct" is a lie. Force a retry instead of silently passing.
+        if raw.startswith("ALREADY_CORRECT"):
+            if forbid_noop:
+                print("[SURGEON] Rejected ALREADY_CORRECT after QA failure — Surgeon must produce real edits")
+                return symbol.code, 0, ["Surgeon: refused noop after QA rejection"], [], []
+            return symbol.code, 10, ["Surgeon: already implemented"], [], []
 
-    if not _matches:
-        # If the raw output contains SEARCH/REPLACE markers the regex didn't match,
-        # the Surgeon tried to use the format but produced malformed blocks.
-        # NEVER inject raw output containing those markers — it would write
-        # <<<<<<< SEARCH / ======= / >>>>>>> REPLACE directly into the file.
-        _has_sr_markers = ("<<<<<<< SEARCH" in raw or ">>>>>>> REPLACE" in raw
-                           or ("=======" in raw and "SEARCH" in raw))
-        if _has_sr_markers:
-            print("[SURGEON] Malformed SEARCH/REPLACE blocks detected — refusing raw fallback to avoid injecting markers")
-            return symbol.code, 0, ["Surgeon: malformed SEARCH/REPLACE output — retry"], [], []
-        # Safe: no markers present — treat whole raw as full symbol replacement
-        print("[SURGEON] No SEARCH/REPLACE blocks found — using raw as full replacement")
-        _clean = raw.strip("\n")
-        if _clean:
-            operations = [{"find": symbol.code, "replace": _clean}]
-    else:
-        for _find, _replace in _matches:
-            operations.append({"find": _find, "replace": _replace})
-        print(f"[SURGEON] Parsed {len(_matches)} SEARCH/REPLACE block(s)")
+        # Extract all <<<<<<< SEARCH / ======= / >>>>>>> REPLACE blocks
+        _sr_pattern = re.compile(r"<{7} SEARCH\r?\n(.*?)\r?\n={7}\r?\n(.*?)\r?\n>{7} REPLACE", re.DOTALL)
+        _matches = _sr_pattern.findall(raw)
 
-    # v3.11.0: If QA just rejected and Surgeon only produced empty blocks, refuse.
-    # An empty SEARCH/REPLACE pair is the same noop escape hatch as ALREADY_CORRECT.
-    if forbid_noop and operations:
-        _all_empty = all(
-            not (op.get("find", "") or "").strip() and not (op.get("replace", "") or "").strip()
-            for op in operations
-        )
-        if _all_empty:
-            print("[SURGEON] Rejected all-empty SEARCH/REPLACE after QA failure")
-            return symbol.code, 0, ["Surgeon: refused empty-block noop after QA rejection"], [], []
+        if not _matches:
+            # If the raw output contains SEARCH/REPLACE markers the regex didn't match,
+            # the Surgeon tried to use the format but produced malformed blocks.
+            # NEVER inject raw output containing those markers — it would write
+            # <<<<<<< SEARCH / ======= / >>>>>>> REPLACE directly into the file.
+            _has_sr_markers = ("<<<<<<< SEARCH" in raw or ">>>>>>> REPLACE" in raw
+                               or ("=======" in raw and "SEARCH" in raw))
+            if _has_sr_markers:
+                print("[SURGEON] Malformed SEARCH/REPLACE blocks detected — refusing raw fallback to avoid injecting markers")
+                return symbol.code, 0, ["Surgeon: malformed SEARCH/REPLACE output — retry"], [], []
+            # Safe: no markers present — treat whole raw as full symbol replacement
+            print("[SURGEON] No SEARCH/REPLACE blocks found — using raw as full replacement")
+            _clean = raw.strip("\n")
+            if _clean:
+                operations = [{"find": symbol.code, "replace": _clean}]
+        else:
+            for _find, _replace in _matches:
+                operations.append({"find": _find, "replace": _replace})
+            print(f"[SURGEON] Parsed {len(_matches)} SEARCH/REPLACE block(s)")
+
+        # v3.11.0: If QA just rejected and Surgeon only produced empty blocks, refuse.
+        # An empty SEARCH/REPLACE pair is the same noop escape hatch as ALREADY_CORRECT.
+        if forbid_noop and operations:
+            _all_empty = all(
+                not (op.get("find", "") or "").strip() and not (op.get("replace", "") or "").strip()
+                for op in operations
+            )
+            if _all_empty:
+                print("[SURGEON] Rejected all-empty SEARCH/REPLACE after QA failure")
+                return symbol.code, 0, ["Surgeon: refused empty-block noop after QA rejection"], [], []
     # ── Mechanical trailing-context rescue ──────────────────────────────────────────────
     # Must run BEFORE apply so QA + diff both see the corrected ops.
     # Detects 'find' strings that captured structural lines after the change target
