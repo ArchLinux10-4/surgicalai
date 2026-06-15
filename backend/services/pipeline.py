@@ -4145,14 +4145,19 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
                 model=_qa_model,
                 max_tokens=1500,
                 system=QA_SYSTEM,
-                messages=[{"role": "user", "content": user_msg}],
+                messages=[
+                    {"role": "user", "content": user_msg},
+                    {"role": "assistant", "content": "{"},
+                ],
             )
-            _qa_raw_text = (_qa_msg.content[0].text or "").strip()
+            # Assistant prefill: model continues from "{", so prepend it
+            _qa_raw_text = "{" + (_qa_msg.content[0].text or "").strip()
             _dlog("qa_agent_raw_response",
                   session_id=session_id, filename=filename,
                   symbol=symbol_path, model=_qa_model,
                   raw_len=len(_qa_raw_text),
                   raw_preview=_qa_raw_text[:500],
+                  prefill_used=True,
                   user_id=user_id)
             # Robust JSON extraction — Claude sometimes adds preamble or markdown fences
             _raw_qa = _extract_json_from_text(_qa_raw_text)
