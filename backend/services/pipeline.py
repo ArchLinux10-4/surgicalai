@@ -11009,7 +11009,27 @@ async def run_natural_pipeline_stream(
                         if _cb.endswith(EDIT_CLOSE):
                             new_pending.append(_cb[:-len(EDIT_CLOSE)])
                             _cb, _cs = "", "normal"
-                pending_edits = new_pending or []
+                # Filter correction edits: only keep edits for symbols
+                # that were actually unresolved. The correction model may
+                # gratuitously re-emit edits for already-resolved symbols,
+                # which would double-splice and create duplicates.
+                _unresolved_keys = {(x["filename"], x["symbol"]) for x in still_unresolved}
+                _filtered_pending = []
+                for _np_raw in (new_pending or []):
+                    try:
+                        _np_parsed = json.loads(_np_raw)
+                        _np_key = (_np_parsed.get("filename", ""), _np_parsed.get("symbol", ""))
+                        if _np_key in _unresolved_keys:
+                            _filtered_pending.append(_np_raw)
+                        else:
+                            _dlog("correction_edit_skipped_already_resolved",
+                                  session_id=session_id,
+                                  filename=_np_parsed.get("filename", ""),
+                                  symbol=_np_parsed.get("symbol", ""),
+                                  user_id=user_id)
+                    except Exception:
+                        _filtered_pending.append(_np_raw)
+                pending_edits = _filtered_pending
 
                 # ── Correction search-and-retry ───────────────────────────
                 # When Claude asks for a <search_request> instead of emitting
@@ -11086,7 +11106,23 @@ async def run_natural_pipeline_stream(
                                             _fup.append(_fcb[:-len(EDIT_CLOSE)])
                                             _fcb, _fcs = "", "normal"
                                 if _fup:
-                                    pending_edits = _fup
+                                    # Same filter — only keep unresolved symbols
+                                    _fup_filtered = []
+                                    for _fup_raw in _fup:
+                                        try:
+                                            _fup_parsed = json.loads(_fup_raw)
+                                            _fup_key = (_fup_parsed.get("filename", ""), _fup_parsed.get("symbol", ""))
+                                            if _fup_key in _unresolved_keys:
+                                                _fup_filtered.append(_fup_raw)
+                                            else:
+                                                _dlog("correction_followup_edit_skipped_already_resolved",
+                                                      session_id=session_id,
+                                                      filename=_fup_parsed.get("filename", ""),
+                                                      symbol=_fup_parsed.get("symbol", ""),
+                                                      user_id=user_id)
+                                        except Exception:
+                                            _fup_filtered.append(_fup_raw)
+                                    pending_edits = _fup_filtered or _fup
                         except Exception as _cse:
                             _dlog("correction_search_failed",
                                   session_id=session_id,
