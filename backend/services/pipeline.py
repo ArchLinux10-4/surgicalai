@@ -10221,6 +10221,7 @@ async def run_natural_pipeline_stream(
 
             # Build correction calls for all blocked changes
             correction_tasks = []
+            _corr_msgs_by_idx = {}  # Save per-correction messages for ReAct follow-ups
             for idx in blocked_indices:
                 cs     = change_shells[idx]
                 qa_d   = qa_results[idx]
@@ -10341,6 +10342,7 @@ async def run_natural_pipeline_stream(
                 correction_messages = [
                     {"role": "user", "content": correction_prompt},
                 ]
+                _corr_msgs_by_idx[idx] = correction_messages
 
                 correction_tasks.append((
                     idx,
@@ -10373,14 +10375,184 @@ async def run_natural_pipeline_stream(
                     corr_text = "".join(
                         b.text for b in corr_resp.content if hasattr(b, "text")
                     )
-                    # Extract first <surgical_edit> block from response
-                    ei = corr_text.find(EDIT_OPEN)
-                    ec = corr_text.find(EDIT_CLOSE, ei) if ei != -1 else -1
-                    if ei == -1 or ec == -1:
-                        _dlog("qa_retry_correction_no_edit_block", session_id=session_id, user_id=user_id,
+                    # ── ReAct loop: if Claude asks for context, provide it ──
+                    # Instead of giving up when correction has no edit block,
+                    # check for <search_request>/<file_request> tags, execute
+                    # them, feed results back, and let Claude produce the edit.
+                    _MAX_CORR_REACT = 3
+                    _react_msgs = list(_corr_msgs_by_idx.get(idx, []))
+                    _got_edit = False
+                    _corr_react_round = 0
+
+                    while _corr_react_round <= _MAX_CORR_REACT:
+                        ei = corr_text.find(EDIT_OPEN)
+                        ec = corr_text.find(EDIT_CLOSE, ei) if ei != -1 else -1
+                        if ei != -1 and ec != -1:
+                            _got_edit = True
+                            break
+
+                        if _corr_react_round >= _MAX_CORR_REACT:
+                            break  # Exhausted ReAct rounds
+
+                        # Look for search/file request tags in the response
+                        _sr_match = re.search(
+                            r'<search_request>\s*(.*?)\s*</search_request>',
+                            corr_text, re.DOTALL
+                        )
+                        _fr_match = re.search(
+                            r'<file_request>\s*(.*?)\s*</file_request>',
+                            corr_text, re.DOTALL
+                        )
+
+                        if not _sr_match and not _fr_match:
+                            _dlog("qa_retry_correction_no_edit_no_react",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  react_round=_corr_react_round,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  response_len=len(corr_text),
+                                  response_preview=corr_text[:500])
+                            break  # No edit and no context request — give up
+
+                        # Execute the context requests
+                        _react_parts = []
+
+                        if _sr_match:
+                            _sr_data = _parse_search_content(_sr_match.group(1))
+                            _sr_terms = (
+                                _sr_data.get("terms", [])
+                                if isinstance(_sr_data, dict) else []
+                            )
+                            if _sr_terms:
+                                _sr_result = _resolve_search_multifile(
+                                    _sr_terms, symbol_maps_by_name,
+                                    file_content_lookup_stream
+                                )
+                                _react_parts.append(
+                                    f"Search results for {_sr_terms}:\n{_sr_result}"
+                                )
+                                _dlog("qa_retry_correction_search_executed",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      react_round=_corr_react_round,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      terms=_sr_terms,
+                                      result_chars=len(_sr_result))
+
+                        if _fr_match:
+                            _fr_names = _parse_filereq_content(_fr_match.group(1))
+                            for _fr_fn in _fr_names[:5]:
+                                _fr_content = file_content_lookup_stream.get(
+                                    _fr_fn, ""
+                                )
+                                if not _fr_content:
+                                    # Fuzzy match — find closest filename
+                                    _fr_cands = [
+                                        k for k in file_content_lookup_stream
+                                        if _fr_fn.lower() in k.lower()
+                                        or k.lower() in _fr_fn.lower()
+                                    ]
+                                    if _fr_cands:
+                                        _fr_fn = _fr_cands[0]
+                                        _fr_content = (
+                                            file_content_lookup_stream.get(
+                                                _fr_fn, ""
+                                            )
+                                        )
+                                if _fr_content:
+                                    _fr_lines = _fr_content.splitlines()
+                                    _react_parts.append(
+                                        f"FILE: {_fr_fn} ({len(_fr_lines)} lines)\n"
+                                        f"```\n{_fr_content}\n```"
+                                    )
+                                else:
+                                    _react_parts.append(
+                                        f"FILE NOT FOUND: '{_fr_fn}'"
+                                    )
+                            _dlog("qa_retry_correction_files_fetched",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  react_round=_corr_react_round,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  requested=_fr_names[:5])
+
+                        if not _react_parts:
+                            _dlog("qa_retry_correction_no_edit_no_react",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  react_round=_corr_react_round,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  response_len=len(corr_text),
+                                  response_preview=corr_text[:500])
+                            break
+
+                        _react_context = "\n\n".join(_react_parts)
+                        _react_msgs.extend([
+                            {"role": "assistant", "content": corr_text},
+                            {"role": "user", "content": (
+                                f"{_react_context}\n\n"
+                                "Now write your corrected <surgical_edit> block. "
+                                "Use the EXACT verbatim lines shown above as your "
+                                "old_code anchor — copy them character-for-character."
+                            )},
+                        ])
+
+                        _dlog("qa_retry_correction_react_followup",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=idx,
+                              react_round=_corr_react_round,
+                              symbol=change_shells[idx]["symbol"].name,
+                              context_chars=len(_react_context),
+                              msg_count=len(_react_msgs))
+
+                        try:
+                            _fu_task = asyncio.create_task(
+                                _stream_and_collect(
+                                    aclient, model=arch_model,
+                                    max_tokens=64000,
+                                    system=system_prompt,
+                                    messages=_react_msgs,
+                                )
+                            )
+                            while not _fu_task.done():
+                                try:
+                                    await asyncio.wait_for(
+                                        asyncio.shield(_fu_task),
+                                        timeout=20.0,
+                                    )
+                                except asyncio.TimeoutError:
+                                    yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+
+                            _fu_resp = _fu_task.result()
+                            corr_text = "".join(
+                                b.text for b in _fu_resp.content
+                                if hasattr(b, "text")
+                            )
+                            _dlog("qa_retry_correction_react_response",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  react_round=_corr_react_round,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  response_chars=len(corr_text),
+                                  has_edit=EDIT_OPEN in corr_text)
+                        except Exception as _react_exc:
+                            _dlog("qa_retry_correction_react_error",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  react_round=_corr_react_round,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  error=str(_react_exc),
+                                  error_type=type(_react_exc).__name__)
+                            break  # API error — stop ReAct for this correction
+
+                        _corr_react_round += 1
+
+                    if not _got_edit:
+                        _dlog("qa_retry_correction_no_edit_block",
+                              session_id=session_id, user_id=user_id,
                               retry_round=_qa_retry_round, idx=idx,
                               symbol=change_shells[idx]["symbol"].name,
-                              edit_open_pos=ei, edit_close_pos=ec,
+                              react_rounds_tried=_corr_react_round,
                               response_len=len(corr_text),
                               response_preview=corr_text[:500])
                         continue
