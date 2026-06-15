@@ -1678,7 +1678,288 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
         surgeon_notes = []
         import_needed_lines = []
 
-        if _is_claude_model(surg_model):
+        _use_multi_turn = get_setting("multi_turn_surgeon", "false") == "true"
+
+        if _is_claude_model(surg_model) and _use_multi_turn:
+            # ── MULTI-TURN VERIFICATION PATH (Phase 3) ─────────────────────────
+            # Claude makes edits one at a time, sees verification after each.
+            # Eliminates old_code mismatch failures: if an edit doesn't match,
+            # Claude sees the error + hint and can fix it on the next turn.
+            # Max turns capped to prevent runaway conversations.
+            _anthropic_key = _get_anthropic_key(user_id)
+            from anthropic import Anthropic as _AnthropicSync
+            _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
+
+            _mt_messages = [{"role": "user", "content": _tu_user_msg}]
+            _mt_working_code = symbol.code    # in-memory working copy
+            _MT_MAX_TURNS = 5                 # safety cap
+            _mt_total_edits = 0
+            _mt_failed_edits = 0
+            _mt_turn = 0
+
+            _dlog("surgeon_multi_turn_start",
+                  session_id=getattr(target, '_session_id', ''),
+                  user_id=user_id,
+                  model=surg_model,
+                  symbol=symbol.name,
+                  symbol_lines=symbol.end_line - symbol.start_line + 1,
+                  max_turns=_MT_MAX_TURNS,
+                  forbid_noop=forbid_noop)
+
+            for _mt_turn in range(_MT_MAX_TURNS):
+                _mt_api_start = time.time()
+                try:
+                    _mt_resp = _sync_aclient.messages.create(
+                        model=surg_model,
+                        max_tokens=8192,
+                        system=SURGEON_TOOL_USE_SYSTEM,
+                        messages=_mt_messages,
+                        tools=SURGEON_TOOLS_ANTHROPIC,
+                    )
+                except Exception as _mt_api_err:
+                    print(f"[SURGEON][MULTI_TURN] API error on turn {_mt_turn+1}: {_mt_api_err}")
+                    _dlog("surgeon_multi_turn_api_error",
+                          turn=_mt_turn + 1,
+                          error=str(_mt_api_err)[:500],
+                          model=surg_model,
+                          user_id=user_id,
+                          ops_so_far=len(operations))
+                    # Return whatever we have so far (graceful degradation)
+                    if operations:
+                        surgeon_notes.append(f"Multi-turn: API error on turn {_mt_turn+1}, returning {len(operations)} ops collected so far")
+                        break
+                    return symbol.code, 0, [f"Surgeon: multi-turn API error — {str(_mt_api_err)[:100]}"], [], []
+
+                _mt_api_elapsed = time.time() - _mt_api_start
+                _mt_stop = _mt_resp.stop_reason
+                _mt_block_count = len(_mt_resp.content)
+
+                print(f"[SURGEON][MULTI_TURN] Turn {_mt_turn+1}/{_MT_MAX_TURNS}: "
+                      f"stop_reason={_mt_stop}, blocks={_mt_block_count}, "
+                      f"latency={_mt_api_elapsed:.1f}s, ops_so_far={len(operations)}")
+
+                # Process tool calls in this turn
+                _mt_tool_results = []
+                _mt_turn_had_noop = False
+
+                for _blk in _mt_resp.content:
+                    if _blk.type == "tool_use":
+                        if _blk.name == "edit_code":
+                            _old = _blk.input.get("old_code", "")
+                            _new = _blk.input.get("new_code", "")
+                            _mt_total_edits += 1
+
+                            if _old and _old in _mt_working_code:
+                                # ✅ Edit matches — apply in-memory
+                                _mt_working_code = _mt_working_code.replace(_old, _new, 1)
+                                operations.append({"find": _old, "replace": _new})
+
+                                # Build verification context (±3 lines around edit)
+                                _edit_pos = _mt_working_code.find(_new) if _new else 0
+                                _ctx_lines = _mt_working_code.splitlines()
+                                _edit_line = _mt_working_code[:max(0, _edit_pos)].count("\n") + 1
+                                _ctx_start = max(0, _edit_line - 4)
+                                _ctx_end = min(len(_ctx_lines), _edit_line + _new.count("\n") + 4)
+                                _ctx_snippet = "\n".join(
+                                    f"{_ctx_start + j + 1}: {l}"
+                                    for j, l in enumerate(_ctx_lines[_ctx_start:_ctx_end])
+                                )
+
+                                _result_payload = {
+                                    "success": True,
+                                    "message": f"Edit applied successfully at line {_edit_line}",
+                                    "lines_changed": _new.count("\n") + 1,
+                                    "context": _ctx_snippet
+                                }
+                                _mt_tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": _blk.id,
+                                    "content": json.dumps(_result_payload)
+                                })
+
+                                _dlog("surgeon_multi_turn_edit_ok",
+                                      turn=_mt_turn + 1,
+                                      edit_num=_mt_total_edits,
+                                      edit_line=_edit_line,
+                                      old_len=len(_old),
+                                      new_len=len(_new),
+                                      working_code_len=len(_mt_working_code),
+                                      user_id=user_id)
+                                print(f"[SURGEON][MULTI_TURN]   ✅ edit_code applied at L{_edit_line} "
+                                      f"(old={len(_old)}→new={len(_new)} chars)")
+
+                            else:
+                                # ❌ old_code doesn't match — send error with hint
+                                _mt_failed_edits += 1
+
+                                # Find the closest matching line for a helpful hint
+                                _hint_lines = []
+                                _old_first_line = _old.strip().split("\n")[0] if _old.strip() else ""
+                                if _old_first_line:
+                                    for _hi, _hl in enumerate(_mt_working_code.splitlines(), 1):
+                                        if _old_first_line.strip() in _hl.strip():
+                                            _hint_lines.append(f"L{_hi}: {_hl.rstrip()}")
+                                            if len(_hint_lines) >= 3:
+                                                break
+
+                                _err_payload = {
+                                    "success": False,
+                                    "error": "old_code not found in current file content. "
+                                             "The text must match exactly, including indentation and whitespace.",
+                                    "old_code_preview": _old[:200],
+                                    "hint": f"Similar lines found: {'; '.join(_hint_lines)}" if _hint_lines else
+                                            "No similar lines found. Try requesting the current file content."
+                                }
+                                _mt_tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": _blk.id,
+                                    "content": json.dumps(_err_payload),
+                                    "is_error": True
+                                })
+
+                                _dlog("surgeon_multi_turn_edit_fail",
+                                      turn=_mt_turn + 1,
+                                      edit_num=_mt_total_edits,
+                                      old_code_len=len(_old),
+                                      old_code_preview=_old[:300],
+                                      hint_lines=_hint_lines,
+                                      working_code_len=len(_mt_working_code),
+                                      user_id=user_id)
+                                print(f"[SURGEON][MULTI_TURN]   ❌ edit_code FAILED — old_code not found "
+                                      f"(old={len(_old)} chars, hints={len(_hint_lines)})")
+
+                        elif _blk.name == "replace_symbol":
+                            _new = _blk.input.get("new_code", "")
+                            operations.append({"find": _mt_working_code, "replace": _new})
+                            _mt_working_code = _new
+                            _mt_total_edits += 1
+
+                            _mt_tool_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": _blk.id,
+                                "content": json.dumps({
+                                    "success": True,
+                                    "message": f"Symbol fully replaced ({len(_new.splitlines())} lines)",
+                                    "new_length": len(_new.splitlines())
+                                })
+                            })
+                            _dlog("surgeon_multi_turn_replace_symbol",
+                                  turn=_mt_turn + 1,
+                                  new_len=len(_new),
+                                  user_id=user_id)
+                            print(f"[SURGEON][MULTI_TURN]   ✅ replace_symbol ({len(_new)} chars)")
+
+                        elif _blk.name == "no_change_needed":
+                            _reason = _blk.input.get("reason", "")
+                            _mt_turn_had_noop = True
+                            print(f"[SURGEON][MULTI_TURN]   no_change_needed: {_reason[:200]}")
+
+                            if forbid_noop:
+                                # QA rejected — force Claude to make real edits
+                                _mt_tool_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": _blk.id,
+                                    "content": json.dumps({
+                                        "success": False,
+                                        "error": "QA has rejected the current code. Changes ARE required. "
+                                                 "Re-read the CHANGE PLAN and make the specified modifications."
+                                    }),
+                                    "is_error": True
+                                })
+                                _dlog("surgeon_multi_turn_noop_rejected",
+                                      turn=_mt_turn + 1,
+                                      reason=_reason[:300],
+                                      user_id=user_id)
+                            else:
+                                # Legitimate noop — return immediately
+                                _dlog("surgeon_multi_turn_noop_accepted",
+                                      turn=_mt_turn + 1,
+                                      reason=_reason[:300],
+                                      user_id=user_id)
+                                return symbol.code, 10, [f"Surgeon: already implemented — {_reason[:100]}"], [], []
+
+                    elif _blk.type == "text":
+                        print(f"[SURGEON][MULTI_TURN]   text block ({len(_blk.text)} chars)")
+
+                # ── Turn exit conditions ──────────────────────────────────────
+                # 1. end_turn with no pending tool results → Claude is done
+                if _mt_stop == "end_turn":
+                    _dlog("surgeon_multi_turn_end_turn",
+                          turn=_mt_turn + 1,
+                          total_ops=len(operations),
+                          total_edits=_mt_total_edits,
+                          failed_edits=_mt_failed_edits,
+                          user_id=user_id)
+                    print(f"[SURGEON][MULTI_TURN] end_turn on turn {_mt_turn+1} — done")
+                    break
+
+                # 2. No tool results to send back → nothing to continue with
+                if not _mt_tool_results:
+                    _dlog("surgeon_multi_turn_no_tools",
+                          turn=_mt_turn + 1,
+                          stop_reason=_mt_stop,
+                          user_id=user_id)
+                    print(f"[SURGEON][MULTI_TURN] No tool results on turn {_mt_turn+1} — done")
+                    break
+
+                # 3. All edits failed and this is the last turn → stop
+                if _mt_turn >= _MT_MAX_TURNS - 1:
+                    _dlog("surgeon_multi_turn_budget_exhausted",
+                          turns_used=_mt_turn + 1,
+                          total_ops=len(operations),
+                          failed_edits=_mt_failed_edits,
+                          user_id=user_id)
+                    print(f"[SURGEON][MULTI_TURN] Budget exhausted after {_mt_turn+1} turns")
+                    break
+
+                # ── Continue conversation ─────────────────────────────────────
+                # Convert response.content to serializable format for messages
+                _mt_assistant_content = []
+                for _blk in _mt_resp.content:
+                    if _blk.type == "tool_use":
+                        _mt_assistant_content.append({
+                            "type": "tool_use",
+                            "id": _blk.id,
+                            "name": _blk.name,
+                            "input": _blk.input
+                        })
+                    elif _blk.type == "text":
+                        _mt_assistant_content.append({
+                            "type": "text",
+                            "text": _blk.text
+                        })
+
+                _mt_messages.append({"role": "assistant", "content": _mt_assistant_content})
+                _mt_messages.append({"role": "user", "content": _mt_tool_results})
+
+                print(f"[SURGEON][MULTI_TURN] Continuing → turn {_mt_turn+2} "
+                      f"(msgs={len(_mt_messages)}, ops={len(operations)}, "
+                      f"failed={_mt_failed_edits})")
+
+            # ── Multi-turn summary ────────────────────────────────────────────
+            _mt_final_turns = _mt_turn + 1
+            _dlog("surgeon_multi_turn_complete",
+                  turns_used=_mt_final_turns,
+                  max_turns=_MT_MAX_TURNS,
+                  total_ops=len(operations),
+                  total_edits=_mt_total_edits,
+                  failed_edits=_mt_failed_edits,
+                  working_code_len=len(_mt_working_code),
+                  original_code_len=len(symbol.code),
+                  model=surg_model,
+                  user_id=user_id)
+            print(f"[SURGEON][MULTI_TURN] Complete: {len(operations)} ops in "
+                  f"{_mt_final_turns} turn(s), {_mt_failed_edits} failed edits")
+
+            if _mt_failed_edits > 0 and not operations:
+                # All edits failed — return with confidence 0
+                surgeon_notes.append(f"Multi-turn: {_mt_failed_edits} edit(s) failed, 0 succeeded")
+                confidence = 0
+            elif _mt_failed_edits > 0:
+                surgeon_notes.append(f"Multi-turn: {_mt_failed_edits} edit(s) failed, {len(operations)} succeeded")
+
+        elif _is_claude_model(surg_model):
+            # ── SINGLE-TURN TOOL USE (Phase 1 — unchanged) ──────────────────────
             _anthropic_key = _get_anthropic_key(user_id)
             from anthropic import Anthropic as _AnthropicSync
             _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
