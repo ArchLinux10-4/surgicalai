@@ -4105,14 +4105,96 @@ When the user asks you to DIAGNOSE a bug, investigate state/session issues, or d
 """
 
 
-def _build_architect_system(is_diagnostic: bool = False) -> str:
-    """Return the SMART_ARCHITECT_SYSTEM prompt, with diagnosis section injected when needed."""
+# ── Code quality best practices — always injected into SMART_ARCHITECT_SYSTEM for edits ──
+_CODE_QUALITY_SECTION = """
+━━━ CODE QUALITY RULES (MANDATORY FOR ALL EDITS) ━━━
+Before writing ANY change plan, verify your plan follows every applicable rule below.
+
+CSS / STYLING:
+1. NO DUPLICATE DEFINITIONS — Before adding a CSS class or keyframe, check if it already exists
+   in the symbol. If it does, MODIFY the existing definition. Never create a second copy.
+2. USE ONLY DEFINED VARIABLES — Only reference CSS custom properties (--var-name) that are
+   defined in :root or a parent scope in the file. If you need a new variable, ADD it to :root
+   first and include that in your plan. Never reference undefined variables.
+3. REUSE EXISTING TOKENS — Scan the file's existing :root / theme variables for colors, spacing,
+   and fonts. Use those instead of hardcoding hex/rgb values or inventing new variable names.
+4. SPECIFICITY DISCIPLINE — No !important unless overriding third-party styles. Prefer class
+   selectors over element selectors. Keep specificity flat.
+5. CONSISTENT UNITS — Match the unit convention already in the file (rem vs px vs em). Don't
+   mix unit systems within the same component.
+
+REACT / JSX:
+6. TAG BALANCE — Every opening JSX tag must have a matching close tag at the correct nesting
+   level. After planning any JSX change, mentally walk the open/close tree to confirm balance.
+7. KEY PROPS — Every element produced by .map() or a loop must have a unique, stable `key`
+   derived from data (id, slug), never from the array index if items can reorder or be deleted.
+8. HOOK RULES — Hooks must be called unconditionally at the top level of the component.
+   Never place hooks inside if/else, loops, or after early returns.
+9. EFFECT CLEANUP — useEffect that creates subscriptions, timers, or event listeners MUST
+   return a cleanup function. Missing cleanup = memory leak.
+10. DEPENDENCY ARRAYS — useEffect / useMemo / useCallback deps must include every external
+    variable referenced inside the callback. Never leave deps empty to "run once" if the
+    callback reads props or state.
+11. NO INLINE CLOSURES IN RENDER — Avoid creating new function instances inside JSX
+    (onClick={() => fn(x)}) when a stable callback (useCallback or class method) is available.
+
+TYPESCRIPT:
+12. PRESERVE TYPES — Never widen a typed parameter to `any`. When adding a variable or param,
+    give it a specific type matching existing patterns in the file.
+13. INTERFACE CONSISTENCY — When adding a field to a type/interface, update every place that
+    constructs or destructures that type. Mark new optional fields with ?.
+14. IMPORT TYPES — Use `import type { X }` for type-only imports to avoid runtime overhead.
+15. GENERICS — When the existing code uses generics (e.g., useState<string>), maintain the
+    type parameter. Don't drop it to useState("") with inferred type.
+
+STATE & DATA FLOW:
+16. NO REDUNDANT STATE — Don't add useState for values that can be derived from existing state
+    or props. Compute them in the render body or useMemo.
+17. IMMUTABLE UPDATES — Never mutate state directly (push/splice on arrays, property assignment
+    on objects). Always create new references: spread, map/filter, or structuredClone.
+18. SINGLE SOURCE OF TRUTH — Don't duplicate the same data in multiple state variables or stores.
+    One canonical location, derived views everywhere else.
+
+ERROR HANDLING:
+19. TRY/CATCH EVERY ASYNC — Every fetch, API call, or async operation must have error handling.
+    Surface errors to the user via toast/alert/state — never silently swallow them.
+20. GRACEFUL DEGRADATION — When a feature depends on an API or optional data, handle the loading
+    and error states explicitly. The UI must never show a blank screen on failure.
+
+STRUCTURAL INTEGRITY:
+21. PRESERVE EXPORTS — Do not accidentally remove, rename, or change the signature of exported
+    functions, components, or constants. Verify default and named exports remain intact.
+22. IMPORT HYGIENE — Add imports for everything you reference. Remove imports you make unused.
+    Never leave orphan imports or missing imports.
+23. INDENTATION — Match the file's existing style exactly: spaces vs tabs, 2-space vs 4-space.
+    Never mix indentation styles within a file.
+24. NO DEAD CODE — Don't leave commented-out code blocks, unreachable branches, or unused
+    variables. If you remove usage of something, remove its declaration too.
+25. PRESERVE COMMENTS — Don't silently delete existing comments or doc blocks unless the code
+    they describe is being removed. Comments are documentation for humans.
+"""
+
+
+def _build_architect_system(is_diagnostic: bool = False, session_id: str = "") -> str:
+    """Return the SMART_ARCHITECT_SYSTEM prompt, with conditional sections injected."""
     base = SMART_ARCHITECT_SYSTEM
-    if is_diagnostic:
-        # Inject diagnosis section before the IMPORT DEPENDENCY CHECK section
-        inject_before = "━━━ IMPORT DEPENDENCY CHECK (DO THIS FIRST) ━━━"
-        if inject_before in base:
-            base = base.replace(inject_before, _DIAGNOSIS_SECTION + "\n" + inject_before, 1)
+    inject_before = "━━━ IMPORT DEPENDENCY CHECK (DO THIS FIRST) ━━━"
+    _injected = []
+    if inject_before in base:
+        # Always inject code quality rules
+        sections = _CODE_QUALITY_SECTION + "\n"
+        _injected.append("code_quality_rules")
+        # Conditionally add diagnosis section
+        if is_diagnostic:
+            sections = _DIAGNOSIS_SECTION + "\n" + sections
+            _injected.append("diagnosis_best_practices")
+        base = base.replace(inject_before, sections + inject_before, 1)
+    _dlog("architect_system_build",
+          injected_sections=_injected,
+          is_diagnostic=is_diagnostic,
+          quality_rules_len=len(_CODE_QUALITY_SECTION),
+          final_system_len=len(base),
+          session_id=session_id)
     return base
 
 
@@ -5951,7 +6033,13 @@ USER REQUEST:
         # Detect if this is a diagnostic request — inject extra guidance if so
         _req_lower = user_request.lower()
         _is_diagnostic = any(kw in _req_lower for kw in _DIAGNOSIS_KEYWORDS)
-        _architect_system = _build_architect_system(is_diagnostic=_is_diagnostic)
+        _architect_system = _build_architect_system(is_diagnostic=_is_diagnostic, session_id=session_id)
+        _dlog("architect_prompt_assembly",
+              has_project_memory=bool(project_memory),
+              project_memory_len=len(project_memory) if project_memory else 0,
+              has_session_summary=bool(session_summary),
+              is_diagnostic=_is_diagnostic,
+              total_system_len=len(_architect_system))
 
         if _is_claude_model(arch_model):
             # -- Claude Architect with ReAct agentic search loop --
