@@ -926,6 +926,102 @@ SURGEON_TOOLS_OPENAI = [
 ]
 
 
+# ── Phase 2: Agentic Tool-Use Tools (Claude Architect) ──────────────────────
+# Used when get_setting('agentic_tool_use') == 'true'.
+# Replaces free-text JSON plan + intent=search ReAct with structured tool calls.
+# Eliminates JSON fence stripping, _repair_json, brace matching, regex salvage.
+AGENTIC_TOOLS_V2 = [
+    {
+        "name": "search_codebase",
+        "description": "Search across all session files for code matching the given terms. Returns matching symbols and code with line numbers. Use to find functions, variables, CSS classes, or any code pattern.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "terms": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Search terms — function names, variable names, class names, string literals, CSS selectors"
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Brief reason for this search"
+                }
+            },
+            "required": ["terms"]
+        }
+    },
+    {
+        "name": "request_file",
+        "description": "Request the full content of a specific file from the session, with line numbers. Use when you need to see the complete file.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "The filename to retrieve (as shown in the file list)"
+                }
+            },
+            "required": ["filename"]
+        }
+    },
+    {
+        "name": "submit_plan",
+        "description": "Submit your final plan. Use intent='edit' with targets for code changes, 'chat' for conversation, 'needs_clarification' to ask questions, or 'create' for new files.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "intent": {
+                    "type": "string",
+                    "enum": ["edit", "chat", "needs_clarification", "create"],
+                    "description": "The type of response"
+                },
+                "targets": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {"type": "string"},
+                            "symbol_path": {"type": "string", "description": "The function/class/component to modify (from the symbol index)"},
+                            "change_type": {"type": "string", "enum": ["modify", "add", "delete", "refactor"]},
+                            "description": {"type": "string", "description": "What the change does"},
+                            "new_logic": {"type": "string", "description": "Detailed description of the new implementation"},
+                            "confidence": {"type": "integer", "minimum": 1, "maximum": 10},
+                            "import_changes": {"type": "array", "items": {"type": "string"}},
+                            "target_line": {"type": "integer", "description": "Line number where the change should be applied"},
+                            "context_needs": {"type": "array", "items": {"type": "string"}},
+                            "surgeon_context": {"type": "array", "items": {"type": "object"}}
+                        },
+                        "required": ["filename", "symbol_path", "description", "new_logic"]
+                    },
+                    "description": "Code changes to make (for edit intent)"
+                },
+                "chat_response": {"type": "string", "description": "Response text (for chat intent)"},
+                "reasoning": {"type": "string", "description": "Your reasoning"},
+                "risks": {"type": "array", "items": {"type": "string"}, "description": "Potential risks"},
+                "questions": {"type": "array", "items": {"type": "string"}, "description": "Questions (for needs_clarification)"},
+                "clarification_response": {"type": "string", "description": "Full clarification response"},
+                "summary": {"type": "string"},
+                "new_files": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {"type": "string"},
+                            "description": {"type": "string"},
+                            "dependencies": {"type": "array", "items": {"type": "string"}}
+                        }
+                    },
+                    "description": "New files to create (for create intent)"
+                }
+            },
+            "required": ["intent"]
+        }
+    }
+]
+
+
+
+
 
 def run_architect(
     symbol_map: SymbolMap,
@@ -5241,385 +5337,735 @@ USER REQUEST:
             # Each "search" intent response triggers a grep + re-call (up to 4 rounds).
             aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
 
-            # ReAct loop state — scale limits by file size
-            _largest_file_lines = max(
-                (sf_.get("lines", len(sf_.get("content", "").splitlines()))
-                 for _, sf_ in symbol_maps_by_name.values()
-                 if isinstance(sf_, dict)),
-                default=0,
-            )
-            if _largest_file_lines > 5000:
-                _REACT_MAX_ROUNDS = 8
-                _REACT_BUDGET = 8000
-            elif _largest_file_lines > 1000:
-                _REACT_MAX_ROUNDS = 6
-                _REACT_BUDGET = 5000
-            else:
-                _REACT_MAX_ROUNDS = 4
-                _REACT_BUDGET = 2500
 
-            _react_round = 0
-            _react_searched_terms = []
-            _react_accumulated = ""
-            _react_budget_lines = 0
+            _use_agentic_tools = get_setting("agentic_tool_use", "false").lower() == "true"
+            _agentic_plan_set = False
 
-            # Seed from session cache (previous search rounds in this session)
-            _react_cache_key = "{}::{}".format(
-                session_id or "",
-                ":".join(sorted(symbol_maps_by_name.keys()))
-            )
-            if _react_cache_key in _react_grep_cache:
-                _react_accumulated = _react_grep_cache[_react_cache_key]
-                _react_budget_lines = _react_accumulated.count("\n")
+            if _use_agentic_tools:
+                # ── Phase 2: Tool-Use ReAct Loop ──────────────────────────────
+                # Claude uses search_codebase/request_file tools for context
+                # gathering and submit_plan for the final plan.
+                # Eliminates: JSON fence stripping, _repair_json, brace matching,
+                # chat_response regex salvage, intent=search JSON parsing.
+                print(f"[AGENTIC][TOOL_USE] Enabled for session {session_id}")
 
-            while _react_round < _REACT_MAX_ROUNDS:
-                _react_round += 1
-
-                # Build context for this round (base + accumulated search results)
-                _react_context = context_msg
-                if _react_accumulated:
-                    _react_context += (
-                        "\n\n=== SEARCH RESULTS (from {} search round(s)) ===\n{}".format(
-                            _react_round - 1, _react_accumulated
-                        )
-                    )
-                if _react_searched_terms:
-                    _react_context += (
-                        "\n\nALREADY SEARCHED TERMS (do NOT request again): {}".format(
-                            ", ".join(_react_searched_terms)
-                        )
-                    )
-                if _react_round >= _REACT_MAX_ROUNDS:
-                    _react_context += (
-                        "\n\n[SEARCH BUDGET EXHAUSTED] You MUST now return "
-                        "'edit', 'chat', or 'needs_clarification'. "
-                        "No more search rounds. Plan with what you have."
-                    )
-
-                # Build user content for Claude (images use different format)
-                if image_files:
-                    _CLAUDE_VISION_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-                    user_content = [{"type": "text", "text": _react_context}]
-                    for img_sf in image_files:
-                        img_data = img_sf["content"]
-                        _fname = img_sf.get("filename", "unknown")
-                        if img_data.startswith("data:"):
-                            parts = img_data.split(",", 1)
-                            media_type = parts[0].split(":")[1].split(";")[0]
-                            b64_data = parts[1]
-                        else:
-                            ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
-                            mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
-                                        "png": "image/png", "webp": "image/webp",
-                                        "gif": "image/gif"}
-                            media_type = mime_map.get(ext, "image/png")
-                            b64_data = img_data
-                        logger.info(
-                            f"[pipeline:smart] Vision block: file={_fname!r} media_type={media_type!r} "
-                            f"b64_len={len(b64_data)} data_url_valid={img_data.startswith('data:')}"
-                        )
-                        if media_type not in _CLAUDE_VISION_TYPES:
-                            logger.warning(
-                                f"[pipeline:smart] Unsupported media type {media_type!r} for {_fname!r} — skipping vision block"
-                            )
-                            continue
-                        user_content.append({
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": media_type,
-                                       "data": b64_data}
-                        })
+                # Scale rounds by file size (same logic as legacy path)
+                _tu_largest = max(
+                    (sf_.get("lines", len(sf_.get("content", "").splitlines()))
+                     for _, sf_ in symbol_maps_by_name.values()
+                     if isinstance(sf_, dict)),
+                    default=0,
+                )
+                if _tu_largest > 5000:
+                    _TU_MAX_ROUNDS = 8
+                elif _tu_largest > 1000:
+                    _TU_MAX_ROUNDS = 6
                 else:
-                    user_content = _react_context
+                    _TU_MAX_ROUNDS = 4
 
-                thinking_chunks = []
-                response_text_chunks = []
-                claude_failed = False
-
-                # -- Retry loop: up to 3 attempts for transient 500/529 errors --
-                _claude_attempt = 0
-                _claude_retry_delay = 10
-                while _claude_attempt < 3:
-                    _claude_attempt += 1
-                    thinking_chunks = []
-                    response_text_chunks = []
-                    try:
-                        async with aclient.messages.stream(
-                            model=arch_model,
-                            max_tokens=64000,
-                            **_get_thinking_kwargs(arch_model, 10000),
-                            **_get_effort_kwargs(arch_model),
-                            system=_architect_system,
-                            messages=_arch_history_msgs + [{"role": "user",
-                                                            "content": user_content}],
-                        ) as astream:
-                            current_block = None
-                            async for event in astream:
-                                if event.type == "content_block_start":
-                                    current_block = getattr(event.content_block,
-                                                            'type', None)
-                                    if current_block == "thinking":
-                                        yield sse({"type": "thinking_start",
-                                                   "content": ""})
-                                elif event.type == "content_block_delta":
-                                    if hasattr(event.delta, 'thinking'):
-                                        yield sse({"type": "thinking",
-                                                   "content": event.delta.thinking})
-                                        thinking_chunks.append(event.delta.thinking)
-                                    elif hasattr(event.delta, 'text'):
-                                        response_text_chunks.append(event.delta.text)
-                                elif event.type == "content_block_stop":
-                                    if current_block == "thinking":
-                                        yield sse({"type": "thinking_end",
-                                                   "content": ""})
-                        break  # success: exit retry loop
-                    except Exception as claude_err:
-                        err_str = str(claude_err)
-                        err_low = err_str.lower()
-                        _is_transient = (
-                            "500" in err_str or "529" in err_str
-                            or "overloaded" in err_low
-                            or "internal_server_error" in err_low
-                        )
-                        if _is_transient and _claude_attempt < 3:
-                            yield sse({"type": "progress",
-                                       "content": f"AI service busy (attempt {_claude_attempt}/3) -- retrying in {_claude_retry_delay}s..."})
-                            await asyncio.sleep(_claude_retry_delay)
-                            _claude_retry_delay = min(_claude_retry_delay * 2, 60)
-                            continue  # retry
-                        if image_files and ("image" in err_low or "unsupported" in err_low):
-                            yield sse({"type": "progress",
-                                       "content": "Images failed -- retrying text-only..."})
-                            thinking_chunks = []
-                            response_text_chunks = []
-                            try:
-                                async with aclient.messages.stream(
-                                    model=arch_model,
-                                    max_tokens=64000,
-                                    **_get_thinking_kwargs(arch_model, 10000),
-                                    **_get_effort_kwargs(arch_model),
-                                    system=_architect_system,
-                                    messages=_arch_history_msgs + [{"role": "user",
-                                                                    "content": _react_context}],
-                                ) as astream:
-                                    current_block = None
-                                    async for event in astream:
-                                        if event.type == "content_block_start":
-                                            current_block = getattr(event.content_block,
-                                                                    'type', None)
-                                            if current_block == "thinking":
-                                                yield sse({"type": "thinking_start",
-                                                           "content": ""})
-                                        elif event.type == "content_block_delta":
-                                            if hasattr(event.delta, 'thinking'):
-                                                yield sse({"type": "thinking",
-                                                           "content": event.delta.thinking})
-                                                thinking_chunks.append(event.delta.thinking)
-                                            elif hasattr(event.delta, 'text'):
-                                                response_text_chunks.append(event.delta.text)
-                                        elif event.type == "content_block_stop":
-                                            if current_block == "thinking":
-                                                yield sse({"type": "thinking_end",
-                                                           "content": ""})
-                            except Exception:
-                                raise
-                            break  # text-only succeeded
+                # Build initial user content (with images if present)
+                if image_files:
+                    _CLAUDE_VIS = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+                    _tu_user_content = [{"type": "text", "text": context_msg}]
+                    for _iv_sf in image_files:
+                        _iv_data = _iv_sf["content"]
+                        if _iv_data.startswith("data:"):
+                            _iv_parts = _iv_data.split(",", 1)
+                            _iv_mt = _iv_parts[0].split(":")[1].split(";")[0]
+                            _iv_b64 = _iv_parts[1]
                         else:
+                            _iv_ext = Path(_iv_sf["filename"]).suffix.lower().lstrip(".")
+                            _iv_mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                                        "png": "image/png", "webp": "image/webp",
+                                        "gif": "image/gif"}.get(_iv_ext, "image/png")
+                            _iv_mt = _iv_mime
+                            _iv_b64 = _iv_data
+                        if _iv_mt in _CLAUDE_VIS:
+                            _tu_user_content.append({
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": _iv_mt, "data": _iv_b64}
+                            })
+                else:
+                    _tu_user_content = context_msg
+
+                _tu_messages = list(_arch_history_msgs) + [{"role": "user", "content": _tu_user_content}]
+                _tu_round = 0
+                _tu_searched = []
+                plan = None
+
+                while _tu_round < _TU_MAX_ROUNDS:
+                    _tu_round += 1
+                    print(f"[AGENTIC][TOOL_USE] Round {_tu_round}/{_TU_MAX_ROUNDS}")
+
+                    # Inject budget warning on final round
+                    if _tu_round == _TU_MAX_ROUNDS:
+                        _tu_messages.append({
+                            "role": "user",
+                            "content": (
+                                "[SEARCH BUDGET EXHAUSTED] You MUST call submit_plan now. "
+                                "No more search_codebase or request_file calls. "
+                                "Plan with the context you have."
+                            )
+                        })
+
+                    # ── Streaming call with tools ──
+                    _tu_tcalls = {}  # index -> {name, id, json}
+                    _tu_thinking = []
+                    _tu_text = []
+                    _tu_final_msg = None
+
+                    _tu_attempt = 0
+                    _tu_retry_delay = 10
+                    while _tu_attempt < 3:
+                        _tu_attempt += 1
+                        _tu_tcalls = {}
+                        _tu_thinking = []
+                        _tu_text = []
+                        try:
+                            _tu_kwargs = {
+                                "model": arch_model,
+                                "max_tokens": 64000,
+                                "system": _architect_system,
+                                "messages": _tu_messages,
+                                "tools": AGENTIC_TOOLS_V2,
+                            }
+                            _tu_kwargs.update(_get_thinking_kwargs(arch_model, 10000))
+                            _tu_kwargs.update(_get_effort_kwargs(arch_model))
+
+                            async with aclient.messages.stream(**_tu_kwargs) as _tu_stream:
+                                _tu_cur_blk = None
+                                async for _tu_ev in _tu_stream:
+                                    if _tu_ev.type == "content_block_start":
+                                        _tu_cur_blk = getattr(_tu_ev.content_block, "type", None)
+                                        if _tu_cur_blk == "thinking":
+                                            yield sse({"type": "thinking_start", "content": ""})
+                                        elif _tu_cur_blk == "tool_use":
+                                            _tu_tcalls[_tu_ev.index] = {
+                                                "name": _tu_ev.content_block.name,
+                                                "id": _tu_ev.content_block.id,
+                                                "json": ""
+                                            }
+                                            print(f"[AGENTIC][TOOL_USE] Tool started: {_tu_ev.content_block.name}")
+                                    elif _tu_ev.type == "content_block_delta":
+                                        if hasattr(_tu_ev.delta, "thinking"):
+                                            yield sse({"type": "thinking", "content": _tu_ev.delta.thinking})
+                                            _tu_thinking.append(_tu_ev.delta.thinking)
+                                        elif hasattr(_tu_ev.delta, "text"):
+                                            _tu_text.append(_tu_ev.delta.text)
+                                        elif hasattr(_tu_ev.delta, "partial_json"):
+                                            if _tu_ev.index in _tu_tcalls:
+                                                _tu_tcalls[_tu_ev.index]["json"] += _tu_ev.delta.partial_json
+                                    elif _tu_ev.type == "content_block_stop":
+                                        if _tu_cur_blk == "thinking":
+                                            yield sse({"type": "thinking_end", "content": ""})
+                                # Get final message for conversation history (includes signatures)
+                                _tu_final_msg = await _tu_stream.get_final_message()
+                            break  # success
+                        except Exception as _tu_err:
+                            _tu_es = str(_tu_err)
+                            _tu_el = _tu_es.lower()
+                            _tu_transient = (
+                                "500" in _tu_es or "529" in _tu_es
+                                or "overloaded" in _tu_el
+                                or "internal_server_error" in _tu_el
+                            )
+                            if _tu_transient and _tu_attempt < 3:
+                                yield sse({"type": "progress",
+                                           "content": f"AI service busy (attempt {_tu_attempt}/3) — retrying in {_tu_retry_delay}s..."})
+                                await asyncio.sleep(_tu_retry_delay)
+                                _tu_retry_delay = min(_tu_retry_delay * 2, 60)
+                                continue
+                            if image_files and ("image" in _tu_el or "unsupported" in _tu_el):
+                                yield sse({"type": "progress", "content": "Images failed — retrying text-only..."})
+                                _tu_messages[-1] = {"role": "user", "content": context_msg}
+                                continue
                             raise
 
-                raw_text = "".join(response_text_chunks)
-                # Claude might wrap JSON in markdown fences
-                stripped = raw_text.strip()
-                if stripped.startswith("```"):
-                    fence_lines = stripped.split("\n")
-                    # Remove first line (```json) and last line (```)
-                    if fence_lines[-1].strip() == "```":
-                        raw_text = "\n".join(fence_lines[1:-1])
-                    else:
-                        raw_text = "\n".join(fence_lines[1:])
+                    # ── Parse tool calls ──
+                    _tu_parsed = []
+                    for _ti in sorted(_tu_tcalls):
+                        _tc = _tu_tcalls[_ti]
+                        try:
+                            _tc_args = json.loads(_tc["json"]) if _tc["json"] else {}
+                        except json.JSONDecodeError:
+                            _tc_args = {}
+                            print(f"[AGENTIC][TOOL_USE] JSON parse error for {_tc['name']}: {_tc['json'][:200]}")
+                        _tu_parsed.append({"name": _tc["name"], "id": _tc["id"], "input": _tc_args})
+                        print(f"[AGENTIC][TOOL_USE] Tool: {_tc['name']} id={_tc['id'][:12]} keys={list(_tc_args.keys())}")
 
-                # Robust JSON parsing -- Claude may not always produce perfect JSON
-                try:
-                    plan = json.loads(raw_text)
-                except json.JSONDecodeError:
-                    # Attempt 2: repair literal control chars inside string values
-                    # (Claude sometimes writes actual newlines inside a JSON string value)
-                    try:
-                        plan = json.loads(_repair_json(raw_text))
-                    except json.JSONDecodeError:
-                        # Attempt 3: extract JSON object from surrounding text
-                        _brace_start = raw_text.find('{')
-                        _brace_end = raw_text.rfind('}')
-                        json_match = (raw_text[_brace_start:_brace_end + 1]
-                                      if _brace_start >= 0 and _brace_end > _brace_start
-                                      else None)
-                        if json_match:
+                    # ── Check for submit_plan ──
+                    _tu_plan = next((t for t in _tu_parsed if t["name"] == "submit_plan"), None)
+                    if _tu_plan:
+                        plan = _tu_plan["input"]
+                        plan.setdefault("intent", "edit" if plan.get("targets") else "chat")
+                        print(f"[AGENTIC][TOOL_USE] Plan submitted: intent={plan.get('intent')} targets={len(plan.get('targets', []))} round={_tu_round}")
+                        break
+
+                    # ── No tools → text fallback (backward compat) ──
+                    if not _tu_parsed:
+                        _tu_raw = "".join(_tu_text).strip()
+                        print(f"[AGENTIC][TOOL_USE] No tools, text fallback ({len(_tu_raw)} chars)")
+                        if _tu_raw.startswith("```"):
+                            _fl = _tu_raw.split("\n")
+                            if _fl[-1].strip() == "```":
+                                _tu_raw = "\n".join(_fl[1:-1])
+                            else:
+                                _tu_raw = "\n".join(_fl[1:])
+                        try:
+                            plan = json.loads(_tu_raw)
+                        except json.JSONDecodeError:
                             try:
-                                plan = json.loads(json_match)
+                                plan = json.loads(_repair_json(_tu_raw))
                             except json.JSONDecodeError:
-                                try:
-                                    plan = json.loads(_repair_json(json_match))
-                                except json.JSONDecodeError:
-                                    # Last resort: treat entire response as chat
-                                    # Note: raw_text here IS the JSON string from Claude —
-                                    # streaming it directly would show the user raw JSON.
-                                    # Instead, try to salvage chat_response with a targeted search.
-                                    import re as _re_fallback
-                                    _cr_search = _re_fallback.search(
-                                        r'"chat_response"\s*:\s*"((?:[^"\\]|\\.)*)"',
-                                        raw_text, _re_fallback.DOTALL
-                                    )
-                                    if _cr_search:
-                                        _salvaged = _cr_search.group(1).replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
-                                        plan = {"intent": "chat", "chat_response": _salvaged}
-                                    else:
-                                        plan = {"intent": "chat", "chat_response": raw_text}
-                        else:
-                            # No JSON found at all -- Claude gave a plain text answer
-                            plan = {"intent": "chat", "chat_response": raw_text}
-
-                # -- ReAct: check if Claude wants to search for more context --
-                _this_intent = plan.get("intent", "chat")
-                if _this_intent != "search":
-                    break  # Got a real plan (edit/chat/needs_clarification) -- exit ReAct loop
-
-                # -- Handle search round --
-                _search_terms = plan.get("search_terms", [])
-                _search_reason = plan.get("reasoning", "gathering more context")
-                _new_terms = [
-                    t for t in _search_terms
-                    if t.lower() not in {s.lower() for s in _react_searched_terms}
-                ]
-
-                if not _new_terms:
-                    # All requested terms already searched -- force clarification
-                    plan = {
-                        "intent": "needs_clarification",
-                        "questions": ["Could you paste a small snippet of the code you want to change, or tell me the exact element ID or function name?"],
-                        "clarification_response": (
-                            "I've searched through the file thoroughly but couldn't pinpoint "
-                            "the exact code. Could you paste a small snippet of the element "
-                            "you want to change, or give me the exact ID or function name? "
-                            "That will let me find it directly."
-                        )
-                    }
-                    break
-
-                if _react_budget_lines < _REACT_BUDGET:
-                    yield sse({"type": "progress", "content":
-                               "Searching for: {} (round {}/{})...".format(
-                                   ", ".join(_new_terms[:3]), _react_round, _REACT_MAX_ROUNDS
-                               )})
-
-                    _round_hits = []
-                    _seen_sym_paths = set()
-
-                    for _fname_r, (_smap_r, _sf_r) in symbol_maps_by_name.items():
-                        _fcontent_r = _sf_r.get("content", "") if isinstance(_sf_r, dict) else ""
-                        if not _fcontent_r:
-                            continue
-                        _file_lines_r = _fcontent_r.splitlines()
-
-                        # Pass 1: exact AST symbol name match — most precise
-                        if _smap_r:
-                            for _term_r in _new_terms:
-                                _term_lower = _term_r.lower()
-                                for _sym_r in _smap_r.symbols:
-                                    if (_sym_r.name.lower() == _term_lower
-                                            or _sym_r.full_path.lower() == _term_lower):
-                                        _sym_lines = _sym_r.code.splitlines()
-                                        _sym_numbered = "\n".join(
-                                            f"{_sym_r.start_line + j:5d}: {_sym_lines[j]}"
-                                            for j in range(len(_sym_lines))
-                                        )
-                                        _label = (
-                                            f"SYMBOL MATCH [{_fname_r} :: {_sym_r.full_path} "
-                                            f"({_sym_r.symbol_type.value}, "
-                                            f"L{_sym_r.start_line}–{_sym_r.end_line})]"
-                                        )
-                                        _path_key = f"{_fname_r}::{_sym_r.full_path}"
-                                        if _path_key not in _seen_sym_paths:
-                                            _seen_sym_paths.add(_path_key)
-                                            _round_hits.append((_fname_r, _label, _sym_numbered))
-                                        break
-
-                        # Pass 2: keyword grep, expanded to enclosing AST symbol
-                        for _term_r in _new_terms:
-                            _tl = _term_r.lower()
-                            for _li, _ln in enumerate(_file_lines_r):
-                                if _tl not in _ln.lower():
-                                    continue
-                                _lineno_r = _li + 1
-                                _enc = None
-                                if _smap_r:
-                                    _best_size = float("inf")
-                                    for _sym_r in _smap_r.symbols:
-                                        if _sym_r.start_line <= _lineno_r <= _sym_r.end_line:
-                                            _sz = _sym_r.end_line - _sym_r.start_line
-                                            if _sz < _best_size:
-                                                _best_size = _sz
-                                                _enc = _sym_r
-                                if _enc:
-                                    _path_key = f"{_fname_r}::{_enc.full_path}"
-                                    if _path_key not in _seen_sym_paths:
-                                        _seen_sym_paths.add(_path_key)
-                                        _enc_lines = _enc.code.splitlines()
-                                        _enc_numbered = "\n".join(
-                                            f"{_enc.start_line + j:5d}: {_enc_lines[j]}"
-                                            for j in range(len(_enc_lines))
-                                        )
-                                        _label = (
-                                            f"GREP MATCH ('{_term_r}') [{_fname_r} :: "
-                                            f"{_enc.full_path} ({_enc.symbol_type.value}, "
-                                            f"L{_enc.start_line}–{_enc.end_line})]"
-                                        )
-                                        _round_hits.append((_fname_r, _label, _enc_numbered))
+                                _bs = _tu_raw.find("{")
+                                _be = _tu_raw.rfind("}")
+                                if _bs >= 0 and _be > _bs:
+                                    try:
+                                        plan = json.loads(_tu_raw[_bs:_be + 1])
+                                    except json.JSONDecodeError:
+                                        plan = {"intent": "chat", "chat_response": _tu_raw}
                                 else:
-                                    _path_key = f"{_fname_r}::L{_lineno_r}"
-                                    if _path_key not in _seen_sym_paths:
-                                        _seen_sym_paths.add(_path_key)
-                                        _ws = max(0, _li - 15)
-                                        _we = min(len(_file_lines_r), _li + 16)
-                                        _raw = "\n".join(
-                                            f"{_ws + j + 1:5d}: {_file_lines_r[_ws + j]}"
-                                            for j in range(_we - _ws)
-                                        )
-                                        _label = f"GREP MATCH ('{_term_r}') [{_fname_r} L{_lineno_r}]"
-                                        _round_hits.append((_fname_r, _label, _raw))
-                                break
+                                    plan = {"intent": "chat", "chat_response": _tu_raw}
+                        break
 
-                    _round_text = ""
-                    for _rh_fname, _rh_label, _rh_code in _round_hits:
-                        _block = f"\n{_rh_label}:\n{_rh_code}"
-                        _round_text += _block
-                        _react_budget_lines += _block.count("\n")
-                        if _react_budget_lines >= _REACT_BUDGET:
-                            break
-                    if _round_text:
-                        _react_accumulated += _round_text
+                    # ── Search/request tools → execute and loop ──
+                    _tu_search = [t for t in _tu_parsed if t["name"] in ("search_codebase", "request_file")]
+                    if not _tu_search:
+                        # Unknown tools — treat text as chat
+                        plan = {"intent": "chat", "chat_response": "".join(_tu_text) or "I couldn't determine what to do."}
+                        break
 
-                    _react_searched_terms.extend(_new_terms)
+                    # Build assistant message for conversation history
+                    _tu_asst = []
+                    if _tu_final_msg:
+                        for _blk in _tu_final_msg.content:
+                            if _blk.type == "thinking":
+                                _tu_asst.append({
+                                    "type": "thinking",
+                                    "thinking": _blk.thinking,
+                                    "signature": getattr(_blk, "signature", ""),
+                                })
+                            elif _blk.type == "text":
+                                _tu_asst.append({"type": "text", "text": _blk.text})
+                            elif _blk.type == "tool_use":
+                                _tu_asst.append({
+                                    "type": "tool_use",
+                                    "id": _blk.id,
+                                    "name": _blk.name,
+                                    "input": _blk.input,
+                                })
+                    _tu_messages.append({"role": "assistant", "content": _tu_asst})
 
-                    if _round_hits:
-                        _hit_names = ", ".join(
-                            h[1].split("::")[1].split("(")[0].strip()
-                            if "::" in h[1] else h[1]
-                            for h in _round_hits[:3]
+                    # Execute search/request tools
+                    _tu_results = []
+                    for _tc in _tu_search:
+                        if _tc["name"] == "search_codebase":
+                            _s_terms = _tc["input"].get("terms", [])
+                            _s_new = [t for t in _s_terms if t.lower() not in {s.lower() for s in _tu_searched}]
+                            if not _s_new:
+                                _tu_results.append({
+                                    "type": "tool_result",
+                                    "tool_use_id": _tc["id"],
+                                    "content": "All requested terms already searched. Call submit_plan with what you have."
+                                })
+                                continue
+                            yield sse({"type": "progress", "content":
+                                       f"Searching for: {', '.join(_s_new[:3])} (round {_tu_round}/{_TU_MAX_ROUNDS})..."})
+                            # 2-pass grep (same as legacy path)
+                            _s_hits = []
+                            _s_seen = set()
+                            for _s_fn, (_s_sm, _s_sf) in symbol_maps_by_name.items():
+                                _s_ct = _s_sf.get("content", "") if isinstance(_s_sf, dict) else ""
+                                if not _s_ct:
+                                    continue
+                                _s_lns = _s_ct.splitlines()
+                                # Pass 1: AST symbol name match
+                                if _s_sm:
+                                    for _s_t in _s_new:
+                                        _s_tl = _s_t.lower()
+                                        for _s_sym in _s_sm.symbols:
+                                            if _s_sym.name.lower() == _s_tl or _s_sym.full_path.lower() == _s_tl:
+                                                _sk = f"{_s_fn}::{_s_sym.full_path}"
+                                                if _sk not in _s_seen:
+                                                    _s_seen.add(_sk)
+                                                    _sl = _s_sym.code.splitlines()
+                                                    _sn = "\n".join(
+                                                        f"{_s_sym.start_line + j:5d}: {_sl[j]}"
+                                                        for j in range(len(_sl))
+                                                    )
+                                                    _s_hits.append(
+                                                        f"SYMBOL MATCH [{_s_fn} :: {_s_sym.full_path} "
+                                                        f"({_s_sym.symbol_type.value}, L{_s_sym.start_line}–{_s_sym.end_line})]:\n{_sn}"
+                                                    )
+                                                break
+                                # Pass 2: keyword grep with enclosing symbol
+                                for _s_t in _s_new:
+                                    _s_tl = _s_t.lower()
+                                    for _s_li, _s_ln in enumerate(_s_lns):
+                                        if _s_tl not in _s_ln.lower():
+                                            continue
+                                        _s_lineno = _s_li + 1
+                                        _s_enc = None
+                                        if _s_sm:
+                                            _s_bsz = float("inf")
+                                            for _s_sym in _s_sm.symbols:
+                                                if _s_sym.start_line <= _s_lineno <= _s_sym.end_line:
+                                                    _sz = _s_sym.end_line - _s_sym.start_line
+                                                    if _sz < _s_bsz:
+                                                        _s_bsz = _sz
+                                                        _s_enc = _s_sym
+                                        if _s_enc:
+                                            _sk = f"{_s_fn}::{_s_enc.full_path}"
+                                            if _sk not in _s_seen:
+                                                _s_seen.add(_sk)
+                                                _el = _s_enc.code.splitlines()
+                                                _en = "\n".join(
+                                                    f"{_s_enc.start_line + j:5d}: {_el[j]}"
+                                                    for j in range(len(_el))
+                                                )
+                                                _s_hits.append(
+                                                    f"GREP MATCH ('{_s_t}') [{_s_fn} :: {_s_enc.full_path} "
+                                                    f"({_s_enc.symbol_type.value}, L{_s_enc.start_line}–{_s_enc.end_line})]:\n{_en}"
+                                                )
+                                        else:
+                                            _sk = f"{_s_fn}::L{_s_lineno}"
+                                            if _sk not in _s_seen:
+                                                _s_seen.add(_sk)
+                                                _ws = max(0, _s_li - 15)
+                                                _we = min(len(_s_lns), _s_li + 16)
+                                                _sr = "\n".join(
+                                                    f"{_ws + j + 1:5d}: {_s_lns[_ws + j]}"
+                                                    for j in range(_we - _ws)
+                                                )
+                                                _s_hits.append(f"GREP MATCH ('{_s_t}') [{_s_fn} L{_s_lineno}]:\n{_sr}")
+                                        break  # one match per term per file
+                            _tu_searched.extend(_s_new)
+                            _s_result = "\n\n".join(_s_hits) if _s_hits else "No matches found for: " + ", ".join(_s_new)
+                            _tu_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": _tc["id"],
+                                "content": _s_result[:16000]
+                            })
+                            if _s_hits:
+                                _hp = ", ".join(
+                                    h.split("::")[1].split("(")[0].strip() if "::" in h else h[:40]
+                                    for h in _s_hits[:3]
+                                )
+                                yield sse({"type": "progress", "content":
+                                           f"Found: {_hp}"
+                                           + (f" +{len(_s_hits)-3} more" if len(_s_hits) > 3 else "")})
+                        elif _tc["name"] == "request_file":
+                            _rf_name = _tc["input"].get("filename", "")
+                            _rf_match = None
+                            for _rf_fn in symbol_maps_by_name:
+                                if _rf_fn == _rf_name or _rf_fn.endswith(_rf_name) or _rf_name.endswith(_rf_fn):
+                                    _rf_match = _rf_fn
+                                    break
+                            if _rf_match:
+                                _, _rf_sf = symbol_maps_by_name[_rf_match]
+                                _rf_ct = _rf_sf.get("content", "") if isinstance(_rf_sf, dict) else ""
+                                _rf_lns = _rf_ct.splitlines()
+                                _rf_num = "\n".join(f"{i+1:5d}: {l}" for i, l in enumerate(_rf_lns))
+                                _rf_res = f"FILE: {_rf_match} ({len(_rf_lns)} lines)\n{_rf_num}"
+                                yield sse({"type": "progress", "content": f"Loaded: {_rf_match} ({len(_rf_lns)} lines)"})
+                            else:
+                                _rf_res = f"File '{_rf_name}' not found. Available: {', '.join(symbol_maps_by_name.keys())}"
+                            _tu_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": _tc["id"],
+                                "content": _rf_res[:32000]
+                            })
+
+                    _tu_messages.append({"role": "user", "content": _tu_results})
+                    print(f"[AGENTIC][TOOL_USE] Round {_tu_round} done: {len(_tu_search)} tools, {len(_tu_results)} results")
+
+                # End of tool_use while loop
+                if plan is None:
+                    plan = {"intent": "chat", "chat_response": "".join(_tu_text) or "I couldn't determine what to do."}
+                _agentic_plan_set = True
+                print(f"[AGENTIC][TOOL_USE] Final: intent={plan.get('intent')} targets={len(plan.get('targets', []))}")
+
+            if not _agentic_plan_set:
+
+                # ReAct loop state — scale limits by file size
+                _largest_file_lines = max(
+                    (sf_.get("lines", len(sf_.get("content", "").splitlines()))
+                     for _, sf_ in symbol_maps_by_name.values()
+                     if isinstance(sf_, dict)),
+                    default=0,
+                )
+                if _largest_file_lines > 5000:
+                    _REACT_MAX_ROUNDS = 8
+                    _REACT_BUDGET = 8000
+                elif _largest_file_lines > 1000:
+                    _REACT_MAX_ROUNDS = 6
+                    _REACT_BUDGET = 5000
+                else:
+                    _REACT_MAX_ROUNDS = 4
+                    _REACT_BUDGET = 2500
+
+                _react_round = 0
+                _react_searched_terms = []
+                _react_accumulated = ""
+                _react_budget_lines = 0
+
+                # Seed from session cache (previous search rounds in this session)
+                _react_cache_key = "{}::{}".format(
+                    session_id or "",
+                    ":".join(sorted(symbol_maps_by_name.keys()))
+                )
+                if _react_cache_key in _react_grep_cache:
+                    _react_accumulated = _react_grep_cache[_react_cache_key]
+                    _react_budget_lines = _react_accumulated.count("\n")
+
+                while _react_round < _REACT_MAX_ROUNDS:
+                    _react_round += 1
+
+                    # Build context for this round (base + accumulated search results)
+                    _react_context = context_msg
+                    if _react_accumulated:
+                        _react_context += (
+                            "\n\n=== SEARCH RESULTS (from {} search round(s)) ===\n{}".format(
+                                _react_round - 1, _react_accumulated
+                            )
                         )
+                    if _react_searched_terms:
+                        _react_context += (
+                            "\n\nALREADY SEARCHED TERMS (do NOT request again): {}".format(
+                                ", ".join(_react_searched_terms)
+                            )
+                        )
+                    if _react_round >= _REACT_MAX_ROUNDS:
+                        _react_context += (
+                            "\n\n[SEARCH BUDGET EXHAUSTED] You MUST now return "
+                            "'edit', 'chat', or 'needs_clarification'. "
+                            "No more search rounds. Plan with what you have."
+                        )
+
+                    # Build user content for Claude (images use different format)
+                    if image_files:
+                        _CLAUDE_VISION_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+                        user_content = [{"type": "text", "text": _react_context}]
+                        for img_sf in image_files:
+                            img_data = img_sf["content"]
+                            _fname = img_sf.get("filename", "unknown")
+                            if img_data.startswith("data:"):
+                                parts = img_data.split(",", 1)
+                                media_type = parts[0].split(":")[1].split(";")[0]
+                                b64_data = parts[1]
+                            else:
+                                ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
+                                mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+                                            "png": "image/png", "webp": "image/webp",
+                                            "gif": "image/gif"}
+                                media_type = mime_map.get(ext, "image/png")
+                                b64_data = img_data
+                            logger.info(
+                                f"[pipeline:smart] Vision block: file={_fname!r} media_type={media_type!r} "
+                                f"b64_len={len(b64_data)} data_url_valid={img_data.startswith('data:')}"
+                            )
+                            if media_type not in _CLAUDE_VISION_TYPES:
+                                logger.warning(
+                                    f"[pipeline:smart] Unsupported media type {media_type!r} for {_fname!r} — skipping vision block"
+                                )
+                                continue
+                            user_content.append({
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": media_type,
+                                           "data": b64_data}
+                            })
+                    else:
+                        user_content = _react_context
+
+                    thinking_chunks = []
+                    response_text_chunks = []
+                    claude_failed = False
+
+                    # -- Retry loop: up to 3 attempts for transient 500/529 errors --
+                    _claude_attempt = 0
+                    _claude_retry_delay = 10
+                    while _claude_attempt < 3:
+                        _claude_attempt += 1
+                        thinking_chunks = []
+                        response_text_chunks = []
+                        try:
+                            async with aclient.messages.stream(
+                                model=arch_model,
+                                max_tokens=64000,
+                                **_get_thinking_kwargs(arch_model, 10000),
+                                **_get_effort_kwargs(arch_model),
+                                system=_architect_system,
+                                messages=_arch_history_msgs + [{"role": "user",
+                                                                "content": user_content}],
+                            ) as astream:
+                                current_block = None
+                                async for event in astream:
+                                    if event.type == "content_block_start":
+                                        current_block = getattr(event.content_block,
+                                                                'type', None)
+                                        if current_block == "thinking":
+                                            yield sse({"type": "thinking_start",
+                                                       "content": ""})
+                                    elif event.type == "content_block_delta":
+                                        if hasattr(event.delta, 'thinking'):
+                                            yield sse({"type": "thinking",
+                                                       "content": event.delta.thinking})
+                                            thinking_chunks.append(event.delta.thinking)
+                                        elif hasattr(event.delta, 'text'):
+                                            response_text_chunks.append(event.delta.text)
+                                    elif event.type == "content_block_stop":
+                                        if current_block == "thinking":
+                                            yield sse({"type": "thinking_end",
+                                                       "content": ""})
+                            break  # success: exit retry loop
+                        except Exception as claude_err:
+                            err_str = str(claude_err)
+                            err_low = err_str.lower()
+                            _is_transient = (
+                                "500" in err_str or "529" in err_str
+                                or "overloaded" in err_low
+                                or "internal_server_error" in err_low
+                            )
+                            if _is_transient and _claude_attempt < 3:
+                                yield sse({"type": "progress",
+                                           "content": f"AI service busy (attempt {_claude_attempt}/3) -- retrying in {_claude_retry_delay}s..."})
+                                await asyncio.sleep(_claude_retry_delay)
+                                _claude_retry_delay = min(_claude_retry_delay * 2, 60)
+                                continue  # retry
+                            if image_files and ("image" in err_low or "unsupported" in err_low):
+                                yield sse({"type": "progress",
+                                           "content": "Images failed -- retrying text-only..."})
+                                thinking_chunks = []
+                                response_text_chunks = []
+                                try:
+                                    async with aclient.messages.stream(
+                                        model=arch_model,
+                                        max_tokens=64000,
+                                        **_get_thinking_kwargs(arch_model, 10000),
+                                        **_get_effort_kwargs(arch_model),
+                                        system=_architect_system,
+                                        messages=_arch_history_msgs + [{"role": "user",
+                                                                        "content": _react_context}],
+                                    ) as astream:
+                                        current_block = None
+                                        async for event in astream:
+                                            if event.type == "content_block_start":
+                                                current_block = getattr(event.content_block,
+                                                                        'type', None)
+                                                if current_block == "thinking":
+                                                    yield sse({"type": "thinking_start",
+                                                               "content": ""})
+                                            elif event.type == "content_block_delta":
+                                                if hasattr(event.delta, 'thinking'):
+                                                    yield sse({"type": "thinking",
+                                                               "content": event.delta.thinking})
+                                                    thinking_chunks.append(event.delta.thinking)
+                                                elif hasattr(event.delta, 'text'):
+                                                    response_text_chunks.append(event.delta.text)
+                                            elif event.type == "content_block_stop":
+                                                if current_block == "thinking":
+                                                    yield sse({"type": "thinking_end",
+                                                               "content": ""})
+                                except Exception:
+                                    raise
+                                break  # text-only succeeded
+                            else:
+                                raise
+
+                    raw_text = "".join(response_text_chunks)
+                    # Claude might wrap JSON in markdown fences
+                    stripped = raw_text.strip()
+                    if stripped.startswith("```"):
+                        fence_lines = stripped.split("\n")
+                        # Remove first line (```json) and last line (```)
+                        if fence_lines[-1].strip() == "```":
+                            raw_text = "\n".join(fence_lines[1:-1])
+                        else:
+                            raw_text = "\n".join(fence_lines[1:])
+
+                    # Robust JSON parsing -- Claude may not always produce perfect JSON
+                    try:
+                        plan = json.loads(raw_text)
+                    except json.JSONDecodeError:
+                        # Attempt 2: repair literal control chars inside string values
+                        # (Claude sometimes writes actual newlines inside a JSON string value)
+                        try:
+                            plan = json.loads(_repair_json(raw_text))
+                        except json.JSONDecodeError:
+                            # Attempt 3: extract JSON object from surrounding text
+                            _brace_start = raw_text.find('{')
+                            _brace_end = raw_text.rfind('}')
+                            json_match = (raw_text[_brace_start:_brace_end + 1]
+                                          if _brace_start >= 0 and _brace_end > _brace_start
+                                          else None)
+                            if json_match:
+                                try:
+                                    plan = json.loads(json_match)
+                                except json.JSONDecodeError:
+                                    try:
+                                        plan = json.loads(_repair_json(json_match))
+                                    except json.JSONDecodeError:
+                                        # Last resort: treat entire response as chat
+                                        # Note: raw_text here IS the JSON string from Claude —
+                                        # streaming it directly would show the user raw JSON.
+                                        # Instead, try to salvage chat_response with a targeted search.
+                                        import re as _re_fallback
+                                        _cr_search = _re_fallback.search(
+                                            r'"chat_response"\s*:\s*"((?:[^"\\]|\\.)*)"',
+                                            raw_text, _re_fallback.DOTALL
+                                        )
+                                        if _cr_search:
+                                            _salvaged = _cr_search.group(1).replace('\\n', '\n').replace('\\"', '"').replace('\\\\', '\\')
+                                            plan = {"intent": "chat", "chat_response": _salvaged}
+                                        else:
+                                            plan = {"intent": "chat", "chat_response": raw_text}
+                            else:
+                                # No JSON found at all -- Claude gave a plain text answer
+                                plan = {"intent": "chat", "chat_response": raw_text}
+
+                    # -- ReAct: check if Claude wants to search for more context --
+                    _this_intent = plan.get("intent", "chat")
+                    if _this_intent != "search":
+                        break  # Got a real plan (edit/chat/needs_clarification) -- exit ReAct loop
+
+                    # -- Handle search round --
+                    _search_terms = plan.get("search_terms", [])
+                    _search_reason = plan.get("reasoning", "gathering more context")
+                    _new_terms = [
+                        t for t in _search_terms
+                        if t.lower() not in {s.lower() for s in _react_searched_terms}
+                    ]
+
+                    if not _new_terms:
+                        # All requested terms already searched -- force clarification
+                        plan = {
+                            "intent": "needs_clarification",
+                            "questions": ["Could you paste a small snippet of the code you want to change, or tell me the exact element ID or function name?"],
+                            "clarification_response": (
+                                "I've searched through the file thoroughly but couldn't pinpoint "
+                                "the exact code. Could you paste a small snippet of the element "
+                                "you want to change, or give me the exact ID or function name? "
+                                "That will let me find it directly."
+                            )
+                        }
+                        break
+
+                    if _react_budget_lines < _REACT_BUDGET:
                         yield sse({"type": "progress", "content":
-                                   f"Found: {_hit_names}"
-                                   + (f" +{len(_round_hits)-3} more" if len(_round_hits) > 3 else "")})
-                    elif _react_round > 1:
-                        yield sse({"type": "progress", "content":
-                                   "Round {}: no matches for: {}".format(
-                                       _react_round, ", ".join(_new_terms[:3])
+                                   "Searching for: {} (round {}/{})...".format(
+                                       ", ".join(_new_terms[:3]), _react_round, _REACT_MAX_ROUNDS
                                    )})
 
-                    _react_grep_cache[_react_cache_key] = _react_accumulated
+                        _round_hits = []
+                        _seen_sym_paths = set()
 
-                # If budget was exceeded, the warning is injected at top of next round;
-                # the loop naturally exits when _react_round hits _REACT_MAX_ROUNDS.
+                        for _fname_r, (_smap_r, _sf_r) in symbol_maps_by_name.items():
+                            _fcontent_r = _sf_r.get("content", "") if isinstance(_sf_r, dict) else ""
+                            if not _fcontent_r:
+                                continue
+                            _file_lines_r = _fcontent_r.splitlines()
 
-            # End of ReAct while loop -- plan is now set to a non-search intent
+                            # Pass 1: exact AST symbol name match — most precise
+                            if _smap_r:
+                                for _term_r in _new_terms:
+                                    _term_lower = _term_r.lower()
+                                    for _sym_r in _smap_r.symbols:
+                                        if (_sym_r.name.lower() == _term_lower
+                                                or _sym_r.full_path.lower() == _term_lower):
+                                            _sym_lines = _sym_r.code.splitlines()
+                                            _sym_numbered = "\n".join(
+                                                f"{_sym_r.start_line + j:5d}: {_sym_lines[j]}"
+                                                for j in range(len(_sym_lines))
+                                            )
+                                            _label = (
+                                                f"SYMBOL MATCH [{_fname_r} :: {_sym_r.full_path} "
+                                                f"({_sym_r.symbol_type.value}, "
+                                                f"L{_sym_r.start_line}–{_sym_r.end_line})]"
+                                            )
+                                            _path_key = f"{_fname_r}::{_sym_r.full_path}"
+                                            if _path_key not in _seen_sym_paths:
+                                                _seen_sym_paths.add(_path_key)
+                                                _round_hits.append((_fname_r, _label, _sym_numbered))
+                                            break
+
+                            # Pass 2: keyword grep, expanded to enclosing AST symbol
+                            for _term_r in _new_terms:
+                                _tl = _term_r.lower()
+                                for _li, _ln in enumerate(_file_lines_r):
+                                    if _tl not in _ln.lower():
+                                        continue
+                                    _lineno_r = _li + 1
+                                    _enc = None
+                                    if _smap_r:
+                                        _best_size = float("inf")
+                                        for _sym_r in _smap_r.symbols:
+                                            if _sym_r.start_line <= _lineno_r <= _sym_r.end_line:
+                                                _sz = _sym_r.end_line - _sym_r.start_line
+                                                if _sz < _best_size:
+                                                    _best_size = _sz
+                                                    _enc = _sym_r
+                                    if _enc:
+                                        _path_key = f"{_fname_r}::{_enc.full_path}"
+                                        if _path_key not in _seen_sym_paths:
+                                            _seen_sym_paths.add(_path_key)
+                                            _enc_lines = _enc.code.splitlines()
+                                            _enc_numbered = "\n".join(
+                                                f"{_enc.start_line + j:5d}: {_enc_lines[j]}"
+                                                for j in range(len(_enc_lines))
+                                            )
+                                            _label = (
+                                                f"GREP MATCH ('{_term_r}') [{_fname_r} :: "
+                                                f"{_enc.full_path} ({_enc.symbol_type.value}, "
+                                                f"L{_enc.start_line}–{_enc.end_line})]"
+                                            )
+                                            _round_hits.append((_fname_r, _label, _enc_numbered))
+                                    else:
+                                        _path_key = f"{_fname_r}::L{_lineno_r}"
+                                        if _path_key not in _seen_sym_paths:
+                                            _seen_sym_paths.add(_path_key)
+                                            _ws = max(0, _li - 15)
+                                            _we = min(len(_file_lines_r), _li + 16)
+                                            _raw = "\n".join(
+                                                f"{_ws + j + 1:5d}: {_file_lines_r[_ws + j]}"
+                                                for j in range(_we - _ws)
+                                            )
+                                            _label = f"GREP MATCH ('{_term_r}') [{_fname_r} L{_lineno_r}]"
+                                            _round_hits.append((_fname_r, _label, _raw))
+                                    break
+
+                        _round_text = ""
+                        for _rh_fname, _rh_label, _rh_code in _round_hits:
+                            _block = f"\n{_rh_label}:\n{_rh_code}"
+                            _round_text += _block
+                            _react_budget_lines += _block.count("\n")
+                            if _react_budget_lines >= _REACT_BUDGET:
+                                break
+                        if _round_text:
+                            _react_accumulated += _round_text
+
+                        _react_searched_terms.extend(_new_terms)
+
+                        if _round_hits:
+                            _hit_names = ", ".join(
+                                h[1].split("::")[1].split("(")[0].strip()
+                                if "::" in h[1] else h[1]
+                                for h in _round_hits[:3]
+                            )
+                            yield sse({"type": "progress", "content":
+                                       f"Found: {_hit_names}"
+                                       + (f" +{len(_round_hits)-3} more" if len(_round_hits) > 3 else "")})
+                        elif _react_round > 1:
+                            yield sse({"type": "progress", "content":
+                                       "Round {}: no matches for: {}".format(
+                                           _react_round, ", ".join(_new_terms[:3])
+                                       )})
+
+                        _react_grep_cache[_react_cache_key] = _react_accumulated
+
+                    # If budget was exceeded, the warning is injected at top of next round;
+                    # the loop naturally exits when _react_round hits _REACT_MAX_ROUNDS.
+
+                # End of ReAct while loop -- plan is now set to a non-search intent
         elif _is_gemini_model(arch_model):
             # ── Gemini Architect — native thinking, 1M context window ──
             yield sse({"type": "progress", "content": "Sending to Gemini Architect..."})
