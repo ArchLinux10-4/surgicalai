@@ -2856,6 +2856,252 @@ def _apply_snippet_by_lines(
     return full_new, True, f"line-number-splice:{edit_start_line}-{edit_end_line}"
 
 
+# ---------------------------------------------------------------------------
+# Helper: _number_lines  (prepend 1-indexed line numbers to code)
+# ---------------------------------------------------------------------------
+
+def _number_lines(code: str) -> str:
+    """Prepend 1-indexed line numbers to code for correction context.
+
+    Example output:
+        1: .sai-hero {
+        2:   background: var(--bg1);
+        3: }
+    """
+    lines = code.split('\n')
+    width = len(str(len(lines)))
+    return '\n'.join(f"{i+1:>{width}}: {line}" for i, line in enumerate(lines))
+
+
+# ---------------------------------------------------------------------------
+# Helper: _apply_line_targeted_fixes  (line-number correction splice)
+# ---------------------------------------------------------------------------
+
+def _apply_line_targeted_fixes(
+    symbol_code: str,
+    fixes: list,
+    session_id: str = "",
+    user_id: str = "",
+    symbol_name: str = "",
+) -> tuple:
+    """Apply line-targeted correction fixes to a symbol.
+
+    Each fix in ``fixes`` is a dict with:
+        start_line:  first line to replace (1-indexed within the symbol)
+        end_line:    last line to replace (1-indexed, inclusive)
+        new_code:    replacement code (no line numbers)
+        reason:      (optional) explanation for debug logging
+
+    Fixes are applied bottom-up (highest start_line first) so earlier line
+    numbers stay valid after each splice.
+
+    Returns (full_new_code, applied_count, skipped_count, details).
+        full_new_code  — the reconstructed symbol (or original if 0 applied)
+        applied_count  — how many fixes spliced successfully
+        skipped_count  — how many were skipped (bounds errors etc.)
+        details        — list of per-fix result dicts for logging
+    """
+    if not symbol_code:
+        _dlog("line_fix_empty_symbol",
+              session_id=session_id, user_id=user_id,
+              symbol=symbol_name)
+        return symbol_code, 0, len(fixes), [{"error": "empty symbol"}]
+
+    if not fixes or not isinstance(fixes, list):
+        _dlog("line_fix_no_fixes",
+              session_id=session_id, user_id=user_id,
+              symbol=symbol_name,
+              fixes_type=type(fixes).__name__,
+              fixes_value=str(fixes)[:200])
+        return symbol_code, 0, 0, [{"error": "no fixes provided"}]
+
+    lines = symbol_code.split('\n')
+    total_lines = len(lines)
+
+    _dlog("line_fix_start",
+          session_id=session_id, user_id=user_id,
+          symbol=symbol_name,
+          total_symbol_lines=total_lines,
+          total_symbol_chars=len(symbol_code),
+          fix_count=len(fixes),
+          fix_ranges=[(f.get("start_line"), f.get("end_line")) for f in fixes])
+
+    # Validate all fixes BEFORE applying any
+    validated = []
+    for i, fix in enumerate(fixes):
+        start = fix.get("start_line")
+        end = fix.get("end_line")
+        new_code = fix.get("new_code", "")
+        reason = fix.get("reason", "")
+
+        _dlog("line_fix_validate",
+              session_id=session_id, user_id=user_id,
+              symbol=symbol_name,
+              fix_index=i,
+              start_line=start,
+              end_line=end,
+              new_code_len=len(new_code) if new_code else 0,
+              new_code_line_count=len(new_code.split('\n')) if new_code else 0,
+              reason=reason[:200],
+              start_type=type(start).__name__,
+              end_type=type(end).__name__)
+
+        # Type coercion — model might return strings
+        try:
+            start = int(start) if start is not None else None
+            end = int(end) if end is not None else None
+        except (ValueError, TypeError) as e:
+            _dlog("line_fix_type_error",
+                  session_id=session_id, user_id=user_id,
+                  symbol=symbol_name,
+                  fix_index=i,
+                  start_raw=str(fix.get("start_line")),
+                  end_raw=str(fix.get("end_line")),
+                  error=str(e))
+            validated.append({"index": i, "skip": True, "reason": f"type error: {e}"})
+            continue
+
+        if start is None or end is None:
+            _dlog("line_fix_missing_lines",
+                  session_id=session_id, user_id=user_id,
+                  symbol=symbol_name,
+                  fix_index=i,
+                  start=start, end=end)
+            validated.append({"index": i, "skip": True, "reason": "missing start_line or end_line"})
+            continue
+
+        if start < 1 or end < 1:
+            _dlog("line_fix_negative_lines",
+                  session_id=session_id, user_id=user_id,
+                  symbol=symbol_name,
+                  fix_index=i,
+                  start=start, end=end)
+            validated.append({"index": i, "skip": True, "reason": f"line numbers must be >= 1 (got {start}, {end})"})
+            continue
+
+        if start > end:
+            _dlog("line_fix_inverted_range",
+                  session_id=session_id, user_id=user_id,
+                  symbol=symbol_name,
+                  fix_index=i,
+                  start=start, end=end)
+            validated.append({"index": i, "skip": True, "reason": f"start_line ({start}) > end_line ({end})"})
+            continue
+
+        if end > total_lines:
+            _dlog("line_fix_out_of_bounds",
+                  session_id=session_id, user_id=user_id,
+                  symbol=symbol_name,
+                  fix_index=i,
+                  start=start, end=end,
+                  total_lines=total_lines)
+            validated.append({"index": i, "skip": True, "reason": f"end_line ({end}) > total lines ({total_lines})"})
+            continue
+
+        validated.append({
+            "index": i,
+            "skip": False,
+            "start": start,
+            "end": end,
+            "new_code": new_code,
+            "reason": reason,
+        })
+
+    # Check for overlapping ranges (after sorting)
+    good_fixes = [v for v in validated if not v.get("skip")]
+    good_fixes.sort(key=lambda f: f["start"], reverse=True)  # bottom-up order
+
+    for j in range(len(good_fixes) - 1):
+        upper = good_fixes[j]
+        lower = good_fixes[j + 1]
+        if lower["end"] >= upper["start"]:
+            _dlog("line_fix_overlap_detected",
+                  session_id=session_id, user_id=user_id,
+                  symbol=symbol_name,
+                  fix_a_range=(upper["start"], upper["end"]),
+                  fix_b_range=(lower["start"], lower["end"]))
+            # Skip the later (higher-index) fix to avoid corruption
+            upper["skip"] = True
+            upper["reason"] = f"overlaps with fix at lines {lower['start']}-{lower['end']}"
+
+    # Apply fixes bottom-up
+    applied_count = 0
+    skipped_count = 0
+    details = []
+
+    for v in good_fixes:
+        if v.get("skip"):
+            skipped_count += 1
+            details.append({"fix_index": v["index"], "status": "skipped", "reason": v.get("reason", "unknown")})
+            _dlog("line_fix_skipped",
+                  session_id=session_id, user_id=user_id,
+                  symbol=symbol_name,
+                  fix_index=v["index"],
+                  reason=v.get("reason", "unknown"))
+            continue
+
+        start_0 = v["start"] - 1  # convert to 0-indexed
+        end_0 = v["end"]          # exclusive upper bound (1-indexed end → 0-indexed exclusive)
+
+        old_lines = lines[start_0:end_0]
+        old_text = '\n'.join(old_lines)
+        new_lines = v["new_code"].split('\n') if v["new_code"] else []
+
+        _dlog("line_fix_applying",
+              session_id=session_id, user_id=user_id,
+              symbol=symbol_name,
+              fix_index=v["index"],
+              start_line=v["start"],
+              end_line=v["end"],
+              old_line_count=len(old_lines),
+              new_line_count=len(new_lines),
+              old_text_preview=old_text[:300],
+              new_text_preview=v["new_code"][:300] if v["new_code"] else "",
+              lines_before_splice=len(lines),
+              reason=v.get("reason", "")[:200])
+
+        lines[start_0:end_0] = new_lines
+
+        _dlog("line_fix_applied",
+              session_id=session_id, user_id=user_id,
+              symbol=symbol_name,
+              fix_index=v["index"],
+              start_line=v["start"],
+              end_line=v["end"],
+              old_line_count=len(old_lines),
+              new_line_count=len(new_lines),
+              lines_after_splice=len(lines),
+              delta_lines=len(new_lines) - len(old_lines))
+
+        applied_count += 1
+        details.append({
+            "fix_index": v["index"],
+            "status": "applied",
+            "start_line": v["start"],
+            "end_line": v["end"],
+            "old_line_count": len(old_lines),
+            "new_line_count": len(new_lines),
+        })
+
+    # Also count the originally-skipped (validation failures)
+    skipped_count += sum(1 for v in validated if v.get("skip") and v not in good_fixes)
+
+    result_code = '\n'.join(lines)
+
+    _dlog("line_fix_complete",
+          session_id=session_id, user_id=user_id,
+          symbol=symbol_name,
+          original_lines=total_lines,
+          original_chars=len(symbol_code),
+          result_lines=len(lines),
+          result_chars=len(result_code),
+          applied_count=applied_count,
+          skipped_count=skipped_count,
+          details=details)
+
+    return result_code, applied_count, skipped_count, details
+
+
 def _fragment_reason(symbol_code: str, new_code: str):
     """
     Detect a degenerate "fragment" edit.
@@ -11770,25 +12016,71 @@ async def run_natural_pipeline_stream(
                     _sym_line_count > 60 and _qa_score_val > 4
                 )
 
+                _dlog("correction_format_decision",
+                      session_id=session_id, user_id=user_id,
+                      symbol=symbol.name,
+                      sym_line_count=_sym_line_count,
+                      qa_score=_qa_score_val,
+                      is_large_symbol=_is_large_symbol,
+                      threshold_reason="300+ lines" if _sym_line_count > 300 else
+                                       f"60+ lines AND score {_qa_score_val} > 4" if _is_large_symbol else
+                                       "small symbol")
+
                 if _is_large_symbol:
+                    # Line-targeted correction: show numbered code, ask for
+                    # fixes array with start_line/end_line instead of old_code.
+                    # This eliminates verbatim-match failures on large/minified symbols.
+                    _numbered_original = _number_lines(symbol.code)
                     _format_instructions = (
-                        f"This symbol is {_sym_line_count} lines — DO NOT re-emit the whole symbol. "
-                        f"Make a TARGETED edit: in your <surgical_edit> JSON provide\n"
-                        f'  "old_code": the EXACT small snippet from ORIGINAL CODE you are changing '
-                        f"(copied verbatim, no line-number prefixes), and\n"
-                        f'  "new_code": the replacement for just that snippet.\n'
-                        f"The system splices your snippet into the complete symbol, so everything "
-                        f"you do NOT mention is preserved automatically. Keep old_code as small as "
-                        f"possible while still matching exactly one place.\n\n"
-                        f"NOTE ON THE QA ISSUES ABOVE: file-level imports, other functions, and "
-                        f"module exports live OUTSIDE this symbol — you do NOT need to add them. "
-                        f"Only fix issues that are genuinely inside the symbol."
+                        f"This symbol is {_sym_line_count} lines — DO NOT re-emit the whole symbol.\n"
+                        f"Use LINE-TARGETED fixes. In your <surgical_edit> JSON, provide a \"fixes\" array:\n"
+                        f'{{\n'
+                        f'  "symbol": "{symbol.name}",\n'
+                        f'  "fixes": [\n'
+                        f'    {{\n'
+                        f'      "start_line": <first line to replace (1-indexed, from ORIGINAL CODE above)>,\n'
+                        f'      "end_line": <last line to replace (1-indexed, inclusive)>,\n'
+                        f'      "new_code": "<replacement code — NO line numbers, just raw code>",\n'
+                        f'      "reason": "<what was fixed>"\n'
+                        f'    }}\n'
+                        f'  ]\n'
+                        f'}}\n\n'
+                        f"RULES:\n"
+                        f"- start_line/end_line are 1-indexed line numbers from the ORIGINAL CODE listing above\n"
+                        f"- new_code is the replacement for ONLY those lines — everything else is preserved automatically\n"
+                        f"- You can include multiple fixes in the array (one per QA issue)\n"
+                        f"- new_code must NOT contain line-number prefixes — just raw code\n"
+                        f"- To DELETE lines: set new_code to empty string\n\n"
+                        f"FALLBACK: if you cannot determine exact line numbers, you may instead use\n"
+                        f"old_code/new_code format (old_code = exact verbatim snippet, new_code = replacement).\n\n"
+                        f"NOTE: file-level imports, other functions, and module exports live OUTSIDE this symbol — "
+                        f"you do NOT need to add them. Only fix issues that are genuinely inside the symbol."
                     )
+                    _dlog("correction_line_targeted_prompt",
+                          session_id=session_id, user_id=user_id,
+                          symbol=symbol.name,
+                          numbered_lines=_sym_line_count,
+                          numbered_chars=len(_numbered_original),
+                          format_instructions_len=len(_format_instructions))
                 else:
+                    _numbered_original = None
                     _format_instructions = (
                         f"Write a corrected <surgical_edit> block whose \"new_code\" contains the "
                         f"COMPLETE symbol code (nothing omitted) using the exact symbol name "
                         f"`{symbol.name}`."
+                    )
+
+                # Build the ORIGINAL CODE section — numbered for large symbols,
+                # raw for small ones.
+                if _numbered_original is not None:
+                    _original_code_block = (
+                        f"ORIGINAL CODE (line numbers shown — use them for start_line/end_line):\n"
+                        f"```\n{_numbered_original}\n```"
+                    )
+                else:
+                    _original_code_block = (
+                        f"ORIGINAL CODE (what the symbol looks like NOW — before your change):\n"
+                        f"```\n{symbol.code}\n```"
                     )
 
                 correction_prompt = (
@@ -11798,8 +12090,7 @@ async def run_natural_pipeline_stream(
                     f"before this can be applied.\n\n"
                     f"Issues to fix:\n{issues_block}"
                     f"{diff_block}\n\n"
-                    f"ORIGINAL CODE (what the symbol looks like NOW — before your change):\n"
-                    f"```\n{symbol.code}\n```\n\n"
+                    f"{_original_code_block}\n\n"
                     f"YOUR BROKEN CODE (what you wrote — DO NOT reuse this verbatim):\n"
                     f"```\n{cs['new_code']}\n```\n\n"
                     f"Requirements:\n"
@@ -12075,52 +12366,148 @@ async def run_natural_pipeline_stream(
                                   symbol=change_shells[idx]["symbol"].name,
                                   raw_preview=raw_edit.strip()[:300])
                             continue
+                        corrected_fixes = edit_data.get("fixes")
                         corrected_code = edit_data.get("new_code", "")
                         corrected_old  = edit_data.get("old_code", "")
                         _sym_code = change_shells[idx]["symbol"].code
+
                         _dlog("qa_retry_correction_parsed", session_id=session_id, user_id=user_id,
                               retry_round=_qa_retry_round, idx=idx,
                               symbol=change_shells[idx]["symbol"].name,
+                              has_fixes_array=isinstance(corrected_fixes, list),
+                              fixes_count=len(corrected_fixes) if isinstance(corrected_fixes, list) else 0,
                               has_new_code=bool(corrected_code),
                               new_code_len=len(corrected_code),
                               has_old_code=bool(corrected_old),
                               old_code_len=len(corrected_old),
-                              sym_code_len=len(_sym_code))
+                              sym_code_len=len(_sym_code),
+                              edit_data_keys=list(edit_data.keys()) if isinstance(edit_data, dict) else [])
 
                         # Reconstruct a FULL symbol from the correction before it can be
                         # stored. This loop must NEVER replace a change with a degenerate
                         # fragment (the large-file failure mode: a 2-line snippet stored as
-                        # the whole 850-line symbol). Three cases:
+                        # the whole 850-line symbol).
+                        #
+                        # Priority order:
+                        #   1. Line-targeted fixes array (deterministic, no string matching)
+                        #   2. old_code/new_code snippet (verbatim match splice)
+                        #   3. Full new_code replacement (fragment-checked)
                         accepted = None
-                        if corrected_code:
-                            if corrected_old:
-                                # Targeted edit: splice the snippet into the full symbol.
-                                _full, _ok_snip, _ = _apply_snippet_to_symbol(
-                                    _sym_code, corrected_old, corrected_code
-                                )
-                                if _ok_snip:
-                                    accepted = _full
-                                else:
-                                    _dlog("qa_retry_correction_splice_failed", session_id=session_id, user_id=user_id,
+
+                        # ── Path 1: Line-targeted fixes (preferred for large symbols) ──
+                        if isinstance(corrected_fixes, list) and len(corrected_fixes) > 0:
+                            _dlog("correction_line_targeted_attempt",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  fix_count=len(corrected_fixes),
+                                  fixes_preview=[{
+                                      "start_line": f.get("start_line"),
+                                      "end_line": f.get("end_line"),
+                                      "new_code_len": len(f.get("new_code", "")) if f.get("new_code") else 0,
+                                      "reason": str(f.get("reason", ""))[:100],
+                                  } for f in corrected_fixes[:10]])
+
+                            _lt_result, _lt_applied, _lt_skipped, _lt_details = _apply_line_targeted_fixes(
+                                _sym_code,
+                                corrected_fixes,
+                                session_id=session_id,
+                                user_id=user_id,
+                                symbol_name=change_shells[idx]["symbol"].name,
+                            )
+
+                            _dlog("correction_line_targeted_result",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  applied=_lt_applied,
+                                  skipped=_lt_skipped,
+                                  result_chars=len(_lt_result) if _lt_result else 0,
+                                  original_chars=len(_sym_code),
+                                  details=_lt_details)
+
+                            if _lt_applied > 0 and _lt_result and _lt_result != _sym_code:
+                                # Verify the result isn't a degenerate fragment
+                                _lt_frag = _fragment_reason(_sym_code, _lt_result)
+                                if _lt_frag is None:
+                                    accepted = _lt_result
+                                    _dlog("correction_line_targeted_accepted",
+                                          session_id=session_id, user_id=user_id,
                                           retry_round=_qa_retry_round, idx=idx,
                                           symbol=change_shells[idx]["symbol"].name,
-                                          old_code_preview=corrected_old[:200],
-                                          new_code_preview=corrected_code[:200])
-                                # splice failed (snippet not found/ambiguous) -> keep prior,
-                                # do NOT store a fragment.
+                                          applied_fixes=_lt_applied,
+                                          original_lines=len(_sym_code.splitlines()),
+                                          result_lines=len(_lt_result.splitlines()))
+                                else:
+                                    _dlog("correction_line_targeted_fragment_rejected",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          fragment_reason=_lt_frag,
+                                          applied_fixes=_lt_applied)
+                            elif _lt_applied == 0:
+                                _dlog("correction_line_targeted_all_skipped",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      skipped=_lt_skipped,
+                                      details=_lt_details)
+                                # Fall through to old_code/new_code path below
+
+                        # ── Path 2: old_code/new_code snippet splice (fallback) ──
+                        if accepted is None and corrected_code and corrected_old:
+                            _dlog("correction_old_code_splice_attempt",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  old_code_len=len(corrected_old),
+                                  new_code_len=len(corrected_code),
+                                  old_code_preview=corrected_old[:200],
+                                  sym_code_len=len(_sym_code))
+
+                            _full, _ok_snip, _snip_reason = _apply_snippet_to_symbol(
+                                _sym_code, corrected_old, corrected_code
+                            )
+
+                            _dlog("correction_old_code_splice_result",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  ok=_ok_snip,
+                                  reason=_snip_reason,
+                                  result_chars=len(_full) if _full else 0)
+
+                            if _ok_snip:
+                                accepted = _full
                             else:
-                                # No old_code: only accept as a full-symbol replacement when
-                                # it is NOT a degenerate fragment of a large symbol.
-                                _frag_reason = _fragment_reason(_sym_code, corrected_code)
-                                if _frag_reason is None:
-                                    accepted = corrected_code
-                                else:
-                                    _dlog("qa_retry_correction_fragment_rejected", session_id=session_id, user_id=user_id,
-                                          retry_round=_qa_retry_round, idx=idx,
-                                          symbol=change_shells[idx]["symbol"].name,
-                                          fragment_reason=_frag_reason,
-                                          sym_len=len(_sym_code), corrected_len=len(corrected_code))
-                                # degenerate fragment -> reject, keep prior change.
+                                _dlog("qa_retry_correction_splice_failed", session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      old_code_preview=corrected_old[:200],
+                                      new_code_preview=corrected_code[:200],
+                                      splice_reason=_snip_reason)
+
+                        # ── Path 3: Full new_code replacement (fragment-checked) ──
+                        if accepted is None and corrected_code and not corrected_old:
+                            _frag_reason = _fragment_reason(_sym_code, corrected_code)
+
+                            _dlog("correction_full_replacement_attempt",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  new_code_len=len(corrected_code),
+                                  sym_code_len=len(_sym_code),
+                                  is_fragment=_frag_reason is not None,
+                                  fragment_reason=_frag_reason)
+
+                            if _frag_reason is None:
+                                accepted = corrected_code
+                            else:
+                                _dlog("qa_retry_correction_fragment_rejected", session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      fragment_reason=_frag_reason,
+                                      sym_len=len(_sym_code), corrected_len=len(corrected_code))
 
                         if accepted is None:
                             _dlog("qa_retry_correction_not_accepted", session_id=session_id, user_id=user_id,
