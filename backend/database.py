@@ -683,7 +683,11 @@ def get_setting(key: str, default: str = "") -> str:
     conn = get_db()
     row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
     conn.close()
-    return row["value"] if row else default
+    if row:
+        return row["value"]
+    # Fallback: check OS environment variable (UPPER_CASE convention)
+    env_val = os.environ.get(key.upper(), os.environ.get(key, ""))
+    return env_val if env_val else default
 
 
 def set_setting(key: str, value: str):
