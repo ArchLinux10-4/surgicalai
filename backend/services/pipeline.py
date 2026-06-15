@@ -8648,68 +8648,172 @@ async def run_natural_pipeline_stream(
                         continue
                     raise
 
-            # ── End-of-stream close-check ────────────────────────────────
-            # When a short response has both opening AND closing tags in the
-            # same/final streaming chunk, the state machine transitions to
-            # in_filereq / in_search / in_plan but no further text_chunk
-            # events arrive to trigger the close-check.  Handle that here.
-            if state == "in_filereq":
-                idx = file_req_buf.find(FILE_REQ_CLOSE)
-                if idx != -1:
-                    raw = file_req_buf[:idx].strip()
-                    try:
-                        parsed = json.loads(raw)
-                        if isinstance(parsed, list):
-                            fnames = [str(f).strip() for f in parsed if str(f).strip()]
-                        elif isinstance(parsed, str):
-                            fnames = [parsed.strip()]
-                        else:
-                            fnames = []
-                    except (json.JSONDecodeError, ValueError):
-                        fnames = [f.strip() for f in raw.replace(",", "\n").split("\n") if f.strip()]
-                    if fnames:
-                        file_request_data = fnames[:5]
-                    state = "normal"
-                    normal_buf = file_req_buf[idx + len(FILE_REQ_CLOSE):]
-                    file_req_buf = ""
-                    _dlog("filereq_late_close",
-                          session_id=session_id, user_id=user_id,
-                          filenames=file_request_data)
+            # ── Universal end-of-stream finalizer ───────────────────────
+            # After the stream exhausts, if the state machine is stuck in
+            # any non-normal state, use full_response to recover ALL tags
+            # that the chunk-by-chunk parser missed.  One mechanism for
+            # every tag type — eliminates the entire class of "last chunk
+            # ate the tag" bugs.
+            if state != "normal":
+                _dlog("eos_finalizer_triggered",
+                      session_id=session_id, user_id=user_id,
+                      stuck_state=state,
+                      full_response_len=len(full_response))
+
+                # ── file_request recovery ──
+                if state == "in_filereq":
+                    _fr_match = re.search(
+                        r"<file_request>(.*?)</file_request>",
+                        full_response, re.DOTALL
+                    )
+                    if _fr_match:
+                        raw = _fr_match.group(1).strip()
+                        try:
+                            parsed = json.loads(raw)
+                            if isinstance(parsed, list):
+                                fnames = [str(f).strip() for f in parsed if str(f).strip()]
+                            elif isinstance(parsed, str):
+                                fnames = [parsed.strip()]
+                            else:
+                                fnames = []
+                        except (json.JSONDecodeError, ValueError):
+                            fnames = [f.strip() for f in raw.replace(",", "\n").split("\n") if f.strip()]
+                        if fnames:
+                            file_request_data = fnames[:5]
+                        state = "normal"
+                        file_req_buf = ""
+                        _dlog("eos_filereq_recovered",
+                              session_id=session_id, user_id=user_id,
+                              filenames=file_request_data,
+                              raw_len=len(raw))
+                    else:
+                        _dlog("eos_filereq_no_close_tag",
+                              session_id=session_id, user_id=user_id,
+                              buf_preview=file_req_buf[:300])
+
+                # ── search_request recovery ──
+                elif state == "in_search":
+                    _sr_match = re.search(
+                        r"<search_request>(.*?)</search_request>",
+                        full_response, re.DOTALL
+                    )
+                    if _sr_match:
+                        try:
+                            search_data = json.loads(_sr_match.group(1).strip())
+                            search_requested = search_data
+                        except Exception:
+                            pass
+                        state = "normal"
+                        search_buf = ""
+                        _dlog("eos_search_recovered",
+                              session_id=session_id, user_id=user_id,
+                              search_data=str(search_requested)[:200])
+                    else:
+                        _dlog("eos_search_no_close_tag",
+                              session_id=session_id, user_id=user_id,
+                              buf_preview=search_buf[:300])
+
+                # ── edit_plan recovery ──
+                elif state == "in_plan":
+                    _pl_match = re.search(
+                        r"<edit_plan>(.*?)</edit_plan>",
+                        full_response, re.DOTALL
+                    )
+                    if _pl_match:
+                        try:
+                            _plan_parsed = json.loads(_pl_match.group(1).strip())
+                            if isinstance(_plan_parsed, list):
+                                edit_plan_data = _plan_parsed
+                        except Exception:
+                            pass
+                        state = "normal"
+                        plan_buf = ""
+                        _dlog("eos_plan_recovered",
+                              session_id=session_id, user_id=user_id,
+                              plan_items=len(edit_plan_data) if edit_plan_data else 0)
+                    else:
+                        _dlog("eos_plan_no_close_tag",
+                              session_id=session_id, user_id=user_id,
+                              buf_preview=plan_buf[:300])
+
+                # ── surgical_edit recovery ──
+                elif state == "in_edit":
+                    _all_edits = re.findall(
+                        r"<surgical_edit>(.*?)</surgical_edit>",
+                        full_response, re.DOTALL
+                    )
+                    if _all_edits:
+                        # Recover any complete edits the mid-stream parser missed
+                        _new_count = 0
+                        for _eblock in _all_edits:
+                            if _eblock not in edit_blocks_raw:
+                                edit_blocks_raw.append(_eblock)
+                                _new_count += 1
+                        # Also preserve partial edit_buf (unclosed last edit)
+                        # — truncation detector downstream needs it.
+                        # Only if close tag is NOT in buf (otherwise findall
+                        # already captured the clean content).
+                        _partial_kept = False
+                        if (edit_buf.strip()
+                                and EDIT_CLOSE not in edit_buf
+                                and edit_buf not in edit_blocks_raw):
+                            edit_blocks_raw.append(edit_buf)
+                            _partial_kept = True
+                        state = "normal"
+                        _dlog("eos_edit_recovered",
+                              session_id=session_id, user_id=user_id,
+                              recovered_count=_new_count,
+                              partial_kept=_partial_kept,
+                              total_edit_blocks=len(edit_blocks_raw))
+                        edit_buf = ""
+                    else:
+                        # No close tag at all — append raw buffer (existing behavior)
+                        if edit_buf.strip():
+                            edit_blocks_raw.append(edit_buf)
+                        _dlog("eos_edit_no_close_tag",
+                              session_id=session_id, user_id=user_id,
+                              buf_len=len(edit_buf))
+                    yield sse({"type": "edit_end", "content": ""})
+
+                # ── new_file recovery ──
+                elif state == "in_file":
+                    _all_files = re.findall(
+                        r"<new_file>(.*?)</new_file>",
+                        full_response, re.DOTALL
+                    )
+                    if _all_files:
+                        _new_count = 0
+                        for _fblock in _all_files:
+                            if _fblock not in new_file_blocks_raw:
+                                new_file_blocks_raw.append(_fblock)
+                                _new_count += 1
+                        # Also preserve partial file_buf (unclosed last new_file)
+                        # Only if close tag is NOT in buf (same reason as edit).
+                        _partial_kept = False
+                        if (file_buf.strip()
+                                and FILE_CLOSE not in file_buf
+                                and file_buf not in new_file_blocks_raw):
+                            new_file_blocks_raw.append(file_buf)
+                            _partial_kept = True
+                        state = "normal"
+                        _dlog("eos_newfile_recovered",
+                              session_id=session_id, user_id=user_id,
+                              recovered_count=_new_count,
+                              partial_kept=_partial_kept,
+                              total_file_blocks=len(new_file_blocks_raw))
+                        file_buf = ""
+                    else:
+                        if file_buf.strip():
+                            new_file_blocks_raw.append(file_buf)
+                        _dlog("eos_newfile_no_close_tag",
+                              session_id=session_id, user_id=user_id,
+                              buf_len=len(file_buf))
+                    yield sse({"type": "edit_end", "content": ""})
+
                 else:
-                    _dlog("filereq_incomplete",
+                    _dlog("eos_unknown_state",
                           session_id=session_id, user_id=user_id,
-                          buf_preview=file_req_buf[:200])
-
-            elif state == "in_search":
-                idx = search_buf.find(SEARCH_CLOSE)
-                if idx != -1:
-                    search_json_raw = search_buf[:idx]
-                    try:
-                        search_data = json.loads(search_json_raw.strip())
-                        search_requested = search_data
-                    except Exception:
-                        pass
-                    state = "normal"
-                    normal_buf = search_buf[idx + len(SEARCH_CLOSE):]
-                    search_buf = ""
-                    _dlog("search_late_close",
-                          session_id=session_id, user_id=user_id)
-
-            elif state == "in_plan":
-                idx = plan_buf.find(PLAN_CLOSE)
-                if idx != -1:
-                    plan_json_raw = plan_buf[:idx]
-                    try:
-                        plan_data = json.loads(plan_json_raw.strip())
-                        if isinstance(plan_data, list):
-                            edit_plan_data = plan_data
-                    except Exception:
-                        pass
-                    state = "normal"
-                    normal_buf = plan_buf[idx + len(PLAN_CLOSE):]
-                    plan_buf = ""
-                    _dlog("plan_late_close",
-                          session_id=session_id, user_id=user_id)
+                          state=state)
 
             # Flush any normal text buffered at end of this round
             if state == "normal" and normal_buf.strip():
@@ -8975,18 +9079,9 @@ async def run_natural_pipeline_stream(
         # Final flush for edge cases (Claude ended inside a block)
         if in_thinking:
             yield sse({"type": "thinking_end", "content": ""})
-        if state == "in_edit" and edit_buf.strip():
-            edit_blocks_raw.append(edit_buf)
-            _dlog("edit_buf_edge_flush",
-                  session_id=session_id,
-                  length=len(edit_buf),
-                  first_200=edit_buf[:200],
-                  last_200=edit_buf[-200:],
-                  user_id=user_id)
-            yield sse({"type": "edit_end", "content": ""})
-        elif state == "in_file" and file_buf.strip():
-            new_file_blocks_raw.append(file_buf)
-            yield sse({"type": "edit_end", "content": ""})
+        # NOTE: in_edit / in_file / in_search / in_filereq / in_plan
+        # are all handled by the universal end-of-stream finalizer
+        # inside the search_round loop above.  No duplicate logic here.
 
         # Initialize skipped_changes early — truncation detection may append to it
         skipped_changes_struct: list = []
