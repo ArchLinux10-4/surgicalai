@@ -39,8 +39,21 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
 }) {
   const [applying, setApplying] = useState(false)
   const [done, setDone]         = useState(false)
+  const [appliedIds, setAppliedIds] = useState<Set<string>>(new Set())
 
-  // Collect all messages with unapplied changes
+  // Fetch applied IDs from DB on mount + re-sync when individual cards apply changes
+  useEffect(() => {
+    const fetchApplied = () => {
+      api.surgical.getApplied(sessionId)
+        .then(({ applied_ids }: { applied_ids: string[] }) => setAppliedIds(new Set(applied_ids)))
+        .catch(() => {})
+    }
+    fetchApplied()
+    window.addEventListener('sai-applied-refresh', fetchApplied)
+    return () => window.removeEventListener('sai-applied-refresh', fetchApplied)
+  }, [sessionId])
+
+  // Collect all messages with surgical data
   const pendingMessages = messages.filter(m =>
     (m.message_type === 'natural_result' || m.message_type === 'surgical_result') &&
     m.surgical_data
@@ -48,20 +61,24 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
 
   if (pendingMessages.length === 0) return null
 
-  // Count total changes across all pending messages
+  // Count only UNAPPLIED changes — diff cards' applied state is source of truth
   let totalChanges = 0
-  let totalFiles   = 0
+  const fileSet    = new Set<string>()
   for (const msg of pendingMessages) {
     try {
       const result: SmartResult = JSON.parse(msg.surgical_data)
-      const files = Object.keys(result.changes_by_file || {})
-      totalFiles   += files.length
-      totalChanges += files.reduce(
-        (acc, f) => acc + (result.changes_by_file[f]?.changes?.length || 0), 0
-      )
+      for (const [fname, fd] of Object.entries(result.changes_by_file || {})) {
+        const changes = (fd as any)?.changes || []
+        const unapplied = changes.filter((c: any) => c.id && !appliedIds.has(c.id))
+        if (unapplied.length > 0) {
+          totalChanges += unapplied.length
+          fileSet.add(fname)
+        }
+      }
       totalChanges += (result.new_files || []).length
     } catch {}
   }
+  const totalFiles = fileSet.size
 
   if (totalChanges === 0) return null
 

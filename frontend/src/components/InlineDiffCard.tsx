@@ -849,10 +849,23 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         <span className="text-[11px] text-muted/70 ml-1">
           {realChanges.length} change{realChanges.length !== 1 ? 's' : ''}
         </span>
-        {/* File-level Live Preview button */}
+        {/* File-level Live Preview button — on open, replicate browser refresh:
+             fetch fresh file from DB, clear stale state, force full remount */}
         {isVisualFile(filename) && (
           <button
-            onClick={() => setShowFilePreview(p => !p)}
+            onClick={async () => {
+              const opening = !showFilePreview
+              if (opening) {
+                // Replicate what browser refresh does on mount: fresh DB fetch
+                try {
+                  const freshFile = await api.sessionFiles.get(sessionId, fileData.file_id)
+                  if (freshFile?.content) setOriginalCode(freshFile.content)
+                } catch {}
+                setModifiedCode(undefined)
+                setPreviewKey(k => k + 1)
+              }
+              setShowFilePreview(opening)
+            }}
             className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors ml-auto"
             title={showFilePreview ? 'Hide live preview' : 'Show live preview of this file'}
           >
