@@ -2874,6 +2874,131 @@ def _number_lines(code: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helper: _find_changed_window  (focused diff window for correction)
+# ---------------------------------------------------------------------------
+
+def _find_changed_window(original_code: str, edited_code: str, context_lines: int = 20):
+    """Diff original vs edited code, return a focused window around changes.
+
+    Returns a dict with window boundaries and formatted code for the
+    correction prompt.  Returns ``None`` when the two strings are identical.
+
+    The window is extracted from the EDITED (broken) version, since that is
+    what the correction model will fix.  A corresponding window from the
+    ORIGINAL is included for reference.
+
+    Returns None if codes are identical or on any internal error (caller
+    must handle gracefully).
+    """
+    try:
+        if not original_code or not edited_code:
+            _dlog("find_changed_window_empty_input",
+                  original_len=len(original_code) if original_code else 0,
+                  edited_len=len(edited_code) if edited_code else 0)
+            return None
+
+        orig_lines = original_code.splitlines()
+        edit_lines = edited_code.splitlines()
+
+        if not orig_lines or not edit_lines:
+            _dlog("find_changed_window_no_lines",
+                  orig_line_count=len(orig_lines),
+                  edit_line_count=len(edit_lines))
+            return None
+
+        sm = difflib.SequenceMatcher(None, orig_lines, edit_lines)
+        changed_in_edit = set()   # 0-indexed lines in edited version that differ
+        changed_in_orig = set()   # 0-indexed lines in original that differ
+
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag != "equal":
+                for j in range(j1, j2):
+                    changed_in_edit.add(j)
+                for i in range(i1, i2):
+                    changed_in_orig.add(i)
+
+        if not changed_in_edit and not changed_in_orig:
+            _dlog("find_changed_window_identical",
+                  orig_lines=len(orig_lines),
+                  edit_lines=len(edit_lines))
+            return None
+
+        # ── Window in the edited (broken) version ──
+        if changed_in_edit:
+            edit_first = min(changed_in_edit)
+            edit_last  = max(changed_in_edit)
+        else:
+            # Pure deletion — anchor at the deletion point
+            edit_first = min(changed_in_orig) if changed_in_orig else 0
+            edit_last  = edit_first
+
+        ws = max(0, edit_first - context_lines)
+        we = min(len(edit_lines) - 1, edit_last + context_lines)
+
+        # Safety: ensure valid range
+        if ws > we or we >= len(edit_lines):
+            _dlog("find_changed_window_bad_range",
+                  ws=ws, we=we, edit_lines=len(edit_lines),
+                  edit_first=edit_first, edit_last=edit_last,
+                  context_lines=context_lines)
+            return None
+
+        window_lines = edit_lines[ws : we + 1]
+        numbered_broken = "\n".join(
+            f"{ws + i + 1:4d} | {line}" for i, line in enumerate(window_lines)
+        )
+
+        # ── Corresponding window in the original ──
+        if changed_in_orig:
+            orig_first = min(changed_in_orig)
+            orig_last  = max(changed_in_orig)
+            ows = max(0, orig_first - context_lines)
+            owe = min(len(orig_lines) - 1, orig_last + context_lines)
+            orig_window = orig_lines[ows : owe + 1]
+            numbered_original = "\n".join(
+                f"{ows + i + 1:4d} | {line}" for i, line in enumerate(orig_window)
+            )
+        else:
+            numbered_original = "(no lines changed in original)"
+            ows, owe = ws, we
+
+        _changed_edit_count = len(changed_in_edit)
+        _changed_orig_count = len(changed_in_orig)
+        _window_line_count = we - ws + 1
+
+        _dlog("find_changed_window_result",
+              orig_lines=len(orig_lines),
+              edit_lines=len(edit_lines),
+              changed_in_edit=_changed_edit_count,
+              changed_in_orig=_changed_orig_count,
+              edit_first_changed=edit_first,
+              edit_last_changed=edit_last,
+              window_start_0=ws,
+              window_end_0=we,
+              window_line_count=_window_line_count,
+              context_lines=context_lines,
+              compression_ratio=f"{_window_line_count}/{len(edit_lines)} = {_window_line_count/max(len(edit_lines),1)*100:.0f}%")
+
+        return {
+            "window_start": ws,           # 0-indexed in edited_code
+            "window_end": we,             # 0-indexed in edited_code (inclusive)
+            "numbered_broken": numbered_broken,
+            "numbered_original": numbered_original,
+            "window_line_count": _window_line_count,
+            "total_edit_lines": len(edit_lines),
+            "total_orig_lines": len(orig_lines),
+            "changed_line_count": _changed_edit_count,
+        }
+    except Exception as _fcw_exc:
+        _dlog("find_changed_window_error",
+              error=str(_fcw_exc),
+              error_type=type(_fcw_exc).__name__,
+              original_len=len(original_code) if original_code else 0,
+              edited_len=len(edited_code) if edited_code else 0)
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Helper: _apply_line_targeted_fixes  (line-number correction splice)
 # ---------------------------------------------------------------------------
 
@@ -11986,6 +12111,7 @@ async def run_natural_pipeline_stream(
             # Build correction calls for all blocked changes
             correction_tasks = []
             _corr_msgs_by_idx = {}  # Save per-correction messages for ReAct follow-ups
+            _correction_window_info = {}  # Per-idx window info for windowed corrections
             for idx in blocked_indices:
                 cs     = change_shells[idx]
                 qa_d   = qa_results[idx]
@@ -12057,70 +12183,94 @@ async def run_natural_pipeline_stream(
                                        "small symbol")
 
                 if _is_large_symbol:
-                    # Line-targeted correction: show numbered code, ask for
-                    # fixes array with start_line/end_line instead of old_code.
-                    # This eliminates verbatim-match failures on large/minified symbols.
-                    _numbered_original = _number_lines(symbol.code)
-                    _format_instructions = (
-                        f"⚠️ CRITICAL FORMAT REQUIREMENT — READ CAREFULLY ⚠️\n\n"
-                        f"This symbol is {_sym_line_count} lines. DO NOT re-emit the whole symbol.\n"
-                        f"DO NOT use the standard {{\"filename\", \"symbol\", \"new_code\"}} format.\n\n"
-                        f"You MUST return a <surgical_edit> block with a \"fixes\" array.\n"
-                        f"Each fix targets specific line numbers from the ORIGINAL CODE above.\n\n"
-                        f"REQUIRED FORMAT (inside <surgical_edit> tags):\n"
-                        f'{{\n'
-                        f'  "fixes": [\n'
-                        f'    {{\n'
-                        f'      "start_line": <first line to replace (1-indexed from ORIGINAL CODE)>,\n'
-                        f'      "end_line": <last line to replace (inclusive)>,\n'
-                        f'      "new_code": "<replacement for those lines — raw code, NO line-number prefixes>",\n'
-                        f'      "reason": "<what this fix does>"\n'
-                        f'    }}\n'
-                        f'  ]\n'
-                        f'}}\n\n'
-                        f"EXAMPLE — to remove a stray closing tag on line 500:\n"
-                        f"<surgical_edit>\n"
-                        f'{{"fixes": [{{"start_line": 500, "end_line": 500, "new_code": "", "reason": "Remove stray </div>"}}]}}\n'
-                        f"</surgical_edit>\n\n"
-                        f"EXAMPLE — to fix lines 120-122:\n"
-                        f"<surgical_edit>\n"
-                        f'{{"fixes": [{{"start_line": 120, "end_line": 122, "new_code": "  const x = calculateValue();\\n  return x;", "reason": "Fix logic error"}}]}}\n'
-                        f"</surgical_edit>\n\n"
-                        f"RULES:\n"
-                        f"- Use line numbers from the ORIGINAL CODE listing above\n"
-                        f"- new_code replaces ONLY those lines — everything else is preserved automatically\n"
-                        f"- Multiple fixes: add multiple objects to the fixes array\n"
-                        f"- To DELETE lines: set new_code to empty string\n"
-                        f"- new_code must NOT contain line-number prefixes\n\n"
-                        f"FALLBACK: if you truly cannot determine exact line numbers, use old_code/new_code format:\n"
-                        f"{{\"old_code\": \"<exact verbatim text to find>\", \"new_code\": \"<replacement>\"}}\n\n"
-                        f"NOTE: imports, other functions, and exports are OUTSIDE this symbol — do not add them."
-                    )
-                    _dlog("correction_line_targeted_prompt",
-                          session_id=session_id, user_id=user_id,
-                          symbol=symbol.name,
-                          numbered_lines=_sym_line_count,
-                          numbered_chars=len(_numbered_original),
-                          format_instructions_len=len(_format_instructions))
+                    # ── Windowed correction ──────────────────────────────────
+                    # Instead of sending the full 2000-line symbol and asking
+                    # the model for a complex fixes-array format, we:
+                    #   1. Diff original vs broken edit to find changed region
+                    #   2. Show only that region ± 20 lines of context
+                    #   3. Model returns corrected window (standard format)
+                    #   4. Server splices window back (deterministic, no matching)
+                    _window_info = _find_changed_window(symbol.code, cs["new_code"])
+                    if _window_info:
+                        _correction_window_info[idx] = _window_info
+                        _wl = _window_info["window_line_count"]
+                        _ws1 = _window_info["window_start"] + 1   # 1-indexed
+                        _we1 = _window_info["window_end"] + 1
+
+                        _format_instructions = (
+                            f"This symbol is {_sym_line_count} lines. You are seeing ONLY the "
+                            f"changed region (lines {_ws1}–{_we1}, {_wl} lines) plus context.\n\n"
+                            f"Return a <surgical_edit> block with the CORRECTED version of this "
+                            f"window. The server will splice it back into the full symbol automatically.\n\n"
+                            f"Format:\n"
+                            f"<surgical_edit>\n"
+                            f'{{"filename": "{cs["filename"]}", "symbol": "{symbol.name}", '
+                            f'"new_code": "<corrected lines {_ws1}–{_we1}>"}}\n'
+                            f"</surgical_edit>\n\n"
+                            f"RULES:\n"
+                            f"- Return ALL {_wl} lines of the window (context lines + corrected changes)\n"
+                            f"- Do NOT return the entire {_sym_line_count}-line symbol\n"
+                            f"- Do NOT include line-number prefixes (the \"1234 | \" part) in new_code\n"
+                            f"- Fix every issue listed above while preserving the original request\n"
+                            f"- Adding or removing lines within the window is fine"
+                        )
+                        _original_code_block = (
+                            f"ORIGINAL CODE (lines {_ws1}–{_we1} of "
+                            f"{_window_info['total_orig_lines']} total — before your edit):\n"
+                            f"```\n{_window_info['numbered_original']}\n```"
+                        )
+                        _broken_code_block = (
+                            f"YOUR BROKEN EDIT (lines {_ws1}–{_we1} — fix this):\n"
+                            f"```\n{_window_info['numbered_broken']}\n```"
+                        )
+                        _dlog("correction_windowed_prompt",
+                              session_id=session_id, user_id=user_id,
+                              symbol=symbol.name,
+                              window_start=_ws1, window_end=_we1,
+                              window_lines=_wl,
+                              total_lines=_sym_line_count,
+                              total_orig_lines=_window_info["total_orig_lines"],
+                              prompt_original_chars=len(_window_info["numbered_original"]),
+                              prompt_broken_chars=len(_window_info["numbered_broken"]))
+                    else:
+                        # _find_changed_window returned None — diff found no
+                        # changes, or an internal error.  Shouldn't happen during
+                        # correction (we know codes differ), but degrade safely.
+                        _dlog("correction_windowed_fallback_null_window",
+                              session_id=session_id, user_id=user_id,
+                              symbol=symbol.name,
+                              sym_line_count=_sym_line_count,
+                              new_code_len=len(cs["new_code"]),
+                              codes_identical=symbol.code == cs["new_code"],
+                              reason="find_changed_window returned None for large symbol")
+                        _correction_window_info[idx] = None
+                        _format_instructions = (
+                            f"Write a corrected <surgical_edit> block whose \"new_code\" contains the "
+                            f"COMPLETE symbol code (nothing omitted) using the exact symbol name "
+                            f"`{symbol.name}`."
+                        )
+                        _original_code_block = (
+                            f"ORIGINAL CODE (what the symbol looks like NOW — before your change):\n"
+                            f"```\n{symbol.code}\n```"
+                        )
+                        _broken_code_block = (
+                            f"YOUR BROKEN CODE (what you wrote — DO NOT reuse this verbatim):\n"
+                            f"```\n{cs['new_code']}\n```"
+                        )
                 else:
-                    _numbered_original = None
+                    _correction_window_info[idx] = None
                     _format_instructions = (
                         f"Write a corrected <surgical_edit> block whose \"new_code\" contains the "
                         f"COMPLETE symbol code (nothing omitted) using the exact symbol name "
                         f"`{symbol.name}`."
                     )
-
-                # Build the ORIGINAL CODE section — numbered for large symbols,
-                # raw for small ones.
-                if _numbered_original is not None:
-                    _original_code_block = (
-                        f"ORIGINAL CODE (line numbers shown — use them for start_line/end_line):\n"
-                        f"```\n{_numbered_original}\n```"
-                    )
-                else:
                     _original_code_block = (
                         f"ORIGINAL CODE (what the symbol looks like NOW — before your change):\n"
                         f"```\n{symbol.code}\n```"
+                    )
+                    _broken_code_block = (
+                        f"YOUR BROKEN CODE (what you wrote — DO NOT reuse this verbatim):\n"
+                        f"```\n{cs['new_code']}\n```"
                     )
 
                 correction_prompt = (
@@ -12131,8 +12281,7 @@ async def run_natural_pipeline_stream(
                     f"Issues to fix:\n{issues_block}"
                     f"{diff_block}\n\n"
                     f"{_original_code_block}\n\n"
-                    f"YOUR BROKEN CODE (what you wrote — DO NOT reuse this verbatim):\n"
-                    f"```\n{cs['new_code']}\n```\n\n"
+                    f"{_broken_code_block}\n\n"
                     f"Requirements:\n"
                     f"1. Fix every issue listed above\n"
                     f"2. Still implement the original request: {cs['description']}\n"
@@ -12427,76 +12576,147 @@ async def run_natural_pipeline_stream(
                               sym_code_len=len(_sym_code),
                               edit_data_keys=list(edit_data.keys()) if isinstance(edit_data, dict) else [])
 
-                        # Reconstruct a FULL symbol from the correction before it can be
-                        # stored. This loop must NEVER replace a change with a degenerate
-                        # fragment (the large-file failure mode: a 2-line snippet stored as
-                        # the whole 850-line symbol).
+                        # Reconstruct a FULL symbol from the correction before it
+                        # can be stored.  NEVER replace a change with a degenerate
+                        # fragment (a 2-line snippet stored as the whole 850-line
+                        # symbol).
                         #
                         # Priority order:
-                        #   1. Line-targeted fixes array (deterministic, no string matching)
+                        #   W. Windowed splice (large symbols — deterministic)
                         #   2. old_code/new_code snippet (verbatim match splice)
                         #   3. Full new_code replacement (fragment-checked)
                         accepted = None
 
-                        # ── Path 1: Line-targeted fixes (preferred for large symbols) ──
-                        if isinstance(corrected_fixes, list) and len(corrected_fixes) > 0:
-                            _dlog("correction_line_targeted_attempt",
+                        # ── Path W: Windowed correction splice ──────────────
+                        # If we used windowed correction, the model returned the
+                        # corrected WINDOW only.  Splice it back into the broken
+                        # full symbol at the known line positions.
+                        _winfo = _correction_window_info.get(idx)
+                        _windowed_path_attempted = False
+
+                        # If model returned a fixes array when we asked for
+                        # windowed new_code, log it clearly.
+                        if _winfo and isinstance(corrected_fixes, list) and not corrected_code:
+                            _dlog("correction_windowed_got_fixes_instead",
                                   session_id=session_id, user_id=user_id,
                                   retry_round=_qa_retry_round, idx=idx,
                                   symbol=change_shells[idx]["symbol"].name,
-                                  fix_count=len(corrected_fixes),
-                                  fixes_preview=[{
-                                      "start_line": f.get("start_line"),
-                                      "end_line": f.get("end_line"),
-                                      "new_code_len": len(f.get("new_code", "")) if f.get("new_code") else 0,
-                                      "reason": str(f.get("reason", ""))[:100],
-                                  } for f in corrected_fixes[:10]])
+                                  fixes_count=len(corrected_fixes),
+                                  note="model returned fixes array instead of windowed new_code — falling through")
 
-                            _lt_result, _lt_applied, _lt_skipped, _lt_details = _apply_line_targeted_fixes(
-                                _sym_code,
-                                corrected_fixes,
-                                session_id=session_id,
-                                user_id=user_id,
-                                symbol_name=change_shells[idx]["symbol"].name,
-                            )
+                        if _winfo and corrected_code and not corrected_old:
+                            _windowed_path_attempted = True
+                            _broken_lines = change_shells[idx]["new_code"].splitlines()
+                            _ws_0 = _winfo["window_start"]
+                            _we_0 = _winfo["window_end"]
 
-                            _dlog("correction_line_targeted_result",
-                                  session_id=session_id, user_id=user_id,
-                                  retry_round=_qa_retry_round, idx=idx,
-                                  symbol=change_shells[idx]["symbol"].name,
-                                  applied=_lt_applied,
-                                  skipped=_lt_skipped,
-                                  result_chars=len(_lt_result) if _lt_result else 0,
-                                  original_chars=len(_sym_code),
-                                  details=_lt_details)
-
-                            if _lt_applied > 0 and _lt_result and _lt_result != _sym_code:
-                                # Verify the result isn't a degenerate fragment
-                                _lt_frag = _fragment_reason(_sym_code, _lt_result)
-                                if _lt_frag is None:
-                                    accepted = _lt_result
-                                    _dlog("correction_line_targeted_accepted",
-                                          session_id=session_id, user_id=user_id,
-                                          retry_round=_qa_retry_round, idx=idx,
-                                          symbol=change_shells[idx]["symbol"].name,
-                                          applied_fixes=_lt_applied,
-                                          original_lines=len(_sym_code.splitlines()),
-                                          result_lines=len(_lt_result.splitlines()))
-                                else:
-                                    _dlog("correction_line_targeted_fragment_rejected",
-                                          session_id=session_id, user_id=user_id,
-                                          retry_round=_qa_retry_round, idx=idx,
-                                          symbol=change_shells[idx]["symbol"].name,
-                                          fragment_reason=_lt_frag,
-                                          applied_fixes=_lt_applied)
-                            elif _lt_applied == 0:
-                                _dlog("correction_line_targeted_all_skipped",
+                            # Sanity-check: window bounds must be valid for the
+                            # broken symbol. If not, skip windowed splice entirely.
+                            if _we_0 >= len(_broken_lines) or _ws_0 < 0 or _ws_0 > _we_0:
+                                _dlog("correction_windowed_bounds_invalid",
                                       session_id=session_id, user_id=user_id,
                                       retry_round=_qa_retry_round, idx=idx,
                                       symbol=change_shells[idx]["symbol"].name,
-                                      skipped=_lt_skipped,
-                                      details=_lt_details)
-                                # Fall through to old_code/new_code path below
+                                      ws_0=_ws_0, we_0=_we_0,
+                                      broken_lines=len(_broken_lines),
+                                      note="window bounds out of range — skipping windowed splice")
+                            else:
+                                # Strip line-number prefixes if model accidentally
+                                # included them (e.g. "  42 | code...")
+                                # SAFETY: Only strip if MAJORITY of non-empty lines
+                                # have the prefix pattern. A single matching line like
+                                # `1 | true` in JS could be real code — bulk detection
+                                # prevents mangling real pipe operators.
+                                _raw_corrected = corrected_code.splitlines()
+                                _prefix_pat = re.compile(r'^\s*\d+\s*\|\s?')
+                                _nonempty = [l for l in _raw_corrected if l.strip()]
+                                _prefix_hits = sum(1 for l in _nonempty if _prefix_pat.match(l))
+                                _prefix_ratio = _prefix_hits / max(len(_nonempty), 1)
+                                _had_prefix = _prefix_ratio >= 0.7 and _prefix_hits >= 3
+
+                                _dlog("correction_windowed_prefix_check",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      total_lines=len(_raw_corrected),
+                                      nonempty_lines=len(_nonempty),
+                                      prefix_hits=_prefix_hits,
+                                      prefix_ratio=f"{_prefix_ratio:.2f}",
+                                      will_strip=_had_prefix)
+
+                                _corrected_lines = []
+                                if _had_prefix:
+                                    for _cl in _raw_corrected:
+                                        _pfx = _prefix_pat.match(_cl)
+                                        if _pfx:
+                                            _corrected_lines.append(_cl[_pfx.end():])
+                                        else:
+                                            _corrected_lines.append(_cl)
+                                else:
+                                    _corrected_lines = list(_raw_corrected)
+
+                                _expected_window_lines = _we_0 - _ws_0 + 1
+                                _line_delta = len(_corrected_lines) - _expected_window_lines
+
+                                _result_lines = list(_broken_lines)
+                                _result_lines[_ws_0 : _we_0 + 1] = _corrected_lines
+                                _spliced = "\n".join(_result_lines)
+                                _frag_w = _fragment_reason(_sym_code, _spliced)
+
+                                _dlog("correction_windowed_splice_attempt",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      window_start=_ws_0 + 1,
+                                      window_end=_we_0 + 1,
+                                      expected_window_lines=_expected_window_lines,
+                                      corrected_lines_count=len(_corrected_lines),
+                                      line_delta=_line_delta,
+                                      had_line_prefixes=_had_prefix,
+                                      broken_total_lines=len(_broken_lines),
+                                      spliced_total_lines=len(_result_lines),
+                                      spliced_len=len(_spliced),
+                                      sym_code_len=len(_sym_code),
+                                      is_fragment=_frag_w is not None,
+                                      fragment_reason=_frag_w)
+
+                                if _frag_w is None:
+                                    accepted = _spliced
+                                    _dlog("correction_windowed_splice_accepted",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          original_lines=len(_sym_code.splitlines()),
+                                          result_lines=len(_spliced.splitlines()),
+                                          line_delta=_line_delta)
+                                else:
+                                    _dlog("correction_windowed_splice_rejected",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          fragment_reason=_frag_w,
+                                          spliced_len=len(_spliced),
+                                          sym_code_len=len(_sym_code))
+                        elif _winfo and not corrected_code:
+                            # Windowed correction was set up but model returned
+                            # no new_code — log so we can diagnose.
+                            _dlog("correction_windowed_no_new_code",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  has_old_code=bool(corrected_old),
+                                  has_fixes=isinstance(corrected_fixes, list),
+                                  note="windowed prompt sent but model returned no new_code")
+                        elif _winfo and corrected_old:
+                            # Model returned old_code/new_code format despite
+                            # windowed prompt — Path 2 will handle it.
+                            _dlog("correction_windowed_got_old_code_format",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  old_code_len=len(corrected_old),
+                                  new_code_len=len(corrected_code),
+                                  note="windowed prompt sent but model used old_code/new_code format — trying Path 2")
 
                         # ── Path 2: old_code/new_code snippet splice (fallback) ──
                         if accepted is None and corrected_code and corrected_old:
@@ -12531,55 +12751,12 @@ async def run_natural_pipeline_stream(
                                       new_code_preview=corrected_code[:200],
                                       splice_reason=_snip_reason)
 
-                        # ── Path 2.5: Fragment-as-correction ──
-                        # Model returned new_code that's a small fragment (not full symbol).
-                        # Treat it as a corrected version of the ORIGINAL BROKEN edit.
-                        # Find the broken edit in the current symbol and replace it.
-                        if accepted is None and corrected_code and not corrected_old and not isinstance(corrected_fixes, list):
-                            _original_edit = change_shells[idx]["new_code"]
-                            _frag_reason_25 = _fragment_reason(_sym_code, corrected_code)
-                            _can_splice = (
-                                _frag_reason_25 is not None  # corrected_code IS a fragment
-                                and _original_edit  # we have the original broken edit
-                                and corrected_code != _original_edit  # correction is actually different
-                                and _original_edit in _sym_code  # broken edit is in the symbol
-                            )
-                            if _can_splice:
-                                _spliced = _sym_code.replace(_original_edit, corrected_code, 1)
-                                _splice_frag = _fragment_reason(_sym_code, _spliced)
-                                _dlog("correction_fragment_as_fix_attempt",
-                                      session_id=session_id, user_id=user_id,
-                                      retry_round=_qa_retry_round, idx=idx,
-                                      symbol=change_shells[idx]["symbol"].name,
-                                      original_edit_len=len(_original_edit),
-                                      corrected_fragment_len=len(corrected_code),
-                                      sym_code_len=len(_sym_code),
-                                      spliced_len=len(_spliced),
-                                      splice_is_fragment=_splice_frag is not None)
-                                if _splice_frag is None:
-                                    accepted = _spliced
-                                    _dlog("correction_fragment_as_fix_accepted",
-                                          session_id=session_id, user_id=user_id,
-                                          retry_round=_qa_retry_round, idx=idx,
-                                          symbol=change_shells[idx]["symbol"].name)
-                                else:
-                                    _dlog("correction_fragment_as_fix_rejected",
-                                          session_id=session_id, user_id=user_id,
-                                          retry_round=_qa_retry_round, idx=idx,
-                                          symbol=change_shells[idx]["symbol"].name,
-                                          splice_fragment_reason=_splice_frag)
-                            elif _frag_reason_25 is not None:
-                                _dlog("correction_fragment_as_fix_skipped",
-                                      session_id=session_id, user_id=user_id,
-                                      retry_round=_qa_retry_round, idx=idx,
-                                      symbol=change_shells[idx]["symbol"].name,
-                                      reason="precondition_failed",
-                                      has_original_edit=bool(_original_edit),
-                                      edits_differ=corrected_code != _original_edit if _original_edit else False,
-                                      original_in_sym=_original_edit in _sym_code if _original_edit else False)
-
                         # ── Path 3: Full new_code replacement (fragment-checked) ──
-                        if accepted is None and corrected_code and not corrected_old:
+                        # SKIP if windowed correction was used — the corrected_code
+                        # is a WINDOW, not a full symbol. Trying full-replacement
+                        # would always fail the fragment check and produce
+                        # misleading logs.
+                        if accepted is None and corrected_code and not corrected_old and not _windowed_path_attempted:
                             _frag_reason = _fragment_reason(_sym_code, corrected_code)
 
                             _dlog("correction_full_replacement_attempt",
@@ -12604,7 +12781,14 @@ async def run_natural_pipeline_stream(
                             _dlog("qa_retry_correction_not_accepted", session_id=session_id, user_id=user_id,
                                   retry_round=_qa_retry_round, idx=idx,
                                   symbol=change_shells[idx]["symbol"].name,
-                                  reason="no_valid_correction_produced")
+                                  reason="no_valid_correction_produced",
+                                  windowed_attempted=_windowed_path_attempted,
+                                  had_winfo=_winfo is not None,
+                                  had_corrected_code=bool(corrected_code),
+                                  had_corrected_old=bool(corrected_old),
+                                  had_fixes_array=isinstance(corrected_fixes, list),
+                                  corrected_code_len=len(corrected_code) if corrected_code else 0,
+                                  sym_code_len=len(_sym_code))
                         elif accepted == change_shells[idx]["new_code"]:
                             _dlog("qa_retry_correction_not_accepted", session_id=session_id, user_id=user_id,
                                   retry_round=_qa_retry_round, idx=idx,
