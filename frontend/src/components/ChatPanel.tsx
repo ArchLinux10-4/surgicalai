@@ -316,10 +316,14 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
           <span className="text-[10px] text-faint opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
         </div>
 
-        {/* Persistent thinking trail — shown after streaming completes */}
+        {/* Persistent phase trail — PipelineTimeline for edits, PersistentSteps for text */}
         {(msg._thinking || (msg._steps && msg._steps.filter((s: string) => s !== 'Thinking...').length > 0)) && (
           <div className="mb-3 space-y-1">
-            {msg._steps && <PersistentSteps steps={msg._steps} />}
+            {msg._steps && (
+              (isSurgical || isNaturalResult)
+                ? <PipelineTimeline steps={msg._steps} />
+                : <PersistentSteps steps={msg._steps} />
+            )}
             {msg._thinking && <ThinkingBlock text={msg._thinking} isStreaming={false} />}
           </div>
         )}
@@ -419,7 +423,7 @@ function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boole
   )
 }
 
-// ── Persistent steps trail (shown on completed messages) ────────────────
+// ── Persistent steps trail (shown on non-surgical completed messages) ────
 function PersistentSteps({ steps }: { steps: string[] }) {
   const [expanded, setExpanded] = useState(false)
   const allSteps = steps.filter(s => s !== 'Thinking...')
@@ -447,8 +451,95 @@ function PersistentSteps({ steps }: { steps: string[] }) {
   )
 }
 
+// ── Pipeline Phase Timeline ─────────────────────────────────────────────
+// Structured phase indicator for surgical edits: Analyze → Code → QA → Done
+// Replaces raw step list with visual pipeline. Always visible, no collapse.
+function PipelineTimeline({ steps, isLive = false }: { steps: string[]; isLive?: boolean }) {
+  const filtered = steps.filter(s => s !== 'Thinking...')
+  if (!filtered.length) return null
+
+  // Detect furthest phase reached from progress text
+  let reached = 0  // 0=none, 1=analyze, 2=code, 3=qa
+  let healed = false
+  let qaScore = ''
+  let qaIcon = ''
+
+  for (const s of filtered) {
+    if (/reading \d+ file|parsing file|found \d+ symbol|looking up|loaded:|claude is analyzing/i.test(s))
+      reached = Math.max(reached, 1)
+    if (/preparing code|narrowing:/i.test(s))
+      reached = Math.max(reached, 2)
+    if (/running qa|QA\s*[✅⚠️🚫⏭]/i.test(s))
+      reached = Math.max(reached, 3)
+    if (/🔁|surgeon retry|auto.fix|fixing blocked/i.test(s))
+      healed = true
+    const scoreMatch = s.match(/score:\s*(\d+)/)
+    const iconMatch = s.match(/QA\s*(✅|⚠️|🚫|⏭)/)
+    if (scoreMatch) qaScore = scoreMatch[1] + '/10'
+    if (iconMatch) qaIcon = iconMatch[1]
+  }
+
+  // When stream is done and we reached at least code phase, mark as done
+  if (!isLive && reached >= 2) reached = 4
+  // If live and we have steps but nothing matched, default to analyze
+  if (isLive && reached === 0 && filtered.length > 0) reached = 1
+
+  // Build QA label
+  const qaLabel = healed && isLive && reached === 3
+    ? 'Auto-Healing...'
+    : `${healed ? '🔁 ' : ''}QA${qaScore ? ` ${qaScore}` : ''}${qaIcon ? ` ${qaIcon}` : ''}`
+
+  const phases = [
+    { label: 'Analyze', n: 1 },
+    { label: 'Code', n: 2 },
+    { label: qaLabel, n: 3, isHeal: healed && isLive && reached === 3 },
+    { label: 'Done', n: 4 },
+  ]
+
+  return (
+    <div className="flex items-center gap-1 mb-2 py-1">
+      {phases.map((p, i) => {
+        const done = isLive ? p.n < reached : p.n <= reached
+        const active = isLive && p.n === reached
+
+        const textCls = done
+          ? 'text-success'
+          : active
+            ? p.isHeal ? 'text-amber-400' : 'text-accent'
+            : 'text-muted/40'
+
+        const pillBg = done
+          ? 'bg-success/8'
+          : active
+            ? p.isHeal
+              ? 'bg-amber-500/10 shadow-sm shadow-amber-500/20'
+              : 'bg-accent/10 shadow-sm shadow-accent/20'
+            : ''
+
+        const dotCls = done
+          ? 'bg-success'
+          : active
+            ? `${p.isHeal ? 'bg-amber-500' : 'bg-accent'} animate-pulse`
+            : 'bg-muted/30'
+
+        return (
+          <React.Fragment key={i}>
+            {i > 0 && (
+              <div className={`h-px w-3 sm:w-5 ${done || active ? 'bg-success/30' : 'bg-border/30'}`} />
+            )}
+            <span className={`flex items-center gap-1 text-[10px] font-semibold px-2 py-0.5 rounded-full whitespace-nowrap ${textCls} ${pillBg}`}>
+              {done && <span>✓</span>}
+              {active && <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${dotCls}`} />}
+              {p.label}
+            </span>
+          </React.Fragment>
+        )
+      })}
+    </div>
+  )
+}
+
 function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit }: { content: string; progress: string; progressHistory: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean }) {
-  const [thinkingExpanded, setThinkingExpanded] = useState(true)
   const [elapsed, setElapsed] = useState(0)
 
   // Elapsed timer — ticks every second while streaming
@@ -471,40 +562,32 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-2">
           <span className="text-[12px] font-semibold text-ink/80">SurgicalAI</span>
-          {/* Current progress badge */}
-          {progress && (
-            <span className="text-[11px] text-accent flex items-center gap-1.5 bg-accent/10 px-2 py-0.5 rounded-full border border-accent/20">
-              <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />
-              {progress}
-            </span>
-          )}
+          {/* Current progress badge — QA and Auto-Heal get distinct styling */}
+          {progress && (() => {
+            const isHeal = /🔁|surgeon retry|auto.fix|fixing blocked/i.test(progress)
+            const isQA = /running qa|QA\s*[✅⚠️🚫⏭]/i.test(progress)
+            const badgeCls = isHeal
+              ? 'text-amber-400 bg-amber-500/10 border-amber-500/25 shadow-sm shadow-amber-500/10'
+              : isQA
+                ? 'text-blue-400 bg-blue-500/10 border-blue-500/25'
+                : 'text-accent bg-accent/10 border-accent/20'
+            const dotCls = isHeal ? 'bg-amber-400' : isQA ? 'bg-blue-400' : 'bg-accent'
+            return (
+              <span className={`text-[11px] flex items-center gap-1.5 px-2 py-0.5 rounded-full border font-medium ${badgeCls}`}>
+                <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${dotCls}`} />
+                {progress}
+              </span>
+            )
+          })()}
           {/* Elapsed timer */}
           {elapsed > 0 && !content && (
             <span className="text-[10px] text-muted/70 tabular-nums">{elapsed}s</span>
           )}
         </div>
 
-        {/* Collapsible thinking trail */}
+        {/* Live pipeline phase timeline */}
         {hasSteps && !content && (
-          <div className="mb-2">
-            <button
-              onClick={() => setThinkingExpanded(e => !e)}
-              className="text-[11px] text-muted/70 hover:text-ink/80 flex items-center gap-1 transition-colors"
-            >
-              <span>{thinkingExpanded ? '▾' : '▸'}</span>
-              <span>{completedSteps.length} step{completedSteps.length !== 1 ? 's' : ''} completed</span>
-            </button>
-            {thinkingExpanded && (
-              <div className="mt-1.5 pl-3 border-l-2 border-border/60 space-y-1">
-                {completedSteps.map((step, i) => (
-                  <div key={i} className="text-[11px] text-muted/70 flex items-center gap-1.5">
-                    <span className="text-success/80">✓</span>
-                    <span>{step}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
+          <PipelineTimeline steps={completedSteps} isLive />
         )}
 
         {/* Claude thinking block */}

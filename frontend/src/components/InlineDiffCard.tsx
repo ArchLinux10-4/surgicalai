@@ -720,25 +720,10 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         }
       }
 
-      if (result.cloud_mode || result.modified_content) {
-        const blob = new Blob([newContent], { type: 'text/plain' })
-        const url = URL.createObjectURL(blob)
-        const a = document.createElement('a')
-        a.href = url; a.download = filename; a.click()
-        URL.revokeObjectURL(url)
-        const label = selectedChanges.length > 1
-          ? `Applied & downloaded ${filename} (${selectedChanges.length} changes)`
-          : `Applied & downloaded ${filename}`
-        toast.success(`✅ ${label}`)
-        setModifiedCode(undefined)  // clear so LivePreview falls back to originalCode (fresh from DB)
-        setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
-        onApplied?.(filename, newContent)
-      } else {
-        toast.success(`Applied ${selectedChanges.length} change${selectedChanges.length !== 1 ? 's' : ''} to ${filename}`)
-        setModifiedCode(undefined)  // clear so LivePreview falls back to originalCode (fresh from DB)
-        setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
-        onApplied?.(filename, newContent)
-      }
+      toast.success(`Applied ${selectedChanges.length} change${selectedChanges.length !== 1 ? 's' : ''} to ${filename}`)
+      setModifiedCode(undefined)  // clear so LivePreview falls back to originalCode (fresh from DB)
+      setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
+      onApplied?.(filename, newContent)
       for (const change of selectedChanges) markApplied(change.id)
       // Signal ApplyAllButton to re-check applied state (replicates refresh sync)
       window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
@@ -1025,18 +1010,18 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         )
       })}
 
-      {/* ── Single action bar ──────────────────────────────────────────── */}
-      {!allApplied && (
-        <div className="flex items-center gap-2 px-4 py-3 bg-surface/60 border-t border-border rounded-b-xl">
-          {/* Download selected changes */}
-          <button
-            onClick={handleDownload}
-            className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors"
-            title="Download file with selected changes applied"
-          >
-            <FileDownload sx={{ fontSize: 12 }} /> Download
-          </button>
+      {/* ── Action bar — download always visible, apply/skip only when pending ── */}
+      <div className="flex items-center gap-2 px-4 py-3 bg-surface/60 border-t border-border rounded-b-xl">
+        {/* Download — always available */}
+        <button
+          onClick={handleDownload}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors"
+          title="Download file with changes applied"
+        >
+          <FileDownload sx={{ fontSize: 12 }} /> Download
+        </button>
 
+        {!allApplied && (
           <div className="ml-auto flex items-center gap-2">
             {/* Skip all = uncheck all pending */}
             {selectedChanges.length > 0 && (
@@ -1066,8 +1051,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               }
             </button>
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   )
 }
