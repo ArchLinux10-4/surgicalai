@@ -1722,7 +1722,13 @@ CONTEXT AFTER (read-only reference, do NOT include in operations):
 Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
 
     # ── Feature flag: tool_use vs text SEARCH/REPLACE ───────────────────────────
-    _use_tool_use = get_setting("surgeon_tool_use", "false") == "true"
+    _surgeon_raw = get_setting("surgeon_tool_use", "false")
+    _use_tool_use = _surgeon_raw == "true"
+    _dlog("flag_check_surgeon_tool_use",
+          raw_value=_surgeon_raw, resolved=_use_tool_use,
+          env_upper=_os.environ.get("SURGEON_TOOL_USE", "<not set>"),
+          env_lower=_os.environ.get("surgeon_tool_use", "<not set>"),
+          session_id=session_id, user_id=user_id)
 
     if _use_tool_use:
         # ── TOOL USE PATH (Phase 1) ─────────────────────────────────────────────
@@ -3404,7 +3410,12 @@ async def analyze_and_plan_stream(
                 _fb_text = "\n".join(_fb_parts)
 
                 # Phase 4: tool_use vs free-text correction path
-                _use_correction_tool_use = str(get_setting("correction_tool_use", "false")).lower() == "true"
+                _correction_raw = str(get_setting("correction_tool_use", "false")).lower()
+                _use_correction_tool_use = _correction_raw == "true"
+                _dlog("flag_check_correction_tool_use",
+                      raw_value=_correction_raw, resolved=_use_correction_tool_use,
+                      env_upper=_os.environ.get("CORRECTION_TOOL_USE", "<not set>"),
+                      session_id=session_id, user_id=user_id)
                 if _use_correction_tool_use:
                     # ── Multi-turn tool_use correction ──────────────────────────
                     try:
@@ -5899,7 +5910,12 @@ USER REQUEST:
             aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
 
 
-            _use_agentic_tools = get_setting("agentic_tool_use", "false").lower() == "true"
+            _agentic_raw = get_setting("agentic_tool_use", "false").lower()
+            _use_agentic_tools = _agentic_raw == "true"
+            _dlog("flag_check_agentic_tool_use",
+                  raw_value=_agentic_raw, resolved=_use_agentic_tools,
+                  env_upper=_os.environ.get("AGENTIC_TOOL_USE", "<not set>"),
+                  session_id=session_id, user_id=user_id)
             _agentic_plan_set = False
 
             if _use_agentic_tools:
