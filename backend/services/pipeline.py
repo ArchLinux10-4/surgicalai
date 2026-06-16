@@ -543,7 +543,8 @@ def _friendly_error(e: Exception) -> str:
 
 def _chat_create(client: OpenAI, model: str, messages: list, temperature: float = 0.3, **kwargs):
     """Wrapper around client.chat.completions.create that drops temperature
-    for reasoning models and injects reasoning_effort when configured."""
+    for reasoning models and injects reasoning_effort when configured.
+    Also injects max_completion_tokens for reasoning models that require it."""
     base_model = model.split(":")[0].lower()
     if base_model in NO_TEMPERATURE_MODELS:
         # Inject reasoning_effort for models that support it, unless caller overrode it
@@ -551,6 +552,17 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
             _re = get_setting("reasoning_effort", "")
             if _re and _re.lower() in ("none", "low", "medium", "high", "xhigh"):
                 kwargs["reasoning_effort"] = _re.lower()
+        # Reasoning models require max_completion_tokens (not max_tokens).
+        # Without this, the model can allocate unlimited reasoning budget and
+        # think for minutes — causing SSE timeouts with 0 tokens collected.
+        if "max_completion_tokens" not in kwargs:
+            kwargs["max_completion_tokens"] = 16384
+        _dlog("chat_create_reasoning_model",
+              model=model, base_model=base_model,
+              reasoning_effort=kwargs.get("reasoning_effort", "<not set>"),
+              max_completion_tokens=kwargs.get("max_completion_tokens"),
+              has_response_format="response_format" in kwargs,
+              stream=kwargs.get("stream", False))
         return client.chat.completions.create(model=model, messages=messages, **kwargs)
     return client.chat.completions.create(model=model, messages=messages, temperature=temperature, **kwargs)
 
@@ -7383,10 +7395,34 @@ USER REQUEST:
                     {"role": "system", "content": _architect_system},
                     {"role": "user", "content": context_msg},
                 ]
-                resp_oai = await asyncio.to_thread(
-                    lambda: _chat_create(gclient_oai, model=arch_model, messages=arch_msgs_oai,
-                                        temperature=0.3, response_format={"type": "json_object"})
-                )
+                # For reasoning models, force low effort for architect planning
+                _fb_base = arch_model.split(":")[0].lower()
+                _fb_extra = {}
+                if _fb_base in NO_TEMPERATURE_MODELS and _fb_base in REASONING_EFFORT_MODELS:
+                    _fb_extra["reasoning_effort"] = "low"
+                _dlog("oai_fallback_architect_call",
+                      model=arch_model, is_reasoning=_fb_base in NO_TEMPERATURE_MODELS,
+                      reasoning_effort=_fb_extra.get("reasoning_effort", "<default>"),
+                      session_id=session_id, user_id=user_id)
+                _fb_start = time.time()
+                try:
+                    resp_oai = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            lambda: _chat_create(gclient_oai, model=arch_model, messages=arch_msgs_oai,
+                                                temperature=0.3, response_format={"type": "json_object"},
+                                                **_fb_extra)
+                        ),
+                        timeout=120
+                    )
+                except asyncio.TimeoutError:
+                    _dlog("oai_fallback_architect_timeout",
+                          model=arch_model, elapsed=round(time.time() - _fb_start, 1),
+                          session_id=session_id, user_id=user_id)
+                    yield sse({"type": "error", "content": f"The model timed out after 120s. Please try again or switch models."})
+                    return
+                _dlog("oai_fallback_architect_ok",
+                      model=arch_model, elapsed_s=round(time.time() - _fb_start, 1),
+                      session_id=session_id, user_id=user_id)
                 plan = json.loads(resp_oai.choices[0].message.content)
         else:
             # ── OpenAI Architect with ReAct search loop ──
@@ -7547,13 +7583,31 @@ USER REQUEST:
                         {"role": "user", "content": _oai_context_msg}
                     ]
 
+                # Reasoning models (GPT-5.x) need low effort for architect planning —
+                # this is a JSON planning task, not deep reasoning. "low" cuts think
+                # time from 60s+ to ~10s. Only override for reasoning models.
+                _arch_base = arch_model.split(":")[0].lower()
+                _is_reasoning = _arch_base in NO_TEMPERATURE_MODELS
+                _oai_arch_extra_kwargs = {}
+                if _is_reasoning and _arch_base in REASONING_EFFORT_MODELS:
+                    _oai_arch_extra_kwargs["reasoning_effort"] = "low"
+                _dlog("oai_architect_call_setup",
+                      model=arch_model, is_reasoning=_is_reasoning,
+                      reasoning_effort=_oai_arch_extra_kwargs.get("reasoning_effort", "<default>"),
+                      react_round=_oai_round, has_images=bool(image_files),
+                      msg_count=len(architect_messages),
+                      session_id=session_id, user_id=user_id)
+
+                _OAI_ARCH_TIMEOUT = 120  # seconds — generous for low-effort call
+
                 async def _call_architect_oai(msgs):
                     return await asyncio.to_thread(
                         lambda: _chat_create(client,
                             model=arch_model,
                             messages=msgs,
                             temperature=0.3,
-                            response_format={"type": "json_object"}
+                            response_format={"type": "json_object"},
+                            **_oai_arch_extra_kwargs
                         )
                     )
 
@@ -7563,33 +7617,128 @@ USER REQUEST:
                 while not arch_task.done():
                     await asyncio.sleep(1)
                     tick += 1
+                    elapsed = int(time.time() - start_time)
                     if tick % 3 == 0:
-                        elapsed = int(time.time() - start_time)
                         yield sse({"type": "progress", "content": f"Architect thinking{_round_label}... ({elapsed}s)"})
+                    # Timeout guard — bail if model thinks too long
+                    if elapsed >= _OAI_ARCH_TIMEOUT and not arch_task.done():
+                        arch_task.cancel()
+                        _dlog("oai_architect_timeout",
+                              model=arch_model, elapsed=elapsed,
+                              timeout=_OAI_ARCH_TIMEOUT,
+                              react_round=_oai_round,
+                              session_id=session_id, user_id=user_id)
+                        yield sse({"type": "progress", "content": f"⚠️ {arch_model} took too long ({elapsed}s). Try again or switch models."})
+                        yield sse({"type": "error", "content": f"The model timed out after {elapsed}s. This can happen with reasoning models on complex prompts. Please try again or switch to a different model."})
+                        return
 
                 try:
                     response = arch_task.result()
+                    _arch_elapsed = round(time.time() - start_time, 1)
+                    # Log response stats for debugging
+                    _arch_usage = getattr(response, "usage", None)
+                    _dlog("oai_architect_response_ok",
+                          model=arch_model, elapsed_s=_arch_elapsed,
+                          react_round=_oai_round,
+                          prompt_tokens=getattr(_arch_usage, "prompt_tokens", None) if _arch_usage else None,
+                          completion_tokens=getattr(_arch_usage, "completion_tokens", None) if _arch_usage else None,
+                          total_tokens=getattr(_arch_usage, "total_tokens", None) if _arch_usage else None,
+                          response_len=len(response.choices[0].message.content) if response.choices else 0,
+                          session_id=session_id, user_id=user_id)
+                except asyncio.CancelledError:
+                    # Already handled above in timeout guard
+                    return
                 except Exception as img_err:
+                    _arch_elapsed = round(time.time() - start_time, 1)
                     err_str = str(img_err).lower()
+                    _dlog("oai_architect_error",
+                          model=arch_model, elapsed_s=_arch_elapsed,
+                          error=str(img_err)[:500], error_type=type(img_err).__name__,
+                          react_round=_oai_round, has_images=bool(image_files),
+                          session_id=session_id, user_id=user_id)
                     if image_files and ("image" in err_str or "unsupported" in err_str or "invalid" in err_str):
                         yield sse({"type": "progress", "content": "⚠️ Images couldn't be read — falling back to text context..."})
                         architect_messages = [
                             {"role": "system", "content": _oai_architect_system},
                             {"role": "user", "content": _oai_context_msg}
                         ]
+                        _dlog("oai_architect_image_fallback",
+                              model=arch_model, react_round=_oai_round,
+                              session_id=session_id, user_id=user_id)
                         arch_task2 = asyncio.create_task(_call_architect_oai(architect_messages))
-                        start_time = time.time()
+                        start_time2 = time.time()
                         while not arch_task2.done():
                             await asyncio.sleep(1)
                             tick += 1
+                            elapsed2 = int(time.time() - start_time2)
                             if tick % 3 == 0:
-                                elapsed = int(time.time() - start_time)
-                                yield sse({"type": "progress", "content": f"Architect retrying{_round_label}... ({elapsed}s)"})
-                        response = arch_task2.result()
+                                yield sse({"type": "progress", "content": f"Architect retrying{_round_label}... ({elapsed2}s)"})
+                            if elapsed2 >= _OAI_ARCH_TIMEOUT and not arch_task2.done():
+                                arch_task2.cancel()
+                                _dlog("oai_architect_retry_timeout",
+                                      model=arch_model, elapsed=elapsed2,
+                                      session_id=session_id, user_id=user_id)
+                                yield sse({"type": "error", "content": f"The model timed out on retry after {elapsed2}s. Please try again or switch models."})
+                                return
+                        try:
+                            response = arch_task2.result()
+                            _dlog("oai_architect_retry_ok",
+                                  model=arch_model,
+                                  elapsed_s=round(time.time() - start_time2, 1),
+                                  session_id=session_id, user_id=user_id)
+                        except asyncio.CancelledError:
+                            return
+                        except Exception as retry_err:
+                            _dlog("oai_architect_retry_error",
+                                  model=arch_model,
+                                  error=str(retry_err)[:500],
+                                  session_id=session_id, user_id=user_id)
+                            raise
                     else:
                         raise
 
-                plan = json.loads(response.choices[0].message.content)
+                # Defensive JSON parsing — GPT-5 models sometimes return
+                # concatenated JSON objects (known bug). Try normal parse first,
+                # then fall back to extracting the first valid JSON object.
+                _oai_plan_raw = response.choices[0].message.content
+                try:
+                    plan = json.loads(_oai_plan_raw)
+                except json.JSONDecodeError as _jde:
+                    _dlog("oai_architect_json_malformed",
+                          model=arch_model, error=str(_jde)[:200],
+                          raw_len=len(_oai_plan_raw),
+                          raw_preview=_oai_plan_raw[:300],
+                          session_id=session_id, user_id=user_id)
+                    # Try first line (concatenated JSONs are newline-separated)
+                    _first_line = _oai_plan_raw.strip().split("\n")[0]
+                    try:
+                        plan = json.loads(_first_line)
+                        _dlog("oai_architect_json_first_line_ok",
+                              model=arch_model,
+                              session_id=session_id, user_id=user_id)
+                    except json.JSONDecodeError:
+                        # Try extracting first {...} block
+                        _brace_start = _oai_plan_raw.find("{")
+                        if _brace_start >= 0:
+                            _depth = 0
+                            _brace_end = -1
+                            for _ci, _ch in enumerate(_oai_plan_raw[_brace_start:], _brace_start):
+                                if _ch == "{":
+                                    _depth += 1
+                                elif _ch == "}":
+                                    _depth -= 1
+                                    if _depth == 0:
+                                        _brace_end = _ci
+                                        break
+                            if _brace_end > _brace_start:
+                                plan = json.loads(_oai_plan_raw[_brace_start:_brace_end + 1])
+                                _dlog("oai_architect_json_brace_extract_ok",
+                                      model=arch_model,
+                                      session_id=session_id, user_id=user_id)
+                            else:
+                                raise
+                        else:
+                            raise
                 _oai_intent = plan.get("intent", "unknown")
                 print(f"[OAI_REACT] Round {_oai_round}/{_OAI_REACT_MAX} → intent={_oai_intent}"
                       f" | search_terms={plan.get('search_terms', [])}"
