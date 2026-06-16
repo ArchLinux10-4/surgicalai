@@ -749,6 +749,8 @@ export function ChatPanel() {
   const [availableModels, setAvailableModels] = useState<{id: string; name: string; role: string; description?: string}[]>([])
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const userScrolledUpRef = useRef(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -766,9 +768,23 @@ export function ChatPanel() {
   const pendingRunRef = useRef<{ runId: string; tasks: any[] } | null>(null)
   const [restartSignal, setRestartSignal] = useState<{ msg: string; sid: string } | null>(null)
 
-  // Scroll to bottom on new messages
+  // Smart auto-scroll: only scroll to bottom when user is already at the bottom.
+  // If user scrolls up to read, don't yank them back down.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    const el = scrollContainerRef.current
+    if (!el) return
+    const handleScroll = () => {
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+      userScrolledUpRef.current = distanceFromBottom > 80
+    }
+    el.addEventListener('scroll', handleScroll, { passive: true })
+    return () => el.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  useEffect(() => {
+    if (!userScrolledUpRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [messages, streamingMessage])
 
   // Load session files when session changes
@@ -1347,7 +1363,18 @@ export function ChatPanel() {
 
   // ── Send message ──────────────────────────────────────
   const handleSend = useCallback(async () => {
-    if (!input.trim() || isStreaming) return
+    if (!input.trim()) return
+    // Steer: if Claude is thinking, queue the input as mid-thought context
+    // instead of starting a new stream. Existing injection logic will
+    // abort + restart with the combined message when thinking ends.
+    if (isStreaming && isThinking && input.trim()) {
+      pendingInjectionRef.current = input.trim()
+      setInjectionQueued(true)
+      setInput('')
+      if (textareaRef.current) textareaRef.current.style.height = 'auto'
+      return
+    }
+    if (isStreaming) return
     if (!settings?.openai_api_key_set && !(settings as any)?.anthropic_api_key_set) {
       setError('Add your API key (OpenAI or Anthropic) in Settings first.')
       return
@@ -1357,6 +1384,7 @@ export function ChatPanel() {
     sentMessageRef.current = text
     setInput('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
+    userScrolledUpRef.current = false  // snap to bottom on user's own send
 
     const sessionId = await ensureSession()
     streamSessionRef.current = sessionId
@@ -1392,7 +1420,7 @@ export function ChatPanel() {
     progressHistoryRef.current = ['Thinking...']
 
     doStream(sessionId, text, isFirstMessage, autoNameSession)
-  }, [input, isStreaming, settings, activeSessions, sessionFiles, doStream])
+  }, [input, isStreaming, isThinking, settings, activeSessions, sessionFiles, doStream])
 
   const handleKey = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); handleSend() }
@@ -1460,7 +1488,7 @@ export function ChatPanel() {
               <>
                 <div className="fixed inset-0 z-40" onClick={() => setModelPickerOpen(false)} />
                 <div className="absolute right-0 top-full mt-1 z-50 bg-surface border border-border rounded-lg shadow-xl py-1 min-w-[220px] max-h-[300px] overflow-y-auto">
-                  {availableModels.filter(m => m.role === 'architect').map(m => (
+                  {availableModels.filter(m => m.role === 'architect' && m.id.startsWith('claude-')).map(m => (
                     <button
                       key={m.id}
                       onClick={() => handleModelChange(m.id)}
@@ -1492,7 +1520,7 @@ export function ChatPanel() {
       )}
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto">
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
         {messages.length === 0 && !isStreaming ? (
           <EmptyState onUpload={() => fileInputRef.current?.click()} />
         ) : (
@@ -1504,28 +1532,7 @@ export function ChatPanel() {
             {isStreaming && (streamingMessage || streamProgress) && (
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} />
             )}
-            {/* Mid-thought injection input — visible only during the thinking phase */}
-            {isThinking && !injectionQueued && (
-              <div className="mx-4 mt-2">
-                <div className="flex items-center gap-2 bg-surface/50 border border-purple/20 rounded-xl px-3 py-2 focus-within:border-purple/40 transition-colors">
-                  <span className="text-[10px] font-semibold text-purple/60 uppercase tracking-wide whitespace-nowrap select-none">Steer</span>
-                  <input
-                    autoFocus
-                    value={injectionInput}
-                    onChange={e => setInjectionInput(e.target.value)}
-                    onKeyDown={e => {
-                      if (e.key === 'Enter' && injectionInput.trim()) {
-                        pendingInjectionRef.current = injectionInput.trim()
-                        setInjectionQueued(true)
-                        setInjectionInput('')
-                      }
-                    }}
-                    placeholder="Add context before Claude writes code... (Enter to queue)"
-                    className="flex-1 bg-transparent text-xs text-ink placeholder:text-muted/40 focus:outline-none"
-                  />
-                </div>
-              </div>
-            )}
+            {/* Steer queued indicator — user typed in chat input during thinking */}
             {injectionQueued && isStreaming && (
               <div className="mx-4 mt-1.5 flex items-center gap-1.5 text-[11px] text-purple/60">
                 <span className="w-1.5 h-1.5 rounded-full bg-purple/50 animate-pulse flex-shrink-0" />
@@ -1619,7 +1626,7 @@ export function ChatPanel() {
               el.style.height = 'auto'
               el.style.height = Math.min(el.scrollHeight, 200) + 'px'
             }}
-            className="w-full bg-transparent text-sm text-ink placeholder:text-muted/70 resize-none pl-4 pr-4 pt-3 pb-10 focus:outline-none leading-relaxed font-[inherit] min-h-[52px] max-h-[200px] overflow-y-auto"
+            className="w-full bg-transparent text-sm text-ink placeholder:text-muted/70 resize-none pl-4 pr-4 pt-3 pb-14 focus:outline-none leading-relaxed font-[inherit] min-h-[56px] max-h-[200px] overflow-y-auto"
           />
           {/* Bottom toolbar inside pill */}
           <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between px-2 pb-2">
@@ -1642,22 +1649,27 @@ export function ChatPanel() {
             </div>
             <div className="flex items-center gap-1.5">
               <span className="text-[11px] text-faint mr-1 select-none">⌘↵</span>
-              {isStreaming ? (
+              {isStreaming && (
                 <button
                   onClick={() => { abortRef.current?.abort(); stopStream() }}
                   className="h-8 px-3 rounded-lg bg-danger/15 text-danger text-xs font-semibold flex items-center gap-1.5 hover:bg-danger/25 transition-colors"
                 >
                   <Close sx={{ fontSize: 13 }} /> Stop
                 </button>
-              ) : (
+              )}
+              {/* Send button: always visible. During thinking, acts as Steer (queues context). */}
+              {(!isStreaming || isThinking) && (
                 <button
                   onClick={handleSend}
                   disabled={!input.trim() || isCompacting}
                   className={`h-8 w-8 rounded-lg flex items-center justify-center transition-all ${
                     !input.trim() || isCompacting
                       ? 'text-faint cursor-not-allowed'
-                      : 'bg-accent text-white hover:bg-accent active:scale-95 shadow-sm shadow-accent/25'
+                      : isThinking
+                        ? 'bg-purple/80 text-white hover:bg-purple active:scale-95 shadow-sm shadow-purple/25'
+                        : 'bg-accent text-white hover:bg-accent active:scale-95 shadow-sm shadow-accent/25'
                   }`}
+                  title={isThinking ? 'Send as steering context' : 'Send message'}
                 >
                   <Send sx={{ fontSize: 14 }} />
                 </button>

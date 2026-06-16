@@ -467,7 +467,7 @@ export function SettingsModal() {
                 <SectionHeader title="Model Configuration" subtitle="Select which AI model powers SurgicalAI" />
 
                 <Field label="AI Model">
-                  <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect').map((m) => ({ value: m.id, label: `${m.name} \u2014 ${m.description}` }))} />
+                  <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect' && m.id.startsWith('claude-')).map((m) => ({ value: m.id, label: `${m.name} \u2014 ${m.description}` }))} />
                 </Field>
 
                 {!form.architect_model.startsWith('claude-') && (
