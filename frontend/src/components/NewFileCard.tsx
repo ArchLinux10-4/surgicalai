@@ -8,7 +8,6 @@ import { toast } from '../lib/toast'
 import type { SmartResult, NewFile } from '../types'
 import { InlineDiffCard } from './InlineDiffCard'
 import { Add, Check, ContentCopy, Description, FileDownload, KeyboardArrowDown, KeyboardArrowUp } from '@mui/icons-material';
-import { DownloadAllButton } from './DownloadAllButton'
 
 const LANG_LABELS: Record<string, string> = {
   typescript: 'TypeScript', tsx: 'TSX', javascript: 'JavaScript',
@@ -52,7 +51,11 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
   const cardRef = useRef<HTMLDivElement>(null)
   const [saving, setSaving] = useState(false)
   const savedKey = `sai-added:${sessionId}:${file.filename}`
-  const [saved, setSaved] = useState(() => localStorage.getItem(savedKey) === '1')
+  const sessionFiles = useAppStore(s => s.sessionFiles)
+  // Check both localStorage AND whether the file already exists in session files (reactive)
+  const alreadyInSession = sessionFiles.some(sf => sf.filename === file.filename)
+  const [savedLocally, setSavedLocally] = useState(() => localStorage.getItem(savedKey) === '1')
+  const saved = savedLocally || alreadyInSession
   const [copied, setCopied] = useState(false)
 
   const lang = detectLang(file.filename, file.language)
@@ -73,7 +76,7 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
         language: lang,
         origin: 'created',
       })
-      setSaved(true)
+      setSavedLocally(true)
       localStorage.setItem(savedKey, '1')
       onSaved(file.filename)
       // Immediately refresh the session file list in the store so the Files tray updates
@@ -266,12 +269,9 @@ export function NewFileCard({ result, sessionId }: NewFileCardProps) {
             </span>
           )}
         </div>
-        <div className="flex items-center gap-2">
-          <DownloadAllButton files={newFiles.map(f => ({ filename: f.filename, content: f.content }))} />
-          {result.summary && (
-            <span className="text-[12px] text-muted truncate max-w-xs">{result.summary}</span>
-          )}
-        </div>
+        {result.summary && (
+          <span className="text-[12px] text-muted truncate max-w-xs">{result.summary}</span>
+        )}
       </div>
 
       {/* File cards */}

@@ -75,7 +75,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
           fileSet.add(fname)
         }
       }
-      totalChanges += (result.new_files || []).length
+      // new_files are not edits — don't count them as changes to apply
     } catch {}
   }
   const totalFiles = fileSet.size
