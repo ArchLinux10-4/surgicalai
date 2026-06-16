@@ -12737,7 +12737,12 @@ async def run_natural_pipeline_stream(
                 # "re-emit everything" makes it drop the rest). For anything sizeable, steer
                 # to a TARGETED old_code/new_code edit which is spliced into the full symbol
                 # server-side. Small symbols may still be re-emitted whole.
-                _sym_line_count = len(symbol.code.splitlines())
+                # Use the ACTUAL broken code size (cs["new_code"]) for format
+                # decision, not the original symbol size. Prior correction
+                # rounds may have expanded the code (e.g. 102 → 124 lines),
+                # and the model needs to return code at the current size.
+                _sym_line_count = len(cs["new_code"].splitlines())
+                _orig_line_count = len(symbol.code.splitlines())
                 _qa_score_val = qa_d.get("qa_score") or 0
                 # Very large symbols (300+ lines) MUST always use targeted edits —
                 # Claude physically cannot re-emit thousands of lines in a
@@ -12754,6 +12759,7 @@ async def run_natural_pipeline_stream(
                       session_id=session_id, user_id=user_id,
                       symbol=symbol.name,
                       sym_line_count=_sym_line_count,
+                      orig_line_count=_orig_line_count,
                       qa_score=_qa_score_val,
                       is_large_symbol=_is_large_symbol,
                       threshold_reason="300+ lines" if _sym_line_count > 300 else
@@ -12802,6 +12808,21 @@ async def run_natural_pipeline_stream(
                             f"YOUR BROKEN EDIT (lines {_ws1}–{_we1} — fix this):\n"
                             f"```\n{_window_info['numbered_broken']}\n```"
                         )
+                        # ── Suffix context: show a few lines after the window
+                        # so the correction agent knows what comes next and
+                        # won't re-emit those lines in its output.
+                        _sfx_all = cs["new_code"].splitlines()
+                        _sfx_start = _window_info["window_end"] + 1  # 0-indexed
+                        _sfx_count = min(5, len(_sfx_all) - _sfx_start)
+                        if _sfx_count > 0:
+                            _sfx_preview = "\n".join(
+                                f"{_sfx_start + i + 1:4d} | {_sfx_all[_sfx_start + i]}"
+                                for i in range(_sfx_count)
+                            )
+                            _broken_code_block += (
+                                f"\n\nLINES AFTER YOUR WINDOW (read-only — do NOT include these in your output):\n"
+                                f"```\n{_sfx_preview}\n```"
+                            )
                         _dlog("correction_windowed_prompt",
                               session_id=session_id, user_id=user_id,
                               symbol=symbol.name,
@@ -13260,6 +13281,28 @@ async def run_natural_pipeline_stream(
                                 else:
                                     _corrected_lines = list(_raw_corrected)
 
+                                # ── Boundary dedup: strip lines at end of corrected
+                                # window that duplicate the start of the untouched suffix.
+                                # The correction agent sometimes re-emits closing lines
+                                # (e.g. `""")`) that already exist right after the window,
+                                # causing duplicate code at the splice seam.
+                                _suffix_lines_after = _broken_lines[_we_0 + 1:]
+                                if _suffix_lines_after and _corrected_lines:
+                                    _max_ov = min(len(_corrected_lines), len(_suffix_lines_after), 10)
+                                    _overlap = 0
+                                    for _ov_k in range(1, _max_ov + 1):
+                                        if _corrected_lines[-_ov_k:] == _suffix_lines_after[:_ov_k]:
+                                            _overlap = _ov_k
+                                    if _overlap > 0:
+                                        _dlog("correction_windowed_boundary_dedup",
+                                              session_id=session_id, user_id=user_id,
+                                              retry_round=_qa_retry_round, idx=idx,
+                                              symbol=change_shells[idx]["symbol"].name,
+                                              overlap_lines=_overlap,
+                                              stripped=[l.rstrip() for l in _corrected_lines[-_overlap:]],
+                                              suffix_head=[l.rstrip() for l in _suffix_lines_after[:_overlap]])
+                                        _corrected_lines = _corrected_lines[:-_overlap]
+
                                 _expected_window_lines = _we_0 - _ws_0 + 1
                                 _line_delta = len(_corrected_lines) - _expected_window_lines
 
@@ -13487,6 +13530,19 @@ async def run_natural_pipeline_stream(
                         f"YOUR BROKEN EDIT (window {_mw_wi + 1} — lines {_mw_ws1}–{_mw_we1} — fix this):\n"
                         f"```\n{_mw_winfo['numbered_broken']}\n```"
                     )
+                    # ── Suffix context for multi-window (same as single-window) ──
+                    _mw_sfx_all = _mw_running_code.splitlines()
+                    _mw_sfx_start = _mw_winfo["window_end"] + 1
+                    _mw_sfx_count = min(5, len(_mw_sfx_all) - _mw_sfx_start)
+                    if _mw_sfx_count > 0:
+                        _mw_sfx_preview = "\n".join(
+                            f"{_mw_sfx_start + i + 1:4d} | {_mw_sfx_all[_mw_sfx_start + i]}"
+                            for i in range(_mw_sfx_count)
+                        )
+                        _mw_broken_block += (
+                            f"\n\nLINES AFTER YOUR WINDOW (read-only — do NOT include these in your output):\n"
+                            f"```\n{_mw_sfx_preview}\n```"
+                        )
                     _mw_prompt = (
                         f"QA reviewed your <surgical_edit> for `{_mw_sym.name}` in "
                         f"`{_mw_cs['filename']}` and found it BLOCKED (score "
@@ -13613,6 +13669,25 @@ async def run_natural_pipeline_stream(
                             ]
                         else:
                             _mw_corrected = list(_mw_raw_lines)
+
+                        # ── Boundary dedup (same logic as single-window) ──
+                        _mw_broken_lines_pre = _mw_running_code.splitlines()
+                        _mw_suffix_after = _mw_broken_lines_pre[_mw_we0 + 1:]
+                        if _mw_suffix_after and _mw_corrected:
+                            _mw_max_ov = min(len(_mw_corrected), len(_mw_suffix_after), 10)
+                            _mw_overlap = 0
+                            for _mw_ov_k in range(1, _mw_max_ov + 1):
+                                if _mw_corrected[-_mw_ov_k:] == _mw_suffix_after[:_mw_ov_k]:
+                                    _mw_overlap = _mw_ov_k
+                            if _mw_overlap > 0:
+                                _dlog("correction_multi_window_boundary_dedup",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=_mw_idx,
+                                      symbol=_mw_sym.name, window_idx=_mw_wi,
+                                      overlap_lines=_mw_overlap,
+                                      stripped=[l.rstrip() for l in _mw_corrected[-_mw_overlap:]],
+                                      suffix_head=[l.rstrip() for l in _mw_suffix_after[:_mw_overlap]])
+                                _mw_corrected = _mw_corrected[:-_mw_overlap]
 
                         # ── Splice into running code ──
                         _mw_broken_lines = _mw_running_code.splitlines()
