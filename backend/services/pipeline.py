@@ -11597,6 +11597,221 @@ async def run_natural_pipeline_stream(
                     else:
                         symbol, match_method = _fuzzy_find_symbol(smap, symbol_name)
 
+                # ── Fix C: Auto-resolve symbol from line numbers / old_code ──
+                # When the model targets the right CODE but names the wrong
+                # SYMBOL (common in mega-block HTML files where SymbolMap
+                # splits one <script> into script_8, script_9, etc.), verify
+                # the resolved symbol actually contains the edit target.
+                # If not, scan all symbols to find the correct one.
+                if symbol and smap and hasattr(smap, "symbols") and smap.symbols:
+                    _needs_resolve = False
+                    _resolve_reason = None
+
+                    _dlog("symbol_auto_resolve_check_entry",
+                          session_id=session_id,
+                          filename=filename,
+                          model_requested_symbol=symbol_name,
+                          resolved_symbol_name=symbol.name,
+                          resolved_symbol_range=(
+                              f"{symbol.start_line}-{symbol.end_line}"
+                          ),
+                          resolved_symbol_code_len=len(
+                              symbol.code or ""
+                          ),
+                          match_method=match_method,
+                          has_edit_start_line=bool(edit_start_line),
+                          edit_start_line=str(
+                              edit_start_line
+                          ) if edit_start_line else None,
+                          edit_end_line=str(
+                              edit_end_line
+                          ) if edit_end_line else None,
+                          has_old_code=bool(old_code),
+                          old_code_len=len(old_code) if old_code else 0,
+                          total_symbols=len(smap.symbols),
+                          user_id=user_id)
+
+                    # Check A: line-number targeting — edit lines within symbol?
+                    if edit_start_line and edit_end_line:
+                        _isl_check = int(edit_start_line)
+                        if not (symbol.start_line <= _isl_check <= symbol.end_line):
+                            _needs_resolve = True
+                            _resolve_reason = (
+                                f"edit_start_line={_isl_check} outside "
+                                f"{symbol.name} range "
+                                f"{symbol.start_line}-{symbol.end_line}"
+                            )
+                            _dlog("symbol_auto_resolve_check_a_mismatch",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  edit_start_line=_isl_check,
+                                  symbol_name=symbol.name,
+                                  symbol_start=symbol.start_line,
+                                  symbol_end=symbol.end_line,
+                                  reason=_resolve_reason,
+                                  user_id=user_id)
+                        else:
+                            _dlog("symbol_auto_resolve_check_a_ok",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  edit_start_line=_isl_check,
+                                  symbol_name=symbol.name,
+                                  symbol_start=symbol.start_line,
+                                  symbol_end=symbol.end_line,
+                                  verdict="line_within_symbol",
+                                  user_id=user_id)
+
+                    # Check B: old_code targeting — old_code present in symbol?
+                    elif old_code:
+                        _oc_stripped = old_code.strip()
+                        _sym_code = symbol.code or ""
+                        if _oc_stripped and _oc_stripped not in _sym_code:
+                            _needs_resolve = True
+                            _resolve_reason = (
+                                f"old_code ({len(old_code)} chars) not found "
+                                f"in {symbol.name} "
+                                f"({len(_sym_code)} chars, "
+                                f"L{symbol.start_line}-{symbol.end_line})"
+                            )
+                            _dlog("symbol_auto_resolve_check_b_mismatch",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  old_code_len=len(old_code),
+                                  old_code_preview=old_code[:200],
+                                  symbol_name=symbol.name,
+                                  symbol_code_len=len(_sym_code),
+                                  symbol_start=symbol.start_line,
+                                  symbol_end=symbol.end_line,
+                                  reason=_resolve_reason,
+                                  user_id=user_id)
+                        else:
+                            _dlog("symbol_auto_resolve_check_b_ok",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  old_code_len=len(old_code),
+                                  symbol_name=symbol.name,
+                                  symbol_code_len=len(_sym_code),
+                                  verdict="old_code_found_in_symbol",
+                                  user_id=user_id)
+                    else:
+                        _dlog("symbol_auto_resolve_check_skip",
+                              session_id=session_id,
+                              filename=filename,
+                              symbol_name=symbol.name,
+                              reason="no_edit_start_line_and_no_old_code",
+                              user_id=user_id)
+
+                    if _needs_resolve:
+                        _correct_sym = None
+                        _correct_method = None
+
+                        # Strategy 1: find symbol containing target line
+                        if edit_start_line and edit_end_line:
+                            _target_line = int(edit_start_line)
+                            _best_size = float("inf")
+                            _candidates_found = 0
+                            for _s in smap.symbols:
+                                if _s.start_line <= _target_line <= _s.end_line:
+                                    _candidates_found += 1
+                                    _s_size = _s.end_line - _s.start_line
+                                    # Pick the tightest (smallest) symbol
+                                    if _s_size < _best_size:
+                                        _best_size = _s_size
+                                        _correct_sym = _s
+                                        _correct_method = "auto_resolve_by_line"
+                            _dlog("symbol_auto_resolve_strategy1_result",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  target_line=_target_line,
+                                  candidates_found=_candidates_found,
+                                  found=bool(_correct_sym),
+                                  resolved_to=(
+                                      _correct_sym.name
+                                  ) if _correct_sym else None,
+                                  resolved_range=(
+                                      f"{_correct_sym.start_line}-"
+                                      f"{_correct_sym.end_line}"
+                                  ) if _correct_sym else None,
+                                  user_id=user_id)
+
+                        # Strategy 2: find symbol containing old_code text
+                        if not _correct_sym and old_code:
+                            _oc_stripped = old_code.strip()
+                            _best_size = float("inf")
+                            _candidates_found = 0
+                            for _s in smap.symbols:
+                                _s_code = _s.code or ""
+                                if _oc_stripped and _oc_stripped in _s_code:
+                                    _candidates_found += 1
+                                    _s_size = len(_s_code)
+                                    if _s_size < _best_size:
+                                        _best_size = _s_size
+                                        _correct_sym = _s
+                                        _correct_method = "auto_resolve_by_content"
+                            _dlog("symbol_auto_resolve_strategy2_result",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  old_code_len=len(old_code),
+                                  candidates_found=_candidates_found,
+                                  found=bool(_correct_sym),
+                                  resolved_to=(
+                                      _correct_sym.name
+                                  ) if _correct_sym else None,
+                                  resolved_range=(
+                                      f"{_correct_sym.start_line}-"
+                                      f"{_correct_sym.end_line}"
+                                  ) if _correct_sym else None,
+                                  user_id=user_id)
+
+                        if _correct_sym:
+                            _dlog("symbol_auto_resolved",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  original_symbol=symbol_name,
+                                  original_range=(
+                                      f"{symbol.start_line}-{symbol.end_line}"
+                                  ),
+                                  resolved_symbol=_correct_sym.name,
+                                  resolved_full_path=getattr(
+                                      _correct_sym, "full_path", ""
+                                  ),
+                                  resolved_range=(
+                                      f"{_correct_sym.start_line}-"
+                                      f"{_correct_sym.end_line}"
+                                  ),
+                                  resolved_code_len=len(
+                                      _correct_sym.code or ""
+                                  ),
+                                  resolve_method=_correct_method,
+                                  reason=_resolve_reason,
+                                  user_id=user_id)
+                            symbol = _correct_sym
+                            match_method = _correct_method
+                        else:
+                            _dlog("symbol_auto_resolve_failed",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  original_symbol=symbol_name,
+                                  original_range=(
+                                      f"{symbol.start_line}-{symbol.end_line}"
+                                  ),
+                                  resolve_reason=_resolve_reason,
+                                  available_symbols=[
+                                      (getattr(_s, "name", "?"),
+                                       _s.start_line, _s.end_line)
+                                      for _s in smap.symbols[:30]
+                                  ],
+                                  edit_start_line=str(
+                                      edit_start_line
+                                  ) if edit_start_line else None,
+                                  old_code_preview=(
+                                      old_code[:200]
+                                  ) if old_code else None,
+                                  user_id=user_id)
+                            # Don't block — let the original symbol path
+                            # proceed and fail naturally with existing
+                            # snippet_apply_failed logging.
+
                 if symbol:
                     # ── Targeted (snippet) edit ──────────────────────────────
                     # When Claude supplies an old_code snippet instead of the
