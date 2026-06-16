@@ -8,6 +8,7 @@ import { toast } from '../lib/toast'
 import type { SmartResult, NewFile } from '../types'
 import { InlineDiffCard } from './InlineDiffCard'
 import { Add, Check, ContentCopy, Description, FileDownload, KeyboardArrowDown, KeyboardArrowUp } from '@mui/icons-material';
+import { DownloadAllButton } from './DownloadAllButton'
 
 const LANG_LABELS: Record<string, string> = {
   typescript: 'TypeScript', tsx: 'TSX', javascript: 'JavaScript',
@@ -265,9 +266,12 @@ export function NewFileCard({ result, sessionId }: NewFileCardProps) {
             </span>
           )}
         </div>
-        {result.summary && (
-          <span className="text-[12px] text-muted truncate max-w-xs">{result.summary}</span>
-        )}
+        <div className="flex items-center gap-2">
+          <DownloadAllButton files={newFiles.map(f => ({ filename: f.filename, content: f.content }))} />
+          {result.summary && (
+            <span className="text-[12px] text-muted truncate max-w-xs">{result.summary}</span>
+          )}
+        </div>
       </div>
 
       {/* File cards */}
