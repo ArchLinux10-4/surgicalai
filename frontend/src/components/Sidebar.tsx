@@ -12,6 +12,7 @@ import { RailwayPanel } from './RailwayPanel'
 import { useThemeStore } from '../stores/themeStore'
 import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, PushPin, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile } from '../lib/fileClassify'
+import { DownloadSessionButton } from './DownloadSessionButton'
 
 // ── File icon helper ─────────────────────────────────────────────────────────
 const FILE_ICONS: Record<string, string> = {
@@ -518,7 +519,7 @@ function getFileIcon(filename: string) {
 }
 
 function SessionFilesPanel() {
-  const { sessionFiles, removeSessionFile, addSessionFile, fileFilter } = useAppStore()
+  const { sessionFiles, removeSessionFile, addSessionFile, fileFilter, activeSessions } = useAppStore()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const counts = fileCounts(sessionFiles)
   const visibleFiles = sessionFiles.filter(f => matchesFileFilter(f, fileFilter))
@@ -566,13 +567,21 @@ function SessionFilesPanel() {
             ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''}`
             : 'No files yet'}
         </span>
-        <button
-          onClick={() => fileInputRef.current?.click()}
-          className="flex items-center gap-1 px-2 py-1 rounded-lg bg-accent/10 text-accent text-[11px] font-semibold hover:bg-accent/20 transition-colors"
-          title="Upload files"
-        >
-          <FileUpload sx={{ fontSize: 11 }} /> Add
-        </button>
+        <div className="flex items-center gap-1.5">
+          {activeSessions && sessionFiles.length >= 2 && (
+            <DownloadSessionButton
+              sessionId={activeSessions}
+              sessionFiles={sessionFiles}
+            />
+          )}
+          <button
+            onClick={() => fileInputRef.current?.click()}
+            className="flex items-center gap-1 px-2 py-1 rounded-lg bg-accent/10 text-accent text-[11px] font-semibold hover:bg-accent/20 transition-colors"
+            title="Upload files"
+          >
+            <FileUpload sx={{ fontSize: 11 }} /> Add
+          </button>
+        </div>
         <input
           ref={fileInputRef}
           type="file"

@@ -6,6 +6,7 @@ import { useAppStore } from '../stores/appStore'
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isSpreadsheetFile } from '../lib/fileClassify'
 import { DataLabModal } from './DataLabModal'
 import { GitHub } from '@mui/icons-material';
+import { DownloadSessionButton } from './DownloadSessionButton'
 
 interface SessionFilesTrayProps {
   sessionId: string
@@ -175,6 +176,12 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
           </button>
 
           <div className="flex items-center gap-2 shrink-0 pl-2">
+            {sessionFiles.length >= 2 && (
+              <DownloadSessionButton
+                sessionId={sessionId}
+                sessionFiles={sessionFiles}
+              />
+            )}
             {hasGithubFiles && (
               <button
                 onClick={() => setShowCommitModal(true)}
