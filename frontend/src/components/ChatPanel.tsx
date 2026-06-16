@@ -1606,7 +1606,7 @@ export function ChatPanel() {
         )}
 
         {/* Unified input pill — Claude/Tasklet style */}
-        <div className="relative bg-surface/80 border border-border/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-border focus-within:shadow-accent/5 transition-all">
+        <div className="flex flex-col bg-surface/80 border border-border/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-border focus-within:shadow-accent/5 transition-all">
           <textarea
             ref={textareaRef}
             value={input}
@@ -1626,10 +1626,10 @@ export function ChatPanel() {
               el.style.height = 'auto'
               el.style.height = Math.min(el.scrollHeight, 200) + 'px'
             }}
-            className="w-full bg-transparent text-sm text-ink placeholder:text-muted/70 resize-none pl-4 pr-4 pt-3 pb-14 focus:outline-none leading-relaxed font-[inherit] min-h-[56px] max-h-[200px] overflow-y-auto"
+            className="w-full bg-transparent text-sm text-ink placeholder:text-muted/70 resize-none px-4 pt-3 pb-2 focus:outline-none leading-relaxed font-[inherit] min-h-[44px] max-h-[200px] overflow-y-auto"
           />
-          {/* Bottom toolbar inside pill */}
-          <div className="absolute bottom-0 left-0 right-0 flex items-center justify-between px-2 pb-2">
+          {/* Bottom toolbar — flex row below textarea, never overlaps */}
+          <div className="flex items-center justify-between px-2 pb-2">
             <div className="flex items-center gap-1">
               <button
                 onClick={() => fileInputRef.current?.click()}
