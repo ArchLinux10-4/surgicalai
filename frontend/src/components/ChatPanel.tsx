@@ -13,6 +13,7 @@ import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
 import { VoiceButton } from './VoiceButton'
+import { DownloadSessionButton } from './DownloadSessionButton'
 import { validateFileSize } from '../utils/fileValidation'
 
 // ── Strip internal protocol tags from model output ────────────────────────────
@@ -1553,14 +1554,18 @@ export function ChatPanel() {
         <div ref={bottomRef} />
       </div>
 
-      {/* Apply All — single click to apply every pending change across all files */}
+      {/* Apply All + Download All — session-level action bar */}
       {activeSessions && !isStreaming && (
-        <div className="px-3 pt-2 flex-shrink-0">
+        <div className="px-3 pt-2 flex-shrink-0 flex items-center gap-2">
           <ApplyAllButton
             messages={messages}
             sessionId={activeSessions}
             sessionFiles={sessionFiles}
             setSessionFiles={setSessionFiles}
+          />
+          <DownloadSessionButton
+            sessionId={activeSessions}
+            sessionFiles={sessionFiles}
           />
         </div>
       )}
