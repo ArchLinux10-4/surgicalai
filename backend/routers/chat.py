@@ -152,23 +152,36 @@ def search_chats(request: Request, q: str):
 # ---------------------------------------------------------------------------
 import openai as _openai_mod
 
+# Token-aware compaction settings
+HISTORY_TOKEN_BUDGET = 30_000  # Max estimated tokens before compaction triggers
+MIN_RECENT_KEEP = 6            # Always keep at least this many recent messages
+
 async def _compact_session(session_id: str, user_id: str) -> str:
     """
-    Compact oldest 14 uncompacted messages into session_summary.
-    Uses GPT-4.1-mini (fast + cheap).
+    Token-aware compaction: compact oldest uncompacted messages, keeping
+    MIN_RECENT_KEEP recent ones. Uses GPT-4.1-mini (fast + cheap).
     Returns the new summary string.
     """
     db = get_db()
     try:
-        to_compact = db.execute(
+        all_uncompacted = db.execute(
             "SELECT id, role, content FROM chat_messages "
             "WHERE session_id = ? AND is_compacted = 0 "
-            "ORDER BY created_at ASC LIMIT 14",
+            "ORDER BY created_at ASC",
             (session_id,)
         ).fetchall()
+        if not all_uncompacted or len(all_uncompacted) <= MIN_RECENT_KEEP:
+            db.close()
+            return ""
+
+        # Keep MIN_RECENT_KEEP most recent, compact everything else
+        to_compact = all_uncompacted[:-MIN_RECENT_KEEP]
         if not to_compact:
             db.close()
             return ""
+        _dlog("compact_token_aware", session_id=session_id,
+              total_uncompacted=len(all_uncompacted),
+              compacting=len(to_compact), keeping=MIN_RECENT_KEEP)
 
         session_row = db.execute(
             "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
@@ -568,13 +581,6 @@ async def smart_stream(req: dict, request: Request):
         (msg_id, session_id, "user", message)
     )
 
-    # Check if compaction is needed (>= 20 uncompacted messages)
-    uc_count = conn.execute(
-        "SELECT COUNT(*) FROM chat_messages WHERE session_id = ? AND is_compacted = 0",
-        (session_id,)
-    ).fetchone()
-    needs_compaction = int(list(uc_count.values())[0] if hasattr(uc_count, 'values') else uc_count[0]) >= 20
-
     # Load session_summary
     sess_row = conn.execute(
         "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
@@ -587,6 +593,13 @@ async def smart_stream(req: dict, request: Request):
         (session_id,)
     ).fetchall()
     conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
+
+    # Token-aware compaction trigger: estimate tokens from loaded history
+    _history_tokens = sum(len(h.get("content") or "") for h in conversation_history) // 4
+    needs_compaction = _history_tokens > HISTORY_TOKEN_BUDGET
+    _dlog("compaction_check", session_id=session_id,
+          history_tokens=_history_tokens, budget=HISTORY_TOKEN_BUDGET,
+          msg_count=len(conversation_history), needs_compaction=needs_compaction)
 
     # Load session files
     file_rows = conn.execute(
