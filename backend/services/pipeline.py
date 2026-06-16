@@ -11763,6 +11763,66 @@ async def run_natural_pipeline_stream(
                                   ) if _correct_sym else None,
                                   user_id=user_id)
 
+                        # Strategy 3: Gap Bridge — create synthetic whole-file
+                        # symbol when SymbolMap has coverage gaps.  Common in
+                        # mega HTML files where a 6000+ line <script> block is
+                        # only partially mapped (e.g. first 100 lines captured
+                        # as script_8, rest is gap).  Uses the same whole-file
+                        # SymbolInfo pattern as the no-symbol fallback above
+                        # (L11558-11568).  All gap bridge edits for the same
+                        # file share the name "_gap_bridge" so _symbol_accum
+                        # chains them correctly (bottom-to-top sort safe).
+                        if not _correct_sym and edit_start_line and file_content:
+                            _fc_lines = file_content.split("\n")
+                            _fc_total = len(_fc_lines)
+                            _target_line = int(edit_start_line)
+                            _target_end = int(edit_end_line) if edit_end_line else _target_line
+                            if 1 <= _target_line <= _fc_total:
+                                try:
+                                    from models.schemas import (
+                                        SymbolInfo as _SI_gap,
+                                        SymbolType as _ST_gap,
+                                    )
+                                    _correct_sym = _SI_gap(
+                                        name="_gap_bridge",
+                                        symbol_type=_ST_gap.VARIABLE,
+                                        start_line=1,
+                                        end_line=_fc_total,
+                                        parent=None,
+                                        indentation=0,
+                                        code=file_content,
+                                    )
+                                    _correct_method = "gap_bridge_whole_file"
+                                    _dlog("symbol_auto_resolve_gap_bridge",
+                                          session_id=session_id,
+                                          filename=filename,
+                                          target_line=_target_line,
+                                          target_end=_target_end,
+                                          file_total_lines=_fc_total,
+                                          original_symbol=symbol_name,
+                                          original_range=(
+                                              f"{symbol.start_line}-"
+                                              f"{symbol.end_line}"
+                                          ),
+                                          created=True,
+                                          reason="no_symbol_covers_target_line",
+                                          user_id=user_id)
+                                except Exception as _gap_err:
+                                    _dlog("symbol_auto_resolve_gap_bridge_error",
+                                          session_id=session_id,
+                                          filename=filename,
+                                          target_line=_target_line,
+                                          error=str(_gap_err)[:200],
+                                          user_id=user_id)
+                            else:
+                                _dlog("symbol_auto_resolve_gap_bridge_skip",
+                                      session_id=session_id,
+                                      filename=filename,
+                                      target_line=_target_line,
+                                      file_total_lines=_fc_total,
+                                      reason="target_line_outside_file_bounds",
+                                      user_id=user_id)
+
                         if _correct_sym:
                             _dlog("symbol_auto_resolved",
                                   session_id=session_id,
