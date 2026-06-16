@@ -959,17 +959,25 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     <Cancel sx={{ fontSize: 9 }} /> Skipped
                   </span>
                 )}
-                {isApplied && (
-                  <button
-                    onClick={() => handleUndo(change)}
-                    disabled={undoing[change.id]}
-                    className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors disabled:opacity-50"
-                    title="Revert this change"
-                  >
-                    <Replay sx={{ fontSize: 11 }} />
-                    {undoing[change.id] ? 'Reverting...' : 'Undo'}
-                  </button>
-                )}
+                {isApplied && (() => {
+                  const totalApplied = Object.values(applied).filter(Boolean).length
+                  const canUndo = totalApplied === 1
+                  return (
+                    <button
+                      onClick={() => canUndo && handleUndo(change)}
+                      disabled={!canUndo || undoing[change.id]}
+                      className={`flex items-center gap-1 px-2 py-1 bg-surface border border-border rounded-lg text-[11px] font-semibold transition-colors ${
+                        canUndo
+                          ? 'text-muted hover:bg-overlay hover:text-ink cursor-pointer'
+                          : 'text-muted/40 cursor-not-allowed'
+                      }`}
+                      title={canUndo ? 'Revert this change' : 'Undo is only available when one change is applied. Download the file to save your current version.'}
+                    >
+                      <Replay sx={{ fontSize: 11 }} />
+                      {undoing[change.id] ? 'Reverting...' : 'Undo'}
+                    </button>
+                  )
+                })()}
 
                 <button
                   onClick={() => toggleDiff(change.id)}
