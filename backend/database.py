@@ -151,6 +151,25 @@ def get_db():
         return conn
 
 
+from contextlib import contextmanager
+
+@contextmanager
+def get_db_ctx():
+    """Context-managed DB connection — guarantees close() even on exception.
+
+    Usage:
+        with get_db_ctx() as conn:
+            conn.execute(...)
+            conn.commit()
+        # conn.close() called automatically, even if an exception occurred.
+    """
+    conn = get_db()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def init_db():
     if USE_POSTGRES:
         _init_postgres()

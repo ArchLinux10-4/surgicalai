@@ -7,7 +7,7 @@ from models.schemas import (
     SurgicalApplyRequest, SurgicalApplyResponse,
     SurgicalChange
 )
-from database import get_setting, get_db
+from database import get_setting, get_db_ctx
 from services.pipeline import analyze_and_plan, analyze_and_plan_stream
 from services.surgical_editor import apply_changes_to_file
 
@@ -50,12 +50,11 @@ async def analyze_stream(req: SurgicalAnalyzeRequest):
         raise HTTPException(status_code=401, detail="No AI API key configured. Go to Settings to add your OpenAI, Anthropic, or Gemini key.")
 
     workspace = get_setting("workspace_path", "")
-    conn = get_db()
-    memory_row = conn.execute(
-        "SELECT content FROM project_memory WHERE workspace_path = ? LIMIT 1", (workspace,)
-    ).fetchone() if workspace else None
-    project_memory = memory_row["content"] if memory_row else None
-    conn.close()
+    with get_db_ctx() as conn:
+        memory_row = conn.execute(
+            "SELECT content FROM project_memory WHERE workspace_path = ? LIMIT 1", (workspace,)
+        ).fetchone() if workspace else None
+        project_memory = memory_row["content"] if memory_row else None
 
     async def generate():
         async for chunk in analyze_and_plan_stream(
@@ -81,18 +80,17 @@ def apply(req: SurgicalApplyRequest):
         )
 
         # Record in change history
-        conn = get_db()
-        for change in req.changes:
-            if change.id == req.change_id:
-                conn.execute(
-                    """INSERT OR REPLACE INTO change_history
-                       (id, file_path, symbol_path, original_code, new_code, applied)
-                       VALUES (?, ?, ?, ?, ?, 1)""",
-                    (change.id, req.file_path, change.symbol.full_path,
-                     change.original_code, change.new_code)
-                )
-        conn.commit()
-        conn.close()
+        with get_db_ctx() as conn:
+            for change in req.changes:
+                if change.id == req.change_id:
+                    conn.execute(
+                        """INSERT OR REPLACE INTO change_history
+                           (id, file_path, symbol_path, original_code, new_code, applied)
+                           VALUES (?, ?, ?, ?, ?, 1)""",
+                        (change.id, req.file_path, change.symbol.full_path,
+                         change.original_code, change.new_code)
+                    )
+            conn.commit()
 
         return result
     except FileNotFoundError as e:
@@ -125,103 +123,96 @@ def apply_all(req: SurgicalApplyRequest):
 @router.get("/history")
 def get_history(file_path: str = None, limit: int = 50):
     """Get surgical change history."""
-    conn = get_db()
-    if file_path:
-        rows = conn.execute(
-            "SELECT * FROM change_history WHERE file_path = ? ORDER BY created_at DESC LIMIT ?",
-            (file_path, limit)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM change_history ORDER BY created_at DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with get_db_ctx() as conn:
+        if file_path:
+            rows = conn.execute(
+                "SELECT * FROM change_history WHERE file_path = ? ORDER BY created_at DESC LIMIT ?",
+                (file_path, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM change_history ORDER BY created_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 @router.get("/qa-log")
 def get_qa_log(session_id: str = None, limit: int = 100):
     """Admin: view QA log entries. Proof that QA ran on every edit."""
-    conn = get_db()
-    if session_id:
-        rows = conn.execute(
-            "SELECT * FROM qa_log WHERE session_id = ? ORDER BY ran_at DESC LIMIT ?",
-            (session_id, limit)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM qa_log ORDER BY ran_at DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with get_db_ctx() as conn:
+        if session_id:
+            rows = conn.execute(
+                "SELECT * FROM qa_log WHERE session_id = ? ORDER BY ran_at DESC LIMIT ?",
+                (session_id, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM qa_log ORDER BY ran_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 @router.get("/compliance-log")
 def get_compliance_log(session_id: str = None, limit: int = 50):
     """Admin: view pipeline compliance records. Proves all required steps ran."""
-    conn = get_db()
-    if session_id:
-        rows = conn.execute(
-            "SELECT * FROM compliance_log WHERE session_id = ? ORDER BY ran_at DESC LIMIT ?",
-            (session_id, limit)
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM compliance_log ORDER BY ran_at DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with get_db_ctx() as conn:
+        if session_id:
+            rows = conn.execute(
+                "SELECT * FROM compliance_log WHERE session_id = ? ORDER BY ran_at DESC LIMIT ?",
+                (session_id, limit)
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM compliance_log ORDER BY ran_at DESC LIMIT ?",
+                (limit,)
+            ).fetchall()
+        return [dict(r) for r in rows]
 
 
 @router.post("/applied/{session_id}/{change_id}")
 def mark_change_applied(session_id: str, change_id: str):
     """Persist that a user applied a change — survives page refresh."""
-    conn = get_db()
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS applied_changes
-           (session_id TEXT NOT NULL, change_id TEXT NOT NULL,
-            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (session_id, change_id))"""
-    )
-    conn.execute(
-        "INSERT OR IGNORE INTO applied_changes (session_id, change_id) VALUES (?, ?)",
-        (session_id, change_id)
-    )
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS applied_changes
+               (session_id TEXT NOT NULL, change_id TEXT NOT NULL,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (session_id, change_id))"""
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO applied_changes (session_id, change_id) VALUES (?, ?)",
+            (session_id, change_id)
+        )
+        conn.commit()
     return {"ok": True}
 
 
 @router.delete("/applied/{session_id}/{change_id}")
 def unmark_change_applied(session_id: str, change_id: str):
     """Remove applied state (undo support)."""
-    conn = get_db()
-    conn.execute(
-        "DELETE FROM applied_changes WHERE session_id = ? AND change_id = ?",
-        (session_id, change_id)
-    )
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        conn.execute(
+            "DELETE FROM applied_changes WHERE session_id = ? AND change_id = ?",
+            (session_id, change_id)
+        )
+        conn.commit()
     return {"ok": True}
 
 
 @router.get("/applied/{session_id}")
 def get_applied_changes(session_id: str):
     """Return all applied change IDs for a session — used on page load."""
-    conn = get_db()
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS applied_changes
-           (session_id TEXT NOT NULL, change_id TEXT NOT NULL,
-            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (session_id, change_id))"""
-    )
-    rows = conn.execute(
-        "SELECT change_id FROM applied_changes WHERE session_id = ?",
-        (session_id,)
-    ).fetchall()
-    conn.close()
-    return {"applied_ids": [r["change_id"] for r in rows]}
-
+    with get_db_ctx() as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS applied_changes
+               (session_id TEXT NOT NULL, change_id TEXT NOT NULL,
+                applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (session_id, change_id))"""
+        )
+        rows = conn.execute(
+            "SELECT change_id FROM applied_changes WHERE session_id = ?",
+            (session_id,)
+        ).fetchall()
+        return {"applied_ids": [r["change_id"] for r in rows]}

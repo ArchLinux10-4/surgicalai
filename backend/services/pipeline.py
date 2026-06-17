@@ -43,22 +43,21 @@ def _dlog(event: str, **kwargs):
 
         # ── Primary: write to database (survives deploys/restarts) ──
         try:
-            from database import get_db
-            conn = get_db()
-            session_id = str(kwargs.get("session_id", ""))
-            user_id = str(kwargs.get("user_id", ""))
-            data_json = _json_mod.dumps(record, default=str)
-            conn.execute(
-                "INSERT INTO debug_events (id, event, session_id, user_id, data, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (str(_uuid_dlog.uuid4()), event, session_id, user_id, data_json, ts),
-            )
-            # Probabilistic cleanup: ~1 in 50 calls, expire old entries
-            if _rnd_dlog.random() < 0.02:
-                cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=_DLOG_EXPIRE_DAYS)).isoformat()
-                conn.execute("DELETE FROM debug_events WHERE created_at < ?", (cutoff,))
-            conn.commit()
-            conn.close()
+            from database import get_db_ctx
+            with get_db_ctx() as conn:
+                session_id = str(kwargs.get("session_id", ""))
+                user_id = str(kwargs.get("user_id", ""))
+                data_json = _json_mod.dumps(record, default=str)
+                conn.execute(
+                    "INSERT INTO debug_events (id, event, session_id, user_id, data, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (str(_uuid_dlog.uuid4()), event, session_id, user_id, data_json, ts),
+                )
+                # Probabilistic cleanup: ~1 in 50 calls, expire old entries
+                if _rnd_dlog.random() < 0.02:
+                    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=_DLOG_EXPIRE_DAYS)).isoformat()
+                    conn.execute("DELETE FROM debug_events WHERE created_at < ?", (cutoff,))
+                conn.commit()
         except Exception:
             pass  # DB write failed — file fallback still works
 

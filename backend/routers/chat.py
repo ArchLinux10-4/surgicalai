@@ -6,7 +6,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from models.schemas import ChatRequest, NewSessionRequest, ChatSession
-from database import get_db, get_setting, get_user_api_key, GLOBAL_MEMORY_KEY
+from database import get_db, get_db_ctx, get_setting, get_user_api_key, GLOBAL_MEMORY_KEY
 from services.pipeline import run_chat, run_chat_stream, _dlog
 
 router = APIRouter()
@@ -77,13 +77,12 @@ def _load_effective_memory(conn, session_id):
 def create_session(req: NewSessionRequest, request: Request):
     session_id = str(uuid.uuid4())
     user_id = getattr(request.state, "user_id", None)
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO chat_sessions (id, title, file_path, model, user_id) VALUES (?, ?, ?, ?, ?)",
-        (session_id, req.title, req.file_path, req.model or get_setting("architect_model", "gpt-4.1"), user_id)
-    )
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        conn.execute(
+            "INSERT INTO chat_sessions (id, title, file_path, model, user_id) VALUES (?, ?, ?, ?, ?)",
+            (session_id, req.title, req.file_path, req.model or get_setting("architect_model", "gpt-4.1"), user_id)
+        )
+        conn.commit()
     return {"id": session_id, "title": req.title}
 
 @router.get("/search")
@@ -95,55 +94,55 @@ def search_chats(request: Request, q: str):
     if not q:
         return []
     like = f"%{q}%"
-    conn = get_db()
-    # Query A: sessions matching by title
-    session_rows = conn.execute(
-        "SELECT id, title FROM chat_sessions WHERE user_id = ? AND LOWER(title) LIKE LOWER(?)",
-        (user_id, like)
-    ).fetchall()
-    # Query B: messages matching content
-    message_rows = conn.execute(
-        "SELECT m.id, m.session_id, m.role, m.content, m.created_at, s.title FROM chat_messages m JOIN chat_sessions s ON s.id = m.session_id WHERE s.user_id = ? AND LOWER(m.content) LIKE LOWER(?)",
-        (user_id, like)
-    ).fetchall()
-    results_dict = {}
-    # Seed with sessions from Query A
-    for row in session_rows:
-        results_dict[row["id"]] = {
-            "session_id": row["id"],
-            "session_name": row["title"],
-            "matched_messages": []
-        }
-    # Add messages from Query B
-    for m in message_rows:
-        sid = m["session_id"]
-        if sid not in results_dict:
-            results_dict[sid] = {
-                "session_id": sid,
-                "session_name": m["title"],
+    with get_db_ctx() as conn:
+        # Query A: sessions matching by title
+        session_rows = conn.execute(
+            "SELECT id, title FROM chat_sessions WHERE user_id = ? AND LOWER(title) LIKE LOWER(?)",
+            (user_id, like)
+        ).fetchall()
+        # Query B: messages matching content
+        message_rows = conn.execute(
+            "SELECT m.id, m.session_id, m.role, m.content, m.created_at, s.title FROM chat_messages m JOIN chat_sessions s ON s.id = m.session_id WHERE s.user_id = ? AND LOWER(m.content) LIKE LOWER(?)",
+            (user_id, like)
+        ).fetchall()
+        results_dict = {}
+        # Seed with sessions from Query A
+        for row in session_rows:
+            results_dict[row["id"]] = {
+                "session_id": row["id"],
+                "session_name": row["title"],
                 "matched_messages": []
             }
-        results_dict[sid]["matched_messages"].append({
-            "message_id": m["id"],
-            "role": m["role"],
-            "content_snippet": (m["content"] or "")[:200],
-            "created_at": m["created_at"]
-        })
-    # For sessions from Query A with no matched_messages, fetch matching messages in that session
-    for sid, entry in results_dict.items():
-        if not entry["matched_messages"]:
-            extra_rows = conn.execute(
-                "SELECT id, role, content, created_at FROM chat_messages WHERE session_id = ? AND LOWER(content) LIKE LOWER(?)",
-                (sid, like)
-            ).fetchall()
-            for m in extra_rows:
-                entry["matched_messages"].append({
-                    "message_id": m["id"],
-                    "role": m["role"],
-                    "content_snippet": (m["content"] or "")[:200],
-                    "created_at": m["created_at"]
-                })
-    return list(results_dict.values())
+        # Add messages from Query B
+        for m in message_rows:
+            sid = m["session_id"]
+            if sid not in results_dict:
+                results_dict[sid] = {
+                    "session_id": sid,
+                    "session_name": m["title"],
+                    "matched_messages": []
+                }
+            results_dict[sid]["matched_messages"].append({
+                "message_id": m["id"],
+                "role": m["role"],
+                "content_snippet": (m["content"] or "")[:200],
+                "created_at": m["created_at"]
+            })
+        # For sessions from Query A with no matched_messages, fetch matching messages in that session
+        for sid, entry in results_dict.items():
+            if not entry["matched_messages"]:
+                extra_rows = conn.execute(
+                    "SELECT id, role, content, created_at FROM chat_messages WHERE session_id = ? AND LOWER(content) LIKE LOWER(?)",
+                    (sid, like)
+                ).fetchall()
+                for m in extra_rows:
+                    entry["matched_messages"].append({
+                        "message_id": m["id"],
+                        "role": m["role"],
+                        "content_snippet": (m["content"] or "")[:200],
+                        "created_at": m["created_at"]
+                    })
+        return list(results_dict.values())
 
 
 
@@ -162,177 +161,170 @@ async def _compact_session(session_id: str, user_id: str) -> str:
     MIN_RECENT_KEEP recent ones. Uses GPT-4.1-mini (fast + cheap).
     Returns the new summary string.
     """
-    db = get_db()
-    try:
-        all_uncompacted = db.execute(
-            "SELECT id, role, content FROM chat_messages "
-            "WHERE session_id = ? AND is_compacted = 0 "
-            "ORDER BY created_at ASC",
-            (session_id,)
-        ).fetchall()
-        if not all_uncompacted or len(all_uncompacted) <= MIN_RECENT_KEEP:
-            db.close()
-            return ""
-
-        # Keep MIN_RECENT_KEEP most recent, compact everything else
-        to_compact = all_uncompacted[:-MIN_RECENT_KEEP]
-        if not to_compact:
-            db.close()
-            return ""
-        _dlog("compact_token_aware", session_id=session_id,
-              total_uncompacted=len(all_uncompacted),
-              compacting=len(to_compact), keeping=MIN_RECENT_KEEP)
-
-        session_row = db.execute(
-            "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-        existing = (session_row["session_summary"] if session_row and session_row["session_summary"] else "") or ""
-
-        turns_text_parts = []
-        for r in to_compact:
-            row = dict(r)
-            role = row.get("role", "user").upper()
-            raw = str(row.get("content", ""))
-
-            # Clean stored format — same logic as _clean_history_content()
-            # so the summarizer sees readable text, not raw JSON blobs
-            if raw.startswith("__NATURAL_AND_RESULT__:"):
-                try:
-                    import json as _j
-                    payload = _j.loads(raw[len("__NATURAL_AND_RESULT__:"):])
-                    text = payload.get("text", "").strip()
-                    result = payload.get("result", {})
-                    changes = []
-                    for _fname, _fdata in result.get("changes_by_file", {}).items():
-                        for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
-                            sym = ch.get("symbol", {})
-                            name = (sym.get("name") or sym.get("full_path", "")) if isinstance(sym, dict) else ""
-                            if name:
-                                changes.append(f"{_fname}::{name}")
-                    qa_flags = []
-                    for _fname, _fdata in result.get("changes_by_file", {}).items():
-                        for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
-                            qr = ch.get("qa_result") or {}
-                            verdict = qr.get("verdict", "")
-                            summary = (qr.get("summary") or "").strip()
-                            sym = ch.get("symbol", {})
-                            name = (sym.get("name") or "") if isinstance(sym, dict) else ""
-                            if verdict in ("warning", "blocked") and summary:
-                                qa_flags.append(f"{name}: {summary}")
-                    if changes:
-                        text += f" [Changed: {', '.join(changes[:4])}]"
-                    if qa_flags:
-                        text += f" [QA flagged: {'; '.join(qa_flags[:2])}]"
-                    cleaned = text or "Made code changes."
-                except Exception:
-                    cleaned = "Made code changes."
-            elif raw.startswith("__SURGICAL_RESULT__:"):
-                cleaned = "Made code changes (surgical edit)."
-            else:
-                cleaned = raw
-
-            turns_text_parts.append(f"{role}: {cleaned[:500]}")
-
-        turns_text = "\n".join(turns_text_parts)
-        prompt_parts = []
-        if existing:
-            prompt_parts.append(f"Previous summary:\n{existing}\n")
-        prompt_parts.append(f"New conversation turns to add:\n{turns_text}")
-
-        compact_prompt = (
-            "Summarize this coding assistant conversation history. "
-            "Focus on: what files were discussed, what code changes were made or planned, "
-            "key decisions, and any patterns or conventions established. "
-            "Be concise but complete. Under 400 words. Use bullet points."
-        )
-
-        openai_key = get_setting("openai_api_key") or (get_user_api_key(user_id, "openai") if user_id else "")
-        anthropic_key = get_setting("anthropic_api_key") or (get_user_api_key(user_id, "anthropic") if user_id else "")
-
-        new_summary = ""
-        if openai_key:
-            client = _openai_mod.AsyncOpenAI(api_key=openai_key)
-            resp = await client.chat.completions.create(
-                model="gpt-4.1-mini",
-                messages=[
-                    {"role": "system", "content": compact_prompt},
-                    {"role": "user", "content": "\n".join(prompt_parts)}
-                ],
-                max_tokens=500,
-            )
-            new_summary = resp.choices[0].message.content or ""
-        elif anthropic_key:
-            from anthropic import AsyncAnthropic as _AsyncAnthropic
-            aclient = _AsyncAnthropic(api_key=anthropic_key)
-            resp = await aclient.messages.create(
-                model="claude-haiku-4-5-20251001",
-                max_tokens=500,
-                system=compact_prompt,
-                messages=[{"role": "user", "content": "\n".join(prompt_parts)}],
-            )
-            new_summary = resp.content[0].text if resp.content else ""
-        else:
-            db.close()
-            return existing
-
-        ids = [dict(r)["id"] for r in to_compact]
-        placeholders = ",".join(["?" for _ in ids])
-        db.execute(
-            f"UPDATE chat_messages SET is_compacted = 1 WHERE id IN ({placeholders})",
-            ids
-        )
-        db.execute(
-            "UPDATE chat_sessions SET session_summary = ? WHERE id = ?",
-            (new_summary, session_id)
-        )
-        db.commit()
-        db.close()
-        return new_summary
-    except Exception as exc:
+    with get_db_ctx() as db:
         try:
-            db.rollback()
-            db.close()
-        except Exception:
-            pass
-        print(f"[compact] Error: {exc}")
-        return ""
+            all_uncompacted = db.execute(
+                "SELECT id, role, content FROM chat_messages "
+                "WHERE session_id = ? AND is_compacted = 0 "
+                "ORDER BY created_at ASC",
+                (session_id,)
+            ).fetchall()
+            if not all_uncompacted or len(all_uncompacted) <= MIN_RECENT_KEEP:
+                return ""
+
+            # Keep MIN_RECENT_KEEP most recent, compact everything else
+            to_compact = all_uncompacted[:-MIN_RECENT_KEEP]
+            if not to_compact:
+                return ""
+            _dlog("compact_token_aware", session_id=session_id,
+                  total_uncompacted=len(all_uncompacted),
+                  compacting=len(to_compact), keeping=MIN_RECENT_KEEP)
+
+            session_row = db.execute(
+                "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            existing = (session_row["session_summary"] if session_row and session_row["session_summary"] else "") or ""
+
+            turns_text_parts = []
+            for r in to_compact:
+                row = dict(r)
+                role = row.get("role", "user").upper()
+                raw = str(row.get("content", ""))
+
+                # Clean stored format — same logic as _clean_history_content()
+                # so the summarizer sees readable text, not raw JSON blobs
+                if raw.startswith("__NATURAL_AND_RESULT__:"):
+                    try:
+                        import json as _j
+                        payload = _j.loads(raw[len("__NATURAL_AND_RESULT__:"):])
+                        text = payload.get("text", "").strip()
+                        result = payload.get("result", {})
+                        changes = []
+                        for _fname, _fdata in result.get("changes_by_file", {}).items():
+                            for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
+                                sym = ch.get("symbol", {})
+                                name = (sym.get("name") or sym.get("full_path", "")) if isinstance(sym, dict) else ""
+                                if name:
+                                    changes.append(f"{_fname}::{name}")
+                        qa_flags = []
+                        for _fname, _fdata in result.get("changes_by_file", {}).items():
+                            for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
+                                qr = ch.get("qa_result") or {}
+                                verdict = qr.get("verdict", "")
+                                summary = (qr.get("summary") or "").strip()
+                                sym = ch.get("symbol", {})
+                                name = (sym.get("name") or "") if isinstance(sym, dict) else ""
+                                if verdict in ("warning", "blocked") and summary:
+                                    qa_flags.append(f"{name}: {summary}")
+                        if changes:
+                            text += f" [Changed: {', '.join(changes[:4])}]"
+                        if qa_flags:
+                            text += f" [QA flagged: {'; '.join(qa_flags[:2])}]"
+                        cleaned = text or "Made code changes."
+                    except Exception:
+                        cleaned = "Made code changes."
+                elif raw.startswith("__SURGICAL_RESULT__:"):
+                    cleaned = "Made code changes (surgical edit)."
+                else:
+                    cleaned = raw
+
+                turns_text_parts.append(f"{role}: {cleaned[:500]}")
+
+            turns_text = "\n".join(turns_text_parts)
+            prompt_parts = []
+            if existing:
+                prompt_parts.append(f"Previous summary:\n{existing}\n")
+            prompt_parts.append(f"New conversation turns to add:\n{turns_text}")
+
+            compact_prompt = (
+                "Summarize this coding assistant conversation history. "
+                "Focus on: what files were discussed, what code changes were made or planned, "
+                "key decisions, and any patterns or conventions established. "
+                "Be concise but complete. Under 400 words. Use bullet points."
+            )
+
+            openai_key = get_setting("openai_api_key") or (get_user_api_key(user_id, "openai") if user_id else "")
+            anthropic_key = get_setting("anthropic_api_key") or (get_user_api_key(user_id, "anthropic") if user_id else "")
+
+            new_summary = ""
+            if openai_key:
+                client = _openai_mod.AsyncOpenAI(api_key=openai_key)
+                resp = await client.chat.completions.create(
+                    model="gpt-4.1-mini",
+                    messages=[
+                        {"role": "system", "content": compact_prompt},
+                        {"role": "user", "content": "\n".join(prompt_parts)}
+                    ],
+                    max_tokens=500,
+                )
+                new_summary = resp.choices[0].message.content or ""
+            elif anthropic_key:
+                from anthropic import AsyncAnthropic as _AsyncAnthropic
+                aclient = _AsyncAnthropic(api_key=anthropic_key)
+                resp = await aclient.messages.create(
+                    model="claude-haiku-4-5-20251001",
+                    max_tokens=500,
+                    system=compact_prompt,
+                    messages=[{"role": "user", "content": "\n".join(prompt_parts)}],
+                )
+                new_summary = resp.content[0].text if resp.content else ""
+            else:
+                return existing
+
+            ids = [dict(r)["id"] for r in to_compact]
+            placeholders = ",".join(["?" for _ in ids])
+            db.execute(
+                f"UPDATE chat_messages SET is_compacted = 1 WHERE id IN ({placeholders})",
+                ids
+            )
+            db.execute(
+                "UPDATE chat_sessions SET session_summary = ? WHERE id = ?",
+                (new_summary, session_id)
+            )
+            db.commit()
+            return new_summary
+        except Exception as exc:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            print(f"[compact] Error: {exc}")
+            return ""
 
 
 @router.get("/sessions")
 def list_sessions(request: Request):
     user_id = getattr(request.state, "user_id", None)
-    conn = get_db()
-    if user_id:
-        rows = conn.execute("""
-            SELECT s.*, COUNT(m.id) as message_count
-            FROM chat_sessions s
-            LEFT JOIN chat_messages m ON m.session_id = s.id
-            WHERE s.user_id = ? OR s.user_id IS NULL
-            GROUP BY s.id
-            ORDER BY s.updated_at DESC
-            LIMIT 50
-        """, (user_id,)).fetchall()
-    else:
-        rows = conn.execute("""
-            SELECT s.*, COUNT(m.id) as message_count
-            FROM chat_sessions s
-            LEFT JOIN chat_messages m ON m.session_id = s.id
-            GROUP BY s.id
-            ORDER BY s.updated_at DESC
-            LIMIT 50
-        """).fetchall()
-    conn.close()
+    with get_db_ctx() as conn:
+        if user_id:
+            rows = conn.execute("""
+                SELECT s.*, COUNT(m.id) as message_count
+                FROM chat_sessions s
+                LEFT JOIN chat_messages m ON m.session_id = s.id
+                WHERE s.user_id = ? OR s.user_id IS NULL
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC
+                LIMIT 50
+            """, (user_id,)).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT s.*, COUNT(m.id) as message_count
+                FROM chat_sessions s
+                LEFT JOIN chat_messages m ON m.session_id = s.id
+                GROUP BY s.id
+                ORDER BY s.updated_at DESC
+                LIMIT 50
+            """).fetchall()
     return [dict(r) for r in rows]
 
 
 @router.get("/sessions/{session_id}/messages")
 def get_messages(session_id: str):
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
-        (session_id,)
-    ).fetchall()
-    conn.close()
+    with get_db_ctx() as conn:
+        rows = conn.execute(
+            "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
+            (session_id,)
+        ).fetchall()
     msgs = []
     for r in rows:
         d = dict(r)
@@ -362,43 +354,42 @@ def send_message(req: ChatRequest):
     if not get_setting("openai_api_key") and not get_setting("anthropic_api_key") and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured. Go to Settings.")
 
-    conn = get_db()
+    with get_db_ctx() as conn:
 
-    # Save user message
-    msg_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-        (msg_id, req.session_id, "user", req.message)
-    )
+        # Save user message
+        msg_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+            (msg_id, req.session_id, "user", req.message)
+        )
 
-    # Get conversation history
-    history = conn.execute(
-        "SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
-        (req.session_id,)
-    ).fetchall()
+        # Get conversation history
+        history = conn.execute(
+            "SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
+            (req.session_id,)
+        ).fetchall()
 
-    messages = [{"role": r["role"], "content": r["content"]} for r in history]
+        messages = [{"role": r["role"], "content": r["content"]} for r in history]
 
-    # Get pinned context and project memory
-    workspace = req.session_id  # Use session_id as workspace for per-session memory
-    pinned_rows = conn.execute(
-        "SELECT * FROM pinned_context WHERE workspace_path = ?", (workspace,)
-    ).fetchall() if workspace else []
+        # Get pinned context and project memory
+        workspace = req.session_id  # Use session_id as workspace for per-session memory
+        pinned_rows = conn.execute(
+            "SELECT * FROM pinned_context WHERE workspace_path = ?", (workspace,)
+        ).fetchall() if workspace else []
 
-    pinned_context = []
-    for pin in pinned_rows:
-        try:
-            with open(pin["file_path"], 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()[:3000]
-            pinned_context.append({"label": pin["label"], "file_path": pin["file_path"], "content": content})
-        except Exception:
-            pass
+        pinned_context = []
+        for pin in pinned_rows:
+            try:
+                with open(pin["file_path"], 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()[:3000]
+                pinned_context.append({"label": pin["label"], "file_path": pin["file_path"], "content": content})
+            except Exception:
+                pass
 
-    # Global (team-wide) memory + per-session memory, both injected every prompt
-    project_memory = _load_effective_memory(conn, workspace)
+        # Global (team-wide) memory + per-session memory, both injected every prompt
+        project_memory = _load_effective_memory(conn, workspace)
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
     # Run AI
     try:
@@ -416,18 +407,17 @@ def send_message(req: ChatRequest):
         raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
 
     # Save assistant message
-    conn = get_db()
-    resp_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-        (resp_id, req.session_id, "assistant", response)
-    )
-    conn.execute(
-        "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-        (req.session_id,)
-    )
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        resp_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+            (resp_id, req.session_id, "assistant", response)
+        )
+        conn.execute(
+            "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (req.session_id,)
+        )
+        conn.commit()
 
     return {"id": resp_id, "role": "assistant", "content": response}
 
@@ -438,42 +428,41 @@ async def stream_message(req: ChatRequest):
     if not get_setting("openai_api_key") and not get_setting("anthropic_api_key") and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured.")
 
-    conn = get_db()
+    with get_db_ctx() as conn:
 
-    # Save user message
-    msg_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-        (msg_id, req.session_id, "user", req.message)
-    )
+        # Save user message
+        msg_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+            (msg_id, req.session_id, "user", req.message)
+        )
 
-    # Get history
-    history = conn.execute(
-        "SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
-        (req.session_id,)
-    ).fetchall()
-    messages = [{"role": r["role"], "content": r["content"]} for r in history]
+        # Get history
+        history = conn.execute(
+            "SELECT role, content FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
+            (req.session_id,)
+        ).fetchall()
+        messages = [{"role": r["role"], "content": r["content"]} for r in history]
 
-    # Get pinned context and memory
-    workspace = req.session_id  # Use session_id as workspace for per-session memory
-    pinned_rows = conn.execute(
-        "SELECT * FROM pinned_context WHERE workspace_path = ?", (workspace,)
-    ).fetchall() if workspace else []
+        # Get pinned context and memory
+        workspace = req.session_id  # Use session_id as workspace for per-session memory
+        pinned_rows = conn.execute(
+            "SELECT * FROM pinned_context WHERE workspace_path = ?", (workspace,)
+        ).fetchall() if workspace else []
 
-    pinned_context = []
-    for pin in pinned_rows:
-        try:
-            with open(pin["file_path"], 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()[:3000]
-            pinned_context.append({"label": pin["label"], "file_path": pin["file_path"], "content": content})
-        except Exception:
-            pass
+        pinned_context = []
+        for pin in pinned_rows:
+            try:
+                with open(pin["file_path"], 'r', encoding='utf-8', errors='ignore') as f:
+                    content = f.read()[:3000]
+                pinned_context.append({"label": pin["label"], "file_path": pin["file_path"], "content": content})
+            except Exception:
+                pass
 
-    # Global (team-wide) memory + per-session memory, both injected every prompt
-    project_memory = _load_effective_memory(conn, workspace)
+        # Global (team-wide) memory + per-session memory, both injected every prompt
+        project_memory = _load_effective_memory(conn, workspace)
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
     session_id = req.session_id
 
@@ -491,17 +480,16 @@ async def stream_message(req: ChatRequest):
                         # Save full response to DB
                         full_text = "".join(collected)
                         resp_id = str(uuid.uuid4())
-                        db = get_db()
-                        db.execute(
-                            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                            (resp_id, session_id, "assistant", full_text)
-                        )
-                        db.execute(
-                            "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                            (session_id,)
-                        )
-                        db.commit()
-                        db.close()
+                        with get_db_ctx() as db:
+                            db.execute(
+                                "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+                                (resp_id, session_id, "assistant", full_text)
+                            )
+                            db.execute(
+                                "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                (session_id,)
+                            )
+                            db.commit()
                 except Exception:
                     pass
             yield chunk
@@ -514,29 +502,28 @@ async def stream_message(req: ChatRequest):
 
 @router.delete("/sessions/{session_id}")
 def delete_session(session_id: str):
-    conn = get_db()
-    # Cascade: delete files and messages before session row
-    conn.execute("DELETE FROM session_files WHERE session_id = ?", (session_id,))
-    conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
-    conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
-    conn.commit()
-    # Hard-delete all session-scoped auxiliary rows so nothing orphans by
-    # session_id (code-diff history, applied/undo state, tasks, audit logs).
-    # Each runs in its own committed step and is best-effort: a not-yet-created
-    # table simply rolls back and is skipped, never breaking the core delete.
-    for _tbl in (
-        "change_history",
-        "applied_changes",
-        "agent_tasks",
-        "qa_log",
-        "compliance_log",
-    ):
-        try:
-            conn.execute(f"DELETE FROM {_tbl} WHERE session_id = ?", (session_id,))
-            conn.commit()
-        except Exception:
-            conn.rollback()
-    conn.close()
+    with get_db_ctx() as conn:
+        # Cascade: delete files and messages before session row
+        conn.execute("DELETE FROM session_files WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+        conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+        conn.commit()
+        # Hard-delete all session-scoped auxiliary rows so nothing orphans by
+        # session_id (code-diff history, applied/undo state, tasks, audit logs).
+        # Each runs in its own committed step and is best-effort: a not-yet-created
+        # table simply rolls back and is skipped, never breaking the core delete.
+        for _tbl in (
+            "change_history",
+            "applied_changes",
+            "agent_tasks",
+            "qa_log",
+            "compliance_log",
+        ):
+            try:
+                conn.execute(f"DELETE FROM {_tbl} WHERE session_id = ?", (session_id,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
     return {"ok": True}
 
 
@@ -545,10 +532,9 @@ def rename_session(session_id: str, body: dict):
     title = body.get("title", "")
     if not title:
         raise HTTPException(status_code=400, detail="Title required")
-    conn = get_db()
-    conn.execute("UPDATE chat_sessions SET title = ? WHERE id = ?", (title, session_id))
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        conn.execute("UPDATE chat_sessions SET title = ? WHERE id = ?", (title, session_id))
+        conn.commit()
     return {"ok": True}
 
 
@@ -572,55 +558,54 @@ async def smart_stream(req: dict, request: Request):
     if not has_openai and not has_anthropic and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured. Go to Settings.")
 
-    conn = get_db()
+    with get_db_ctx() as conn:
 
-    # Save user message
-    msg_id = str(uuid.uuid4())
-    conn.execute(
-        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-        (msg_id, session_id, "user", message)
-    )
+        # Save user message
+        msg_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+            (msg_id, session_id, "user", message)
+        )
 
-    # Load session_summary
-    sess_row = conn.execute(
-        "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
-    ).fetchone()
-    session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
+        # Load session_summary
+        sess_row = conn.execute(
+            "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
 
-    # Get conversation history — only uncompacted messages
-    history = conn.execute(
-        "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 ORDER BY created_at ASC",
-        (session_id,)
-    ).fetchall()
-    conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
+        # Get conversation history — only uncompacted messages
+        history = conn.execute(
+            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 ORDER BY created_at ASC",
+            (session_id,)
+        ).fetchall()
+        conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
 
-    # Token-aware compaction trigger: estimate tokens from loaded history
-    _history_tokens = sum(len(h.get("content") or "") for h in conversation_history) // 4
-    needs_compaction = _history_tokens > HISTORY_TOKEN_BUDGET
-    _dlog("compaction_check", session_id=session_id,
-          history_tokens=_history_tokens, budget=HISTORY_TOKEN_BUDGET,
-          msg_count=len(conversation_history), needs_compaction=needs_compaction)
+        # Token-aware compaction trigger: estimate tokens from loaded history
+        _history_tokens = sum(len(h.get("content") or "") for h in conversation_history) // 4
+        needs_compaction = _history_tokens > HISTORY_TOKEN_BUDGET
+        _dlog("compaction_check", session_id=session_id,
+              history_tokens=_history_tokens, budget=HISTORY_TOKEN_BUDGET,
+              msg_count=len(conversation_history), needs_compaction=needs_compaction)
 
-    # Load session files
-    file_rows = conn.execute(
-        "SELECT id, filename, content, language, lines, symbol_count, file_type FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
-        (session_id,)
-    ).fetchall()
-    session_files = [dict(r) for r in file_rows]
+        # Load session files
+        file_rows = conn.execute(
+            "SELECT id, filename, content, language, lines, symbol_count, file_type FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
+            (session_id,)
+        ).fetchall()
+        session_files = [dict(r) for r in file_rows]
 
-    # File-awareness hint: prepend attached file list to user message so
-    # all models (including smaller ones) notice files immediately.
-    if session_files:
-        _fnames = [f['filename'] for f in session_files]
-        _file_hint = (f"[{len(_fnames)} file(s) attached: {', '.join(_fnames)}. "
-                      "Examine their contents before responding.]")
-        message = f"{_file_hint}\n\n{message}"
+        # File-awareness hint: prepend attached file list to user message so
+        # all models (including smaller ones) notice files immediately.
+        if session_files:
+            _fnames = [f['filename'] for f in session_files]
+            _file_hint = (f"[{len(_fnames)} file(s) attached: {', '.join(_fnames)}. "
+                          "Examine their contents before responding.]")
+            message = f"{_file_hint}\n\n{message}"
 
-    # Project memory — GLOBAL team conventions (every prompt) + any per-session memory
-    project_memory = _load_effective_memory(conn, session_id)
+        # Project memory — GLOBAL team conventions (every prompt) + any per-session memory
+        project_memory = _load_effective_memory(conn, session_id)
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
     async def stream_and_save():
         import json as _json
@@ -776,55 +761,54 @@ async def smart_stream(req: dict, request: Request):
                             result_content = data.get("content", "")
                         elif chunk_type in ("done", "error"):
                             # Save assistant message — store both natural text AND result
-                            db = get_db()
-                            resp_id = str(uuid.uuid4())
-                            natural_text = "".join(collected_tokens).strip()
+                            with get_db_ctx() as db:
+                                resp_id = str(uuid.uuid4())
+                                natural_text = "".join(collected_tokens).strip()
 
-                            if result_content:
-                                parsed_result = _json.loads(result_content)
+                                if result_content:
+                                    parsed_result = _json.loads(result_content)
 
-                                # Change 1: Surface QA warnings in the chat bubble text so
-                                # users see them in conversation flow, not only behind "Review".
-                                # Collect unique warning/blocked summaries from all changes.
-                                qa_warnings = []
-                                for _fdata in parsed_result.get("changes_by_file", {}).values():
-                                    for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
-                                        qr = ch.get("qa_result") or {}
-                                        verdict = qr.get("verdict", "")
-                                        summary = (qr.get("summary") or "").strip()
-                                        score   = qr.get("qa_score")
-                                        if verdict in ("warning", "blocked") and summary:
-                                            icon = "⚠️" if verdict == "warning" else "🚫"
-                                            sym  = (ch.get("symbol") or {})
-                                            sym_name = sym.get("name") or sym.get("full_path", "change")
-                                            qa_warnings.append(f"{icon} **{sym_name}** (QA {score}/10): {summary}")
+                                    # Change 1: Surface QA warnings in the chat bubble text so
+                                    # users see them in conversation flow, not only behind "Review".
+                                    # Collect unique warning/blocked summaries from all changes.
+                                    qa_warnings = []
+                                    for _fdata in parsed_result.get("changes_by_file", {}).values():
+                                        for ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
+                                            qr = ch.get("qa_result") or {}
+                                            verdict = qr.get("verdict", "")
+                                            summary = (qr.get("summary") or "").strip()
+                                            score   = qr.get("qa_score")
+                                            if verdict in ("warning", "blocked") and summary:
+                                                icon = "⚠️" if verdict == "warning" else "🚫"
+                                                sym  = (ch.get("symbol") or {})
+                                                sym_name = sym.get("name") or sym.get("full_path", "change")
+                                                qa_warnings.append(f"{icon} **{sym_name}** (QA {score}/10): {summary}")
 
-                                if qa_warnings:
-                                    natural_text = (
-                                        natural_text
-                                        + ("\n\n" if natural_text else "")
-                                        + "**QA Notes:**\n"
-                                        + "\n".join(f"- {w}" for w in qa_warnings)
-                                    )
+                                    if qa_warnings:
+                                        natural_text = (
+                                            natural_text
+                                            + ("\n\n" if natural_text else "")
+                                            + "**QA Notes:**\n"
+                                            + "\n".join(f"- {w}" for w in qa_warnings)
+                                        )
 
-                                saved_content = "__NATURAL_AND_RESULT__:" + _json.dumps({
-                                    "text": natural_text,
-                                    "result": parsed_result,
-                                })
-                            else:
-                                saved_content = natural_text
+                                    saved_content = "__NATURAL_AND_RESULT__:" + _json.dumps({
+                                        "text": natural_text,
+                                        "result": parsed_result,
+                                    })
+                                else:
+                                    saved_content = natural_text
 
-                            db.execute(
-                                "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                                (resp_id, session_id, "assistant", saved_content)
-                            )
-                            db.execute(
-                                "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                                (session_id,)
-                            )
-                            db.commit()
-                            db.close()
-                            _saved = True
+                                db.execute(
+                                    "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+                                    (resp_id, session_id, "assistant", saved_content)
+                                )
+                                db.execute(
+                                    "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                    (session_id,)
+                                )
+                                db.commit()
+                                _saved = True
                     except Exception as _save_err:
                         print(f"[STREAM] DB save failed: {_save_err}")
                 yield chunk
@@ -840,21 +824,20 @@ async def smart_stream(req: dict, request: Request):
             # client disconnect), persist whatever tokens were collected.
             if not _saved and collected_tokens:
                 try:
-                    db = get_db()
-                    resp_id = str(uuid.uuid4())
-                    fallback_text = "".join(collected_tokens).strip()
-                    if fallback_text:
-                        db.execute(
-                            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                            (resp_id, session_id, "assistant", fallback_text)
-                        )
-                        db.execute(
-                            "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                            (session_id,)
-                        )
-                        db.commit()
-                        db.close()
-                        print(f"[STREAM] Safety-net save: {len(fallback_text)} chars for session {session_id}")
+                    with get_db_ctx() as db:
+                        resp_id = str(uuid.uuid4())
+                        fallback_text = "".join(collected_tokens).strip()
+                        if fallback_text:
+                            db.execute(
+                                "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+                                (resp_id, session_id, "assistant", fallback_text)
+                            )
+                            db.execute(
+                                "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                (session_id,)
+                            )
+                            db.commit()
+                            print(f"[STREAM] Safety-net save: {len(fallback_text)} chars for session {session_id}")
                 except Exception as _fallback_err:
                     print(f"[STREAM] Safety-net save failed: {_fallback_err}")
 
@@ -944,48 +927,46 @@ def _build_prior_work_context(session_id, run_id, current_seq):
 
 def _save_task_message(session_id, natural_text, parsed):
     """Persist a task's assistant message (natural text + optional diff result)."""
-    db = get_db()
-    rid = str(uuid.uuid4())
-    if parsed:
-        qa_warnings = []
-        for _fd in parsed.get("changes_by_file", {}).values():
-            for _ch in (_fd.get("changes", []) if isinstance(_fd, dict) else []):
-                _qr = _ch.get("qa_result") or {}
-                _vd = _qr.get("verdict", "")
-                _sm = (_qr.get("summary") or "").strip()
-                _sc = _qr.get("qa_score")
-                if _vd in ("warning", "blocked") and _sm:
-                    _ic = "⚠️" if _vd == "warning" else "🚫"
-                    _sy = (_ch.get("symbol") or {})
-                    _nm = _sy.get("name") or _sy.get("full_path", "change")
-                    qa_warnings.append(f"{_ic} **{_nm}** (QA {_sc}/10): {_sm}")
-        _txt = natural_text
-        if qa_warnings:
-            _txt = (_txt + ("\n\n" if _txt else "") + "**QA Notes:**\n"
-                    + "\n".join(f"- {w}" for w in qa_warnings))
-        saved = "__NATURAL_AND_RESULT__:" + json.dumps({"text": _txt, "result": parsed})
-    else:
-        saved = natural_text
-    db.execute(
-        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-        (rid, session_id, "assistant", saved),
-    )
-    db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
-    db.commit()
-    db.close()
+    with get_db_ctx() as db:
+        rid = str(uuid.uuid4())
+        if parsed:
+            qa_warnings = []
+            for _fd in parsed.get("changes_by_file", {}).values():
+                for _ch in (_fd.get("changes", []) if isinstance(_fd, dict) else []):
+                    _qr = _ch.get("qa_result") or {}
+                    _vd = _qr.get("verdict", "")
+                    _sm = (_qr.get("summary") or "").strip()
+                    _sc = _qr.get("qa_score")
+                    if _vd in ("warning", "blocked") and _sm:
+                        _ic = "⚠️" if _vd == "warning" else "🚫"
+                        _sy = (_ch.get("symbol") or {})
+                        _nm = _sy.get("name") or _sy.get("full_path", "change")
+                        qa_warnings.append(f"{_ic} **{_nm}** (QA {_sc}/10): {_sm}")
+            _txt = natural_text
+            if qa_warnings:
+                _txt = (_txt + ("\n\n" if _txt else "") + "**QA Notes:**\n"
+                        + "\n".join(f"- {w}" for w in qa_warnings))
+            saved = "__NATURAL_AND_RESULT__:" + json.dumps({"text": _txt, "result": parsed})
+        else:
+            saved = natural_text
+        db.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+            (rid, session_id, "assistant", saved),
+        )
+        db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
+        db.commit()
 
 
 def _save_run_note(session_id, text):
     """Persist a plain assistant note (run summary lines)."""
-    db = get_db()
-    rid = str(uuid.uuid4())
-    db.execute(
-        "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-        (rid, session_id, "assistant", text),
-    )
-    db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
-    db.commit()
-    db.close()
+    with get_db_ctx() as db:
+        rid = str(uuid.uuid4())
+        db.execute(
+            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+            (rid, session_id, "assistant", text),
+        )
+        db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
+        db.commit()
 
 
 def _run_counts(session_id, run_id):
@@ -1033,23 +1014,22 @@ async def execute_task(req: dict, request: Request):
 
     # Load fresh session state. Reloading per task means each task sees edits
     # and the compacted summary persisted by prior tasks in the run.
-    conn = get_db()
-    sess_row = conn.execute(
-        "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
-    ).fetchone()
-    session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
-    history = conn.execute(
-        "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 ORDER BY created_at ASC",
-        (session_id,)
-    ).fetchall()
-    conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
-    file_rows = conn.execute(
-        "SELECT id, filename, content, language, lines, symbol_count, file_type FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
-        (session_id,)
-    ).fetchall()
-    session_files = [dict(r) for r in file_rows]
-    project_memory = _load_effective_memory(conn, session_id)
-    conn.close()
+    with get_db_ctx() as conn:
+        sess_row = conn.execute(
+            "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
+        history = conn.execute(
+            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 ORDER BY created_at ASC",
+            (session_id,)
+        ).fetchall()
+        conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
+        file_rows = conn.execute(
+            "SELECT id, filename, content, language, lines, symbol_count, file_type FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
+            (session_id,)
+        ).fetchall()
+        session_files = [dict(r) for r in file_rows]
+        project_memory = _load_effective_memory(conn, session_id)
 
     async def stream_one_task():
         _t0 = time.time()
