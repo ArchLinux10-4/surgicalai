@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ChatSession, ChatMessage, FileContent, SurgicalAnalysis, AppSettings, FileNode, PinnedContext, PromptTemplate, ImpactAnalysis } from '../types'
+import type { ChatSession, ChatMessage, FileContent, SurgicalAnalysis, AppSettings, FileNode, PromptTemplate, ImpactAnalysis } from '../types'
 
 interface AppState {
   // Settings
@@ -43,9 +43,7 @@ interface AppState {
   workspacePath: string
   setWorkspacePath: (p: string) => void
 
-  // Context pinning
-  pins: PinnedContext[]
-  setPins: (pins: PinnedContext[]) => void
+
 
   // Project memory
   projectMemory: string
@@ -146,8 +144,7 @@ export const useAppStore = create<AppState>((set) => ({
   workspacePath: '',
   setWorkspacePath: (workspacePath) => set({ workspacePath }),
 
-  pins: [],
-  setPins: (pins) => set({ pins }),
+
 
   projectMemory: '',
   setProjectMemory: (projectMemory) => set({ projectMemory }),
