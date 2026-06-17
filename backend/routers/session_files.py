@@ -282,12 +282,11 @@ def upload_session_file(session_id: str, body: dict):
     # ── File size validation ──────────────────────────────────────────────
     _payload_bytes = len(base64_data) if base64_data else len(raw_content.encode("utf-8", errors="replace"))
     validate_file_size(filename, _payload_bytes)
-    _vconn = get_db()
-    _session_total = _vconn.execute(
-        "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM session_files WHERE session_id = ?",
-        (session_id,)
-    ).fetchone()[0]
-    _vconn.close()
+    with get_db_ctx() as _vconn:
+        _session_total = _vconn.execute(
+            "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM session_files WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()[0]
     validate_session_total(_session_total, _payload_bytes)
     file_type = body.get("file_type") or _get_file_type(filename)
     language = body.get("language") or _get_language(filename)
@@ -354,31 +353,29 @@ def upload_session_file(session_id: str, body: dict):
     filename = _sanitize_for_postgres(filename)
     content = _sanitize_for_postgres(content)
 
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT id, updated_at FROM session_files WHERE session_id = ? AND filename = ?",
-        (session_id, filename)
-    ).fetchone()
+    with get_db_ctx() as conn:
+        existing = conn.execute(
+            "SELECT id, updated_at FROM session_files WHERE session_id = ? AND filename = ?",
+            (session_id, filename)
+        ).fetchone()
 
-    if existing:
-        file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
-        row_updated_at = existing["updated_at"] if hasattr(existing, "__getitem__") else existing[1]
-        result = conn.execute(
-            "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND updated_at = ?",
-            (content, language, lines, symbol_count, file_type, file_id, row_updated_at)
-        )
-        if result.rowcount == 0:
-            conn.close()
-            raise HTTPException(status_code=409, detail="File was modified concurrently — please retry")
-    else:
-        file_id = str(uuid.uuid4())
-        conn.execute(
-            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, origin, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            (file_id, session_id, filename, content, language, lines, symbol_count, file_type, origin)
-        )
+        if existing:
+            file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
+            row_updated_at = existing["updated_at"] if hasattr(existing, "__getitem__") else existing[1]
+            result = conn.execute(
+                "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND updated_at = ?",
+                (content, language, lines, symbol_count, file_type, file_id, row_updated_at)
+            )
+            if result.rowcount == 0:
+                raise HTTPException(status_code=409, detail="File was modified concurrently — please retry")
+        else:
+            file_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, origin, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+                (file_id, session_id, filename, content, language, lines, symbol_count, file_type, origin)
+            )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
     # DataLab fork (flag-gated, best-effort): keep the original spreadsheet bytes.
     if file_type in ("csv", "excel"):
@@ -417,12 +414,11 @@ async def upload_session_file_multipart(
 
     # ── File size validation ──────────────────────────────────────────────
     validate_file_size(actual_filename, len(raw_bytes))
-    _vconn = get_db()
-    _session_total = _vconn.execute(
-        "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM session_files WHERE session_id = ?",
-        (session_id,)
-    ).fetchone()[0]
-    _vconn.close()
+    with get_db_ctx() as _vconn:
+        _session_total = _vconn.execute(
+            "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM session_files WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()[0]
     validate_session_total(_session_total, len(raw_bytes))
 
     file_type = _get_file_type(actual_filename)
@@ -485,31 +481,29 @@ async def upload_session_file_multipart(
     actual_filename = _sanitize_for_postgres(actual_filename)
     content = _sanitize_for_postgres(content)
 
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT id, updated_at FROM session_files WHERE session_id = ? AND filename = ?",
-        (session_id, actual_filename)
-    ).fetchone()
+    with get_db_ctx() as conn:
+        existing = conn.execute(
+            "SELECT id, updated_at FROM session_files WHERE session_id = ? AND filename = ?",
+            (session_id, actual_filename)
+        ).fetchone()
 
-    if existing:
-        file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
-        row_updated_at = existing["updated_at"] if hasattr(existing, "__getitem__") else existing[1]
-        result = conn.execute(
-            "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND updated_at = ?",
-            (content, language, lines, symbol_count, file_type, file_id, row_updated_at)
-        )
-        if result.rowcount == 0:
-            conn.close()
-            raise HTTPException(status_code=409, detail="File was modified concurrently — please retry")
-    else:
-        file_id = str(uuid.uuid4())
-        conn.execute(
-            "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, origin, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', CURRENT_TIMESTAMP)",
-            (file_id, session_id, actual_filename, content, language, lines, symbol_count, file_type)
-        )
+        if existing:
+            file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
+            row_updated_at = existing["updated_at"] if hasattr(existing, "__getitem__") else existing[1]
+            result = conn.execute(
+                "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, file_type = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND updated_at = ?",
+                (content, language, lines, symbol_count, file_type, file_id, row_updated_at)
+            )
+            if result.rowcount == 0:
+                raise HTTPException(status_code=409, detail="File was modified concurrently — please retry")
+        else:
+            file_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, origin, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'uploaded', CURRENT_TIMESTAMP)",
+                (file_id, session_id, actual_filename, content, language, lines, symbol_count, file_type)
+            )
 
-    conn.commit()
-    conn.close()
+        conn.commit()
 
     # DataLab fork (flag-gated, best-effort): keep the original spreadsheet bytes.
     _maybe_store_datalab_bytes(
@@ -533,25 +527,23 @@ async def upload_session_file_multipart(
 @router.get("/{session_id}/files")
 def list_session_files(session_id: str):
     """List files attached to a session (metadata only, no content)."""
-    conn = get_db()
-    rows = conn.execute(
-        """SELECT id, session_id, filename, language, lines, symbol_count, file_type, origin, github_meta, created_at, updated_at, github_pushed_at, edited
-           FROM session_files WHERE session_id = ? ORDER BY created_at ASC""",
-        (session_id,)
-    ).fetchall()
-    conn.close()
+    with get_db_ctx() as conn:
+        rows = conn.execute(
+            """SELECT id, session_id, filename, language, lines, symbol_count, file_type, origin, github_meta, created_at, updated_at, github_pushed_at, edited
+               FROM session_files WHERE session_id = ? ORDER BY created_at ASC""",
+            (session_id,)
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
 @router.get("/{session_id}/files/{file_id}")
 def get_session_file(session_id: str, file_id: str):
     """Get a specific file's full content."""
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM session_files WHERE id = ? AND session_id = ?",
-        (file_id, session_id)
-    ).fetchone()
-    conn.close()
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT * FROM session_files WHERE id = ? AND session_id = ?",
+            (file_id, session_id)
+        ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="File not found")
     return dict(row)
@@ -566,41 +558,38 @@ def update_session_file(session_id: str, file_id: str, body: dict):
     returns 409 instead of silently overwriting the other change.
     """
     new_content = body.get("content", "")
-    conn = get_db()
-    row = conn.execute(
-        "SELECT content, filename, updated_at FROM session_files WHERE id = ? AND session_id = ?",
-        (file_id, session_id)
-    ).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="File not found")
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT content, filename, updated_at FROM session_files WHERE id = ? AND session_id = ?",
+            (file_id, session_id)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="File not found")
 
-    if hasattr(row, "__getitem__"):
-        filename = row["filename"]
-        prev_content = row["content"]
-        row_updated_at = row["updated_at"]
-    else:
-        prev_content, filename, row_updated_at = row[0], row[1], row[2]
+        if hasattr(row, "__getitem__"):
+            filename = row["filename"]
+            prev_content = row["content"]
+            row_updated_at = row["updated_at"]
+        else:
+            prev_content, filename, row_updated_at = row[0], row[1], row[2]
 
-    lines = len(new_content.splitlines())
-    try:
-        smap = parser.parse(new_content, filename)
-        symbol_count = len(smap.symbols)
-    except Exception:
-        symbol_count = 0
+        lines = len(new_content.splitlines())
+        try:
+            smap = parser.parse(new_content, filename)
+            symbol_count = len(smap.symbols)
+        except Exception:
+            symbol_count = 0
 
-    new_content = _sanitize_for_postgres(new_content)
-    prev_content = _sanitize_for_postgres(prev_content)
+        new_content = _sanitize_for_postgres(new_content)
+        prev_content = _sanitize_for_postgres(prev_content)
 
-    result = conn.execute(
-        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, edited = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ? AND updated_at = ?",
-        (new_content, prev_content, lines, symbol_count, file_id, session_id, row_updated_at)
-    )
-    if result.rowcount == 0:
-        conn.close()
-        raise HTTPException(status_code=409, detail="File was modified concurrently — please retry with fresh content")
-    conn.commit()
-    conn.close()
+        result = conn.execute(
+            "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, edited = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ? AND updated_at = ?",
+            (new_content, prev_content, lines, symbol_count, file_id, session_id, row_updated_at)
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=409, detail="File was modified concurrently — please retry with fresh content")
+        conn.commit()
     return {"id": file_id, "lines": lines, "symbol_count": symbol_count, "ok": True}
 
 
@@ -611,68 +600,62 @@ def undo_session_file(session_id: str, file_id: str):
     Optimistic concurrency: AND updated_at = ? prevents undo from
     silently overwriting a concurrent edit.
     """
-    conn = get_db()
-    row = conn.execute(
-        "SELECT content, previous_content, filename, updated_at FROM session_files WHERE id = ? AND session_id = ?",
-        (file_id, session_id)
-    ).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail="File not found")
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT content, previous_content, filename, updated_at FROM session_files WHERE id = ? AND session_id = ?",
+            (file_id, session_id)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="File not found")
 
-    if hasattr(row, "__getitem__"):
-        current = row["content"]
-        prev = row["previous_content"]
-        filename = row["filename"]
-        row_updated_at = row["updated_at"]
-    else:
-        current, prev, filename, row_updated_at = row[0], row[1], row[2], row[3]
+        if hasattr(row, "__getitem__"):
+            current = row["content"]
+            prev = row["previous_content"]
+            filename = row["filename"]
+            row_updated_at = row["updated_at"]
+        else:
+            current, prev, filename, row_updated_at = row[0], row[1], row[2], row[3]
 
-    if not prev:
-        conn.close()
-        raise HTTPException(status_code=400, detail="No previous version to restore")
+        if not prev:
+            raise HTTPException(status_code=400, detail="No previous version to restore")
 
-    lines = len(prev.splitlines())
-    try:
-        smap = parser.parse(prev, filename)
-        symbol_count = len(smap.symbols)
-    except Exception:
-        symbol_count = 0
+        lines = len(prev.splitlines())
+        try:
+            smap = parser.parse(prev, filename)
+            symbol_count = len(smap.symbols)
+        except Exception:
+            symbol_count = 0
 
-    result = conn.execute(
-        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, edited = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ? AND updated_at = ?",
-        (prev, current, lines, symbol_count, file_id, session_id, row_updated_at)
-    )
-    if result.rowcount == 0:
-        conn.close()
-        raise HTTPException(status_code=409, detail="File was modified concurrently — undo cancelled")
-    conn.commit()
-    conn.close()
+        result = conn.execute(
+            "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, edited = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ? AND updated_at = ?",
+            (prev, current, lines, symbol_count, file_id, session_id, row_updated_at)
+        )
+        if result.rowcount == 0:
+            raise HTTPException(status_code=409, detail="File was modified concurrently — undo cancelled")
+        conn.commit()
     return {"id": file_id, "content": prev, "lines": lines, "symbol_count": symbol_count, "ok": True}
 
 
 @router.delete("/{session_id}/files/{file_id}")
 def delete_session_file(session_id: str, file_id: str):
     """Remove a file from a session."""
-    conn = get_db()
-    conn.execute(
-        "DELETE FROM session_files WHERE id = ? AND session_id = ?",
-        (file_id, session_id)
-    )
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        conn.execute(
+            "DELETE FROM session_files WHERE id = ? AND session_id = ?",
+            (file_id, session_id)
+        )
+        conn.commit()
     return {"ok": True}
 
 
 @router.get("/{session_id}/files/{file_id}/preview")
 def preview_session_file(session_id: str, file_id: str):
     """Serve file content for live preview with correct Content-Type."""
-    conn = get_db()
-    row = conn.execute(
-        "SELECT filename, content FROM session_files WHERE id = ? AND session_id = ?",
-        (file_id, session_id),
-    ).fetchone()
-    conn.close()
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT filename, content FROM session_files WHERE id = ? AND session_id = ?",
+            (file_id, session_id),
+        ).fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="File not found")
 
@@ -708,26 +691,24 @@ def preview_bundle(session_id: str, file_id: str, body: dict = None):
     body = body or {}
     override = body.get("content")
 
-    conn = get_db()
-    target = conn.execute(
-        "SELECT filename, content, file_type FROM session_files WHERE id = ? AND session_id = ?",
-        (file_id, session_id),
-    ).fetchone()
-    if not target:
-        conn.close()
-        raise HTTPException(status_code=404, detail="File not found")
+    with get_db_ctx() as conn:
+        target = conn.execute(
+            "SELECT filename, content, file_type FROM session_files WHERE id = ? AND session_id = ?",
+            (file_id, session_id),
+        ).fetchone()
+        if not target:
+            raise HTTPException(status_code=404, detail="File not found")
 
-    if hasattr(target, "__getitem__"):
-        filename = target["filename"]
-        stored = target["content"]
-    else:
-        filename, stored = target[0], target[1]
+        if hasattr(target, "__getitem__"):
+            filename = target["filename"]
+            stored = target["content"]
+        else:
+            filename, stored = target[0], target[1]
 
-    rows = conn.execute(
-        "SELECT filename, content, file_type FROM session_files WHERE session_id = ?",
-        (session_id,),
-    ).fetchall()
-    conn.close()
+        rows = conn.execute(
+            "SELECT filename, content, file_type FROM session_files WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
 
     session_map = {}
     for r in rows:
