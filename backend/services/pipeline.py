@@ -155,9 +155,13 @@ async def _stream_and_collect(aclient, **kwargs):
     Used instead of aclient.messages.create() for large-token calls that would
     exceed the Anthropic SDK's 10-minute non-streaming limit (e.g. Opus 4.5
     with max_tokens=64000).  Returns the same Message object as .create().
+    Retries automatically on transient API errors (429, 500, 503, overloaded).
     """
-    async with aclient.messages.stream(**kwargs) as strm:
-        return await strm.get_final_message()
+    from services.api_retry import async_api_call_with_retry
+    async def _call():
+        async with aclient.messages.stream(**kwargs) as strm:
+            return await strm.get_final_message()
+    return await async_api_call_with_retry(_call)
 
 
 
@@ -544,7 +548,9 @@ def _friendly_error(e: Exception) -> str:
 def _chat_create(client: OpenAI, model: str, messages: list, temperature: float = 0.3, **kwargs):
     """Wrapper around client.chat.completions.create that drops temperature
     for reasoning models and injects reasoning_effort when configured.
-    Also injects max_completion_tokens for reasoning models that require it."""
+    Also injects max_completion_tokens for reasoning models that require it.
+    Retries automatically on transient API errors (429, 500, 503, overloaded)."""
+    from services.api_retry import api_call_with_retry
     base_model = model.split(":")[0].lower()
     if base_model in NO_TEMPERATURE_MODELS:
         # Inject reasoning_effort for models that support it, unless caller overrode it
@@ -563,8 +569,8 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
               max_completion_tokens=kwargs.get("max_completion_tokens"),
               has_response_format="response_format" in kwargs,
               stream=kwargs.get("stream", False))
-        return client.chat.completions.create(model=model, messages=messages, **kwargs)
-    return client.chat.completions.create(model=model, messages=messages, temperature=temperature, **kwargs)
+        return api_call_with_retry(lambda: client.chat.completions.create(model=model, messages=messages, **kwargs))
+    return api_call_with_retry(lambda: client.chat.completions.create(model=model, messages=messages, temperature=temperature, **kwargs))
 
 
 def _get_client(user_id: str = "") -> OpenAI:
@@ -2145,12 +2151,13 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
             _anthropic_key = _get_anthropic_key(user_id)
             from anthropic import Anthropic as _AnthropicSync
             _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
-            _claude_surgeon_resp = _sync_aclient.messages.create(
+            from services.api_retry import api_call_with_retry
+            _claude_surgeon_resp = api_call_with_retry(lambda: _sync_aclient.messages.create(
                 model=surg_model,
                 max_tokens=8192,
                 system=SURGEON_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
-            )
+            ))
             raw = _claude_surgeon_resp.content[0].text
         else:
             response = _chat_create(client,
@@ -3620,12 +3627,13 @@ async def run_qa_for_changes(
         aclient = AsyncAnthropic(api_key=anthropic_key)
         # QA always uses Sonnet — cheaper than user's model, accurate for review
         _qa_model_legacy = "claude-sonnet-4-6"
-        response = await aclient.messages.create(
+        from services.api_retry import async_api_call_with_retry
+        response = await async_api_call_with_retry(lambda: aclient.messages.create(
             model=_qa_model_legacy,
             max_tokens=1000,
             system=_QA_SYSTEM,
             messages=[{"role": "user", "content": user_message}],
-        )
+        ))
 
         raw_text = ""
         for block in response.content:
