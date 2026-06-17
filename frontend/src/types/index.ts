@@ -124,15 +124,6 @@ export interface GitStatus {
   untracked: string[]
 }
 
-export interface PinnedContext {
-  id: string
-  workspace_path: string
-  file_path: string
-  symbol_path: string | null
-  label: string | null
-  created_at: string
-}
-
 export interface ProjectMemory {
   id: string | null
   workspace_path: string

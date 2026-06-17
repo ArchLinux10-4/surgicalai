@@ -1,4 +1,4 @@
-import type { StreamChunk, PinnedContext, ProjectMemory, PromptTemplate, ImpactAnalysis, MultiFileAnalysis, MemoryPreset } from '../types'
+import type { StreamChunk, ProjectMemory, PromptTemplate, ImpactAnalysis, MultiFileAnalysis, MemoryPreset } from '../types'
 
 const BASE = (import.meta.env.VITE_API_URL ?? '') + '/api'
 
@@ -441,9 +441,6 @@ export const api = {
   },
 
   context: {
-    getPins: (workspacePath: string) => request<PinnedContext[]>(`/context/pins?workspace_path=${encodeURIComponent(workspacePath)}`),
-    addPin: (data: any) => request<any>('/context/pins', { method: 'POST', body: JSON.stringify(data) }),
-    removePin: (id: string) => request<any>(`/context/pins/${id}`, { method: 'DELETE' }),
     getMemory: (workspacePath: string) => request<ProjectMemory>(`/context/memory?workspace_path=${encodeURIComponent(workspacePath)}`),
     saveMemory: (data: any) => request<any>('/context/memory', { method: 'POST', body: JSON.stringify(data) }),
     getGlobalMemory: () => request<ProjectMemory>('/context/memory/global'),

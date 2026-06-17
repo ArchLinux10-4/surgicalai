@@ -10,7 +10,7 @@ import { LinearPanel } from './LinearPanel'
 import { VercelPanel } from './VercelPanel'
 import { RailwayPanel } from './RailwayPanel'
 import { useThemeStore } from '../stores/themeStore'
-import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, PushPin, Search, Settings } from '@mui/icons-material';
+import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Psychology, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile } from '../lib/fileClassify'
 import { DownloadSessionButton } from './DownloadSessionButton'
 
@@ -669,7 +669,7 @@ const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
   { id: 'linear',   icon: LinearIcon,    label: 'Linear', tooltip: 'Linear Issues' },
   { id: 'vercel',   icon: VercelIcon,         label: 'Vercel', tooltip: 'Vercel Deployments' },
   { id: 'railway',  icon: RailwayIcon,        label: 'Railway', tooltip: 'Railway Services' },
-  { id: 'context',  icon: PushPin,           label: 'Pinned', tooltip: 'Pinned & Memory' },
+  { id: 'context',  icon: Psychology,         label: 'Memory', tooltip: 'Global Memory' },
 ]
 
 // ── Vercel icon (inline SVG) ──────────────────────────────────────────────────

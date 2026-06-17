@@ -271,21 +271,6 @@ class GitDiffRequest(BaseModel):
 
 # ─── Context Pinning ──────────────────────────────────────────────────────────
 
-class PinnedContext(BaseModel):
-    id: str
-    workspace_path: str
-    file_path: str
-    symbol_path: Optional[str] = None
-    label: Optional[str] = None
-    created_at: str
-
-class PinRequest(BaseModel):
-    session_id: Optional[str] = None
-    workspace_path: Optional[str] = None
-    file_path: str
-    symbol_path: Optional[str] = None
-    label: Optional[str] = None
-
 # ─── Project Memory ───────────────────────────────────────────────────────────
 
 class ProjectMemory(BaseModel):

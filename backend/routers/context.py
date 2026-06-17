@@ -1,11 +1,11 @@
 """
-Context pinning, project memory, prompt templates, impact analysis, multi-file surgical.
+Project memory, prompt templates, impact analysis, multi-file surgical.
 """
 import uuid
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from models.schemas import (
-    PinRequest, PinnedContext, ProjectMemory,
+    ProjectMemory,
     PromptTemplate, PromptTemplateCreate,
     MultiFileAnalyzeRequest, ImpactAnalysisResponse
 )
@@ -14,49 +14,6 @@ from services.pipeline import run_impact_analysis, analyze_multi_file
 from data.memory_presets import MEMORY_PRESETS
 
 router = APIRouter()
-
-# ─── Context Pinning ──────────────────────────────────────────────────────────
-
-@router.get("/pins")
-def get_pins(session_id: str = None, workspace_path: str = None):
-    key = session_id or workspace_path
-    if not key:
-        raise HTTPException(status_code=422, detail="session_id or workspace_path required")
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT * FROM pinned_context WHERE workspace_path = ? ORDER BY created_at DESC",
-        (key,)
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-@router.post("/pins")
-def add_pin(req: PinRequest):
-    # Read file content for the pin
-    try:
-        with open(req.file_path, 'r', encoding='utf-8', errors='ignore') as f:
-            content = f.read()
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Cannot read file: {e}")
-
-    key = req.session_id or req.workspace_path or ""
-    pin_id = str(uuid.uuid4())
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO pinned_context (id, workspace_path, file_path, symbol_path, label) VALUES (?, ?, ?, ?, ?)",
-        (pin_id, key, req.file_path, req.symbol_path, req.label or req.file_path.split('/')[-1])
-    )
-    conn.commit()
-    conn.close()
-    return {"id": pin_id, "ok": True}
-
-@router.delete("/pins/{pin_id}")
-def remove_pin(pin_id: str):
-    conn = get_db()
-    conn.execute("DELETE FROM pinned_context WHERE id = ?", (pin_id,))
-    conn.commit()
-    conn.close()
-    return {"ok": True}
 
 # ─── Project Memory ───────────────────────────────────────────────────────────
 

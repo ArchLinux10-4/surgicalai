@@ -70,6 +70,17 @@ MEMORY_PRESETS = [
 - Optimize Core Web Vitals: code-split routes, lazy-load non-critical UI, use modern image formats.
 - Never trust client state for authorization; re-check on the server.
 - Keep side effects in hooks with correct dependency arrays; clean up subscriptions.
+
+## Performance & Rendering
+- Wrap expensive computations in `useMemo`; wrap callback props in `useCallback` to prevent child re-renders.
+- Never create objects, arrays, or functions inline in JSX props — extract them or memoize them.
+- Use `React.memo()` on components that receive stable props but sit under frequently-updating parents.
+- Debounce user-driven events that fire rapidly (input, scroll, resize) — never trigger state updates on every keystroke or frame.
+- Keep state as local as possible; a state change at the top re-renders everything below.
+- Avoid storing derived data in state — compute it with `useMemo` from the source state instead.
+- Virtualize long lists (`react-window` or `react-virtuoso`) instead of rendering hundreds of DOM nodes.
+- Lazy-load heavy components and routes with `React.lazy()` + `Suspense`.
+- Profile with React DevTools before optimizing — fix measured problems, not guesses.
 """,
     },
     {
