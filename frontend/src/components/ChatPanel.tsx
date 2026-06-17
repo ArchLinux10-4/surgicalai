@@ -799,14 +799,20 @@ export function ChatPanel() {
       api.sessionFiles.list(activeSessions)
         .then(files => setSessionFiles(files))
         .catch(() => {})
-      // Reconcile the agentic task list to whatever this session has on the
-      // server (clears stale cross-session state; repopulates if a run exists).
+      // Reconcile the agentic task list: only show tasks for ACTIVE runs.
+      // Completed runs are historical — their results are already in the chat
+      // as message cards. Repopulating them would keep the Executor panel
+      // permanently visible, blocking natural chat flow.
       clearAgentTasks()
       api.tasks.list(activeSessions)
         .then((rows: any[]) => {
           if (!Array.isArray(rows) || rows.length === 0) return
           const latestRun = rows[0]?.run_id
           const forRun = rows.filter(r => r.run_id === latestRun)
+          const TERMINAL = ['done', 'blocked', 'cancelled', 'error']
+          const allTerminal = forRun.every(r => TERMINAL.includes(r.status))
+          // Skip — completed runs don't need the mission control panel.
+          if (allTerminal) return
           setTaskRunId(latestRun || null)
           setAgentTasks(forRun
             .slice()

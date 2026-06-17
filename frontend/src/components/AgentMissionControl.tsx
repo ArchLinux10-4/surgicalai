@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import type { AgentTask, AgentTaskStatus } from '../types'
@@ -13,9 +13,14 @@ import type { AgentTask, AgentTaskStatus } from '../types'
  * Connected by a vertical timeline with phase-transition dots.
  * Preserves all existing functionality: cancel buttons, QA badges,
  * live progress text, and useTaskPolling reconciliation.
+ *
+ * Auto-dismisses after completion so the chat flows naturally.
  */
 
 const ACTIVE: AgentTaskStatus[] = ['pending', 'running']
+
+/** How long the "complete" state stays visible before auto-dismissing (ms). */
+const AUTO_DISMISS_MS = 8_000
 
 /* ── Derive effective phase from store + task state ────────────────────
  * Handles page reload gracefully: the store resets to 'idle', but if
@@ -363,7 +368,33 @@ export function AgentMissionControl() {
   const activeSessions = useAppStore(s => s.activeSessions)
   const updateAgentTask = useAppStore(s => s.updateAgentTask)
   const setAgentTasks = useAppStore(s => s.setAgentTasks)
+  const clearAgentTasks = useAppStore(s => s.clearAgentTasks)
   const [busy, setBusy] = useState(false)
+  const [dismissing, setDismissing] = useState(false)
+  const dismissTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // ── Auto-dismiss: fade out after completion ────────────────────────
+  // When all tasks finish, wait AUTO_DISMISS_MS then clear the panel.
+  // If a new run starts (phase leaves 'complete'), cancel the timer.
+  useEffect(() => {
+    if (phase === 'complete') {
+      dismissTimerRef.current = setTimeout(() => {
+        setDismissing(true)
+        // Let the CSS fade-out play (~400ms), then fully clear.
+        setTimeout(() => { clearAgentTasks(); setDismissing(false) }, 400)
+      }, AUTO_DISMISS_MS)
+    } else {
+      // Phase changed away from complete — cancel any pending dismiss.
+      setDismissing(false)
+      if (dismissTimerRef.current) {
+        clearTimeout(dismissTimerRef.current)
+        dismissTimerRef.current = null
+      }
+    }
+    return () => {
+      if (dismissTimerRef.current) clearTimeout(dismissTimerRef.current)
+    }
+  }, [phase, clearAgentTasks])
 
   const { done, total, anyActive, pct } = useMemo(() => {
     const _total = agentTasks.length
@@ -400,7 +431,7 @@ export function AgentMissionControl() {
   }
 
   return (
-    <div className="mx-3 mb-2 animate-slide-up">
+    <div className={`mx-3 mb-2 animate-slide-up transition-opacity duration-400 ${dismissing ? 'opacity-0' : 'opacity-100'}`}>
       {/* 🧠 Architect Agent */}
       <ArchitectCard
         phase={phase}
