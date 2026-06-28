@@ -1,4 +1,8 @@
-"""File system router — browse, read, write files."""
+"""File system router — browse, read, write files.
+
+Security: All path access is sandboxed to the configured workspace root.
+Path traversal (../) and symlink escapes are blocked.
+"""
 import os
 import mimetypes
 from pathlib import Path
@@ -16,6 +20,41 @@ IGNORED_EXTS = {".pyc", ".pyo", ".class", ".o", ".so", ".dll", ".exe"}
 MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 
 
+# ─── Path Security ────────────────────────────────────────────────────────────
+
+def _get_workspace_root() -> str:
+    """Return the resolved (absolute) workspace root directory."""
+    raw = get_setting("workspace_path", str(Path.home()))
+    return os.path.realpath(raw)
+
+
+def _safe_path(requested: str) -> Path:
+    """Resolve requested path and ensure it stays within the workspace.
+
+    Blocks path traversal (../), absolute paths outside workspace,
+    and symlink escapes.  Raises 403 on any violation.
+    """
+    # Reject null bytes (path injection vector)
+    if "\x00" in requested:
+        raise HTTPException(status_code=400, detail="Invalid path")
+
+    workspace = _get_workspace_root()
+
+    # Resolve: relative paths join to workspace, absolute paths resolve directly
+    if os.path.isabs(requested):
+        resolved = os.path.realpath(requested)
+    else:
+        resolved = os.path.realpath(os.path.join(workspace, requested))
+
+    # Prefix check — trailing sep prevents /app matching /application
+    if resolved != workspace and not resolved.startswith(workspace + os.sep):
+        raise HTTPException(status_code=403, detail="Access denied")
+
+    return Path(resolved)
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
 def _get_language(path: str) -> str:
     ext = Path(path).suffix.lower()
     lang_map = {
@@ -32,8 +71,14 @@ def _get_language(path: str) -> str:
     return lang_map.get(ext, "plaintext")
 
 
-def _build_tree(path: Path, max_depth: int = 6, depth: int = 0) -> FileNode:
+def _build_tree(path: Path, workspace: str, max_depth: int = 6, depth: int = 0) -> FileNode:
+    """Build file tree, restricted to workspace root."""
     if depth > max_depth:
+        return None
+
+    # Safety: skip anything that resolved outside the workspace
+    real = os.path.realpath(str(path))
+    if real != workspace and not real.startswith(workspace + os.sep):
         return None
 
     name = path.name
@@ -44,7 +89,7 @@ def _build_tree(path: Path, max_depth: int = 6, depth: int = 0) -> FileNode:
         try:
             entries = sorted(path.iterdir(), key=lambda p: (p.is_file(), p.name.lower()))
             for entry in entries[:200]:  # Cap at 200 entries per dir
-                child = _build_tree(entry, max_depth, depth + 1)
+                child = _build_tree(entry, workspace, max_depth, depth + 1)
                 if child:
                     children.append(child)
         except PermissionError:
@@ -62,19 +107,30 @@ def _build_tree(path: Path, max_depth: int = 6, depth: int = 0) -> FileNode:
                        extension=ext, size=size)
 
 
+# ─── Endpoints ────────────────────────────────────────────────────────────────
+
 @router.get("/tree")
 def get_file_tree(root: str = None):
-    workspace = root or get_setting("workspace_path", str(Path.home()))
-    root_path = Path(workspace)
+    workspace = _get_workspace_root()
+
+    if root:
+        # Validate that any client-supplied root is within the workspace
+        real_root = os.path.realpath(root)
+        if real_root != workspace and not real_root.startswith(workspace + os.sep):
+            raise HTTPException(status_code=403, detail="Access denied")
+        root_path = Path(real_root)
+    else:
+        root_path = Path(workspace)
+
     if not root_path.exists():
-        raise HTTPException(status_code=404, detail=f"Path not found: {workspace}")
-    tree = _build_tree(root_path)
+        raise HTTPException(status_code=404, detail=f"Path not found: {root_path}")
+    tree = _build_tree(root_path, workspace)
     return tree
 
 
 @router.get("/read")
 def read_file(path: str):
-    p = Path(path)
+    p = _safe_path(path)
     if not p.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if not p.is_file():
@@ -90,9 +146,9 @@ def read_file(path: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-    language = _get_language(path)
+    language = _get_language(str(p))
     return FileContent(
-        path=path,
+        path=str(p),
         content=content,
         language=language,
         size=size,
@@ -102,7 +158,7 @@ def read_file(path: str):
 
 @router.post("/save")
 def save_file(req: SaveFileRequest):
-    p = Path(req.path)
+    p = _safe_path(req.path)
     if not p.exists():
         raise HTTPException(status_code=404, detail="File not found")
     try:
@@ -117,7 +173,7 @@ def save_file(req: SaveFileRequest):
 def get_symbols(path: str, content: str = None):
     """Parse and return the symbol map for a file."""
     if content is None:
-        p = Path(path)
+        p = _safe_path(path)
         if not p.exists():
             raise HTTPException(status_code=404, detail="File not found")
         with open(str(p), "r", encoding="utf-8") as f:
@@ -128,6 +184,7 @@ def get_symbols(path: str, content: str = None):
 
 @router.get("/backups")
 def list_backups(path: str):
+    _safe_path(path)  # validate before delegating
     from services.surgical_editor import list_backups
     return list_backups(path)
 
@@ -139,5 +196,7 @@ def restore_backup(body: dict):
     backup_path = body.get("backup_path")
     if not file_path or not backup_path:
         raise HTTPException(status_code=400, detail="file_path and backup_path required")
+    _safe_path(file_path)    # validate both paths
+    _safe_path(backup_path)
     ok = restore_backup(file_path, backup_path)
     return {"ok": ok}

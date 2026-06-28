@@ -11,15 +11,17 @@ import json
 from typing import Optional
 from fastapi import APIRouter, Request, Query
 from fastapi.responses import JSONResponse, Response
+from fastapi import HTTPException
 from database import get_db
 from auth_utils import decode_token
 
 router = APIRouter(prefix="/api/debug", tags=["debug"])
 
 
-def _require_admin(request: Request) -> bool:
-    user_id = getattr(request.state, "user_id", None)
-    return user_id is not None
+def _require_admin(request: Request):
+    """Require actual admin role — not just 'any logged-in user'."""
+    if not getattr(request.state, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
 
 
 @router.get("/pipeline-log")
@@ -30,8 +32,7 @@ async def get_pipeline_log(
     user_id: Optional[str] = Query(None),
 ):
     """Return the last `last` log events from the database, optionally filtered."""
-    if not _require_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    _require_admin(request)
 
     try:
         conn = get_db()
@@ -88,16 +89,16 @@ async def download_pipeline_log(
     Also accepts ?token= for browser direct-link access without Authorization header.
     """
     # Primary auth: middleware-populated state
-    authed = _require_admin(request)
+    is_admin = getattr(request.state, "is_admin", False)
     # Fallback: ?token= query param (browser direct-link)
-    if not authed and token:
+    if not is_admin and token:
         try:
-            decode_token(token)
-            authed = True
+            payload = decode_token(token)
+            is_admin = bool(payload.get("is_admin", False))
         except Exception:
-            authed = False
-    if not authed:
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+            is_admin = False
+    if not is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required")
 
     try:
         conn = get_db()
@@ -139,8 +140,7 @@ async def clear_pipeline_log(
     - No params: wipe everything
     - ?older_than_days=7: only expire entries older than N days
     """
-    if not _require_admin(request):
-        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    _require_admin(request)
     try:
         conn = get_db()
         if older_than_days:
