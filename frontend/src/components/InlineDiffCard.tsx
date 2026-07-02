@@ -720,11 +720,31 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         }
       }
 
-      toast.success(`Applied ${selectedChanges.length} change${selectedChanges.length !== 1 ? 's' : ''} to ${filename}`)
+      // ── Per-change failure surfacing (v3.4) ──────────────────────────
+      // The backend now applies what it can and reports what it couldn't.
+      // Never silently mark a dropped change as applied.
+      const failedChanges: any[] = Array.isArray(result?.failed_changes) ? result.failed_changes : []
+      const failedIds = new Set(failedChanges.map((f: any) => f.change_id).filter(Boolean))
+      const okCount = selectedChanges.length - failedChanges.length
+
+      if (failedChanges.length > 0) {
+        console.warn('[InlineDiffCard] apply reported failed changes:', failedChanges)
+        const names = failedChanges.map((f: any) => f.symbol || '?').slice(0, 3).join(', ')
+        toast.error(
+          `${failedChanges.length} change${failedChanges.length !== 1 ? 's' : ''} could not be applied (${names}) — ` +
+          `the file changed since these edits were generated. Re-run the request to regenerate them.`,
+          { duration: 8000 }
+        )
+      }
+      if (okCount > 0) {
+        toast.success(`Applied ${okCount} change${okCount !== 1 ? 's' : ''} to ${filename}`)
+      }
       setModifiedCode(undefined)  // clear so LivePreview falls back to originalCode (fresh from DB)
       setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
       onApplied?.(filename, newContent)
-      for (const change of selectedChanges) markApplied(change.id)
+      for (const change of selectedChanges) {
+        if (!failedIds.has(change.id)) markApplied(change.id)
+      }
       // Signal ApplyAllButton to re-check applied state (replicates refresh sync)
       window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
     } catch (e: any) {

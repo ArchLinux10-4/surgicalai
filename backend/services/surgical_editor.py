@@ -361,8 +361,35 @@ def apply_change(file_content: str, change) -> str:
         change.applied = True
         return result
 
-    # Nothing worked — return unchanged
-    return file_content
+    # Nothing worked — SURFACE the failure instead of silently returning the
+    # file unchanged. A silent no-op here made apply_changes_to_file count the
+    # change as "applied" while the fix was actually dropped (the QA-correction
+    # drop bug). Raising lets the caller report exactly which change failed.
+    try:
+        from services.pipeline import _dlog
+    except Exception:
+        def _dlog(event, **kwargs):
+            pass
+    _sym_name = getattr(symbol, "full_path", None) or getattr(symbol, "name", "?") if symbol else "?"
+    _dlog(
+        "apply_change_all_paths_failed",
+        symbol=_sym_name,
+        had_new_code=bool(new_code),
+        had_original_code=bool(original_code),
+        original_code_in_file=bool(original_code and original_code in file_content),
+        operations_count=len(operations),
+        line_replace_attempted=bool(start_line and end_line),
+        start_line=start_line,
+        end_line=end_line,
+    )
+    raise ValueError(
+        f"Change to '{_sym_name}' could not be applied by any strategy: "
+        f"line-number replacement "
+        f"{'failed (stale lines — content mismatch, relocation failed)' if (start_line and end_line) else 'not available (no line numbers)'}; "
+        f"{len(operations)} SEARCH/REPLACE operation(s) available; "
+        f"original_code anchor {'not found in current file content' if original_code else 'missing'}. "
+        f"The file content has changed since this edit was generated — re-analyze against the current file."
+    )
 
 def apply_changes_to_file(
     file_path: str,
@@ -439,19 +466,47 @@ def apply_changes_to_file(
     # Backup only when file exists on disk
     backup_path = _backup_file(file_path) if on_disk else None
 
-    # Apply changes
+    # Apply changes — per-change failure isolation.
+    # OLD BEHAVIOR: one failed change aborted the ENTIRE batch (409 to the
+    # client) and rolled back everything, so 4 good edits died with 1 bad one.
+    # NEW BEHAVIOR: apply every change that can be applied; collect failures
+    # and report them in the response so nothing is dropped silently.
     current_content = original_content
     applied_count = 0
+    failed_changes: list = []
 
     for change in to_apply_sorted:
+        _c_sym = getattr(change.symbol, "full_path", None) or getattr(change.symbol, "name", "?")
         try:
             current_content = apply_change(current_content, change)
             applied_count += 1
+            _dlog("apply_all_change_ok", symbol=_c_sym,
+                  applied_count=applied_count)
         except ValueError as e:
-            # Restore from backup if partial failure
-            if applied_count > 0 and backup_path:
-                shutil.copy2(backup_path, file_path)
-            raise ValueError(f"Failed applying change to {change.symbol.full_path}: {e}")
+            _dlog("apply_all_change_failed", symbol=_c_sym,
+                  change_id=getattr(change, "id", None),
+                  reason=str(e))
+            failed_changes.append({
+                "change_id": getattr(change, "id", None),
+                "symbol": _c_sym,
+                "reason": str(e),
+            })
+
+    _dlog("apply_all_batch_summary",
+          total=len(to_apply_sorted),
+          applied=applied_count,
+          failed=len(failed_changes),
+          failed_symbols=[f["symbol"] for f in failed_changes])
+
+    if failed_changes and applied_count == 0:
+        # Nothing applied at all — keep the old contract: raise so the
+        # caller gets a hard error (surfaced as 409 by the router).
+        _summary = "; ".join(
+            f"{f['symbol']}: {f['reason'][:160]}" for f in failed_changes[:5]
+        )
+        raise ValueError(
+            f"All {len(failed_changes)} change(s) failed to apply. {_summary}"
+        )
 
     # v3.3.1: HTML structure validation — reject if critical structure was lost
     _ext = Path(file_path).suffix.lower()
@@ -491,7 +546,9 @@ def apply_changes_to_file(
             applied_count=applied_count,
             backup_path=backup_path,
             cloud_mode=False,
-            modified_content=current_content
+            modified_content=current_content,
+            failed_count=len(failed_changes),
+            failed_changes=failed_changes
         )
     else:
         # Cloud/in-memory mode — file was uploaded, not on disk
@@ -501,7 +558,9 @@ def apply_changes_to_file(
             applied_count=applied_count,
             backup_path=None,
             cloud_mode=True,
-            modified_content=current_content
+            modified_content=current_content,
+            failed_count=len(failed_changes),
+            failed_changes=failed_changes
         )
 
 

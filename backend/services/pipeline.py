@@ -11636,6 +11636,17 @@ async def run_natural_pipeline_stream(
         for resolve_round in range(MAX_SYMBOL_RETRIES + 1):
             still_unresolved = []
 
+            # ── Correction-round rebase (v3.4) ─────────────────────────────
+            # EVERY correction prompt now shows the CURRENT accumulated symbol
+            # content, so corrected edits arrive anchored to current line
+            # numbers. The applied-ranges recorded in round 0 use pre-shift
+            # coordinates — comparing them against corrected edits produces
+            # false overlaps that re-block the very fixes the correction loop
+            # asked for (the correction-drop bug). Reset the guard once per
+            # symbol per correction round; edits within the same round still
+            # guard against each other.
+            _rebased_this_round: set = set()
+
             for edit_raw in pending_edits:
                 _parse_err_1 = _parse_err_2 = _parse_err_3 = None
                 try:
@@ -12064,6 +12075,19 @@ async def run_natural_pipeline_stream(
                         # ensures non-overlapping ranges apply in the correct order;
                         # overlapping ones are a generation error — skip with a
                         # clear message rather than silently corrupt the symbol.
+                        # ── Correction-round rebase: corrected edits are anchored
+                        # to the current accumulated content (shown in the
+                        # correction prompt), so ranges recorded in earlier rounds
+                        # are obsolete for this symbol. Clear once per round.
+                        if resolve_round > 0 and _akey not in _rebased_this_round:
+                            _dlog("line_range_overlap_rebase", session_id=session_id,
+                                  filename=filename, symbol=symbol_name,
+                                  resolve_round=resolve_round,
+                                  cleared_ranges=_ln_applied_ranges.get(_akey, []),
+                                  user_id=user_id)
+                            _ln_applied_ranges[_akey] = []
+                            _rebased_this_round.add(_akey)
+
                         _overlap_reason = None
                         for (_ps, _pe) in _ln_applied_ranges.get(_akey, []):
                             if _isl <= _pe and _iel >= _ps:
@@ -12075,16 +12099,37 @@ async def run_natural_pipeline_stream(
                                 )
                                 break
                         if _overlap_reason:
+                            # Do NOT dead-end the edit (old behavior silently
+                            # dropped it into skipped_changes_struct). Route it
+                            # to the correction loop with the CURRENT accumulated
+                            # symbol content so Claude can re-anchor the edit
+                            # against what the symbol looks like NOW.
+                            _accum_now = _symbol_accum.get(_akey, symbol.code)
                             logging.warning(
-                                "line_range_overlap: %s %s", filename, _overlap_reason
+                                "line_range_overlap: %s %s — routing to correction loop",
+                                filename, _overlap_reason
                             )
                             _dlog("line_range_overlap", session_id=session_id,
                                   filename=filename, symbol=symbol_name,
-                                  conflict=_overlap_reason, user_id=user_id)
-                            skipped_changes_struct.append({
+                                  conflict=_overlap_reason,
+                                  resolve_round=resolve_round,
+                                  routed_to_correction=True,
+                                  accum_base_len=len(_accum_now),
+                                  user_id=user_id)
+                            still_unresolved.append({
                                 "filename": filename,
                                 "symbol": symbol_name,
-                                "reason": _overlap_reason,
+                                "new_code": new_code,
+                                "description": description,
+                                "_raw": edit_raw,
+                                "_snippet_reason": (
+                                    _overlap_reason
+                                    + " The symbol content shown below is the CURRENT "
+                                    "state (earlier edits already applied) — re-anchor "
+                                    "your edit against it."
+                                ),
+                                "_symbol_code": _accum_now,
+                                "_symbol_start": symbol.start_line,
                             })
                             continue
 
@@ -12121,7 +12166,12 @@ async def run_natural_pipeline_stream(
                                 "description": description,
                                 "_raw": edit_raw,
                                 "_snippet_reason": snip_reason,
-                                "_symbol_code": symbol.code,
+                                # CURRENT accumulated content — not symbol.code
+                                # (the pristine original). Showing stale content
+                                # made the correction model re-anchor against
+                                # lines that no longer exist (the correction-drop
+                                # bug).
+                                "_symbol_code": _accum_base,
                                 "_symbol_start": symbol.start_line,
                             })
                             continue
@@ -12183,7 +12233,12 @@ async def run_natural_pipeline_stream(
                                 "description": description,
                                 "_raw": edit_raw,
                                 "_snippet_reason": snip_reason,
-                                "_symbol_code": symbol.code,
+                                # CURRENT accumulated content — not symbol.code
+                                # (the pristine original). Showing stale content
+                                # made the correction model re-anchor against
+                                # lines that no longer exist (the correction-drop
+                                # bug).
+                                "_symbol_code": _accum_base,
                                 "_symbol_start": symbol.start_line,
                             })
                             continue
@@ -12194,7 +12249,8 @@ async def run_natural_pipeline_stream(
                         # replacement would destroy the rest of the symbol. Force a
                         # targeted-edit retry (old_code/new_code) instead of building
                         # a destructive find:<whole symbol> -> replace:<fragment> op.
-                        frag_reason = _fragment_reason(symbol.code, new_code)
+                        _accum_frag_base = _symbol_accum.get(_akey, symbol.code)
+                        frag_reason = _fragment_reason(_accum_frag_base, new_code)
                         if frag_reason:
                             still_unresolved.append({
                                 "filename": filename,
@@ -12203,7 +12259,8 @@ async def run_natural_pipeline_stream(
                                 "description": description,
                                 "_raw": edit_raw,
                                 "_snippet_reason": frag_reason,
-                                "_symbol_code": symbol.code,
+                                # CURRENT accumulated content (see comment above)
+                                "_symbol_code": _accum_frag_base,
                                 "_symbol_start": symbol.start_line,
                             })
                             continue

@@ -239,6 +239,10 @@ class SurgicalApplyResponse(BaseModel):
     backup_path: Optional[str] = None
     cloud_mode: bool = False
     modified_content: Optional[str] = None
+    # Per-change failure reporting (v3.4): changes that could not be applied
+    # are listed here instead of silently no-oping or aborting the batch.
+    failed_count: int = 0
+    failed_changes: List[dict] = Field(default_factory=list)
 
 
 class SurgicalPreviewRequest(BaseModel):
