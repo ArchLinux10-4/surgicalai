@@ -222,4 +222,3 @@ def test_ollama(body: dict = None):
         return {"ok": True, "models": models, "message": f"Connected to Ollama at {base_url}"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Cannot connect to Ollama: {str(e)}")
-
