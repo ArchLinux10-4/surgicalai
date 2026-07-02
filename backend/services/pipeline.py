@@ -249,7 +249,7 @@ _THINKING_EXCLUDED_MODELS = ("claude-opus-4-7", "claude-opus-4-8")
 # Adaptive mode also auto-enables interleaved thinking (no beta header needed).
 # display defaults to "omitted" on these models — must set "summarized" explicitly
 # or thinking panel content will come back as empty strings (silent bug).
-_ADAPTIVE_THINKING_MODELS = ("claude-opus-4-8", "claude-opus-4-7")
+_ADAPTIVE_THINKING_MODELS = ("claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5", "claude-fable-5")
 
 # -- ReAct agentic search: per-session grep cache ----------------------------
 # Keyed by session_cache_key -> accumulated grep text from prior search rounds.
@@ -464,6 +464,23 @@ def _get_effort_kwargs(model: str) -> dict:
     if _uses_adaptive_thinking(model):
         return {"output_config": {"effort": "xhigh"}}
     return {}
+
+
+def _extract_claude_text(response) -> str:
+    """Safely extract text from a Claude API response.
+
+    Models with adaptive/always-on thinking (Sonnet 5, Fable 5, Opus 4.x)
+    return ThinkingBlock(s) before the TextBlock.  content[0].text crashes
+    on a ThinkingBlock.  This iterates to find the first TextBlock instead.
+    Returns '' if no text block is found (graceful degradation).
+    """
+    for block in response.content:
+        if getattr(block, "type", None) == "text":
+            return block.text or ""
+    _dlog("extract_claude_text_no_text_block",
+          stop_reason=getattr(response, "stop_reason", None),
+          block_types=[getattr(b, "type", "?") for b in response.content])
+    return ""
 
 
 def _resolve_key(user_id: str, key_type: str) -> str:
@@ -2157,7 +2174,7 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
                 system=SURGEON_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
             ))
-            raw = _claude_surgeon_resp.content[0].text
+            raw = _extract_claude_text(_claude_surgeon_resp)
         else:
             response = _chat_create(client,
                 model=surg_model,
