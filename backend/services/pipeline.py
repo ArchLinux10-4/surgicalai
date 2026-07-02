@@ -7009,6 +7009,13 @@ USER REQUEST:
                 _react_searched_terms = []
                 _react_accumulated = ""
                 _react_budget_lines = 0
+                # ── Progress-based round extension ──
+                # A round that surfaces never-before-seen code locations is
+                # "productive" and gets refunded (doesn't count against the
+                # cap). Bounded by an absolute hard ceiling on total rounds.
+                _react_abs_round = 0
+                _REACT_HARD_CEILING = 16
+                _react_seen_across = set()
 
                 # Seed from session cache (previous search rounds in this session)
                 _react_cache_key = "{}::{}".format(
@@ -7021,6 +7028,7 @@ USER REQUEST:
 
                 while _react_round < _REACT_MAX_ROUNDS:
                     _react_round += 1
+                    _react_abs_round += 1
 
                     # Build context for this round (base + accumulated search results)
                     _react_context = context_msg
@@ -7363,6 +7371,46 @@ USER REQUEST:
 
                         _react_grep_cache[_react_cache_key] = _react_accumulated
 
+                        # ── Progress-based round extension ──
+                        # Labels are deterministic (file + symbol path + line
+                        # range), so they identify code locations across rounds.
+                        try:
+                            _new_locations = [
+                                _h[1] for _h in _round_hits
+                                if _h[1] not in _react_seen_across
+                            ]
+                            for _h in _round_hits:
+                                _react_seen_across.add(_h[1])
+                            if _react_abs_round == _REACT_HARD_CEILING:
+                                # Absolute ceiling reached: grant exactly one
+                                # final forced-planning round, then exit.
+                                _react_round = _REACT_MAX_ROUNDS - 1
+                                _dlog("react_hard_ceiling",
+                                      session_id=session_id, user_id=user_id,
+                                      abs_round=_react_abs_round,
+                                      max_rounds=_REACT_MAX_ROUNDS)
+                            elif _new_locations and _react_abs_round < _REACT_HARD_CEILING:
+                                # Productive round — refund it so it doesn't
+                                # count against the round cap.
+                                _react_round -= 1
+                                _dlog("react_round_productive_extension",
+                                      session_id=session_id, user_id=user_id,
+                                      abs_round=_react_abs_round,
+                                      counted_round=_react_round,
+                                      new_locations=len(_new_locations))
+                            elif not _new_locations:
+                                _dlog("react_round_stalled",
+                                      session_id=session_id, user_id=user_id,
+                                      abs_round=_react_abs_round,
+                                      counted_round=_react_round,
+                                      terms=_new_terms[:5])
+                        except Exception as _ext_exc:
+                            # Extension is best-effort — never break the loop.
+                            _dlog("react_extension_error",
+                                  session_id=session_id, user_id=user_id,
+                                  error=str(_ext_exc),
+                                  error_type=type(_ext_exc).__name__)
+
                     # If budget was exceeded, the warning is injected at top of next round;
                     # the loop naturally exits when _react_round hits _REACT_MAX_ROUNDS.
 
@@ -7473,6 +7521,11 @@ USER REQUEST:
             _oai_round = 0
             _oai_searched_terms = set()
             _oai_accumulated_context = ""
+            # ── Progress-based round extension (mirror of Claude loop) ──
+            # Terms are deduped via _oai_searched_terms, so any non-empty
+            # result for a new term is genuinely new information.
+            _oai_abs_round = 0
+            _OAI_HARD_CEILING = 16
             _oai_react_cache = getattr(session_files[0], "_react_grep_cache", {}) if session_files else {}
             plan = {"intent": "search"}  # seed to enter loop
 
@@ -7482,6 +7535,7 @@ USER REQUEST:
                     break  # Architect has enough context — exit loop
 
                 _oai_round += 1
+                _oai_abs_round += 1
                 _search_terms_oai = plan.get("search_terms", [])
                 _new_terms = [t for t in _search_terms_oai if t not in _oai_searched_terms]
 
@@ -7547,6 +7601,37 @@ USER REQUEST:
 
                 if _grep_results_oai:
                     _oai_accumulated_context += _grep_results_oai
+
+                # ── Progress-based round extension ──
+                try:
+                    if _oai_abs_round == _OAI_HARD_CEILING:
+                        # Absolute ceiling: grant exactly one final
+                        # forced-planning round, then exit.
+                        _oai_round = _OAI_REACT_MAX - 1
+                        _dlog("oai_react_hard_ceiling",
+                              session_id=session_id, user_id=user_id,
+                              abs_round=_oai_abs_round,
+                              max_rounds=_OAI_REACT_MAX)
+                    elif _grep_results_oai and _oai_abs_round < _OAI_HARD_CEILING:
+                        # Productive round — refund it.
+                        _oai_round -= 1
+                        _dlog("oai_react_round_productive_extension",
+                              session_id=session_id, user_id=user_id,
+                              abs_round=_oai_abs_round,
+                              counted_round=_oai_round,
+                              result_chars=len(_grep_results_oai))
+                    else:
+                        _dlog("oai_react_round_stalled",
+                              session_id=session_id, user_id=user_id,
+                              abs_round=_oai_abs_round,
+                              counted_round=_oai_round,
+                              terms=(_new_terms or _search_terms_oai)[:5])
+                except Exception as _ext_exc_oai:
+                    # Extension is best-effort — never break the loop.
+                    _dlog("oai_react_extension_error",
+                          session_id=session_id, user_id=user_id,
+                          error=str(_ext_exc_oai),
+                          error_type=type(_ext_exc_oai).__name__)
 
                 # ── "No matches" feedback: tell the model explicitly when search found nothing ──
                 _no_match_terms = [t for t in (_new_terms or _search_terms_oai)[:6]
@@ -12412,6 +12497,14 @@ async def run_natural_pipeline_stream(
                 # edit blocks, execute the search inline and issue one more
                 # Claude call so it can produce the edit with verbatim anchors.
                 if not new_pending:
+                    if "<cannot_anchor" in corr_text:
+                        # Model honestly can't anchor — log it; the existing
+                        # no-edit path below already degrades to skipped.
+                        _dlog("correction_cannot_anchor",
+                              session_id=session_id,
+                              resolve_round=resolve_round,
+                              response_preview=corr_text[:300],
+                              user_id=user_id)
                     import re as _re_corr
                     _csm = _re_corr.search(
                         r'<search_request>\s*(\{.*?\})\s*</search_request>',
@@ -12440,7 +12533,10 @@ async def run_natural_pipeline_stream(
                                         + _csr
                                         + "\n\nNow write your corrected <surgical_edit> block(s). "
                                         "Use the EXACT verbatim lines shown above as your "
-                                        "old_code anchor — copy them character-for-character."
+                                        "old_code anchor — copy them character-for-character. "
+                                        "If you cannot locate the exact code to anchor on, "
+                                        "reply <cannot_anchor reason='...'/> instead of "
+                                        "guessing — never fabricate an anchor."
                                     )},
                                 ]
                                 _fu_task = asyncio.create_task(
@@ -13208,12 +13304,29 @@ async def run_natural_pipeline_stream(
                     _react_msgs = list(_corr_msgs_by_idx.get(idx, []))
                     _got_edit = False
                     _corr_react_round = 0
+                    # ── Progress-based round extension ──
+                    # Follow-ups that fetch never-before-seen context are
+                    # free; bounded by an absolute hard ceiling.
+                    _corr_abs_round = 0
+                    _CORR_HARD_CEILING = 6
+                    _corr_seen_ctx = set()
 
                     while _corr_react_round <= _MAX_CORR_REACT:
                         ei = corr_text.find(EDIT_OPEN)
                         ec = corr_text.find(EDIT_CLOSE, ei) if ei != -1 else -1
                         if ei != -1 and ec != -1:
                             _got_edit = True
+                            break
+
+                        if "<cannot_anchor" in corr_text:
+                            # Model honestly can't locate an anchor — clean
+                            # abort routes to the existing keep-original path.
+                            _dlog("qa_retry_correction_clean_abort",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  react_round=_corr_react_round,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  response_preview=corr_text[:300])
                             break
 
                         if _corr_react_round >= _MAX_CORR_REACT:
@@ -13318,7 +13431,10 @@ async def run_natural_pipeline_stream(
                                 f"{_react_context}\n\n"
                                 "Now write your corrected <surgical_edit> block. "
                                 "Use the EXACT verbatim lines shown above as your "
-                                "old_code anchor — copy them character-for-character."
+                                "old_code anchor — copy them character-for-character. "
+                                "If you cannot locate the exact code to anchor on, "
+                                "reply <cannot_anchor reason='...'/> instead of "
+                                "guessing — never fabricate an anchor."
                             )},
                         ])
 
@@ -13370,7 +13486,36 @@ async def run_natural_pipeline_stream(
                                   error_type=type(_react_exc).__name__)
                             break  # API error — stop ReAct for this correction
 
-                        _corr_react_round += 1
+                        # ── Progress-based round extension ──
+                        # _react_context is deterministic per fetched content,
+                        # so a repeated hash means the model re-requested the
+                        # same context (stalled). New context = free round.
+                        _corr_abs_round += 1
+                        _ctx_sig = hash(_react_context)
+                        if _corr_abs_round >= _CORR_HARD_CEILING:
+                            _corr_react_round = _MAX_CORR_REACT
+                            _dlog("qa_retry_correction_hard_ceiling",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  abs_round=_corr_abs_round,
+                                  symbol=change_shells[idx]["symbol"].name)
+                        elif _ctx_sig not in _corr_seen_ctx:
+                            # New context fetched — this follow-up is free.
+                            _dlog("qa_retry_correction_productive_extension",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  abs_round=_corr_abs_round,
+                                  counted_round=_corr_react_round,
+                                  symbol=change_shells[idx]["symbol"].name)
+                        else:
+                            _corr_react_round += 1
+                            _dlog("qa_retry_correction_round_stalled",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  abs_round=_corr_abs_round,
+                                  counted_round=_corr_react_round,
+                                  symbol=change_shells[idx]["symbol"].name)
+                        _corr_seen_ctx.add(_ctx_sig)
 
                     if not _got_edit:
                         _dlog("qa_retry_correction_no_edit_block",
