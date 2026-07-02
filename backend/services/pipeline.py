@@ -10233,13 +10233,25 @@ async def _retry_truncated_edit(
     }]
 
     try:
+        _retry_edit_kwargs = {
+            "model": arch_model,
+            "max_tokens": 64000,
+            "system": focused_system,
+            "messages": focused_messages,
+        }
+        _retry_edit_thinking_kwargs = _get_thinking_kwargs(arch_model, 10000)
+        _retry_edit_effort_kwargs = _get_effort_kwargs(arch_model)
+        _retry_edit_kwargs.update(_retry_edit_thinking_kwargs)
+        _retry_edit_kwargs.update(_retry_edit_effort_kwargs)
+        _dlog("retry_truncated_edit_kwargs",
+              session_id=session_id, user_id=user_id,
+              filename=filename, symbol=symbol_name,
+              model=arch_model,
+              thinking_kwargs=_retry_edit_thinking_kwargs,
+              effort_kwargs=_retry_edit_effort_kwargs)
+
         _chunks = []
-        async with aclient.messages.stream(
-            model=arch_model,
-            max_tokens=64000,
-            system=focused_system,
-            messages=focused_messages,
-        ) as _stream:
+        async with aclient.messages.stream(**_retry_edit_kwargs) as _stream:
             async for _t in _stream.text_stream:
                 _chunks.append(_t)
 
@@ -10311,13 +10323,25 @@ async def _retry_truncated_newfile(
     }]
 
     try:
+        _retry_newfile_kwargs = {
+            "model": arch_model,
+            "max_tokens": 64000,
+            "system": focused_system,
+            "messages": focused_messages,
+        }
+        _retry_newfile_thinking_kwargs = _get_thinking_kwargs(arch_model, 10000)
+        _retry_newfile_effort_kwargs = _get_effort_kwargs(arch_model)
+        _retry_newfile_kwargs.update(_retry_newfile_thinking_kwargs)
+        _retry_newfile_kwargs.update(_retry_newfile_effort_kwargs)
+        _dlog("retry_truncated_newfile_kwargs",
+              session_id=session_id, user_id=user_id,
+              filename=filename,
+              model=arch_model,
+              thinking_kwargs=_retry_newfile_thinking_kwargs,
+              effort_kwargs=_retry_newfile_effort_kwargs)
+
         _chunks = []
-        async with aclient.messages.stream(
-            model=arch_model,
-            max_tokens=64000,
-            system=focused_system,
-            messages=focused_messages,
-        ) as _stream:
+        async with aclient.messages.stream(**_retry_newfile_kwargs) as _stream:
             async for _t in _stream.text_stream:
                 _chunks.append(_t)
 
