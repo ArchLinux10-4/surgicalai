@@ -73,7 +73,7 @@ def get_available_models(request: Request):
     # account actually accepts are listed (others 404 at request time).
     claude_models = [
         {"id": "claude-opus-4-8", "name": "Claude Opus 4.8", "role": "architect",
-         "description": "Newest flagship — most capable, best for complex multi-file work", "provider": "anthropic"},
+         "description": "Complex agentic coding — powerful for multi-file work", "provider": "anthropic"},
         {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "role": "architect",
          "description": "High-capability Opus — strong for large, multi-step changes", "provider": "anthropic"},
         {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "role": "architect",
@@ -83,13 +83,13 @@ def get_available_models(request: Request):
         {"id": "claude-opus-4-1", "name": "Claude Opus 4.1", "role": "architect",
          "description": "Earlier Opus — solid for complex changes", "provider": "anthropic"},
         {"id": "claude-sonnet-5", "name": "Claude Sonnet 5", "role": "architect",
-         "description": "Latest Sonnet — fast and powerful, adaptive thinking", "provider": "anthropic"},
+         "description": "Best speed + intelligence balance — recommended for most tasks", "provider": "anthropic"},
         {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "role": "architect",
-         "description": "Fast, intelligent — recommended for most tasks", "provider": "anthropic"},
+         "description": "Fast, intelligent — proven and reliable", "provider": "anthropic"},
         {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "role": "architect",
          "description": "Fast and capable — balanced speed and quality", "provider": "anthropic"},
         {"id": "claude-fable-5", "name": "Claude Fable 5", "role": "architect",
-         "description": "Creative powerhouse — ⚠️ 5x Sonnet pricing ($10/$50 per M tokens)", "provider": "anthropic"},
+         "description": "Most capable model — ⚠️ Premium pricing ($10/$50 per M tokens)", "provider": "anthropic"},
         {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "role": "architect",
          "description": "Fastest Claude — great for quick edits and simple changes", "provider": "anthropic"},
     ]
