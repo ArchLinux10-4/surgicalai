@@ -395,8 +395,46 @@ def apply_changes_to_file(
     if not to_apply:
         raise ValueError("No matching changes to apply.")
 
-    # Sort by line number descending — apply bottom-up to preserve line positions
-    to_apply_sorted = sorted(to_apply, key=lambda c: c.symbol.start_line, reverse=True)
+    # Sort by line number descending — apply bottom-up to preserve line positions.
+    # EXCEPTION: "_gap_bridge" changes are whole-file anchors (start_line=1,
+    # end_line=file_total). If applied last (their natural sort position, since
+    # start_line=1 is always smallest), their anchor is the ENTIRE ORIGINAL FILE —
+    # which can never match after any other edit has already changed the file,
+    # and can never be found again by substring relocation either. So gap_bridge
+    # must be applied FIRST, establishing the correct baseline; the other edits'
+    # own stale-line relocation (by their own small, unique anchor text) then
+    # safely absorbs any line-number shift gap_bridge introduces.
+    try:
+        from services.pipeline import _dlog
+    except Exception:
+        def _dlog(event, **kwargs):
+            pass
+
+    _gap_bridge_count = sum(
+        1 for c in to_apply if getattr(c.symbol, "name", "") == "_gap_bridge"
+    )
+    _dlog(
+        "apply_all_sort_start",
+        total_changes=len(to_apply),
+        gap_bridge_count=_gap_bridge_count,
+        change_names=[getattr(c.symbol, "name", "") for c in to_apply],
+        change_start_lines=[getattr(c.symbol, "start_line", None) for c in to_apply],
+    )
+
+    to_apply_sorted = sorted(
+        to_apply,
+        key=lambda c: (getattr(c.symbol, "name", "") != "_gap_bridge", -c.symbol.start_line),
+    )
+
+    _dlog(
+        "apply_all_sort_result",
+        sorted_names=[getattr(c.symbol, "name", "") for c in to_apply_sorted],
+        sorted_start_lines=[getattr(c.symbol, "start_line", None) for c in to_apply_sorted],
+        gap_bridge_moved_first=(
+            _gap_bridge_count > 0
+            and getattr(to_apply_sorted[0].symbol, "name", "") == "_gap_bridge"
+        ),
+    )
 
     # Backup only when file exists on disk
     backup_path = _backup_file(file_path) if on_disk else None
