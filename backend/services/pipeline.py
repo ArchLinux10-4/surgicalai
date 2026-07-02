@@ -10205,7 +10205,7 @@ async def _retry_truncated_edit(
     if smap:
         lines = []
         for sym in smap.symbols:
-            lines.append(f"  {sym.kind}: {sym.name} (L{sym.start_line}-L{sym.end_line})")
+            lines.append(f"  {sym.symbol_type.value}: {sym.name} (L{sym.start_line}-L{sym.end_line})")
         sym_index = "SYMBOL INDEX:\n" + "\n".join(lines) + "\n\n"
 
     focused_system = (
