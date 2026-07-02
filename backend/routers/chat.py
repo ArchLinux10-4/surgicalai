@@ -45,8 +45,10 @@ async def _with_heartbeat(aiter, interval: int = 5):
         task.cancel()
         try:
             await task
-        except (asyncio.CancelledError, Exception):
+        except asyncio.CancelledError:
             pass
+        except Exception as _hb_exc:
+            _dlog("heartbeat_swallow", exc_type=type(_hb_exc).__name__, exc_msg=str(_hb_exc))
 
 
 def _load_effective_memory(conn, session_id):

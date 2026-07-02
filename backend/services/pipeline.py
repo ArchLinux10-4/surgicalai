@@ -10273,6 +10273,80 @@ async def _retry_truncated_edit(
         return None
 
 
+async def _retry_truncated_newfile(
+    aclient,
+    arch_model: str,
+    filename: str,
+    user_request: str,
+    session_id: str = "",
+    user_id: str = "",
+) -> str | None:
+    """
+    Retry a single truncated new-file creation with a focused Claude call.
+
+    Mirrors _retry_truncated_edit but for <new_file> blocks: instead of
+    asking Claude to produce ALL files in one response, this gives it just
+    ONE filename and asks it to write the complete file from scratch.
+    Returns the raw new_file block JSON string, or None on failure.
+    """
+    import json as _json
+
+    focused_system = (
+        "You are SurgicalAI. Write EXACTLY ONE <new_file> block for the "
+        f"file '{filename}'.\n\n"
+        "Format:\n"
+        "<new_file>\n"
+        '{"filename": "...", "language": "...", "summary": "...", "content": "..."}\n'
+        "</new_file>\n\n"
+        "Write production-ready code — no stubs, no TODOs, no placeholders. "
+        "Include all necessary imports. The file should be immediately usable."
+    )
+
+    focused_messages = [{
+        "role": "user",
+        "content": (
+            f"User request: {user_request}\n\n"
+            f"Write the complete file '{filename}' now, in full."
+        ),
+    }]
+
+    try:
+        _chunks = []
+        async with aclient.messages.stream(
+            model=arch_model,
+            max_tokens=64000,
+            system=focused_system,
+            messages=focused_messages,
+        ) as _stream:
+            async for _t in _stream.text_stream:
+                _chunks.append(_t)
+
+        text = "".join(_chunks).strip()
+
+        FILE_OPEN = "<new_file>"
+        FILE_CLOSE = "</new_file>"
+        start = text.find(FILE_OPEN)
+        end = text.find(FILE_CLOSE)
+
+        if start != -1 and end != -1:
+            raw = text[start + len(FILE_OPEN):end].strip()
+            _json.loads(raw)  # validate parseable
+            _dlog("retry_truncated_newfile_success",
+                  session_id=session_id, user_id=user_id,
+                  filename=filename, raw_len=len(raw))
+            return raw
+
+        _dlog("retry_truncated_newfile_no_block",
+              session_id=session_id, user_id=user_id,
+              filename=filename, response_preview=text[:200])
+        return None
+
+    except Exception as e:
+        _dlog("retry_truncated_newfile_error",
+              session_id=session_id, user_id=user_id,
+              filename=filename, error=str(e))
+        return None
+
 
 async def _execute_single_edit(
     aclient, model: str,
@@ -11307,6 +11381,53 @@ async def run_natural_pipeline_stream(
 
                 # Replace edit_blocks_raw with only the good (+ retried) blocks
                 edit_blocks_raw = _good_blocks
+
+            # Find which new_file blocks failed to parse (truncated ones)
+            _good_files = []
+            _bad_files_raw = []
+            for _fb_raw in new_file_blocks_raw:
+                try:
+                    json.loads(_fb_raw.strip())
+                    _good_files.append(_fb_raw)
+                except Exception:
+                    try:
+                        json.loads(_repair_json(_fb_raw.strip()))
+                        _good_files.append(_fb_raw)
+                    except Exception:
+                        _bad_files_raw.append(_fb_raw)
+
+            if _bad_files_raw:
+                _dlog("retry_truncated_newfiles",
+                      session_id=session_id, user_id=user_id,
+                      good=len(_good_files), bad=len(_bad_files_raw))
+
+                import re as _re_retry_nf
+                for _bad_raw in _bad_files_raw:
+                    _fname_match = _re_retry_nf.search(r'"filename"\s*:\s*"([^"]+)"', _bad_raw)
+                    if _fname_match:
+                        _retry_fname = _fname_match.group(1)
+                        yield sse({"type": "progress",
+                                   "content": f"Retrying {_retry_fname}..."})
+                        _retried_file = await _retry_truncated_newfile(
+                            aclient, arch_model,
+                            _retry_fname, user_request,
+                            session_id, user_id
+                        )
+                        if _retried_file:
+                            _good_files.append(_retried_file)
+                            yield sse({"type": "progress",
+                                       "content": f"✅ {_retry_fname} recovered"})
+                            continue
+
+                    # If retry failed or couldn't identify the filename
+                    skipped_changes_struct.append({
+                        "filename": _fname_match.group(1) if _fname_match else "(unknown)",
+                        "symbol": "(new file)",
+                        "reason": "New file was truncated by output limit and retry failed",
+                    })
+
+                # Replace new_file_blocks_raw with only the good (+ retried) blocks
+                new_file_blocks_raw = _good_files
 
 
         # ── Plan→Execute: focused per-symbol edit calls ──────────────────
