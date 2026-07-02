@@ -731,9 +731,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         console.warn('[InlineDiffCard] apply reported failed changes:', failedChanges)
         const names = failedChanges.map((f: any) => f.symbol || '?').slice(0, 3).join(', ')
         toast.error(
-          `${failedChanges.length} change${failedChanges.length !== 1 ? 's' : ''} could not be applied (${names}) — ` +
-          `the file changed since these edits were generated. Re-run the request to regenerate them.`,
-          { duration: 8000 }
+          `${failedChanges.length} change${failedChanges.length !== 1 ? 's' : ''} could not be applied (${names})`,
+          'The file changed since these edits were generated. Re-run the request to regenerate them.'
         )
       }
       if (okCount > 0) {
