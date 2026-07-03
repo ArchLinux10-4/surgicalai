@@ -574,23 +574,60 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
     from services.api_retry import api_call_with_retry
     base_model = model.split(":")[0].lower()
     if base_model in NO_TEMPERATURE_MODELS:
-        # Inject reasoning_effort for models that support it, unless caller overrode it
-        if base_model in REASONING_EFFORT_MODELS and "reasoning_effort" not in kwargs:
-            _re = get_setting("reasoning_effort", "")
-            if _re and _re.lower() in ("none", "low", "medium", "high", "xhigh"):
-                kwargs["reasoning_effort"] = _re.lower()
-        # Reasoning models require max_completion_tokens (not max_tokens).
-        # Without this, the model can allocate unlimited reasoning budget and
-        # think for minutes — causing SSE timeouts with 0 tokens collected.
-        if "max_completion_tokens" not in kwargs:
-            kwargs["max_completion_tokens"] = 16384
+        # ── GPT-5.x / o-series reasoning branch (Claude models never enter here) ──
+        # Phase 1 hardening (flag: gpt5_hardening, default ON): 32k budget,
+        # explicit low reasoning_effort, finish_reason truncation retry.
+        # Docs: reasoning tokens bill against max_completion_tokens; OpenAI says
+        # reserve >= 25k, and truncation can occur with ZERO visible output.
+        _gpt_hardened = False
+        try:
+            from services.gpt_reasoning import (
+                apply_hardening_kwargs as _gh_apply,
+                create_with_truncation_retry as _gh_create,
+                responses_api_enabled as _gh_responses_on,
+                responses_create as _gh_responses_create,
+            )
+            _gpt_hardened = _gh_apply(base_model, kwargs, REASONING_EFFORT_MODELS,
+                                      get_setting, _dlog)
+        except Exception as _gh_err:
+            _dlog("gpt_hardening_import_error", model=model,
+                  error_type=type(_gh_err).__name__, error=str(_gh_err)[:300])
+            _gh_create = None
+            _gh_responses_on = None
+            _gh_responses_create = None
+        if not _gpt_hardened:
+            # Legacy defaults — byte-for-byte the pre-hardening behavior.
+            if base_model in REASONING_EFFORT_MODELS and "reasoning_effort" not in kwargs:
+                _re = get_setting("reasoning_effort", "")
+                if _re and _re.lower() in ("none", "low", "medium", "high", "xhigh"):
+                    kwargs["reasoning_effort"] = _re.lower()
+            if "max_completion_tokens" not in kwargs:
+                kwargs["max_completion_tokens"] = 16384
         _dlog("chat_create_reasoning_model",
               model=model, base_model=base_model,
               reasoning_effort=kwargs.get("reasoning_effort", "<not set>"),
               max_completion_tokens=kwargs.get("max_completion_tokens"),
               has_response_format="response_format" in kwargs,
-              stream=kwargs.get("stream", False))
-        return api_call_with_retry(lambda: client.chat.completions.create(model=model, messages=messages, **kwargs))
+              stream=kwargs.get("stream", False),
+              gpt_hardened=_gpt_hardened)
+        _is_stream = bool(kwargs.get("stream", False))
+        # Phase 3 (flag: gpt_responses_api, default OFF): route non-stream calls
+        # to the Responses API via a chat-completions-shaped shim. Any mapping
+        # or API problem returns None and we fall back to Chat Completions.
+        if not _is_stream and _gh_responses_on is not None and _gh_responses_on(get_setting):
+            _shim = _gh_responses_create(client, model, messages, kwargs,
+                                         api_call_with_retry, _dlog)
+            if _shim is not None:
+                return _shim
+            _dlog("gpt_responses_fallback_to_chat_completions", model=model)
+        if _is_stream or not _gpt_hardened or _gh_create is None:
+            # Streams cannot be inspected for finish_reason here; hardening-off
+            # keeps the original single-shot call.
+            return api_call_with_retry(lambda: client.chat.completions.create(model=model, messages=messages, **kwargs))
+        # Phase 1: single truncation retry on finish_reason=length / empty output.
+        return _gh_create(
+            lambda _kw: api_call_with_retry(lambda: client.chat.completions.create(model=model, messages=messages, **_kw)),
+            kwargs, _dlog, model=model)
     return api_call_with_retry(lambda: client.chat.completions.create(model=model, messages=messages, temperature=temperature, **kwargs))
 
 
@@ -2118,9 +2155,26 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
                     ],
                     temperature=temp,
                     tools=SURGEON_TOOLS_OPENAI,
+                    tool_choice="required",  # docs: force >=1 tool call — text-only
+                                             # replies would silently become noops
                 )
+                # Phase 1 guard: refuse output that stayed truncated after retry.
+                # Partial tool_call JSON must never be parsed into operations.
+                if getattr(_tu_resp, "_sai_truncated", False):
+                    _dlog("surgeon_tool_use_truncated_refused",
+                          model=surg_model, user_id=user_id)
+                    print("[SURGEON][TOOL_USE] GPT output truncated after retry — refusing")
+                    return symbol.code, 0, ["Surgeon: output truncated — retry"], [], []
                 _tu_calls = _tu_resp.choices[0].message.tool_calls or []
                 print(f"[SURGEON][TOOL_USE] GPT response: {len(_tu_calls)} tool call(s)")
+                if not _tu_calls:
+                    # Without this, zero tool calls fell through to operations=[]
+                    # → confidence 10 → falsely reported "already correct".
+                    _dlog("surgeon_tool_use_no_tool_calls",
+                          model=surg_model, user_id=user_id,
+                          finish_reason=getattr(_tu_resp.choices[0], "finish_reason", None))
+                    print("[SURGEON][TOOL_USE] GPT returned no tool calls — refusing")
+                    return symbol.code, 0, ["Surgeon: no tool calls returned — retry"], [], []
                 for _tc in _tu_calls:
                     import json as _json_tu
                     try:
@@ -2190,6 +2244,15 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
                 temperature=temp
             )
             raw = response.choices[0].message.content
+            # Phase 1 guard: _chat_create marks responses that stayed truncated
+            # even after its budget-doubling retry. Parsing partial output here
+            # risks writing half a symbol into the file — refuse instead.
+            if getattr(response, "_sai_truncated", False):
+                _dlog("surgeon_truncated_output_refused",
+                      model=surg_model, raw_len=len(raw or ""), user_id=user_id)
+                print("[SURGEON] Output truncated (finish_reason=length after retry) — refusing partial output")
+                return symbol.code, 0, ["Surgeon: output truncated — retry"], [], []
+            raw = raw or ""
 
         # Parse Aider-style SEARCH/REPLACE blocks
         operations = []
