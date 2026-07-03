@@ -555,3 +555,25 @@ deployWatch: {
       request<any>(`/deploy-watch/railway${projectId ? `?project_id=${encodeURIComponent(projectId)}` : ''}`),
   },
 }
+// ─── Image Studio (GPT image generation & editing) ─────────────────────────
+export interface ImageStudioResult {
+  ok: boolean
+  image_base64?: string
+  image_mime?: string
+  text?: string
+  error_code?: string
+  detail?: string
+}
+
+/** Calls the Image Studio backend. Errors come back as { ok:false, detail }
+ *  rather than thrown, except for network/auth failures thrown by request(). */
+export function generateImage(body: {
+  prompt: string
+  image_base64?: string
+  image_mime?: string
+}): Promise<ImageStudioResult> {
+  return request<ImageStudioResult>('/images/generate', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}

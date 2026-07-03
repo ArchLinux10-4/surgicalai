@@ -5,6 +5,7 @@ import { CodePanel } from './CodePanel'
 import { useAppStore } from '../stores/appStore'
 import { useAuthStore } from '../stores/authStore'
 import { LoginPage } from '../pages/LoginPage'
+import { ImageStudio } from './ImageStudio'
 
 // Sidebar width constants
 const SIDEBAR_MIN_PX = 264   // 44px rail + 220px panel — current default
@@ -45,6 +46,7 @@ export function Layout() {
 
   return (
     <div className="flex flex-1 overflow-hidden">
+      <ImageStudio />
       {/* Sidebar — resizable between SIDEBAR_MIN_PX and SIDEBAR_MAX_PX */}
       <aside
         className="flex-shrink-0 flex flex-col bg-surface overflow-hidden relative"
