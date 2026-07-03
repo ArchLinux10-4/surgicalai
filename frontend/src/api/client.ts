@@ -571,6 +571,7 @@ export function generateImage(body: {
   prompt: string
   image_base64?: string
   image_mime?: string
+  quality?: string // low | medium | high — omitted means auto
 }): Promise<ImageStudioResult> {
   return request<ImageStudioResult>('/images/generate', {
     method: 'POST',

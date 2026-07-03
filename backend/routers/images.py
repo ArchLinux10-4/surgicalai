@@ -42,6 +42,11 @@ class ImageRequest(BaseModel):
     prompt: str
     image_base64: str | None = None   # bare base64, no data: prefix
     image_mime: str | None = None     # e.g. "image/jpeg"
+    quality: str | None = None        # docs: low | medium | high | auto
+
+
+# Official values per docs (tools-image-generation). Anything else is ignored.
+ALLOWED_QUALITIES = {"low", "medium", "high", "auto"}
 
 
 def _dlog(msg: str) -> None:
@@ -111,14 +116,25 @@ def _build_payload(body: ImageRequest) -> dict:
         data_url = f"data:{body.image_mime};base64,{body.image_base64}"
         content.append({"type": "input_image", "image_url": data_url})
 
+    # Quality is an official tool option (docs: size/quality/format on the tool
+    # object). Whitelist-validated; anything unexpected is ignored so a bad
+    # value can never break generation. Omitting it == today's default (auto).
+    tool: dict = {"type": "image_generation"}
+    if body.quality:
+        if body.quality in ALLOWED_QUALITIES and body.quality != "auto":
+            tool["quality"] = body.quality
+            _dlog(f"quality applied={body.quality}")
+        else:
+            _dlog(f"quality ignored value={body.quality!r}")
+
     payload = {
         "model": IMAGE_MODEL,
         "input": [{"role": "user", "content": content}],
-        "tools": [{"type": "image_generation"}],
+        "tools": [tool],
     }
     _dlog(
         f"payload model={IMAGE_MODEL} has_input_image={bool(body.image_base64)} "
-        f"prompt_len={len(body.prompt)}"
+        f"prompt_len={len(body.prompt)} quality={tool.get('quality', 'auto')}"
     )
     return payload
 
@@ -249,4 +265,19 @@ def generate_image(body: ImageRequest, request: Request):
         _dlog(f"response_status=failed error={err[:200]}")
         return _map_api_error(200, err)
 
-    return _extract_result(data)
+    result = _extract_result(data)
+
+    # Audit trail: one greppable line per completed call — who spent what.
+    # Wrapped so a logging hiccup can never break a successful generation.
+    try:
+        _dlog(
+            f"audit user_id={user_id} ok={result.get('ok')} "
+            f"mode={'edit' if body.image_base64 else 'generate'} "
+            f"quality={body.quality or 'auto'} elapsed={elapsed:.1f}s "
+            f"image_b64_len={len(result.get('image_base64') or '')} "
+            f"prompt={body.prompt.strip()[:120]!r}"
+        )
+    except Exception:
+        pass
+
+    return result

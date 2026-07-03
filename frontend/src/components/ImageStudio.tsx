@@ -22,7 +22,18 @@ export function ImageStudio() {
   const [error, setError] = useState('')
   const [busy, setBusy] = useState(false)
   const [elapsed, setElapsed] = useState(0)
+  const [quality, setQuality] = useState('auto') // auto | low | medium | high
   const fileRef = useRef<HTMLInputElement>(null)
+
+  // Esc closes the modal (never mid-generation).
+  useEffect(() => {
+    if (!open) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !busy) setOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [open, busy])
 
   // Elapsed-seconds ticker while generating (image calls can take 30-120s).
   useEffect(() => {
@@ -67,6 +78,8 @@ export function ImageStudio() {
         prompt: prompt.trim(),
         image_base64: inputImage?.base64,
         image_mime: inputImage?.mime,
+        // Omit "auto" so the default request stays byte-identical to before.
+        quality: quality !== 'auto' ? quality : undefined,
       })
       if (res.ok && res.image_base64) {
         setResult({ base64: res.image_base64, mime: res.image_mime || 'image/png', text: res.text || '' })
@@ -78,6 +91,19 @@ export function ImageStudio() {
     } finally {
       setBusy(false)
     }
+  }
+
+  // Reset everything back to a blank studio (safe: blocked while a generation is running).
+  const reset = () => {
+    if (busy) return
+    setPrompt('')
+    setInputImage(null)
+    setResult(null)
+    setError('')
+    setQuality('auto')
+    // File inputs keep their last value even after state clears — wipe it so
+    // re-uploading the same file still fires onChange.
+    if (fileRef.current) fileRef.current.value = ''
   }
 
   const download = () => {
@@ -110,7 +136,17 @@ export function ImageStudio() {
           >
             <div className="flex items-center justify-between">
               <h2 className="text-base font-semibold">🎨 Image Studio</h2>
-              <button onClick={() => !busy && setOpen(false)} className="text-muted hover:text-fg" title="Close">✕</button>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={reset}
+                  disabled={busy}
+                  className="text-xs text-muted hover:text-fg disabled:opacity-50"
+                  title="Clear everything and start a new image"
+                >
+                  ↺ Reset
+                </button>
+                <button onClick={() => !busy && setOpen(false)} className="text-muted hover:text-fg" title="Close">✕</button>
+              </div>
             </div>
 
             <textarea
@@ -120,8 +156,29 @@ export function ImageStudio() {
                 ? 'Describe how to edit the uploaded image…'
                 : 'Describe the image to generate — or upload one to edit…'}
               rows={3}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                  e.preventDefault()
+                  run()
+                }
+              }}
               className="w-full rounded border border-border bg-base p-2 text-sm resize-y focus:outline-none focus:border-accent/60"
             />
+
+            <label className="flex items-center gap-2 text-xs text-muted">
+              Quality
+              <select
+                value={quality}
+                onChange={e => setQuality(e.target.value)}
+                disabled={busy}
+                className="rounded border border-border bg-base px-2 py-1 text-xs disabled:opacity-50"
+              >
+                <option value="auto">Auto (model decides)</option>
+                <option value="low">Low — fastest, cheapest</option>
+                <option value="medium">Medium</option>
+                <option value="high">High — best, priciest</option>
+              </select>
+            </label>
 
             <div className="flex items-center gap-3">
               <input
