@@ -249,7 +249,7 @@ _THINKING_EXCLUDED_MODELS = ("claude-opus-4-7", "claude-opus-4-8")
 # Adaptive mode also auto-enables interleaved thinking (no beta header needed).
 # display defaults to "omitted" on these models — must set "summarized" explicitly
 # or thinking panel content will come back as empty strings (silent bug).
-_ADAPTIVE_THINKING_MODELS = ("claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-5", "claude-fable-5")
+_ADAPTIVE_THINKING_MODELS = ("claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-sonnet-5", "claude-fable-5")
 
 # -- ReAct agentic search: per-session grep cache ----------------------------
 # Keyed by session_cache_key -> accumulated grep text from prior search rounds.
