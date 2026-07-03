@@ -13008,6 +13008,13 @@ async def run_natural_pipeline_stream(
 
             # Build correction calls for all blocked changes
             correction_tasks = []
+            # Correction uses Sonnet — cheaper + less prone to hallucination
+            # on large symbols than Opus.  Architect model stays for the
+            # initial edit; only the *fix* loop is downgraded.
+            # Defined BEFORE the loop: every blocked idx may be deferred to
+            # the multi-window path (continue), leaving the loop body never
+            # executed — the tasks_created _dlog below still references it.
+            _correction_model = "claude-sonnet-4-6"
             _corr_msgs_by_idx = {}  # Save per-correction messages for ReAct follow-ups
             _correction_window_info = {}  # Per-idx window info for windowed corrections
             _multi_window_pending = []   # Indices that need multi-window sequential correction
@@ -13259,11 +13266,6 @@ async def run_natural_pipeline_stream(
                     {"role": "user", "content": correction_prompt},
                 ]
                 _corr_msgs_by_idx[idx] = correction_messages
-
-                # Correction uses Sonnet — cheaper + less prone to hallucination
-                # on large symbols than Opus.  Architect model stays for the
-                # initial edit; only the *fix* loop is downgraded.
-                _correction_model = "claude-sonnet-4-6"
 
                 correction_tasks.append((
                     idx,
