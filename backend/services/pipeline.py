@@ -251,6 +251,11 @@ _THINKING_EXCLUDED_MODELS = ("claude-opus-4-7", "claude-opus-4-8")
 # or thinking panel content will come back as empty strings (silent bug).
 _ADAPTIVE_THINKING_MODELS = ("claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-sonnet-5", "claude-fable-5")
 
+# 4-6 generation models support adaptive thinking and effort, but NOT 'xhigh'.
+# Supported levels: max, high, medium, low.  Sending effort='xhigh' returns 400.
+# Omitting effort entirely defaults to 'high' which is correct for these models.
+_NO_XHIGH_EFFORT_MODELS = ("claude-opus-4-6", "claude-sonnet-4-6")
+
 # -- ReAct agentic search: per-session grep cache ----------------------------
 # Keyed by session_cache_key -> accumulated grep text from prior search rounds.
 # Avoids re-scanning large files on follow-up edits in the same session.
@@ -461,7 +466,7 @@ def _get_effort_kwargs(model: str) -> dict:
     significant quality regression — explicitly set xhigh for agentic/coding work.
     Returns {} for all other models (safe to ** spread).
     """
-    if _uses_adaptive_thinking(model):
+    if _uses_adaptive_thinking(model) and not any(m in model for m in _NO_XHIGH_EFFORT_MODELS):
         return {"output_config": {"effort": "xhigh"}}
     return {}
 
