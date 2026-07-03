@@ -14,9 +14,11 @@ const SIDEBAR_MAX_PX = Math.round(SIDEBAR_MIN_PX * 1.4)  // +40% = ~370px
 export function Layout() {
   const activeFile = useAppStore(s => s.activeFile)
   const { isAuthenticated } = useAuthStore()
-  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_MIN_PX)
+  // Default to max width — the panel was too cramped at the minimum.
+  // Users can still drag it narrower via the resize handle.
+  const [sidebarWidth, setSidebarWidth] = useState(SIDEBAR_MAX_PX)
   const dragStartX  = useRef<number>(0)
-  const dragStartW  = useRef<number>(SIDEBAR_MIN_PX)
+  const dragStartW  = useRef<number>(SIDEBAR_MAX_PX)
   const isDragging  = useRef(false)
 
   const onDragStart = useCallback((e: React.MouseEvent) => {

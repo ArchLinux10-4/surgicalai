@@ -191,7 +191,30 @@ function SessionList() {
   const [bulkDeleteLoading, setBulkDeleteLoading] = useState(false)
 
   const loadSessions = () => api.chat.getSessions().then(setSessions).catch(() => {})
-  useEffect(() => { loadSessions() }, [])
+
+  // On login/mount: make sure the user lands in a chat automatically instead
+  // of having to press "New Chat". Reuse an existing empty chat if one exists
+  // (avoids stacking blank sessions on every login), otherwise create one.
+  // On any failure, degrade gracefully to the old behavior (manual New Chat).
+  useEffect(() => {
+    (async () => {
+      try {
+        const list = await api.chat.getSessions()
+        setSessions(list)
+        if (useAppStore.getState().activeSessions) return  // already in a chat
+        const empty = list.find((s: any) => !s.message_count)
+        if (empty) {
+          setActiveSession(empty.id)
+          setMessages([])
+          return
+        }
+        const s = await api.chat.createSession({ title: 'New Chat' })
+        setActiveSession(s.id)
+        setMessages([])
+        await loadSessions()
+      } catch { /* graceful: user can still press New Chat */ }
+    })()
+  }, [])
 
   const newSession = async () => {
     try {
