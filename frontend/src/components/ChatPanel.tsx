@@ -1494,7 +1494,7 @@ export function ChatPanel() {
               <>
                 <div className="fixed inset-0 z-40" onClick={() => setModelPickerOpen(false)} />
                 <div className="absolute right-0 top-full mt-1 z-50 bg-surface border border-border rounded-lg shadow-xl py-1 min-w-[220px] max-h-[300px] overflow-y-auto">
-                  {availableModels.filter(m => m.role === 'architect' && m.id.startsWith('claude-')).map(m => (
+                  {availableModels.filter(m => m.role === 'architect').map(m => (
                     <button
                       key={m.id}
                       onClick={() => handleModelChange(m.id)}

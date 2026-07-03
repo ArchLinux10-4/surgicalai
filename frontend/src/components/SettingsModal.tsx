@@ -467,10 +467,10 @@ export function SettingsModal() {
                 <SectionHeader title="Model Configuration" subtitle="Select which AI model powers SurgicalAI" />
 
                 <Field label="AI Model">
-                  <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect' && m.id.startsWith('claude-')).map((m) => ({ value: m.id, label: `${m.name} \u2014 ${m.description}` }))} />
+                  <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect').map((m) => ({ value: m.id, label: `${m.name} \u2014 ${m.description}` }))} />
                 </Field>
 
-                {!form.architect_model.startsWith('claude-') && (
+                {!form.architect_model.startsWith('claude-') && !form.architect_model.startsWith('gpt-5') && (
                 <Field label={`Temperature: ${form.temperature_architect}`}>
                   <input type="range" min="0" max="1" step="0.1" value={form.temperature_architect}
                     onChange={(e) => upd('temperature_architect')(parseFloat(e.target.value))} className="w-full accent-accent" />
