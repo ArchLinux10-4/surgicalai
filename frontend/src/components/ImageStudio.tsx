@@ -70,9 +70,11 @@ export function ImageStudio() {
     threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight })
   }, [turns.length, busy])
 
+  // Closing only hides the window — the session (versions, thread, edit chain)
+  // stays in memory and is restored on reopen. "New session" is the only
+  // destructive action.
   const tryClose = () => {
     if (busy) return
-    if (turns.length > 0 && !window.confirm('Close Image Studio? Your edit session will be lost.')) return
     setOpen(false)
   }
 
