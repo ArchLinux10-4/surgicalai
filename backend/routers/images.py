@@ -13,6 +13,14 @@ Design rules:
     * moderation blocked                   -> clear content-policy message
     * slow generation / timeout            -> 180s budget + clean timeout error
     * text-only response (no image)        -> surface the model's text
+    * expired/unknown previous_response_id -> "session expired" message
+- `tool_choice` forces the image_generation tool: the model must always
+  produce an image instead of optionally answering in text (docs: "To force
+  the image generation tool call, set tool_choice to {type: image_generation}").
+  Text can now only appear via refusals — the frontend labels it as such.
+- Multi-turn editing: the client may send `previous_response_id` (docs:
+  Multi-turn editing) so follow-up prompts edit the previous result. Requires
+  OpenAI response storage, which is on by default (`store` is never disabled).
 - Never raises to the client unhandled: all errors return structured JSON.
 """
 import base64
@@ -43,6 +51,7 @@ class ImageRequest(BaseModel):
     image_base64: str | None = None   # bare base64, no data: prefix
     image_mime: str | None = None     # e.g. "image/jpeg"
     quality: str | None = None        # docs: low | medium | high | auto
+    previous_response_id: str | None = None  # multi-turn editing (docs: resp_…)
 
 
 # Official values per docs (tools-image-generation). Anything else is ignored.
@@ -99,6 +108,18 @@ def _validate(body: ImageRequest) -> dict | None:
                 f"Image is {len(raw) // (1024 * 1024)} MB — max is 20 MB.",
             )
         _dlog(f"input_image mime={mime} decoded_bytes={len(raw)}")
+    if body.previous_response_id is not None:
+        rid = body.previous_response_id.strip()
+        if not rid or not rid.startswith("resp_") or len(rid) > 200:
+            # A malformed id would silently produce an unrelated image —
+            # fail loud instead so the user knows the session is broken.
+            _dlog(f"previous_response_id invalid value={body.previous_response_id!r}")
+            return _error(
+                "bad_previous_response_id",
+                "This edit session is no longer valid. "
+                "Start a new session (↺ New session) and try again.",
+            )
+        _dlog(f"previous_response_id ok={rid}")
     return None
 
 
@@ -131,10 +152,23 @@ def _build_payload(body: ImageRequest) -> dict:
         "model": IMAGE_MODEL,
         "input": [{"role": "user", "content": content}],
         "tools": [tool],
+        # Docs: "To force the image generation tool call, you can set the
+        # parameter tool_choice to {"type": "image_generation"}". Without this
+        # the model may legally answer in text (design chat) instead of
+        # generating — observed in production. Text now only appears on refusal.
+        "tool_choice": {"type": "image_generation"},
     }
+
+    # Multi-turn editing (docs: "Multi-turn editing" / previous_response_id):
+    # chain this turn onto the prior response so the model edits its own
+    # last output with full conversation context. Validated in _validate().
+    if body.previous_response_id:
+        payload["previous_response_id"] = body.previous_response_id.strip()
+
     _dlog(
         f"payload model={IMAGE_MODEL} has_input_image={bool(body.image_base64)} "
-        f"prompt_len={len(body.prompt)} quality={tool.get('quality', 'auto')}"
+        f"prompt_len={len(body.prompt)} quality={tool.get('quality', 'auto')} "
+        f"chained={bool(body.previous_response_id)} tool_choice=image_generation"
     )
     return payload
 
@@ -168,7 +202,14 @@ def _extract_result(data: dict) -> dict:
                 if part.get("type") == "output_text" and part.get("text"):
                     text_parts.append(part["text"])
     text = "\n".join(text_parts).strip()
-    _dlog(f"extract image_found={bool(image_b64)} text_len={len(text)}")
+
+    # The Responses API response id (resp_…) — returned to the client so the
+    # next prompt can chain onto this turn via previous_response_id.
+    response_id = data.get("id") or ""
+    _dlog(
+        f"extract image_found={bool(image_b64)} text_len={len(text)} "
+        f"response_id={response_id or 'MISSING'}"
+    )
 
     if image_b64:
         return {
@@ -176,9 +217,12 @@ def _extract_result(data: dict) -> dict:
             "image_base64": image_b64,
             "image_mime": f"image/{output_format}",
             "text": text,
+            "response_id": response_id,
         }
     if text:
-        # Model chose to answer in text (refusal or question) — surface it.
+        # tool_choice forces the image tool, so reaching here means the model
+        # refused (e.g. content policy). Surface its explanation — the
+        # frontend renders it under a "no image was generated" warning label.
         return _error("no_image_text_response", text)
     return _error(
         "no_image",
@@ -202,6 +246,14 @@ def _map_api_error(status_code: int, body_text: str) -> dict:
             "moderation_blocked",
             "The request was blocked by OpenAI's content policy. "
             "Adjust the prompt or image and try again.",
+        )
+    if "previous response" in lower and ("not found" in lower or "not_found" in lower):
+        # Chained edit references a response OpenAI no longer has (expired,
+        # deleted, or a zero-data-retention org). Session cannot continue.
+        return _error(
+            "session_expired",
+            "This edit session has expired on OpenAI's side. "
+            "Start a new session (↺ New session) and re-upload your image.",
         )
     if status_code == 401:
         return _error("bad_key", "OpenAI rejected the API key. Check it in Settings.")
@@ -273,6 +325,7 @@ def generate_image(body: ImageRequest, request: Request):
         _dlog(
             f"audit user_id={user_id} ok={result.get('ok')} "
             f"mode={'edit' if body.image_base64 else 'generate'} "
+            f"chained={bool(body.previous_response_id)} "
             f"quality={body.quality or 'auto'} elapsed={elapsed:.1f}s "
             f"image_b64_len={len(result.get('image_base64') or '')} "
             f"prompt={body.prompt.strip()[:120]!r}"

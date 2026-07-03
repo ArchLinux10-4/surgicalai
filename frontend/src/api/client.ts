@@ -563,6 +563,7 @@ export interface ImageStudioResult {
   text?: string
   error_code?: string
   detail?: string
+  response_id?: string // OpenAI response id — chain follow-up edits onto it
 }
 
 /** Calls the Image Studio backend. Errors come back as { ok:false, detail }
@@ -572,6 +573,7 @@ export function generateImage(body: {
   image_base64?: string
   image_mime?: string
   quality?: string // low | medium | high — omitted means auto
+  previous_response_id?: string // multi-turn editing: edit the previous result
 }): Promise<ImageStudioResult> {
   return request<ImageStudioResult>('/images/generate', {
     method: 'POST',
