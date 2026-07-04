@@ -540,6 +540,21 @@ export const api = {
     commit: (body: any) => request<any>('/github/commit', { method: 'POST', body: JSON.stringify(body) }),
   },
 
+  githubApp: {
+    config: () => request<any>('/github-app/config'),
+    installUrl: () => request<any>('/github-app/install-url'),
+    status: () => request<any>('/github-app/status'),
+    setTier: (installation_id: string, tier: string) =>
+      request<any>('/github-app/permission-tier', { method: 'POST', body: JSON.stringify({ installation_id, tier }) }),
+    disconnect: (installation_id: string) => request<any>(`/github-app/${installation_id}`, { method: 'DELETE' }),
+    repos: () => request<any>('/github-app/repos'),
+    branches: (owner: string, repo: string) => request<any>(`/github-app/repos/${owner}/${repo}/branches`),
+    tree: (owner: string, repo: string, branch: string, path: string) =>
+      request<any>(`/github-app/repos/${owner}/${repo}/tree?branch=${encodeURIComponent(branch)}&path=${encodeURIComponent(path)}`),
+    load: (body: any) => request<any>('/github-app/load', { method: 'POST', body: JSON.stringify(body) }),
+    commit: (body: any) => request<any>('/github-app/commit', { method: 'POST', body: JSON.stringify(body) }),
+  },
+
   vercel: {
     status: () => request<any>('/vercel/status'),
     connect: (token: string) => request<any>('/vercel/connect', { method: 'POST', body: JSON.stringify({ token }) }),

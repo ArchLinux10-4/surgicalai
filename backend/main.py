@@ -27,6 +27,7 @@ from routers import tests as tests_router
 from routers import tasks as tasks_router
 from routers import images as images_router
 from routers import runs as runs_router
+from routers import github_app as github_app_router
 
 app = FastAPI(
     title="SurgicalAI",
@@ -145,6 +146,7 @@ app.include_router(git.router, prefix="/api/git", tags=["git"])
 app.include_router(context.router, prefix="/api/context", tags=["context"])
 app.include_router(session_files.router, prefix="/api/chat", tags=["session-files"])
 app.include_router(github_router.router, prefix="/api/github", tags=["github"])
+app.include_router(github_app_router.router, prefix="/api/github-app", tags=["github-app"])
 app.include_router(vercel_router.router, prefix="/api/vercel", tags=["vercel"])
 app.include_router(railway_router.router, prefix="/api/railway", tags=["railway"])
 app.include_router(linear_router.router, prefix="/api/linear", tags=["linear"])

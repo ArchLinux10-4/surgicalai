@@ -3,6 +3,7 @@ import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import { AdminUsersPanel } from './AdminUsersPanel'
+import { GitHubAppPanel } from './GitHubAppPanel'
 import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
 import { BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
@@ -556,6 +557,10 @@ export function SettingsModal() {
                   title="GitHub Integration"
                   subtitle="Connect your GitHub account to browse repos, load files, and push commits directly from SurgicalAI"
                 />
+
+                <GitHubAppPanel />
+
+                <div className="text-xs text-muted uppercase tracking-wide pt-2">Legacy: Personal Access Token</div>
 
                 {githubStatus?.connected ? (
                   <div className="space-y-4">

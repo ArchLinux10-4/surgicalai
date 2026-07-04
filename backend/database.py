@@ -475,6 +475,24 @@ def _init_sqlite():
         )
     """)
 
+    # github_app_installations — one row per (user, installation). A user can
+    # have multiple installations (e.g. personal account + one or more orgs).
+    # permission_tier gates write access at the API layer (routers/github_app.py)
+    # — read_only / read_comment / read_write. Legacy PAT flow (user_api_keys,
+    # key_type='github') is completely separate and untouched.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS github_app_installations (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            installation_id TEXT NOT NULL,
+            account_login TEXT DEFAULT '',
+            permission_tier TEXT DEFAULT 'read_only',
+            connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(user_id, installation_id)
+        )
+    """)
+
     _seed_defaults_sqlite(cur)
     conn.commit()
     conn.close()
@@ -851,6 +869,92 @@ def get_user_api_key(user_id: str, key_type: str) -> str:
             (user_id, key_type),
         ).fetchone()
     return row["encrypted_value"] if row else ""
+
+
+def save_github_app_installation(user_id: str, installation_id: str, account_login: str):
+    """Upsert one (user_id, installation_id) link. Keeps whatever
+    permission_tier was already set if this is a re-install; defaults to
+    read_only for a brand new link (safest default)."""
+    row_id = hashlib.md5(f"{user_id}:{installation_id}".encode()).hexdigest()
+    with get_db_ctx() as conn:
+        if USE_POSTGRES:
+            conn.execute(
+                """INSERT INTO github_app_installations (id, user_id, installation_id, account_login, updated_at)
+                   VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                   ON CONFLICT (user_id, installation_id) DO UPDATE SET
+                     account_login = EXCLUDED.account_login,
+                     updated_at = EXCLUDED.updated_at""",
+                (row_id, user_id, installation_id, account_login),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO github_app_installations (id, user_id, installation_id, account_login, updated_at)
+                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                   ON CONFLICT (user_id, installation_id) DO UPDATE SET
+                     account_login = excluded.account_login,
+                     updated_at = excluded.updated_at""",
+                (row_id, user_id, installation_id, account_login),
+            )
+        conn.commit()
+    _dlog("github_app_installation_saved", user_id=user_id, installation_id=installation_id, account_login=account_login)
+
+
+def list_github_app_installations(user_id: str) -> list:
+    """All installations linked to this user, each with its permission tier."""
+    with get_db_ctx() as conn:
+        rows = conn.execute(
+            "SELECT installation_id, account_login, permission_tier, connected_at FROM github_app_installations WHERE user_id = ? ORDER BY connected_at DESC",
+            (user_id,),
+        ).fetchall()
+    result = [
+        {
+            "installation_id": row["installation_id"] if hasattr(row, "__getitem__") else row[0],
+            "account_login": row["account_login"] if hasattr(row, "__getitem__") else row[1],
+            "permission_tier": row["permission_tier"] if hasattr(row, "__getitem__") else row[2],
+            "connected_at": str(row["connected_at"] if hasattr(row, "__getitem__") else row[3]),
+        }
+        for row in rows
+    ]
+    _dlog("github_app_installations_listed", user_id=user_id, count=len(result))
+    return result
+
+
+def get_github_app_installation(user_id: str, installation_id: str) -> dict:
+    """Single installation row for this user, or {} if not found/not theirs
+    (this also acts as the ownership check — a user can never look up an
+    installation_id that isn't linked to their own user_id)."""
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT installation_id, account_login, permission_tier FROM github_app_installations WHERE user_id = ? AND installation_id = ?",
+            (user_id, installation_id),
+        ).fetchone()
+    if not row:
+        return {}
+    return {
+        "installation_id": row["installation_id"] if hasattr(row, "__getitem__") else row[0],
+        "account_login": row["account_login"] if hasattr(row, "__getitem__") else row[1],
+        "permission_tier": row["permission_tier"] if hasattr(row, "__getitem__") else row[2],
+    }
+
+
+def set_github_app_permission_tier(user_id: str, installation_id: str, tier: str):
+    with get_db_ctx() as conn:
+        conn.execute(
+            "UPDATE github_app_installations SET permission_tier = ?, updated_at = CURRENT_TIMESTAMP WHERE user_id = ? AND installation_id = ?",
+            (tier, user_id, installation_id),
+        )
+        conn.commit()
+    _dlog("github_app_permission_tier_set", user_id=user_id, installation_id=installation_id, tier=tier)
+
+
+def delete_github_app_installation(user_id: str, installation_id: str):
+    with get_db_ctx() as conn:
+        conn.execute(
+            "DELETE FROM github_app_installations WHERE user_id = ? AND installation_id = ?",
+            (user_id, installation_id),
+        )
+        conn.commit()
+    _dlog("github_app_installation_deleted", user_id=user_id, installation_id=installation_id)
 
 
 def get_all_settings() -> dict:

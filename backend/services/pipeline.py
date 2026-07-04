@@ -1133,6 +1133,20 @@ except Exception:
     _ARCH_SEARCH_TOOLS_EXT = []
 AGENTIC_TOOLS_V2 = AGENTIC_TOOLS_V2 + _ARCH_SEARCH_TOOLS_EXT
 
+# Extend AGENTIC_TOOLS_V2 with GitHub App read-side context tools
+# (list_prs/get_pr_diff/get_pr_comments/list_issues/get_issue_comments/diff_branches).
+# Gated by its OWN flag on top of the existing agentic_tool_use flag — both
+# must be "true" before these tools are even added to the tool list, so this
+# has zero effect until BOTH flags are explicitly turned on.
+try:
+    from services.github_context_tools import GITHUB_CONTEXT_TOOLS_V2 as _GH_CTX_TOOLS_EXT
+except Exception:
+    _GH_CTX_TOOLS_EXT = []
+
+_github_context_tools_flag = get_setting("github_context_tools_enabled", "false").lower() == "true"
+if _github_context_tools_flag:
+    AGENTIC_TOOLS_V2 = AGENTIC_TOOLS_V2 + _GH_CTX_TOOLS_EXT
+
 
 # Phase 4: Correction handler tool definitions (tool_use migration)
 CORRECTION_TOOLS = [
@@ -7159,6 +7173,30 @@ USER REQUEST:
                                 "type": "tool_result",
                                 "tool_use_id": _tc["id"],
                                 "content": _es_res[:16000]
+                            })
+
+                        elif _tc["name"] in ("list_prs", "get_pr_diff", "get_pr_comments", "list_issues", "get_issue_comments", "diff_branches"):
+                            _dlog("tu_github_context_tool_call", tool_name=_tc["name"],
+                                  tool_input=_tc["input"], session_id=session_id, round=_tu_round)
+                            try:
+                                from services.github_context_tools import execute_github_context_tool
+                            except Exception as _e_gh_imp:
+                                execute_github_context_tool = None
+                                _dlog("github_context_tools_import_failed", error=str(_e_gh_imp))
+                            if execute_github_context_tool is None:
+                                _gh_res = f"[{_tc['name']} unavailable — module failed to load]"
+                            else:
+                                yield sse({"type": "progress", "content":
+                                           f"GitHub: {_tc['name'].replace('_', ' ')}..."})
+                                _gh_res = execute_github_context_tool(
+                                    _tc["name"], _tc["input"], user_id, dlog=_dlog
+                                )
+                                _dlog("tu_github_context_tool_result", tool_name=_tc["name"],
+                                      result_len=len(_gh_res), session_id=session_id)
+                            _tu_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": _tc["id"],
+                                "content": _gh_res[:16000]
                             })
 
                     _tu_messages.append({"role": "user", "content": _tu_results})
