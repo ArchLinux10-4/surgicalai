@@ -62,6 +62,14 @@ const CSS = `
 }
 @media(max-width:600px){
   .sai-ma-bullets{grid-template-columns:1fr}
+  .sai-ma-section{padding:70px 16px}
+  .sai-ma-body{padding:16px 14px}
+  .sai-ma-agent{padding:12px}
+  /* Integration QA row: allow wrapping so the merge badge never overflows
+     the viewport; badge drops to its own line instead of clipping. */
+  .sai-ma-integration{flex-wrap:wrap;row-gap:8px}
+  .sai-ma-merge-badge{margin-left:0}
+  .sai-ma-supervisor{align-items:flex-start}
 }
 `;
 
