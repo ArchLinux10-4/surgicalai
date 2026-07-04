@@ -1084,6 +1084,9 @@ async def execute_task(req: dict, request: Request):
         _dlog("sse_exec_task_start", session_id=session_id, user_id=current_user_id,
               task_id=task_id, task_seq=seq+1, task_total=total, title=task["title"][:80])
         update_task(task_id, status="running")
+        # Disconnect guard: mark that THIS stream owns the running status, so
+        # the wrapper below knows it may safely reset it if the client drops.
+        _guard_state["owns_running"] = True
         yield _sse({"type": "task_start", "id": task_id})
 
         # --- Prior-work context injection (Issue 2 fix) ---
@@ -1241,7 +1244,35 @@ async def execute_task(req: dict, request: Request):
               task_id=task_id, task_seq=seq+1, duration_s=round(time.time() - _t0, 1))
         yield _sse({"type": "done"})
 
-    return StreamingResponse(stream_one_task(), media_type="text/event-stream", headers={
+    # Shared flag: set by stream_one_task once it flips the task to "running".
+    # Lets the disconnect guard distinguish a task WE started (safe to reset)
+    # from one another stream owns (guard-skipped duplicate — never touch it).
+    _guard_state = {"owns_running": False}
+
+    async def stream_with_disconnect_guard():
+        # If the client vanishes mid-task (tab close, refresh, network drop),
+        # this generator is closed at the current yield via GeneratorExit /
+        # CancelledError — BaseExceptions the pipeline's `except Exception`
+        # can never catch. Without this guard the task would be orphaned in
+        # status="running" forever and the run could never be resumed.
+        try:
+            async for _chunk in stream_one_task():
+                yield _chunk
+        finally:
+            try:
+                if _guard_state["owns_running"]:
+                    _rows = list_tasks(session_id, run_id)
+                    _row = next((t for t in _rows if t["id"] == task_id), None)
+                    if _row and _row.get("status") == "running":
+                        update_task(task_id, status="pending")
+                        _dlog("sse_exec_task_orphan_reset", session_id=session_id,
+                              user_id=current_user_id, task_id=task_id,
+                              from_status="running", to_status="pending")
+            except Exception as _ox:
+                _dlog("sse_exec_task_orphan_reset_error", session_id=session_id,
+                      task_id=task_id, error=str(_ox)[:200])
+
+    return StreamingResponse(stream_with_disconnect_guard(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
     })

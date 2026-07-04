@@ -795,6 +795,7 @@ export function ChatPanel() {
       stopStream()
       streamSessionRef.current = null
     }
+    setResumableRun(null)  // stale banner never survives a session switch
     if (activeSessions) {
       api.sessionFiles.list(activeSessions)
         .then(files => setSessionFiles(files))
@@ -823,6 +824,18 @@ export function ChatPanel() {
               status: r.status, qa_score: r.qa_score ?? null, verdict: r.verdict ?? null,
               run_id: r.run_id, progress: r.result_summary ?? undefined,
             })))
+          // Resume detection: pending tasks with nothing running means the
+          // run was interrupted (tab closed / refreshed mid-run). Offer a
+          // one-click Resume instead of leaving the tasks stranded forever.
+          const pendingTasks = forRun
+            .filter(r => r.status === 'pending')
+            .slice()
+            .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+            .map(r => ({ id: r.id, seq: r.seq, title: r.title }))
+          const anyRunning = forRun.some(r => r.status === 'running')
+          if (pendingTasks.length > 0 && !anyRunning && latestRun) {
+            setResumableRun({ sid: activeSessions, runId: latestRun, tasks: pendingTasks })
+          }
         })
         .catch(() => {})
     } else {
@@ -854,6 +867,142 @@ export function ChatPanel() {
     setStreamProgress('')
   }
 
+  // ── v1.4 per-task execution queue ─────────────────────────────────────
+  // Hoisted to component scope so BOTH a freshly planned run (doStream) and
+  // a resumed interrupted run (resumeInterruptedRun) can drive it.
+  // /smart-stream ends right after planning. We then run each task in its
+  // own short-lived SSE stream, sequentially, so no single connection can
+  // hit the proxy/process timeout that previously killed long runs.
+
+  // Holds an interrupted run detected on session load (pending tasks, none
+  // running) — rendered as a Resume banner above the Mission Control panel.
+  const [resumableRun, setResumableRun] = useState<{ sid: string; runId: string; tasks: any[] } | null>(null)
+
+  const addTaskResultCard = (sid: string, result: any) => {
+    const naturalText = (result.natural_text || '')
+      .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
+      .replace(/<new_file>[\s\S]*$/, '')
+      .trim()
+    addMessage({
+      id: Date.now().toString() + '_task_' + Math.random().toString(36).slice(2, 7),
+      session_id: sid,
+      role: 'assistant',
+      message_type: naturalText ? 'natural_result' : 'surgical_result',
+      surgical_data: JSON.stringify(result),
+      content: naturalText,
+      created_at: new Date().toISOString(),
+    })
+    api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
+  }
+
+  const handleTaskEvent = (event: any) => {
+    switch (event.type) {
+      case 'task_start':
+        updateAgentTask(event.id, { status: 'running', progress: undefined }); break
+      case 'task_progress':
+        updateAgentTask(event.id, { progress: event.content }); break
+      case 'task_done':
+        updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict }); break
+      case 'task_blocked':
+        updateAgentTask(event.id, { status: 'blocked', qa_score: event.qa_score, verdict: event.verdict }); break
+      case 'task_cancelled':
+        updateAgentTask(event.id, { status: 'cancelled' }); break
+      case 'tasks_complete':
+        setAgentPhase('complete'); break
+    }
+  }
+
+  const finishTaskRun = (sid: string, onFinish?: () => void) => {
+    setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
+    setIsBuildingEdit(false)
+    setAgentPhase('complete')
+    if (onFinish) onFinish()
+    else api.chat.getSessions().then(setSessions).catch(() => {})
+    api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
+  }
+
+  const runTaskQueue = (sid: string, runId: string, tasks: any[], onFinish?: () => void) => {
+    let idx = 0
+    const runNext = () => {
+      if (useAppStore.getState().activeSessions !== sid || idx >= tasks.length) {
+        finishTaskRun(sid, onFinish); return
+      }
+      const t = tasks[idx++]
+      // True once this task's stream delivered a terminal event
+      // (task_done / task_blocked / task_cancelled). If the stream closes
+      // without one, the connection dropped mid-task and we must reconcile
+      // the real status from the DB instead of stalling the queue.
+      let sawTerminal = false
+      let streamErr = ''
+      const reconcileOnClose = () => {
+        if (sawTerminal) return  // normal close after task_done — already advanced
+        if (useAppStore.getState().activeSessions !== sid) { finishTaskRun(sid, onFinish); return }
+        api.tasks.list(sid, runId)
+          .then((rows: any[]) => {
+            if (useAppStore.getState().activeSessions !== sid) { finishTaskRun(sid, onFinish); return }
+            const row: any = (rows || []).find((r: any) => r.id === t.id)
+            const status = row?.status
+            if (status === 'done') {
+              // Backend finished the task but the task_done event was lost
+              // in transit — record it and keep the queue moving.
+              updateAgentTask(t.id, { status: 'done', qa_score: row.qa_score, verdict: row.verdict })
+              runNext()
+            } else if (status === 'blocked' || status === 'cancelled') {
+              updateAgentTask(t.id, { status, qa_score: row?.qa_score, verdict: row?.verdict })
+              finishTaskRun(sid, onFinish)
+            } else if (status === 'pending') {
+              // The backend disconnect guard reset the orphaned task after
+              // the drop — pause the run and offer a one-click Resume.
+              updateAgentTask(t.id, { status: 'pending', progress: undefined })
+              setResumableRun({ sid, runId, tasks: tasks.slice(idx - 1) })
+              setError(streamErr || 'Connection dropped mid-task. The run is paused — click Resume to continue.')
+              finishTaskRun(sid, onFinish)
+            } else {
+              // running / unknown — we cannot safely continue.
+              setError(streamErr || 'Connection dropped mid-task. Task status is unresolved — reopen the session to check progress.')
+              finishTaskRun(sid, onFinish)
+            }
+          })
+          .catch(() => {
+            setError(streamErr || 'Connection dropped and task status could not be verified.')
+            finishTaskRun(sid, onFinish)
+          })
+      }
+      const ctrl = api.stream.executeTask(
+        { session_id: sid, run_id: runId, task_id: t.id },
+        (progress) => { if (useAppStore.getState().activeSessions === sid) setStreamProgress(progress) },
+        (result) => addTaskResultCard(sid, result),
+        reconcileOnClose,  // per-task stream closed
+        (err) => { streamErr = err },  // defer: reconcileOnClose decides the outcome
+        (event) => {
+          if (event.type === 'task_done' || event.type === 'task_blocked' || event.type === 'task_cancelled') {
+            sawTerminal = true
+          }
+          handleTaskEvent(event)
+          if (event.type === 'task_done') runNext()
+          else if (event.type === 'task_blocked' || event.type === 'task_cancelled') finishTaskRun(sid, onFinish)
+        },
+      )
+      abortRef.current = ctrl
+    }
+    runNext()
+  }
+
+  // Restart an interrupted run: re-drives the queue over its remaining
+  // pending tasks. The backend idempotency guard makes this safe — a task
+  // that is not "pending" can never be re-executed.
+  const resumeInterruptedRun = () => {
+    if (!resumableRun || isStreaming) return
+    if (useAppStore.getState().activeSessions !== resumableRun.sid) { setResumableRun(null); return }
+    const { sid, runId, tasks } = resumableRun
+    setResumableRun(null)
+    setError(null)
+    setIsStreaming(true)
+    setAgentPhase('executing')
+    streamSessionRef.current = sid
+    runTaskQueue(sid, runId, tasks)
+  }
+
   // ── Core stream launcher — shared by handleSend and injection restart ─────
   const doStream = useCallback((
     sessionId: string,
@@ -863,113 +1012,6 @@ export function ChatPanel() {
   ) => {
     let accumulated = ''
     let gotResult = false
-
-    // ── v1.4 per-task execution ───────────────────────────────────────────
-    // /smart-stream now ends right after planning. We then run each task in
-    // its own short-lived SSE stream, sequentially, so no single connection
-    // can hit the proxy/process timeout that previously killed long runs.
-    const addTaskResultCard = (result: any) => {
-      const naturalText = (result.natural_text || '')
-        .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
-        .replace(/<new_file>[\s\S]*$/, '')
-        .trim()
-      addMessage({
-        id: Date.now().toString() + '_task_' + Math.random().toString(36).slice(2, 7),
-        session_id: sessionId,
-        role: 'assistant',
-        message_type: naturalText ? 'natural_result' : 'surgical_result',
-        surgical_data: JSON.stringify(result),
-        content: naturalText,
-        created_at: new Date().toISOString(),
-      })
-      api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
-    }
-
-    const handleTaskEvent = (event: any) => {
-      switch (event.type) {
-        case 'task_start':
-          updateAgentTask(event.id, { status: 'running', progress: undefined }); break
-        case 'task_progress':
-          updateAgentTask(event.id, { progress: event.content }); break
-        case 'task_done':
-          updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict }); break
-        case 'task_blocked':
-          updateAgentTask(event.id, { status: 'blocked', qa_score: event.qa_score, verdict: event.verdict }); break
-        case 'task_cancelled':
-          updateAgentTask(event.id, { status: 'cancelled' }); break
-        case 'tasks_complete':
-          setAgentPhase('complete'); break
-      }
-    }
-
-    const finishTaskRun = () => {
-      setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
-      setIsBuildingEdit(false)
-      setAgentPhase('complete')
-      if (isFirst) autoRename()
-      else api.chat.getSessions().then(setSessions).catch(() => {})
-      api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
-    }
-
-    const runTaskQueue = (sid: string, runId: string, tasks: any[]) => {
-      let idx = 0
-      const runNext = () => {
-        if (useAppStore.getState().activeSessions !== sid || idx >= tasks.length) {
-          finishTaskRun(); return
-        }
-        const t = tasks[idx++]
-        // True once this task's stream delivered a terminal event
-        // (task_done / task_blocked / task_cancelled). If the stream closes
-        // without one, the connection dropped mid-task and we must reconcile
-        // the real status from the DB instead of stalling the queue.
-        let sawTerminal = false
-        let streamErr = ''
-        const reconcileOnClose = () => {
-          if (sawTerminal) return  // normal close after task_done — already advanced
-          if (useAppStore.getState().activeSessions !== sid) { finishTaskRun(); return }
-          api.tasks.list(sid, runId)
-            .then((rows: any[]) => {
-              if (useAppStore.getState().activeSessions !== sid) { finishTaskRun(); return }
-              const row: any = (rows || []).find((r: any) => r.id === t.id)
-              const status = row?.status
-              if (status === 'done') {
-                // Backend finished the task but the task_done event was lost
-                // in transit — record it and keep the queue moving.
-                updateAgentTask(t.id, { status: 'done', qa_score: row.qa_score, verdict: row.verdict })
-                runNext()
-              } else if (status === 'blocked' || status === 'cancelled') {
-                updateAgentTask(t.id, { status, qa_score: row?.qa_score, verdict: row?.verdict })
-                finishTaskRun()
-              } else {
-                // pending / running / unknown — we cannot safely continue.
-                setError(streamErr || 'Connection dropped mid-task. Task status is unresolved — reopen the session to check progress.')
-                finishTaskRun()
-              }
-            })
-            .catch(() => {
-              setError(streamErr || 'Connection dropped and task status could not be verified.')
-              finishTaskRun()
-            })
-        }
-        const ctrl = api.stream.executeTask(
-          { session_id: sid, run_id: runId, task_id: t.id },
-          (progress) => { if (useAppStore.getState().activeSessions === sid) setStreamProgress(progress) },
-          (result) => addTaskResultCard(result),
-          reconcileOnClose,  // per-task stream closed
-          (err) => { streamErr = err },  // defer: reconcileOnClose decides the outcome
-          (event) => {
-            if (event.type === 'task_done' || event.type === 'task_blocked' || event.type === 'task_cancelled') {
-              sawTerminal = true
-            }
-            handleTaskEvent(event)
-            if (event.type === 'task_done') runNext()
-            else if (event.type === 'task_blocked' || event.type === 'task_cancelled') finishTaskRun()
-          },
-        )
-        abortRef.current = ctrl
-      }
-      runNext()
-    }
 
     const ctrl = api.stream.smart(
       { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id) },
@@ -1034,7 +1076,10 @@ export function ChatPanel() {
         if (pendingRunRef.current) {
           const run = pendingRunRef.current
           pendingRunRef.current = null
-          runTaskQueue(sessionId, run.runId, run.tasks)
+          runTaskQueue(sessionId, run.runId, run.tasks, () => {
+            if (isFirst) autoRename()
+            else api.chat.getSessions().then(setSessions).catch(() => {})
+          })
           return
         }
         if (gotResult) return
@@ -1570,6 +1615,27 @@ export function ChatPanel() {
             {messages.map((msg, i) => (
               <Message key={msg.id || i} msg={msg} sessionId={msg.session_id || activeSessions || ''} />
             ))}
+            {resumableRun && resumableRun.sid === activeSessions && !isStreaming && (
+              <div className="mx-3 mb-2 flex items-center justify-between gap-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5 animate-slide-up">
+                <span className="text-[12px] text-ink leading-snug">
+                  This task run was interrupted — {resumableRun.tasks.length} task{resumableRun.tasks.length === 1 ? '' : 's'} remaining.
+                </span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={resumeInterruptedRun}
+                    className="text-[11px] font-semibold px-2.5 py-1 rounded-lg text-accent bg-accent/10 border border-accent/20 hover:bg-accent/20 transition-colors"
+                  >
+                    Resume
+                  </button>
+                  <button
+                    onClick={() => setResumableRun(null)}
+                    className="text-[11px] font-medium px-2 py-1 rounded-lg text-muted hover:bg-overlay/60 transition-colors"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
             <AgentMissionControl />
             {isStreaming && (streamingMessage || streamProgress) && (
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} />
