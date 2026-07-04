@@ -1124,6 +1124,15 @@ AGENTIC_TOOLS_V2 = [
     }
 ]
 
+# Extend AGENTIC_TOOLS_V2 with find_callers/find_usages/get_lines, mirroring
+# context_resolver's callers/usages/lines request types already proven in the
+# Surgeon. Import failure degrades gracefully — base 3 tools still work.
+try:
+    from services.architect_search_tools import ARCHITECT_SEARCH_TOOLS_V2 as _ARCH_SEARCH_TOOLS_EXT
+except Exception:
+    _ARCH_SEARCH_TOOLS_EXT = []
+AGENTIC_TOOLS_V2 = AGENTIC_TOOLS_V2 + _ARCH_SEARCH_TOOLS_EXT
+
 
 # Phase 4: Correction handler tool definitions (tool_use migration)
 CORRECTION_TOOLS = [
@@ -6772,7 +6781,8 @@ USER REQUEST:
             _dlog("flag_check_agentic_tool_use",
                   raw_value=_agentic_raw, resolved=_use_agentic_tools,
                   env_upper=_os.environ.get("AGENTIC_TOOL_USE", "<not set>"),
-                  session_id=session_id, user_id=user_id)
+                  session_id=session_id, user_id=user_id,
+                  extra_search_tools_loaded=len(_ARCH_SEARCH_TOOLS_EXT))
             _agentic_plan_set = False
 
             if _use_agentic_tools:
@@ -6825,7 +6835,19 @@ USER REQUEST:
                 _tu_messages = list(_arch_history_msgs) + [{"role": "user", "content": _tu_user_content}]
                 _tu_round = 0
                 _tu_searched = []
+                _tu_extra_searched = set()  # dedupe key for find_callers/find_usages/get_lines
                 plan = None
+
+                # Import once per Architect call; failure degrades gracefully —
+                # the three extra tools simply report "unavailable" instead of
+                # crashing the whole tool-use loop.
+                try:
+                    from services.architect_search_tools import execute_architect_search_tool
+                    _dlog("architect_search_tools_import_ok", session_id=session_id)
+                except Exception as _e_ast_imp:
+                    execute_architect_search_tool = None
+                    _dlog("architect_search_tools_import_failed",
+                          error=str(_e_ast_imp), session_id=session_id)
 
                 while _tu_round < _TU_MAX_ROUNDS:
                     _tu_round += 1
@@ -6837,7 +6859,8 @@ USER REQUEST:
                             "role": "user",
                             "content": (
                                 "[SEARCH BUDGET EXHAUSTED] You MUST call submit_plan now. "
-                                "No more search_codebase or request_file calls. "
+                                "No more search_codebase, request_file, find_callers, "
+                                "find_usages, or get_lines calls. "
                                 "Plan with the context you have."
                             )
                         })
@@ -6963,7 +6986,10 @@ USER REQUEST:
                         break
 
                     # ── Search/request tools → execute and loop ──
-                    _tu_search = [t for t in _tu_parsed if t["name"] in ("search_codebase", "request_file")]
+                    _tu_search = [t for t in _tu_parsed if t["name"] in (
+                        "search_codebase", "request_file",
+                        "find_callers", "find_usages", "get_lines",
+                    )]
                     if not _tu_search:
                         # Unknown tools — treat text as chat
                         plan = {"intent": "chat", "chat_response": "".join(_tu_text) or "I couldn't determine what to do."}
@@ -7108,6 +7134,31 @@ USER REQUEST:
                                 "type": "tool_result",
                                 "tool_use_id": _tc["id"],
                                 "content": _rf_res[:32000]
+                            })
+                        elif _tc["name"] in ("find_callers", "find_usages", "get_lines"):
+                            _dlog("tu_extra_search_tool_call", tool_name=_tc["name"],
+                                  tool_input=_tc["input"], session_id=session_id, round=_tu_round)
+                            _es_key = f"{_tc['name']}:{sorted(_tc['input'].items())}"
+                            if _es_key in _tu_extra_searched:
+                                _es_res = "Already requested — call submit_plan with what you have."
+                                _dlog("tu_extra_search_dedup_hit", tool_name=_tc["name"], key=_es_key)
+                            elif execute_architect_search_tool is None:
+                                _es_res = f"[{_tc['name']} unavailable — module failed to load]"
+                                _dlog("tu_extra_search_tool_unavailable", tool_name=_tc["name"])
+                            else:
+                                _tu_extra_searched.add(_es_key)
+                                _es_label = _tc["input"].get("name") or _tc["input"].get("filename", "")
+                                yield sse({"type": "progress", "content":
+                                           f"{_tc['name'].replace('_', ' ').title()}: {_es_label}..."})
+                                _es_res = execute_architect_search_tool(
+                                    _tc["name"], _tc["input"], symbol_maps_by_name, dlog=_dlog
+                                )
+                                _dlog("tu_extra_search_tool_result", tool_name=_tc["name"],
+                                      result_len=len(_es_res), session_id=session_id)
+                            _tu_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": _tc["id"],
+                                "content": _es_res[:16000]
                             })
 
                     _tu_messages.append({"role": "user", "content": _tu_results})
