@@ -671,16 +671,11 @@ html{scroll-behavior:smooth}
 
 export function LandingPage() {
   useEffect(() => {
-    const s = document.createElement('style');
-    s.id = 'sai-landing-css';
-    s.textContent = CSS;
-    document.head.appendChild(s);
     const prevOverflow = document.body.style.overflow;
     const prevBg = document.body.style.background;
     document.body.style.overflow = 'auto';
     document.body.style.background = '#ffffff';
     return () => {
-      s.remove();
       document.body.style.overflow = prevOverflow;
       document.body.style.background = prevBg;
     };
@@ -1576,6 +1571,8 @@ export function LandingPage() {
 
   return (
     <>
+      {/* Inline style tag — renders with first paint, prevents FOUC */}
+      <style dangerouslySetInnerHTML={{ __html: CSS }} />
       {/* NAV */}
       <nav className="sai-nav">
         <a href="#" className="sai-nav-logo">
