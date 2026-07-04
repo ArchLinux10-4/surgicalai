@@ -2,8 +2,15 @@
 import httpx
 from fastapi import APIRouter, HTTPException, Request
 from models.schemas import SettingsUpdate, SettingsResponse
-from database import get_all_settings, set_setting, get_setting, set_user_api_key, get_user_api_key
+from database import get_all_settings, set_setting, get_setting, set_user_api_key, get_user_api_key, _dlog
 from crypto_utils import encrypt_api_key, decrypt_api_key
+
+# Settings that control server-side infrastructure (not just per-user UI
+# preferences) — changing these can affect every user on the instance, so
+# they require admin. workspace_path in particular is the trust root for
+# the entire file browser sandbox (see routers/files.py:_safe_path) — a
+# non-admin able to repoint it could read/write anywhere the process can.
+_ADMIN_ONLY_SETTINGS = {"workspace_path"}
 
 router = APIRouter()
 
@@ -54,10 +61,26 @@ def get_settings(request: Request):
 
 
 @router.post("")
-def update_settings(req: SettingsUpdate):
+def update_settings(req: SettingsUpdate, request: Request):
     updates = req.model_dump(exclude_none=True)
+    user_id = _get_user_id(request)
+    is_admin = getattr(request.state, "is_admin", False)
+
+    attempted_admin_only = _ADMIN_ONLY_SETTINGS.intersection(updates.keys())
+    if attempted_admin_only and not is_admin:
+        _dlog("settings_admin_only_rejected", user_id=user_id, keys=list(attempted_admin_only))
+        raise HTTPException(
+            status_code=403,
+            detail=f"Admin access required to change: {', '.join(sorted(attempted_admin_only))}"
+        )
+
     for key, val in updates.items():
+        if key == "workspace_path":
+            old_val = get_setting("workspace_path", "")
+            _dlog("settings_workspace_path_changed", user_id=user_id, old_value=old_val, new_value=str(val))
         set_setting(key, str(val))
+
+    _dlog("settings_updated", user_id=user_id, keys=list(updates.keys()))
     return {"ok": True, "updated": list(updates.keys())}
 
 

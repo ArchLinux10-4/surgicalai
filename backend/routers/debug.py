@@ -12,7 +12,7 @@ from typing import Optional
 from fastapi import APIRouter, Request, Query
 from fastapi.responses import JSONResponse, Response
 from fastapi import HTTPException
-from database import get_db
+from database import get_db_ctx, _dlog
 from auth_utils import decode_token
 
 router = APIRouter(prefix="/api/debug", tags=["debug"])
@@ -21,6 +21,7 @@ router = APIRouter(prefix="/api/debug", tags=["debug"])
 def _require_admin(request: Request):
     """Require actual admin role — not just 'any logged-in user'."""
     if not getattr(request.state, "is_admin", False):
+        _dlog("debug_admin_check_failed", user_id=getattr(request.state, "user_id", ""))
         raise HTTPException(status_code=403, detail="Admin access required")
 
 
@@ -35,30 +36,28 @@ async def get_pipeline_log(
     _require_admin(request)
 
     try:
-        conn = get_db()
+        with get_db_ctx() as conn:
+            # Build query with optional filters
+            conditions = []
+            params = []
+            if session_id:
+                conditions.append("session_id = ?")
+                params.append(session_id)
+            if user_id:
+                conditions.append("user_id = ?")
+                params.append(str(user_id))
 
-        # Build query with optional filters
-        conditions = []
-        params = []
-        if session_id:
-            conditions.append("session_id = ?")
-            params.append(session_id)
-        if user_id:
-            conditions.append("user_id = ?")
-            params.append(str(user_id))
+            where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
 
-        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+            # Get total count
+            total_row = conn.execute(f"SELECT COUNT(*) as cnt FROM debug_events{where}", params).fetchone()
+            total = total_row["cnt"] if total_row else 0
 
-        # Get total count
-        total_row = conn.execute(f"SELECT COUNT(*) as cnt FROM debug_events{where}", params).fetchone()
-        total = total_row["cnt"] if total_row else 0
-
-        # Get last N events ordered by created_at
-        rows = conn.execute(
-            f"SELECT data FROM debug_events{where} ORDER BY created_at DESC LIMIT ?",
-            params + [last],
-        ).fetchall()
-        conn.close()
+            # Get last N events ordered by created_at
+            rows = conn.execute(
+                f"SELECT data FROM debug_events{where} ORDER BY created_at DESC LIMIT ?",
+                params + [last],
+            ).fetchall()
 
         # Parse JSON data column back to dicts
         events = []
@@ -75,6 +74,7 @@ async def get_pipeline_log(
             "returned": len(events),
         })
     except Exception as e:
+        _dlog("debug_get_pipeline_log_failed", session_id=session_id, user_id=user_id, error=str(e))
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -101,22 +101,20 @@ async def download_pipeline_log(
         raise HTTPException(status_code=403, detail="Admin access required")
 
     try:
-        conn = get_db()
+        with get_db_ctx() as conn:
+            conditions = []
+            params = []
+            if session_id:
+                conditions.append("session_id = ?")
+                params.append(session_id)
+            if user_id:
+                conditions.append("user_id = ?")
+                params.append(str(user_id))
 
-        conditions = []
-        params = []
-        if session_id:
-            conditions.append("session_id = ?")
-            params.append(session_id)
-        if user_id:
-            conditions.append("user_id = ?")
-            params.append(str(user_id))
-
-        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-        rows = conn.execute(
-            f"SELECT data FROM debug_events{where} ORDER BY created_at ASC", params
-        ).fetchall()
-        conn.close()
+            where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+            rows = conn.execute(
+                f"SELECT data FROM debug_events{where} ORDER BY created_at ASC", params
+            ).fetchall()
 
         lines = [row["data"] for row in rows]
         content = "\n".join(lines)
@@ -128,6 +126,7 @@ async def download_pipeline_log(
             headers={"Content-Disposition": f"attachment; filename={fname}"},
         )
     except Exception as e:
+        _dlog("debug_download_pipeline_log_failed", session_id=session_id, user_id=user_id, error=str(e))
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
@@ -142,15 +141,17 @@ async def clear_pipeline_log(
     """
     _require_admin(request)
     try:
-        conn = get_db()
-        if older_than_days:
-            import datetime
-            cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=older_than_days)).isoformat()
-            conn.execute("DELETE FROM debug_events WHERE created_at < ?", (cutoff,))
-        else:
-            conn.execute("DELETE FROM debug_events")
-        conn.commit()
-        conn.close()
+        with get_db_ctx() as conn:
+            if older_than_days:
+                import datetime
+                cutoff = (datetime.datetime.utcnow() - datetime.timedelta(days=older_than_days)).isoformat()
+                conn.execute("DELETE FROM debug_events WHERE created_at < ?", (cutoff,))
+            else:
+                conn.execute("DELETE FROM debug_events")
+            conn.commit()
+        _dlog("debug_pipeline_log_cleared", older_than_days=older_than_days,
+              cleared_by=getattr(request.state, "user_id", ""))
         return JSONResponse({"cleared": True, "scope": f"older_than_{older_than_days}_days" if older_than_days else "all"})
     except Exception as e:
+        _dlog("debug_clear_pipeline_log_failed", older_than_days=older_than_days, error=str(e))
         return JSONResponse({"error": str(e)}, status_code=500)

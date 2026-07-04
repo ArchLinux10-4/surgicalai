@@ -9,7 +9,7 @@ from models.schemas import (
     PromptTemplate, PromptTemplateCreate,
     MultiFileAnalyzeRequest, ImpactAnalysisResponse
 )
-from database import get_db, get_setting, GLOBAL_MEMORY_KEY
+from database import get_db_ctx, get_setting, GLOBAL_MEMORY_KEY, _dlog
 from services.pipeline import run_impact_analysis, analyze_multi_file
 from data.memory_presets import MEMORY_PRESETS
 
@@ -22,12 +22,11 @@ def get_memory(session_id: str = None, workspace_path: str = None):
     key = session_id or workspace_path
     if not key:
         raise HTTPException(status_code=422, detail="session_id or workspace_path required")
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM project_memory WHERE workspace_path = ? ORDER BY updated_at DESC LIMIT 1",
-        (key,)
-    ).fetchone()
-    conn.close()
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT * FROM project_memory WHERE workspace_path = ? ORDER BY updated_at DESC LIMIT 1",
+            (key,)
+        ).fetchone()
     if not row:
         return {"workspace_path": key, "content": "", "id": None}
     return dict(row)
@@ -35,24 +34,23 @@ def get_memory(session_id: str = None, workspace_path: str = None):
 @router.post("/memory")
 def save_memory(req: ProjectMemory):
     key = req.session_id or req.workspace_path or ""
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT id FROM project_memory WHERE workspace_path = ?",
-        (key,)
-    ).fetchone()
+    with get_db_ctx() as conn:
+        existing = conn.execute(
+            "SELECT id FROM project_memory WHERE workspace_path = ?",
+            (key,)
+        ).fetchone()
 
-    if existing:
-        conn.execute(
-            "UPDATE project_memory SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE workspace_path = ?",
-            (req.content, key)
-        )
-    else:
-        conn.execute(
-            "INSERT INTO project_memory (id, workspace_path, content) VALUES (?, ?, ?)",
-            (str(uuid.uuid4()), key, req.content)
-        )
-    conn.commit()
-    conn.close()
+        if existing:
+            conn.execute(
+                "UPDATE project_memory SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE workspace_path = ?",
+                (req.content, key)
+            )
+        else:
+            conn.execute(
+                "INSERT INTO project_memory (id, workspace_path, content) VALUES (?, ?, ?)",
+                (str(uuid.uuid4()), key, req.content)
+            )
+        conn.commit()
     return {"ok": True}
 
 # ─── Global Project Memory (team-wide, injected into every prompt) ────────────
@@ -60,35 +58,33 @@ def save_memory(req: ProjectMemory):
 @router.get("/memory/global")
 def get_global_memory():
     """Team-wide conventions injected into every prompt, every session, every user."""
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM project_memory WHERE workspace_path = ? ORDER BY updated_at DESC LIMIT 1",
-        (GLOBAL_MEMORY_KEY,)
-    ).fetchone()
-    conn.close()
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT * FROM project_memory WHERE workspace_path = ? ORDER BY updated_at DESC LIMIT 1",
+            (GLOBAL_MEMORY_KEY,)
+        ).fetchone()
     if not row:
         return {"workspace_path": GLOBAL_MEMORY_KEY, "content": "", "id": None}
     return dict(row)
 
 @router.post("/memory/global")
 def save_global_memory(req: ProjectMemory):
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT id FROM project_memory WHERE workspace_path = ?",
-        (GLOBAL_MEMORY_KEY,)
-    ).fetchone()
-    if existing:
-        conn.execute(
-            "UPDATE project_memory SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE workspace_path = ?",
-            (req.content, GLOBAL_MEMORY_KEY)
-        )
-    else:
-        conn.execute(
-            "INSERT INTO project_memory (id, workspace_path, content) VALUES (?, ?, ?)",
-            (str(uuid.uuid4()), GLOBAL_MEMORY_KEY, req.content)
-        )
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        existing = conn.execute(
+            "SELECT id FROM project_memory WHERE workspace_path = ?",
+            (GLOBAL_MEMORY_KEY,)
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE project_memory SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE workspace_path = ?",
+                (req.content, GLOBAL_MEMORY_KEY)
+            )
+        else:
+            conn.execute(
+                "INSERT INTO project_memory (id, workspace_path, content) VALUES (?, ?, ?)",
+                (str(uuid.uuid4()), GLOBAL_MEMORY_KEY, req.content)
+            )
+        conn.commit()
     return {"ok": True}
 
 @router.get("/memory/presets")
@@ -100,29 +96,26 @@ def get_memory_presets():
 
 @router.get("/templates")
 def get_templates():
-    conn = get_db()
-    rows = conn.execute("SELECT * FROM prompt_templates ORDER BY name ASC").fetchall()
-    conn.close()
+    with get_db_ctx() as conn:
+        rows = conn.execute("SELECT * FROM prompt_templates ORDER BY name ASC").fetchall()
     return [dict(r) for r in rows]
 
 @router.post("/templates")
 def create_template(req: PromptTemplateCreate):
     template_id = str(uuid.uuid4())
-    conn = get_db()
-    conn.execute(
-        "INSERT INTO prompt_templates (id, name, prompt, mode) VALUES (?, ?, ?, ?)",
-        (template_id, req.name, req.prompt, req.mode)
-    )
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        conn.execute(
+            "INSERT INTO prompt_templates (id, name, prompt, mode) VALUES (?, ?, ?, ?)",
+            (template_id, req.name, req.prompt, req.mode)
+        )
+        conn.commit()
     return {"id": template_id, "ok": True}
 
 @router.delete("/templates/{template_id}")
 def delete_template(template_id: str):
-    conn = get_db()
-    conn.execute("DELETE FROM prompt_templates WHERE id = ?", (template_id,))
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        conn.execute("DELETE FROM prompt_templates WHERE id = ?", (template_id,))
+        conn.commit()
     return {"ok": True}
 
 # ─── Impact Analysis ──────────────────────────────────────────────────────────
@@ -135,6 +128,7 @@ def get_impact(symbol_path: str, file_path: str, workspace_path: str = None):
         result = run_impact_analysis(symbol_path, file_path, "", workspace_path)
         return result
     except Exception as e:
+        _dlog("context_impact_analysis_failed", symbol_path=symbol_path, file_path=file_path, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─── Multi-file Surgical ──────────────────────────────────────────────────────
@@ -154,4 +148,5 @@ def multi_analyze(req: MultiFileAnalyzeRequest):
             "overall_summary": summary
         }
     except Exception as e:
+        _dlog("context_multi_analyze_failed", session_id=req.session_id, error=str(e))
         raise HTTPException(status_code=500, detail=str(e))

@@ -6,7 +6,51 @@ import os
 import json
 import uuid
 import hashlib
+import time
+import logging
+import threading
+import datetime as _dt
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Connection-lifecycle logging
+# ---------------------------------------------------------------------------
+# IMPORTANT: this _dlog is intentionally standalone (Python `logging` + a flat
+# /tmp file) and must NEVER call back into get_db()/get_db_ctx(). The
+# database-backed _dlog used elsewhere in the app (services/pipeline.py)
+# writes its debug events through get_db_ctx() — if database.py's own
+# connection logging did that too, a DB outage would recurse into itself
+# (log the failure to open a connection by... opening a connection).
+_db_logger = logging.getLogger("surgicalai.database")
+_DB_DLOG_PATH = "/tmp/surgicalai_db_debug.jsonl"
+
+# Tracks how many DB connections are currently open (best-effort, not
+# thread-safe-strict, but good enough for leak *trend* detection in logs —
+# a steadily climbing number across log lines means connections aren't
+# being closed somewhere).
+_open_conn_count = 0
+_open_conn_lock = threading.Lock()
+_LEAK_WARN_THRESHOLD = 20  # flag in logs if this many connections are open at once
+
+
+def _dlog(event: str, **kwargs):
+    """Lightweight, DB-independent debug log for connection lifecycle events.
+
+    Writes to both the standard Python logger (shows up in Railway logs)
+    and a flat /tmp file (fast, greppable fallback). Never raises — a
+    logging failure must never break a real DB operation.
+    """
+    try:
+        ts = _dt.datetime.utcnow().isoformat() + "Z"
+        record = {"ts": ts, "event": event, **kwargs}
+        _db_logger.info("[db] %s", json.dumps(record, default=str))
+        try:
+            with open(_DB_DLOG_PATH, "a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception:
+            pass  # /tmp write is best-effort only; logger line above already fired
+    except Exception:
+        pass  # logging must never break a DB call
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 USE_POSTGRES = DATABASE_URL.startswith("postgres")
@@ -142,13 +186,54 @@ def get_db_connection():
 
 
 def get_db():
-    if USE_POSTGRES:
-        return CompatConn(DATABASE_URL)
+    """Open a new DB connection. Logs open/failure and tracks a live-count
+    so leaks show up as a steadily rising number in the debug logs.
+
+    NOTE: callers are responsible for closing this connection. Prefer
+    get_db_ctx() (a `with` block) wherever possible — it closes
+    automatically even on exception. Raw get_db() call sites that don't
+    use try/finally are a known leak risk (see _dlog "db_open" trend).
+    """
+    global _open_conn_count
+    t0 = time.monotonic()
+    try:
+        if USE_POSTGRES:
+            conn = CompatConn(DATABASE_URL)
+        else:
+            DB_DIR.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(DB_PATH))
+            conn.row_factory = sqlite3.Row
+    except Exception as e:
+        _dlog("db_open_failed", driver=("postgres" if USE_POSTGRES else "sqlite"),
+              error=str(e), elapsed_ms=round((time.monotonic() - t0) * 1000, 1))
+        raise
+
+    with _open_conn_lock:
+        _open_conn_count += 1
+        current_count = _open_conn_count
+
+    _dlog("db_open", driver=("postgres" if USE_POSTGRES else "sqlite"),
+          open_connections=current_count, elapsed_ms=round((time.monotonic() - t0) * 1000, 1))
+    if current_count >= _LEAK_WARN_THRESHOLD:
+        _dlog("db_open_count_high_possible_leak", open_connections=current_count,
+              threshold=_LEAK_WARN_THRESHOLD)
+    return conn
+
+
+def _note_conn_closed(reason: str, exc: Exception = None):
+    """Shared bookkeeping for connection close — decrements the live count
+    and logs whether this close happened after an exception in the caller's
+    `with` block (that path is exactly what raw get_db()+close() call sites
+    miss, since they never run cleanup on exception)."""
+    global _open_conn_count
+    with _open_conn_lock:
+        _open_conn_count = max(0, _open_conn_count - 1)
+        current_count = _open_conn_count
+    if exc is not None:
+        _dlog("db_close_after_exception", reason=reason, open_connections=current_count,
+              exception_type=type(exc).__name__, exception_msg=str(exc))
     else:
-        DB_DIR.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(DB_PATH))
-        conn.row_factory = sqlite3.Row
-        return conn
+        _dlog("db_close", reason=reason, open_connections=current_count)
 
 
 from contextlib import contextmanager
@@ -162,12 +247,24 @@ def get_db_ctx():
             conn.execute(...)
             conn.commit()
         # conn.close() called automatically, even if an exception occurred.
+
+    This is the preferred way to get a DB connection. It logs open/close
+    (including whether close happened after an exception) so any future
+    leak or crash-mid-query shows up clearly in the debug logs.
     """
     conn = get_db()
+    exc_seen = None
     try:
         yield conn
+    except Exception as e:
+        exc_seen = e
+        raise
     finally:
-        conn.close()
+        try:
+            conn.close()
+        except Exception as close_err:
+            _dlog("db_close_failed", error=str(close_err))
+        _note_conn_closed(reason="get_db_ctx", exc=exc_seen)
 
 
 def init_db():
@@ -700,9 +797,14 @@ def _default_templates():
 # ---------------------------------------------------------------------------
 
 def get_setting(key: str, default: str = "") -> str:
-    conn = get_db()
-    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-    conn.close()
+    try:
+        with get_db_ctx() as conn:
+            row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    except Exception as e:
+        # Never let a DB hiccup take down a setting lookup — degrade to
+        # env var / default, but log it loudly so it's visible in Railway logs.
+        _dlog("get_setting_db_error", key=key, error=str(e))
+        row = None
     if row:
         return row["value"]
     # Fallback: check OS environment variable (UPPER_CASE convention)
@@ -711,51 +813,47 @@ def get_setting(key: str, default: str = "") -> str:
 
 
 def set_setting(key: str, value: str):
-    conn = get_db()
-    conn.execute(
-        "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
-        (key, value),
-    )
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP)",
+            (key, value),
+        )
+        conn.commit()
 
 
 def set_user_api_key(user_id: str, key_type: str, encrypted_value: str):
     """Store an encrypted API key for a user. Upserts."""
-    conn = get_db()
     key_id = hashlib.md5(f"{user_id}:{key_type}".encode()).hexdigest()
-    if USE_POSTGRES:
-        conn.execute(
-            """INSERT INTO user_api_keys (id, user_id, key_type, encrypted_value, updated_at)
-               VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
-               ON CONFLICT (user_id, key_type) DO UPDATE SET
-                 encrypted_value = EXCLUDED.encrypted_value,
-                 updated_at = EXCLUDED.updated_at""",
-            (key_id, user_id, key_type, encrypted_value),
-        )
-    else:
-        conn.execute(
-            """INSERT OR REPLACE INTO user_api_keys (id, user_id, key_type, encrypted_value, updated_at)
-               VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
-            (key_id, user_id, key_type, encrypted_value),
-        )
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        if USE_POSTGRES:
+            conn.execute(
+                """INSERT INTO user_api_keys (id, user_id, key_type, encrypted_value, updated_at)
+                   VALUES (%s, %s, %s, %s, CURRENT_TIMESTAMP)
+                   ON CONFLICT (user_id, key_type) DO UPDATE SET
+                     encrypted_value = EXCLUDED.encrypted_value,
+                     updated_at = EXCLUDED.updated_at""",
+                (key_id, user_id, key_type, encrypted_value),
+            )
+        else:
+            conn.execute(
+                """INSERT OR REPLACE INTO user_api_keys (id, user_id, key_type, encrypted_value, updated_at)
+                   VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                (key_id, user_id, key_type, encrypted_value),
+            )
+        conn.commit()
 
 
 def get_user_api_key(user_id: str, key_type: str) -> str:
     """Retrieve encrypted API key for a user. Returns empty string if not found."""
-    conn = get_db()
-    row = conn.execute(
-        "SELECT encrypted_value FROM user_api_keys WHERE user_id = ? AND key_type = ?",
-        (user_id, key_type),
-    ).fetchone()
-    conn.close()
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT encrypted_value FROM user_api_keys WHERE user_id = ? AND key_type = ?",
+            (user_id, key_type),
+        ).fetchone()
     return row["encrypted_value"] if row else ""
 
 
 def get_all_settings() -> dict:
-    conn = get_db()
-    rows = conn.execute("SELECT key, value FROM settings").fetchall()
-    conn.close()
+    with get_db_ctx() as conn:
+        rows = conn.execute("SELECT key, value FROM settings").fetchall()
     return {row["key"]: row["value"] for row in rows}

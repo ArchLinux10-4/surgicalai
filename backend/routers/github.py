@@ -14,7 +14,7 @@ try:
 except ImportError:
     PYGITHUB_AVAILABLE = False
 
-from database import get_user_api_key, set_user_api_key, get_db
+from database import get_user_api_key, set_user_api_key, get_db_ctx, _dlog
 from crypto_utils import encrypt_api_key, decrypt_api_key
 
 router = APIRouter()
@@ -270,26 +270,25 @@ def _fetch_and_store_file(r, path: str, body: "LoadFilesRequest", parser, lang_m
             "sha": content_file.sha,
         })
 
-        conn = get_db()
-        existing = conn.execute(
-            "SELECT id FROM session_files WHERE session_id = ? AND filename = ?",
-            (body.session_id, filename)
-        ).fetchone()
+        with get_db_ctx() as conn:
+            existing = conn.execute(
+                "SELECT id FROM session_files WHERE session_id = ? AND filename = ?",
+                (body.session_id, filename)
+            ).fetchone()
 
-        if existing:
-            file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
-            conn.execute(
-                "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, github_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (raw, language, line_count, symbol_count, github_meta, file_id)
-            )
-        else:
-            file_id = str(uuid.uuid4())
-            conn.execute(
-                "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, github_meta, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'code', ?, CURRENT_TIMESTAMP)",
-                (file_id, body.session_id, filename, raw, language, line_count, symbol_count, github_meta)
-            )
-        conn.commit()
-        conn.close()
+            if existing:
+                file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
+                conn.execute(
+                    "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, github_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (raw, language, line_count, symbol_count, github_meta, file_id)
+                )
+            else:
+                file_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, github_meta, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'code', ?, CURRENT_TIMESTAMP)",
+                    (file_id, body.session_id, filename, raw, language, line_count, symbol_count, github_meta)
+                )
+            conn.commit()
 
         return ({
             "id": file_id,
@@ -304,6 +303,7 @@ def _fetch_and_store_file(r, path: str, body: "LoadFilesRequest", parser, lang_m
             "created_at": None,
         }, None)
     except Exception as e:
+        _dlog("github_fetch_and_store_file_failed", path=path, session_id=body.session_id, error=str(e))
         return (None, {"path": path, "error": str(e)})
 
 
@@ -388,12 +388,11 @@ def commit_changes(body: CommitRequest, request: Request):
 
         committed_files = []
         for f in body.files:
-            conn = get_db()
-            row = conn.execute(
-                "SELECT content, github_meta FROM session_files WHERE id = ?",
-                (f.session_file_id,)
-            ).fetchone()
-            conn.close()
+            with get_db_ctx() as conn:
+                row = conn.execute(
+                    "SELECT content, github_meta FROM session_files WHERE id = ?",
+                    (f.session_file_id,)
+                ).fetchone()
 
             if not row:
                 continue
@@ -418,15 +417,15 @@ def commit_changes(body: CommitRequest, request: Request):
                 )
                 new_sha = result["content"].sha if result.get("content") else sha
                 updated_meta = {**github_meta, "sha": new_sha, "branch": target_branch}
-                conn = get_db()
-                conn.execute(
-                    "UPDATE session_files SET github_meta = ?, github_pushed_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (json.dumps(updated_meta), f.session_file_id)
-                )
-                conn.commit()
-                conn.close()
+                with get_db_ctx() as conn:
+                    conn.execute(
+                        "UPDATE session_files SET github_meta = ?, github_pushed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (json.dumps(updated_meta), f.session_file_id)
+                    )
+                    conn.commit()
                 committed_files.append(github_path)
             except Exception as ge:
+                _dlog("github_commit_file_failed", github_path=github_path, error=str(ge))
                 raise HTTPException(
                     status_code=400,
                     detail=f"GitHub error on {github_path}: {str(ge)}"

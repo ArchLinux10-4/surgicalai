@@ -16,7 +16,7 @@ import uuid
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
-from database import get_db
+from database import get_db_ctx, _dlog
 from auth_utils import hash_password, verify_password, create_access_token
 
 router = APIRouter()
@@ -61,16 +61,18 @@ class SelfChangePasswordRequest(BaseModel):
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _require_admin(request: Request):
-    if not getattr(request.state, "is_admin", False):
+    is_admin = getattr(request.state, "is_admin", False)
+    if not is_admin:
+        _dlog("auth_admin_check_failed", user_id=getattr(request.state, "user_id", ""),
+              path=request.url.path)
         raise HTTPException(status_code=403, detail="Admin access required")
 
 
 def _get_user_by_username(username: str):
-    conn = get_db()
-    row = conn.execute(
-        "SELECT * FROM users WHERE username = ? AND is_active = 1", (username,)
-    ).fetchone()
-    conn.close()
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT * FROM users WHERE username = ? AND is_active = 1", (username,)
+        ).fetchone()
     return dict(row) if row else None
 
 
@@ -79,9 +81,8 @@ def _get_user_by_username(username: str):
 @router.get("/setup-required")
 def setup_required():
     """Returns true if no admin account exists yet (first-run)."""
-    conn = get_db()
-    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    conn.close()
+    with get_db_ctx() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     return {"setup_required": count == 0}
 
 
@@ -91,29 +92,29 @@ def setup_admin(req: SetupRequest):
     Create the first admin account. Only works when zero users exist.
     Subsequent calls are rejected — use the admin panel to create more users.
     """
-    conn = get_db()
-    count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    if count > 0:
-        conn.close()
-        raise HTTPException(
-            status_code=400,
-            detail="Setup already complete. Log in with your admin account."
+    with get_db_ctx() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if count > 0:
+            _dlog("auth_setup_rejected_already_complete", existing_user_count=count)
+            raise HTTPException(
+                status_code=400,
+                detail="Setup already complete. Log in with your admin account."
+            )
+
+        if len(req.username) < 3:
+            raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
+        if len(req.password) < 8:
+            raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
+
+        user_id = str(uuid.uuid4())
+        hashed = hash_password(req.password)
+        conn.execute(
+            "INSERT INTO users (id, username, email, hashed_password, is_admin) VALUES (?, ?, ?, ?, 1)",
+            (user_id, req.username.strip().lower(), req.email.strip().lower(), hashed)
         )
+        conn.commit()
 
-    if len(req.username) < 3:
-        raise HTTPException(status_code=400, detail="Username must be at least 3 characters")
-    if len(req.password) < 8:
-        raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
-
-    user_id = str(uuid.uuid4())
-    hashed = hash_password(req.password)
-    conn.execute(
-        "INSERT INTO users (id, username, email, hashed_password, is_admin) VALUES (?, ?, ?, ?, 1)",
-        (user_id, req.username.strip().lower(), req.email.strip().lower(), hashed)
-    )
-    conn.commit()
-    conn.close()
-
+    _dlog("auth_setup_admin_created", user_id=user_id, username=req.username.strip().lower())
     token = create_access_token(user_id, req.username.strip().lower(), is_admin=True)
     return {
         "access_token": token,
@@ -130,18 +131,20 @@ def setup_admin(req: SetupRequest):
 @router.post("/login")
 def login(req: LoginRequest):
     """Authenticate and receive a JWT token."""
-    user = _get_user_by_username(req.username.strip().lower())
+    username = req.username.strip().lower()
+    user = _get_user_by_username(username)
     if not user or not verify_password(req.password, user["hashed_password"]):
+        _dlog("auth_login_failed", username=username, reason=("no_such_user" if not user else "bad_password"))
         raise HTTPException(status_code=401, detail="Invalid username or password")
 
     # Update last_login
-    conn = get_db()
-    conn.execute(
-        "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?", (user["id"],)
-    )
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        conn.execute(
+            "UPDATE users SET last_login = CURRENT_TIMESTAMP WHERE id = ?", (user["id"],)
+        )
+        conn.commit()
 
+    _dlog("auth_login_success", user_id=user["id"], username=username)
     token = create_access_token(user["id"], user["username"], bool(user["is_admin"]))
     return {
         "access_token": token,
@@ -163,13 +166,13 @@ def get_me(request: Request):
     user_id = getattr(request.state, "user_id", None)
     if not user_id:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    conn = get_db()
-    row = conn.execute(
-        "SELECT id, username, email, is_admin, created_at, last_login FROM users WHERE id = ?",
-        (user_id,)
-    ).fetchone()
-    conn.close()
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT id, username, email, is_admin, created_at, last_login FROM users WHERE id = ?",
+            (user_id,)
+        ).fetchone()
     if not row:
+        _dlog("auth_me_user_not_found", user_id=user_id)
         raise HTTPException(status_code=404, detail="User not found")
     return dict(row)
 
@@ -180,11 +183,10 @@ def get_me(request: Request):
 def list_users(request: Request):
     """List all users. Admin only."""
     _require_admin(request)
-    conn = get_db()
-    rows = conn.execute(
-        "SELECT id, username, email, is_admin, is_active, created_at, last_login FROM users ORDER BY created_at ASC"
-    ).fetchall()
-    conn.close()
+    with get_db_ctx() as conn:
+        rows = conn.execute(
+            "SELECT id, username, email, is_admin, is_active, created_at, last_login FROM users ORDER BY created_at ASC"
+        ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -198,23 +200,24 @@ def create_user(req: CreateUserRequest, request: Request):
     if len(req.password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
-    conn = get_db()
-    existing = conn.execute(
-        "SELECT id FROM users WHERE username = ?", (req.username.strip().lower(),)
-    ).fetchone()
-    if existing:
-        conn.close()
-        raise HTTPException(status_code=409, detail="Username already exists")
+    with get_db_ctx() as conn:
+        existing = conn.execute(
+            "SELECT id FROM users WHERE username = ?", (req.username.strip().lower(),)
+        ).fetchone()
+        if existing:
+            _dlog("auth_create_user_rejected_duplicate", username=req.username.strip().lower())
+            raise HTTPException(status_code=409, detail="Username already exists")
 
-    user_id = str(uuid.uuid4())
-    hashed = hash_password(req.password)
-    conn.execute(
-        "INSERT INTO users (id, username, email, hashed_password, is_admin) VALUES (?, ?, ?, ?, ?)",
-        (user_id, req.username.strip().lower(), req.email.strip().lower(), hashed, int(req.is_admin))
-    )
-    conn.commit()
-    conn.close()
+        user_id = str(uuid.uuid4())
+        hashed = hash_password(req.password)
+        conn.execute(
+            "INSERT INTO users (id, username, email, hashed_password, is_admin) VALUES (?, ?, ?, ?, ?)",
+            (user_id, req.username.strip().lower(), req.email.strip().lower(), hashed, int(req.is_admin))
+        )
+        conn.commit()
 
+    _dlog("auth_create_user_success", user_id=user_id, created_by=getattr(request.state, "user_id", ""),
+          is_admin=req.is_admin)
     return {
         "id": user_id,
         "username": req.username.strip().lower(),
@@ -228,7 +231,6 @@ def create_user(req: CreateUserRequest, request: Request):
 def update_user(user_id: str, req: UpdateUserRequest, request: Request):
     """Update user info or role. Admin only."""
     _require_admin(request)
-    conn = get_db()
     updates = {}
     if req.email is not None:
         updates["email"] = req.email.strip().lower()
@@ -238,14 +240,16 @@ def update_user(user_id: str, req: UpdateUserRequest, request: Request):
         updates["is_active"] = int(req.is_active)
 
     if not updates:
-        conn.close()
         return {"ok": True, "updated": []}
 
-    set_clause = ", ".join(f"{k} = ?" for k in updates)
-    values = list(updates.values()) + [user_id]
-    conn.execute(f"UPDATE users SET {set_clause} WHERE id = ?", values)
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        set_clause = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values()) + [user_id]
+        conn.execute(f"UPDATE users SET {set_clause} WHERE id = ?", values)
+        conn.commit()
+
+    _dlog("auth_update_user", target_user_id=user_id, updated_fields=list(updates.keys()),
+          updated_by=getattr(request.state, "user_id", ""))
     return {"ok": True, "updated": list(updates.keys())}
 
 
@@ -256,16 +260,18 @@ def change_password(user_id: str, req: ChangePasswordRequest, request: Request):
     is_admin = getattr(request.state, "is_admin", False)
 
     if not is_admin and requester_id != user_id:
+        _dlog("auth_password_reset_rejected_not_self_or_admin", requester_id=requester_id, target_user_id=user_id)
         raise HTTPException(status_code=403, detail="You can only change your own password")
 
     if len(req.new_password) < 8:
         raise HTTPException(status_code=400, detail="Password must be at least 8 characters")
 
-    conn = get_db()
-    hashed = hash_password(req.new_password)
-    conn.execute("UPDATE users SET hashed_password = ? WHERE id = ?", (hashed, user_id))
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        hashed = hash_password(req.new_password)
+        conn.execute("UPDATE users SET hashed_password = ? WHERE id = ?", (hashed, user_id))
+        conn.commit()
+
+    _dlog("auth_password_reset_success", target_user_id=user_id, requester_id=requester_id, via_admin=is_admin)
     return {"ok": True}
 
 
@@ -301,30 +307,30 @@ def self_change_password(req: SelfChangePasswordRequest, request: Request):
     if not re.search(r'[0-9]', req.new_password):
         raise HTTPException(status_code=400, detail="Password must include at least one number")
 
-    # Fetch current hash
-    conn = get_db()
-    row = conn.execute(
-        "SELECT hashed_password FROM users WHERE id = ? AND is_active = 1", (user_id,)
-    ).fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    with get_db_ctx() as conn:
+        # Fetch current hash
+        row = conn.execute(
+            "SELECT hashed_password FROM users WHERE id = ? AND is_active = 1", (user_id,)
+        ).fetchone()
+        if not row:
+            _dlog("auth_self_change_password_user_not_found", user_id=user_id)
+            raise HTTPException(status_code=401, detail="Not authenticated")
 
-    # Verify current password (constant-time bcrypt)
-    if not verify_password(req.current_password, row["hashed_password"]):
-        conn.close()
-        raise HTTPException(status_code=401, detail="Current password is incorrect")
+        # Verify current password (constant-time bcrypt)
+        if not verify_password(req.current_password, row["hashed_password"]):
+            _dlog("auth_self_change_password_wrong_current", user_id=user_id)
+            raise HTTPException(status_code=401, detail="Current password is incorrect")
 
-    # Reject reuse
-    if verify_password(req.new_password, row["hashed_password"]):
-        conn.close()
-        raise HTTPException(status_code=400, detail="New password must be different from your current password")
+        # Reject reuse
+        if verify_password(req.new_password, row["hashed_password"]):
+            raise HTTPException(status_code=400, detail="New password must be different from your current password")
 
-    # Commit
-    hashed = hash_password(req.new_password)
-    conn.execute("UPDATE users SET hashed_password = ? WHERE id = ?", (hashed, user_id))
-    conn.commit()
-    conn.close()
+        # Commit
+        hashed = hash_password(req.new_password)
+        conn.execute("UPDATE users SET hashed_password = ? WHERE id = ?", (hashed, user_id))
+        conn.commit()
+
+    _dlog("auth_self_change_password_success", user_id=user_id)
     return {"ok": True}
 
 
@@ -345,8 +351,9 @@ def delete_user(user_id: str, request: Request):
     if requester_id == user_id:
         raise HTTPException(status_code=400, detail="You cannot delete your own account")
 
-    conn = get_db()
-    conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
-    conn.commit()
-    conn.close()
+    with get_db_ctx() as conn:
+        conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        conn.commit()
+
+    _dlog("auth_delete_user", target_user_id=user_id, deleted_by=requester_id)
     return {"ok": True}

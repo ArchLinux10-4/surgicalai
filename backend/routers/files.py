@@ -8,7 +8,7 @@ import mimetypes
 from pathlib import Path
 from fastapi import APIRouter, HTTPException
 from models.schemas import FileNode, FileContent, SaveFileRequest
-from database import get_setting
+from database import get_setting, _dlog
 from services.ast_parser import ASTParser
 
 router = APIRouter()
@@ -33,9 +33,15 @@ def _safe_path(requested: str) -> Path:
 
     Blocks path traversal (../), absolute paths outside workspace,
     and symlink escapes.  Raises 403 on any violation.
+
+    Every rejection is logged (event, requested path, resolved path,
+    workspace root) — this is the actual security boundary for the whole
+    file browser, so a rejected request here is exactly the signal you'd
+    want in the logs if someone is probing for an escape.
     """
     # Reject null bytes (path injection vector)
     if "\x00" in requested:
+        _dlog("files_safe_path_rejected_null_byte", requested=repr(requested))
         raise HTTPException(status_code=400, detail="Invalid path")
 
     workspace = _get_workspace_root()
@@ -48,6 +54,8 @@ def _safe_path(requested: str) -> Path:
 
     # Prefix check — trailing sep prevents /app matching /application
     if resolved != workspace and not resolved.startswith(workspace + os.sep):
+        _dlog("files_safe_path_rejected_outside_workspace", requested=requested,
+              resolved=resolved, workspace=workspace)
         raise HTTPException(status_code=403, detail="Access denied")
 
     return Path(resolved)
