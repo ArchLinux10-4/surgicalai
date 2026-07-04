@@ -751,6 +751,19 @@ export function ChatPanel() {
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const userScrolledUpRef = useRef(false)
+  // ── Agent Mode toggle (multi-agent task breakdown) ───────────────────────
+  // Read localStorage at send time (not from a closure) so doStream never
+  // sees a stale value. State exists only to drive the toggle UI.
+  const agentModeOn = () => {
+    try { return localStorage.getItem('sai_agent_mode') === '1' } catch { return false }
+  }
+  const [agentMode, setAgentMode] = useState(agentModeOn)
+  const toggleAgentMode = () => setAgentMode(prev => {
+    const next = !prev
+    try { localStorage.setItem('sai_agent_mode', next ? '1' : '0') } catch { /* storage blocked — session-only toggle */ }
+    return next
+  })
+
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortRef = useRef<AbortController | null>(null)
@@ -1061,7 +1074,7 @@ export function ChatPanel() {
     let gotResult = false
 
     const ctrl = api.stream.smart(
-      { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id) },
+      { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id), force_tasks: agentModeOn() },
       (progress) => {
         if (useAppStore.getState().activeSessions !== sessionId) return
         setStreamProgress(progress)
@@ -1800,6 +1813,36 @@ export function ChatPanel() {
                 lastResponse={messages.filter(m => m.role === 'assistant' && m.content).slice(-1)[0]?.content}
                 disabled={isStreaming || isCompacting}
               />
+              {/* Agent Mode toggle — forces multi-agent task breakdown */}
+              <div className="relative group">
+                <button
+                  onClick={toggleAgentMode}
+                  disabled={isStreaming || isCompacting}
+                  className={`h-8 px-2.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors disabled:opacity-40 ${
+                    agentMode
+                      ? 'bg-accent/15 text-accent hover:bg-accent/25'
+                      : 'text-muted/70 hover:text-ink/80 hover:bg-overlay/60'
+                  }`}
+                >
+                  <AccountTree sx={{ fontSize: 14 }} />
+                  Agent Mode
+                  {agentMode && <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />}
+                </button>
+                <div className="absolute bottom-full left-0 mb-2 w-72 p-3 rounded-xl bg-surface border border-border/80 shadow-xl shadow-black/40 text-left hidden group-hover:block z-50 pointer-events-none">
+                  <div className="text-xs font-semibold text-ink mb-1 flex items-center gap-1.5">
+                    <AccountTree sx={{ fontSize: 13 }} className="text-accent" /> Agent Mode
+                  </div>
+                  <p className="text-[11px] text-muted leading-relaxed">
+                    Breaks your request into tasks and runs them with a team of AI agents —
+                    each with its own architect, surgeon, and QA — plus a final integration
+                    review across all changes. Best for large, multi-file requests.
+                  </p>
+                  <p className="text-[11px] text-faint leading-relaxed mt-1.5">
+                    When off, you can still trigger it by including “create tasks” in your
+                    prompt. Requires a Claude model.
+                  </p>
+                </div>
+              </div>
               <span className="text-[11px] text-faint ml-1 select-none">
                 {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} attached` : ''}
               </span>

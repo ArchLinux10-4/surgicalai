@@ -551,6 +551,9 @@ async def smart_stream(req: dict, request: Request):
 
     session_id = req.get("session_id")
     message = req.get("message", "")
+    # v1.5: explicit Agent Mode toggle from the UI. ORed with the phrase cue
+    # below — never replaces it, so "create tasks" prompts keep working.
+    force_tasks = bool(req.get("force_tasks", False))
     current_user_id = getattr(request.state, "user_id", "") or ""
 
     # Check per-user encrypted keys AND global settings
@@ -665,7 +668,22 @@ async def smart_stream(req: dict, request: Request):
         def _sse(obj):
             return "data: " + _json.dumps(obj) + "\n\n"
 
-        if _use_natural and wants_task_breakdown(message):
+        _cue_match = wants_task_breakdown(message)
+        _dlog("sse_task_gate", session_id=session_id, user_id=current_user_id,
+              force_tasks=force_tasks, cue_match=_cue_match, use_natural=_use_natural)
+
+        if (force_tasks or _cue_match) and not _use_natural:
+            # Tasks were explicitly requested (toggle or phrase) but the active
+            # model is not Claude, so the agentic pipeline cannot run. Tell the
+            # user instead of silently ignoring the request (fix #4).
+            _dlog("sse_task_gate_model_notice", session_id=session_id,
+                  user_id=current_user_id, architect_model=_arch_model)
+            yield _sse({"type": "chat", "content": (
+                "*Note: Agent Mode (multi-agent tasks) requires a Claude model. "
+                "Running this as a normal single-pass request instead.*\n\n"
+            )})
+
+        if _use_natural and (force_tasks or _cue_match):
             _phase = "planning"
             _plan_t0 = time.time()
             _plan_ka = 0

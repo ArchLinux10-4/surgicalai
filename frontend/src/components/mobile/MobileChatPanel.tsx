@@ -350,6 +350,18 @@ export function MobileChatPanel() {
   const pendingRunRef      = useRef<{ runId: string; tasks: any[] } | null>(null)
   const bottomRef          = useRef<HTMLDivElement>(null)
   const textareaRef        = useRef<HTMLTextAreaElement>(null)
+
+  // ── Agent Mode toggle (multi-agent task breakdown) — shares the desktop
+  // localStorage key; read at send time so the payload is never stale.
+  const agentModeOn = () => {
+    try { return localStorage.getItem('sai_agent_mode') === '1' } catch { return false }
+  }
+  const [agentMode, setAgentMode] = useState(agentModeOn)
+  const toggleAgentMode = () => setAgentMode(prev => {
+    const next = !prev
+    try { localStorage.setItem('sai_agent_mode', next ? '1' : '0') } catch { /* storage blocked — session-only toggle */ }
+    return next
+  })
   const fileInputRef       = useRef<HTMLInputElement>(null)
 
   // Scroll to bottom on new messages/streaming
@@ -516,7 +528,7 @@ export function MobileChatPanel() {
     }
 
     const ctrl = api.stream.smart(
-      { session_id: sessionId, message: text, file_ids: sessionFiles.map(f => f.id) },
+      { session_id: sessionId, message: text, file_ids: sessionFiles.map(f => f.id), force_tasks: agentModeOn() },
       (progress) => {
         setProgress(progress)
         setProgHist(prev => {
@@ -784,6 +796,26 @@ export function MobileChatPanel() {
                 disabled={isStreaming || isCompacting}
                 size="compact"
               />
+
+              {/* Agent Mode toggle — forces multi-agent task breakdown */}
+              <button
+                onClick={toggleAgentMode}
+                disabled={isStreaming || isCompacting}
+                className={`w-9 h-9 flex items-center justify-center rounded-xl transition-colors disabled:opacity-40 ${
+                  agentMode
+                    ? 'text-accent bg-accent/15 active:bg-accent/25'
+                    : 'text-muted/60 hover:text-ink hover:bg-overlay/60 active:bg-overlay'
+                }`}
+                title="Agent Mode: breaks your request into tasks and runs them with a team of AI agents (architect, surgeon, QA per task + integration review). Requires a Claude model."
+              >
+                <svg width="17" height="17" viewBox="0 0 24 24" fill="none"
+                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <rect x="9" y="2" width="6" height="5" rx="1"/>
+                  <rect x="2" y="17" width="6" height="5" rx="1"/>
+                  <rect x="16" y="17" width="6" height="5" rx="1"/>
+                  <path d="M12 7v4M12 11H5v6M12 11h7v6"/>
+                </svg>
+              </button>
 
               {/* Expand to full-screen compose */}
               <button
