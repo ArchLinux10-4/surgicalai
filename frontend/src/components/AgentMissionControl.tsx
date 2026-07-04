@@ -111,6 +111,18 @@ function ScoreBadge({
       </span>
     )
   }
+  if (verdict === 'no_edits') {
+    // Planning/reasoning task: completed with zero code edits, so the QA gate
+    // never ran. Say so honestly instead of faking a green QA pass.
+    return (
+      <span
+        className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-overlay/60 text-muted border-border/50"
+        title="No code edits produced — QA skipped by design"
+      >
+        QA skipped &#10003;
+      </span>
+    )
+  }
   if (score == null) {
     if (!verdict) return null
     const ok = /safe|pass|clean|ok/i.test(verdict)

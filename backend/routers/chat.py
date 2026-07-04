@@ -1213,7 +1213,22 @@ async def execute_task(req: dict, request: Request):
             yield _sse({"type": "done"})
             return
 
-        _verdict = "skipped" if _is_answer else (worst or "safe")
+        # Honest QA status: a code-kind task that produced zero edits never
+        # went through the QA gate, so it must not surface as a "safe" pass.
+        _has_edits = False
+        if parsed:
+            for _fd in (parsed.get("changes_by_file") or {}).values():
+                if isinstance(_fd, dict) and _fd.get("changes"):
+                    _has_edits = True
+                    break
+        if _is_answer:
+            _verdict = "skipped"
+        elif not _has_edits:
+            _verdict = "no_edits"
+            _dlog("sse_exec_task_no_edits", session_id=session_id,
+                  task_id=task_id, task_seq=seq+1, had_parsed=bool(parsed))
+        else:
+            _verdict = worst or "safe"
         _score = None if _is_answer else score
         _edit_summary = _extract_edit_summary(parsed) if parsed else ""
         _rsummary = natural_text[:500]
