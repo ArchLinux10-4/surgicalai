@@ -16,6 +16,13 @@ Architecture
 
 Safety properties
 ─────────────────
+- SCALING WARNING: the `_runs` registry below is an in-memory dict and
+  assumes exactly one backend process. If this service is ever
+  horizontally scaled to 2+ instances, a run tracked by one instance is
+  invisible to another — status polling could 404 or show stale state
+  depending on which instance handles the request. Fine for one instance;
+  revisit with a shared store (e.g. DB-backed run table or Redis) before
+  scaling out.
 - Feature-flagged OFF by default (`server_task_runner` setting or
   SERVER_TASK_RUNNER env). When OFF, start_run() refuses and the client
   falls back to the existing browser-driven queue — zero behaviour change.
@@ -392,7 +399,7 @@ async def _run_integration_qa(session_id: str, run_id: str, user_id: str):
         from anthropic import AsyncAnthropic
         client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         resp = await client.messages.create(
-            model="claude-sonnet-4-5",  # QA is always Sonnet
+            model="claude-sonnet-5",  # QA is always Sonnet (upgraded from 4.5, matches pipeline QA sites)
             max_tokens=1000,
             system=_INTEGRATION_QA_SYSTEM,
             messages=[{"role": "user", "content": user_block}],

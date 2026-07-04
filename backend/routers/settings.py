@@ -38,8 +38,8 @@ def get_settings(request: Request):
     return SettingsResponse(
         openai_api_key_set=has_openai,
         anthropic_api_key_set=has_anthropic,
-        architect_model=s.get("architect_model", "claude-sonnet-4-6"),
-        surgeon_model=s.get("surgeon_model", "claude-sonnet-4-6"),
+        architect_model=s.get("architect_model", "claude-sonnet-5"),
+        surgeon_model=s.get("surgeon_model", "claude-sonnet-5"),
         temperature_architect=float(s.get("temperature_architect", "0.3")),
         temperature_surgeon=float(s.get("temperature_surgeon", "0.1")),
         confidence_threshold=int(s.get("confidence_threshold", "7")),

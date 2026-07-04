@@ -114,9 +114,9 @@ async def plan_tasks(message: str, session_files: list, user_id: str = "") -> di
     except Exception:
         return {"preamble": "", "tasks": []}
 
-    model = get_setting("architect_model", "claude-sonnet-4-5")
+    model = get_setting("architect_model", "claude-sonnet-5")
     if not _is_claude_model(model):
-        model = "claude-sonnet-4-5"
+        model = "claude-sonnet-5"
 
     file_hint = ""
     if session_files:

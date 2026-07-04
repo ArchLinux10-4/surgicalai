@@ -185,6 +185,7 @@ def _init_sqlite():
     DB_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH))
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")  # Allow concurrent reads during writes; persists in DB file, set once at init
     cur = conn.cursor()
 
     cur.execute("""

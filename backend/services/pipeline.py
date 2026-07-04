@@ -3821,10 +3821,10 @@ async def analyze_and_plan_stream(
         # Step 2: Get Anthropic key and model
         # ------------------------------------------------------------------
         anthropic_key = _get_anthropic_key(user_id)
-        architect_model = get_setting("architect_model", "claude-sonnet-4-5")
+        architect_model = get_setting("architect_model", "claude-sonnet-5")
         # Ensure we're using a Claude model (user might have set a GPT model)
         if not _is_claude_model(architect_model):
-            architect_model = "claude-sonnet-4-5"
+            architect_model = "claude-sonnet-5"
 
         aclient = AsyncAnthropic(api_key=anthropic_key)
 
@@ -5349,9 +5349,9 @@ async def run_file_creator(
         return json.loads(raw)
 
     # Prefer Claude for file creation — it generates better structured code
-    creator_model = get_setting("architect_model", "claude-sonnet-4-6")
+    creator_model = get_setting("architect_model", "claude-sonnet-5")
     if not _is_claude_model(creator_model):
-        creator_model = "claude-sonnet-4-6"
+        creator_model = "claude-sonnet-5"
 
     user_msg = _build_creator_user_msg(file_spec, codebase_context)
 
@@ -8847,9 +8847,9 @@ USER REQUEST:
                         _lint_fixed = False
                         _MAX_LINT_ATTEMPTS = 3
                         _lint_fix_client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
-                        _lint_surg_model = get_setting("surgeon_model", "claude-sonnet-4-5")
+                        _lint_surg_model = get_setting("surgeon_model", "claude-sonnet-5")
                         if not _is_claude_model(_lint_surg_model):
-                            _lint_surg_model = "claude-sonnet-4-5"
+                            _lint_surg_model = "claude-sonnet-5"
                         _lint_working = _full_after_lint          # updated each attempt
                         _lint_remaining = _linter_introduced_errors  # refreshed each attempt
                         for _lint_attempt in range(_MAX_LINT_ATTEMPTS):
@@ -10801,9 +10801,9 @@ async def run_natural_pipeline_stream(
 
     try:
         anthropic_key = _get_anthropic_key(user_id)
-        arch_model = get_setting("architect_model", "claude-sonnet-4-5")
+        arch_model = get_setting("architect_model", "claude-sonnet-5")
         if not _is_claude_model(arch_model):
-            arch_model = "claude-sonnet-4-5"
+            arch_model = "claude-sonnet-5"
 
         aclient = AsyncAnthropic(api_key=anthropic_key)
 

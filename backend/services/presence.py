@@ -4,6 +4,12 @@ In-memory user presence tracker.
 Tracks last API activity per user.  Zero DB overhead — just a dict
 updated on every authenticated request from the auth middleware.
 Lost on process restart, which is fine (rebuilds as users hit the API).
+
+SCALING WARNING: this dict lives in a single process and assumes exactly
+one backend instance. If this service is ever horizontally scaled to 2+
+instances, presence data fragments per instance (a user's requests may
+land on different instances, so no single instance sees the full picture).
+Fine for one instance; revisit with a shared store before scaling out.
 """
 import time
 import threading

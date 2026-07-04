@@ -4,6 +4,13 @@ Per-user rate limiting for SurgicalAI.
 In-memory token bucket — no Redis dependency needed.
 Limits reset on deploy (acceptable for per-minute windows on Railway).
 
+SCALING WARNING: this dict lives in a single process. It assumes exactly
+one backend instance. If this service is ever horizontally scaled to 2+
+instances (autoscaling, overlapping zero-downtime deploys), each instance
+will enforce its own independent limit, so a user's effective rate limit
+becomes (per-instance limit × instance count). Fine for one instance;
+revisit with a shared store (e.g. Redis) before scaling out.
+
 Two tiers:
   • pipeline  — endpoints that call Claude API (expensive)
   • general   — everything else (cheap DB/proxy calls)
