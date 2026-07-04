@@ -11,6 +11,7 @@
  */
 import { useEffect, useState } from 'react';
 import LoginIcon from '@mui/icons-material/Login';
+import { MultiAgentShowcase } from './MultiAgentShowcase';
 
 const CSS = `
 *{box-sizing:border-box;margin:0;padding:0}
@@ -1582,6 +1583,7 @@ export function LandingPage() {
         <ul className="sai-nav-links">
           <li><a href="#how-it-works">How it works</a></li>
           <li><a href="#features">Features</a></li>
+          <li><a href="#multi-agent">Multi-Agent</a></li>
           <li><a href="#integrations">Integrations</a></li>
           <li><a href="#pricing">Pricing</a></li>
           <li><a href="#compare">Compare</a></li>
@@ -1603,6 +1605,7 @@ export function LandingPage() {
       <div className={`sai-mobile-menu${mobileMenuOpen ? ' open' : ''}`}>
         <a href="#how-it-works" onClick={closeMobileMenu}>How it works</a>
         <a href="#features" onClick={closeMobileMenu}>Features</a>
+        <a href="#multi-agent" onClick={closeMobileMenu}>Multi-Agent</a>
         <a href="#integrations" onClick={closeMobileMenu}>Integrations</a>
         <a href="#pricing" onClick={closeMobileMenu}>Pricing</a>
         <a href="#compare" onClick={closeMobileMenu}>Compare</a>
@@ -2526,6 +2529,9 @@ export function LandingPage() {
           </div>
         </div>
       </section>
+
+      {/* MULTI-AGENT ORCHESTRATION */}
+      <MultiAgentShowcase />
 
       {/* PRICING */}
       <section id="pricing" className="sai-section" style={{background:'var(--bg2)'}}>
