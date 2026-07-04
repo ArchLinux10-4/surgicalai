@@ -1,12 +1,14 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { generateImage, type ImageStudioResult } from '../api/client'
+import { useAppStore } from '../stores/appStore'
 import { AddPhotoAlternateOutlined, AutoAwesome, Close, FileDownload, ImageOutlined, RestartAlt, WarningAmber } from '@mui/icons-material'
 
 /**
  * Image Studio — GPT-powered image generation & editing with multi-turn sessions.
  *
- * Fully self-contained: renders its own floating trigger button and modal.
- * Mounted with a single <ImageStudio /> line in Layout.tsx.
+ * Mounted with a single <ImageStudio /> line in Layout.tsx (stays mounted so
+ * the session survives close/reopen). Opened via the Image Studio icon in the
+ * sidebar rail — visibility lives in the app store (imageStudioOpen).
  *
  * Flow: prompt (+ optional uploaded image) -> POST /api/images/generate
  * -> backend calls OpenAI Responses API image_generation tool -> base64 back.
@@ -31,7 +33,8 @@ interface Turn {
 }
 
 export function ImageStudio() {
-  const [open, setOpen] = useState(false)
+  const open = useAppStore(s => s.imageStudioOpen)
+  const setOpen = useAppStore(s => s.setImageStudioOpen)
   const [prompt, setPrompt] = useState('')
   const [inputImage, setInputImage] = useState<{ base64: string; mime: string; name: string } | null>(null)
   const [turns, setTurns] = useState<Turn[]>([])
@@ -211,17 +214,6 @@ export function ImageStudio() {
 
   return (
     <>
-      {/* Floating trigger button — bottom-right, out of the way of chat */}
-      <button
-        onClick={() => setOpen(true)}
-        title="Image Studio (GPT image generation & editing)"
-        className="fixed bottom-4 right-4 z-40 flex items-center gap-2 px-3 py-2 rounded-full
-          bg-surface border border-border text-sm text-muted hover:text-fg hover:border-accent/60
-          shadow-lg transition-colors"
-      >
-        <AutoAwesome sx={{ fontSize: 18 }} /> <span className="hidden sm:inline">Image Studio</span>
-      </button>
-
       {open && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={tryClose}>
           <div

@@ -10,7 +10,7 @@ import { LinearPanel } from './LinearPanel'
 import { VercelPanel } from './VercelPanel'
 import { RailwayPanel } from './RailwayPanel'
 import { useThemeStore } from '../stores/themeStore'
-import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Psychology, Search, Settings } from '@mui/icons-material';
+import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile } from '../lib/fileClassify'
 import { DownloadSessionButton } from './DownloadSessionButton'
 
@@ -724,7 +724,7 @@ function LinearIcon({ size = 16 }: { size?: number }) {
 }
 
 export function Sidebar() {
-  const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, sidebarPanelOpen, setSidebarPanelOpen } = useAppStore()
+  const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, sidebarPanelOpen, setSidebarPanelOpen, imageStudioOpen, setImageStudioOpen } = useAppStore()
   const { theme, toggleTheme } = useThemeStore()
   const { user, logout } = useAuthStore()
   const [panelOpen, setPanelOpen] = useState(true)
@@ -799,6 +799,19 @@ export function Sidebar() {
             </button>
           )
         })}
+
+        {/* Image Studio — opens its own screen, not a sliding panel */}
+        <button
+          onClick={() => setImageStudioOpen(true)}
+          title="Image Studio"
+          className={`relative flex items-center justify-center w-8 h-8 rounded-lg transition-all ${
+            imageStudioOpen
+              ? 'bg-accent/15 text-accent'
+              : 'text-muted hover:text-ink hover:bg-overlay'
+          }`}
+        >
+          <Palette sx={{ fontSize: 17 }} />
+        </button>
 
         {/* Spacer */}
         <div className="flex-1" />
