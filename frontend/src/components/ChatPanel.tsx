@@ -918,13 +918,49 @@ export function ChatPanel() {
           finishTaskRun(); return
         }
         const t = tasks[idx++]
+        // True once this task's stream delivered a terminal event
+        // (task_done / task_blocked / task_cancelled). If the stream closes
+        // without one, the connection dropped mid-task and we must reconcile
+        // the real status from the DB instead of stalling the queue.
+        let sawTerminal = false
+        let streamErr = ''
+        const reconcileOnClose = () => {
+          if (sawTerminal) return  // normal close after task_done — already advanced
+          if (useAppStore.getState().activeSessions !== sid) { finishTaskRun(); return }
+          api.tasks.list(sid, runId)
+            .then((rows: any[]) => {
+              if (useAppStore.getState().activeSessions !== sid) { finishTaskRun(); return }
+              const row: any = (rows || []).find((r: any) => r.id === t.id)
+              const status = row?.status
+              if (status === 'done') {
+                // Backend finished the task but the task_done event was lost
+                // in transit — record it and keep the queue moving.
+                updateAgentTask(t.id, { status: 'done', qa_score: row.qa_score, verdict: row.verdict })
+                runNext()
+              } else if (status === 'blocked' || status === 'cancelled') {
+                updateAgentTask(t.id, { status, qa_score: row?.qa_score, verdict: row?.verdict })
+                finishTaskRun()
+              } else {
+                // pending / running / unknown — we cannot safely continue.
+                setError(streamErr || 'Connection dropped mid-task. Task status is unresolved — reopen the session to check progress.')
+                finishTaskRun()
+              }
+            })
+            .catch(() => {
+              setError(streamErr || 'Connection dropped and task status could not be verified.')
+              finishTaskRun()
+            })
+        }
         const ctrl = api.stream.executeTask(
           { session_id: sid, run_id: runId, task_id: t.id },
           (progress) => { if (useAppStore.getState().activeSessions === sid) setStreamProgress(progress) },
           (result) => addTaskResultCard(result),
-          () => {},  // per-task stream closed; queue advances on task_done
-          (err) => { setError(err); finishTaskRun() },
+          reconcileOnClose,  // per-task stream closed
+          (err) => { streamErr = err },  // defer: reconcileOnClose decides the outcome
           (event) => {
+            if (event.type === 'task_done' || event.type === 'task_blocked' || event.type === 'task_cancelled') {
+              sawTerminal = true
+            }
             handleTaskEvent(event)
             if (event.type === 'task_done') runNext()
             else if (event.type === 'task_blocked' || event.type === 'task_cancelled') finishTaskRun()

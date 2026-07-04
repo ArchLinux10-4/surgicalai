@@ -1068,6 +1068,19 @@ async def execute_task(req: dict, request: Request):
             yield _sse({"type": "done"})
             return
 
+        # ── Idempotency guard: only pending tasks may execute ───────────────
+        # A task already running/done/blocked must never re-run — re-executing
+        # would re-apply its edits (two open tabs, a retried stream after a
+        # connection drop, etc.). The client reconciles the real status via
+        # GET /tasks whenever a stream ends without a terminal task event.
+        _cur_status = task.get("status")
+        if _cur_status != "pending":
+            _dlog("sse_exec_task_not_pending", session_id=session_id, user_id=current_user_id,
+                  task_id=task_id, task_seq=seq+1, run_id=run_id, status=_cur_status)
+            yield _sse({"type": "task_skipped", "id": task_id, "status": _cur_status})
+            yield _sse({"type": "done"})
+            return
+
         _dlog("sse_exec_task_start", session_id=session_id, user_id=current_user_id,
               task_id=task_id, task_seq=seq+1, task_total=total, title=task["title"][:80])
         update_task(task_id, status="running")
