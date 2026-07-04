@@ -3746,7 +3746,7 @@ async def run_qa_for_changes(
 
         aclient = AsyncAnthropic(api_key=anthropic_key)
         # QA always uses Sonnet — cheaper than user's model, accurate for review
-        _qa_model_legacy = "claude-sonnet-4-6"
+        _qa_model_legacy = "claude-sonnet-5"  # QA upgraded to Sonnet 5 (better + cheaper than 4.6)
         from services.api_retry import async_api_call_with_retry
         response = await async_api_call_with_retry(lambda: aclient.messages.create(
             model=_qa_model_legacy,
@@ -4112,8 +4112,8 @@ async def analyze_and_plan_stream(
                                   fixes_so_far=len(_corr_changes))
                             try:
                                 _corr_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
-                                    model="claude-sonnet-4-6",  # correction uses Sonnet — cheaper + accurate
-                                    max_tokens=_max_output_tokens("claude-sonnet-4-6"),
+                                    model="claude-sonnet-5",  # correction uses Sonnet — cheaper + accurate
+                                    max_tokens=_max_output_tokens("claude-sonnet-5"),
                                     system=CLAUDE_EDITOR_SYSTEM,
                                     messages=_corr_msgs,
                                     tools=CORRECTION_TOOLS,
@@ -4311,8 +4311,8 @@ async def analyze_and_plan_stream(
                             )},
                         ]
                         _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
-                            model="claude-sonnet-4-6",  # correction uses Sonnet — cheaper + accurate
-                            max_tokens=_max_output_tokens("claude-sonnet-4-6"),
+                            model="claude-sonnet-5",  # correction uses Sonnet — cheaper + accurate
+                            max_tokens=_max_output_tokens("claude-sonnet-5"),
                             system=CLAUDE_EDITOR_SYSTEM,
                             messages=_retry_msgs,
                         )
@@ -5092,7 +5092,7 @@ async def _run_qa_for_new_file(file_result: dict, codebase_context: str, user_id
     try:
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _use_claude = True
-        _model = "claude-sonnet-4-6"
+        _model = "claude-sonnet-5"  # QA upgraded to Sonnet 5
     except Exception as _qc_key_err:
         _qa_aclient = None
         _use_claude = False
@@ -5119,7 +5119,14 @@ Run all 5 checks and return the JSON verdict."""
                 system=QA_CREATE_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
             )
-            raw = _msg.content[0].text.strip()
+            # Iterate blocks defensively — adaptive-thinking models may emit
+            # non-text blocks first, so content[0] is not guaranteed to be text.
+            raw = "".join(
+                _nb.text for _nb in _msg.content if hasattr(_nb, "text")
+            ).strip()
+            _dlog("qa_create_response_blocks",
+                  block_count=len(_msg.content),
+                  block_types=[getattr(_nb, "type", "?") for _nb in _msg.content])
             if raw.startswith("```"):
                 lines = raw.split("\n")
                 raw = "\n".join(lines[1:] if lines[-1].strip() != "```" else lines[1:-1])
@@ -5762,7 +5769,7 @@ async def run_qa_agent(
     try:
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _qa_use_claude = True
-        _qa_model = "claude-sonnet-4-6"
+        _qa_model = "claude-sonnet-5"  # QA upgraded to Sonnet 5 (better + cheaper than 4.6)
     except Exception as _qa_key_err:
         _qa_aclient = None
         _qa_use_claude = False
@@ -5882,7 +5889,14 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
                     {"role": "user", "content": user_msg},
                 ],
             )
-            _qa_raw_text = (_qa_msg.content[0].text or "").strip()
+            # Iterate blocks defensively — adaptive-thinking models may emit
+            # non-text blocks first, so content[0] is not guaranteed to be text.
+            _qa_raw_text = "".join(
+                _qb.text for _qb in _qa_msg.content if hasattr(_qb, "text")
+            ).strip()
+            _dlog("qa_response_blocks", session_id=session_id,
+                  block_count=len(_qa_msg.content),
+                  block_types=[getattr(_qb, "type", "?") for _qb in _qa_msg.content])
             _dlog("qa_agent_raw_response",
                   session_id=session_id, filename=filename,
                   symbol=symbol_path, model=_qa_model,
@@ -13133,7 +13147,7 @@ async def run_natural_pipeline_stream(
             # Defined BEFORE the loop: every blocked idx may be deferred to
             # the multi-window path (continue), leaving the loop body never
             # executed — the tasks_created _dlog below still references it.
-            _correction_model = "claude-sonnet-4-6"
+            _correction_model = "claude-sonnet-5"  # correction upgraded to Sonnet 5
             _corr_msgs_by_idx = {}  # Save per-correction messages for ReAct follow-ups
             _correction_window_info = {}  # Per-idx window info for windowed corrections
             _multi_window_pending = []   # Indices that need multi-window sequential correction
@@ -13972,7 +13986,7 @@ async def run_natural_pipeline_stream(
                 _mw_diff = _mw_meta.get("diff_block", "")
                 _mw_running_code = _mw_cs["new_code"]
                 _mw_all_ok = True
-                _mw_correction_model = "claude-sonnet-4-6"
+                _mw_correction_model = "claude-sonnet-5"  # correction upgraded to Sonnet 5
 
                 _dlog("correction_multi_window_start",
                       session_id=session_id, user_id=user_id,
