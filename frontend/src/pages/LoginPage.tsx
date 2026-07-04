@@ -383,6 +383,19 @@ export function LoginPage() {
         }}>
           <div style={{ width: '100%', maxWidth: 420 }}>
 
+            {/* Back to homepage */}
+            <a
+              href="/"
+              style={{
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                marginBottom: 14, fontSize: 13, fontWeight: 600,
+                fontFamily: "'Inter', system-ui, sans-serif",
+                color: '#6d5ce6', textDecoration: 'none', opacity: 0.85,
+              }}
+            >
+              ← Back to home
+            </a>
+
             {/* Card */}
             <form
               onSubmit={handleSubmit}
@@ -637,6 +650,18 @@ export function LoginPage() {
                 '0 0 80px rgba(74,222,128,0.08), 0 25px 50px rgba(0,0,0,0.5)',
             }}
           >
+            {/* Back to homepage */}
+            <a
+              href="/"
+              style={{
+                display: 'inline-block', marginBottom: 14,
+                fontSize: 12, fontFamily: 'monospace',
+                color: '#4ade80', textDecoration: 'none', opacity: 0.8,
+              }}
+            >
+              ← back to home
+            </a>
+
             {/* Logo */}
             <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 8 }}>
               <img

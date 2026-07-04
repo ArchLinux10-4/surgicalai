@@ -71,6 +71,13 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
       `${STORAGE_PREFIX}${user.username}`,
       JSON.stringify({ token, user })
     );
+    // Move the URL off /login so the app lives at "/" (URL discipline:
+    // "/" = app when authed, homepage when not; /login = login form only).
+    try {
+      if (window.location.pathname === '/login') {
+        window.history.replaceState(null, '', '/');
+      }
+    } catch { /* ignore - auth state change below still renders the app */ }
     set({ token, user, isAuthenticated: true });
   },
 
@@ -80,6 +87,11 @@ export const useAuthStore = create<AuthState>()((set, get) => ({
       localStorage.removeItem(`${STORAGE_PREFIX}${user.username}`);
     }
     localStorage.removeItem(LEGACY_KEY);
+    // Land on the marketing homepage, never the login form (modern UX:
+    // logout -> homepage, which offers "Login" in its nav).
+    try {
+      window.history.replaceState(null, '', '/');
+    } catch { /* ignore - state change below still renders LandingPage */ }
     set({ token: null, user: null, isAuthenticated: false });
   },
 }));
