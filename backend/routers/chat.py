@@ -710,11 +710,22 @@ async def smart_stream(req: dict, request: Request):
             if len(_planned) >= 1:
                 run_id = str(uuid.uuid4())
                 tasks = create_tasks(session_id, run_id, _planned)
+                # Server-side runner flag (v2.0): when ON, the client hands
+                # execution to POST /api/runs/start instead of driving the
+                # per-task SSE queue itself. Flag OFF -> exact v1.4 behaviour.
+                try:
+                    from services.task_runner import server_runner_enabled as _sre
+                    _server_run = bool(_sre())
+                except Exception as _srx:
+                    _dlog("sse_server_run_flag_error", session_id=session_id,
+                          error=str(_srx)[:200])
+                    _server_run = False
                 _dlog("sse_tasks_created", session_id=session_id, user_id=current_user_id,
-                      run_id=run_id, task_count=len(tasks))
+                      run_id=run_id, task_count=len(tasks), server_run=_server_run)
                 yield _sse({
                     "type": "task_plan",
                     "run_id": run_id,
+                    "server_run": _server_run,
                     "preamble": _plan.get("preamble", ""),
                     "tasks": [
                         {"id": t["id"], "seq": t["seq"], "title": t["title"],

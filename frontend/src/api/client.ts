@@ -478,6 +478,18 @@ export const api = {
     status: (runId: string) => request<any>(`/tests/status/${runId}`),
   },
 
+  // v2.0: server-side task runner. start() hands run execution to the
+  // backend supervisor; a non-ok response means the feature is disabled or
+  // unavailable and the caller falls back to the browser-driven queue.
+  runs: {
+    start: (sessionId: string, runId: string) =>
+      request<{ ok: boolean; mode: string; total?: number; pending?: number }>(
+        '/runs/start', { method: 'POST', body: JSON.stringify({ session_id: sessionId, run_id: runId }) }),
+    status: (sessionId: string, runId: string) =>
+      request<{ active: boolean; enabled?: boolean; wave?: number; pending?: number; total?: number }>(
+        `/runs/status?run_id=${encodeURIComponent(runId)}&session_id=${encodeURIComponent(sessionId)}`),
+  },
+
   tasks: {
     list: (sessionId: string, runId?: string) =>
       request<import('../types').AgentTask[]>(`/tasks?session_id=${encodeURIComponent(sessionId)}${runId ? `&run_id=${encodeURIComponent(runId)}` : ''}`),

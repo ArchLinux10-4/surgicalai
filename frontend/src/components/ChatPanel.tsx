@@ -719,7 +719,7 @@ export function ChatPanel() {
     isStreaming, setIsStreaming, streamingMessage, setStreamingMessage,
     streamProgress, setStreamProgress, sessions, setSessions, settings, setSettings,
     sessionFiles, setSessionFiles, addSessionFile, removeSessionFile,
-    setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble, setAgentPhase,
+    agentTasks, setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble, setAgentPhase,
     pendingChatInput, setPendingChatInput,
   } = useAppStore()
 
@@ -765,7 +765,7 @@ export function ChatPanel() {
   const sentMessageRef = useRef<string>('')
   // v1.4: holds the planned run while the planning stream closes, so the
   // per-task execution queue can start once /smart-stream returns.
-  const pendingRunRef = useRef<{ runId: string; tasks: any[] } | null>(null)
+  const pendingRunRef = useRef<{ runId: string; tasks: any[]; serverRun?: boolean } | null>(null)
   const [restartSignal, setRestartSignal] = useState<{ msg: string; sid: string } | null>(null)
 
   // Smart auto-scroll: only scroll to bottom when user is already at the bottom.
@@ -1000,8 +1000,55 @@ export function ChatPanel() {
     setIsStreaming(true)
     setAgentPhase('executing')
     streamSessionRef.current = sid
-    runTaskQueue(sid, runId, tasks)
+    // Server runner (when enabled) also handles resume — /runs/start simply
+    // executes whatever is still pending. Non-ok → client queue, as always.
+    startServerRun(sid, runId, tasks)
   }
+
+  // ── v2.0 server-side task runner ──────────────────────────────────────
+  // When the backend plans a run with server_run=true, execution is handed
+  // to POST /runs/start and the backend supervisor drives every task (the
+  // tab can even close — the run keeps going). This tab stays a pure
+  // observer: useTaskPolling reconciles task state every 2.5s, and the
+  // watcher below finishes the run + reloads persisted result cards once
+  // every task reaches a terminal state. Any start failure falls back to
+  // the browser-driven queue, so the feature can never strand a run.
+  const [serverRun, setServerRun] = useState<{ sid: string; runId: string; onFinish?: () => void } | null>(null)
+
+  const startServerRun = (sid: string, runId: string, tasks: any[], onFinish?: () => void) => {
+    api.runs.start(sid, runId)
+      .then((resp: any) => {
+        if (useAppStore.getState().activeSessions !== sid) return
+        if (resp?.ok) {
+          setAgentPhase('executing')
+          setServerRun({ sid, runId, onFinish })
+        } else {
+          // Disabled / already running / error — the client queue always works.
+          runTaskQueue(sid, runId, tasks, onFinish)
+        }
+      })
+      .catch(() => {
+        if (useAppStore.getState().activeSessions === sid) runTaskQueue(sid, runId, tasks, onFinish)
+      })
+  }
+
+  useEffect(() => {
+    if (!serverRun) return
+    if (useAppStore.getState().activeSessions !== serverRun.sid) { setServerRun(null); return }
+    if (agentTasks.length === 0) return
+    const TERMINAL = ['done', 'blocked', 'cancelled', 'error']
+    if (!agentTasks.every(t => TERMINAL.includes(t.status))) return
+    // Every task is terminal — the server run is over. Reload the persisted
+    // messages so the result cards + run summary note appear, then tear down.
+    const { sid, onFinish } = serverRun
+    setServerRun(null)
+    api.chat.getMessages(sid)
+      .then((saved: any[]) => {
+        if (useAppStore.getState().activeSessions === sid && saved?.length) setMessages(saved)
+      })
+      .catch(() => {})
+    finishTaskRun(sid, onFinish)
+  }, [agentTasks, serverRun])
 
   // ── Core stream launcher — shared by handleSend and injection restart ─────
   const doStream = useCallback((
@@ -1076,10 +1123,12 @@ export function ChatPanel() {
         if (pendingRunRef.current) {
           const run = pendingRunRef.current
           pendingRunRef.current = null
-          runTaskQueue(sessionId, run.runId, run.tasks, () => {
+          const onRunFinish = () => {
             if (isFirst) autoRename()
             else api.chat.getSessions().then(setSessions).catch(() => {})
-          })
+          }
+          if (run.serverRun) startServerRun(sessionId, run.runId, run.tasks, onRunFinish)
+          else runTaskQueue(sessionId, run.runId, run.tasks, onRunFinish)
           return
         }
         if (gotResult) return
@@ -1186,7 +1235,7 @@ export function ChatPanel() {
               run_id: event.run_id,
             })))
             // Stash the plan; the queue starts once the planning stream closes.
-            pendingRunRef.current = { runId: event.run_id, tasks: event.tasks || [] }
+            pendingRunRef.current = { runId: event.run_id, tasks: event.tasks || [], serverRun: !!event.server_run }
             break
           case 'task_start':
             updateAgentTask(event.id, { status: 'running', progress: undefined })

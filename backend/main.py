@@ -26,6 +26,7 @@ from routers import deploy_watch as deploy_watch_router
 from routers import tests as tests_router
 from routers import tasks as tasks_router
 from routers import images as images_router
+from routers import runs as runs_router
 
 app = FastAPI(
     title="SurgicalAI",
@@ -152,6 +153,7 @@ app.include_router(deploy_watch_router.router, prefix="/api/deploy-watch", tags=
 app.include_router(tests_router.router, prefix="/api/tests", tags=["tests"])
 app.include_router(tasks_router.router, prefix="/api/tasks", tags=["tasks"])
 app.include_router(images_router.router, prefix="/api/images", tags=["images"])
+app.include_router(runs_router.router, prefix="/api/runs", tags=["runs"])
 app.include_router(datalab_router.router, prefix="/api/datalab", tags=["datalab"])
 app.include_router(debug_router.router)
 
