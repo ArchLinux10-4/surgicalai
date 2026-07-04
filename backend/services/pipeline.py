@@ -103,6 +103,35 @@ except ImportError:
 
 parser = ASTParser()
 
+# ── Per-model max output tokens (verified vs Anthropic docs) ─────────────────
+# 128k-output models. Everything else falls back to 64000 (previous behavior).
+_MODEL_MAX_OUTPUT = {
+    "claude-sonnet-5": 128000,
+    "claude-fable-5": 128000,
+    "claude-opus-4-8": 128000,
+}
+_MAX_OUTPUT_DEFAULT = 64000
+
+
+def _max_output_tokens(model: str) -> int:
+    """Return the max output tokens for a model, with a safe default.
+
+    Matches exact IDs and dated variants (e.g. "claude-sonnet-5-20260101").
+    Never raises — unknown/blank models get the conservative default.
+    """
+    try:
+        base = (model or "").strip().lower()
+        for known, cap in _MODEL_MAX_OUTPUT.items():
+            if base == known or base.startswith(known + "-"):
+                _dlog("max_output_lookup", model=model, matched=known, cap=cap)
+                return cap
+        _dlog("max_output_lookup", model=model, matched="default", cap=_MAX_OUTPUT_DEFAULT)
+        return _MAX_OUTPUT_DEFAULT
+    except Exception as _moe:
+        _dlog("max_output_lookup_error", error=str(_moe)[:200])
+        return _MAX_OUTPUT_DEFAULT
+
+
 # Models that do NOT accept a temperature parameter (reasoning / latest-gen models)
 NO_TEMPERATURE_MODELS = {
     "gpt-5", "gpt-5-mini", "gpt-5-nano",
@@ -2117,6 +2146,13 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
                 _tu_stop = _tu_resp.stop_reason
                 print(f"[SURGEON][TOOL_USE] Claude response: stop_reason={_tu_stop}, "
                       f"content_blocks={len(_tu_resp.content)}")
+                if _tu_stop == "max_tokens":
+                    _dlog("surgeon_tool_use_truncated_refused",
+                          model=surg_model,
+                          stop_reason=_tu_stop,
+                          user_id=user_id)
+                    print("[SURGEON][TOOL_USE] Truncated at max_tokens — refusing partial tool input")
+                    return symbol.code, 0, ["Surgeon: output truncated at token limit — no edit applied"], [], []
                 for _blk in _tu_resp.content:
                     if _blk.type == "tool_use":
                         print(f"[SURGEON][TOOL_USE]   tool={_blk.name}, "
@@ -3815,7 +3851,7 @@ async def analyze_and_plan_stream(
 
             model_kwargs = {
                 "model": architect_model,
-                "max_tokens": 64000,
+                "max_tokens": _max_output_tokens(architect_model),
                 "system": CLAUDE_EDITOR_SYSTEM,
                 "messages": messages,
             }
@@ -4077,7 +4113,7 @@ async def analyze_and_plan_stream(
                             try:
                                 _corr_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
                                     model="claude-sonnet-4-6",  # correction uses Sonnet — cheaper + accurate
-                                    max_tokens=64000,
+                                    max_tokens=_max_output_tokens("claude-sonnet-4-6"),
                                     system=CLAUDE_EDITOR_SYSTEM,
                                     messages=_corr_msgs,
                                     tools=CORRECTION_TOOLS,
@@ -4276,7 +4312,7 @@ async def analyze_and_plan_stream(
                         ]
                         _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
                             model="claude-sonnet-4-6",  # correction uses Sonnet — cheaper + accurate
-                            max_tokens=64000,
+                            max_tokens=_max_output_tokens("claude-sonnet-4-6"),
                             system=CLAUDE_EDITOR_SYSTEM,
                             messages=_retry_msgs,
                         )
@@ -6328,7 +6364,7 @@ async def _run_claude_direct_rewrite(
         try:
             async with _da_client.messages.stream(
                 model=model,
-                max_tokens=32000,
+                max_tokens=_max_output_tokens(model),
                 system=_dr_system,
                 messages=[{"role": "user", "content": _dr_user}],
                 tools=_dr_tools,
@@ -6344,6 +6380,21 @@ async def _run_claude_direct_rewrite(
                 _dr_delay = min(_dr_delay * 2, 60)
                 continue
             raise  # non-529 or final attempt
+
+    # ── Truncation gate: never parse partial tool input as a complete file ──
+    _dr_stop = getattr(_dr_resp, "stop_reason", None)
+    _dlog("direct_rewrite_stop_reason",
+          stop_reason=_dr_stop,
+          model=model,
+          filename=filename,
+          max_tokens=_max_output_tokens(model))
+    if _dr_stop == "max_tokens":
+        print(f"[DIRECT_REWRITE] TRUNCATED at max_tokens={_max_output_tokens(model)} — refusing partial file")
+        _dlog("direct_rewrite_truncated_refused", model=model, filename=filename)
+        raise RuntimeError(
+            f"[DIRECT_REWRITE] Output truncated at {_max_output_tokens(model)} tokens — "
+            f"file too large for a single-shot rewrite; no partial file was written"
+        )
 
     for _blk in _dr_resp.content:
         if getattr(_blk, "type", None) == "tool_use" and getattr(_blk, "name", None) == "submit_file_rewrite":
@@ -6433,7 +6484,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 claude_msgs = conversation_history[-HISTORY_WINDOW:] + [{"role": "user", "content": user_request}]
                 async with aclient.messages.stream(
                     model=chat_model,
-                    max_tokens=64000,
+                    max_tokens=_max_output_tokens(chat_model),
                     **_get_thinking_kwargs(chat_model, 10000),
                     **_get_effort_kwargs(chat_model),
                     system=system,
@@ -6793,7 +6844,7 @@ USER REQUEST:
                         try:
                             _tu_kwargs = {
                                 "model": arch_model,
-                                "max_tokens": 64000,
+                                "max_tokens": _max_output_tokens(arch_model),
                                 "system": _architect_system,
                                 "messages": _tu_messages,
                                 "tools": AGENTIC_TOOLS_V2,
@@ -7168,7 +7219,7 @@ USER REQUEST:
                         try:
                             async with aclient.messages.stream(
                                 model=arch_model,
-                                max_tokens=64000,
+                                max_tokens=_max_output_tokens(arch_model),
                                 **_get_thinking_kwargs(arch_model, 10000),
                                 **_get_effort_kwargs(arch_model),
                                 system=_architect_system,
@@ -7217,7 +7268,7 @@ USER REQUEST:
                                 try:
                                     async with aclient.messages.stream(
                                         model=arch_model,
-                                        max_tokens=64000,
+                                        max_tokens=_max_output_tokens(arch_model),
                                         **_get_thinking_kwargs(arch_model, 10000),
                                         **_get_effort_kwargs(arch_model),
                                         system=_architect_system,
@@ -10388,7 +10439,7 @@ async def _retry_truncated_edit(
     try:
         _retry_edit_kwargs = {
             "model": arch_model,
-            "max_tokens": 64000,
+            "max_tokens": _max_output_tokens(arch_model),
             "system": focused_system,
             "messages": focused_messages,
         }
@@ -10478,7 +10529,7 @@ async def _retry_truncated_newfile(
     try:
         _retry_newfile_kwargs = {
             "model": arch_model,
-            "max_tokens": 64000,
+            "max_tokens": _max_output_tokens(arch_model),
             "system": focused_system,
             "messages": focused_messages,
         }
@@ -10635,7 +10686,7 @@ async def _execute_single_edit(
     try:
         call_kwargs = {
             "model": model,
-            "max_tokens": 64000,
+            "max_tokens": _max_output_tokens(model),
             "system": focused_system,
             "messages": [{"role": "user", "content": focused_user}],
         }
@@ -10894,7 +10945,7 @@ async def run_natural_pipeline_stream(
 
         stream_kwargs = {
             "model": arch_model,
-            "max_tokens": 32000,
+            "max_tokens": _max_output_tokens(arch_model),
             "system": system_prompt,
             "messages": messages,
         }
@@ -13340,7 +13391,7 @@ async def run_natural_pipeline_stream(
                     asyncio.create_task(_stream_and_collect(
                         aclient,
                         model=_correction_model,
-                        max_tokens=64000,
+                        max_tokens=_max_output_tokens(_correction_model),
                         system=system_prompt,
                         messages=correction_messages,
                     ))
@@ -13520,7 +13571,7 @@ async def run_natural_pipeline_stream(
                             _fu_task = asyncio.create_task(
                                 _stream_and_collect(
                                     aclient, model=_correction_model,
-                                    max_tokens=64000,
+                                    max_tokens=_max_output_tokens(_correction_model),
                                     system=system_prompt,
                                     messages=_react_msgs,
                                 )
@@ -14015,7 +14066,7 @@ async def run_natural_pipeline_stream(
                     try:
                         _mw_task = asyncio.create_task(_stream_and_collect(
                             aclient, model=_mw_correction_model,
-                            max_tokens=64000, system=system_prompt,
+                            max_tokens=_max_output_tokens(_mw_correction_model), system=system_prompt,
                             messages=[{"role": "user", "content": _mw_prompt}],
                         ))
                         while not _mw_task.done():
