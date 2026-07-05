@@ -14833,10 +14833,12 @@ async def run_natural_pipeline_stream(
                           symbol=change_shells[idx]["symbol"].name,
                           error=str(_reqa_exc), error_type=type(_reqa_exc).__name__)
 
-        # ── tsc compile gate — final verification after all retries ───────────
+        # ── tsc compile check — final verification after all retries ──────────
         # Re-run tsc on the FINAL content of every change. Anything that still
-        # introduces a compile error is forced below the 8/10 gate so it cannot
-        # ship — the production build is never broken by a tsc-rejected change.
+        # introduces a compile error is marked verdict="blocked" / score<=3 via
+        # _force_block_on_tsc. NOTE: with the advisory-only QA gate below, this
+        # no longer withholds the change — it ships with a loud QA advisory
+        # warning so the user can decide whether to apply it.
         _tsc_final_cache: dict = {}
         for _ti, _tcs in enumerate(change_shells):
             _t_introduced = await _tsc_introduced_errors(_tcs, _tsc_final_cache)
@@ -14847,11 +14849,14 @@ async def run_natural_pipeline_stream(
                                       f"{len(_t_msgs)} compile error(s) — blocked from shipping"})
 
         # ── Assemble SurgicalChange objects from results
-        # HARD 8/10 GATE — enforced, not advisory. A change ships ONLY if QA
-        # produced a real score >= 8 and did not block it. Anything blocked,
-        # skipped (QA could not run), unscored, or below 8 after every retry is
-        # excluded from changes_by_file and surfaced in skipped_changes so the
-        # user sees exactly what was withheld and why. Nothing below 8 ships.
+        # ADVISORY 8/10 GATE — NOT a hard block. Every change ships regardless
+        # of QA outcome. Anything blocked, skipped (QA could not run), unscored,
+        # or below _GATE_MIN (8) after every retry ships WITH a visible
+        # "QA advisory ... Shipping anyway" progress message and a
+        # qa_advisory_warning _dlog entry, so the user sees exactly what QA
+        # flagged and why. (Historically this was a hard gate that withheld
+        # sub-8 changes into skipped_changes; it was intentionally softened
+        # to advisory-only — see the "QA is advisory-only" note in the loop.)
         # ── v3.13.0: Same-file companion gate elevation ─────────────────
         # If edits to the same file form a batch, and at least one edit in
         # that batch passes the hard gate (>=8), elevate companion edits
