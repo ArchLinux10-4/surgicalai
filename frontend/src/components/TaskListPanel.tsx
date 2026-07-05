@@ -170,7 +170,7 @@ export function TaskListPanel() {
                 <div className="text-[11px] text-muted/80 truncate mt-0.5">{t.progress}</div>
               )}
               {t.status === 'blocked' && (
-                <div className="text-[11px] text-danger/90 mt-0.5">Paused — did not pass the 8/10 QA gate. Review before continuing.</div>
+                <div className="text-[11px] text-danger/90 mt-0.5">{t.verdict === 'error' ? 'Paused — this task hit an error. Review before continuing.' : 'Paused — QA flagged blocking issues. Review before continuing.'}</div>
               )}
             </div>
             {ACTIVE.includes(t.status) && (

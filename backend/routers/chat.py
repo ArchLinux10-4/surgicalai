@@ -1009,15 +1009,25 @@ def _run_counts(session_id, run_id):
     }
 
 
-def _run_summary_note(session_id, run_id, status, blocked_title=None):
+def _run_summary_note(session_id, run_id, status, blocked_title=None, reason="qa"):
     c = _run_counts(session_id, run_id)
     completed, total = c["completed"], c["total"]
     if status == "cancelled":
         return (f"⛔ Task run cancelled. Completed {completed} of {total} task(s); "
                 f"the remaining were cancelled.")
     if status == "blocked":
+        # Honest wording — a task pauses the run either because QA returned a
+        # "blocked" verdict (hard issues found) or because execution errored.
+        # There is no numeric 8/10 gate at the task level.
+        _dlog("run_summary_note_blocked", session_id=session_id, run_id=run_id,
+              blocked_title=blocked_title, reason=reason,
+              completed=completed, total=total)
+        if reason == "error":
+            return (f"🚫 Task run paused. Completed {completed} of {total}. "
+                    f"Task “{blocked_title}” hit an error, "
+                    f"so the remaining tasks were halted for your review.")
         return (f"🚫 Task run paused. Completed {completed} of {total}. "
-                f"Task “{blocked_title}” did not pass the 8/10 QA gate, "
+                f"QA flagged blocking issues in task “{blocked_title}”, "
                 f"so the remaining tasks were halted for your review.")
     return f"✅ Completed all {total} task(s)."
 
@@ -1194,7 +1204,7 @@ async def execute_task(req: dict, request: Request):
                         result_summary=("".join(collected))[:500])
             mark_pending_cancelled(session_id, run_id)
             yield _sse({"type": "task_blocked", "id": task_id, "qa_score": None, "verdict": "error"})
-            note = _run_summary_note(session_id, run_id, status="blocked", blocked_title=task["title"])
+            note = _run_summary_note(session_id, run_id, status="blocked", blocked_title=task["title"], reason="error")
             _save_run_note(session_id, note)
             yield _sse({"type": "tasks_complete", "status": "blocked",
                         **_run_counts(session_id, run_id), "summary": note})
@@ -1225,7 +1235,7 @@ async def execute_task(req: dict, request: Request):
         score, worst = _eval_task_result(parsed) if parsed else (None, "safe")
         _save_task_message(session_id, natural_text, parsed)
 
-        # Non-code ("answer") tasks edit nothing → skip the 8/10 QA gate.
+        # Non-code ("answer") tasks edit nothing → skip the QA verdict gate.
         _is_answer = task.get("kind") == "answer"
         if parsed and worst == "blocked" and not _is_answer:
             update_task(task_id, status="blocked", qa_score=score,
@@ -1235,7 +1245,7 @@ async def execute_task(req: dict, request: Request):
                   task_id=task_id, task_seq=seq+1, status="blocked",
                   qa_score=score, duration_s=round(time.time() - _t0, 1))
             yield _sse({"type": "task_blocked", "id": task_id, "qa_score": score, "verdict": worst})
-            note = _run_summary_note(session_id, run_id, status="blocked", blocked_title=task["title"])
+            note = _run_summary_note(session_id, run_id, status="blocked", blocked_title=task["title"], reason="qa")
             _save_run_note(session_id, note)
             yield _sse({"type": "tasks_complete", "status": "blocked",
                         **_run_counts(session_id, run_id), "summary": note})
