@@ -14845,8 +14845,8 @@ async def run_natural_pipeline_stream(
             if _t_introduced:
                 _t_msgs = _force_block_on_tsc(_ti, _t_introduced, " remain after auto-fix")
                 yield sse({"type": "progress",
-                           "content": f"🔴 tsc gate: {_tcs['symbol'].name} still has "
-                                      f"{len(_t_msgs)} compile error(s) — blocked from shipping"})
+                           "content": f"🔴 tsc check: {_tcs['symbol'].name} still has "
+                                      f"{len(_t_msgs)} compile error(s) — shipping with a QA warning, review before applying"})
 
         # ── Assemble SurgicalChange objects from results
         # ADVISORY 8/10 GATE — NOT a hard block. Every change ships regardless
