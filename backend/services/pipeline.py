@@ -5907,6 +5907,56 @@ async def run_qa_agent(
                 + "\nVerify the Surgeon has resolved ALL of these in this new attempt."
             )
 
+    # ── PRE-QA ADDITIVE BLOCK (flag-gated, default OFF) ─────────────────────
+    # Two independent, purely-advisory prompt enrichments. Neither can gate,
+    # block, or raise — any failure degrades to an empty string and QA runs
+    # exactly as before. Single-pass path untouched.
+    _pre_qa_block = ""
+
+    # 1. Deterministic sanity checks (PRE_QA_SANITY=true) — local, no API calls
+    if _os.environ.get("PRE_QA_SANITY", "false").lower() == "true":
+        try:
+            from services.pre_qa_sanity import run_sanity_checks
+            _sanity = run_sanity_checks(filename, original_code, new_code)
+            _dlog("pre_qa_sanity_result",
+                  session_id=session_id, filename=filename, symbol=symbol_path,
+                  checked=_sanity.get("checked", []),
+                  finding_count=len(_sanity.get("findings", [])),
+                  findings=_sanity.get("findings", []),
+                  check_errors=_sanity.get("errors", []),
+                  user_id=user_id)
+            if _sanity.get("findings"):
+                _pre_qa_block += (
+                    "\n\nDETERMINISTIC PRE-CHECKS flagged the following (these are "
+                    "heuristics, not verdicts — verify each one against the code):\n"
+                    + "\n".join(f"- {_f}" for _f in _sanity["findings"])
+                )
+        except Exception as _sanity_err:
+            _dlog("pre_qa_sanity_error",
+                  session_id=session_id, filename=filename, symbol=symbol_path,
+                  error=str(_sanity_err)[:200], user_id=user_id)
+
+    # 2. QA history memory (QA_HISTORY=true) — one indexed SELECT on qa_log
+    if _os.environ.get("QA_HISTORY", "false").lower() == "true":
+        try:
+            from services.qa_history import get_symbol_history
+            _hist = await asyncio.to_thread(get_symbol_history, filename, symbol_path)
+            _dlog("qa_history_result",
+                  session_id=session_id, filename=filename, symbol=symbol_path,
+                  total=_hist.get("total", 0), blocked=_hist.get("blocked", 0),
+                  warning=_hist.get("warning", 0),
+                  last_verdict=_hist.get("last_verdict", ""),
+                  has_summary=bool(_hist.get("summary")),
+                  lookup_error=_hist.get("error"),
+                  user_id=user_id)
+            if _hist.get("summary"):
+                _pre_qa_block += "\n\n" + _hist["summary"]
+        except Exception as _hist_err:
+            _dlog("qa_history_error",
+                  session_id=session_id, filename=filename, symbol=symbol_path,
+                  error=str(_hist_err)[:200], user_id=user_id)
+    # ── END PRE-QA ADDITIVE BLOCK ────────────────────────────────────────────
+
     user_msg = f"""CHANGE PLAN:
 Symbol: {symbol_path}
 File: {filename}
@@ -5921,7 +5971,7 @@ NEW CODE (complete — this is what the Surgeon produced):
 {_new_snippet}
 
 OTHER FILES IN SESSION (for cross-file checking):
-{other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_qa_feedback_block}
+{other_ctx if other_ctx.strip() else "(no other files uploaded)"}{_targeted_block}{_qa_feedback_block}{_pre_qa_block}
 
 {("\n\nOTHER CHANGES IN THIS SAME REQUEST (these companion edits are shipping together with this one):\nIMPORTANT: If a concern you find (e.g. missing import, missing CDN tag, missing function) is RESOLVED by one of the companion edits listed below, do NOT lower the score for it. Score this edit as if the companion changes are already applied.\n" + same_run_context + "\n") if same_run_context else ""}Compare ORIGINAL CODE → NEW CODE directly. Run all 8 checks and return the JSON verdict.
 
