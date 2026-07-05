@@ -11706,6 +11706,69 @@ async def run_natural_pipeline_stream(
                       result_len=len(_gh_result),
                       result_preview=_gh_result[:300])
 
+                # ── ADDITIVE: register read_file result as a session file ──
+                # After a successful read_file, fetch + persist the COMPLETE
+                # file (same row shape as /api/github-app/load) and inject it
+                # into this request's in-memory session context. From here the
+                # normal edit pipeline treats it exactly like an upload: edit
+                # blocks resolve, diff cards render, QA runs, apply works.
+                # Fully guarded — any failure logs and falls through to
+                # today's read-only behavior unchanged.
+                try:
+                    if _gh_req.get("tool") == "read_file":
+                        _gh_args = _gh_req.get("args", {}) or {}
+                        _gh_path = (_gh_args.get("path") or "").strip().lstrip("/")
+                        _gh_basename = _gh_path.rsplit("/", 1)[-1] if _gh_path else ""
+                        if _gh_basename and _gh_basename in file_content_lookup_stream:
+                            _dlog("github_session_file_already_registered",
+                                  session_id=session_id, user_id=user_id,
+                                  filename=_gh_basename)
+                        elif _gh_basename:
+                            from services.github_natural_tag import (
+                                fetch_and_register_github_file,
+                            )
+                            _gh_entry = fetch_and_register_github_file(
+                                _gh_req, user_id, session_id, dlog=_dlog)
+                            if _gh_entry and _gh_entry.get("content"):
+                                _gh_fname = _gh_entry["filename"]
+                                session_files.append(_gh_entry)
+                                file_content_lookup_stream[_gh_fname] = _gh_entry["content"]
+                                try:
+                                    _gh_smap = parser.parse(_gh_entry["content"], _gh_fname)
+                                    symbol_maps_by_name[_gh_fname] = (_gh_smap, _gh_entry)
+                                except Exception as _gh_parse_err:
+                                    symbol_maps_by_name[_gh_fname] = (None, _gh_entry)
+                                    _dlog("github_session_file_parse_failed",
+                                          session_id=session_id, user_id=user_id,
+                                          filename=_gh_fname,
+                                          error=str(_gh_parse_err))
+                                _dlog("github_session_file_registered",
+                                      session_id=session_id, user_id=user_id,
+                                      filename=_gh_fname,
+                                      file_id=_gh_entry.get("id"),
+                                      content_chars=len(_gh_entry["content"]),
+                                      lines=_gh_entry.get("lines"),
+                                      symbol_count=_gh_entry.get("symbol_count"),
+                                      total_session_files=len(session_files))
+                                _gh_result = (
+                                    _gh_result
+                                    + f"\n\n[NOTE: The complete file '{_gh_fname}' "
+                                    f"({_gh_entry.get('lines')} lines) is now loaded in this "
+                                    f"session and is EDITABLE. To modify it, emit standard "
+                                    f"<surgical_edit> blocks with filename \"{_gh_fname}\" — "
+                                    f"the user will see a diff card with a QA score. Do NOT "
+                                    f"use push_files unless the user explicitly asked to "
+                                    f"push/commit.]"
+                                )
+                            else:
+                                _dlog("github_session_file_not_registered",
+                                      session_id=session_id, user_id=user_id,
+                                      path=_gh_path)
+                except Exception as _gh_reg_err:
+                    _dlog("github_session_file_register_error",
+                          session_id=session_id, user_id=user_id,
+                          error=str(_gh_reg_err))
+
                 github_injection = (
                     f"Here is the GitHub data you requested ({_gh_req.get('tool')})"
                     + (f" — {_gh_req.get('reason')}" if _gh_req.get("reason") else "")

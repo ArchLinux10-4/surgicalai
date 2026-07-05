@@ -127,6 +127,16 @@ Rules:
 - Before push_files: read the current file with read_file first, and always send the COMPLETE new file content — partial content overwrites the whole file.
 - Never push unless the user explicitly asked for a change to be pushed/committed.
 - Results come back as a user message; then answer the user's question naturally.
+- EDITING REPO FILES: when you read_file a code file, the COMPLETE file is
+  automatically loaded into this session as an editable file — exactly as if
+  the user uploaded it. To change it, emit standard <surgical_edit> blocks
+  using the file's BASENAME as the filename (e.g. "LandingPage.tsx", not the
+  full repo path). The user then gets a diff card with a QA score and applies
+  the change themselves. For ordinary edit requests this is the ONLY correct
+  flow — do NOT use push_files unless the user explicitly asked to push/commit.
+- If the file is large and you have not yet seen the region you need to edit,
+  keep calling read_file with start_line until you have — never guess code you
+  have not seen.
 """
 
 
@@ -229,3 +239,140 @@ def execute_github_request(parsed: dict, user_id: str,
         _safe_dlog(dlog, "natural_github_execute_error",
                    user_id=user_id, error=str(e))
         return f"[GitHub request failed: {e}]"
+
+
+def fetch_and_register_github_file(parsed: dict, user_id: str,
+                                   session_id: str,
+                                   dlog: Optional[Callable] = None):
+    """After a successful read_file <github_request>, fetch the COMPLETE file
+    and persist it into session_files — exactly the same row shape the
+    /api/github-app/load endpoint writes (basename as filename, full repo
+    path + sha inside github_meta). That makes the repo file a first-class
+    session file: surgical edits, diff cards, QA, apply, and push-back all
+    work on it with zero pipeline changes.
+
+    Returns a session-file dict (id, filename, content, file_type, language,
+    lines, symbol_count, github_meta) or None. NEVER raises — any failure
+    logs and returns None so the chat continues with read-only behavior."""
+    try:
+        if parsed.get("tool") != "read_file":
+            _safe_dlog(dlog, "gh_session_register_skip_tool",
+                       user_id=user_id, tool=parsed.get("tool"))
+            return None
+
+        args = parsed.get("args", {}) or {}
+        owner = (args.get("owner") or "").strip()
+        repo = (args.get("repo") or "").strip()
+        path = (args.get("path") or "").strip().lstrip("/")
+        if not owner or not repo or not path:
+            _safe_dlog(dlog, "gh_session_register_missing_args",
+                       user_id=user_id, owner=owner, repo=repo, path=path)
+            return None
+
+        # ── Fetch the COMPLETE file (read_file results are paged; we need
+        #    the whole thing to register it as an editable session file) ──
+        from services.github_context_tools import _find_client_for_repo
+
+        def _log(event, **kw):
+            _safe_dlog(dlog, event, **kw)
+
+        g, inst, err = _find_client_for_repo(user_id, owner, repo, _log)
+        if err:
+            _safe_dlog(dlog, "gh_session_register_no_client",
+                       user_id=user_id, owner=owner, repo=repo, error=err)
+            return None
+
+        r = g.get_repo(f"{owner}/{repo}")
+        ref = (args.get("ref") or "").strip() or r.default_branch
+        contents = r.get_contents(path, ref=ref)
+        if isinstance(contents, list):
+            _safe_dlog(dlog, "gh_session_register_is_dir",
+                       user_id=user_id, path=path)
+            return None
+        if contents.encoding != "base64" or contents.content is None:
+            # GitHub only inlines files up to 1MB — same limit as read_file.
+            _safe_dlog(dlog, "gh_session_register_too_large",
+                       user_id=user_id, path=path, size=contents.size)
+            return None
+        raw = contents.decoded_content
+        if b"\x00" in raw[:8000]:
+            _safe_dlog(dlog, "gh_session_register_binary",
+                       user_id=user_id, path=path, size=contents.size)
+            return None
+        text = raw.decode("utf-8", errors="replace")
+
+        # ── Build the row exactly like /api/github-app/load does ─────────
+        import uuid as _uuid
+        from pathlib import Path as _Path
+
+        filename = _Path(path).name  # basename convention (path lives in github_meta)
+        ext = _Path(filename).suffix.lower()
+        lang_map = {
+            ".py": "python", ".js": "javascript", ".ts": "typescript",
+            ".jsx": "javascriptreact", ".tsx": "typescriptreact",
+            ".go": "go", ".rs": "rust", ".java": "java", ".cs": "csharp",
+            ".cpp": "cpp", ".c": "c", ".h": "c", ".hpp": "cpp",
+            ".html": "html", ".css": "css", ".json": "json",
+            ".md": "markdown", ".sh": "bash", ".sql": "sql",
+            ".toml": "toml", ".yaml": "yaml", ".yml": "yaml",
+            ".rb": "ruby", ".php": "php", ".swift": "swift", ".kt": "kotlin",
+        }
+        language = lang_map.get(ext, "plaintext")
+        line_count = len(text.splitlines())
+
+        symbol_count = 0
+        try:
+            from services.ast_parser import ASTParser
+            smap = ASTParser().parse(text, filename)
+            symbol_count = len(smap.symbols)
+        except Exception as pe:
+            _safe_dlog(dlog, "gh_session_register_parse_failed",
+                       user_id=user_id, filename=filename, error=str(pe))
+
+        github_meta = json.dumps({
+            "owner": owner, "repo": repo, "branch": ref,
+            "path": path, "sha": contents.sha, "source": "github_app",
+            "installation_id": (inst or {}).get("installation_id"),
+        })
+
+        # ── Persist (INSERT or UPDATE — same upsert logic as /load) ──────
+        from database import get_db_ctx
+        with get_db_ctx() as conn:
+            existing = conn.execute(
+                "SELECT id FROM session_files WHERE session_id = ? AND filename = ?",
+                (session_id, filename)
+            ).fetchone()
+            if existing:
+                file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
+                conn.execute(
+                    "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, github_meta = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (text, language, line_count, symbol_count, github_meta, file_id)
+                )
+                _safe_dlog(dlog, "gh_session_register_updated",
+                           user_id=user_id, session_id=session_id,
+                           file_id=file_id, filename=filename)
+            else:
+                file_id = str(_uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO session_files (id, session_id, filename, content, language, lines, symbol_count, file_type, github_meta, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'code', ?, CURRENT_TIMESTAMP)",
+                    (file_id, session_id, filename, text, language, line_count, symbol_count, github_meta)
+                )
+                _safe_dlog(dlog, "gh_session_register_inserted",
+                           user_id=user_id, session_id=session_id,
+                           file_id=file_id, filename=filename)
+            conn.commit()
+
+        _safe_dlog(dlog, "gh_session_register_ok",
+                   user_id=user_id, session_id=session_id, file_id=file_id,
+                   filename=filename, repo=f"{owner}/{repo}", ref=ref,
+                   path=path, lines=line_count, symbol_count=symbol_count,
+                   content_chars=len(text))
+        return {
+            "id": file_id, "filename": filename, "content": text,
+            "file_type": "code", "language": language, "lines": line_count,
+            "symbol_count": symbol_count, "github_meta": github_meta,
+        }
+    except Exception as e:
+        _safe_dlog(dlog, "gh_session_register_error",
+                   user_id=user_id, session_id=session_id, error=str(e))
+        return None
