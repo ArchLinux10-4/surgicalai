@@ -42,6 +42,7 @@ _NATURAL_GH_TOOLS = (
     "list_repos", "list_prs", "get_pr_diff", "get_pr_comments",
     "list_issues", "get_issue_comments", "diff_branches",
     "list_files", "read_file", "search_code", "push_files",
+    "push_session_file",
 )
 
 GH_TAG_OPEN = "<github_request>"
@@ -119,12 +120,23 @@ Available tools:
 - read_file     args: {{owner, repo, path, ref?, start_line?}} → read one file (paged; follow the TRUNCATED hint to continue)
 - search_code   args: {{owner, repo, query}}                  → search file contents (default branch only)
 - push_files    args: {{owner, repo, branch, message, files: [{{path, content}} or {{path, delete: true}}]}} → one commit to a branch (created from the default branch if missing); requires the connection's read_write tier
+- push_session_file args: {{filename, message, branch?}}      → push a session file that was loaded from the repo (and edited/applied here) back to GitHub. Send ONLY the file's basename and a commit message — the server supplies the file content and repo location itself. Requires the connection's read_write tier
 
 Rules:
 - The tag body must be a single valid JSON object: {{"tool": ..., "args": {{...}}, "reason": ...}}
 - ONE github_request per response. Emit it, stop, and wait for results.
 - If you don't know the exact repo name, call list_repos first.
 - Before push_files: read the current file with read_file first, and always send the COMPLETE new file content — partial content overwrites the whole file.
+- PUSHING AN EDITED SESSION FILE: when the user expresses ANY intent to get an
+  edited session file into GitHub — "push it", "ship it", "commit that",
+  "send it to the repo", "make it live", "update GitHub", "save my changes",
+  or anything similar — treat it as a push request. Specifically: when the user asks to push/commit a file that
+  was loaded from the repo into this session (edited via surgical_edit + diff
+  cards), ALWAYS use push_session_file with just the basename and a commit
+  message — e.g. {{"tool": "push_session_file", "args": {{"filename": "LandingPage.tsx", "message": "Update pricing"}}}}.
+  NEVER retype the file content and NEVER use push_files for these files — the
+  server pushes the exact applied content from the session. This is a simple,
+  instant request: do not re-read the file first.
 - Never push unless the user explicitly asked for a change to be pushed/committed.
 - Results come back as a user message; then answer the user's question naturally.
 - EDITING REPO FILES: when you read_file a code file, the COMPLETE file is
@@ -376,3 +388,158 @@ def fetch_and_register_github_file(parsed: dict, user_id: str,
         _safe_dlog(dlog, "gh_session_register_error",
                    user_id=user_id, session_id=session_id, error=str(e))
         return None
+
+
+def push_session_file_from_db(parsed: dict, user_id: str,
+                              session_id: str,
+                              dlog: Optional[Callable] = None) -> str:
+    """Push an already-edited session file back to its GitHub repo.
+
+    The model sends ONLY {"filename": ..., "message": ..., "branch"?: ...}.
+    The server supplies the file content from the session_files row (which
+    the Apply flow keeps current) and the repo coordinates from the
+    github_meta written at registration time. The model never carries file
+    content — a 2-line change on a 2,700-line file costs the same as any
+    other request.
+
+    Mirrors the proven /api/github-app/commit endpoint: update_file with
+    the stored blob sha (GitHub rejects stale shas, so a file changed
+    upstream can never be silently clobbered), then refresh github_meta +
+    github_pushed_at. Always returns a string; never raises."""
+    try:
+        args = parsed.get("args", {}) or {}
+        filename = (args.get("filename") or "").strip().lstrip("/").rsplit("/", 1)[-1]
+        message = (args.get("message") or "").strip()
+        _safe_dlog(dlog, "gh_push_session_start",
+                   user_id=user_id, session_id=session_id,
+                   filename=filename, message=message[:200])
+
+        if not filename:
+            _safe_dlog(dlog, "gh_push_session_missing_filename", user_id=user_id)
+            return ("push_session_file needs a 'filename' — the session file's "
+                    "basename, e.g. \"LandingPage.tsx\".")
+        if not message:
+            _safe_dlog(dlog, "gh_push_session_missing_message",
+                       user_id=user_id, filename=filename)
+            return f"push_session_file needs a commit 'message' for '{filename}'."
+
+        # ── 1. Load the applied content + repo coordinates from the DB ──
+        from database import get_db_ctx
+        with get_db_ctx() as conn:
+            row = conn.execute(
+                "SELECT id, content, github_meta, edited FROM session_files "
+                "WHERE session_id = ? AND filename = ?",
+                (session_id, filename)
+            ).fetchone()
+
+        if not row:
+            _safe_dlog(dlog, "gh_push_session_no_row",
+                       user_id=user_id, session_id=session_id, filename=filename)
+            return (f"No session file named '{filename}' in this session. "
+                    "Read it from the repo first (read_file), edit it, apply, "
+                    "then push.")
+
+        file_id = row["id"]
+        content = row["content"] or ""
+        meta_raw = row["github_meta"]
+        edited = row["edited"]
+        if not meta_raw:
+            _safe_dlog(dlog, "gh_push_session_no_meta",
+                       user_id=user_id, file_id=file_id, filename=filename)
+            return (f"'{filename}' was not loaded from GitHub (no repo "
+                    "coordinates stored), so push_session_file cannot push it. "
+                    "Use push_files with the complete content instead.")
+
+        meta = json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
+        owner = (meta.get("owner") or "").strip()
+        repo = (meta.get("repo") or "").strip()
+        path = (meta.get("path") or "").strip().lstrip("/")
+        sha = (meta.get("sha") or "").strip()
+        branch = (args.get("branch") or "").strip() or (meta.get("branch") or "").strip()
+        _safe_dlog(dlog, "gh_push_session_meta",
+                   user_id=user_id, file_id=file_id, owner=owner, repo=repo,
+                   path=path, branch=branch, sha=sha, edited=edited,
+                   content_chars=len(content))
+
+        if not (owner and repo and path and sha):
+            _safe_dlog(dlog, "gh_push_session_meta_incomplete",
+                       user_id=user_id, file_id=file_id, meta_keys=list(meta.keys()))
+            return (f"'{filename}' has incomplete GitHub metadata "
+                    "(owner/repo/path/sha) — cannot push safely.")
+        if not content.strip():
+            _safe_dlog(dlog, "gh_push_session_empty_content",
+                       user_id=user_id, file_id=file_id, filename=filename)
+            return (f"'{filename}' has empty content in this session — "
+                    "refusing to push an empty file.")
+
+        # ── 2. Tier-gated client (identical gate to push_files) ──────────
+        from services.github_context_tools import _find_client_for_repo
+
+        def _log(event, **kw):
+            _safe_dlog(dlog, event, **kw)
+
+        g, inst, err = _find_client_for_repo(user_id, owner, repo, _log)
+        if err:
+            _safe_dlog(dlog, "gh_push_session_no_client",
+                       user_id=user_id, owner=owner, repo=repo, error=err)
+            return err
+        tier = (inst or {}).get("permission_tier", "read_only")
+        if tier != "read_write":
+            _safe_dlog(dlog, "gh_push_session_tier_denied",
+                       user_id=user_id, tier=tier)
+            return (f"Push blocked: this GitHub connection's permission tier "
+                    f"is '{tier}'. Set it to 'read_write' in Settings → GitHub "
+                    "to allow pushes.")
+
+        # ── 3. Push with the stored blob sha ─────────────────────────────
+        r = g.get_repo(f"{owner}/{repo}")
+        branch = branch or r.default_branch
+        try:
+            result = r.update_file(
+                path=path, message=message,
+                content=content.encode("utf-8"), sha=sha, branch=branch,
+            )
+        except Exception as ge:
+            _safe_dlog(dlog, "gh_push_session_update_failed",
+                       user_id=user_id, path=path, branch=branch, error=str(ge))
+            if "409" in str(ge) or "does not match" in str(ge):
+                return (f"Push rejected: '{path}' changed on GitHub after it "
+                        "was loaded into this session (stale sha). Re-read the "
+                        "file, re-apply the change, then push again.")
+            return f"GitHub rejected the push for '{path}': {ge}"
+
+        new_sha = result["content"].sha if result.get("content") else sha
+        commit_sha = result["commit"].sha if result.get("commit") else ""
+
+        # ── 4. Refresh stored sha so the NEXT push isn't stale ───────────
+        try:
+            updated_meta = {**meta, "sha": new_sha, "branch": branch}
+            with get_db_ctx() as conn:
+                conn.execute(
+                    "UPDATE session_files SET github_meta = ?, github_pushed_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (json.dumps(updated_meta), file_id)
+                )
+                conn.commit()
+            _safe_dlog(dlog, "gh_push_session_meta_refreshed",
+                       user_id=user_id, file_id=file_id, new_sha=new_sha)
+        except Exception as me:
+            # The push itself succeeded — only the local sha cache refresh
+            # failed. Report success; the next push would surface a stale sha.
+            _safe_dlog(dlog, "gh_push_session_meta_refresh_failed",
+                       user_id=user_id, file_id=file_id, error=str(me))
+
+        _safe_dlog(dlog, "gh_push_session_ok",
+                   user_id=user_id, session_id=session_id, filename=filename,
+                   path=path, branch=branch, commit_sha=commit_sha,
+                   new_sha=new_sha, content_chars=len(content))
+        note = "" if edited else ("\n(Note: this file has no applied edits in "
+                                  "this session — the pushed content matches "
+                                  "what was loaded.)")
+        return (f"Pushed '{path}' to '{branch}' in {owner}/{repo} "
+                f"(commit {commit_sha[:10]}).\n"
+                f"View: https://github.com/{owner}/{repo}/commit/{commit_sha}"
+                + note)
+    except Exception as e:
+        _safe_dlog(dlog, "gh_push_session_error",
+                   user_id=user_id, session_id=session_id, error=str(e))
+        return f"[push_session_file failed: {e}]"

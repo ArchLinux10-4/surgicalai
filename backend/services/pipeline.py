@@ -11699,7 +11699,25 @@ async def run_natural_pipeline_stream(
                 yield sse({"type": "progress",
                            "content": f"GitHub: {_gh_req['tool'].replace('_', ' ')}..."})
 
-                _gh_result = execute_github_request(_gh_req, user_id, dlog=_dlog)
+                # ── ADDITIVE: push_session_file needs session_id, so it is
+                # routed here instead of through execute_github_request. The
+                # server pushes the already-applied DB content — the model
+                # never carries file bytes. Fully guarded: any failure becomes
+                # a normal string result and the loop continues unchanged.
+                if _gh_req.get("tool") == "push_session_file":
+                    try:
+                        from services.github_natural_tag import (
+                            push_session_file_from_db,
+                        )
+                        _gh_result = push_session_file_from_db(
+                            _gh_req, user_id, session_id, dlog=_dlog)
+                    except Exception as _gh_push_err:
+                        _dlog("gh_push_session_route_error",
+                              session_id=session_id, user_id=user_id,
+                              error=str(_gh_push_err))
+                        _gh_result = f"[push_session_file failed: {_gh_push_err}]"
+                else:
+                    _gh_result = execute_github_request(_gh_req, user_id, dlog=_dlog)
                 _dlog("natural_github_result",
                       session_id=session_id, user_id=user_id,
                       tool=_gh_req.get("tool"),
