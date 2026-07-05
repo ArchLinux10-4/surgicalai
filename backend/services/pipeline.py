@@ -8972,6 +8972,9 @@ USER REQUEST:
                             _lint_surg_model = "claude-sonnet-5"
                         _lint_working = _full_after_lint          # updated each attempt
                         _lint_remaining = _linter_introduced_errors  # refreshed each attempt
+                        # Improvement #3: collect every applied fix so a clean pass
+                        # can ship them in _operations/new_code (not just report them).
+                        _lint_shipped_fixes: list = []
                         for _lint_attempt in range(_MAX_LINT_ATTEMPTS):
                             try:
                                 _lint_err_lines = "\n".join(
@@ -9035,6 +9038,10 @@ USER REQUEST:
                                             if _lf and _lf in _lint_patched:
                                                 _lint_patched = _lint_patched.replace(_lf, _lr, 1)
                                                 _fixes_applied += 1
+                                                _lint_shipped_fixes.append({"find": _lf, "replace": _lr})
+                                                _dlog("lint_fix_applied", session_id=session_id,
+                                                      file=matched_name, attempt=_lint_attempt + 1,
+                                                      find_preview=_lf[:80], replace_preview=_lr[:80])
                                 # Re-run linter on patched content to get fresh error list
                                 _lint_retry_count = _count_lint(_lint_patched, matched_name)
                                 _lint_working = _lint_patched  # always advance, even if errors remain
@@ -9042,6 +9049,27 @@ USER REQUEST:
                                     _full_after_lint = _lint_working
                                     _linter_introduced_errors = []
                                     _lint_fixed = True
+                                    # Improvement #3: ship the applied fixes — append them to
+                                    # _operations (applied sequentially after the surgeon's ops,
+                                    # same order they were derived) and replay them into new_code
+                                    # so the diff card shows what actually gets delivered.
+                                    try:
+                                        _lint_replayed = 0
+                                        for _lsf in _lint_shipped_fixes:
+                                            _operations.append({"find": _lsf["find"], "replace": _lsf["replace"]})
+                                            if _lsf["find"] in new_code:
+                                                new_code = new_code.replace(_lsf["find"], _lsf["replace"], 1)
+                                                _lint_replayed += 1
+                                        if _lint_replayed:
+                                            diff = _make_diff(_original_symbol_code, new_code, symbol_path)
+                                        _dlog("lint_fixes_shipped", session_id=session_id,
+                                              file=matched_name, symbol=symbol_path,
+                                              fixes_shipped=len(_lint_shipped_fixes),
+                                              replayed_into_symbol=_lint_replayed,
+                                              diff_recomputed=bool(_lint_replayed))
+                                    except Exception as _lsf_exc:
+                                        _dlog("lint_fixes_ship_error", session_id=session_id,
+                                              file=matched_name, error=str(_lsf_exc)[:300])
                                     yield sse({"type": "progress", "content": f"✅ {_lint_tool} clean (auto-fixed {_lint_new_count} error(s) in {_lint_attempt+1} attempt(s))"})
                                     break
                                 else:
@@ -11116,6 +11144,26 @@ async def run_natural_pipeline_stream(
         stream_kwargs.update(_get_thinking_kwargs(arch_model, 10000))
         stream_kwargs.update(_get_effort_kwargs(arch_model))
 
+        # ── Improvement #4: halt the stream at round-trip tag closers ────
+        # Anthropic-native stop_sequences: when a <search_request>/
+        # <file_request>/<edit_plan>/<github_request> tag closes, the API
+        # stops generating instead of draining to natural completion —
+        # saves output tokens every round and prevents post-tag text
+        # leaking to the user. Edit/new-file closers are NOT included
+        # (the model legitimately continues after those).
+        # Kill switch: set TAG_STOP_SEQUENCES=false to restore old behavior.
+        _ROUND_TRIP_TAGS = ("search", "filereq", "plan", "github")
+        _tag_stop_enabled = _os.getenv("TAG_STOP_SEQUENCES", "true").strip().lower() == "true"
+        if _tag_stop_enabled:
+            _tag_stop_seqs = [TAG_DEFS[_tn]["close"] for _tn in _ROUND_TRIP_TAGS if _tn in TAG_DEFS]
+            stream_kwargs["stop_sequences"] = _tag_stop_seqs
+            _dlog("tag_stop_sequences_enabled",
+                  session_id=session_id, user_id=user_id,
+                  sequences=_tag_stop_seqs)
+        else:
+            _dlog("tag_stop_sequences_disabled",
+                  session_id=session_id, user_id=user_id)
+
         # ── Streaming loop with ReAct search + edit/file/search tag parsing ─────
         # Claude can emit <search_request>, <surgical_edit>, or <new_file> tags.
         # Search tags trigger a silent code-fetch + re-call loop (max 4 rounds).
@@ -11134,6 +11182,7 @@ async def run_natural_pipeline_stream(
 
         MAX_SEARCH_ROUNDS = 10
         _last_stop_reason: str | None = None     # capture Claude's stop_reason per round
+        _matched_stop_seq: str | None = None     # which stop_sequence halted the round (Improvement #4)
         searched_terms: list = []                # terms fetched so far (avoid re-fetching)
         requested_files: set = set()             # files fetched via <file_request>
         MAX_FILE_REQ_TOTAL = 15                  # cap total fetchable via <file_request>                # terms fetched so far (avoid re-fetching)
@@ -11313,14 +11362,34 @@ async def run_natural_pipeline_stream(
 
                         # If a search, file, or github request was made, break out of the event loop
                         if search_requested is not None or file_request_data is not None or edit_plan_data is not None or github_requested is not None:
+                            # Improvement #4: this legacy mid-stream break skips the
+                            # stop_reason capture below — clear the value from a
+                            # previous round so the max_tokens truncation detector
+                            # can't fire on stale data.
+                            _last_stop_reason = None
+                            _matched_stop_seq = None
                             break
 
                     # Capture stop_reason from the stream
                     try:
                         _final = await astream.get_final_message()
                         _last_stop_reason = _final.stop_reason if _final else None
+                        # Improvement #4: which custom stop sequence halted us (if any)
+                        _matched_stop_seq = getattr(_final, "stop_sequence", None) if _final else None
                     except Exception:
                         _last_stop_reason = None
+                        _matched_stop_seq = None
+                    if _last_stop_reason == "stop_sequence":
+                        _dlog("stream_halted_at_stop_sequence",
+                              session_id=session_id, user_id=user_id,
+                              matched=str(_matched_stop_seq)[:60],
+                              state_at_halt=state, tag_buf_len=len(tag_buf))
+                        if state == "normal":
+                            # Fired outside a tag body (e.g. model emitted a closer
+                            # with no opener) — should not happen; log loudly.
+                            _dlog("stop_sequence_outside_tag",
+                                  session_id=session_id, user_id=user_id,
+                                  matched=str(_matched_stop_seq)[:60])
 
                     break  # success — exit transient-error retry loop
 
@@ -11336,7 +11405,65 @@ async def run_natural_pipeline_stream(
                                    "content": f"Service busy — retrying ({_attempt+1}/3)..."})
                         await asyncio.sleep(5 * (_attempt + 1))
                         continue
+                    # Improvement #4: if the API ever rejects the stop_sequences
+                    # parameter itself (400), drop it and retry once instead of
+                    # failing the whole round. Never breaks the main path.
+                    if (stream_kwargs.get("stop_sequences")
+                            and "stop_sequence" in err_str.lower()
+                            and _attempt < 2):
+                        stream_kwargs.pop("stop_sequences", None)
+                        _dlog("tag_stop_sequences_rejected_disabled",
+                              session_id=session_id, user_id=user_id,
+                              error=err_str[:300])
+                        continue
                     raise
+
+            # ── Improvement #4: stop_sequence tag-close synthesizer ─────
+            # When TAG_STOP_SEQUENCES is on, the API halts generation AT a
+            # round-trip tag closer — and per Anthropic docs the closer text
+            # itself is never emitted. The chunk parser is therefore left in
+            # the in_* state with the COMPLETE tag body in tag_buf.
+            # Synthesize the tag close here. The legacy EOS finalizer below
+            # is untouched and still covers every non-stop_sequence case.
+            if (_last_stop_reason == "stop_sequence"
+                    and state in ("in_search", "in_filereq", "in_plan", "in_github")):
+                _ss_tag = state[3:]
+                _ss_content = tag_buf
+                try:
+                    if _ss_tag == "search":
+                        _sd = _parse_search_content(_ss_content)
+                        if _sd is not None:
+                            search_requested = _sd
+                    elif _ss_tag == "filereq":
+                        fnames = _parse_filereq_content(_ss_content)
+                        if fnames:
+                            file_request_data = fnames[:5]
+                    elif _ss_tag == "plan":
+                        _pd = _parse_plan_content(_ss_content)
+                        if _pd is not None:
+                            edit_plan_data = _pd
+                    elif _ss_tag == "github":
+                        # Only reachable when the github tag was registered,
+                        # so parse_github_request is bound.
+                        _gd = parse_github_request(_ss_content, dlog=_dlog)
+                        github_requested = (
+                            _gd if _gd is not None
+                            else {"_invalid": _ss_content[:500]}
+                        )
+                    # Re-append the closer so the assistant turn fed back into
+                    # current_messages stays well-formed for the next round.
+                    full_response += TAG_DEFS[_ss_tag]["close"]
+                    state = "normal"
+                    tag_buf = ""
+                    _dlog("tag_closed_via_stop_sequence",
+                          session_id=session_id, user_id=user_id,
+                          tag_type=_ss_tag, content_len=len(_ss_content),
+                          matched=str(_matched_stop_seq)[:60])
+                except Exception as _ss_exc:
+                    # Leave state untouched → legacy finalizer logs no_close_tag
+                    _dlog("stop_sequence_synthesize_error",
+                          session_id=session_id, user_id=user_id,
+                          tag_type=_ss_tag, error=str(_ss_exc)[:300])
 
             # ── Universal end-of-stream finalizer ───────────────────────
             # After the stream exhausts, if the state machine is stuck in
