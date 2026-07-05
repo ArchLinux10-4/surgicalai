@@ -138,21 +138,29 @@ def github_app_callback(installation_id: str = "", setup_action: str = "", state
     token, never from the normal Bearer-token auth middleware."""
     _dlog("github_app_callback_hit", installation_id=installation_id, setup_action=setup_action, has_state=bool(state))
 
-    if setup_action and setup_action != "install":
-        # e.g. "update" — user changed repo selection on an existing install.
-        # Nothing new to link; just bounce back.
-        _dlog("github_app_callback_non_install_action", setup_action=setup_action)
-        return RedirectResponse(url=f"{_FRONTEND_RETURN_URL}?github_app=updated")
-
     if not installation_id:
-        _dlog("github_app_callback_missing_installation_id")
+        _dlog("github_app_callback_missing_installation_id", setup_action=setup_action)
         return RedirectResponse(url=f"{_FRONTEND_RETURN_URL}?github_app=error&reason=missing_installation_id")
 
     user_id = _verify_install_state(state)
     if not user_id:
+        # No usable identity for this browser hit. For non-install actions
+        # (e.g. setup_action=update from GitHub's app settings page, which
+        # can arrive with no state at all) this is a benign bounce, not an
+        # error — the existing link, if any, is untouched.
+        if setup_action and setup_action != "install":
+            _dlog("github_app_callback_update_no_state", setup_action=setup_action,
+                  installation_id=installation_id)
+            return RedirectResponse(url=f"{_FRONTEND_RETURN_URL}?github_app=updated")
         _dlog("github_app_callback_bad_state", installation_id=installation_id)
         return RedirectResponse(url=f"{_FRONTEND_RETURN_URL}?github_app=error&reason=invalid_or_expired_state")
 
+    # We have a verified user AND an installation_id — link them regardless
+    # of setup_action. GitHub sends setup_action=update (not "install") when
+    # the app is already installed on the account, which happens whenever a
+    # user re-runs the connect flow — e.g. after a failed first attempt. The
+    # DB write is a safe upsert keyed on (user_id, installation_id), so
+    # re-linking an already-linked install is a no-op refresh.
     try:
         info = get_installation_account_info(installation_id)
         save_github_app_installation(
@@ -161,7 +169,7 @@ def github_app_callback(installation_id: str = "", setup_action: str = "", state
             account_login=info.get("account_login", "unknown"),
         )
         _dlog("github_app_installation_linked", user_id=user_id, installation_id=installation_id,
-              account_login=info.get("account_login"))
+              account_login=info.get("account_login"), setup_action=setup_action)
         return RedirectResponse(url=f"{_FRONTEND_RETURN_URL}?github_app=connected")
     except Exception as e:
         _dlog("github_app_callback_link_failed", user_id=user_id, installation_id=installation_id, error=str(e))
