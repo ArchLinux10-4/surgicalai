@@ -134,6 +134,11 @@ Rules:
   was loaded from the repo into this session (edited via surgical_edit + diff
   cards), ALWAYS use push_session_file with just the basename and a commit
   message — e.g. {{"tool": "push_session_file", "args": {{"filename": "LandingPage.tsx", "message": "Update pricing"}}}}.
+- AFTER A SUCCESSFUL PUSH: present a short, well-formatted summary — the
+  commit as a markdown link, the file with the +/- line stats from the tool
+  result, a one-line "What changed" describing the edits you made in this
+  session, and the Deploy line from the tool result if present. Keep it
+  brief and celebratory. Do NOT re-read the file or take any further action.
   NEVER retype the file content and NEVER use push_files for these files — the
   server pushes the exact applied content from the session. This is a simple,
   instant request: do not re-read the file first.
@@ -535,10 +540,51 @@ def push_session_file_from_db(parsed: dict, user_id: str,
         note = "" if edited else ("\n(Note: this file has no applied edits in "
                                   "this session — the pushed content matches "
                                   "what was loaded.)")
+
+        # ── 5. Enrich summary: real +/- line stats (best-effort) ─────────
+        stats_line = ""
+        try:
+            if commit_sha:
+                commit_obj = r.get_commit(commit_sha)
+                additions = commit_obj.stats.additions
+                deletions = commit_obj.stats.deletions
+                stats_line = f"\nChanges: +{additions} / -{deletions} lines."
+                _safe_dlog(dlog, "gh_push_session_stats",
+                           user_id=user_id, commit_sha=commit_sha,
+                           additions=additions, deletions=deletions)
+        except Exception as se:
+            _safe_dlog(dlog, "gh_push_session_stats_failed",
+                       user_id=user_id, commit_sha=commit_sha, error=str(se))
+
+        # ── 6. Deploy awareness: is Vercel/Railway connected? (DB-only) ──
+        deploy_line = ""
+        try:
+            from database import get_user_api_key
+            vercel_connected = bool(get_user_api_key(user_id, "vercel"))
+            railway_connected = bool(get_user_api_key(user_id, "railway"))
+            _safe_dlog(dlog, "gh_push_session_deploy_check",
+                       user_id=user_id, vercel=vercel_connected,
+                       railway=railway_connected)
+            connected = [n for n, ok in
+                         (("Vercel", vercel_connected),
+                          ("Railway", railway_connected)) if ok]
+            if connected:
+                deploy_line = ("\nDeploy: " + " and ".join(connected) +
+                               " connected — the deploy should start "
+                               "automatically; the user can watch the build "
+                               "live in the Deploys panel.")
+            else:
+                deploy_line = ("\nDeploy tip: connecting Vercel or Railway in "
+                               "Settings lets the user watch this deploy "
+                               "build live.")
+        except Exception as de:
+            _safe_dlog(dlog, "gh_push_session_deploy_check_failed",
+                       user_id=user_id, error=str(de))
+
         return (f"Pushed '{path}' to '{branch}' in {owner}/{repo} "
                 f"(commit {commit_sha[:10]}).\n"
                 f"View: https://github.com/{owner}/{repo}/commit/{commit_sha}"
-                + note)
+                + stats_line + deploy_line + note)
     except Exception as e:
         _safe_dlog(dlog, "gh_push_session_error",
                    user_id=user_id, session_id=session_id, error=str(e))
