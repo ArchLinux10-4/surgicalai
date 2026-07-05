@@ -42,7 +42,7 @@ _NATURAL_GH_TOOLS = (
     "list_repos", "list_prs", "get_pr_diff", "get_pr_comments",
     "list_issues", "get_issue_comments", "diff_branches",
     "list_files", "read_file", "search_code", "push_files",
-    "push_session_file",
+    "push_session_file", "check_deploy",
 )
 
 GH_TAG_OPEN = "<github_request>"
@@ -121,6 +121,7 @@ Available tools:
 - search_code   args: {{owner, repo, query}}                  → search file contents (default branch only)
 - push_files    args: {{owner, repo, branch, message, files: [{{path, content}} or {{path, delete: true}}]}} → one commit to a branch (created from the default branch if missing); requires the connection's read_write tier
 - push_session_file args: {{filename, message, branch?}}      → push a session file that was loaded from the repo (and edited/applied here) back to GitHub. Send ONLY the file's basename and a commit message — the server supplies the file content and repo location itself. Requires the connection's read_write tier
+- check_deploy  args: {{provider?}}                           → latest deployment status from the user's connected deploy platforms ("provider": "vercel"|"railway"|"both", default "both"). On a FAILED deploy the result includes the build-log tail so you can diagnose the error
 
 Rules:
 - The tag body must be a single valid JSON object: {{"tool": ..., "args": {{...}}, "reason": ...}}
@@ -143,6 +144,15 @@ Rules:
   server pushes the exact applied content from the session. This is a simple,
   instant request: do not re-read the file first.
 - Never push unless the user explicitly asked for a change to be pushed/committed.
+- DEPLOY QUESTIONS: when the user expresses ANY intent to check a deployment —
+  "did it deploy?", "is the build done?", "did my push go live?", "any deploy
+  errors?", "why did the build fail?", or anything similar — use check_deploy.
+  The result includes the deployment's commit sha and timestamp: compare them
+  against the commit you just pushed to confirm you are looking at the right
+  deploy (a deploy created BEFORE your push is not yours — say it hasn't
+  started or is still queued). If the status is a failure, the build-log tail
+  is included — quote the actual error lines and explain the likely fix.
+  Never claim a deploy succeeded or failed without calling check_deploy.
 - Results come back as a user message; then answer the user's question naturally.
 - EDITING REPO FILES: when you read_file a code file, the COMPLETE file is
   automatically loaded into this session as an editable file — exactly as if
@@ -245,6 +255,9 @@ def execute_github_request(parsed: dict, user_id: str,
 
         if tool == "list_repos":
             result = _list_repos(user_id, dlog)
+        elif tool == "check_deploy":
+            from services.deploy_status import check_deploy_status
+            result = check_deploy_status(user_id, args, dlog=dlog)
         else:
             from services.github_context_tools import execute_github_context_tool
             result = execute_github_context_tool(tool, args, user_id, dlog=dlog)
