@@ -104,7 +104,7 @@ access — fetch the data with a github_request tag:
 {{"tool": "list_prs", "args": {{"owner": "{accounts.split(',')[0].strip()}", "repo": "REPO_NAME"}}, "reason": "why you need this"}}
 </github_request>
 
-Available tools (all read-only):
+Available tools:
 - list_repos    args: {{}}                                    → repos the connection can reach (use FIRST if you don't know the repo name)
 - list_prs      args: {{owner, repo, state?}}                 → open PRs ("state": "open"|"closed"|"all")
 - get_pr_diff   args: {{owner, repo, pr_number}}              → file-by-file diff of one PR
@@ -112,11 +112,17 @@ Available tools (all read-only):
 - list_issues   args: {{owner, repo, state?}}                 → issues
 - get_issue_comments args: {{owner, repo, issue_number}}      → issue discussion
 - diff_branches args: {{owner, repo, base, head}}             → compare two branches
+- list_files    args: {{owner, repo, ref?, path_prefix?}}     → list all files in a branch (filter with path_prefix)
+- read_file     args: {{owner, repo, path, ref?, start_line?}} → read one file (paged; follow the TRUNCATED hint to continue)
+- search_code   args: {{owner, repo, query}}                  → search file contents (default branch only)
+- push_files    args: {{owner, repo, branch, message, files: [{{path, content}} or {{path, delete: true}}]}} → one commit to a branch (created from the default branch if missing); requires the connection's read_write tier
 
 Rules:
 - The tag body must be a single valid JSON object: {{"tool": ..., "args": {{...}}, "reason": ...}}
 - ONE github_request per response. Emit it, stop, and wait for results.
 - If you don't know the exact repo name, call list_repos first.
+- Before push_files: read the current file with read_file first, and always send the COMPLETE new file content — partial content overwrites the whole file.
+- Never push unless the user explicitly asked for a change to be pushed/committed.
 - Results come back as a user message; then answer the user's question naturally.
 """
 
