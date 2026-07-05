@@ -35,10 +35,13 @@ import json
 from typing import Callable, Optional
 
 
-# Tools Claude may request via the tag. All read-only.
+# Tools Claude may request via the tag. Read tools work on any tier;
+# push_files is additionally gated on the read_write tier inside
+# execute_github_context_tool (server-side, never trusted to the model).
 _NATURAL_GH_TOOLS = (
     "list_repos", "list_prs", "get_pr_diff", "get_pr_comments",
     "list_issues", "get_issue_comments", "diff_branches",
+    "list_files", "read_file", "search_code", "push_files",
 )
 
 GH_TAG_OPEN = "<github_request>"
