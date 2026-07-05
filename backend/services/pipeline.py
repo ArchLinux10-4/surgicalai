@@ -10955,6 +10955,36 @@ async def run_natural_pipeline_stream(
                 }
             )
 
+        # ── GitHub natural-chat tag (flag-gated, per-user) ─────────────────
+        # Only active when github_context_tools_enabled=true AND the GitHub
+        # App is configured AND this user has a linked installation. When
+        # inactive, TAG_DEFS and the system prompt are byte-identical to
+        # before — the single-pass path is untouched.
+        _gh_nat_enabled = False
+        try:
+            from services.github_natural_tag import (
+                natural_github_availability, build_github_prompt_section,
+                parse_github_request, execute_github_request,
+                GH_TAG_OPEN, GH_TAG_CLOSE,
+            )
+            _gh_nat_enabled, _gh_nat_installs = natural_github_availability(
+                user_id, dlog=_dlog
+            )
+            if _gh_nat_enabled:
+                TAG_DEFS["github"] = {"open": GH_TAG_OPEN, "close": GH_TAG_CLOSE}
+                system_prompt.append({
+                    "type": "text",
+                    "text": build_github_prompt_section(_gh_nat_installs),
+                })
+                _dlog("natural_github_tag_registered",
+                      session_id=session_id, user_id=user_id,
+                      installations=len(_gh_nat_installs))
+        except Exception as _gh_nat_err:
+            _gh_nat_enabled = False
+            _dlog("natural_github_setup_error",
+                  session_id=session_id, user_id=user_id,
+                  error=str(_gh_nat_err))
+
         # ── Debug: confirm quality rules and project memory reached the prompt ──
         _total_sys_chars = sum(b.get("text", "") if isinstance(b, dict) else b for b in system_prompt if isinstance(b, dict)) if False else sum(len(b["text"]) for b in system_prompt if isinstance(b, dict) and "text" in b)
         _has_quality = "CODE QUALITY RULES" in NATURAL_SYSTEM
@@ -11080,6 +11110,8 @@ async def run_natural_pipeline_stream(
         current_messages = list(messages)        # grows with search result turns
         _forced_edit_round_done = False          # only one forced-edit round allowed
         _thinking_only_retries = 0               # max 1 auto-retry for thinking-only responses
+        MAX_GITHUB_ROUNDS = 6                    # cap <github_request> rounds per prompt
+        _github_rounds_used = 0                  # counts github rounds (incl. invalid JSON)
 
         # +2: one extra slot for the forced-edit round when budget exhausted
         for search_round in range(MAX_SEARCH_ROUNDS + 2):
@@ -11089,6 +11121,7 @@ async def run_natural_pipeline_stream(
             tag_buf = ""        # unified buffer for all non-normal tag states
             search_requested: dict | None = None  # set when a search block completes
             file_request_data: list | None = None  # set when a file_request block completes
+            github_requested: dict | None = None  # set when a github_request block completes
             had_thinking = False                    # track if Claude produced thinking this round
 
             # Retry loop for transient API errors
@@ -11214,6 +11247,17 @@ async def run_natural_pipeline_stream(
                                                 edit_plan_data = _pd
                                             _break_stream = True
 
+                                        elif _tag_name == "github":
+                                            # Only reachable when the tag was
+                                            # registered (flag on + linked user),
+                                            # so parse_github_request is bound.
+                                            _gd = parse_github_request(_content, dlog=_dlog)
+                                            github_requested = (
+                                                _gd if _gd is not None
+                                                else {"_invalid": _content[:500]}
+                                            )
+                                            _break_stream = True
+
                                         state = "normal"
                                         normal_buf = _remainder
                                         tag_buf = ""
@@ -11235,8 +11279,8 @@ async def run_natural_pipeline_stream(
                                     yield sse({"type": "thinking_end", "content": ""})
                                     in_thinking = False
 
-                        # If a search or file request was made, break out of the event loop
-                        if search_requested is not None or file_request_data is not None or edit_plan_data is not None:
+                        # If a search, file, or github request was made, break out of the event loop
+                        if search_requested is not None or file_request_data is not None or edit_plan_data is not None or github_requested is not None:
                             break
 
                     # Capture stop_reason from the stream
@@ -11312,6 +11356,28 @@ async def run_natural_pipeline_stream(
                               search_data=str(search_requested)[:200])
                     else:
                         _dlog("eos_search_no_close_tag",
+                              session_id=session_id, user_id=user_id,
+                              buf_preview=tag_buf[:300])
+
+                # ── github_request recovery ──
+                elif state == "in_github":
+                    _gh_match = re.search(
+                        r"<github_request>(.*?)</github_request>",
+                        full_response, re.DOTALL
+                    )
+                    if _gh_match:
+                        _gd = parse_github_request(_gh_match.group(1), dlog=_dlog)
+                        github_requested = (
+                            _gd if _gd is not None
+                            else {"_invalid": _gh_match.group(1)[:500]}
+                        )
+                        state = "normal"
+                        tag_buf = ""
+                        _dlog("eos_github_recovered",
+                              session_id=session_id, user_id=user_id,
+                              github_data=str(github_requested)[:200])
+                    else:
+                        _dlog("eos_github_no_close_tag",
                               session_id=session_id, user_id=user_id,
                               buf_preview=tag_buf[:300])
 
@@ -11586,6 +11652,75 @@ async def run_natural_pipeline_stream(
                 full_response = ""  # Reset for next round
                 search_requested = None
                 continue  # Next search round
+
+            # ── Handle GitHub request (natural-chat <github_request> tag) ──
+            if github_requested is not None:
+                _gh_req = github_requested
+                github_requested = None
+                _github_rounds_used += 1
+                _dlog("natural_github_round",
+                      session_id=session_id, user_id=user_id,
+                      round=search_round,
+                      github_rounds_used=_github_rounds_used,
+                      request=str(_gh_req)[:300])
+
+                # Budget exhausted — tell Claude to answer with what it has
+                if _github_rounds_used > MAX_GITHUB_ROUNDS:
+                    _dlog("natural_github_budget_exhausted",
+                          session_id=session_id, user_id=user_id,
+                          github_rounds_used=_github_rounds_used)
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": full_response or "(checking GitHub...)"},
+                        {"role": "user", "content":
+                            f"GitHub request limit reached ({MAX_GITHUB_ROUNDS} requests already made). "
+                            "Do NOT emit another <github_request>. "
+                            "Answer the user's question now using the GitHub data you already received."},
+                    ]
+                    full_response = ""
+                    continue
+
+                # Invalid JSON in the tag — feed the error back so Claude retries
+                if "_invalid" in _gh_req:
+                    _dlog("natural_github_invalid_json",
+                          session_id=session_id, user_id=user_id,
+                          raw_preview=_gh_req["_invalid"][:200])
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": full_response or "(checking GitHub...)"},
+                        {"role": "user", "content":
+                            "Your <github_request> tag did not contain valid JSON or used an "
+                            "unknown tool. The body must be a single JSON object like: "
+                            '{"tool": "list_prs", "args": {"owner": "X", "repo": "Y"}, "reason": "..."}. '
+                            "Valid tools: list_repos, list_prs, get_pr_diff, get_pr_comments, "
+                            "list_issues, get_issue_comments, diff_branches. Try again."},
+                    ]
+                    full_response = ""
+                    continue
+
+                yield sse({"type": "progress",
+                           "content": f"GitHub: {_gh_req['tool'].replace('_', ' ')}..."})
+
+                _gh_result = execute_github_request(_gh_req, user_id, dlog=_dlog)
+                _dlog("natural_github_result",
+                      session_id=session_id, user_id=user_id,
+                      tool=_gh_req.get("tool"),
+                      result_len=len(_gh_result),
+                      result_preview=_gh_result[:300])
+
+                github_injection = (
+                    f"Here is the GitHub data you requested ({_gh_req.get('tool')})"
+                    + (f" — {_gh_req.get('reason')}" if _gh_req.get("reason") else "")
+                    + ":\n\n"
+                    + _gh_result
+                    + "\n\nAnswer the user's question naturally using this data. "
+                    "If you genuinely need more GitHub data, emit ONE more <github_request>."
+                )
+
+                current_messages = current_messages + [
+                    {"role": "assistant", "content": full_response or "(checking GitHub...)"},
+                    {"role": "user", "content": github_injection},
+                ]
+                full_response = ""
+                continue  # Next round
 
             # ── Thinking-only detection ───────────────────────────────────
             # Claude produced thinking blocks but zero visible text, zero tags.
