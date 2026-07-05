@@ -2576,7 +2576,7 @@ export function LandingPage() {
                 <div className="sai-pricing-popular">Most Powerful</div>
                 <div className="sai-pricing-tier" style={{color:'var(--accent)'}}>Pro</div>
                 <div className="sai-pricing-price">
-                  <sup>$</sup>200<sub>/mo</sub>
+                  <sup>$</sup>250<sub>/mo</sub>
                 </div>
                 <p className="sai-pricing-desc">For teams shipping fast. Maximum intelligence, unlimited scale, priority everything.</p>
                 <div className="sai-pricing-model opus">🏛 Claude Opus — Architect + Surgeon</div>
