@@ -11110,6 +11110,7 @@ async def run_natural_pipeline_stream(
         current_messages = list(messages)        # grows with search result turns
         _forced_edit_round_done = False          # only one forced-edit round allowed
         _thinking_only_retries = 0               # max 1 auto-retry for thinking-only responses
+        _gh_announce_retries = 0                 # max 1 auto-retry for announce-without-action stalls
         MAX_GITHUB_ROUNDS = 6                    # cap <github_request> rounds per prompt
         _github_rounds_used = 0                  # counts github rounds (incl. invalid JSON)
 
@@ -11849,6 +11850,53 @@ async def run_natural_pipeline_stream(
                                           "or provide more detail?"})
                     yield sse({"type": "done", "content": ""})
                     return
+
+            # ── GitHub announce-without-action detection (additive) ───────
+            # Claude produced a tiny visible response (e.g. "Let me check the
+            # deployment status...") with thinking, but emitted no tag, no
+            # edits, and no plan — then stopped. This is a silent stall: the
+            # model "performed" the action inside its thinking block instead
+            # of typing the tag. Nudge once, mirroring the thinking-only
+            # retry pattern above. Guarded so it can never fire twice and
+            # never touches rounds where any tool/edit/plan was produced.
+            if (_gh_nat_enabled
+                    and _github_rounds_used == 0
+                    and _gh_announce_retries < 1
+                    and had_thinking
+                    and full_response.strip()
+                    and len(full_response.strip()) < 200
+                    and not edit_blocks_raw
+                    and not new_file_blocks_raw
+                    and not edit_plan_data):
+                _gh_announce_retries += 1
+                _dlog("gh_announce_without_action",
+                      session_id=session_id, user_id=user_id,
+                      search_round=search_round,
+                      response_len=len(full_response.strip()),
+                      response_preview=full_response.strip()[:120],
+                      retries=_gh_announce_retries)
+                yield sse({"type": "progress",
+                           "content": "Completing the check..."})
+                if in_thinking:
+                    yield sse({"type": "thinking_end", "content": ""})
+                    in_thinking = False
+                current_messages = current_messages + [
+                    {"role": "assistant", "content": full_response},
+                    {"role": "user",
+                     "content":
+                        "Your response ended after a brief statement without "
+                        "performing any action. If you announced or intended a "
+                        "check or lookup (deploy status, GitHub data, code "
+                        "search, file contents), perform it NOW by emitting the "
+                        "corresponding tag (<github_request>, <search_request>, "
+                        "or <file_request>) in your visible response — tags "
+                        "typed inside thinking are never executed. If your "
+                        "brief message was genuinely your complete answer, "
+                        "restate it now with the key details and evidence."},
+                ]
+                full_response = ""
+                had_thinking = False
+                continue  # Retry round
 
             # ── No search request — streaming is done ─────────────────────
             break
