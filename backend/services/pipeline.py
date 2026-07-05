@@ -1751,7 +1751,7 @@ def run_surgeon(
         _plan_dev = (qa_feedback.get("plan_deviation") or "").strip()
         if _plan_dev:
             _qa_lines.append(f"Plan deviation: {_plan_dev[:400]}")
-        for _qk in ("import_issues", "type_errors", "downstream_risks"):
+        for _qk in ("import_issues", "type_errors", "logic_errors", "downstream_risks"):
             for _qi in (qa_feedback.get(_qk) or [])[:3]:
                 _qa_lines.append(f"  - {_qk.replace('_', ' ')}: {str(_qi)[:200]}")
         # risk_verdicts is a list of dicts; surface blocked ones
@@ -1852,11 +1852,13 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
     # ── Feature flag: tool_use vs text SEARCH/REPLACE ───────────────────────────
     _surgeon_raw = get_setting("surgeon_tool_use", "false")
     _use_tool_use = _surgeon_raw == "true"
+    # NOTE: no session_id kwarg here — run_surgeon has no session_id in scope
+    # (previously caused a guaranteed NameError on the non-streaming path).
     _dlog("flag_check_surgeon_tool_use",
           raw_value=_surgeon_raw, resolved=_use_tool_use,
           env_upper=_os.environ.get("SURGEON_TOOL_USE", "<not set>"),
           env_lower=_os.environ.get("surgeon_tool_use", "<not set>"),
-          session_id=session_id, user_id=user_id)
+          user_id=user_id)
 
     if _use_tool_use:
         # ── TOOL USE PATH (Phase 1) ─────────────────────────────────────────────
@@ -2293,6 +2295,15 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
                 messages=[{"role": "user", "content": user_msg}],
             ))
             raw = _extract_claude_text(_claude_surgeon_resp)
+            # Truncation guard (mirrors the GPT _sai_truncated refusal below):
+            # a max_tokens cut can leave zero complete SEARCH/REPLACE blocks,
+            # and the raw-fallback would then apply the truncated text as a
+            # FULL symbol replacement. Refuse and let the caller retry instead.
+            if getattr(_claude_surgeon_resp, "stop_reason", None) == "max_tokens":
+                _dlog("surgeon_claude_text_truncated_refused",
+                      model=surg_model, raw_len=len(raw or ""), user_id=user_id)
+                print("[SURGEON] Claude output truncated at max_tokens — refusing partial output")
+                return symbol.code, 0, ["Surgeon: output truncated — retry"], [], []
         else:
             response = _chat_create(client,
                 model=surg_model,
@@ -3784,6 +3795,17 @@ async def run_qa_for_changes(
                 raw_text += block.text
 
         result = _extract_json_from_text(raw_text)
+        # _extract_json_from_text is shadowed module-wide by a later duplicate
+        # that returns a JSON *string*, not a dict. Handle both shapes
+        # (mirrors the isinstance pattern used by every other caller).
+        if isinstance(result, str):
+            result = json.loads(result)
+
+        _dlog("qa_for_changes_parsed",
+              model=model,
+              verdict=result.get("verdict"),
+              qa_score=result.get("qa_score"),
+              raw_len=len(raw_text))
 
         # Normalise keys
         return {
@@ -3794,7 +3816,13 @@ async def run_qa_for_changes(
             "risks": result.get("risks", []),
         }
 
-    except Exception:
+    except Exception as _qa_fc_err:
+        try:
+            _dlog("qa_for_changes_error",
+                  model=model,
+                  error=f"{type(_qa_fc_err).__name__}: {str(_qa_fc_err)[:300]}")
+        except Exception:
+            pass
         return _FALLBACK
 
 
@@ -5867,7 +5895,7 @@ async def run_qa_agent(
     _qa_feedback_block = ""
     if qa_feedback:
         _issues = []
-        for _qk in ("import_issues", "type_errors", "downstream_risks"):
+        for _qk in ("import_issues", "type_errors", "logic_errors", "downstream_risks"):
             for _qi in (qa_feedback.get(_qk) or [])[:2]:
                 _issues.append(f"  - {_qk.replace('_', ' ')}: {_qi}")
         if qa_feedback.get("plan_deviation"):
@@ -5975,6 +6003,7 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
             "import_issues":    data.get("import_issues", []),
             "downstream_risks": data.get("downstream_risks", []),
             "type_errors":      data.get("type_errors", []),
+            "logic_errors":     data.get("logic_errors", []) or [],
             "plan_deviation":   data.get("plan_deviation", ""),
             "skipped_reason":   None,
         }
@@ -5986,6 +6015,7 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
               summary=result["summary"][:200],
               has_import_issues=bool(result["import_issues"]),
               has_type_errors=bool(result["type_errors"]),
+              has_logic_errors=bool(result["logic_errors"]),
               user_id=user_id)
 
         # Enforce verdict/score consistency
@@ -6050,6 +6080,7 @@ def _log_qa_result(session_id: str, filename: str, symbol_name: str, result: dic
         "import_issues":    result.get("import_issues", []),
         "downstream_risks": result.get("downstream_risks", []),
         "type_errors":      result.get("type_errors", []),
+        "logic_errors":     result.get("logic_errors", []),
         "plan_deviation":   result.get("plan_deviation", ""),
     })
     conn = get_db_connection()
@@ -8733,7 +8764,7 @@ USER REQUEST:
                         qa_verdict.get("summary", "") or "",
                         qa_verdict.get("plan_deviation", "") or "",
                     ]
-                    for _qk in ("import_issues", "type_errors", "downstream_risks"):
+                    for _qk in ("import_issues", "type_errors", "logic_errors", "downstream_risks"):
                         _qa_text_parts.extend(str(x) for x in (qa_verdict.get(_qk) or []))
                     for _rv in (qa_verdict.get("risk_verdicts") or []):
                         if isinstance(_rv, dict):
@@ -11334,7 +11365,7 @@ async def run_natural_pipeline_stream(
                         _dlog("eos_filereq_recovered",
                               session_id=session_id, user_id=user_id,
                               filenames=file_request_data,
-                              raw_len=len(raw))
+                              raw_len=len(_fr_match.group(0)))
                     else:
                         _dlog("eos_filereq_no_close_tag",
                               session_id=session_id, user_id=user_id,
