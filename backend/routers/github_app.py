@@ -127,11 +127,15 @@ def github_app_install_url(request: Request):
     return {"url": url}
 
 
+@router.get("/setup")
 @router.get("/callback")
 def github_app_callback(installation_id: str = "", setup_action: str = "", state: str = ""):
     """GitHub redirects the user's browser here after they finish the
-    install flow (this is the App's 'Setup URL'). No auth header available —
-    identity comes only from the signed state token."""
+    install flow. The App's configured 'Setup URL' is /setup (confirmed from
+    live production logs); /callback is kept as an additional alias for the
+    same handler in case anything else ever points there. No auth header is
+    available on this request — identity comes only from the signed state
+    token, never from the normal Bearer-token auth middleware."""
     _dlog("github_app_callback_hit", installation_id=installation_id, setup_action=setup_action, has_state=bool(state))
 
     if setup_action and setup_action != "install":

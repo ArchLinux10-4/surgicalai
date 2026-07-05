@@ -54,6 +54,12 @@ _OPEN_PATHS = {
     "/api/auth/login",
     "/api/auth/setup",
     "/api/auth/setup-required",
+    # GitHub App's own "Setup URL" — GitHub's browser redirect lands here
+    # directly after install with no Authorization header possible. Identity
+    # is carried instead via a short-lived signed state token verified inside
+    # the handler itself (see routers/github_app.py _verify_install_state).
+    "/api/github-app/setup",
+    "/api/github-app/callback",
 }
 
 # Path patterns that bypass auth (used for iframe-loaded preview resources

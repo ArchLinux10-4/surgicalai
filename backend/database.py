@@ -753,6 +753,23 @@ def _init_postgres():
             CREATE INDEX IF NOT EXISTS idx_debug_events_session
             ON debug_events(session_id)
         """)
+        # github_app_installations — one row per (user, installation). A user can
+        # have multiple installations (e.g. personal account + one or more orgs).
+        # permission_tier gates write access at the API layer (routers/github_app.py)
+        # — read_only / read_comment / read_write. Legacy PAT flow (user_api_keys,
+        # key_type='github') is completely separate and untouched.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS github_app_installations (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                installation_id TEXT NOT NULL,
+                account_login TEXT DEFAULT '',
+                permission_tier TEXT DEFAULT 'read_only',
+                connected_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, installation_id)
+            )
+        """)
         conn.commit()
 
         _seed_defaults_postgres(conn)
