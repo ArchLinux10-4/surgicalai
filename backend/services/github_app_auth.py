@@ -71,7 +71,11 @@ def _get_app_auth():
         # instead of real newlines (common Railway/Heroku gotcha) — normalize.
         if "\\n" in private_key and "\n" not in private_key:
             private_key = private_key.replace("\\n", "\n")
-        auth = Auth.AppAuth(int(app_id), private_key)
+        # app_id MUST stay a string: PyJWT >= 2.10 raises
+        # "Issuer (iss) must be a string." on int (PyJWT is unpinned, so
+        # Railway installs the strict version). Verified live against the
+        # real app on PyGithub 2.3.0.
+        auth = Auth.AppAuth(app_id, private_key)
         _dlog("github_app_auth_built", app_id=app_id)
         return auth
     except Exception as e:

@@ -42,7 +42,7 @@ from database import (
 from auth_utils import get_jwt_secret
 from services.github_app_auth import (
     is_github_app_configured, get_app_slug, get_installation_client,
-    get_installation_account_info,
+    get_installation_account_info, get_integration,
 )
 
 router = APIRouter()
@@ -259,8 +259,13 @@ def list_repos(request: Request):
     for inst in installations:
         installation_id = inst["installation_id"]
         try:
-            g = _client_for(user_id, installation_id, "read")
-            for repo in g.get_installation(int(installation_id)).get_repos():
+            # PyGithub 2.3.0: a plain Github installation client has NO
+            # get_installation method. GithubIntegration.get_app_installation
+            # returns an Installation that auto-swaps to installation auth,
+            # so .get_repos() is correctly scoped (verified vs live API).
+            _client_for(user_id, installation_id, "read")  # permission check only
+            installation = get_integration().get_app_installation(int(installation_id))
+            for repo in installation.get_repos():
                 all_repos.append({
                     "id": repo.id,
                     "name": repo.name,

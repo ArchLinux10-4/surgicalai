@@ -154,11 +154,16 @@ def parse_github_request(raw: str, dlog: Optional[Callable] = None):
 
 def _list_repos(user_id: str, dlog: Optional[Callable]) -> str:
     """List repos reachable through every installation this user linked.
-    Same PyGithub pattern as the working /api/github-app/repos endpoint.
-    Read-only. Never raises."""
+    Read-only. Never raises.
+
+    PyGithub 2.3.0 pattern (verified against library source + live API):
+    GithubIntegration.get_app_installation(id) returns an Installation whose
+    requester is auto-swapped to installation auth in Installation.__init__,
+    so .get_repos() (GET /installation/repositories) is correctly scoped.
+    A plain Github installation client has NO get_installation method."""
     try:
         from database import list_github_app_installations
-        from services.github_app_auth import get_installation_client
+        from services.github_app_auth import get_integration
 
         installations = list_github_app_installations(user_id)
         if not installations:
@@ -169,9 +174,9 @@ def _list_repos(user_id: str, dlog: Optional[Callable]) -> str:
             iid = inst.get("installation_id")
             login = inst.get("account_login", "?")
             try:
-                g = get_installation_client(iid)
+                installation = get_integration().get_app_installation(int(iid))
                 count = 0
-                for repo in g.get_installation(int(iid)).get_repos():
+                for repo in installation.get_repos():
                     lines.append(
                         f"{repo.full_name}  "
                         f"(default branch: {repo.default_branch}, "
