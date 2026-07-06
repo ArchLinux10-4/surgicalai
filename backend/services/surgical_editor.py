@@ -358,17 +358,18 @@ def apply_change(file_content: str, change) -> str:
             change.applied = True
             return result
 
-        # No operations matched at all — raise so the pipeline knows this failed
-        # and can report a real error instead of silently returning no-op output.
+        # No operations matched at all. Do NOT raise yet — Path 3 (anchor
+        # replace) and Path 4 (hunk-split recovery) may still apply this
+        # change deterministically (e.g. stored whole-file gap-bridge changes
+        # whose sentinel op is the entire stale file). Record the detail so
+        # the final error, if reached, stays specific.
         previews = "; ".join(f"`{f[:60]}...`" if len(f) > 60 else f"`{f}`" for f in failed_finds[:3])
-        raise ValueError(
+        _ops_failure_detail = (
             f"SEARCH/REPLACE failed: none of the {len(operations)} operation(s) matched the file. "
-            f"The find strings did not appear verbatim in the current file content. "
-            f"Unmatched find strings: {previews}. "
-            f"This usually means the file changed between when the focused window was extracted "
-            f"and when the edit was applied, or there is a whitespace/encoding mismatch. "
-            f"Re-read the current file and retry with exact text from it."
+            f"Unmatched find strings: {previews}."
         )
+    else:
+        _ops_failure_detail = ""
 
     # ------------------------------------------------------------------
     # Path 3: Direct new_code replacement using original_code as anchor
@@ -378,6 +379,30 @@ def apply_change(file_content: str, change) -> str:
         result = file_content.replace(original_code, new_code, 1)
         change.applied = True
         return result
+
+    # ------------------------------------------------------------------
+    # Path 4: Hunk-split recovery (session 52802d58 stored gap-bridge fix)
+    # ------------------------------------------------------------------
+    # Legacy sessions contain synthetic whole-file changes whose anchor is the
+    # ENTIRE analysis-time file (created by the old gap-bridge fallback, since
+    # removed).  Once any other change is applied, that anchor can never match
+    # again — proven by 6/6 apply failures on "lines 1-991" in server logs.
+    # Recovery: diff original_code vs new_code into minimal hunks, relocate
+    # each hunk's old-side text (with context) in the CURRENT file, and apply
+    # only if EVERY hunk matches exactly once.  Deterministic — no fuzzy
+    # matching; any ambiguity falls through to the error below.
+    if new_code and original_code and new_code != original_code:
+        _recovered = _hunk_split_recover(file_content, original_code, new_code)
+        if _recovered is not None and _recovered != file_content:
+            try:
+                from services.pipeline import _dlog as _dl4
+                _sym4 = getattr(symbol, "full_path", None) or getattr(symbol, "name", "?") if symbol else "?"
+                _dl4("apply_change_hunk_recovery_success", symbol=_sym4,
+                     original_len=len(original_code), new_len=len(new_code))
+            except Exception:
+                pass
+            change.applied = True
+            return _recovered
 
     # Nothing worked — SURFACE the failure instead of silently returning the
     # file unchanged. A silent no-op here made apply_changes_to_file count the
@@ -404,10 +429,76 @@ def apply_change(file_content: str, change) -> str:
         f"Change to '{_sym_name}' could not be applied by any strategy: "
         f"line-number replacement "
         f"{'failed (stale lines — content mismatch, relocation failed)' if (start_line and end_line) else 'not available (no line numbers)'}; "
-        f"{len(operations)} SEARCH/REPLACE operation(s) available; "
+        f"{_ops_failure_detail or (str(len(operations)) + ' SEARCH/REPLACE operation(s) available')}; "
         f"original_code anchor {'not found in current file content' if original_code else 'missing'}. "
         f"The file content has changed since this edit was generated — re-analyze against the current file."
     )
+
+def _hunk_split_recover(file_content: str, original_code: str, new_code: str):
+    """Salvage a change whose anchor is stale by splitting it into hunks.
+
+    Diffs original_code → new_code line-wise, then relocates each changed
+    hunk (old-side lines plus expanding context) in the current file.  A hunk
+    is applied ONLY if its old-side text occurs exactly once in the current
+    file.  Returns the updated content, or None if any hunk is missing or
+    ambiguous (caller then raises the normal apply error).  Deterministic:
+    exact string matching only.
+    """
+    import difflib
+
+    old_lines = original_code.split("\n")
+    new_lines = new_code.split("\n")
+    cur_lines = file_content.split("\n")
+    n_cur = len(cur_lines)
+
+    sm = difflib.SequenceMatcher(None, old_lines, new_lines, autojunk=False)
+    raw = [(a1, a2, b1, b2) for tag, a1, a2, b1, b2 in sm.get_opcodes() if tag != "equal"]
+    if not raw or len(raw) > 50:
+        return None
+
+    def _find_unique(seq):
+        """Return start index of the single occurrence of seq in cur_lines, else None."""
+        if not seq:
+            return None
+        hits = []
+        first = seq[0]
+        for i in range(n_cur - len(seq) + 1):
+            if cur_lines[i] == first and cur_lines[i:i + len(seq)] == seq:
+                hits.append(i)
+                if len(hits) > 1:
+                    return None
+        return hits[0] if len(hits) == 1 else None
+
+    # Resolve each hunk to a (start, end, replacement_lines) span in cur_lines.
+    spans = []
+    for a1, a2, b1, b2 in raw:
+        located = None
+        for ctx in (2, 4, 8, 16):
+            ca1, ca2 = max(0, a1 - ctx), min(len(old_lines), a2 + ctx)
+            pre = old_lines[ca1:a1]
+            post = old_lines[a2:ca2]
+            seq = pre + old_lines[a1:a2] + post
+            if not seq:
+                continue
+            idx = _find_unique(seq)
+            if idx is not None:
+                replacement = pre + new_lines[b1:b2] + post
+                located = (idx, idx + len(seq), replacement)
+                break
+        if located is None:
+            return None
+        spans.append(located)
+
+    # Reject overlapping spans (context expansion can collide) and apply
+    # bottom-up so earlier indices stay valid.
+    spans.sort(key=lambda s: s[0])
+    for prev, nxt in zip(spans, spans[1:]):
+        if nxt[0] < prev[1]:
+            return None
+    for start, end, replacement in reversed(spans):
+        cur_lines[start:end] = replacement
+    return "\n".join(cur_lines)
+
 
 def apply_changes_to_file(
     file_path: str,
