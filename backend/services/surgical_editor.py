@@ -247,6 +247,24 @@ def apply_change(file_content: str, change) -> str:
     operations = getattr(change, "operations", None) or []
     symbol = getattr(change, "symbol", None)
 
+    # ── Idempotent re-apply detection (session 52802d58 apply-409 fix) ──
+    # If this change was ALREADY applied (its new_code is present verbatim in
+    # the file and its original_code no longer is), re-applying it used to fail
+    # every strategy and raise ValueError → 409 to the client, even though the
+    # file is already in the desired state (proven: Layout.tsx lines 14-92
+    # applied+saved at 21:54:25, identical re-apply 409'd at 21:54:52 in server
+    # log 1783375017500).  Treat that as a no-op success instead.
+    if (
+        new_code
+        and original_code
+        and len(new_code.strip()) >= 50
+        and new_code.strip() in file_content
+        and original_code.strip() not in file_content
+        and new_code.strip() != original_code.strip()
+    ):
+        change.applied = True
+        return file_content
+
     # ------------------------------------------------------------------
     # Determine whether to use the symbol-replacement (line-number) path
     # ------------------------------------------------------------------

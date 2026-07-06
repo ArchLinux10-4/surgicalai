@@ -12777,7 +12777,35 @@ async def run_natural_pipeline_stream(
                         # (L11558-11568).  All gap bridge edits for the same
                         # file share the name "_gap_bridge" so _symbol_accum
                         # chains them correctly (bottom-to-top sort safe).
-                        if not _correct_sym and edit_start_line and file_content:
+                        # ── Gap-bridge guard (session 52802d58 apply-409 fix) ──
+                        # When the model named the symbol CORRECTLY (exact name
+                        # match) but supplied stale line numbers (from an older
+                        # file snapshot), do NOT discard the exact match in
+                        # favor of a whole-file gap bridge.  A whole-file change
+                        # anchors on the ENTIRE analysis-time file, which can
+                        # never relocate after any drift → guaranteed 409 at
+                        # apply time (proven: 6/6 apply failures on lines 1-991
+                        # in server log 1783375017500).  Keeping the exact-name
+                        # symbol lets the snippet path fail naturally into the
+                        # correction loop, which re-anchors against CURRENT
+                        # symbol content and produces a precise, applyable edit.
+                        if not _correct_sym and match_method == "exact":
+                            _dlog("symbol_auto_resolve_gap_bridge_skipped",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  symbol_name=symbol.name,
+                                  symbol_range=(
+                                      f"{symbol.start_line}-{symbol.end_line}"
+                                  ),
+                                  edit_start_line=str(edit_start_line) if edit_start_line else None,
+                                  reason=(
+                                      "exact_name_match_kept: stale edit line "
+                                      "numbers must not override an exact symbol "
+                                      "match with an unrecoverable whole-file "
+                                      "change; routing to correction loop instead"
+                                  ),
+                                  user_id=user_id)
+                        elif not _correct_sym and edit_start_line and file_content:
                             _fc_lines = file_content.split("\n")
                             _fc_total = len(_fc_lines)
                             _target_line = int(edit_start_line)
