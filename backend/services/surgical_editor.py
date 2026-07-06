@@ -254,13 +254,24 @@ def apply_change(file_content: str, change) -> str:
     # file is already in the desired state (proven: Layout.tsx lines 14-92
     # applied+saved at 21:54:25, identical re-apply 409'd at 21:54:52 in server
     # log 1783375017500).  Treat that as a no-op success instead.
+    # NOTE on the original_code test below: for REPLACEMENT changes the old
+    # code must be gone.  But for INSERTION-type changes new_code CONTAINS
+    # original_code (the surrounding context anchor), so original_code never
+    # disappears from the file — and every re-apply used to insert ANOTHER
+    # copy (proven: SIDEBAR_PINNED_KEY constants block duplicated 5x in
+    # Sidebar.tsx, session 52802d58; reproduced 1→2→3 duplications with this
+    # exact function).  In that case new_code being present verbatim is
+    # sufficient proof the change is already applied.
     if (
         new_code
         and original_code
         and len(new_code.strip()) >= 50
         and new_code.strip() in file_content
-        and original_code.strip() not in file_content
         and new_code.strip() != original_code.strip()
+        and (
+            original_code.strip() not in file_content       # replacement: old gone
+            or original_code.strip() in new_code.strip()    # insertion: anchor kept by design
+        )
     ):
         change.applied = True
         return file_content
