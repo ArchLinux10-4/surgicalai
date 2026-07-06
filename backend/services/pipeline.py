@@ -2974,6 +2974,87 @@ def _apply_snippet_to_symbol(symbol_code: str, old_code: str, new_code: str):
     )
 
 
+def _locate_snippet_in_text(text: str, old_code: str):
+    """
+    Locate ``old_code`` inside ``text`` and return the EXACT verbatim substring
+    of ``text`` that it matched — suitable for a mechanical find/replace op.
+
+    Session 0183c92e fix: QA corrections are symbol-scoped, so a correction
+    that fixes the file's import line (the single most common QA fix) could
+    never splice — the import line lives outside the target symbol. This
+    helper lets the correction loop fall back to a whole-file match and store
+    the fix as a file-level operation.
+
+    Same matching ladder as _apply_snippet_to_symbol, and equally strict:
+      1. Exact, unique verbatim match.
+      2. Line-number-prefix strip ("NNN: ") then retry.
+      3. Whitespace-tolerant (tabs→spaces, trailing ws ignored), unique match —
+         returns the ORIGINAL bytes of the matched region.
+
+    Returns (verbatim_old, ok, reason).
+    """
+    if not old_code:
+        return None, False, "no old_code provided"
+    if not text:
+        return None, False, "empty file content"
+
+    def _try_exact(needle: str):
+        cnt = text.count(needle)
+        if cnt == 1:
+            return needle, True, "exact"
+        if cnt > 1:
+            return None, False, f"snippet appears {cnt} times in the file — ambiguous"
+        return None, None, "not found"
+
+    res, ok, reason = _try_exact(old_code)
+    if ok is not None:
+        return res, ok, reason
+
+    # Strip line-number prefixes Claude may have copied from search output.
+    _stripped_lines = []
+    _any_stripped = False
+    for _ln in old_code.splitlines():
+        _m = re.match(r'^\s*\d+:\s?(.*)$', _ln)
+        if _m:
+            _stripped_lines.append(_m.group(1))
+            _any_stripped = True
+        else:
+            _stripped_lines.append(_ln)
+    if _any_stripped:
+        stripped_old = "\n".join(_stripped_lines)
+        res, ok, reason = _try_exact(stripped_old)
+        if ok is not None:
+            return res, ok, reason
+        old_code = stripped_old
+
+    # Whitespace-tolerant line match — return the original bytes of the region.
+    def _norm_line(s: str) -> str:
+        return s.expandtabs(4).rstrip()
+
+    target = [_norm_line(l) for l in old_code.splitlines()]
+    if not target:
+        return None, False, "old_code is blank"
+    text_lines = text.splitlines(keepends=True)
+    n_t = len(target)
+    matches = []
+    for i in range(0, len(text_lines) - n_t + 1):
+        window = [_norm_line(text_lines[i + k].rstrip("\n").rstrip("\r")) for k in range(n_t)]
+        if window == target:
+            matches.append(i)
+    if len(matches) == 1:
+        i = matches[0]
+        region = "".join(text_lines[i:i + n_t])
+        # Trim the trailing newline so find/replace does not eat the separator.
+        if region.endswith("\n"):
+            region = region[:-1]
+            if region.endswith("\r"):
+                region = region[:-1]
+        return region, True, "whitespace-tolerant"
+    if len(matches) > 1:
+        return None, False, f"snippet matches {len(matches)} locations in the file — ambiguous"
+    return None, False, "snippet not found anywhere in the file"
+
+
 # ---------------------------------------------------------------------------
 # Helper: _apply_snippet_by_lines  (Option B — line-number targeted edit)
 # ---------------------------------------------------------------------------
@@ -11793,9 +11874,39 @@ async def run_natural_pipeline_stream(
                       total_requested=len(requested_files),
                       user_id=user_id)
 
+                # ── Missing-file honesty (session 0183c92e fix) ──────────────
+                # When a requested file is NOT in the session, the old message
+                # ("Write your <surgical_edit> blocks now") invited the model to
+                # invent an architectural workaround. Proven: the model asked for
+                # appStore.ts, got found=[], then re-implemented store state as
+                # local component state with a mismatched localStorage key — QA
+                # correctly blocked it at 3/10. Tell the model to surface the
+                # missing file to the user instead of improvising.
+                _missing_fnames = [fn for fn in new_fnames if fn not in requested_files]
+                _missing_note = ""
+                if _missing_fnames:
+                    _missing_note = (
+                        "\n\n\u26a0\ufe0f MISSING FILES: "
+                        + ", ".join(_missing_fnames)
+                        + " — these files are NOT loaded in this session and you cannot "
+                        "see or edit them.\n"
+                        "RULES for missing files:\n"
+                        "1. Do NOT invent a workaround that re-architects around the "
+                        "missing file (e.g. duplicating store/context state locally, "
+                        "inventing new storage keys, or re-declaring shared logic).\n"
+                        "2. If the correct implementation requires editing a missing "
+                        "file, say so PLAINLY in prose before any edit blocks: name the "
+                        "file, describe the exact change it needs, and tell the user to "
+                        "add that file to the session and re-run.\n"
+                        "3. Only emit <surgical_edit> blocks that remain fully correct "
+                        "even without the missing file. If no such edit exists, emit no "
+                        "edit blocks — an honest explanation beats a broken change."
+                    )
+
                 file_injection = (
                     "Here are the files you requested:\n\n"
                     + "\n\n".join(file_result_parts)
+                    + _missing_note
                     + "\n\nWrite your complete <surgical_edit> or <new_file> blocks now. "
                     "Use the EXACT symbol names shown above."
                 )
@@ -14534,6 +14645,7 @@ async def run_natural_pipeline_stream(
                                   note="windowed prompt sent but model used old_code/new_code format — trying Path 2")
 
                         # ── Path 2: old_code/new_code snippet splice (fallback) ──
+                        _file_level_fixed = False
                         if accepted is None and corrected_code and corrected_old:
                             _dlog("correction_old_code_splice_attempt",
                                   session_id=session_id, user_id=user_id,
@@ -14565,6 +14677,69 @@ async def run_natural_pipeline_stream(
                                       old_code_preview=corrected_old[:200],
                                       new_code_preview=corrected_code[:200],
                                       splice_reason=_snip_reason)
+
+                                # ── Path 2b: FILE-LEVEL fallback (session 0183c92e fix) ──
+                                # Corrections were symbol-scoped, so a fix to the
+                                # file's import line (the most common QA fix — e.g.
+                                # "add useCallback to the react import") could NEVER
+                                # apply: the import line is outside the target symbol.
+                                # Proven in session 0183c92e: the correction model
+                                # produced the exact right old_code/new_code for the
+                                # import line and the splice failed with "not found
+                                # verbatim in the target symbol", shipping the broken
+                                # edit. Fallback: locate old_code in the FULL file;
+                                # if it matches exactly one region OUTSIDE the symbol,
+                                # store it as a companion file-level operation that is
+                                # applied together with the symbol edit.
+                                _flv_file = change_shells[idx].get("file_content") or ""
+                                _flv_old, _flv_ok, _flv_reason = _locate_snippet_in_text(
+                                    _flv_file, corrected_old
+                                )
+                                if _flv_ok and _flv_old and _flv_old not in _sym_code:
+                                    _flv_op = {"find": _flv_old, "replace": corrected_code}
+                                    change_shells[idx].setdefault("_extra_ops", []).append(_flv_op)
+                                    # Surface the companion edit in the change diff.
+                                    try:
+                                        change_shells[idx]["diff"] = (
+                                            (change_shells[idx].get("diff") or "")
+                                            + "\n"
+                                            + _make_diff(
+                                                _flv_old, corrected_code,
+                                                f"{change_shells[idx]['symbol'].name} (file-level companion)"
+                                            )
+                                        )
+                                    except Exception:
+                                        pass
+                                    # Make re-QA aware the companion edit ships with
+                                    # this change (otherwise it re-blocks on the same
+                                    # missing import it just fixed).
+                                    change_shells[idx]["same_run"] = (
+                                        (change_shells[idx].get("same_run") or "")
+                                        + "\n  \u2022 [file-level companion edit in "
+                                        + f"{change_shells[idx]['filename']}] applied together "
+                                        "with this change:\n"
+                                        + "    BEFORE: " + _flv_old[:300].replace("\n", "\n    ") + "\n"
+                                        + "    AFTER:  " + corrected_code[:300].replace("\n", "\n    ")
+                                    )
+                                    _file_level_fixed = True
+                                    if idx not in fixed_indices:
+                                        fixed_indices.append(idx)
+                                    _dlog("correction_file_level_op_accepted",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          match_kind=_flv_reason,
+                                          find_preview=_flv_old[:200],
+                                          replace_preview=corrected_code[:200],
+                                          extra_ops_count=len(change_shells[idx]["_extra_ops"]))
+                                else:
+                                    _dlog("correction_file_level_op_rejected",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          reason=(_flv_reason if not _flv_ok
+                                                  else "match lies inside the target symbol — symbol splice should have handled it"),
+                                          old_code_preview=corrected_old[:200])
 
                         # ── Path 3: Full new_code replacement (fragment-checked) ──
                         # SKIP if windowed correction was used — the corrected_code
@@ -15139,7 +15314,11 @@ async def run_natural_pipeline_stream(
                 description=cs["description"],
                 applied=False,
                 qa_result=qa_result_obj,
-                operations=[{"find": symbol.code, "replace": cs["new_code"]}],
+                # Companion file-level ops (e.g. import-line fixes from the
+                # correction loop) ride along after the sentinel symbol op;
+                # apply_change applies them to the same file in the same apply.
+                operations=[{"find": symbol.code, "replace": cs["new_code"]}]
+                           + list(cs.get("_extra_ops") or []),
                 target_element=cs["_tgt"],
                 replacement=cs["_repl"],
             )

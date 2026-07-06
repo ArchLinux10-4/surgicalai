@@ -247,6 +247,46 @@ def apply_change(file_content: str, change) -> str:
     operations = getattr(change, "operations", None) or []
     symbol = getattr(change, "symbol", None)
 
+    def _op_get(op, key, default=""):
+        return op.get(key, default) if isinstance(op, dict) else getattr(op, key, default)
+
+    # ── Companion (file-level) operations — session 0183c92e fix ────────
+    # The pipeline may attach extra find/replace ops AFTER the sentinel
+    # {"find": symbol.code, "replace": new_code} op — e.g. an import-line fix
+    # produced by the QA correction loop that lives OUTSIDE the symbol.
+    # Detect the sentinel-first pattern here so the symbol edit still uses the
+    # reliable line-number path and the companions apply mechanically after it.
+    companion_ops: list = []
+    _sentinel_first = False
+    if new_code and symbol is not None and operations:
+        _sym_code_probe = (getattr(symbol, "code", None) or original_code or "").strip()
+        if (
+            _sym_code_probe
+            and _op_get(operations[0], "find", "").strip() == _sym_code_probe
+            and _op_get(operations[0], "replace", "").strip() == new_code.strip()
+        ):
+            _sentinel_first = True
+            companion_ops = list(operations[1:])
+
+    def _apply_companion_ops(content: str) -> str:
+        for _cop in companion_ops:
+            _f = _op_get(_cop, "find", "")
+            _r = _op_get(_cop, "replace", "")
+            if not _f:
+                continue
+            if _f in content:
+                content = content.replace(_f, _r, 1)
+            elif _r and _r in content:
+                # Already applied (idempotent re-apply) — skip.
+                continue
+            else:
+                import logging as _logging
+                _logging.getLogger("surgical_editor").warning(
+                    "companion op did not match file (find=%r...) — skipped",
+                    _f[:80],
+                )
+        return content
+
     # ── Idempotent re-apply detection (session 52802d58 apply-409 fix) ──
     # If this change was ALREADY applied (its new_code is present verbatim in
     # the file and its original_code no longer is), re-applying it used to fail
@@ -274,7 +314,10 @@ def apply_change(file_content: str, change) -> str:
         )
     ):
         change.applied = True
-        return file_content
+        # Companion ops (e.g. an import-line fix) must still land even when the
+        # symbol edit itself is already present. _apply_companion_ops is
+        # idempotent, so a full re-apply stays a no-op.
+        return _apply_companion_ops(file_content)
 
     # ------------------------------------------------------------------
     # Determine whether to use the symbol-replacement (line-number) path
