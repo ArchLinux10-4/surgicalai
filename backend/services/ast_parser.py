@@ -327,6 +327,17 @@ class ASTParser:
                 if name:
                     _add(name, "FUNCTION", target)
 
+            elif decl_node.type in (
+                "interface_declaration", "type_alias_declaration", "enum_declaration",
+            ):
+                # TS-only declarations (e.g. `interface AppState { ... }`).
+                # Previously invisible — edits targeting them failed with
+                # "Symbol NOT FOUND", and files made only of interfaces +
+                # store factories (zustand appStore.ts) produced empty maps.
+                name = _node_name(decl_node)
+                if name:
+                    _add(name, "CLASS", target)
+
             elif decl_node.type in ("class_declaration", "abstract_class_declaration"):
                 name = _node_name(decl_node)
                 if name:
@@ -374,6 +385,8 @@ class ASTParser:
                         "function_declaration", "generator_function_declaration",
                         "class_declaration", "abstract_class_declaration",
                         "lexical_declaration", "variable_declaration",
+                        "interface_declaration", "type_alias_declaration",
+                        "enum_declaration",
                     ):
                         inner = ec
                         break
@@ -389,6 +402,8 @@ class ASTParser:
                 "function_declaration", "generator_function_declaration",
                 "class_declaration", "abstract_class_declaration",
                 "lexical_declaration", "variable_declaration",
+                "interface_declaration", "type_alias_declaration",
+                "enum_declaration",
             ):
                 _process_decl(child)
 
@@ -454,6 +469,20 @@ class ASTParser:
             r"^(export\s+)?(const|let|var)\s+(\w+)(?:\s*:\s*[^=\n]+?)?\s*=\s*(async\s+)?\(.*?\)\s*=>",
             re.MULTILINE,
         )
+        # TS interface / type alias / enum declarations — previously invisible
+        # to the regex fallback, which made pure-TS files (interfaces + store
+        # factories) parse to ZERO symbols.
+        iface_re = re.compile(
+            r"^(export\s+)?(interface|enum)\s+(\w+)", re.MULTILINE
+        )
+        # const X = someFactory(...) — call-expression initializers such as
+        # zustand's `export const useAppStore = create<AppState>((set) => ({`.
+        # arrow_re misses these because the RHS starts with an identifier,
+        # not a parameter list.
+        factory_re = re.compile(
+            r"^(export\s+)?(const|let|var)\s+(\w+)(?:\s*:\s*[^=\n]+?)?\s*=\s*[\w.]+\s*(?:<[^>\n]*>)?\s*\(",
+            re.MULTILINE,
+        )
 
         class_spans = []
         for m in class_re.finditer(source):
@@ -508,6 +537,51 @@ class ASTParser:
                 )
             )
 
+        seen = {(s.name, s.start_line) for s in symbols}
+
+        for m in iface_re.finditer(source):
+            line_no = source[: m.start()].count("\n") + 1
+            name = m.group(3)
+            if (name, line_no) in seen:
+                continue
+            end_line = self._find_block_end(lines, line_no - 1)
+            seen.add((name, line_no))
+            symbols.append(
+                SymbolInfo(
+                    name=name,
+                    symbol_type=SymbolType.CLASS,
+                    start_line=line_no,
+                    end_line=end_line,
+                    parent=None,
+                    indentation=0,
+                    code="\n".join(lines[line_no - 1 : end_line]),
+                    signature=m.group(0).strip(),
+                )
+            )
+
+        for m in factory_re.finditer(source):
+            line_no = source[: m.start()].count("\n") + 1
+            name = m.group(3)
+            if any(name == n and abs(line_no - l) < 1 for n, l in seen):
+                continue
+            end_line = self._find_block_end(lines, line_no - 1)
+            if end_line - line_no + 1 < 3:
+                continue  # single-line consts stay out of the map (matches tree-sitter path)
+            seen.add((name, line_no))
+            symbols.append(
+                SymbolInfo(
+                    name=name,
+                    symbol_type=SymbolType.FUNCTION,
+                    start_line=line_no,
+                    end_line=end_line,
+                    parent=None,
+                    indentation=0,
+                    code="\n".join(lines[line_no - 1 : end_line]),
+                    signature=m.group(0).strip(),
+                )
+            )
+
+        symbols.sort(key=lambda s: s.start_line)
         return symbols
 
     def _parse_go(self, source: str, lines: List[str]) -> List[SymbolInfo]:
