@@ -732,6 +732,7 @@ export function ChatPanel() {
   const [isDragging, setIsDragging] = useState(false)
   const [uploadingFiles, setUploadingFiles] = useState(false)
   const [isBuildingEdit, setIsBuildingEdit] = useState(false)
+  const [isComposerExpanded, setIsComposerExpanded] = useState(false)
 
   // Consume pending input injected from sidebar components (e.g. deploy watcher "Ask Claude to fix")
   useEffect(() => {
@@ -741,6 +742,16 @@ export function ChatPanel() {
       setTimeout(() => textareaRef.current?.focus(), 50)
     }
   }, [pendingChatInput])
+
+  // Resize the composer immediately when expand/collapse is toggled, so any
+  // existing text reflows to fit the new max-height right away.
+  useEffect(() => {
+    const el = textareaRef.current
+    if (!el) return
+    const maxHeight = isComposerExpanded ? 480 : 200
+    el.style.height = 'auto'
+    el.style.height = Math.min(el.scrollHeight, maxHeight) + 'px'
+  }, [isComposerExpanded])
 
   const [progressHistory, setProgressHistory] = useState<string[]>([])
   const [thinkingText, setThinkingText] = useState('')
@@ -1776,7 +1787,15 @@ export function ChatPanel() {
         )}
 
         {/* Unified input pill — Claude/Tasklet style */}
-        <div className="flex flex-col bg-surface/80 border border-border/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-border focus-within:shadow-accent/5 transition-all">
+        <div className="relative flex flex-col bg-surface/80 border border-border/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-border focus-within:shadow-accent/5 transition-all">
+          <button
+            type="button"
+            onClick={() => setIsComposerExpanded(prev => !prev)}
+            className="absolute top-2 right-2 z-10 h-6 px-2 rounded-md text-[10px] font-medium text-muted/60 hover:text-ink/80 hover:bg-overlay/60 transition-colors flex items-center gap-1"
+            title={isComposerExpanded ? 'Collapse input' : 'Expand input'}
+          >
+            {isComposerExpanded ? '⤡ Collapse' : '⤢ Expand'}
+          </button>
           <textarea
             ref={textareaRef}
             value={input}
@@ -1793,10 +1812,12 @@ export function ChatPanel() {
             rows={1}
             onInput={(e) => {
               const el = e.currentTarget
+              const maxHeight = isComposerExpanded ? 480 : 200
               el.style.height = 'auto'
-              el.style.height = Math.min(el.scrollHeight, 200) + 'px'
+              el.style.height = Math.min(el.scrollHeight, maxHeight) + 'px'
             }}
-            className="w-full bg-transparent text-sm text-ink placeholder:text-muted/70 resize-none px-4 pt-3 pb-2 focus:outline-none leading-relaxed font-[inherit] min-h-[44px] max-h-[200px] overflow-y-auto"
+            style={{ maxHeight: isComposerExpanded ? 480 : 200 }}
+            className="w-full bg-transparent text-sm text-ink placeholder:text-muted/70 resize-none px-4 pr-16 pt-3 pb-2 focus:outline-none leading-relaxed font-[inherit] min-h-[44px] max-h-[200px] overflow-y-auto"
           />
           {/* Bottom toolbar — flex row below textarea, never overlaps */}
           <div className="flex items-center justify-between px-2 pb-2">
