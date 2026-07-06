@@ -5982,9 +5982,14 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
     for _qa_attempt in range(2):
       try:
         if _qa_use_claude:
+            # max_tokens raised 1500 → 4000: session dd543a3a logged
+            # block_types=["thinking"] with raw_len=0 on both attempts —
+            # the response contained ONLY a thinking block and no text,
+            # so 1500 total tokens left no room for the JSON verdict.
+            # Attempt 2 gets extra headroom on top of that.
             _qa_msg = await _qa_aclient.messages.create(
                 model=_qa_model,
-                max_tokens=1500,
+                max_tokens=4000 if _qa_attempt == 0 else 6000,
                 system=QA_SYSTEM,
                 messages=[
                     {"role": "user", "content": user_msg},
@@ -5997,7 +6002,27 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
             ).strip()
             _dlog("qa_response_blocks", session_id=session_id,
                   block_count=len(_qa_msg.content),
-                  block_types=[getattr(_qb, "type", "?") for _qb in _qa_msg.content])
+                  block_types=[getattr(_qb, "type", "?") for _qb in _qa_msg.content],
+                  # stop_reason/output_tokens were NOT logged in session
+                  # dd543a3a, which made the empty-response mechanism
+                  # unprovable. Log them so the next occurrence is provable.
+                  stop_reason=getattr(_qa_msg, "stop_reason", None),
+                  output_tokens=getattr(getattr(_qa_msg, "usage", None), "output_tokens", None))
+            if not _qa_raw_text:
+                # Empty text (e.g. thinking-only response). Raise a clear,
+                # typed error so the retry loop fires with a logged cause
+                # instead of an opaque JSONDecodeError on "".
+                _dlog("qa_agent_empty_text",
+                      session_id=session_id, filename=filename,
+                      symbol=symbol_path, model=_qa_model,
+                      attempt=_qa_attempt,
+                      stop_reason=getattr(_qa_msg, "stop_reason", None),
+                      block_types=[getattr(_qb, "type", "?") for _qb in _qa_msg.content],
+                      user_id=user_id)
+                raise ValueError(
+                    f"QA model returned no text blocks "
+                    f"(stop_reason={getattr(_qa_msg, 'stop_reason', None)})"
+                )
             _dlog("qa_agent_raw_response",
                   session_id=session_id, filename=filename,
                   symbol=symbol_path, model=_qa_model,
@@ -13512,6 +13537,22 @@ async def run_natural_pipeline_stream(
                     # Merge structural issues into LLM QA result so the retry
                     # prompt includes them and Claude knows exactly what to fix.
                     _sq_msgs = [f"[STRUCTURAL] {si['message']}" for si in _sq_issues if si["severity"] == "error"]
+                    # Log the ACTUAL issue messages — in session dd543a3a only
+                    # the count ("2 blocking issue(s)") was recoverable from
+                    # logs; the messages went solely to the SSE stream and
+                    # retry prompt, making root-cause analysis impossible.
+                    _dlog("structural_qa_blocking",
+                          session_id=session_id,
+                          filename=_sq_fname,
+                          symbol=_sq_cs["symbol"].name,
+                          blocking_count=len(_sq_msgs),
+                          messages=[m[:300] for m in _sq_msgs],
+                          all_issues=[{"severity": si["severity"],
+                                       "message": si["message"][:300]}
+                                      for si in _sq_issues],
+                          prior_llm_verdict=qa_results[_sq_i].get("verdict"),
+                          prior_llm_score=qa_results[_sq_i].get("qa_score"),
+                          user_id=user_id)
                     qa_results[_sq_i]["import_issues"] = (
                         qa_results[_sq_i].get("import_issues", []) + _sq_msgs
                     )
@@ -14738,6 +14779,12 @@ async def run_natural_pipeline_stream(
                             _mw_corrected = list(_mw_raw_lines)
 
                         # ── Boundary dedup (same logic as single-window) ──
+                        # NOTE: _mw_ws0/_mw_we0 MUST be assigned before this
+                        # block — they were previously assigned only at the
+                        # splice step below, causing UnboundLocalError on the
+                        # first processed window (see correction_multi_window_error).
+                        _mw_ws0 = _mw_winfo["window_start"]
+                        _mw_we0 = _mw_winfo["window_end"]
                         _mw_broken_lines_pre = _mw_running_code.splitlines()
                         _mw_suffix_after = _mw_broken_lines_pre[_mw_we0 + 1:]
                         if _mw_suffix_after and _mw_corrected:
@@ -14757,9 +14804,8 @@ async def run_natural_pipeline_stream(
                                 _mw_corrected = _mw_corrected[:-_mw_overlap]
 
                         # ── Splice into running code ──
+                        # (_mw_ws0/_mw_we0 assigned above, before boundary dedup)
                         _mw_broken_lines = _mw_running_code.splitlines()
-                        _mw_ws0 = _mw_winfo["window_start"]
-                        _mw_we0 = _mw_winfo["window_end"]
 
                         if _mw_we0 >= len(_mw_broken_lines) or _mw_ws0 < 0 or _mw_ws0 > _mw_we0:
                             _dlog("correction_multi_window_bounds_invalid",
