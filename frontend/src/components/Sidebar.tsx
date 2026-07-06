@@ -728,31 +728,22 @@ function LinearIcon({ size = 16 }: { size?: number }) {
 }
 
 export function Sidebar() {
-  const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, sidebarPanelOpen, setSidebarPanelOpen, imageStudioOpen, setImageStudioOpen } = useAppStore()
+  const {
+    sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, sidebarPanelOpen, setSidebarPanelOpen,
+    imageStudioOpen, setImageStudioOpen, sidebarPinned: pinned, setSidebarPinned: persistPinned,
+  } = useAppStore()
   const { theme, toggleTheme } = useThemeStore()
   const { user, logout } = useAuthStore()
 
   // `pinned` = user has explicitly (manually) expanded the panel — persists
-  // across reloads. `hovering` = transient hover-preview flyout (Cloudflare-
+  // across reloads (sourced from the app store, which persists it to
+  // localStorage). `hovering` = transient hover-preview flyout (Cloudflare-
   // style), never persisted, auto-collapses shortly after the mouse leaves.
-  const [pinned, setPinned] = useState<boolean>(() => {
-    try {
-      const stored = localStorage.getItem(SIDEBAR_PINNED_KEY)
-      return stored === null ? true : stored === 'true'
-    } catch {
-      return true
-    }
-  })
   const [hovering, setHovering] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
   const userMenuRef = useRef<HTMLDivElement>(null)
   const openTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  const persistPinned = (value: boolean) => {
-    setPinned(value)
-    try { localStorage.setItem(SIDEBAR_PINNED_KEY, String(value)) } catch { /* ignore */ }
-  }
 
   // Sync external open requests (e.g. from NewFileCard "Add to session")
   useEffect(() => {
@@ -821,6 +812,19 @@ export function Sidebar() {
     setHovering(false)
   }
 
+  // Always-visible rail toggle — expands/collapses the panel regardless of
+  // which tab is currently selected, without requiring a hover or a click on
+  // a specific nav icon.
+  const toggleSidebar = () => {
+    cancelTimers()
+    if (panelVisible) {
+      persistPinned(false)
+      setHovering(false)
+    } else {
+      persistPinned(true)
+    }
+  }
+
   const fileCount = sessionFiles.length
   const initials = (user?.username ?? 'U').slice(0, 2).toUpperCase()
 
@@ -836,6 +840,17 @@ export function Sidebar() {
         <div className="mb-2 flex items-center justify-center w-8 h-8">
           <img src="/otter.png" alt="SurgicalAI" className="w-7 h-7 rounded-md" />
         </div>
+
+        {/* Expand/collapse toggle — always visible, independent of which tab is selected */}
+        <button
+          onClick={toggleSidebar}
+          title={panelVisible ? 'Collapse sidebar' : 'Expand sidebar'}
+          className="flex items-center justify-center w-8 h-8 rounded-lg text-muted hover:text-ink hover:bg-overlay transition-all mb-1"
+        >
+          <KeyboardArrowLeft
+            sx={{ fontSize: 16, transition: 'transform 150ms ease', transform: panelVisible ? 'none' : 'rotate(180deg)' }}
+          />
+        </button>
 
         {/* Nav icons */}
         {RAIL_ITEMS.map(({ id, icon: Icon, tooltip }) => {
