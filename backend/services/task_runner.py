@@ -400,14 +400,32 @@ async def _run_integration_qa(session_id: str, run_id: str, user_id: str):
         client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         resp = await client.messages.create(
             model="claude-sonnet-5",  # QA is always Sonnet (upgraded from 4.5, matches pipeline QA sites)
-            max_tokens=1000,
+            # 1000 → 4000: proven in run dd543a3a (pipeline QA, same model) that
+            # a small budget can be fully consumed by a thinking block, leaving
+            # zero text blocks. Here that would have parsed to {} and defaulted
+            # the verdict to "pass" — a false green light.
+            max_tokens=4000,
             system=_INTEGRATION_QA_SYSTEM,
             messages=[{"role": "user", "content": user_block}],
         )
         raw = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        _block_types = [getattr(b, "type", "?") for b in resp.content]
+        _dlog("runner_iqa_response", session_id=session_id, run_id=run_id,
+              stop_reason=getattr(resp, "stop_reason", None),
+              output_tokens=getattr(getattr(resp, "usage", None), "output_tokens", None),
+              block_types=_block_types, raw_len=len(raw))
 
         from services.task_planner import _extract_json
         parsed = _extract_json(raw) or {}
+        if not parsed:
+            # Do NOT default an unparseable/empty QA response to "pass".
+            _dlog("runner_iqa_unparseable", session_id=session_id, run_id=run_id,
+                  raw_len=len(raw), raw_head=raw[:200])
+            from routers.chat import _save_run_note
+            _save_run_note(session_id,
+                           "🔍 Integration QA could not run (model returned no "
+                           "parseable result). Advisory only — run is unaffected.")
+            return
         verdict = (parsed.get("verdict") or "pass").strip().lower()
         issues = [str(i).strip() for i in (parsed.get("issues") or []) if str(i).strip()]
         summary = (parsed.get("summary") or "").strip()

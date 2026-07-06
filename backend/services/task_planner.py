@@ -134,19 +134,35 @@ async def plan_tasks(message: str, session_files: list, user_id: str = "") -> di
         client = AsyncAnthropic(api_key=anthropic_key)
         resp = await client.messages.create(
             model=model,
-            max_tokens=2000,
+            # 2000 → 6000: proven in run dd543a3a (pipeline QA site, same model)
+            # that claude-sonnet-5 can spend the entire budget on a thinking
+            # block and return ZERO text blocks, which here would silently
+            # yield an empty plan and disable Agent Mode for the request.
+            max_tokens=6000,
             system=_PLANNER_SYSTEM,
             messages=[{"role": "user", "content": user_block}],
         )
         raw = "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         )
+        _block_types = [getattr(b, "type", "?") for b in resp.content]
+        _stop = getattr(resp, "stop_reason", None)
+        _otoks = getattr(getattr(resp, "usage", None), "output_tokens", None)
+        print(f"[task_planner] plan response stop_reason={_stop} "
+              f"output_tokens={_otoks} block_types={_block_types} raw_len={len(raw)}")
+        if not raw.strip():
+            # Loud, attributable failure instead of a silent empty plan.
+            print(f"[task_planner] EMPTY TEXT from model (stop_reason={_stop}, "
+                  f"block_types={_block_types}) — planner degraded to no-task fallback")
     except Exception as exc:
         print(f"[task_planner] plan call failed: {exc}")
         return {"preamble": "", "tasks": []}
 
     parsed = _extract_json(raw)
     if not parsed:
+        if raw.strip():
+            print(f"[task_planner] response had text but no parseable JSON "
+                  f"(raw_len={len(raw)}, head={raw[:120]!r})")
         return {"preamble": "", "tasks": []}
 
     tasks = []
