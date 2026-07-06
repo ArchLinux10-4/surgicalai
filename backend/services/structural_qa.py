@@ -183,12 +183,33 @@ def _check_missing_imports(
     """
     issues = []
 
-    # Find all import statements
-    import_block = "\n".join(
-        line for line in code.splitlines()
-        if line.strip().startswith("import ") or line.strip().startswith("} from ")
-        or "from '" in line or 'from "' in line
-    )
+    # Find all import statements — in the edit snippet, in the FULL original
+    # file, and in any sibling edits to the same file in this batch.
+    #
+    # False-positive fix (session 52802d58): symbol-scoped edits (e.g. a
+    # replacement of just the `Sidebar` function) naturally contain no import
+    # lines, but the file's top-of-file imports still apply. Previously only
+    # `code` (the snippet) was scanned, so hooks like useAppStore that were
+    # imported at file top (Sidebar.tsx L2) were flagged as "never imported"
+    # and the QA score was wrongly forced to 3/10.
+    def _import_lines(src: str) -> str:
+        return "\n".join(
+            line for line in src.splitlines()
+            if line.strip().startswith("import ") or line.strip().startswith("} from ")
+            or "from '" in line or 'from "' in line
+        )
+
+    import_block = _import_lines(code)
+    if file_content:
+        import_block += "\n" + _import_lines(file_content)
+    if all_changes:
+        for _ch in all_changes:
+            if not isinstance(_ch, dict):
+                continue
+            _ch_file = _ch.get("filename") or ""
+            if _ch_file and filename and _ch_file != filename:
+                continue
+            import_block += "\n" + _import_lines(_ch.get("new_code") or "")
 
     # Find all useXxx calls in the code body (not in import lines)
     non_import_code = "\n".join(
@@ -213,9 +234,11 @@ def _check_missing_imports(
 
         # Check if it's imported
         if hook_name not in import_block:
-            # Maybe it's defined in this same file
+            # Maybe it's defined in this same file (snippet OR full file)
             def_pattern = rf"(?:function|const)\s+{re.escape(hook_name)}\b"
-            if not re.search(def_pattern, code):
+            if not re.search(def_pattern, code) and not (
+                file_content and re.search(def_pattern, file_content)
+            ):
                 issues.append(_error(
                     "missing_import",
                     f"Hook '{hook_name}' is called but never imported. "

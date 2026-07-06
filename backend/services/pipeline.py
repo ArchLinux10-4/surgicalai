@@ -4094,7 +4094,14 @@ async def analyze_and_plan_stream(
                 _sq_new = getattr(_sq_ch, "new_code", "") or ""
                 _sq_orig = getattr(_sq_ch, "original_code", "") or ""
                 _sq_fname = file_path or ""
-                _sq_issues = run_structural_qa(_sq_new, _sq_orig, _sq_fname)
+                _sq_issues = run_structural_qa(
+                    _sq_new, _sq_orig, _sq_fname,
+                    file_content=file_content or "",
+                    all_changes=[
+                        {"filename": file_path or "", "new_code": getattr(_c, "new_code", "") or ""}
+                        for _c in changes
+                    ],
+                )
                 if _sq_blocking(_sq_issues):
                     _sq_has_errors = True
                     _sq_msgs = [si["message"] for si in _sq_issues if si["severity"] == "error"]
@@ -4321,7 +4328,14 @@ async def analyze_and_plan_stream(
                                 for _sq_ch2 in changes:
                                     _sq_n2 = getattr(_sq_ch2, "new_code", "") or ""
                                     _sq_o2 = getattr(_sq_ch2, "original_code", "") or ""
-                                    _sq_i2 = run_structural_qa(_sq_n2, _sq_o2, file_path or "")
+                                    _sq_i2 = run_structural_qa(
+                                        _sq_n2, _sq_o2, file_path or "",
+                                        file_content=file_content or "",
+                                        all_changes=[
+                                            {"filename": file_path or "", "new_code": getattr(_c, "new_code", "") or ""}
+                                            for _c in changes
+                                        ],
+                                    )
                                     if _sq_blocking(_sq_i2):
                                         _sq_still_bad = True
                                         _sq_m2 = [x["message"] for x in _sq_i2 if x["severity"] == "error"]
@@ -4422,7 +4436,14 @@ async def analyze_and_plan_stream(
                                     for _sq_ch2 in changes:
                                         _sq_n2 = getattr(_sq_ch2, "new_code", "") or ""
                                         _sq_o2 = getattr(_sq_ch2, "original_code", "") or ""
-                                        _sq_i2 = run_structural_qa(_sq_n2, _sq_o2, file_path or "")
+                                        _sq_i2 = run_structural_qa(
+                                        _sq_n2, _sq_o2, file_path or "",
+                                        file_content=file_content or "",
+                                        all_changes=[
+                                            {"filename": file_path or "", "new_code": getattr(_c, "new_code", "") or ""}
+                                            for _c in changes
+                                        ],
+                                    )
                                         if _sq_blocking(_sq_i2):
                                             _sq_still_bad = True
                                             _sq_m2 = [x["message"] for x in _sq_i2 if x["severity"] == "error"]
@@ -13532,7 +13553,17 @@ async def run_natural_pipeline_stream(
                 _sq_new   = _sq_cs["new_code"]
                 _sq_orig  = _sq_cs["symbol"].code
                 _sq_fname = _sq_cs["filename"]
-                _sq_issues = run_structural_qa(_sq_new, _sq_orig, _sq_fname)
+                # Pass the FULL original file + sibling edits so top-of-file
+                # imports are visible to the missing-import check (session
+                # 52802d58 false-positive fix).
+                _sq_issues = run_structural_qa(
+                    _sq_new, _sq_orig, _sq_fname,
+                    file_content=_sq_cs.get("file_content") or "",
+                    all_changes=[
+                        {"filename": _s.get("filename"), "new_code": _s.get("new_code")}
+                        for _s in change_shells
+                    ],
+                )
                 if _has_sq_blocking(_sq_issues):
                     # Merge structural issues into LLM QA result so the retry
                     # prompt includes them and Claude knows exactly what to fix.
