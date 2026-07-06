@@ -10,7 +10,7 @@ import { LinearPanel } from './LinearPanel'
 import { VercelPanel } from './VercelPanel'
 import { RailwayPanel } from './RailwayPanel'
 import { useThemeStore } from '../stores/themeStore'
-import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, Search, Settings } from '@mui/icons-material';
+import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile } from '../lib/fileClassify'
 import { DownloadSessionButton } from './DownloadSessionButton'
 
@@ -715,6 +715,10 @@ function RailwayIcon({ size = 16 }: { size?: number }) {
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
 // Linear icon (inline SVG)
+const SIDEBAR_PINNED_KEY = 'surgicalai_sidebar_pinned'
+const HOVER_OPEN_DELAY = 150
+const HOVER_CLOSE_DELAY = 250
+
 function LinearIcon({ size = 16 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 100 100" fill="currentColor">
@@ -727,14 +731,33 @@ export function Sidebar() {
   const { sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, sidebarPanelOpen, setSidebarPanelOpen, imageStudioOpen, setImageStudioOpen } = useAppStore()
   const { theme, toggleTheme } = useThemeStore()
   const { user, logout } = useAuthStore()
-  const [panelOpen, setPanelOpen] = useState(true)
+
+  // `pinned` = user has explicitly (manually) expanded the panel — persists
+  // across reloads. `hovering` = transient hover-preview flyout (Cloudflare-
+  // style), never persisted, auto-collapses shortly after the mouse leaves.
+  const [pinned, setPinned] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem(SIDEBAR_PINNED_KEY)
+      return stored === null ? true : stored === 'true'
+    } catch {
+      return true
+    }
+  })
+  const [hovering, setHovering] = useState(false)
   const [userMenuOpen, setUserMenuOpen] = useState(false)
   const userMenuRef = useRef<HTMLDivElement>(null)
+  const openTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const closeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const persistPinned = (value: boolean) => {
+    setPinned(value)
+    try { localStorage.setItem(SIDEBAR_PINNED_KEY, String(value)) } catch { /* ignore */ }
+  }
 
   // Sync external open requests (e.g. from NewFileCard "Add to session")
   useEffect(() => {
     if (sidebarPanelOpen) {
-      setPanelOpen(true)
+      persistPinned(true)
       setSidebarPanelOpen(false)
     }
   }, [sidebarPanelOpen, setSidebarPanelOpen])
@@ -750,13 +773,52 @@ export function Sidebar() {
     return () => document.removeEventListener('mousedown', handleClick)
   }, [])
 
+  // Clear any pending hover timers on unmount to avoid state updates after unmount
+  useEffect(() => {
+    return () => {
+      if (openTimerRef.current) clearTimeout(openTimerRef.current)
+      if (closeTimerRef.current) clearTimeout(closeTimerRef.current)
+    }
+  }, [])
+
+  const cancelTimers = () => {
+    if (openTimerRef.current) { clearTimeout(openTimerRef.current); openTimerRef.current = null }
+    if (closeTimerRef.current) { clearTimeout(closeTimerRef.current); closeTimerRef.current = null }
+  }
+
+  // Hover-to-preview: entering the rail/panel area briefly expands the panel
+  // (like Cloudflare's dashboard nav) without persisting or reflowing layout,
+  // as long as the user hasn't manually pinned it open already.
+  const handleMouseEnter = () => {
+    if (pinned) return
+    cancelTimers()
+    openTimerRef.current = setTimeout(() => setHovering(true), HOVER_OPEN_DELAY)
+  }
+
+  const handleMouseLeave = () => {
+    if (pinned) return
+    cancelTimers()
+    closeTimerRef.current = setTimeout(() => setHovering(false), HOVER_CLOSE_DELAY)
+  }
+
+  const panelVisible = pinned || hovering
+
   const handleRailClick = (id: TabId) => {
-    if (sidebarTab === id && panelOpen) {
-      setPanelOpen(false)
+    cancelTimers()
+    if (sidebarTab === id && pinned) {
+      // Clicking the already-pinned active tab hides the nav bar entirely.
+      persistPinned(false)
+      setHovering(false)
     } else {
       setSidebarTab(id)
-      setPanelOpen(true)
+      persistPinned(true)
     }
+  }
+
+  const handleCollapse = () => {
+    cancelTimers()
+    persistPinned(false)
+    setHovering(false)
   }
 
   const fileCount = sessionFiles.length
@@ -765,10 +827,10 @@ export function Sidebar() {
   const panelLabel = RAIL_ITEMS.find(r => r.id === sidebarTab)?.label ?? ''
 
   return (
-    <div className="flex h-full">
+    <div className="flex h-full relative" onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
 
       {/* ── Rail (always 44px) ── */}
-      <div className="flex flex-col items-center pt-3 pb-3 gap-1 w-[44px] bg-surface border-r border-border flex-shrink-0">
+      <div className="flex flex-col items-center pt-3 pb-3 gap-1 w-[44px] bg-surface border-r border-border flex-shrink-0 z-10">
 
         {/* Logo mark */}
         <div className="mb-2 flex items-center justify-center w-8 h-8">
@@ -777,7 +839,7 @@ export function Sidebar() {
 
         {/* Nav icons */}
         {RAIL_ITEMS.map(({ id, icon: Icon, tooltip }) => {
-          const isActive = sidebarTab === id && panelOpen
+          const isActive = sidebarTab === id && panelVisible
           const badge = id === 'files' && fileCount > 0 ? fileCount : null
           return (
             <button
@@ -865,10 +927,17 @@ export function Sidebar() {
         </div>
       </div>
 
-      {/* ── Sliding panel ── */}
+      {/* ── Sliding panel ──
+           Pinned: part of the flex layout, reflows the main content (manual expand).
+           Hover-only: absolutely positioned flyout layered over content, so a quick
+           mouseover preview never shifts the rest of the app (Cloudflare-style). */}
       <div
-        className={`flex flex-col bg-surface overflow-hidden transition-all duration-200 ${
-          panelOpen ? 'flex-1 min-w-0' : 'w-0'
+        className={`flex flex-col bg-surface overflow-hidden transition-all duration-200 ease-out ${
+          pinned
+            ? 'relative flex-1 min-w-0'
+            : `absolute left-[44px] top-0 bottom-0 z-20 shadow-2xl shadow-black/20 border-r border-border ${
+                hovering ? 'w-72 opacity-100' : 'w-0 opacity-0 pointer-events-none'
+              }`
         }`}
       >
         {/* Panel header */}
@@ -876,13 +945,24 @@ export function Sidebar() {
           <span className="text-[11px] font-semibold uppercase tracking-wider text-muted select-none">
             {panelLabel}
           </span>
-          <button
-            onClick={() => setPanelOpen(false)}
-            className="flex items-center justify-center w-5 h-5 rounded text-faint hover:text-ink hover:bg-overlay transition"
-            title="Collapse panel"
-          >
-            <KeyboardArrowLeft sx={{ fontSize: 13 }} />
-          </button>
+          <div className="flex items-center gap-0.5">
+            {!pinned && (
+              <button
+                onClick={() => persistPinned(true)}
+                className="flex items-center justify-center w-5 h-5 rounded text-faint hover:text-accent hover:bg-overlay transition"
+                title="Pin sidebar open"
+              >
+                <PushPin sx={{ fontSize: 12 }} />
+              </button>
+            )}
+            <button
+              onClick={handleCollapse}
+              className="flex items-center justify-center w-5 h-5 rounded text-faint hover:text-ink hover:bg-overlay transition"
+              title={pinned ? 'Collapse panel' : 'Close preview'}
+            >
+              <KeyboardArrowLeft sx={{ fontSize: 13 }} />
+            </button>
+          </div>
         </div>
 
         {/* Panel content */}
