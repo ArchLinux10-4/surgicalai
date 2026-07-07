@@ -36,6 +36,8 @@ interface AppState {
   setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'railway') => void
   sidebarPanelOpen: boolean
   setSidebarPanelOpen: (open: boolean) => void
+  sidebarPinned: boolean
+  setSidebarPinned: (pinned: boolean) => void
   imageStudioOpen: boolean
   setImageStudioOpen: (open: boolean) => void
   sendLinearIssue: ((issue: any) => void) | null
@@ -139,6 +141,22 @@ export const useAppStore = create<AppState>((set) => ({
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
   sidebarPanelOpen: false,
   setSidebarPanelOpen: (sidebarPanelOpen) => set({ sidebarPanelOpen }),
+  sidebarPinned: (() => {
+    try {
+      const stored = localStorage.getItem('surgicalai_sidebar_pinned')
+      return stored ? JSON.parse(stored) : false
+    } catch {
+      return false
+    }
+  })(),
+  setSidebarPinned: (sidebarPinned) => {
+    try {
+      localStorage.setItem('surgicalai_sidebar_pinned', JSON.stringify(sidebarPinned))
+    } catch {
+      // ignore write errors (e.g. private browsing)
+    }
+    set({ sidebarPinned })
+  },
   imageStudioOpen: false,
   setImageStudioOpen: (imageStudioOpen) => set({ imageStudioOpen }),
   sendLinearIssue: null,

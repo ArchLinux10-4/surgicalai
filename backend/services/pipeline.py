@@ -13180,12 +13180,49 @@ async def run_natural_pipeline_stream(
                             edit_data["new_code"] = full_new
                             edit_data.pop("old_code", None)  # now a full-symbol edit
                         else:
-                            _dlog("snippet_apply_failed",
-                                  session_id=session_id,
-                                  filename=filename,
-                                  symbol=symbol_name,
-                                  reason=snip_reason,
-                                  old_code_sent=old_code,
+                            # ── Resolution-phase FILE-LEVEL fallback (session 228e17ec fix) ──
+                            # Proven failure: the model targeted symbol "AppState"
+                            # with old_code that lives elsewhere in the file (the
+                            # zustand create() store body — not a parsed symbol).
+                            # The symbol splice failed, every correction round
+                            # failed the same way, and the edit was dropped
+                            # (degenerate_drop) even though old_code matched the
+                            # file VERBATIM and uniquely. Fallback: locate
+                            # old_code in the full file; on an unambiguous match
+                            # OUTSIDE the symbol, keep the symbol edit as a no-op
+                            # and attach the replacement as a companion
+                            # file-level operation (same mechanism as the QA
+                            # correction loop's Path 2b).
+                            _rf_file = file_content_lookup.get(filename, "")
+                            _rf_old, _rf_ok, _rf_reason = _locate_snippet_in_text(
+                                _rf_file, old_code
+                            )
+                            if _rf_ok and _rf_old and _rf_old not in _accum_base:
+                                edit_data["new_code"] = _accum_base  # no-op symbol edit
+                                edit_data.pop("old_code", None)
+                                edit_data.setdefault("_extra_ops", []).append(
+                                    {"find": _rf_old, "replace": new_code}
+                                )
+                                _dlog("resolution_file_level_op_accepted",
+                                      session_id=session_id,
+                                      filename=filename,
+                                      symbol=symbol_name,
+                                      match_kind=_rf_reason,
+                                      find_preview=_rf_old[:200],
+                                      replace_preview=new_code[:200],
+                                      user_id=user_id)
+                                # fall through to the resolved path (no continue)
+                            else:
+                                _dlog("snippet_apply_failed",
+                                      session_id=session_id,
+                                      filename=filename,
+                                      symbol=symbol_name,
+                                      reason=snip_reason,
+                                      file_level_reason=(
+                                          _rf_reason if not _rf_ok
+                                          else "match lies inside the target symbol"
+                                      ),
+                                      old_code_sent=old_code,
                                   old_code_len=len(old_code),
                                   symbol_code_actual=_accum_base,
                                   symbol_code_len=len(_accum_base),
@@ -13237,6 +13274,13 @@ async def run_natural_pipeline_stream(
                         # there is never a conflicting second op on the same text.
                         _prev = _resolved_by_symbol[_akey]
                         _prev["edit_data"]["new_code"] = edit_data["new_code"]
+                        # Preserve file-level companion ops from THIS edit —
+                        # without this merge, a second edit to the same symbol
+                        # silently discarded them (session 228e17ec fix).
+                        if edit_data.get("_extra_ops"):
+                            _prev["edit_data"].setdefault("_extra_ops", []).extend(
+                                edit_data["_extra_ops"]
+                            )
                         _d_old = _prev["edit_data"].get("description", "")
                         _d_new = edit_data.get("description", "")
                         if _d_new and _d_new not in _d_old:
@@ -13572,6 +13616,24 @@ async def run_natural_pipeline_stream(
             diff = _make_diff(symbol.code, new_code, symbol.name)
             _tgt, _repl = _compute_target_element(symbol.code, new_code)
 
+            # File-level companion ops (resolution-phase fallback): include
+            # them in the diff and describe them to QA — otherwise a no-op
+            # sentinel symbol edit looks like an empty change.
+            _x_ops = list(edit_data.get("_extra_ops") or [])
+            _x_note = ""
+            if _x_ops:
+                for _xop in _x_ops:
+                    diff += ("\n" if diff else "") + _make_diff(
+                        _xop["find"], _xop["replace"],
+                        f"{filename} (file-level companion)",
+                    )
+                _x_note = "\n\n".join(
+                    "[File-level companion edit applied OUTSIDE the target "
+                    f"symbol in {filename}]\nBEFORE:\n{_xop['find']}\n"
+                    f"AFTER:\n{_xop['replace']}"
+                    for _xop in _x_ops
+                )
+
             _same_run = "\n".join(
                 f"  \u2022 [{s['symbol']} in {s['filename']}] {s['description']}"
                 for j, s in enumerate(_all_edit_summaries) if j != i and s["description"]
@@ -13625,7 +13687,10 @@ async def run_natural_pipeline_stream(
             asyncio.create_task(run_qa_agent(
                 original_code=cs["qa_original_content"],  # intermediate state, not raw original
                 new_code=cs["new_code"],
-                change_description=cs["description"],
+                change_description=(
+                    cs["description"] + "\n\n" + cs["_x_note"]
+                    if cs.get("_x_note") else cs["description"]
+                ),
                 new_logic=cs["description"],
                 symbol_path=cs["symbol"].name,
                 filename=cs["filename"],

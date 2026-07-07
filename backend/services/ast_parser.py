@@ -411,6 +411,47 @@ class ASTParser:
                 # Route handlers: app.get('/path', (req, res) => { ... })
                 self._extract_route_handler(child, lines, symbols)
 
+        # ── Error-recovery merge (session 228e17ec fix) ──────────────────
+        # The bundled TSX grammar chokes on some valid modern TS (e.g. inline
+        # `import('../types').X` types). tree-sitter then TRUNCATES the node
+        # containing the error and silently drops every later declaration —
+        # appStore.ts lost its `useAppStore = create(...)` store entirely and
+        # AppState's extent ended mid-interface. When the parse tree contains
+        # errors, run the regex parser too and merge:
+        #   - same-name symbol with overlapping range → take the larger extent
+        #   - regex-only symbol not overlapping any tree-sitter symbol → add it
+        if root.has_error:
+            try:
+                regex_syms = self._parse_js_ts_regex(source, lines)
+            except Exception:
+                regex_syms = []
+            by_name = {s.name: s for s in symbols}
+            for rs in regex_syms:
+                existing = by_name.get(rs.name)
+                if existing is not None and not (
+                    rs.end_line < existing.start_line or rs.start_line > existing.end_line
+                ):
+                    # Overlapping same-name symbol: widen to the union extent
+                    # and rebuild code from the source lines.
+                    new_start = min(existing.start_line, rs.start_line)
+                    new_end = max(existing.end_line, rs.end_line)
+                    if (new_start, new_end) != (existing.start_line, existing.end_line):
+                        existing.start_line = new_start
+                        existing.end_line = new_end
+                        existing.code = "\n".join(lines[new_start - 1 : new_end])
+                    continue
+                # Regex-only symbol: add if it doesn't overlap any existing
+                # top-level symbol (methods have parents; skip those in the
+                # overlap check so class members don't block their class).
+                overlaps = any(
+                    o.parent is None
+                    and not (rs.end_line < o.start_line or rs.start_line > o.end_line)
+                    for o in symbols
+                )
+                if not overlaps:
+                    symbols.append(rs)
+            symbols.sort(key=lambda s: s.start_line)
+
         return symbols
 
     def _extract_route_handler(self, expr_node, lines: List[str], symbols: List[SymbolInfo]):

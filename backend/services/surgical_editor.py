@@ -401,6 +401,23 @@ def apply_change(file_content: str, change) -> str:
             replace_text = op.get("replace", "") if isinstance(op, dict) else getattr(op, "replace", "")
             if not find_text:
                 continue
+            # ── Insertion-op idempotency guard (session 228e17ec fix) ──
+            # For insertion-type ops the find text survives INSIDE the
+            # replace text (e.g. find = two store lines, replace = the same
+            # two lines + new ones appended). On re-apply, `find` still
+            # matches — as a substring of the already-applied `replace` —
+            # and the insertion duplicates. Proven: replaying the real
+            # appStore.ts companion op grew the file by +88 chars on every
+            # apply. If the full replace text is already present verbatim,
+            # the op has been applied — skip it and count it as applied.
+            if (
+                replace_text
+                and replace_text != find_text
+                and find_text in replace_text
+                and replace_text in result
+            ):
+                any_applied = True
+                continue
             if find_text in result:
                 result = result.replace(find_text, replace_text, 1)
                 any_applied = True
