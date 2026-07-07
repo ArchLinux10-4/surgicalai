@@ -226,6 +226,7 @@ export const api = {
               chunk.type === 'planning_started' ||
               chunk.type === 'task_plan' || chunk.type === 'task_start' ||
               chunk.type === 'task_progress' || chunk.type === 'task_done' ||
+              chunk.type === 'task_thinking' ||
               chunk.type === 'task_blocked' || chunk.type === 'task_cancelled' ||
               chunk.type === 'tasks_complete'
             ) onTask?.(chunk)
@@ -289,6 +290,7 @@ export const api = {
             else if (chunk.type === 'error') onError(chunk.content)
             else if (
               chunk.type === 'task_start' || chunk.type === 'task_progress' ||
+              chunk.type === 'task_thinking' ||
               chunk.type === 'task_done' || chunk.type === 'task_blocked' ||
               chunk.type === 'task_cancelled' || chunk.type === 'tasks_complete'
             ) {

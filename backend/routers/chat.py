@@ -1165,6 +1165,7 @@ async def execute_task(req: dict, request: Request):
               request_len=len(_task_request))
 
         collected, result_content, poll, aborted = [], None, 0, False
+        _think_parts: list = []  # accumulated extended-thinking text for this task
         try:
             async for chunk in _with_heartbeat(run_natural_pipeline_stream(
                 session_files=session_files,
@@ -1192,6 +1193,15 @@ async def execute_task(req: dict, request: Request):
                             result_content = _d.get("content", "")
                         elif _ct == "progress":
                             yield _sse({"type": "task_progress", "id": task_id, "content": _d.get("content", "")})
+                        elif _ct == "thinking":
+                            # Forward the model's extended thinking so the UI can
+                            # show a per-task expandable reasoning trail (parity
+                            # with chat mode). Previously these events were
+                            # silently dropped by this filter.
+                            _tc = _d.get("content", "")
+                            if _tc:
+                                _think_parts.append(_tc)
+                                yield _sse({"type": "task_thinking", "id": task_id, "content": _tc})
                         elif _ct == "error":
                             yield _sse({"type": "task_progress", "id": task_id, "content": "⚠️ " + _d.get("content", "")})
                     except Exception:
@@ -1201,7 +1211,8 @@ async def execute_task(req: dict, request: Request):
                   task_id=task_id, task_seq=seq+1, phase=_phase,
                   duration_s=round(time.time() - _t0, 1), error=str(_ee))
             update_task(task_id, status="blocked", verdict="error",
-                        result_summary=("".join(collected))[:500])
+                        result_summary=("".join(collected))[:500],
+                        thinking=("".join(_think_parts))[:24000])
             mark_pending_cancelled(session_id, run_id)
             yield _sse({"type": "task_blocked", "id": task_id, "qa_score": None, "verdict": "error"})
             note = _run_summary_note(session_id, run_id, status="blocked", blocked_title=task["title"], reason="error")
@@ -1239,7 +1250,8 @@ async def execute_task(req: dict, request: Request):
         _is_answer = task.get("kind") == "answer"
         if parsed and worst == "blocked" and not _is_answer:
             update_task(task_id, status="blocked", qa_score=score,
-                        verdict=worst, result_summary=natural_text[:500])
+                        verdict=worst, result_summary=natural_text[:500],
+                        thinking=("".join(_think_parts))[:24000])
             mark_pending_cancelled(session_id, run_id)
             _dlog("sse_exec_task_done", session_id=session_id, user_id=current_user_id,
                   task_id=task_id, task_seq=seq+1, status="blocked",
@@ -1276,7 +1288,8 @@ async def execute_task(req: dict, request: Request):
             _dlog("sse_exec_task_edit_summary", session_id=session_id,
                   task_id=task_id, edit_summary=_edit_summary[:300])
         update_task(task_id, status="done", qa_score=_score,
-                    verdict=_verdict, result_summary=_rsummary[:800])
+                    verdict=_verdict, result_summary=_rsummary[:800],
+                    thinking=("".join(_think_parts))[:24000])
         _dlog("sse_exec_task_done", session_id=session_id, user_id=current_user_id,
               task_id=task_id, task_seq=seq+1, status="done",
               qa_score=_score, verdict=_verdict, duration_s=round(time.time() - _t0, 1))

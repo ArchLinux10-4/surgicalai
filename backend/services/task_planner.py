@@ -239,7 +239,7 @@ def create_tasks(session_id: str, run_id: str, tasks: list) -> list:
 
 def update_task(task_id: str, **fields):
     """Update mutable task columns. Always bumps updated_at."""
-    allowed = {"status", "qa_score", "verdict", "result_summary"}
+    allowed = {"status", "qa_score", "verdict", "result_summary", "thinking"}
     sets = [f"{k} = ?" for k in fields if k in allowed]
     vals = [fields[k] for k in fields if k in allowed]
     if not sets:

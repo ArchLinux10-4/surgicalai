@@ -213,6 +213,7 @@ export interface AgentTask {
   verdict?: string | null
   run_id?: string
   progress?: string  // latest live progress line (client-side only)
+  thinking?: string  // model's extended-thinking trail (streamed live + persisted)
 }
 
 export interface SmartResult {

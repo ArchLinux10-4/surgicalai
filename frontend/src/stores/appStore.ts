@@ -93,6 +93,7 @@ interface AppState {
   taskPreamble: string
   setAgentTasks: (tasks: import('../types').AgentTask[]) => void
   updateAgentTask: (id: string, patch: Partial<import('../types').AgentTask>) => void
+  appendAgentTaskThinking: (id: string, chunk: string) => void
   clearAgentTasks: () => void
   setTaskRunId: (id: string | null) => void
   setTaskPreamble: (s: string) => void
@@ -209,6 +210,11 @@ export const useAppStore = create<AppState>((set) => ({
   setAgentTasks: (agentTasks) => set({ agentTasks }),
   updateAgentTask: (id, patch) => set((state) => ({
     agentTasks: state.agentTasks.map(t => t.id === id ? { ...t, ...patch } : t)
+  })),
+  appendAgentTaskThinking: (id, chunk) => set((state) => ({
+    // Append streamed extended-thinking; cap to keep the store bounded.
+    agentTasks: state.agentTasks.map(t =>
+      t.id === id ? { ...t, thinking: ((t.thinking || '') + chunk).slice(-24000) } : t)
   })),
   clearAgentTasks: () => set({ agentTasks: [], taskRunId: null, taskPreamble: '', agentPhase: 'idle' }),
   setTaskRunId: (taskRunId) => set({ taskRunId }),

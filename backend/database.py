@@ -458,10 +458,16 @@ def _init_sqlite():
             verdict TEXT,
             cancel_requested INTEGER DEFAULT 0,
             result_summary TEXT DEFAULT '',
+            thinking TEXT DEFAULT '',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # Migration: add thinking to agent_tasks if missing (extended-thinking
+    # transparency — each task persists the model's reasoning for the UI).
+    at_cols = [row[1] for row in cur.execute("PRAGMA table_info(agent_tasks)").fetchall()]
+    if at_cols and "thinking" not in at_cols:
+        cur.execute("ALTER TABLE agent_tasks ADD COLUMN thinking TEXT DEFAULT ''")
 
     # debug_events — persistent pipeline debug log (survives deploys/restarts)
     cur.execute("""
@@ -730,9 +736,14 @@ def _init_postgres():
                 verdict TEXT,
                 cancel_requested INTEGER DEFAULT 0,
                 result_summary TEXT DEFAULT '',
+                thinking TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
+        """)
+        # Migration: add thinking column for pre-existing deployments (idempotent on PG)
+        conn.execute("""
+            ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS thinking TEXT DEFAULT ''
         """)
         # debug_events — persistent pipeline debug log (survives deploys/restarts)
         conn.execute("""

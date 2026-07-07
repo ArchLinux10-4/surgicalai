@@ -17,6 +17,32 @@ import type { AgentTask, AgentTaskStatus } from '../types'
 
 const ACTIVE: AgentTaskStatus[] = ['pending', 'running']
 
+/* ── Per-task expandable reasoning trail (parity with chat mode) ──────── */
+function TaskThinking({ text, isLive }: { text: string; isLive: boolean }) {
+  const [expanded, setExpanded] = useState(false)
+  if (!text) return null
+  return (
+    <div className="mt-1">
+      <button
+        onClick={() => setExpanded(e => !e)}
+        className="flex items-center gap-1 text-[10px] text-purple/80 hover:text-purple transition-colors"
+        aria-expanded={expanded}
+        title="Show this agent's reasoning"
+      >
+        <span className={`transform transition-transform duration-200 ${expanded ? 'rotate-90' : ''}`}>▶</span>
+        <span>{isLive ? 'Thinking…' : 'Reasoning'}</span>
+        {!isLive && <span className="text-muted/60">(click to view)</span>}
+      </button>
+      {expanded && (
+        <div className="mt-1 ml-3 pl-2 border-l-2 border-purple/30 text-[11px] text-muted/90 whitespace-pre-wrap max-h-60 overflow-y-auto leading-relaxed font-mono">
+          {text}
+          {isLive && <span className="inline-block w-1.5 h-3 bg-purple/60 rounded-sm ml-0.5 animate-pulse" />}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function StatusDot({ status }: { status: AgentTaskStatus }) {
   if (status === 'running') {
     return (
@@ -51,14 +77,15 @@ function ScoreBadge({ score, verdict, kind }: { score?: number | null; verdict?:
     )
   }
   if (verdict === 'no_edits') {
-    // Planning/reasoning task: completed with zero code edits, so the QA gate
-    // never ran. Say so honestly instead of faking a green QA pass.
+    // Planning/reasoning task: completed with zero code edits, so the code QA
+    // gate has nothing to scan. Show a calm green check with the reason —
+    // "skipped" read as if something was missed, which it wasn't.
     return (
       <span
-        className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-overlay/60 text-muted border-border/50"
-        title="No code edits produced — QA skipped by design"
+        className="text-[10px] font-semibold px-1.5 py-0.5 rounded border bg-success/10 text-success border-success/25"
+        title="This task produced planning/reasoning output with no code edits — the code QA gate doesn't apply, so there was nothing to scan."
       >
-        QA skipped &#10003;
+        &#10003; no QA needed
       </span>
     )
   }
@@ -168,6 +195,9 @@ export function TaskListPanel() {
               </div>
               {t.status === 'running' && t.progress && (
                 <div className="text-[11px] text-muted/80 truncate mt-0.5">{t.progress}</div>
+              )}
+              {t.thinking && (
+                <TaskThinking text={t.thinking} isLive={t.status === 'running'} />
               )}
               {t.status === 'blocked' && (
                 <div className="text-[11px] text-danger/90 mt-0.5">{t.verdict === 'error' ? 'Paused — this task hit an error. Review before continuing.' : 'Paused — QA flagged blocking issues. Review before continuing.'}</div>

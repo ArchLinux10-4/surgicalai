@@ -24,12 +24,16 @@ export function useTaskPolling(sessionId: string | null | undefined) {
   const agentTasks = useAppStore((s) => s.agentTasks)
   const setAgentTasks = useAppStore((s) => s.setAgentTasks)
 
-  // Avoid clobbering the live client-only `progress` field on each poll.
+  // Avoid clobbering the live client-only `progress` / streamed `thinking`
+  // fields on each poll.
   const progressRef = useRef<Record<string, string | undefined>>({})
+  const thinkingRef = useRef<Record<string, string | undefined>>({})
   useEffect(() => {
     const map: Record<string, string | undefined> = {}
-    for (const t of agentTasks) map[t.id] = t.progress
+    const tmap: Record<string, string | undefined> = {}
+    for (const t of agentTasks) { map[t.id] = t.progress; tmap[t.id] = t.thinking }
     progressRef.current = map
+    thinkingRef.current = tmap
   }, [agentTasks])
 
   // Whether anything is still in flight (drives whether we keep polling).
@@ -60,6 +64,13 @@ export function useTaskPolling(sessionId: string | null | undefined) {
           // Preserve the live progress line the stream gave us; fall back to
           // the persisted result summary so a reconnect still shows context.
           progress: progressRef.current[r.id] ?? r.result_summary ?? undefined,
+          // Prefer whichever thinking trail is longer: the live streamed copy
+          // (client path) or the persisted DB copy (server-runner path).
+          thinking: (() => {
+            const live = thinkingRef.current[r.id] || ''
+            const stored = (r.thinking as string) || ''
+            return (live.length >= stored.length ? live : stored) || undefined
+          })(),
         }))
       setAgentTasks(merged)
     }

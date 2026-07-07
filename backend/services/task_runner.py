@@ -235,7 +235,9 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
         # Drive the pipeline. No SSE client — instead, persist a throttled
         # live progress line so the UI's 2.5s poll shows real-time status.
         collected, result_content, poll, aborted = [], None, 0, False
+        think_parts: list = []  # accumulated extended-thinking text for this task
         last_progress_write = 0.0
+        last_thinking_write = 0.0
         try:
             async for chunk in run_natural_pipeline_stream(
                 session_files=session_files,
@@ -259,6 +261,21 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
                         collected.append(d.get("content", ""))
                     elif ct == "smart_result":
                         result_content = d.get("content", "")
+                    elif ct == "thinking":
+                        # No SSE client on this path — persist the reasoning
+                        # trail (throttled) so the UI's poll can show it live
+                        # and it survives for post-run inspection.
+                        tc = d.get("content", "")
+                        if tc:
+                            think_parts.append(tc)
+                            now = time.time()
+                            if now - last_thinking_write >= 3.0:
+                                last_thinking_write = now
+                                try:
+                                    update_task(task_id, thinking=("".join(think_parts))[:24000])
+                                except Exception as twx:
+                                    _dlog("runner_thinking_write_error", task_id=task_id,
+                                          error=str(twx)[:120])
                     elif ct == "progress":
                         now = time.time()
                         if now - last_progress_write >= 3.0:
@@ -275,7 +292,8 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
                   task_id=task_id, task_seq=seq + 1,
                   duration_s=round(time.time() - t0, 1), error=str(ee)[:300])
             update_task(task_id, status="blocked", verdict="error",
-                        result_summary=("".join(collected))[:500])
+                        result_summary=("".join(collected))[:500],
+                        thinking=("".join(think_parts))[:24000])
             mark_pending_cancelled(session_id, run_id)
             return "blocked"
 
@@ -305,7 +323,8 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
         is_answer = task.get("kind") == "answer"
         if parsed and worst == "blocked" and not is_answer:
             update_task(task_id, status="blocked", qa_score=score,
-                        verdict=worst, result_summary=natural_text[:500])
+                        verdict=worst, result_summary=natural_text[:500],
+                        thinking=("".join(think_parts))[:24000])
             mark_pending_cancelled(session_id, run_id)
             _dlog("runner_task_blocked", session_id=session_id, run_id=run_id,
                   task_id=task_id, task_seq=seq + 1, qa_score=score,
@@ -332,7 +351,8 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
         if edit_summary:
             rsummary += "\nEdited:\n" + edit_summary
         update_task(task_id, status="done", qa_score=final_score,
-                    verdict=verdict, result_summary=rsummary[:800])
+                    verdict=verdict, result_summary=rsummary[:800],
+                    thinking=("".join(think_parts))[:24000])
         _dlog("runner_task_done", session_id=session_id, run_id=run_id,
               task_id=task_id, task_seq=seq + 1, qa_score=final_score,
               verdict=verdict, has_edits=has_edits,

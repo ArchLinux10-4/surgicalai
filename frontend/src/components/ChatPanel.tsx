@@ -925,6 +925,8 @@ export function ChatPanel() {
         updateAgentTask(event.id, { status: 'running', progress: undefined }); break
       case 'task_progress':
         updateAgentTask(event.id, { progress: event.content }); break
+      case 'task_thinking':
+        useAppStore.getState().appendAgentTaskThinking(event.id, event.content || ''); break
       case 'task_done':
         updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict }); break
       case 'task_blocked':
