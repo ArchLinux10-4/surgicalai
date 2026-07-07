@@ -243,6 +243,10 @@ class SurgicalApplyResponse(BaseModel):
     # are listed here instead of silently no-oping or aborting the batch.
     failed_count: int = 0
     failed_changes: List[dict] = Field(default_factory=list)
+    # AI rescue tier (v3.5): failed changes that Claude recovered with a
+    # validated exact search/replace against the current file content.
+    rescued_count: int = 0
+    rescued_changes: List[dict] = Field(default_factory=list)
 
 
 class SurgicalPreviewRequest(BaseModel):

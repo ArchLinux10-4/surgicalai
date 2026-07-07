@@ -1,6 +1,6 @@
 """Surgical analysis and apply router."""
 import json
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from models.schemas import (
     SurgicalAnalyzeRequest, SurgicalAnalyzeResponse,
@@ -10,8 +10,82 @@ from models.schemas import (
 from database import get_setting, get_db_ctx
 from services.pipeline import analyze_and_plan, analyze_and_plan_stream
 from services.surgical_editor import apply_changes_to_file
+from services.edit_rescue import rescue_failed_changes
 
 router = APIRouter()
+
+
+def _attempt_rescue(req: SurgicalApplyRequest, request: Request,
+                    result: SurgicalApplyResponse) -> SurgicalApplyResponse:
+    """AI rescue tier: try to recover changes the deterministic engine failed.
+
+    Runs only when there are failures AND we have current content to work on.
+    Validated strictly (unique exact-match search) — see services/edit_rescue.
+    """
+    if not result.failed_changes or result.modified_content is None:
+        return result
+    user_id = getattr(request.state, "user_id", None) or ""
+    new_content, rescued, still_failed = rescue_failed_changes(
+        file_path=req.file_path,
+        file_content=result.modified_content,
+        all_changes=req.changes,
+        failed_changes=result.failed_changes,
+        user_id=user_id,
+    )
+    if rescued:
+        result.modified_content = new_content
+        result.new_content = new_content
+        result.applied_count += len(rescued)
+        result.rescued_count = len(rescued)
+        result.rescued_changes = rescued
+        # Disk mode: the engine already wrote the pre-rescue content — persist
+        # the rescued content too so disk and response never diverge.
+        if not result.cloud_mode:
+            try:
+                with open(req.file_path, "w", encoding="utf-8") as f:
+                    f.write(new_content)
+            except OSError:
+                pass
+    result.failed_changes = still_failed
+    result.failed_count = len(still_failed)
+    return result
+
+
+def _rescue_after_total_failure(req: SurgicalApplyRequest, request: Request,
+                                error: ValueError,
+                                change_ids=None) -> SurgicalApplyResponse:
+    """Every change failed (engine raised). Last-ditch AI rescue from the
+    original content. Re-raises the original error if nothing is recovered."""
+    if req.file_content is None:
+        raise HTTPException(status_code=409, detail=str(error))
+    wanted = [c for c in req.changes
+              if change_ids is None or c.id in change_ids]
+    failed = [{"change_id": c.id,
+               "symbol": (getattr(c.symbol, "full_path", None)
+                          or getattr(c.symbol, "name", "?")) if c.symbol else "?",
+               "reason": str(error)} for c in wanted]
+    user_id = getattr(request.state, "user_id", None) or ""
+    new_content, rescued, still_failed = rescue_failed_changes(
+        file_path=req.file_path,
+        file_content=req.file_content,
+        all_changes=req.changes,
+        failed_changes=failed,
+        user_id=user_id,
+    )
+    if not rescued:
+        raise HTTPException(status_code=409, detail=str(error))
+    return SurgicalApplyResponse(
+        file_path=req.file_path,
+        new_content=new_content,
+        applied_count=len(rescued),
+        backup_path=None,
+        cloud_mode=True,
+        modified_content=new_content,
+        failed_count=len(still_failed),
+        failed_changes=still_failed,
+        rescued_count=len(rescued),
+        rescued_changes=rescued,
+    )
 
 
 def _any_ai_key_configured() -> bool:
@@ -69,15 +143,21 @@ async def analyze_stream(req: SurgicalAnalyzeRequest):
 
 
 @router.post("/apply", response_model=SurgicalApplyResponse)
-def apply(req: SurgicalApplyRequest):
+def apply(req: SurgicalApplyRequest, request: Request):
     """Apply approved changes to a file."""
     try:
-        result = apply_changes_to_file(
-            file_path=req.file_path,
-            changes=req.changes,
-            change_ids=[req.change_id] if req.change_id else None,
-            file_content=req.file_content
-        )
+        try:
+            result = apply_changes_to_file(
+                file_path=req.file_path,
+                changes=req.changes,
+                change_ids=[req.change_id] if req.change_id else None,
+                file_content=req.file_content
+            )
+            result = _attempt_rescue(req, request, result)
+        except ValueError as ve:
+            result = _rescue_after_total_failure(
+                req, request, ve,
+                change_ids=[req.change_id] if req.change_id else None)
 
         # Record in change history
         with get_db_ctx() as conn:
@@ -93,6 +173,8 @@ def apply(req: SurgicalApplyRequest):
             conn.commit()
 
         return result
+    except HTTPException:
+        raise
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
@@ -102,20 +184,26 @@ def apply(req: SurgicalApplyRequest):
 
 
 @router.post("/apply-all", response_model=SurgicalApplyResponse)
-def apply_all(req: SurgicalApplyRequest):
-    """Apply all changes in a batch."""
+def apply_all(req: SurgicalApplyRequest, request: Request):
+    """Apply all changes in a batch, with an AI rescue tier for failures."""
     try:
-        result = apply_changes_to_file(
-            file_path=req.file_path,
-            changes=req.changes,
-            change_ids=None,  # Apply all
-            file_content=req.file_content
-        )
+        try:
+            result = apply_changes_to_file(
+                file_path=req.file_path,
+                changes=req.changes,
+                change_ids=None,  # Apply all
+                file_content=req.file_content
+            )
+            # Partial failures → AI rescue on the post-apply content
+            result = _attempt_rescue(req, request, result)
+        except ValueError as ve:
+            # Total failure → AI rescue from the original content
+            result = _rescue_after_total_failure(req, request, ve)
         return result
+    except HTTPException:
+        raise
     except FileNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except ValueError as e:
-        raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

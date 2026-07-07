@@ -84,8 +84,12 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
 
   const handleApplyAll = async () => {
     setApplying(true)
-    let appliedFiles = 0
-    let failed       = 0
+    let appliedFiles   = 0
+    let failed         = 0
+    let appliedChanges = 0
+    let rescuedChanges = 0
+    let failedChanges  = 0
+    let firstFailReason = ''
 
     const markPromises: Promise<any>[] = []
     try {
@@ -107,9 +111,21 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
             if (applied.modified_content) {
               await api.sessionFiles.update(sessionId, fd.file_id, applied.modified_content)
               appliedFiles++
-              // Track every applied change in DB so state survives refresh
+              appliedChanges += applied.applied_count ?? fd.changes.length
+              rescuedChanges += applied.rescued_count ?? 0
+              // Truthful accounting: the engine reports exactly which changes
+              // failed — those stay UNAPPLIED so they remain visible/retryable.
+              const failedIds = new Set(
+                (applied.failed_changes || []).map((f: any) => f.change_id).filter(Boolean)
+              )
+              failedChanges += applied.failed_count ?? failedIds.size
+              if ((applied.failed_changes || []).length > 0 && !firstFailReason) {
+                firstFailReason = applied.failed_changes[0]?.reason || ''
+              }
               for (const ch of fd.changes) {
-                if (ch?.id) markPromises.push(api.surgical.markApplied(sessionId, ch.id).catch(() => {}))
+                if (ch?.id && !failedIds.has(ch.id)) {
+                  markPromises.push(api.surgical.markApplied(sessionId, ch.id).catch(() => {}))
+                }
               }
             }
           } catch { failed++ }
@@ -123,12 +139,23 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       // Wait for all DB marks to land before telling diff cards refresh
       await Promise.all(markPromises)
 
-      if (failed === 0) {
-        toast.success(`Applied all changes across ${appliedFiles} file${appliedFiles !== 1 ? 's' : ''}`)
+      const rescuedNote = rescuedChanges > 0 ? ` (${rescuedChanges} AI-rescued)` : ''
+      if (failed === 0 && failedChanges === 0) {
+        toast.success(
+          `Applied ${appliedChanges} change${appliedChanges !== 1 ? 's' : ''} across ` +
+          `${appliedFiles} file${appliedFiles !== 1 ? 's' : ''}${rescuedNote}`
+        )
         window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
         setDone(true)
+      } else if (failedChanges > 0) {
+        toast.error(
+          `Applied ${appliedChanges}${rescuedNote}, but ${failedChanges} ` +
+          `change${failedChanges !== 1 ? 's' : ''} could not be applied`,
+          firstFailReason ? firstFailReason.slice(0, 200) : undefined
+        )
+        window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
       } else {
-        toast.error(`Applied ${appliedFiles} file(s) — ${failed} failed`)
+        toast.error(`Applied ${appliedFiles} file(s) — ${failed} file(s) failed entirely`)
       }
     } catch (e: any) {
       toast.error(e.message || 'Apply all failed')
