@@ -806,6 +806,16 @@ export function Sidebar() {
     }
   }
 
+  // Hovering over a rail icon previews that tab's content immediately — no
+  // click required. The panel's visibility is still governed by the existing
+  // hover-open delay (or a persisted pin); this just keeps the content in
+  // sync with whichever icon the mouse is currently over.
+  const handleRailHover = (id: TabId) => {
+    if (sidebarTab === id) return
+    cancelTimers()
+    setSidebarTab(id)
+  }
+
   const handleCollapse = () => {
     cancelTimers()
     persistPinned(false)
@@ -860,6 +870,7 @@ export function Sidebar() {
             <button
               key={id}
               onClick={() => handleRailClick(id)}
+              onMouseEnter={() => handleRailHover(id)}
               title={tooltip}
               className={`relative flex items-center justify-center w-8 h-8 rounded-lg transition-all ${
                 isActive
