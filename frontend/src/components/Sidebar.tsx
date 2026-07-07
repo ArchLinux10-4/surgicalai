@@ -812,7 +812,6 @@ export function Sidebar() {
   // sync with whichever icon the mouse is currently over.
   const handleRailHover = (id: TabId) => {
     if (sidebarTab === id) return
-    cancelTimers()
     setSidebarTab(id)
   }
 
