@@ -5724,6 +5724,64 @@ def _extract_json_from_text(text: str) -> str:
 
 
 
+def _salvage_fields_from_truncated_json(raw_text: str) -> dict:
+    """
+    Best-effort field recovery for a QA response that WAS valid JSON but got
+    cut off mid-object by max_tokens (e.g. a 'thinking'-heavy model burns most
+    of its budget reasoning, then the JSON text itself is truncated partway
+    through a later field). json.loads() rejects the whole object in that
+    case, but earlier fields (verdict, qa_score, summary, and any fully-quoted
+    array items) are often complete and worth keeping instead of discarding.
+
+    Root cause proven in session 0183c92e-30a2-4a92-9478-fecfe9769e03: the
+    response was cut off mid-string inside "plan_deviation", after "verdict",
+    "qa_score", "summary", "import_issues", "downstream_risks", and
+    "type_errors" had already been written in full.
+    """
+    import re
+    salvaged: dict = {}
+
+    m = re.search(r'"verdict"\s*:\s*"(blocked|safe|warning)"', raw_text)
+    if m:
+        salvaged["verdict"] = m.group(1)
+
+    m = re.search(r'"qa_score"\s*:\s*(\d{1,2})', raw_text)
+    if m:
+        val = int(m.group(1))
+        if 1 <= val <= 10:
+            salvaged["qa_score"] = val
+
+    for field in ("summary", "plan_deviation"):
+        m = re.search(rf'"{field}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw_text)
+        if m:
+            # Unescape via json.loads (not str.encode/decode('unicode_escape'),
+            # which mis-decodes real UTF-8 multibyte chars like em-dashes —
+            # the raw text here is already a proper unicode str, so only
+            # JSON's own escape grammar (\", \\, \n, \uXXXX, ...) needs undoing).
+            try:
+                salvaged[field] = json.loads(f'"{m.group(1)}"')
+            except json.JSONDecodeError:
+                salvaged[field] = m.group(1)
+
+    # Array-of-strings fields: grab whichever complete quoted strings sit
+    # inside the array, even if the array (or the whole object) never closed.
+    _array_fields = ("import_issues", "downstream_risks", "type_errors", "logic_errors")
+    for field in _array_fields:
+        m = re.search(rf'"{field}"\s*:\s*\[(.*?)(?:\]|"(?:{"|".join(_array_fields + ("summary", "plan_deviation"))})"\s*:|$)', raw_text, re.DOTALL)
+        if m:
+            _raw_items = re.findall(r'"((?:[^"\\]|\\.)*)"', m.group(1))
+            items = []
+            for _it in _raw_items:
+                try:
+                    items.append(json.loads(f'"{_it}"'))
+                except json.JSONDecodeError:
+                    items.append(_it)
+            if items:
+                salvaged[field] = items
+
+    return salvaged
+
+
 def _qa_fallback_from_prose(raw_text: str, session_id: str = "", user_id: str = "") -> dict:
     """
     Last-resort fallback: when QA returns prose analysis instead of JSON,
@@ -5732,36 +5790,48 @@ def _qa_fallback_from_prose(raw_text: str, session_id: str = "", user_id: str = 
     PRIORITY: numeric score > explicit verdict keyword > keyword-in-context.
     """
     import re
+
+    # ── Step 0: the response may actually BE (truncated) JSON, not prose. ─────
+    # Try to salvage real fields first — this recovers the model's genuine
+    # summary/import_issues/etc. instead of throwing them away for a garbage
+    # "first line of text" summary (which is literally "{" for JSON text).
+    _salvaged = _salvage_fields_from_truncated_json(raw_text)
+
     text_lower = raw_text.lower()
 
     # ── Step 1: find numeric score ────────────────────────────────────────────
-    score = None
+    # If the response was truncated JSON, the object's own "qa_score" field
+    # is authoritative — skip the generic regex scan over lowercased prose.
+    score = _salvaged.get("qa_score")
     score_patterns = [
         r'(?:score|qa_score)[:\s]+\s*(\d{1,2})(?:\s*/\s*10)?',
         r'(\d{1,2})\s*/\s*10',
         r'score\s+(?:of\s+)?(\d{1,2})',
     ]
-    for pat in score_patterns:
-        m = re.search(pat, text_lower)
-        if m:
-            val = int(m.group(1))
-            if 1 <= val <= 10:
-                score = val
-                break
+    if score is None:
+        for pat in score_patterns:
+            m = re.search(pat, text_lower)
+            if m:
+                val = int(m.group(1))
+                if 1 <= val <= 10:
+                    score = val
+                    break
 
     # ── Step 2: find explicit "verdict: <value>" patterns ─────────────────────
-    # These are high-confidence — the model explicitly stated a verdict.
-    verdict = None
-    _explicit_verdict_match = re.search(
-        r'verdict[:\s]+\s*"?(blocked|safe|warning)"?', text_lower
-    )
-    if _explicit_verdict_match:
-        verdict = _explicit_verdict_match.group(1)
+    # A verdict salvaged directly from the object's own "verdict" field is
+    # authoritative; only fall back to scanning prose if that's absent.
+    verdict = _salvaged.get("verdict")
+    if verdict is None:
+        _explicit_verdict_match = re.search(
+            r'verdict[:\s]+\s*"?(blocked|safe|warning)"?', text_lower
+        )
+        if _explicit_verdict_match:
+            verdict = _explicit_verdict_match.group(1)
 
-    # ── Step 3: if score found, ALWAYS derive verdict from score ──────────────
+    # ── Step 3: if verdict still unknown but score found, derive it ───────────
     # Numeric score is the most reliable signal. Keyword matches like "critical"
     # or "blocked" appearing anywhere in the prose are too noisy.
-    if score is not None:
+    if verdict is None and score is not None:
         if score >= 7:
             verdict = "safe"
         elif score >= 5:
@@ -5793,25 +5863,36 @@ def _qa_fallback_from_prose(raw_text: str, session_id: str = "", user_id: str = 
     if verdict is None and score is None:
         return None
 
-    # Extract a summary — first sentence or first 200 chars
-    summary_line = raw_text.strip().split("\n")[0][:200]
+    # ── Summary: prefer the model's own salvaged "summary" field ──────────────
+    # Only fall back to "first line of raw text" when no real summary field
+    # was recoverable — for JSON responses that first line is just "{", which
+    # is exactly the bug this salvage path exists to avoid (session
+    # 0183c92e-30a2-4a92-9478-fecfe9769e03: score 3/10 with summary "{").
+    _salvaged_summary = _salvaged.get("summary")
+    if _salvaged_summary:
+        summary_line = _salvaged_summary[:500]
+        summary_tag = "[QA response truncated by max_tokens — recovered from partial JSON]"
+    else:
+        summary_line = raw_text.strip().split("\n")[0][:200]
+        summary_tag = "[QA prose fallback]"
 
     _dlog("qa_prose_fallback_extracted",
           session_id=session_id, user_id=user_id,
           verdict=verdict, score=score,
           raw_len=len(raw_text),
           summary_preview=summary_line[:100],
+          salvaged_fields=sorted(_salvaged.keys()),
           raw_text_full=raw_text)
 
     return {
         "verdict": verdict,
         "qa_score": score,
-        "summary": f"[QA prose fallback] {summary_line}",
-        "import_issues": [],
-        "downstream_risks": [],
-        "type_errors": [],
-        "logic_errors": [],
-        "plan_deviation": "",
+        "summary": f"{summary_tag} {summary_line}",
+        "import_issues": _salvaged.get("import_issues", []),
+        "downstream_risks": _salvaged.get("downstream_risks", []),
+        "type_errors": _salvaged.get("type_errors", []),
+        "logic_errors": _salvaged.get("logic_errors", []),
+        "plan_deviation": _salvaged.get("plan_deviation", ""),
         "risk_verdicts": [],
     }
 
