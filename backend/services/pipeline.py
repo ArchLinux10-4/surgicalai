@@ -10875,10 +10875,26 @@ async def _retry_truncated_edit(
               effort_kwargs=_retry_edit_effort_kwargs)
 
         _chunks = []
-        async with aclient.messages.stream(**_retry_edit_kwargs) as _stream:
-            async for _t in _stream.text_stream:
-                _chunks.append(_t)
+        _retry_t0 = time.time()
+        try:
+            async with asyncio.timeout(120):
+                async with aclient.messages.stream(**_retry_edit_kwargs) as _stream:
+                    async for _t in _stream.text_stream:
+                        _chunks.append(_t)
+        except TimeoutError:
+            _dlog("retry_truncated_edit_timeout",
+                  session_id=session_id, user_id=user_id,
+                  filename=filename, symbol=symbol_name,
+                  duration_s=round(time.time() - _retry_t0, 1),
+                  chunks_so_far=len(_chunks))
+            return None
 
+        _dlog("retry_truncated_edit_stream_done",
+              session_id=session_id, user_id=user_id,
+              filename=filename, symbol=symbol_name,
+              duration_s=round(time.time() - _retry_t0, 1),
+              chunk_count=len(_chunks),
+              text_len=len("".join(_chunks)))
         text = "".join(_chunks).strip()
 
         EDIT_OPEN = "<surgical_edit>"
@@ -10965,10 +10981,26 @@ async def _retry_truncated_newfile(
               effort_kwargs=_retry_newfile_effort_kwargs)
 
         _chunks = []
-        async with aclient.messages.stream(**_retry_newfile_kwargs) as _stream:
-            async for _t in _stream.text_stream:
-                _chunks.append(_t)
+        _retry_t0 = time.time()
+        try:
+            async with asyncio.timeout(120):
+                async with aclient.messages.stream(**_retry_newfile_kwargs) as _stream:
+                    async for _t in _stream.text_stream:
+                        _chunks.append(_t)
+        except TimeoutError:
+            _dlog("retry_truncated_newfile_timeout",
+                  session_id=session_id, user_id=user_id,
+                  filename=filename,
+                  duration_s=round(time.time() - _retry_t0, 1),
+                  chunks_so_far=len(_chunks))
+            return None
 
+        _dlog("retry_truncated_newfile_stream_done",
+              session_id=session_id, user_id=user_id,
+              filename=filename,
+              duration_s=round(time.time() - _retry_t0, 1),
+              chunk_count=len(_chunks),
+              text_len=len("".join(_chunks)))
         text = "".join(_chunks).strip()
 
         FILE_OPEN = "<new_file>"
@@ -11199,6 +11231,8 @@ async def run_natural_pipeline_stream(
 
     def sse(obj: dict) -> str:
         return f"data: {json.dumps(obj)}\n\n"
+
+    _pipeline_t0 = time.time()
 
     EDIT_OPEN = "<surgical_edit>"
     EDIT_CLOSE = "</surgical_edit>"
@@ -11476,7 +11510,9 @@ async def run_natural_pipeline_stream(
         _github_attempts = 0                     # counts every attempt — loop-safety backstop
 
         # +2: one extra slot for the forced-edit round when budget exhausted
+        _streaming_t0 = time.time()
         for search_round in range(MAX_SEARCH_ROUNDS + 2):
+            _round_t0 = time.time()
 
             state = "normal"    # "normal" | "in_edit" | "in_file" | "in_search" | "in_filereq" | "in_plan"
             normal_buf = ""
@@ -12412,6 +12448,15 @@ async def run_natural_pipeline_stream(
                 continue  # Retry round
 
             # ── No search request — streaming is done ─────────────────────
+            _dlog("streaming_phase_done",
+                  session_id=session_id, user_id=user_id,
+                  total_rounds=search_round + 1,
+                  streaming_duration_s=round(time.time() - _streaming_t0, 1),
+                  pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1),
+                  edit_blocks=len(edit_blocks_raw),
+                  new_file_blocks=len(new_file_blocks_raw),
+                  has_plan=edit_plan_data is not None,
+                  response_len=len(full_response))
             break
 
         # Final flush for edge cases (Claude ended inside a block)
@@ -12468,12 +12513,20 @@ async def run_natural_pipeline_stream(
                         if _retry_content:
                             yield sse({"type": "progress",
                                        "content": f"Retrying {_retry_sym} in {_retry_fname}..."})
-                            _retried = await _retry_truncated_edit(
+                            _redit_task = asyncio.create_task(_retry_truncated_edit(
                                 aclient, arch_model,
                                 _retry_fname, _retry_sym, _retry_content,
                                 _retry_smap, user_request,
                                 session_id, user_id
-                            )
+                            ))
+                            _redit_t0 = time.time()
+                            while not _redit_task.done():
+                                _done_r, _ = await asyncio.wait({_redit_task}, timeout=15.0)
+                                if not _done_r:
+                                    _redit_el = int(time.time() - _redit_t0)
+                                    yield sse({"type": "progress",
+                                               "content": f"Retrying {_retry_sym}… ({_redit_el}s)"})
+                            _retried = _redit_task.result()
                             if _retried:
                                 _good_blocks.append(_retried)
                                 yield sse({"type": "progress",
@@ -12516,11 +12569,19 @@ async def run_natural_pipeline_stream(
                         _retry_fname = _fname_match.group(1)
                         yield sse({"type": "progress",
                                    "content": f"Retrying {_retry_fname}..."})
-                        _retried_file = await _retry_truncated_newfile(
+                        _rnf_task = asyncio.create_task(_retry_truncated_newfile(
                             aclient, arch_model,
                             _retry_fname, user_request,
                             session_id, user_id
-                        )
+                        ))
+                        _rnf_t0 = time.time()
+                        while not _rnf_task.done():
+                            _done_nf, _ = await asyncio.wait({_rnf_task}, timeout=15.0)
+                            if not _done_nf:
+                                _rnf_el = int(time.time() - _rnf_t0)
+                                yield sse({"type": "progress",
+                                           "content": f"Retrying {_retry_fname}… ({_rnf_el}s)"})
+                        _retried_file = _rnf_task.result()
                         if _retried_file:
                             _good_files.append(_retried_file)
                             yield sse({"type": "progress",
@@ -12540,6 +12601,11 @@ async def run_natural_pipeline_stream(
 
         # ── Plan→Execute: focused per-symbol edit calls ──────────────────
         if edit_plan_data:
+            _plan_exec_t0 = time.time()
+            _dlog("plan_exec_phase_start",
+                  session_id=session_id, user_id=user_id,
+                  plan_count=len(edit_plan_data),
+                  pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
             yield sse({"type": "progress",
                        "content": f"Executing {len(edit_plan_data)} planned edit(s) individually..."})
             for plan_idx, plan_item in enumerate(edit_plan_data):
@@ -12664,6 +12730,11 @@ async def run_natural_pipeline_stream(
             yield sse({"type": "done", "content": ""})
             return
 
+        _resolution_t0 = time.time()
+        _dlog("resolution_phase_start",
+              session_id=session_id, user_id=user_id,
+              edit_count=len(edit_blocks_raw),
+              pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
         yield sse({"type": "progress", "content": f"Resolving {len(edit_blocks_raw)} edit(s)..."})
 
         # Build file content lookup
@@ -13725,6 +13796,10 @@ async def run_natural_pipeline_stream(
                             raise TimeoutError(
                                 "correction call exceeded 180s deadline"
                             )
+                        _dlog("correction_call_keepalive",
+                              session_id=session_id, user_id=user_id,
+                              resolve_round=resolve_round,
+                              elapsed_s=round(_corr_elapsed, 1))
                         yield sse({
                             "type": "progress",
                             "content": (
@@ -13733,7 +13808,6 @@ async def run_natural_pipeline_stream(
                                 f"… still working ({int(_corr_elapsed)}s)"
                             ),
                         })
-                        yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
                 corr_resp = _corr_task.result()
 
                 corr_text = "".join(
@@ -13836,13 +13910,16 @@ async def run_natural_pipeline_stream(
                                         messages=_fu_msgs,
                                     )
                                 )
+                                _fu_t0 = time.time()
                                 while not _fu_task.done():
                                     try:
                                         await asyncio.wait_for(
                                             asyncio.shield(_fu_task), timeout=20.0
                                         )
                                     except asyncio.TimeoutError:
-                                        yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+                                        _fu_el = int(time.time() - _fu_t0)
+                                        yield sse({"type": "progress",
+                                                   "content": f"Correction follow-up… ({_fu_el}s)"})
                                 _fu_resp = _fu_task.result()
                                 _fu_text = "".join(
                                     b.text for b in _fu_resp.content
@@ -13851,6 +13928,7 @@ async def run_natural_pipeline_stream(
                                 _dlog("correction_followup_response",
                                       session_id=session_id,
                                       resolve_round=resolve_round,
+                                      duration_s=round(time.time() - _fu_t0, 1),
                                       response_chars=len(_fu_text),
                                       response_preview=_fu_text,
                                       user_id=user_id)
@@ -13921,6 +13999,12 @@ async def run_natural_pipeline_stream(
               skipped_details=skipped_changes_struct[:10],
               user_id=user_id)
 
+        _qa_t0 = time.time()
+        _dlog("qa_phase_start",
+              session_id=session_id, user_id=user_id,
+              change_count=len(resolved_edits),
+              resolution_duration_s=round(time.time() - _resolution_t0, 1),
+              pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
         yield sse({"type": "progress", "content": f"Running QA on {len(resolved_edits)} change(s)..."})
 
         # Build shared context once — same view the architect had
@@ -14079,13 +14163,20 @@ async def run_natural_pipeline_stream(
             for cs in change_shells
         ]
 
-        # Wait for all QA to finish, sending keepalives every 20 s
+        # Wait for all QA to finish, sending visible progress every 20 s
         pending = set(qa_tasks)
         while pending:
             done_set, pending = await asyncio.wait(pending, timeout=20.0)
             if pending:
-                # SSE keepalive — keeps Railway/Vercel proxy alive, ignored by frontend
-                yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+                _qa_elapsed = int(time.time() - _qa_t0)
+                _qa_done_count = len(qa_tasks) - len(pending)
+                yield sse({"type": "progress",
+                           "content": f"QA: {_qa_done_count}/{len(qa_tasks)} checks done… ({_qa_elapsed}s)"})
+                _dlog("qa_keepalive",
+                      session_id=session_id, user_id=user_id,
+                      elapsed_s=_qa_elapsed,
+                      done=_qa_done_count, total=len(qa_tasks),
+                      pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
 
         qa_results = []
         for t in qa_tasks:
@@ -14106,6 +14197,8 @@ async def run_natural_pipeline_stream(
 
         _dlog("qa_results_collected",
               session_id=session_id,
+              qa_duration_s=round(time.time() - _qa_t0, 1),
+              pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1),
               count=len(qa_results),
               results=[{
                   "symbol": change_shells[_qi]["symbol"].name if _qi < len(change_shells) else "?",
@@ -14808,7 +14901,9 @@ async def run_natural_pipeline_stream(
                                         timeout=20.0,
                                     )
                                 except asyncio.TimeoutError:
-                                    yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+                                    yield sse({"type": "progress",
+                                               "content": f"QA correction round {_qa_retry_round + 1}… "
+                                                           f"still working"})
 
                             _fu_resp = _fu_task.result()
                             corr_text = "".join(
@@ -15362,7 +15457,9 @@ async def run_natural_pipeline_stream(
                             try:
                                 await asyncio.wait_for(asyncio.shield(_mw_task), timeout=20.0)
                             except asyncio.TimeoutError:
-                                yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
+                                yield sse({"type": "progress",
+                                           "content": f"Multi-window correction {_mw_sym.name} "
+                                                       f"window {_mw_wi + 1}/{len(_mw_windows)}…"})
 
                         _mw_resp = _mw_task.result()
                         _mw_text = "".join(
@@ -15906,6 +16003,9 @@ async def run_natural_pipeline_stream(
               files=list(changes_by_file.keys()),
               user_id=user_id)
         yield sse({"type": "smart_result", "content": json.dumps(result)})
+        _dlog("pipeline_complete",
+              session_id=session_id, user_id=user_id,
+              pipeline_total_s=round(time.time() - _pipeline_t0, 1))
         yield sse({"type": "done", "content": ""})
 
     except Exception as e:
