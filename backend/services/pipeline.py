@@ -11381,6 +11381,16 @@ async def run_natural_pipeline_stream(
             file_request_data: list | None = None  # set when a file_request block completes
             github_requested: dict | None = None  # set when a github_request block completes
             had_thinking = False                    # track if Claude produced thinking this round
+            # ── Edit-stream heartbeat (session e4e9d098 fix 3) ──────────
+            # Evidence: 2.5 minutes of edit-block generation produced ZERO
+            # visible output (edit tokens are suppressed from chat) — the
+            # UI showed only a static "Preparing code change..." box, which
+            # reads as hung and invites a client abort (the disconnect that
+            # killed that run).  Emit a byte-count progress heartbeat while
+            # inside <surgical_edit>/<new_file> so long generations read as
+            # alive and moving.
+            _edit_hb_bytes = 0
+            _edit_hb_last = 0
 
             # Retry loop for transient API errors
             for _attempt in range(3):
@@ -11421,6 +11431,21 @@ async def run_natural_pipeline_stream(
                                         normal_buf += text_chunk
                                     else:
                                         tag_buf += text_chunk
+                                        # Heartbeat: visible progress while
+                                        # writing suppressed edit/file blocks
+                                        if state in ("in_edit", "in_file"):
+                                            _edit_hb_bytes += len(text_chunk)
+                                            if (_edit_hb_bytes - _edit_hb_last
+                                                    >= 2048):
+                                                _edit_hb_last = _edit_hb_bytes
+                                                _hb_kb = _edit_hb_bytes / 1024
+                                                yield sse({
+                                                    "type": "progress",
+                                                    "content": (
+                                                        "✍️ Writing code "
+                                                        f"changes… {_hb_kb:.1f} KB"
+                                                    ),
+                                                })
 
                                     # ── Processing loop: open→close→re-scan until stable ──
                                     while True:
@@ -12879,6 +12904,115 @@ async def run_natural_pipeline_stream(
                                   ) if _correct_sym else None,
                                   user_id=user_id)
 
+                        # Strategy 2.5: Preamble edit — imports / file header.
+                        # (session e4e9d098) The model edited absolute lines
+                        # 1-10 (the import block) but labeled the edit with the
+                        # component it was working on ("NewFileCard", exact
+                        # name match).  Strategy 1 finds no candidate because
+                        # the file preamble (imports before the first symbol)
+                        # belongs to NO symbol in the SymbolMap.  Evidence: the
+                        # edit's new_code contained 9 of the file's 10 preamble
+                        # lines verbatim — a valid edit rejected on a label
+                        # technicality, then lost to the correction loop.
+                        # Recovery: when the target range falls ENTIRELY before
+                        # the first mapped symbol AND the existing lines
+                        # substantially reappear in new_code (content proof),
+                        # build a tight synthetic symbol covering just the
+                        # preamble.  Content verification is what makes it safe
+                        # to override an exact-name match here.
+                        if (not _correct_sym and edit_start_line
+                                and edit_end_line and file_content):
+                            _pre_isl = int(edit_start_line)
+                            _pre_iel = int(edit_end_line)
+                            _first_sym_start = min(
+                                (_s.start_line for _s in smap.symbols
+                                 if _s.start_line and _s.start_line > 0),
+                                default=None,
+                            )
+                            if (_first_sym_start and _first_sym_start > 1
+                                    and 1 <= _pre_isl <= _pre_iel
+                                    < _first_sym_start):
+                                _fc_lines_pre = file_content.split("\n")
+                                _tgt_lines = [
+                                    _l.strip() for _l in
+                                    _fc_lines_pre[_pre_isl - 1:_pre_iel]
+                                    if _l.strip()
+                                ]
+                                _nc_line_set = {
+                                    _l.strip() for _l in new_code.split("\n")
+                                    if _l.strip()
+                                }
+                                _pre_hits = sum(
+                                    1 for _l in _tgt_lines
+                                    if _l in _nc_line_set
+                                )
+                                _pre_ratio = (
+                                    _pre_hits / len(_tgt_lines)
+                                ) if _tgt_lines else 0.0
+                                if _tgt_lines and _pre_ratio >= 0.6:
+                                    try:
+                                        from models.schemas import (
+                                            SymbolInfo as _SI_pre,
+                                            SymbolType as _ST_pre,
+                                        )
+                                        _pre_end = _first_sym_start - 1
+                                        _correct_sym = _SI_pre(
+                                            name="_preamble",
+                                            symbol_type=_ST_pre.VARIABLE,
+                                            start_line=1,
+                                            end_line=_pre_end,
+                                            parent=None,
+                                            indentation=0,
+                                            code="\n".join(
+                                                _fc_lines_pre[0:_pre_end]
+                                            ),
+                                        )
+                                        _correct_method = (
+                                            "auto_resolve_preamble"
+                                        )
+                                        _dlog("symbol_auto_resolve_preamble",
+                                              session_id=session_id,
+                                              filename=filename,
+                                              target_range=(
+                                                  f"{_pre_isl}-{_pre_iel}"
+                                              ),
+                                              preamble_range=f"1-{_pre_end}",
+                                              first_symbol_start=(
+                                                  _first_sym_start
+                                              ),
+                                              content_match_ratio=round(
+                                                  _pre_ratio, 3
+                                              ),
+                                              matched_lines=(
+                                                  f"{_pre_hits}/"
+                                                  f"{len(_tgt_lines)}"
+                                              ),
+                                              original_symbol=symbol_name,
+                                              user_id=user_id)
+                                    except Exception as _pre_err:
+                                        _dlog(
+                                            "symbol_auto_resolve_preamble_error",
+                                            session_id=session_id,
+                                            filename=filename,
+                                            error=str(_pre_err)[:200],
+                                            user_id=user_id)
+                                else:
+                                    _dlog(
+                                        "symbol_auto_resolve_preamble_skip",
+                                        session_id=session_id,
+                                        filename=filename,
+                                        target_range=f"{_pre_isl}-{_pre_iel}",
+                                        content_match_ratio=round(
+                                            _pre_ratio, 3
+                                        ),
+                                        reason=(
+                                            "content_verification_failed: "
+                                            "existing preamble lines do not "
+                                            "substantially reappear in "
+                                            "new_code"
+                                        ),
+                                        user_id=user_id)
+
                         # Strategy 3: Gap Bridge — create synthetic whole-file
                         # symbol when SymbolMap has coverage gaps.  Common in
                         # mega HTML files where a 6000+ line <script> block is
@@ -13338,6 +13472,51 @@ async def run_natural_pipeline_stream(
                         })
                 break
 
+            # ── Disconnect checkpoint (session e4e9d098) ─────────────────
+            # Evidence: a client disconnect during the correction round's
+            # Claude call vaporized a fully-resolved 10.2KB edit that had
+            # succeeded 31s earlier — the safety net in chat.py only saved
+            # visible chat tokens.  Before entering the long, risky
+            # correction wait, emit everything resolved SO FAR so the
+            # stream wrapper can persist it if the connection dies.
+            # Unknown SSE types are ignored by all frontend parsers
+            # (verified: if/else-if dispatch in api/client.ts).
+            if resolved_edits:
+                try:
+                    _ckpt_payload = {
+                        "resolve_round": resolve_round,
+                        "unresolved_count": len(still_unresolved),
+                        "resolved": [
+                            {
+                                "filename": _ck["filename"],
+                                "symbol": getattr(
+                                    _ck["symbol"], "name", "?"
+                                ),
+                                "description": _ck["edit_data"].get(
+                                    "description", ""
+                                ),
+                                "new_code": _ck["edit_data"].get(
+                                    "new_code", ""
+                                ),
+                            }
+                            for _ck in resolved_edits
+                        ],
+                    }
+                    _dlog("resolution_checkpoint_emitted",
+                          session_id=session_id,
+                          resolve_round=resolve_round,
+                          resolved_count=len(resolved_edits),
+                          unresolved_count=len(still_unresolved),
+                          payload_bytes=len(json.dumps(_ckpt_payload)),
+                          user_id=user_id)
+                    yield sse({"type": "checkpoint",
+                               "content": json.dumps(_ckpt_payload)})
+                except Exception as _ckpt_err:
+                    _dlog("resolution_checkpoint_error",
+                          session_id=session_id,
+                          error=str(_ckpt_err)[:200],
+                          user_id=user_id)
+
             # ── Silent correction call ────────────────────────────────────
             yield sse({"type": "progress",
                        "content": f"Correcting symbol references ({resolve_round + 1}/{MAX_SYMBOL_RETRIES})..."})
@@ -13363,10 +13542,38 @@ async def run_natural_pipeline_stream(
                     system=system_prompt,
                     messages=correction_msgs,
                 ))
+                # ── Deadline + visible heartbeat (session e4e9d098 fix 3) ──
+                # Evidence: this loop kept a run alive with invisible
+                # keepalives while the UI showed a frozen "Correcting symbol
+                # references..." — and it has no overall deadline, so a hung
+                # Claude call would keepalive forever.  Emit elapsed-time
+                # progress the user can SEE, and give up cleanly at 180s
+                # (routes to the existing correction-failed handler; already-
+                # resolved edits still ship).
+                _corr_t0 = time.time()
                 while not _corr_task.done():
                     try:
                         await asyncio.wait_for(asyncio.shield(_corr_task), timeout=20.0)
                     except asyncio.TimeoutError:
+                        _corr_elapsed = time.time() - _corr_t0
+                        if _corr_elapsed >= 180.0:
+                            _corr_task.cancel()
+                            _dlog("correction_call_deadline",
+                                  session_id=session_id,
+                                  resolve_round=resolve_round,
+                                  elapsed_s=round(_corr_elapsed, 1),
+                                  user_id=user_id)
+                            raise TimeoutError(
+                                "correction call exceeded 180s deadline"
+                            )
+                        yield sse({
+                            "type": "progress",
+                            "content": (
+                                f"Correcting symbol references "
+                                f"({resolve_round + 1}/{MAX_SYMBOL_RETRIES})"
+                                f"… still working ({int(_corr_elapsed)}s)"
+                            ),
+                        })
                         yield f"data: {json.dumps({'type': 'keepalive', 'content': ''})}\n\n"
                 corr_resp = _corr_task.result()
 
@@ -13524,7 +13731,15 @@ async def run_natural_pipeline_stream(
                                   error=str(_cse),
                                   user_id=user_id)
 
-            except Exception:
+            except Exception as _corr_fail:
+                # Log the actual failure — this bare handler previously
+                # swallowed the reason (session e4e9d098 audit).
+                _dlog("correction_call_failed",
+                      session_id=session_id,
+                      resolve_round=resolve_round,
+                      error=str(_corr_fail)[:300],
+                      error_type=type(_corr_fail).__name__,
+                      user_id=user_id)
                 for item in still_unresolved:
                     skipped_messages.append(f"Symbol '{item['symbol']}' not found in {item['filename']} — skipped")
                     skipped_changes_struct.append({

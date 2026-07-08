@@ -617,6 +617,10 @@ async def smart_stream(req: dict, request: Request):
 
         collected_tokens = []
         result_content = None
+        # Latest resolution checkpoint from the pipeline (session e4e9d098):
+        # resolved edits emitted BEFORE risky long waits, so a disconnect
+        # doesn't vaporize completed work.
+        checkpoint_content = None
         current_summary = session_summary
         _stream_t0 = time.time()
         _phase = "init"
@@ -790,6 +794,8 @@ async def smart_stream(req: dict, request: Request):
                             collected_tokens.append(data.get("content", ""))
                         elif chunk_type == "smart_result":
                             result_content = data.get("content", "")
+                        elif chunk_type == "checkpoint":
+                            checkpoint_content = data.get("content", "")
                         elif chunk_type in ("done", "error"):
                             # Save assistant message — store both natural text AND result
                             with get_db_ctx() as db:
@@ -853,11 +859,51 @@ async def smart_stream(req: dict, request: Request):
                       path="single_pass", total_duration_s=round(time.time() - _stream_t0, 1))
             # Safety net: if stream ended without done/error (crash, timeout,
             # client disconnect), persist whatever tokens were collected.
-            if not _saved and collected_tokens:
+            if not _saved and (collected_tokens or checkpoint_content):
                 try:
                     with get_db_ctx() as db:
                         resp_id = str(uuid.uuid4())
                         fallback_text = "".join(collected_tokens).strip()
+                        # ── Checkpoint recovery (session e4e9d098) ──────────
+                        # A disconnect during the correction round used to
+                        # save only visible chat tokens; a fully-resolved
+                        # 10.2KB edit was lost.  If the pipeline emitted a
+                        # resolution checkpoint, reconstruct the resolved
+                        # edits as a readable message so the work survives.
+                        if checkpoint_content:
+                            try:
+                                _ckpt = _json.loads(checkpoint_content)
+                                _rec = _ckpt.get("resolved", [])
+                                if _rec:
+                                    _parts = [
+                                        "\n\n---\n⚡ **Connection was interrupted**, "
+                                        f"but I recovered {len(_rec)} completed "
+                                        "edit(s) from before the drop:"
+                                    ]
+                                    for _r in _rec:
+                                        _desc = _r.get("description") or "edit"
+                                        _parts.append(
+                                            f"\n**{_r.get('filename', '?')}** — "
+                                            f"`{_r.get('symbol', '?')}`: {_desc}\n"
+                                            f"```\n{_r.get('new_code', '')}\n```"
+                                        )
+                                    _parts.append(
+                                        "\nRe-send the prompt to finish the "
+                                        "remaining work, or apply these manually."
+                                    )
+                                    fallback_text = (
+                                        fallback_text + "".join(_parts)
+                                    ).strip()
+                                    _dlog("safety_net_checkpoint_recovered",
+                                          session_id=session_id,
+                                          user_id=current_user_id,
+                                          recovered_edits=len(_rec),
+                                          recovered_chars=sum(
+                                              len(_r.get("new_code", ""))
+                                              for _r in _rec
+                                          ))
+                            except Exception as _ckpt_parse_err:
+                                print(f"[STREAM] Checkpoint recovery failed: {_ckpt_parse_err}")
                         if fallback_text:
                             db.execute(
                                 "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
