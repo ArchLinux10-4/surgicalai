@@ -7,7 +7,8 @@ import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import type { SmartResult, NewFile } from '../types'
 import { InlineDiffCard } from './InlineDiffCard'
-import { Add, Check, ContentCopy, Description, FileDownload, KeyboardArrowDown, KeyboardArrowUp } from '@mui/icons-material';
+import { LivePreview, isVisualFile } from './LivePreview'
+import { Add, Check, ContentCopy, Description, FileDownload, KeyboardArrowDown, KeyboardArrowUp, Visibility } from '@mui/icons-material';
 
 const LANG_LABELS: Record<string, string> = {
   typescript: 'TypeScript', tsx: 'TSX', javascript: 'JavaScript',
@@ -57,6 +58,11 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
   const [savedLocally, setSavedLocally] = useState(() => localStorage.getItem(savedKey) === '1')
   const saved = savedLocally || alreadyInSession
   const [copied, setCopied] = useState(false)
+  const [showPreview, setShowPreview] = useState(false)
+  const canPreview = isVisualFile(file.filename)
+  // Once saved, derive fileId from sessionFiles so LivePreview gets full bundle resolution
+  const sessionFile = sessionFiles.find(sf => sf.filename === file.filename)
+  const fileId = sessionFile?.id
 
   const lang = detectLang(file.filename, file.language)
   const label = LANG_LABELS[lang] || lang.toUpperCase() || 'CODE'
@@ -144,6 +150,18 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
           >
             <FileDownload sx={{ fontSize: 12 }} /><span>Download</span>
           </button>
+          {canPreview && (
+            <button
+              onClick={() => setShowPreview(p => !p)}
+              className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11px] transition-colors ${
+                showPreview
+                  ? 'text-accent bg-accent/10 hover:bg-accent/20'
+                  : 'text-muted hover:text-ink hover:bg-overlay/60'
+              }`}
+            >
+              <Visibility sx={{ fontSize: 12 }} /><span>Preview</span>
+            </button>
+          )}
           {isLong && (
             <button
               onClick={() => setCollapsed(c => !c)}
@@ -155,6 +173,18 @@ function SingleFileCard({ file, sessionId, index, onSaved }: SingleFileCardProps
           )}
         </div>
       </div>
+
+      {/* Live Preview — same component used by InlineDiffCard's FileChangeCard for edited files */}
+      {canPreview && showPreview && (
+        <div className="border-b border-border/60">
+          <LivePreview
+            code={file.content}
+            filename={file.filename}
+            sessionId={sessionId}
+            fileId={fileId}
+          />
+        </div>
+      )}
 
       {/* File summary */}
       {file.summary && (
