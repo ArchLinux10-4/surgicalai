@@ -11103,6 +11103,13 @@ async def _execute_single_edit(
             "Produce exactly ONE <surgical_edit> block now."
         )
 
+    import asyncio as _asyncio_se
+
+    # Per-item timeout: cap any single Anthropic call at 120s.
+    # Prevents a hung API call from blocking the entire pipeline until
+    # the SSE connection is killed externally (see session c72cfe5d).
+    SINGLE_EDIT_TIMEOUT = 120
+
     try:
         call_kwargs = {
             "model": model,
@@ -11114,9 +11121,10 @@ async def _execute_single_edit(
         call_kwargs.update(_get_effort_kwargs(model))
 
         _chunks = []
-        async with aclient.messages.stream(**call_kwargs) as _stream:
-            async for _t in _stream.text_stream:
-                _chunks.append(_t)
+        async with _asyncio_se.timeout(SINGLE_EDIT_TIMEOUT):
+            async with aclient.messages.stream(**call_kwargs) as _stream:
+                async for _t in _stream.text_stream:
+                    _chunks.append(_t)
 
         text = "".join(_chunks)
 
@@ -11141,6 +11149,13 @@ async def _execute_single_edit(
               session_id=session_id, user_id=user_id,
               filename=filename, symbol=symbol_name,
               response_preview=text[:300])
+        return None
+
+    except TimeoutError:
+        _dlog("plan_execute_timeout",
+              session_id=session_id, user_id=user_id,
+              filename=filename, symbol=symbol_name,
+              timeout_sec=SINGLE_EDIT_TIMEOUT)
         return None
 
     except Exception as e:
@@ -12549,12 +12564,25 @@ async def run_natural_pipeline_stream(
                            "content": f"Editing {p_symbol} in {p_filename} ({plan_idx+1}/{len(edit_plan_data)})..."})
 
                 try:
-                    result_raw = await _execute_single_edit(
+                    # Run the edit as a task so we can emit progress heartbeats
+                    # every 15s — prevents silent dead air during long API calls.
+                    _edit_task = asyncio.ensure_future(_execute_single_edit(
                         aclient, arch_model,
                         p_filename, p_symbol, p_description,
                         p_content, p_smap, user_request,
                         session_id, user_id
-                    )
+                    ))
+                    _edit_start = time.monotonic()
+                    while not _edit_task.done():
+                        _done_set, _ = await asyncio.wait(
+                            {_edit_task}, timeout=15
+                        )
+                        if not _done_set:
+                            _elapsed = int(time.monotonic() - _edit_start)
+                            yield sse({"type": "progress",
+                                       "content": f"⏳ Still editing {p_symbol}... ({_elapsed}s)"})
+                    result_raw = _edit_task.result()
+
                     if result_raw:
                         edit_blocks_raw.append(result_raw)
                         yield sse({"type": "progress",
@@ -12567,6 +12595,29 @@ async def run_natural_pipeline_stream(
                         })
                         yield sse({"type": "progress",
                                    "content": f"⚠️ {p_symbol} — no edit produced"})
+
+                except asyncio.CancelledError:
+                    # SSE disconnect: Starlette cancels the generator task.
+                    # Log remaining plan items as skipped so they're visible
+                    # in diagnostics, then re-raise to let cleanup proceed.
+                    _remaining = edit_plan_data[plan_idx:]
+                    _dlog("plan_execute_cancelled",
+                          session_id=session_id, user_id=user_id,
+                          cancelled_at_index=plan_idx,
+                          total_items=len(edit_plan_data),
+                          remaining_items=[
+                              {"filename": ri.get("filename", ""),
+                               "symbol": ri.get("symbol", "")}
+                              for ri in _remaining
+                          ])
+                    for ri in _remaining:
+                        skipped_changes_struct.append({
+                            "filename": ri.get("filename", ""),
+                            "symbol": ri.get("symbol", ""),
+                            "reason": "Skipped — client disconnected during plan execution",
+                        })
+                    raise  # Re-raise CancelledError so the task actually cancels
+
                 except Exception as exec_err:
                     _dlog("plan_execute_error",
                           session_id=session_id, user_id=user_id,
