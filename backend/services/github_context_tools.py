@@ -19,6 +19,7 @@ default OFF). Zero effect on the legacy ReAct loop, single-pass path,
 Surgeon, QA, or correction handler — this module is not imported by any
 of them.
 """
+import itertools
 from typing import Callable, Dict, Optional
 
 from github import InputGitTreeElement
@@ -384,7 +385,11 @@ def execute_github_context_tool(
             hits = g.search_code(query=full_query)
             lines = [f"Code search in {owner}/{repo} for '{query}':", ""]
             count = 0
-            for hit in hits[:30]:
+            # NOTE: use islice iteration, NOT hits[:30]. PaginatedList slice-indexing
+            # raises IndexError when GitHub search returns a 'next' Link header but the
+            # follow-up page has empty items (incomplete_results eventual-consistency).
+            # The iterator path ends cleanly on an empty page. Repro: session ff4ff718.
+            for hit in itertools.islice(hits, 30):
                 lines.append(f"{hit.path}")
                 count += 1
             if count == 0:

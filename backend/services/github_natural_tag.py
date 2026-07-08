@@ -91,18 +91,75 @@ def natural_github_availability(user_id: str, dlog: Optional[Callable] = None):
         return False, []
 
 
-def build_github_prompt_section(installations: list) -> str:
+def get_known_repos(user_id: str, session_id: str,
+                    dlog: Optional[Callable] = None,
+                    limit: int = 3) -> list:
+    """Return 'owner/repo' strings the user has actually worked with —
+    this session's registered GitHub files first, then the user's most
+    recently touched repos across sessions (session_files.github_meta
+    joined to chat_sessions.user_id). Read-only; NEVER raises.
+
+    Purpose (session ff4ff718 fix): sessions that start with zero files
+    burned GitHub round 1 on list_repos just to rediscover a repo name
+    already sitting in the user's session history."""
+    try:
+        from database import get_db_ctx
+        repos: list = []
+        with get_db_ctx() as conn:
+            rows = conn.execute(
+                """SELECT sf.github_meta,
+                          CASE WHEN sf.session_id = ? THEN 0 ELSE 1 END AS pri
+                   FROM session_files sf
+                   JOIN chat_sessions cs ON cs.id = sf.session_id
+                   WHERE cs.user_id = ?
+                     AND sf.github_meta IS NOT NULL AND sf.github_meta != ''
+                   ORDER BY pri ASC, sf.updated_at DESC
+                   LIMIT 25""",
+                (session_id, user_id)).fetchall()
+        for row in rows:
+            raw = row[0] if not hasattr(row, "keys") else row["github_meta"]
+            try:
+                meta = json.loads(raw or "{}")
+            except Exception:
+                continue
+            owner = (meta.get("owner") or "").strip()
+            repo = (meta.get("repo") or "").strip()
+            if owner and repo:
+                full = f"{owner}/{repo}"
+                if full not in repos:
+                    repos.append(full)
+            if len(repos) >= limit:
+                break
+        _safe_dlog(dlog, "gh_known_repos",
+                   user_id=user_id, session_id=session_id, repos=repos)
+        return repos
+    except Exception as e:
+        _safe_dlog(dlog, "gh_known_repos_error", user_id=user_id, error=str(e))
+        return []
+
+
+def build_github_prompt_section(installations: list,
+                                known_repos: Optional[list] = None) -> str:
     """System-prompt text telling Claude the tag exists and how to use it.
     Only ever called when natural_github_availability returned True."""
     accounts = ", ".join(
         str(i.get("account_login", "?")) for i in installations
     ) or "?"
+    known_line = ""
+    if known_repos:
+        known_line = (
+            "\nKNOWN REPOS (from this user's session history, most recent "
+            f"first): {', '.join(known_repos)}\n"
+            "Use these owner/repo values directly. Do NOT call list_repos "
+            "when the repo you need is already listed here.\n"
+        )
     return f"""
 ━━━ GITHUB ACCESS (LIVE) ━━━
 This user has connected their GitHub account ({accounts}) via the GitHub App.
 You HAVE live read access to their repositories. When the user asks about
 their pull requests, issues, branches, diffs, or repos, DO NOT say you lack
 access — fetch the data with a github_request tag:
+{known_line}
 
 <github_request>
 {{"tool": "list_prs", "args": {{"owner": "{accounts.split(',')[0].strip()}", "repo": "REPO_NAME"}}, "reason": "why you need this"}}

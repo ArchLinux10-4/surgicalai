@@ -11201,6 +11201,7 @@ async def run_natural_pipeline_stream(
             from services.github_natural_tag import (
                 natural_github_availability, build_github_prompt_section,
                 parse_github_request, execute_github_request,
+                get_known_repos,
                 GH_TAG_OPEN, GH_TAG_CLOSE,
             )
             _gh_nat_enabled, _gh_nat_installs = natural_github_availability(
@@ -11208,9 +11209,14 @@ async def run_natural_pipeline_stream(
             )
             if _gh_nat_enabled:
                 TAG_DEFS["github"] = {"open": GH_TAG_OPEN, "close": GH_TAG_CLOSE}
+                # session ff4ff718 fix: tell the model which repos this user
+                # already works with so round 1 isn't burned on list_repos.
+                _gh_known_repos = get_known_repos(
+                    user_id, session_id, dlog=_dlog)
                 system_prompt.append({
                     "type": "text",
-                    "text": build_github_prompt_section(_gh_nat_installs),
+                    "text": build_github_prompt_section(
+                        _gh_nat_installs, known_repos=_gh_known_repos),
                 })
                 _dlog("natural_github_tag_registered",
                       session_id=session_id, user_id=user_id,
@@ -11368,8 +11374,10 @@ async def run_natural_pipeline_stream(
         _forced_edit_round_done = False          # only one forced-edit round allowed
         _thinking_only_retries = 0               # max 1 auto-retry for thinking-only responses
         _gh_announce_retries = 0                 # max 1 auto-retry for announce-without-action stalls
-        MAX_GITHUB_ROUNDS = 6                    # cap <github_request> rounds per prompt
-        _github_rounds_used = 0                  # counts github rounds (incl. invalid JSON)
+        MAX_GITHUB_ROUNDS = 6                    # cap PRODUCTIVE <github_request> rounds per prompt
+        MAX_GITHUB_ATTEMPTS = 12                 # hard cap on total attempts (incl. invalid JSON / tool failures)
+        _github_rounds_used = 0                  # counts only rounds that returned data (session ff4ff718 fix)
+        _github_attempts = 0                     # counts every attempt — loop-safety backstop
 
         # +2: one extra slot for the forced-edit round when budget exhausted
         for search_round in range(MAX_SEARCH_ROUNDS + 2):
@@ -12048,18 +12056,25 @@ async def run_natural_pipeline_stream(
             if github_requested is not None:
                 _gh_req = github_requested
                 github_requested = None
-                _github_rounds_used += 1
+                _github_attempts += 1
                 _dlog("natural_github_round",
                       session_id=session_id, user_id=user_id,
                       round=search_round,
                       github_rounds_used=_github_rounds_used,
+                      github_attempts=_github_attempts,
                       request=str(_gh_req)[:300])
 
-                # Budget exhausted — tell Claude to answer with what it has
-                if _github_rounds_used > MAX_GITHUB_ROUNDS:
+                # Budget exhausted — tell Claude to answer with what it has.
+                # Only PRODUCTIVE rounds (data returned) count against
+                # MAX_GITHUB_ROUNDS; wasted rounds (invalid JSON, tool crash)
+                # get a free retry, bounded by MAX_GITHUB_ATTEMPTS so a
+                # failure loop can never run forever. (session ff4ff718 fix)
+                if (_github_rounds_used >= MAX_GITHUB_ROUNDS
+                        or _github_attempts > MAX_GITHUB_ATTEMPTS):
                     _dlog("natural_github_budget_exhausted",
                           session_id=session_id, user_id=user_id,
-                          github_rounds_used=_github_rounds_used)
+                          github_rounds_used=_github_rounds_used,
+                          github_attempts=_github_attempts)
                     current_messages = current_messages + [
                         {"role": "assistant", "content": full_response or "(checking GitHub...)"},
                         {"role": "user", "content":
@@ -12109,9 +12124,21 @@ async def run_natural_pipeline_stream(
                         _gh_result = f"[push_session_file failed: {_gh_push_err}]"
                 else:
                     _gh_result = execute_github_request(_gh_req, user_id, dlog=_dlog)
+                # ── Budget accounting (session ff4ff718 fix): only rounds that
+                # actually returned data consume the MAX_GITHUB_ROUNDS budget.
+                # Failure strings from execute_github_request/context_tools are
+                # always bracket- or "Missing"-prefixed (github_context_tools.py
+                # returns, natural_tag.py:277) — those rounds are free retries.
+                _gh_round_failed = _gh_result.startswith((
+                    "[GitHub tool failed", "[GitHub request failed",
+                    "[push_session_file failed", "Missing "))
+                if not _gh_round_failed:
+                    _github_rounds_used += 1
                 _dlog("natural_github_result",
                       session_id=session_id, user_id=user_id,
                       tool=_gh_req.get("tool"),
+                      counted=not _gh_round_failed,
+                      github_rounds_used=_github_rounds_used,
                       result_len=len(_gh_result),
                       result_preview=_gh_result[:300])
 
@@ -12250,7 +12277,7 @@ async def run_natural_pipeline_stream(
             # retry pattern above. Guarded so it can never fire twice and
             # never touches rounds where any tool/edit/plan was produced.
             if (_gh_nat_enabled
-                    and _github_rounds_used == 0
+                    and _github_attempts == 0
                     and _gh_announce_retries < 1
                     and had_thinking
                     and full_response.strip()
