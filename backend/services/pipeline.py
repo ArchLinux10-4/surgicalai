@@ -5068,6 +5068,41 @@ Examples of when to use `create_spreadsheet`:
 - "Make me a spreadsheet of US states" -> create_spreadsheet with the data
 """
 
+_NATURAL_DATA_SECTION = """
+━━━ DATA FILE ANALYSIS ━━━
+
+The uploaded files include data files (CSV, Excel, or similar). Their content is shown
+as markdown tables in the file context above. You have full capability to work with this data:
+
+1. **Answer questions about the data** — summarize, compare, find patterns, compute statistics,
+   filter, rank, or explain the data. Work directly from the table content you can see above.
+
+2. **Create new data files** — When the user asks you to create, export, filter, transform, or
+   modify data into a downloadable file, use a <new_file> block with CSV content:
+
+<new_file>
+{
+  "filename": "filtered_results.csv",
+  "language": "csv",
+  "summary": "Filtered rows where revenue > 10000",
+  "content": "Name,Revenue,Region\nAcme,15000,West\nGlobex,22000,East"
+}
+</new_file>
+
+   For modifications: read the data from the uploaded content above, apply the user's changes,
+   and output the complete updated data as a <new_file> CSV.
+
+3. **You CAN work with Excel/spreadsheet data** — The data has already been extracted and is
+   visible to you as markdown tables. You can read it, analyze it, and create new files from it.
+
+CRITICAL RULES:
+- Do NOT say "I cannot edit Excel files" — the data is RIGHT HERE in your context as tables.
+- Do NOT suggest the user run Python scripts. YOU do the analysis and create the output directly.
+- For simple questions (totals, averages, specific lookups), just answer in your response text.
+- For new/modified data files, use <new_file> with CSV format.
+"""
+
+
 # ── Code quality best practices — always injected into SMART_ARCHITECT_SYSTEM for edits ──
 _CODE_QUALITY_SECTION = """
 ━━━ CODE QUALITY RULES (MANDATORY FOR ALL EDITS) ━━━
@@ -11737,6 +11772,25 @@ async def run_natural_pipeline_stream(
                 }
             )
 
+        # ── Data-file awareness (R21) ────────────────────────────────────
+        # When the session contains CSV/Excel/data files, inject guidance so
+        # Claude knows it can analyze the data and create new data files via
+        # <new_file> — prevents "I cannot edit Excel" refusals.
+        _nat_has_data_files = any(
+            sf.get("file_type") in ("csv", "excel", "text")
+            for sf in session_files
+        )
+        if _nat_has_data_files:
+            system_prompt.append({
+                "type": "text",
+                "text": _NATURAL_DATA_SECTION,
+            })
+            _dlog("natural_data_section_injected",
+                  session_id=session_id, user_id=user_id,
+                  data_file_count=sum(1 for sf in session_files
+                                      if sf.get("file_type") in ("csv", "excel", "text")))
+
+
         # ── GitHub natural-chat tag (flag-gated, per-user) ─────────────────
         # Only active when github_context_tools_enabled=true AND the GitHub
         # App is configured AND this user has a linked installation. When
@@ -16310,6 +16364,7 @@ async def run_natural_pipeline_stream(
                     "ts": "typescript", "tsx": "typescript", "js": "javascript",
                     "jsx": "javascript", "py": "python", "go": "go", "rs": "rust",
                     "css": "css", "html": "html", "json": "json", "md": "markdown",
+                    "csv": "csv", "tsv": "csv", "xlsx": "csv", "xls": "csv",
                 }
                 language = ext_map.get(ext, "text")
 
