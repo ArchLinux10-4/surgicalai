@@ -5078,8 +5078,10 @@ as markdown tables in the file context above. You have full capability to work w
    filter, rank, or explain the data. Work directly from the table content you can see above.
 
 2. **Create new data files** — When the user asks you to create, export, filter, transform, or
-   modify data into a downloadable file, use a <new_file> block with CSV content:
+   modify data into a downloadable file, use a <new_file> block. You can create BOTH CSV and
+   Excel files:
 
+   CSV example:
 <new_file>
 {
   "filename": "filtered_results.csv",
@@ -5089,18 +5091,29 @@ as markdown tables in the file context above. You have full capability to work w
 }
 </new_file>
 
+   Excel example (provide data as CSV — it will be converted to a real .xlsx binary automatically):
+<new_file>
+{
+  "filename": "report.xlsx",
+  "language": "csv",
+  "summary": "Sales report with all regions",
+  "content": "Name,Revenue,Region\nAcme,15000,West\nGlobex,22000,East"
+}
+</new_file>
+
    For modifications: read the data from the uploaded content above, apply the user's changes,
-   and output the complete updated data as a <new_file> CSV.
+   and output the complete updated data as a <new_file>.
 
 3. **You CAN work with Excel/spreadsheet data** — The data has already been extracted and is
-   visible to you as markdown tables. You can read it, analyze it, and create new files from it.
+   visible to you as markdown tables. You can read it, analyze it, and create new CSV or Excel
+   files from it. If the user uploaded an .xlsx and asks for edits, output an .xlsx back.
 
 CRITICAL RULES:
 - Do NOT use <file_request> for data files — they are ALREADY fully loaded as markdown tables above.
 - Do NOT say "I cannot edit Excel files" — the data is RIGHT HERE in your context as tables.
 - Do NOT suggest the user run Python scripts. YOU do the analysis and create the output directly.
 - For simple questions (totals, averages, specific lookups), just answer in your response text.
-- For new/modified data files, use <new_file> with CSV format.
+- For new/modified data files, use <new_file> with either .csv or .xlsx filename.
 """
 
 
@@ -12445,7 +12458,7 @@ async def run_natural_pipeline_stream(
                     _redirect = (
                         "Those data files are already fully loaded in your context as markdown tables above. "
                         "Analyze the data directly and respond to the user's question. "
-                        "You can create new CSV files using <new_file> if needed."
+                        "You can create new CSV or Excel (.xlsx) files using <new_file> if needed."
                     ) if _all_data else (
                         "Those files are already fully loaded in your context above. "
                         "Use the content shown above — do NOT re-request."
@@ -16398,6 +16411,62 @@ async def run_natural_pipeline_stream(
                     "csv": "csv", "tsv": "csv", "xlsx": "csv", "xls": "csv",
                 }
                 language = ext_map.get(ext, "text")
+
+            # ── R22: Excel binary creation via persist_result ─────────────
+            _nf_ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+            if _nf_ext in ("xlsx", "xls"):
+                try:
+                    from services.datalab.config import datalab_enabled
+                    if datalab_enabled():
+                        import csv as _csv_mod
+                        import io as _io_mod
+                        _csv_reader = _csv_mod.reader(_io_mod.StringIO(content))
+                        _all_rows = list(_csv_reader)
+                        if _all_rows:
+                            _xl_columns = _all_rows[0]
+                            _xl_data_rows = _all_rows[1:]
+                        else:
+                            _xl_columns = []
+                            _xl_data_rows = []
+                        from services.datalab import persist as _dl_persist
+                        _xl_desc = _dl_persist.persist_result(
+                            session_id=session_id,
+                            source_file_id="",
+                            source_filename=filename,
+                            source_kind="excel",
+                            source_delimiter=",",
+                            columns=_xl_columns,
+                            rows=_xl_data_rows,
+                            transform_sql="",
+                            origin="generated",
+                            sheet_name=file_data.get("sheet_name", "Sheet1"),
+                        )
+                        _dlog("newfile_xlsx_persist_ok",
+                              session_id=session_id, user_id=user_id,
+                              filename=_xl_desc["filename"],
+                              file_id=_xl_desc["file_id"],
+                              rows=_xl_desc["row_count"],
+                              cols=_xl_desc["column_count"],
+                              bytes=_xl_desc["byte_size"])
+                        yield sse({"type": "progress",
+                                   "content": f"📊 Created: {_xl_desc['filename']} ({_xl_desc['row_count']} rows × {_xl_desc['column_count']} cols)"})
+                        summary_parts.append(summary or f"Created {_xl_desc['filename']}")
+                        # Skip normal new_files append — persist_result already created the file
+                        continue
+                    else:
+                        _dlog("newfile_xlsx_datalab_disabled",
+                              session_id=session_id, user_id=user_id,
+                              filename=filename)
+                        # Fall through: save as CSV fallback
+                        filename = filename.rsplit(".", 1)[0] + ".csv"
+                except Exception as _xl_err:
+                    _dlog("newfile_xlsx_persist_error",
+                          session_id=session_id, user_id=user_id,
+                          filename=filename,
+                          error=str(_xl_err),
+                          error_type=type(_xl_err).__name__)
+                    # Fall through: save as CSV fallback
+                    filename = filename.rsplit(".", 1)[0] + ".csv"
 
             # QA: check the new file against codebase context
             codebase_ctx = _build_codebase_context_for_creator(symbol_maps_by_name)
