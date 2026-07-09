@@ -1658,7 +1658,7 @@ def run_surgeon(
     forbid_noop: bool = False,       # if True, reject the empty "already correct" escape hatch
 ) -> tuple:
     """
-    GPT-4.1 (Surgeon): receives ONE code chunk + plan, returns search-and-replace operations.
+    Surgeon: receives ONE code chunk + plan, returns search-and-replace operations.
     Returns (new_code, confidence, surgeon_notes, import_needed, operations).
 
     Claude (Architect) has already planned the change and specified exactly what context
@@ -1671,7 +1671,7 @@ def run_surgeon(
              Surgeon now sees the verdict on retry instead of receiving identical inputs.
     """
     client = _get_client(user_id)
-    surg_model = model or get_setting("surgeon_model", "gpt-4.1")
+    surg_model = model or get_setting("surgeon_model", "claude-sonnet-5")
     temp = float(get_setting("temperature_surgeon", "0.1"))
     client = _get_client_for_model(surg_model, user_id)
 
@@ -1775,6 +1775,12 @@ def run_surgeon(
                 + _noop_clause
                 + "\n".join(_qa_lines)
             )
+            _dlog("surgeon_qa_feedback_injected",
+                  symbol=symbol.name if symbol else "?",
+                  feedback_len=len(_qa_feedback_block),
+                  qa_lines_count=len(_qa_lines),
+                  forbid_noop=forbid_noop,
+                  summary=(qa_feedback.get("summary") or "")[:120])
 
     # For DELETE operations, new_logic is typically empty — make the instruction explicit
     # so the Surgeon doesn't misread "nothing to add" as "already correct".
@@ -3791,12 +3797,17 @@ async def run_qa_for_changes(
     user_request: str,
     anthropic_key: str,
     model: str,
+    qa_feedback: dict = None,
 ) -> dict:
     """
     Run a QA review of all proposed changes via a single non-streaming Claude call.
 
     Returns a dict with keys: verdict, qa_score, summary, issues, risks.
     On any error, returns a safe fallback dict.
+
+    v3.12.1: qa_feedback — previous QA verdict dict; when present, appended to the
+             user message so the re-QA judge knows what was previously blocked and
+             can verify the correction actually addressed those issues.
     """
     _QA_SYSTEM = (
         "You are a code reviewer. Review the proposed code changes and verify they "
@@ -3842,14 +3853,25 @@ async def run_qa_for_changes(
             original = getattr(ch, "original_code", "") or ""
             new_code = getattr(ch, "new_code", "") or ""
 
-            # Truncate very long code to 500 lines (must be large enough for
-            # QA to see structural breaks in big JSX components)
+            # Head+tail truncation: keep first 300 + last 200 lines so QA sees
+            # both the entry point and the closing logic of large symbols.
+            # (v3.12.1: was head-only 500 which missed structural breaks at tail)
+            _QA_HEAD, _QA_TAIL = 300, 200
+            _QA_MAX = _QA_HEAD + _QA_TAIL
             orig_lines = original.splitlines()
             new_lines = new_code.splitlines()
-            if len(orig_lines) > 500:
-                original = "\n".join(orig_lines[:500]) + "\n... (truncated)"
-            if len(new_lines) > 500:
-                new_code = "\n".join(new_lines[:500]) + "\n... (truncated)"
+            if len(orig_lines) > _QA_MAX:
+                original = (
+                    "\n".join(orig_lines[:_QA_HEAD])
+                    + f"\n\n... ({len(orig_lines) - _QA_MAX} lines omitted) ...\n\n"
+                    + "\n".join(orig_lines[-_QA_TAIL:])
+                )
+            if len(new_lines) > _QA_MAX:
+                new_code = (
+                    "\n".join(new_lines[:_QA_HEAD])
+                    + f"\n\n... ({len(new_lines) - _QA_MAX} lines omitted) ...\n\n"
+                    + "\n".join(new_lines[-_QA_TAIL:])
+                )
 
             user_parts.append(
                 f"--- CHANGE: {symbol_name} ---\n"
@@ -3858,6 +3880,27 @@ async def run_qa_for_changes(
             )
 
         user_message = "\n".join(user_parts)
+
+        # v3.12.1: if this is a re-QA after correction, inject prior QA feedback
+        # so the judge knows what was blocked and can verify the fix.
+        if qa_feedback and qa_feedback.get("verdict") in ("blocked", "warning"):
+            _prev_issues = qa_feedback.get("issues", [])
+            _prev_summary = qa_feedback.get("summary", "")
+            _prev_parts = []
+            if _prev_summary:
+                _prev_parts.append(f"Previous QA summary: {_prev_summary}")
+            for _pi in _prev_issues[:5]:
+                _prev_parts.append(f"  - {_pi}")
+            if _prev_parts:
+                user_message += (
+                    "\n\n--- PREVIOUS QA REJECTION (verify these are fixed) ---\n"
+                    + "\n".join(_prev_parts)
+                )
+            _dlog("qa_for_changes_reqa_with_feedback",
+                  model=model,
+                  prev_verdict=qa_feedback.get("verdict"),
+                  prev_score=qa_feedback.get("qa_score"),
+                  prev_issues_count=len(_prev_issues))
 
         aclient = AsyncAnthropic(api_key=anthropic_key)
         # QA always uses Sonnet — cheaper than user's model, accurate for review
@@ -4400,8 +4443,8 @@ async def analyze_and_plan_stream(
                             changes = _corr_changes
                             _dlog("correction_tool_use_applying",
                                   session_id=session_id, num_fixes=len(_corr_changes))
-                            # Re-run QA on the fix
-                            qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model)
+                            # Re-run QA on the fix (pass prior qa as feedback so judge can verify fix)
+                            qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model, qa_feedback=qa)
                             qa_risks = qa.get("risks", [])
                             # Re-run structural QA
                             if _sq_blocking is not None:
@@ -4508,8 +4551,8 @@ async def analyze_and_plan_stream(
                                 ))
                             if _new_changes:
                                 changes = _new_changes
-                                # Re-run QA on the fix
-                                qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model)
+                                # Re-run QA on the fix (pass prior qa as feedback so judge can verify fix)
+                                qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model, qa_feedback=qa)
                                 qa_risks = qa.get("risks", [])
                                 # Re-run structural QA
                                 if _sq_blocking is not None:
@@ -8900,7 +8943,7 @@ USER REQUEST:
             # receives the full file and outputs a complete new file via tool_use.
             # This eliminates the focused-window truncation problem for multi-region
             # rewrites that span 800+ lines across 4+ non-contiguous blocks.
-            _surg_model_route = get_setting("surgeon_model", "gpt-4.1")
+            _surg_model_route = get_setting("surgeon_model", "claude-sonnet-5")
             _symbol_size_route = symbol.end_line - symbol.start_line + 1
             # v3.12: use original (pre-narrowing) size — narrowing must not defeat routing
             _use_direct_rewrite = (
