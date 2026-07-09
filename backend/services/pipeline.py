@@ -5096,6 +5096,7 @@ as markdown tables in the file context above. You have full capability to work w
    visible to you as markdown tables. You can read it, analyze it, and create new files from it.
 
 CRITICAL RULES:
+- Do NOT use <file_request> for data files — they are ALREADY fully loaded as markdown tables above.
 - Do NOT say "I cannot edit Excel files" — the data is RIGHT HERE in your context as tables.
 - Do NOT suggest the user run Python scripts. YOU do the analysis and create the output directly.
 - For simple questions (totals, averages, specific lookups), just answer in your response text.
@@ -10963,7 +10964,11 @@ def _build_natural_file_context(
             # actually work with the data.  PDF/text stay more conservative.
             _data_limit = 60_000 if file_type in ("csv", "excel") else 8_000
             preview = content[:_data_limit] + (f"\n...[{len(content)-_data_limit} more chars not shown]" if len(content) > _data_limit else "")
-            return f"FILE: {fname} [{file_type.upper()}]\nCONTENT:\n{preview}\n"
+            return (
+                f"FILE: {fname} [{file_type.upper()} — FULLY LOADED]\n"
+                f"⚠️ This data is already fully loaded below. Do NOT use <file_request> for this file — analyze it directly.\n"
+                f"CONTENT:\n{preview}\n"
+            )
 
         smap, _ = symbol_maps_by_name.get(fname, (None, sf))
 
@@ -11050,7 +11055,7 @@ def _build_natural_file_context(
         for sf in tier2:
             parts.append(_render_lean(sf))
 
-    return "\n".join(parts)
+    return "\n".join(parts), tier1_names
 
 
 def _clean_history_content(content: str) -> str:
@@ -11729,7 +11734,7 @@ async def run_natural_pipeline_stream(
                 symbol_maps_by_name[fname] = (None, sf)
 
         # ── Build file context ────────────────────────────────────────────
-        file_context = _build_natural_file_context(
+        file_context, _tier1_names = _build_natural_file_context(
             session_files, symbol_maps_by_name, user_request,
             project_memory=project_memory, session_summary=session_summary,
             session_id=session_id, user_id=user_id,
@@ -12430,6 +12435,32 @@ async def run_natural_pipeline_stream(
                 fnames_req = file_request_data
                 file_request_data = None
 
+                # ── Tier-1 guard: skip files already in full context ──
+                _tier1_overlap = [fn for fn in fnames_req if fn in _tier1_names]
+                if _tier1_overlap and all(fn in _tier1_names for fn in fnames_req):
+                    _all_data = all(
+                        symbol_maps_by_name.get(fn, (None, {}))[1].get("file_type") in ("csv", "excel", "pdf", "text")
+                        for fn in _tier1_overlap
+                    )
+                    _redirect = (
+                        "Those data files are already fully loaded in your context as markdown tables above. "
+                        "Analyze the data directly and respond to the user's question. "
+                        "You can create new CSV files using <new_file> if needed."
+                    ) if _all_data else (
+                        "Those files are already fully loaded in your context above. "
+                        "Use the content shown above — do NOT re-request."
+                    )
+                    _dlog("filereq_tier1_guard",
+                          session_id=session_id, user_id=user_id,
+                          requested=fnames_req, tier1_overlap=_tier1_overlap,
+                          all_data=_all_data)
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": full_response or "(requesting files...)"},
+                        {"role": "user", "content": _redirect},
+                    ]
+                    full_response = ""
+                    continue
+
                 # Filter already-requested files
                 new_fnames = [fn for fn in fnames_req if fn not in requested_files]
 
@@ -12448,7 +12479,7 @@ async def run_natural_pipeline_stream(
                         {"role": "assistant", "content": full_response or "(requesting files...)"},
                         {"role": "user", "content":
                             "Those files are already in your context. "
-                            "Write your <surgical_edit> blocks now."},
+                            "Use the content already shown above."},
                     ]
                     full_response = ""
                     continue
