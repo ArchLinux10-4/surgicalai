@@ -7147,11 +7147,11 @@ USER REQUEST:
                     default=0,
                 )
                 if _tu_largest > 5000:
-                    _TU_MAX_ROUNDS = 8
+                    _TU_MAX_ROUNDS = 10
                 elif _tu_largest > 1000:
-                    _TU_MAX_ROUNDS = 6
+                    _TU_MAX_ROUNDS = 8
                 else:
-                    _TU_MAX_ROUNDS = 4
+                    _TU_MAX_ROUNDS = 6
 
                 # Build initial user content (with images if present)
                 if image_files:
@@ -7332,12 +7332,19 @@ USER REQUEST:
                         break
 
                     # ── Search/request tools → execute and loop ──
-                    _tu_search = [t for t in _tu_parsed if t["name"] in (
+                    _tu_known_tools = {
                         "search_codebase", "request_file",
                         "find_callers", "find_usages", "get_lines",
-                    )]
+                        "list_prs", "get_pr_diff", "get_pr_comments",
+                        "list_issues", "get_issue_comments", "diff_branches",
+                        "list_files", "read_file", "search_code", "push_files",
+                    }
+                    _tu_search = [t for t in _tu_parsed if t["name"] in _tu_known_tools]
                     if not _tu_search:
                         # Unknown tools — treat text as chat
+                        _dlog("tu_gate_no_known_tools",
+                              tool_names=[t["name"] for t in _tu_parsed],
+                              session_id=session_id, round=_tu_round)
                         plan = {"intent": "chat", "chat_response": "".join(_tu_text) or "I couldn't determine what to do."}
                         break
 
@@ -7507,7 +7514,7 @@ USER REQUEST:
                                 "content": _es_res[:16000]
                             })
 
-                        elif _tc["name"] in ("list_prs", "get_pr_diff", "get_pr_comments", "list_issues", "get_issue_comments", "diff_branches"):
+                        elif _tc["name"] in ("list_prs", "get_pr_diff", "get_pr_comments", "list_issues", "get_issue_comments", "diff_branches", "list_files", "read_file", "search_code", "push_files"):
                             _dlog("tu_github_context_tool_call", tool_name=_tc["name"],
                                   tool_input=_tc["input"], session_id=session_id, round=_tu_round)
                             try:
@@ -7525,6 +7532,67 @@ USER REQUEST:
                                 )
                                 _dlog("tu_github_context_tool_result", tool_name=_tc["name"],
                                       result_len=len(_gh_res), session_id=session_id)
+                            # ── P7: Register read_file result as session file ──
+                            # After a successful read_file, persist the COMPLETE
+                            # file into symbol_maps_by_name so search_codebase and
+                            # future edits work on it. Same pattern as natural pipeline.
+                            if _tc["name"] == "read_file" and _gh_res and not _gh_res.startswith("["):
+                                try:
+                                    _rf_args = _tc["input"]
+                                    _rf_parsed = {
+                                        "tool": "read_file",
+                                        "args": {
+                                            "owner": _rf_args.get("owner", ""),
+                                            "repo": _rf_args.get("repo", ""),
+                                            "path": _rf_args.get("path", ""),
+                                            "ref": _rf_args.get("ref", ""),
+                                        }
+                                    }
+                                    from services.github_natural_tag import (
+                                        fetch_and_register_github_file,
+                                    )
+                                    _rf_entry = fetch_and_register_github_file(
+                                        _rf_parsed, user_id, session_id, dlog=_dlog)
+                                    if _rf_entry and _rf_entry.get("content"):
+                                        _rf_fname = _rf_entry["filename"]
+                                        # Parse symbols and add to searchable index
+                                        try:
+                                            _rf_smap = parser.parse(_rf_entry["content"], _rf_fname)
+                                            symbol_maps_by_name[_rf_fname] = (_rf_smap, _rf_entry)
+                                        except Exception as _rf_parse_err:
+                                            symbol_maps_by_name[_rf_fname] = (None, _rf_entry)
+                                            _dlog("tu_read_file_parse_failed",
+                                                  filename=_rf_fname, error=str(_rf_parse_err),
+                                                  session_id=session_id)
+                                        # P9: Clear term dedup so re-search finds new file content
+                                        _tu_prev_searched = list(_tu_searched)
+                                        _tu_searched.clear()
+                                        _dlog("tu_read_file_registered",
+                                              filename=_rf_fname,
+                                              content_chars=len(_rf_entry["content"]),
+                                              lines=_rf_entry.get("lines"),
+                                              symbol_count=_rf_entry.get("symbol_count"),
+                                              total_files=len(symbol_maps_by_name),
+                                              cleared_dedup_terms=len(_tu_prev_searched),
+                                              session_id=session_id, round=_tu_round)
+                                        _gh_res += (
+                                            f"\n\n[NOTE: The complete file '{_rf_fname}' "
+                                            f"({_rf_entry.get('lines')} lines) is now loaded in "
+                                            f"this session and is EDITABLE + SEARCHABLE. You can "
+                                            f"search_codebase for symbols in this file. To modify "
+                                            f"it, emit standard <surgical_edit> blocks with "
+                                            f'filename \"{_rf_fname}\" — the user will see a '
+                                            f"diff card with a QA score.]"
+                                        )
+                                    else:
+                                        _dlog("tu_read_file_not_registered",
+                                              path=_rf_args.get("path", ""),
+                                              session_id=session_id, round=_tu_round)
+                                except Exception as _rf_reg_err:
+                                    _dlog("tu_read_file_register_error",
+                                          error=str(_rf_reg_err),
+                                          session_id=session_id, round=_tu_round)
+
                             _tu_results.append({
                                 "type": "tool_result",
                                 "tool_use_id": _tc["id"],
