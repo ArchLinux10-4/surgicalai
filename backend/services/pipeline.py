@@ -1147,6 +1147,41 @@ _github_context_tools_flag = get_setting("github_context_tools_enabled", "false"
 if _github_context_tools_flag:
     AGENTIC_TOOLS_V2 = AGENTIC_TOOLS_V2 + _GH_CTX_TOOLS_EXT
 
+# ── P12: Add push_session_file + check_deploy to agentic tools ──
+# push_session_file pushes an already-edited session file back to GitHub
+# (content from DB, not from the model). check_deploy checks Vercel/Railway
+# deployment status. Both are always available when agentic mode is on.
+_P12_TOOLS = [
+    {
+        "name": "push_session_file",
+        "description": "Push an already-edited session file back to its GitHub repo. The server reads the applied content from the database — you only provide the filename and commit message. Use ONLY after edits have been applied by the user.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {"type": "string", "description": "The session file's basename (e.g. 'LandingPage.tsx')"},
+                "message": {"type": "string", "description": "Git commit message"},
+                "branch": {"type": "string", "description": "Target branch (defaults to the branch it was loaded from)"},
+            },
+            "required": ["filename", "message"],
+        },
+    },
+    {
+        "name": "check_deploy",
+        "description": "Check the latest deployment status from Vercel, Railway, or both. Use when the user asks about deploy status, build failures, or 'did it deploy?'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "provider": {
+                    "type": "string",
+                    "enum": ["vercel", "railway", "both"],
+                    "description": "Which platform to check (defaults to 'both')",
+                },
+            },
+        },
+    },
+]
+AGENTIC_TOOLS_V2 = AGENTIC_TOOLS_V2 + _P12_TOOLS
+
 
 # Phase 4: Correction handler tool definitions (tool_use migration)
 CORRECTION_TOOLS = [
@@ -7184,6 +7219,14 @@ USER REQUEST:
                 _tu_extra_searched = set()  # dedupe key for find_callers/find_usages/get_lines
                 plan = None
 
+                # ── P10: Adaptive round extension (ported from ReAct) ──
+                # Productive rounds (that surface new code locations) get
+                # refunded so they don't count against _TU_MAX_ROUNDS.
+                # Bounded by an absolute hard ceiling on total rounds.
+                _tu_abs_round = 0
+                _TU_HARD_CEILING = 20
+                _tu_seen_across = set()
+
                 # Import once per Architect call; failure degrades gracefully —
                 # the three extra tools simply report "unavailable" instead of
                 # crashing the whole tool-use loop.
@@ -7197,7 +7240,8 @@ USER REQUEST:
 
                 while _tu_round < _TU_MAX_ROUNDS:
                     _tu_round += 1
-                    print(f"[AGENTIC][TOOL_USE] Round {_tu_round}/{_TU_MAX_ROUNDS}")
+                    _tu_abs_round += 1
+                    print(f"[AGENTIC][TOOL_USE] Round {_tu_round}/{_TU_MAX_ROUNDS} (abs={_tu_abs_round})")
 
                     # Inject budget warning on final round
                     if _tu_round == _TU_MAX_ROUNDS:
@@ -7338,6 +7382,7 @@ USER REQUEST:
                         "list_prs", "get_pr_diff", "get_pr_comments",
                         "list_issues", "get_issue_comments", "diff_branches",
                         "list_files", "read_file", "search_code", "push_files",
+                        "push_session_file", "check_deploy",  # P12
                     }
                     _tu_search = [t for t in _tu_parsed if t["name"] in _tu_known_tools]
                     if not _tu_search:
@@ -7371,6 +7416,7 @@ USER REQUEST:
 
                     # Execute search/request tools
                     _tu_results = []
+                    _tu_round_locs = set()  # P10: location keys found this round
                     for _tc in _tu_search:
                         if _tc["name"] == "search_codebase":
                             _s_terms = _tc["input"].get("terms", [])
@@ -7453,6 +7499,7 @@ USER REQUEST:
                                                 _s_hits.append(f"GREP MATCH ('{_s_t}') [{_s_fn} L{_s_lineno}]:\n{_sr}")
                                         break  # one match per term per file
                             _tu_searched.extend(_s_new)
+                            _tu_round_locs.update(_s_seen)  # P10: collect for yield tracking
                             _s_result = "\n\n".join(_s_hits) if _s_hits else "No matches found for: " + ", ".join(_s_new)
                             _tu_results.append({
                                 "type": "tool_result",
@@ -7514,7 +7561,71 @@ USER REQUEST:
                                 "content": _es_res[:16000]
                             })
 
-                        elif _tc["name"] in ("list_prs", "get_pr_diff", "get_pr_comments", "list_issues", "get_issue_comments", "diff_branches", "list_files", "read_file", "search_code", "push_files"):
+                        elif _tc["name"] == "push_files":
+                            # ── P11: Block push_files during agentic search loop ──
+                            # push_files bypasses QA, diff cards, and user review.
+                            # The proper flow: include changes in submit_plan →
+                            # edit pipeline → QA → diff card → user Apply → push.
+                            _dlog("tu_push_files_blocked",
+                                  tool_input=_tc["input"],
+                                  session_id=session_id, round=_tu_round)
+                            _tu_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": _tc["id"],
+                                "content": (
+                                    "[BLOCKED] push_files is not allowed during the search/planning phase. "
+                                    "To push code changes: include them in your submit_plan with intent='edit'. "
+                                    "The edit pipeline will run QA, show a diff card, and let the user Apply + Push. "
+                                    "This ensures all changes are reviewed before reaching the repo."
+                                ),
+                                "is_error": True,
+                            })
+
+                        elif _tc["name"] == "push_session_file":
+                            # ── P12: Push already-applied session file to GitHub ──
+                            _dlog("tu_push_session_file_call",
+                                  tool_input=_tc["input"],
+                                  session_id=session_id, round=_tu_round)
+                            try:
+                                from services.github_natural_tag import (
+                                    push_session_file_from_db,
+                                )
+                                _psf_parsed = {"tool": "push_session_file", "args": _tc["input"]}
+                                _psf_res = push_session_file_from_db(
+                                    _psf_parsed, user_id, session_id, dlog=_dlog)
+                            except Exception as _psf_err:
+                                _dlog("tu_push_session_file_error",
+                                      error=str(_psf_err),
+                                      session_id=session_id, round=_tu_round)
+                                _psf_res = f"[push_session_file failed: {_psf_err}]"
+                            _tu_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": _tc["id"],
+                                "content": _psf_res[:16000],
+                            })
+
+                        elif _tc["name"] == "check_deploy":
+                            # ── P12: Check deployment status ──
+                            _dlog("tu_check_deploy_call",
+                                  tool_input=_tc["input"],
+                                  session_id=session_id, round=_tu_round)
+                            try:
+                                from services.deploy_status import check_deploy_status
+                                _cd_res = check_deploy_status(
+                                    user_id, _tc["input"], dlog=_dlog)
+                            except Exception as _cd_err:
+                                _dlog("tu_check_deploy_error",
+                                      error=str(_cd_err),
+                                      session_id=session_id, round=_tu_round)
+                                _cd_res = f"[check_deploy failed: {_cd_err}]"
+                            _tu_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": _tc["id"],
+                                "content": _cd_res[:16000],
+                            })
+                            yield sse({"type": "progress", "content": "Checked deploy status"})
+
+                        elif _tc["name"] in ("list_prs", "get_pr_diff", "get_pr_comments", "list_issues", "get_issue_comments", "diff_branches", "list_files", "read_file", "search_code"):
                             _dlog("tu_github_context_tool_call", tool_name=_tc["name"],
                                   tool_input=_tc["input"], session_id=session_id, round=_tu_round)
                             try:
@@ -7567,6 +7678,7 @@ USER REQUEST:
                                         # P9: Clear term dedup so re-search finds new file content
                                         _tu_prev_searched = list(_tu_searched)
                                         _tu_searched.clear()
+                                        _tu_round_locs.add(f"{_rf_fname}::REGISTERED")  # P10
                                         _dlog("tu_read_file_registered",
                                               filename=_rf_fname,
                                               content_chars=len(_rf_entry["content"]),
@@ -7600,7 +7712,48 @@ USER REQUEST:
                             })
 
                     _tu_messages.append({"role": "user", "content": _tu_results})
-                    print(f"[AGENTIC][TOOL_USE] Round {_tu_round} done: {len(_tu_search)} tools, {len(_tu_results)} results")
+
+                    # ── P10: Adaptive round extension ──
+                    # If this round surfaced new code locations, refund it
+                    # (don't count against _TU_MAX_ROUNDS). Hard ceiling
+                    # prevents runaway loops.
+                    try:
+                        _tu_new_locs = [
+                            loc for loc in _tu_round_locs
+                            if loc not in _tu_seen_across
+                        ]
+                        for loc in _tu_round_locs:
+                            _tu_seen_across.add(loc)
+                        if _tu_abs_round >= _TU_HARD_CEILING:
+                            # Absolute ceiling — grant one final forced-planning round
+                            _tu_round = _TU_MAX_ROUNDS - 1
+                            _dlog("tu_hard_ceiling",
+                                  session_id=session_id, user_id=user_id,
+                                  abs_round=_tu_abs_round,
+                                  max_rounds=_TU_MAX_ROUNDS)
+                        elif _tu_new_locs and _tu_abs_round < _TU_HARD_CEILING:
+                            # Productive round — refund it
+                            _tu_round -= 1
+                            _dlog("tu_round_productive_extension",
+                                  session_id=session_id, user_id=user_id,
+                                  abs_round=_tu_abs_round,
+                                  counted_round=_tu_round,
+                                  new_locations=len(_tu_new_locs),
+                                  new_locs_sample=_tu_new_locs[:5])
+                        elif not _tu_new_locs:
+                            _dlog("tu_round_stalled",
+                                  session_id=session_id, user_id=user_id,
+                                  abs_round=_tu_abs_round,
+                                  counted_round=_tu_round,
+                                  tools_used=[t["name"] for t in _tu_search[:5]])
+                    except Exception as _tu_ext_err:
+                        # Extension is best-effort — never break the loop
+                        _dlog("tu_extension_error",
+                              session_id=session_id, user_id=user_id,
+                              error=str(_tu_ext_err),
+                              error_type=type(_tu_ext_err).__name__)
+
+                    print(f"[AGENTIC][TOOL_USE] Round {_tu_round} done: {len(_tu_search)} tools, {len(_tu_results)} results (abs={_tu_abs_round}, seen={len(_tu_seen_across)})")
 
                 # End of tool_use while loop
                 if plan is None:
