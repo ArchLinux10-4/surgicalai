@@ -124,6 +124,12 @@ def get_available_models(request: Request):
         openai_models = [
             {"id": "gpt-5.5", "name": "GPT-5.5", "role": "architect",
              "description": "Latest GPT — powerful general-purpose model", "provider": "openai"},
+            {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol", "role": "architect",
+             "description": "Frontier reasoning — hardest problems, 1M context", "provider": "openai"},
+            {"id": "gpt-5.6-terra", "name": "GPT-5.6 Terra", "role": "architect",
+             "description": "Balanced reasoning — 2× cheaper than Sol, 1M context", "provider": "openai"},
+            {"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "role": "architect",
+             "description": "Fast reasoning — 5× cheaper than Sol, 1M context", "provider": "openai"},
         ]
 
     return {

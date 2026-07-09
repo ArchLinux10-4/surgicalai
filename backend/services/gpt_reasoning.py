@@ -30,7 +30,7 @@ RETRY_MAX_COMPLETION_TOKENS = 65536     # single retry budget after truncation
 DEFAULT_REASONING_EFFORT = "low"        # docs (reasoning best practices): low effort
                                         # for execution-oriented coding tasks; also
                                         # maximizes visible-output share of the budget
-_VALID_EFFORTS = ("none", "low", "medium", "high", "xhigh")
+_VALID_EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 
 
 # ── Flag helpers ──────────────────────────────────────────────────────────────

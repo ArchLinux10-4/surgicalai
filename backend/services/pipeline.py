@@ -140,6 +140,7 @@ NO_TEMPERATURE_MODELS = {
     "gpt-5.3",
     "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
     "gpt-5.5", "gpt-5.5-pro",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini",
 }
 
@@ -152,6 +153,7 @@ REASONING_EFFORT_MODELS = {
     "gpt-5.3",
     "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
     "gpt-5.5", "gpt-5.5-pro",
+    "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
     "o3", "o3-mini", "o4-mini",
 }
 
