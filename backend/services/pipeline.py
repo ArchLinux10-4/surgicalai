@@ -7098,8 +7098,10 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 continue
 
             if file_type in ("pdf", "csv", "excel", "text"):
-                # Treat as plain text — no AST parsing
-                preview = content[:3000] + (f"\n... [{len(content) - 3000} chars truncated]" if len(content) > 3000 else "")
+                # Data files (csv/excel) already row-capped at 200 rows —
+                # show full markdown.  PDF/text stay conservative.
+                _data_limit = 60_000 if file_type in ("csv", "excel") else 8_000
+                preview = content[:_data_limit] + (f"\n... [{len(content) - _data_limit} more chars not shown]" if len(content) > _data_limit else "")
                 file_summaries.append(
                     f"FILE: {fname} [{file_type.upper()}]\nCONTENT:\n{preview}"
                 )
@@ -10921,7 +10923,11 @@ def _build_natural_file_context(
             )
 
         if file_type in ("pdf", "csv", "excel", "text"):
-            preview = content[:2000] + (f"\n...[{len(content)-2000} chars]" if len(content) > 2000 else "")
+            # Data files (csv/excel) are already row-capped (200 rows) in
+            # _parse_excel_to_markdown — show full markdown so Claude can
+            # actually work with the data.  PDF/text stay more conservative.
+            _data_limit = 60_000 if file_type in ("csv", "excel") else 8_000
+            preview = content[:_data_limit] + (f"\n...[{len(content)-_data_limit} more chars not shown]" if len(content) > _data_limit else "")
             return f"FILE: {fname} [{file_type.upper()}]\nCONTENT:\n{preview}\n"
 
         smap, _ = symbol_maps_by_name.get(fname, (None, sf))
