@@ -609,7 +609,7 @@ function SessionFilesPanel() {
           ref={fileInputRef}
           type="file"
           multiple
-          accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.cpp,.c,.h,.html,.css,.scss,.json,.md,.sh,.sql,.yaml,.yml,.toml,.txt,.env,.rb,.php,.swift,.kt"
+          accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.scss,.sass,.less,.json,.jsonl,.ndjson,.xml,.yaml,.yml,.toml,.ini,.cfg,.env,.properties,.md,.rst,.txt,.sh,.bash,.zsh,.fish,.sql,.cpp,.c,.h,.hpp,.cc,.cxx,.m,.mm,.vue,.svelte,.astro,.prisma,.graphql,.gql,.proto,.r,.R,.scala,.dart,.lua,.zig,.v,.nim,.ex,.exs,.erl,.hs,.ml,.clj,.tf,.hcl,.dockerfile,.conf,.nginx,.log,.diff,.patch,.tex,.bib,.makefile,image/*,.pdf,.csv,.tsv,.xlsx,.xls,.zip,.tar,.gz,.7z,.rar"
           className="hidden"
           onChange={(e) => handleUpload(e.target.files)}
         />

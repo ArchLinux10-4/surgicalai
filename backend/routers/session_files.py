@@ -20,14 +20,25 @@ parser = ASTParser()
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif"}
 PDF_EXTENSIONS = {".pdf"}
-CSV_EXTENSIONS = {".csv"}
+CSV_EXTENSIONS = {".csv", ".tsv"}
 EXCEL_EXTENSIONS = {".xlsx", ".xls"}
 
 CODE_EXTENSIONS = {
     ".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".rs", ".java", ".cs",
-    ".cpp", ".c", ".h", ".hpp", ".rb", ".php", ".swift", ".kt",
-    ".html", ".css", ".json", ".yaml", ".yml", ".md", ".sh", ".sql",
-    ".toml", ".txt",
+    ".cpp", ".c", ".h", ".hpp", ".cc", ".cxx", ".m", ".mm",
+    ".rb", ".php", ".swift", ".kt",
+    ".html", ".css", ".scss", ".sass", ".less",
+    ".json", ".jsonl", ".ndjson", ".xml",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".env", ".properties",
+    ".md", ".rst", ".txt", ".log",
+    ".sh", ".bash", ".zsh", ".fish", ".sql",
+    ".vue", ".svelte", ".astro",
+    ".prisma", ".graphql", ".gql", ".proto",
+    ".r", ".R", ".scala", ".dart", ".lua", ".zig", ".v", ".nim",
+    ".ex", ".exs", ".erl", ".hs", ".ml", ".clj",
+    ".tf", ".hcl", ".dockerfile", ".conf", ".nginx",
+    ".diff", ".patch", ".tex", ".bib", ".makefile",
+    ".tsv",
 }
 
 
@@ -84,11 +95,28 @@ def _get_language(filename: str) -> str:
         ".py": "python", ".js": "javascript", ".ts": "typescript",
         ".jsx": "javascriptreact", ".tsx": "typescriptreact",
         ".go": "go", ".rs": "rust", ".java": "java", ".cs": "csharp",
-        ".cpp": "cpp", ".c": "c", ".h": "c", ".hpp": "cpp",
+        ".cpp": "cpp", ".c": "c", ".h": "c", ".hpp": "cpp", ".cc": "cpp", ".cxx": "cpp",
+        ".m": "objectivec", ".mm": "objectivecpp",
         ".rb": "ruby", ".php": "php", ".swift": "swift", ".kt": "kotlin",
-        ".svg": "xml", ".html": "html", ".css": "css", ".json": "json", ".yaml": "yaml",
-        ".yml": "yaml", ".md": "markdown", ".sh": "bash", ".sql": "sql",
-        ".toml": "toml", ".csv": "csv", ".xlsx": "excel", ".xls": "excel",
+        ".svg": "xml", ".xml": "xml",
+        ".html": "html", ".css": "css", ".scss": "scss", ".sass": "sass", ".less": "less",
+        ".json": "json", ".jsonl": "json", ".ndjson": "json",
+        ".yaml": "yaml", ".yml": "yaml",
+        ".md": "markdown", ".rst": "restructuredtext",
+        ".sh": "bash", ".bash": "bash", ".zsh": "bash", ".fish": "fish",
+        ".sql": "sql",
+        ".toml": "toml", ".ini": "ini", ".cfg": "ini", ".env": "dotenv", ".properties": "properties",
+        ".vue": "vue", ".svelte": "svelte", ".astro": "astro",
+        ".prisma": "prisma", ".graphql": "graphql", ".gql": "graphql", ".proto": "protobuf",
+        ".r": "r", ".R": "r", ".scala": "scala", ".dart": "dart", ".lua": "lua",
+        ".zig": "zig", ".v": "v", ".nim": "nim",
+        ".ex": "elixir", ".exs": "elixir", ".erl": "erlang",
+        ".hs": "haskell", ".ml": "ocaml", ".clj": "clojure",
+        ".tf": "terraform", ".hcl": "hcl", ".dockerfile": "dockerfile",
+        ".conf": "nginx", ".nginx": "nginx",
+        ".log": "log", ".diff": "diff", ".patch": "diff",
+        ".tex": "latex", ".bib": "bibtex", ".makefile": "makefile",
+        ".csv": "csv", ".tsv": "csv", ".xlsx": "excel", ".xls": "excel",
         ".pdf": "pdf",
     }
     return lang_map.get(ext, "plaintext")

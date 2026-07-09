@@ -1182,6 +1182,48 @@ _P12_TOOLS = [
 ]
 AGENTIC_TOOLS_V2 = AGENTIC_TOOLS_V2 + _P12_TOOLS
 
+# ── P13: create_spreadsheet — let Claude generate CSV/Excel files ──
+# Uses existing DataLab infrastructure (writer.py + persist.py) to create
+# a downloadable file that appears in the session file drawer.
+_P13_TOOLS = [
+    {
+        "name": "create_spreadsheet",
+        "description": (
+            "Create a CSV or Excel file and add it to the session for the user to download. "
+            "Use when the user asks you to generate, export, or create a spreadsheet, CSV, or Excel file. "
+            "The file will appear in the session's file list and be downloadable."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "filename": {
+                    "type": "string",
+                    "description": "Output filename (e.g. 'report.csv' or 'analysis.xlsx'). Extension determines format: .csv → CSV, .xlsx → Excel.",
+                },
+                "columns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Column headers (e.g. ['Name', 'Price', 'Quantity'])",
+                },
+                "rows": {
+                    "type": "array",
+                    "items": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "description": "Data rows — each row is an array of string values matching the columns.",
+                },
+                "sheet_name": {
+                    "type": "string",
+                    "description": "Sheet name for Excel files (default: 'Sheet1'). Ignored for CSV.",
+                },
+            },
+            "required": ["filename", "columns", "rows"],
+        },
+    },
+]
+AGENTIC_TOOLS_V2 = AGENTIC_TOOLS_V2 + _P13_TOOLS
+
 
 # Phase 4: Correction handler tool definitions (tool_use migration)
 CORRECTION_TOOLS = [
@@ -4999,6 +5041,33 @@ When the user asks you to DIAGNOSE a bug, investigate state/session issues, or d
 """
 
 
+# ── Spreadsheet/data-file awareness — injected when data files are in session ──
+_SPREADSHEET_SECTION = """
+━━━ SPREADSHEET & DATA FILES ━━━
+
+You have uploaded data files (CSV, Excel, or similar). You have special capabilities for these:
+
+1. **Answering questions about the data:** You can see the data as markdown tables in the file
+   content above. Analyze it directly — summarize, compare, find patterns, answer questions.
+
+2. **Creating new spreadsheet files:** You have the `create_spreadsheet` tool. Use it when
+   the user asks you to generate, export, create, or modify data into a downloadable file.
+   - Provide `filename` (e.g. "report.csv" or "analysis.xlsx"), `columns`, and `rows`
+   - The file will appear in the user's file list for immediate download
+   - For modifications: read the data from the uploaded file content, apply the changes,
+     and call `create_spreadsheet` with the updated data
+
+CRITICAL: Do NOT write Python scripts for the user to run. You have the tools to create
+spreadsheet files directly. Use `create_spreadsheet` instead of suggesting code.
+
+Examples of when to use `create_spreadsheet`:
+- "Add a total row to this spreadsheet" -> read data, compute totals, create_spreadsheet with new data
+- "Filter rows where sales > 1000" -> read data, filter, create_spreadsheet with filtered data
+- "Create a summary report" -> analyze data, create_spreadsheet with summary
+- "Convert this to Excel" -> read CSV data, create_spreadsheet with .xlsx filename
+- "Make me a spreadsheet of US states" -> create_spreadsheet with the data
+"""
+
 # ── Code quality best practices — always injected into SMART_ARCHITECT_SYSTEM for edits ──
 _CODE_QUALITY_SECTION = """
 ━━━ CODE QUALITY RULES (MANDATORY FOR ALL EDITS) ━━━
@@ -5069,7 +5138,7 @@ STRUCTURAL INTEGRITY:
 """
 
 
-def _build_architect_system(is_diagnostic: bool = False, session_id: str = "") -> str:
+def _build_architect_system(is_diagnostic: bool = False, session_id: str = "", has_data_files: bool = False) -> str:
     """Return the SMART_ARCHITECT_SYSTEM prompt, with conditional sections injected."""
     base = SMART_ARCHITECT_SYSTEM
     inject_before = "━━━ IMPORT DEPENDENCY CHECK (DO THIS FIRST) ━━━"
@@ -5082,6 +5151,10 @@ def _build_architect_system(is_diagnostic: bool = False, session_id: str = "") -
         if is_diagnostic:
             sections = _DIAGNOSIS_SECTION + "\n" + sections
             _injected.append("diagnosis_best_practices")
+        # Conditionally add spreadsheet awareness when data files are present
+        if has_data_files:
+            sections = _SPREADSHEET_SECTION + "\n" + sections
+            _injected.append("spreadsheet_data_awareness")
         base = base.replace(inject_before, sections + inject_before, 1)
     _dlog("architect_system_build",
           injected_sections=_injected,
@@ -6849,6 +6922,7 @@ async def run_smart_pipeline_stream(
             "create", "build", "make", "generate", "scaffold", "new file",
             "new component", "new page", "new hook", "new service", "new module",
             "write a", "write me a", "add a new", "create a new",
+            "spreadsheet", "excel", "csv", "xlsx",
         }
         _req_lower_pre = user_request.lower()
         _looks_like_create = any(kw in _req_lower_pre for kw in _CREATE_KEYWORDS)
@@ -6875,6 +6949,10 @@ When you DO generate code:
 - Include clear instructions for how to run it — assume the user is NOT a developer
 - End with "Want me to add X, Y, or Z?" to invite iteration
 
+
+SPREADSHEET CREATION: If the user asks to create, generate, or export a spreadsheet, CSV, or Excel file,
+tell them to upload any source files and you'll create the spreadsheet directly — no code needed.
+You have built-in tools for generating downloadable CSV and Excel files.
 Be warm, friendly, and encouraging. You're helping a person build something real."""
             if project_memory:
                 system += f"\n\n## Project Memory\n{project_memory}"
@@ -7142,12 +7220,18 @@ USER REQUEST:
         # Detect if this is a diagnostic request — inject extra guidance if so
         _req_lower = user_request.lower()
         _is_diagnostic = any(kw in _req_lower for kw in _DIAGNOSIS_KEYWORDS)
-        _architect_system = _build_architect_system(is_diagnostic=_is_diagnostic, session_id=session_id)
+        # Detect if session contains data files (CSV/Excel/text) for spreadsheet awareness
+        _has_data_files = any(
+            sf.get("file_type") in ("csv", "excel", "text")
+            for sf in session_files
+        )
+        _architect_system = _build_architect_system(is_diagnostic=_is_diagnostic, session_id=session_id, has_data_files=_has_data_files)
         _dlog("architect_prompt_assembly",
               has_project_memory=bool(project_memory),
               project_memory_len=len(project_memory) if project_memory else 0,
               has_session_summary=bool(session_summary),
               is_diagnostic=_is_diagnostic,
+              has_data_files=_has_data_files,
               total_system_len=len(_architect_system))
 
         if _is_claude_model(arch_model):
@@ -7624,6 +7708,68 @@ USER REQUEST:
                                 "content": _cd_res[:16000],
                             })
                             yield sse({"type": "progress", "content": "Checked deploy status"})
+
+                        elif _tc["name"] == "create_spreadsheet":
+                            # ── P13: Create CSV/Excel via DataLab ──
+                            _dlog("tu_create_spreadsheet_call",
+                                  tool_input=_tc["input"],
+                                  session_id=session_id, round=_tu_round)
+                            try:
+                                from services.datalab.config import datalab_enabled
+                                if not datalab_enabled():
+                                    _cs_res = "[create_spreadsheet unavailable — DataLab is not enabled on this server]"
+                                    _dlog("tu_create_spreadsheet_disabled",
+                                          session_id=session_id, round=_tu_round)
+                                else:
+                                    _cs_input = _tc["input"]
+                                    _cs_filename = _cs_input.get("filename", "output.csv")
+                                    _cs_columns = _cs_input.get("columns", [])
+                                    _cs_rows = _cs_input.get("rows", [])
+                                    _cs_sheet = _cs_input.get("sheet_name", "Sheet1")
+
+                                    # Determine format from extension
+                                    _cs_ext = _cs_filename.rsplit(".", 1)[-1].lower() if "." in _cs_filename else "csv"
+                                    _cs_kind = "csv" if _cs_ext in ("csv", "tsv") else "excel"
+
+                                    from services.datalab import persist as _dl_persist
+                                    _cs_desc = _dl_persist.persist_result(
+                                        session_id=session_id,
+                                        source_file_id="",
+                                        source_filename=_cs_filename,
+                                        source_kind=_cs_kind,
+                                        source_delimiter=",",
+                                        columns=_cs_columns,
+                                        rows=_cs_rows,
+                                        transform_sql="",
+                                        origin="generated",
+                                        sheet_name=_cs_sheet,
+                                    )
+                                    _cs_res = (
+                                        f"✅ Created {_cs_desc['filename']} "
+                                        f"({_cs_desc['row_count']} rows × {_cs_desc['column_count']} columns, "
+                                        f"{_cs_desc['byte_size']:,} bytes). "
+                                        f"The file is now in the session file list and ready for download."
+                                    )
+                                    _dlog("tu_create_spreadsheet_ok",
+                                          session_id=session_id, round=_tu_round,
+                                          filename=_cs_desc["filename"],
+                                          file_id=_cs_desc["file_id"],
+                                          rows=_cs_desc["row_count"],
+                                          cols=_cs_desc["column_count"],
+                                          bytes=_cs_desc["byte_size"])
+                                    yield sse({"type": "progress", "content":
+                                               f"Created: {_cs_desc['filename']} ({_cs_desc['row_count']} rows)"})
+                            except Exception as _cs_err:
+                                _dlog("tu_create_spreadsheet_error",
+                                      error=str(_cs_err),
+                                      error_type=type(_cs_err).__name__,
+                                      session_id=session_id, round=_tu_round)
+                                _cs_res = f"[create_spreadsheet failed: {_cs_err}]"
+                            _tu_results.append({
+                                "type": "tool_result",
+                                "tool_use_id": _tc["id"],
+                                "content": _cs_res[:16000],
+                            })
 
                         elif _tc["name"] in ("list_prs", "get_pr_diff", "get_pr_comments", "list_issues", "get_issue_comments", "diff_branches", "list_files", "read_file", "search_code"):
                             _dlog("tu_github_context_tool_call", tool_name=_tc["name"],

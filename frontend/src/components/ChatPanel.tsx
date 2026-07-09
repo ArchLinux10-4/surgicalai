@@ -1640,7 +1640,7 @@ export function ChatPanel() {
         ref={fileInputRef}
         type="file"
         multiple
-        accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.json,.yaml,.yml,.toml,.md,.sh,.sql,.cpp,.c,.h,image/*,.pdf,.csv,.xlsx,.xls,.txt,.zip"
+        accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.scss,.sass,.less,.json,.jsonl,.ndjson,.xml,.yaml,.yml,.toml,.ini,.cfg,.env,.properties,.md,.rst,.txt,.sh,.bash,.zsh,.fish,.sql,.cpp,.c,.h,.hpp,.cc,.cxx,.m,.mm,.vue,.svelte,.astro,.prisma,.graphql,.gql,.proto,.r,.R,.scala,.dart,.lua,.zig,.v,.nim,.ex,.exs,.erl,.hs,.ml,.clj,.tf,.hcl,.dockerfile,.conf,.nginx,.log,.diff,.patch,.tex,.bib,.makefile,image/*,.pdf,.csv,.tsv,.xlsx,.xls,.zip,.tar,.gz,.7z,.rar"
         className="hidden"
         onChange={handleFileInput}
       />
