@@ -483,7 +483,10 @@ def _get_thinking_kwargs(model: str, budget: int) -> dict:
     - All other models: {} (no thinking params, safe to ** spread)
     """
     if _uses_adaptive_thinking(model):
-        return {"thinking": {"type": "adaptive", "display": "summarized"}}
+        # Cap thinking to prevent starvation — adaptive has NO budget ceiling
+        # and the model can spend all tokens thinking → zero text output.
+        # Use "enabled" with explicit budget_tokens instead.
+        return {"thinking": {"type": "enabled", "budget_tokens": budget}}
     if _supports_thinking(model):
         return {"thinking": {"type": "enabled", "budget_tokens": budget}}
     return {}
@@ -500,6 +503,196 @@ def _get_effort_kwargs(model: str) -> dict:
     if _uses_adaptive_thinking(model) and not any(m in model for m in _NO_XHIGH_EFFORT_MODELS):
         return {"output_config": {"effort": "xhigh"}}
     return {}
+
+
+# ── Starvation-proof Claude API helpers ──────────────────────────────────
+#
+# Problem: adaptive-thinking models (Sonnet 5, Opus 4.x) have NO thinking
+# budget cap.  With small max_tokens + complex input the model can spend
+# ALL tokens thinking → zero text output ("thinking starvation").
+#
+# Solution: bounded calls use {"type": "enabled", "budget_tokens": N}
+# instead of {"type": "adaptive"}.  budget_tokens is a hard cap on
+# thinking within max_tokens, mathematically guaranteeing text headroom.
+#
+# Three layers of protection:
+#   1. _bounded_thinking_params() — correct params, budget < max_tokens
+#   2. _is_starved()             — detects zero-text responses
+#   3. _safe_claude_call()       — streams + starvation retry
+# ─────────────────────────────────────────────────────────────────────────
+
+def _bounded_thinking_params(model: str, desired_text_tokens: int,
+                              thinking_budget: int | None = None) -> dict:
+    """Build Claude params with GUARANTEED text headroom.
+
+    Uses ``{"type": "enabled", "budget_tokens": N}`` (not adaptive) so the
+    model **cannot** consume all max_tokens on thinking.
+
+    Formula:
+        max_tokens = min(desired_text + budget, model_limit)
+        budget     = min(budget, max_tokens // 2)   # never >50 % thinking
+
+    For streaming calls with 128 K+ budget where the user watches output,
+    adaptive thinking is acceptable — use ``_get_thinking_kwargs`` there.
+    """
+    if not (_uses_adaptive_thinking(model) or _supports_thinking(model)):
+        return {"max_tokens": desired_text_tokens}
+
+    budget = thinking_budget if thinking_budget is not None else min(desired_text_tokens, 16_000)
+    model_limit = _max_output_tokens(model)
+    max_tok = min(desired_text_tokens + budget, model_limit)
+    # Hard rule: thinking never takes more than half of max_tokens
+    budget = min(budget, max_tok // 2)
+    budget = max(budget, 1024)  # floor — always allow some thinking
+
+    result: dict = {
+        "max_tokens": max_tok,
+        "thinking": {"type": "enabled", "budget_tokens": budget},
+    }
+    if _uses_adaptive_thinking(model):
+        effort = _get_effort_kwargs(model)
+        if effort:
+            result.update(effort)
+    return result
+
+
+def _is_starved(response) -> bool:
+    """True when a response contains zero usable text (all thinking)."""
+    if not hasattr(response, "content"):
+        return False
+    return not any(
+        hasattr(b, "text") and b.text.strip()
+        for b in response.content
+    )
+
+
+async def _safe_claude_call(aclient_inst, *, model: str,
+                             desired_text_tokens: int,
+                             thinking_budget: int | None = None,
+                             retry_on_starve: bool = True,
+                             **kwargs):
+    """Starvation-proof async Claude API call.
+
+    Guarantees:
+      1. Always streams internally (prevents Anthropic timeout rejection).
+      2. Thinking is budget-capped (text headroom is mathematically safe).
+      3. If starvation still occurs, auto-retries with 2× budget + reduced
+         effort before returning.
+
+    Returns an Anthropic ``Message`` object (same as ``messages.create``).
+    """
+    params = _bounded_thinking_params(model, desired_text_tokens, thinking_budget)
+
+    _dlog("safe_claude_call_entry",
+          model=model, desired_text=desired_text_tokens,
+          max_tokens=params.get("max_tokens"),
+          budget=params.get("thinking", {}).get("budget_tokens"),
+          effort=params.get("output_config", {}).get("effort"))
+
+    msg = await _stream_and_collect(aclient_inst, model=model, **params, **kwargs)
+
+    if not _is_starved(msg):
+        _dlog("safe_claude_call_ok",
+              model=model,
+              output_tokens=getattr(getattr(msg, "usage", None), "output_tokens", None),
+              stop_reason=getattr(msg, "stop_reason", None))
+        return msg
+
+    # ── Starvation detected — log + retry ────────────────────────────
+    _dlog("thinking_starvation_detected",
+          model=model, desired_text=desired_text_tokens,
+          max_tokens=params.get("max_tokens"),
+          budget=params.get("thinking", {}).get("budget_tokens"),
+          stop_reason=getattr(msg, "stop_reason", None),
+          block_types=[getattr(b, "type", "?") for b in msg.content])
+
+    if not retry_on_starve:
+        return msg
+
+    # Double both budgets, drop effort to "high" to discourage overthinking
+    retry_budget = (thinking_budget or min(desired_text_tokens, 16_000)) * 2
+    retry_params = _bounded_thinking_params(
+        model, desired_text_tokens * 2, retry_budget)
+    if "output_config" in retry_params:
+        retry_params["output_config"] = {"effort": "high"}
+
+    _dlog("thinking_starvation_retry",
+          model=model, retry_max=retry_params.get("max_tokens"),
+          retry_budget=retry_params.get("thinking", {}).get("budget_tokens"))
+
+    msg = await _stream_and_collect(aclient_inst, model=model,
+                                     **retry_params, **kwargs)
+    if _is_starved(msg):
+        _dlog("thinking_starvation_final_fail",
+              model=model, stop_reason=getattr(msg, "stop_reason", None))
+    else:
+        _dlog("thinking_starvation_retry_ok",
+              model=model,
+              output_tokens=getattr(getattr(msg, "usage", None), "output_tokens", None),
+              stop_reason=getattr(msg, "stop_reason", None))
+    return msg
+
+
+def _safe_claude_call_sync(sync_client, *, model: str,
+                            desired_text_tokens: int,
+                            thinking_budget: int | None = None,
+                            retry_on_starve: bool = True,
+                            **kwargs):
+    """Starvation-proof **sync** Claude API call (surgeon thread-pool paths).
+
+    Same guarantees as ``_safe_claude_call`` but blocking.  Uses
+    ``api_call_with_retry`` for transient-error resilience.
+    """
+    from services.api_retry import api_call_with_retry
+
+    params = _bounded_thinking_params(model, desired_text_tokens, thinking_budget)
+
+    _dlog("safe_claude_call_sync_entry",
+          model=model, desired_text=desired_text_tokens,
+          max_tokens=params.get("max_tokens"),
+          budget=params.get("thinking", {}).get("budget_tokens"),
+          effort=params.get("output_config", {}).get("effort"))
+
+    msg = api_call_with_retry(lambda: sync_client.messages.create(
+        model=model, **params, **kwargs))
+
+    if not _is_starved(msg):
+        _dlog("safe_claude_call_sync_ok",
+              model=model,
+              output_tokens=getattr(getattr(msg, "usage", None), "output_tokens", None),
+              stop_reason=getattr(msg, "stop_reason", None))
+        return msg
+
+    _dlog("thinking_starvation_detected_sync",
+          model=model, desired_text=desired_text_tokens,
+          max_tokens=params.get("max_tokens"),
+          stop_reason=getattr(msg, "stop_reason", None),
+          block_types=[getattr(b, "type", "?") for b in msg.content])
+
+    if not retry_on_starve:
+        return msg
+
+    retry_budget = (thinking_budget or min(desired_text_tokens, 16_000)) * 2
+    retry_params = _bounded_thinking_params(
+        model, desired_text_tokens * 2, retry_budget)
+    if "output_config" in retry_params:
+        retry_params["output_config"] = {"effort": "high"}
+
+    _dlog("thinking_starvation_retry_sync",
+          model=model, retry_max=retry_params.get("max_tokens"))
+
+    msg = api_call_with_retry(lambda: sync_client.messages.create(
+        model=model, **retry_params, **kwargs))
+
+    if _is_starved(msg):
+        _dlog("thinking_starvation_final_fail_sync",
+              model=model, stop_reason=getattr(msg, "stop_reason", None))
+    else:
+        _dlog("thinking_starvation_retry_ok_sync",
+              model=model,
+              output_tokens=getattr(getattr(msg, "usage", None), "output_tokens", None),
+              stop_reason=getattr(msg, "stop_reason", None))
+    return msg
 
 
 def _extract_claude_text(response) -> str:
@@ -1994,17 +2187,12 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
             for _mt_turn in range(_MT_MAX_TURNS):
                 _mt_api_start = time.time()
                 try:
-                    # Thinking-config fix: adaptive models need config
-                    _mt_think_kw = _get_thinking_kwargs(surg_model, 4000)
-                    _mt_effort_kw = _get_effort_kwargs(surg_model)
-                    _mt_resp = _sync_aclient.messages.create(
-                        model=surg_model,
-                        max_tokens=16384,
+                    _mt_resp = _safe_claude_call_sync(
+                        _sync_aclient, model=surg_model,
+                        desired_text_tokens=12000, thinking_budget=4000,
                         system=SURGEON_TOOL_USE_SYSTEM,
                         messages=_mt_messages,
                         tools=SURGEON_TOOLS_ANTHROPIC,
-                        **_mt_think_kw,
-                        **_mt_effort_kw,
                     )
                 except Exception as _mt_api_err:
                     print(f"[SURGEON][MULTI_TURN] API error on turn {_mt_turn+1}: {_mt_api_err}")
@@ -2254,17 +2442,15 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
             from anthropic import Anthropic as _AnthropicSync
             _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
             try:
-                # Thinking-config fix: adaptive models need config
-                _tu_think_kw = _get_thinking_kwargs(surg_model, 4000)
-                _tu_effort_kw = _get_effort_kwargs(surg_model)
-                _tu_resp = _sync_aclient.messages.create(
-                    model=surg_model,
-                    max_tokens=16384,
+                _dlog("surgeon_tool_use_call_config", model=surg_model,
+                      wrapper="safe_claude_call_sync", user_id=user_id,
+                      session_id=session_id)
+                _tu_resp = _safe_claude_call_sync(
+                    _sync_aclient, model=surg_model,
+                    desired_text_tokens=12000, thinking_budget=4000,
                     system=SURGEON_TOOL_USE_SYSTEM,
                     messages=[{"role": "user", "content": _tu_user_msg}],
                     tools=SURGEON_TOOLS_ANTHROPIC,
-                    **_tu_think_kw,
-                    **_tu_effort_kw,
                 )
                 _tu_stop = _tu_resp.stop_reason
                 print(f"[SURGEON][TOOL_USE] Claude response: stop_reason={_tu_stop}, "
@@ -2387,21 +2573,14 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
             _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
             from services.api_retry import api_call_with_retry
             # Thinking-config fix: adaptive models consume max_tokens for
-            # thinking + text.  8192 can starve on large symbols.
-            _surg_txt_think = _get_thinking_kwargs(surg_model, 4000)
-            _surg_txt_effort = _get_effort_kwargs(surg_model)
-            _surg_txt_max = 16384
             _dlog("surgeon_text_call_config", model=surg_model,
-                  max_tokens=_surg_txt_max, thinking_kw=_surg_txt_think,
-                  effort_kw=_surg_txt_effort, user_id=user_id)
-            _claude_surgeon_resp = api_call_with_retry(lambda: _sync_aclient.messages.create(
-                model=surg_model,
-                max_tokens=_surg_txt_max,
+                  wrapper="safe_claude_call_sync", user_id=user_id)
+            _claude_surgeon_resp = _safe_claude_call_sync(
+                _sync_aclient, model=surg_model,
+                desired_text_tokens=12000, thinking_budget=4000,
                 system=SURGEON_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
-                **_surg_txt_think,
-                **_surg_txt_effort,
-            ))
+            )
             raw = _extract_claude_text(_claude_surgeon_resp)
             # Truncation guard (mirrors the GPT _sai_truncated refusal below):
             # a max_tokens cut can leave zero complete SEARCH/REPLACE blocks,
@@ -4008,23 +4187,14 @@ async def run_qa_for_changes(
         try:
             aclient = AsyncAnthropic(api_key=anthropic_key)
             _qa_model_legacy = "claude-sonnet-5"
-            # Thinking-config fix (session 69ee9da7): adaptive-thinking
-            # models consume max_tokens for BOTH thinking + text.  1000
-            # tokens guaranteed starvation — raise to 8000 and pass config.
-            _qleg_think_kw = _get_thinking_kwargs(_qa_model_legacy, 2000)
-            _qleg_effort_kw = _get_effort_kwargs(_qa_model_legacy)
             _dlog("qa_for_changes_call_config", model=_qa_model_legacy,
-                  max_tokens=8000, thinking_kw=_qleg_think_kw,
-                  effort_kw=_qleg_effort_kw)
-            from services.api_retry import async_api_call_with_retry
-            response = await async_api_call_with_retry(lambda: aclient.messages.create(
-                model=_qa_model_legacy,
-                max_tokens=8000,
+                  wrapper="safe_claude_call")
+            response = await _safe_claude_call(
+                aclient, model=_qa_model_legacy,
+                desired_text_tokens=8000,
                 system=_QA_SYSTEM,
                 messages=[{"role": "user", "content": user_message}],
-                **_qleg_think_kw,
-                **_qleg_effort_kw,
-            ))
+            )
             for block in response.content:
                 if hasattr(block, "text"):
                     raw_text += block.text
@@ -4452,18 +4622,14 @@ async def analyze_and_plan_stream(
                                   fixes_so_far=len(_corr_changes))
                             try:
                                 if _agent_use_claude:
-                                    # Thinking-config: explicit config for adaptive models
-                                    _acorr_think_kw = _get_thinking_kwargs("claude-sonnet-5", 4000)
-                                    _acorr_effort_kw = _get_effort_kwargs("claude-sonnet-5")
-                                    _corr_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
+                                    _corr_resp = await _safe_claude_call(
+                                        AsyncAnthropic(api_key=anthropic_key),
                                         model="claude-sonnet-5",
-                                        max_tokens=_max_output_tokens("claude-sonnet-5"),
+                                        desired_text_tokens=64000,
                                         system=CLAUDE_EDITOR_SYSTEM,
                                         messages=_corr_msgs,
                                         tools=CORRECTION_TOOLS,
                                         tool_choice={"type": "auto"},
-                                        **_acorr_think_kw,
-                                        **_acorr_effort_kw,
                                     )
                                 else:
                                     # GPT correction: use free-text JSON instead of tool_use
@@ -4715,16 +4881,16 @@ async def analyze_and_plan_stream(
                             )},
                         ]
                         if _agent_use_claude:
-                            # Thinking-config: explicit config for adaptive models
-                            _aretry_think_kw = _get_thinking_kwargs("claude-sonnet-5", 4000)
-                            _aretry_effort_kw = _get_effort_kwargs("claude-sonnet-5")
-                            _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
+                            _dlog("correction_retry_call_config",
+                                  model="claude-sonnet-5",
+                                  wrapper="safe_claude_call",
+                                  session_id=session_id, user_id=user_id)
+                            _retry_resp = await _safe_claude_call(
+                                AsyncAnthropic(api_key=anthropic_key),
                                 model="claude-sonnet-5",
-                                max_tokens=_max_output_tokens("claude-sonnet-5"),
+                                desired_text_tokens=64000,
                                 system=CLAUDE_EDITOR_SYSTEM,
                                 messages=_retry_msgs,
-                                **_aretry_think_kw,
-                                **_aretry_effort_kw,
                             )
                             _retry_text = "".join(
                                 b.text for b in _retry_resp.content if hasattr(b, "text")
@@ -5631,21 +5797,13 @@ Run all 5 checks and return the JSON verdict."""
 
     try:
         if _use_claude:
-            # Same fix as edit-QA: adaptive-thinking models need thinking
-            # config + sufficient budget or they spend all tokens thinking
-            # and emit zero text (session 69ee9da7).
-            _qc_think_kw = _get_thinking_kwargs(_model, 2000)
-            _qc_effort_kw = _get_effort_kwargs(_model)
-            _qc_max = 8000
             _dlog("qa_create_call_config", model=_model,
-                  max_tokens=_qc_max, thinking_kw=_qc_think_kw,
-                  effort_kw=_qc_effort_kw)
-            _msg = await _qa_aclient.messages.create(
-                model=_model, max_tokens=_qc_max,
+                  wrapper="safe_claude_call")
+            _msg = await _safe_claude_call(
+                _qa_aclient, model=_model,
+                desired_text_tokens=8000,
                 system=QA_CREATE_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
-                **_qc_think_kw,
-                **_qc_effort_kw,
             )
             # Iterate blocks defensively — adaptive-thinking models may emit
             # non-text blocks first, so content[0] is not guaranteed to be text.
@@ -6562,34 +6720,23 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 {_risks_block}"""
 
     _last_qa_err = None
+    _qa_had_starvation = False  # tracks thinking-starvation for retry logic
     for _qa_attempt in range(2):
       try:
         if _qa_use_claude:
-            # max_tokens raised 1500 → 4000: session dd543a3a logged
-            # block_types=["thinking"] with raw_len=0 on both attempts —
-            # the response contained ONLY a thinking block and no text,
-            # so 1500 total tokens left no room for the JSON verdict.
-            # Attempt 2 gets extra headroom on top of that.
-            # Adaptive-thinking models (Sonnet 5, etc.) consume max_tokens
-            # for BOTH thinking + text.  Without explicit thinking config +
-            # sufficient budget, the model spends all tokens thinking and
-            # emits zero text (session 69ee9da7: 4× empty QA on 1763-line
-            # symbol).  Use the same helpers every other call site uses.
-            _qa_think_kw = _get_thinking_kwargs(_qa_model, 4000)
-            _qa_effort_kw = _get_effort_kwargs(_qa_model)
-            _qa_max = 16000 if _qa_attempt == 0 else 24000
+            # --- Robust QA call for adaptive-thinking models ---
+            # Session 69ee9da7: Sonnet 5 with max_tokens=4000/6000 spent ALL
+            # tokens on thinking, zero text output → QA failure on 1763-line
+            # symbol.  Session b7d8f1b0: fix attempt with max_tokens=16000 +
+            # adaptive thinking still starved (16K all thinking); retry at
             _dlog("qa_call_config", session_id=session_id,
-                  model=_qa_model, max_tokens=_qa_max, attempt=_qa_attempt,
-                  thinking_kw=_qa_think_kw, effort_kw=_qa_effort_kw)
-            _qa_msg = await _qa_aclient.messages.create(
-                model=_qa_model,
-                max_tokens=_qa_max,
+                  model=_qa_model, attempt=_qa_attempt,
+                  wrapper="safe_claude_call")
+            _qa_msg = await _safe_claude_call(
+                _qa_aclient, model=_qa_model,
+                desired_text_tokens=16000,
                 system=QA_SYSTEM,
-                messages=[
-                    {"role": "user", "content": user_msg},
-                ],
-                **_qa_think_kw,
-                **_qa_effort_kw,
+                messages=[{"role": "user", "content": user_msg}],
             )
             # Iterate blocks defensively — adaptive-thinking models may emit
             # non-text blocks first, so content[0] is not guaranteed to be text.
@@ -10061,12 +10208,16 @@ USER REQUEST:
                                 # Branch: Claude tool_use vs OpenAI tool_calls
                                 _lint_fixes_list = []
                                 if _lint_use_claude:
-                                    # Thinking-config fix: adaptive models need config
-                                    _lint_think_kw = _get_thinking_kwargs(_lint_surg_model, 4000)
-                                    _lint_effort_kw = _get_effort_kwargs(_lint_surg_model)
-                                    _lint_fix_resp = await _lint_fix_client.messages.create(
+                                    _dlog("lint_fix_call_config",
+                                          model=_lint_surg_model,
+                                          wrapper="safe_claude_call",
+                                          session_id=session_id, user_id=user_id)
+                                    _lint_fix_resp = await _safe_claude_call(
+                                        _lint_fix_client,
                                         model=_lint_surg_model,
-                                        max_tokens=16384,
+                                        desired_text_tokens=8192,
+                                        thinking_budget=4000,
+                                        retry_on_starve=True,
                                         tools=[{
                                             "name": "fix_lint_errors",
                                             "description": "Return SEARCH/REPLACE pairs to eliminate TypeScript lint errors. Each find must match the file exactly.",
@@ -10090,8 +10241,6 @@ USER REQUEST:
                                         }],
                                         tool_choice={"type": "tool", "name": "fix_lint_errors"},
                                         messages=[{"role": "user", "content": _lint_user_msg}],
-                                        **_lint_think_kw,
-                                        **_lint_effort_kw,
                                     )
                                     for _lblock in _lint_fix_resp.content:
                                         if hasattr(_lblock, "type") and _lblock.type == "tool_use":
@@ -14887,21 +15036,18 @@ async def run_natural_pipeline_stream(
             try:
                 # Run non-streaming call with keepalive pings so proxy stays alive
                 _corr_correction_model = "claude-sonnet-5"  # R25: corrections always use Claude
-                # Thinking-config fix: adaptive models need explicit config
-                # or they consume max_tokens on thinking alone.
-                _corr_think_kw = _get_thinking_kwargs(_corr_correction_model, 4000)
-                _corr_effort_kw = _get_effort_kwargs(_corr_correction_model)
                 _dlog("correction_call_config", session_id=session_id,
-                      model=_corr_correction_model, max_tokens=16000,
-                      thinking_kw=_corr_think_kw, effort_kw=_corr_effort_kw,
+                      model=_corr_correction_model,
+                      wrapper="safe_claude_call",
                       resolve_round=resolve_round)
-                _corr_task = asyncio.create_task(aclient.messages.create(
+                _corr_task = asyncio.create_task(_safe_claude_call(
+                    aclient,
                     model=_corr_correction_model,
-                    max_tokens=16000,
+                    desired_text_tokens=12000,
+                    thinking_budget=4000,
+                    retry_on_starve=True,
                     system=system_prompt,
                     messages=correction_msgs,
-                    **_corr_think_kw,
-                    **_corr_effort_kw,
                 ))
                 # ── Deadline + visible heartbeat (session e4e9d098 fix 3) ──
                 # Evidence: this loop kept a run alive with invisible
@@ -15033,22 +15179,19 @@ async def run_natural_pipeline_stream(
                                         "guessing — never fabricate an anchor."
                                     )},
                                 ]
-                                # Thinking-config fix: adaptive models need config
-                                _fu_think_kw = _get_thinking_kwargs("claude-sonnet-5", 4000)
-                                _fu_effort_kw = _get_effort_kwargs("claude-sonnet-5")
                                 _dlog("correction_followup_call_config",
                                       session_id=session_id,
-                                      model="claude-sonnet-5", max_tokens=16000,
-                                      thinking_kw=_fu_think_kw,
-                                      effort_kw=_fu_effort_kw)
+                                      model="claude-sonnet-5",
+                                      wrapper="safe_claude_call")
                                 _fu_task = asyncio.create_task(
-                                    aclient.messages.create(
-                                        model="claude-sonnet-5",  # R25: corrections always Claude
-                                        max_tokens=16000,
+                                    _safe_claude_call(
+                                        aclient,
+                                        model="claude-sonnet-5",
+                                        desired_text_tokens=12000,
+                                        thinking_budget=4000,
+                                        retry_on_starve=True,
                                         system=system_prompt,
                                         messages=_fu_msgs,
-                                        **_fu_think_kw,
-                                        **_fu_effort_kw,
                                     )
                                 )
                                 _fu_t0 = time.time()
@@ -16032,17 +16175,19 @@ async def run_natural_pipeline_stream(
                               msg_count=len(_react_msgs))
 
                         try:
-                            # Thinking-config: explicit config for adaptive models
-                            _fu_react_think_kw = _get_thinking_kwargs(_correction_model, 4000)
-                            _fu_react_effort_kw = _get_effort_kwargs(_correction_model)
+                            _dlog("qa_retry_correction_react_call",
+                                  model=_correction_model,
+                                  wrapper="safe_claude_call",
+                                  session_id=session_id, user_id=user_id)
                             _fu_task = asyncio.create_task(
-                                _stream_and_collect(
-                                    aclient, model=_correction_model,
-                                    max_tokens=_max_output_tokens(_correction_model),
+                                _safe_claude_call(
+                                    aclient,
+                                    model=_correction_model,
+                                    desired_text_tokens=12000,
+                                    thinking_budget=4000,
+                                    retry_on_starve=True,
                                     system=system_prompt,
                                     messages=_react_msgs,
-                                    **_fu_react_think_kw,
-                                    **_fu_react_effort_kw,
                                 )
                             )
                             while not _fu_task.done():
