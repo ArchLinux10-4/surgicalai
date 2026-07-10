@@ -1994,12 +1994,17 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
             for _mt_turn in range(_MT_MAX_TURNS):
                 _mt_api_start = time.time()
                 try:
+                    # Thinking-config fix: adaptive models need config
+                    _mt_think_kw = _get_thinking_kwargs(surg_model, 4000)
+                    _mt_effort_kw = _get_effort_kwargs(surg_model)
                     _mt_resp = _sync_aclient.messages.create(
                         model=surg_model,
-                        max_tokens=8192,
+                        max_tokens=16384,
                         system=SURGEON_TOOL_USE_SYSTEM,
                         messages=_mt_messages,
                         tools=SURGEON_TOOLS_ANTHROPIC,
+                        **_mt_think_kw,
+                        **_mt_effort_kw,
                     )
                 except Exception as _mt_api_err:
                     print(f"[SURGEON][MULTI_TURN] API error on turn {_mt_turn+1}: {_mt_api_err}")
@@ -2249,12 +2254,17 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
             from anthropic import Anthropic as _AnthropicSync
             _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
             try:
+                # Thinking-config fix: adaptive models need config
+                _tu_think_kw = _get_thinking_kwargs(surg_model, 4000)
+                _tu_effort_kw = _get_effort_kwargs(surg_model)
                 _tu_resp = _sync_aclient.messages.create(
                     model=surg_model,
-                    max_tokens=8192,
+                    max_tokens=16384,
                     system=SURGEON_TOOL_USE_SYSTEM,
                     messages=[{"role": "user", "content": _tu_user_msg}],
                     tools=SURGEON_TOOLS_ANTHROPIC,
+                    **_tu_think_kw,
+                    **_tu_effort_kw,
                 )
                 _tu_stop = _tu_resp.stop_reason
                 print(f"[SURGEON][TOOL_USE] Claude response: stop_reason={_tu_stop}, "
@@ -2376,11 +2386,21 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
             from anthropic import Anthropic as _AnthropicSync
             _sync_aclient = _AnthropicSync(api_key=_anthropic_key)
             from services.api_retry import api_call_with_retry
+            # Thinking-config fix: adaptive models consume max_tokens for
+            # thinking + text.  8192 can starve on large symbols.
+            _surg_txt_think = _get_thinking_kwargs(surg_model, 4000)
+            _surg_txt_effort = _get_effort_kwargs(surg_model)
+            _surg_txt_max = 16384
+            _dlog("surgeon_text_call_config", model=surg_model,
+                  max_tokens=_surg_txt_max, thinking_kw=_surg_txt_think,
+                  effort_kw=_surg_txt_effort, user_id=user_id)
             _claude_surgeon_resp = api_call_with_retry(lambda: _sync_aclient.messages.create(
                 model=surg_model,
-                max_tokens=8192,
+                max_tokens=_surg_txt_max,
                 system=SURGEON_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
+                **_surg_txt_think,
+                **_surg_txt_effort,
             ))
             raw = _extract_claude_text(_claude_surgeon_resp)
             # Truncation guard (mirrors the GPT _sai_truncated refusal below):
@@ -3988,12 +4008,22 @@ async def run_qa_for_changes(
         try:
             aclient = AsyncAnthropic(api_key=anthropic_key)
             _qa_model_legacy = "claude-sonnet-5"
+            # Thinking-config fix (session 69ee9da7): adaptive-thinking
+            # models consume max_tokens for BOTH thinking + text.  1000
+            # tokens guaranteed starvation — raise to 8000 and pass config.
+            _qleg_think_kw = _get_thinking_kwargs(_qa_model_legacy, 2000)
+            _qleg_effort_kw = _get_effort_kwargs(_qa_model_legacy)
+            _dlog("qa_for_changes_call_config", model=_qa_model_legacy,
+                  max_tokens=8000, thinking_kw=_qleg_think_kw,
+                  effort_kw=_qleg_effort_kw)
             from services.api_retry import async_api_call_with_retry
             response = await async_api_call_with_retry(lambda: aclient.messages.create(
                 model=_qa_model_legacy,
-                max_tokens=1000,
+                max_tokens=8000,
                 system=_QA_SYSTEM,
                 messages=[{"role": "user", "content": user_message}],
+                **_qleg_think_kw,
+                **_qleg_effort_kw,
             ))
             for block in response.content:
                 if hasattr(block, "text"):
@@ -4422,6 +4452,9 @@ async def analyze_and_plan_stream(
                                   fixes_so_far=len(_corr_changes))
                             try:
                                 if _agent_use_claude:
+                                    # Thinking-config: explicit config for adaptive models
+                                    _acorr_think_kw = _get_thinking_kwargs("claude-sonnet-5", 4000)
+                                    _acorr_effort_kw = _get_effort_kwargs("claude-sonnet-5")
                                     _corr_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
                                         model="claude-sonnet-5",
                                         max_tokens=_max_output_tokens("claude-sonnet-5"),
@@ -4429,6 +4462,8 @@ async def analyze_and_plan_stream(
                                         messages=_corr_msgs,
                                         tools=CORRECTION_TOOLS,
                                         tool_choice={"type": "auto"},
+                                        **_acorr_think_kw,
+                                        **_acorr_effort_kw,
                                     )
                                 else:
                                     # GPT correction: use free-text JSON instead of tool_use
@@ -4680,11 +4715,16 @@ async def analyze_and_plan_stream(
                             )},
                         ]
                         if _agent_use_claude:
+                            # Thinking-config: explicit config for adaptive models
+                            _aretry_think_kw = _get_thinking_kwargs("claude-sonnet-5", 4000)
+                            _aretry_effort_kw = _get_effort_kwargs("claude-sonnet-5")
                             _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
                                 model="claude-sonnet-5",
                                 max_tokens=_max_output_tokens("claude-sonnet-5"),
                                 system=CLAUDE_EDITOR_SYSTEM,
                                 messages=_retry_msgs,
+                                **_aretry_think_kw,
+                                **_aretry_effort_kw,
                             )
                             _retry_text = "".join(
                                 b.text for b in _retry_resp.content if hasattr(b, "text")
@@ -5863,12 +5903,17 @@ async def run_file_creator(
 
     user_msg = _build_creator_user_msg(file_spec, codebase_context)
 
+    # Thinking-config fix: adaptive models consume max_tokens for thinking + text
+    _fc_think_kw = _get_thinking_kwargs(creator_model, 4000)
+    _fc_effort_kw = _get_effort_kwargs(creator_model)
     response_chunks = []
     async with aclient.messages.stream(
         model=creator_model,
-        max_tokens=8000,
+        max_tokens=16000,
         system=FILE_CREATOR_SYSTEM,
         messages=[{"role": "user", "content": user_msg}],
+        **_fc_think_kw,
+        **_fc_effort_kw,
     ) as stream:
         async for text in stream.text_stream:
             response_chunks.append(text)
@@ -7056,6 +7101,9 @@ async def _run_claude_direct_rewrite(
     _dr_delay = 10  # seconds between 529 retries
     for _dr_attempt in range(_dr_max_attempts):
         try:
+            # Thinking-config: explicit config for adaptive models
+            _dr_think_kw = _get_thinking_kwargs(model, 4000)
+            _dr_effort_kw = _get_effort_kwargs(model)
             async with _da_client.messages.stream(
                 model=model,
                 max_tokens=_max_output_tokens(model),
@@ -7063,6 +7111,8 @@ async def _run_claude_direct_rewrite(
                 messages=[{"role": "user", "content": _dr_user}],
                 tools=_dr_tools,
                 tool_choice={"type": "tool", "name": "submit_file_rewrite"},
+                **_dr_think_kw,
+                **_dr_effort_kw,
             ) as _dr_stream:
                 _dr_resp = await _dr_stream.get_final_message()
             break  # success
@@ -10011,9 +10061,12 @@ USER REQUEST:
                                 # Branch: Claude tool_use vs OpenAI tool_calls
                                 _lint_fixes_list = []
                                 if _lint_use_claude:
+                                    # Thinking-config fix: adaptive models need config
+                                    _lint_think_kw = _get_thinking_kwargs(_lint_surg_model, 4000)
+                                    _lint_effort_kw = _get_effort_kwargs(_lint_surg_model)
                                     _lint_fix_resp = await _lint_fix_client.messages.create(
                                         model=_lint_surg_model,
-                                        max_tokens=8192,
+                                        max_tokens=16384,
                                         tools=[{
                                             "name": "fix_lint_errors",
                                             "description": "Return SEARCH/REPLACE pairs to eliminate TypeScript lint errors. Each find must match the file exactly.",
@@ -10036,7 +10089,9 @@ USER REQUEST:
                                             }
                                         }],
                                         tool_choice={"type": "tool", "name": "fix_lint_errors"},
-                                        messages=[{"role": "user", "content": _lint_user_msg}]
+                                        messages=[{"role": "user", "content": _lint_user_msg}],
+                                        **_lint_think_kw,
+                                        **_lint_effort_kw,
                                     )
                                     for _lblock in _lint_fix_resp.content:
                                         if hasattr(_lblock, "type") and _lblock.type == "tool_use":
@@ -14832,11 +14887,21 @@ async def run_natural_pipeline_stream(
             try:
                 # Run non-streaming call with keepalive pings so proxy stays alive
                 _corr_correction_model = "claude-sonnet-5"  # R25: corrections always use Claude
+                # Thinking-config fix: adaptive models need explicit config
+                # or they consume max_tokens on thinking alone.
+                _corr_think_kw = _get_thinking_kwargs(_corr_correction_model, 4000)
+                _corr_effort_kw = _get_effort_kwargs(_corr_correction_model)
+                _dlog("correction_call_config", session_id=session_id,
+                      model=_corr_correction_model, max_tokens=16000,
+                      thinking_kw=_corr_think_kw, effort_kw=_corr_effort_kw,
+                      resolve_round=resolve_round)
                 _corr_task = asyncio.create_task(aclient.messages.create(
                     model=_corr_correction_model,
-                    max_tokens=8000,
+                    max_tokens=16000,
                     system=system_prompt,
                     messages=correction_msgs,
+                    **_corr_think_kw,
+                    **_corr_effort_kw,
                 ))
                 # ── Deadline + visible heartbeat (session e4e9d098 fix 3) ──
                 # Evidence: this loop kept a run alive with invisible
@@ -14968,12 +15033,22 @@ async def run_natural_pipeline_stream(
                                         "guessing — never fabricate an anchor."
                                     )},
                                 ]
+                                # Thinking-config fix: adaptive models need config
+                                _fu_think_kw = _get_thinking_kwargs("claude-sonnet-5", 4000)
+                                _fu_effort_kw = _get_effort_kwargs("claude-sonnet-5")
+                                _dlog("correction_followup_call_config",
+                                      session_id=session_id,
+                                      model="claude-sonnet-5", max_tokens=16000,
+                                      thinking_kw=_fu_think_kw,
+                                      effort_kw=_fu_effort_kw)
                                 _fu_task = asyncio.create_task(
                                     aclient.messages.create(
                                         model="claude-sonnet-5",  # R25: corrections always Claude
-                                        max_tokens=8000,
+                                        max_tokens=16000,
                                         system=system_prompt,
                                         messages=_fu_msgs,
+                                        **_fu_think_kw,
+                                        **_fu_effort_kw,
                                     )
                                 )
                                 _fu_t0 = time.time()
@@ -15770,6 +15845,9 @@ async def run_natural_pipeline_stream(
                 ]
                 _corr_msgs_by_idx[idx] = correction_messages
 
+                # Thinking-config: explicit config for adaptive models
+                _cbt_think_kw = _get_thinking_kwargs(_correction_model, 4000)
+                _cbt_effort_kw = _get_effort_kwargs(_correction_model)
                 correction_tasks.append((
                     idx,
                     asyncio.create_task(_stream_and_collect(
@@ -15778,6 +15856,8 @@ async def run_natural_pipeline_stream(
                         max_tokens=_max_output_tokens(_correction_model),
                         system=system_prompt,
                         messages=correction_messages,
+                        **_cbt_think_kw,
+                        **_cbt_effort_kw,
                     ))
                 ))
 
@@ -15952,12 +16032,17 @@ async def run_natural_pipeline_stream(
                               msg_count=len(_react_msgs))
 
                         try:
+                            # Thinking-config: explicit config for adaptive models
+                            _fu_react_think_kw = _get_thinking_kwargs(_correction_model, 4000)
+                            _fu_react_effort_kw = _get_effort_kwargs(_correction_model)
                             _fu_task = asyncio.create_task(
                                 _stream_and_collect(
                                     aclient, model=_correction_model,
                                     max_tokens=_max_output_tokens(_correction_model),
                                     system=system_prompt,
                                     messages=_react_msgs,
+                                    **_fu_react_think_kw,
+                                    **_fu_react_effort_kw,
                                 )
                             )
                             while not _fu_task.done():
@@ -16514,10 +16599,15 @@ async def run_natural_pipeline_stream(
                           prompt_est_tokens=len(_mw_prompt) // 4)
 
                     try:
+                        # Thinking-config: explicit config for adaptive models
+                        _mw_think_kw = _get_thinking_kwargs(_mw_correction_model, 4000)
+                        _mw_effort_kw = _get_effort_kwargs(_mw_correction_model)
                         _mw_task = asyncio.create_task(_stream_and_collect(
                             aclient, model=_mw_correction_model,
                             max_tokens=_max_output_tokens(_mw_correction_model), system=system_prompt,
                             messages=[{"role": "user", "content": _mw_prompt}],
+                            **_mw_think_kw,
+                            **_mw_effort_kw,
                         ))
                         while not _mw_task.done():
                             try:
