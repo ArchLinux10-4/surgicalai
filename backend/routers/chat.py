@@ -658,7 +658,8 @@ async def smart_stream(req: dict, request: Request):
         # Fall back to legacy pipeline for non-Claude models
         from database import get_setting as _gs
         _arch_model = _gs("architect_model", "gpt-4.1")
-        _use_natural = _arch_model.startswith("claude-")
+        _is_claude = _arch_model.startswith("claude-")
+        _use_natural = True  # All models use natural pipeline (R25)
 
         # ── Agentic task branch ───────────────────────────────────────────
         # Only when (a) using the Claude natural pipeline and (b) the user
@@ -676,7 +677,7 @@ async def smart_stream(req: dict, request: Request):
         _dlog("sse_task_gate", session_id=session_id, user_id=current_user_id,
               force_tasks=force_tasks, cue_match=_cue_match, use_natural=_use_natural)
 
-        if (force_tasks or _cue_match) and not _use_natural:
+        if (force_tasks or _cue_match) and not _is_claude:
             # Tasks were explicitly requested (toggle or phrase) but the active
             # model is not Claude, so the agentic pipeline cannot run. Tell the
             # user instead of silently ignoring the request (fix #4).
@@ -687,7 +688,7 @@ async def smart_stream(req: dict, request: Request):
                 "Running this as a normal single-pass request instead.*\n\n"
             )})
 
-        if _use_natural and (force_tasks or _cue_match):
+        if _is_claude and (force_tasks or _cue_match):
             _phase = "planning"
             _plan_t0 = time.time()
             _plan_ka = 0
