@@ -1962,6 +1962,9 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
 
         _use_multi_turn = get_setting("multi_turn_surgeon", "false") == "true"
 
+        if _use_multi_turn and not _is_claude_model(surg_model):
+            _dlog("multi_turn_surgeon_gpt_fallback", model=surg_model, user_id=user_id,
+                  note="GPT multi-turn not yet implemented — using single-turn tool_use")
         if _is_claude_model(surg_model) and _use_multi_turn:
             # ── MULTI-TURN VERIFICATION PATH (Phase 3) ─────────────────────────
             # Claude makes edits one at a time, sees verification after each.
@@ -3981,21 +3984,42 @@ async def run_qa_for_changes(
                   prev_score=qa_feedback.get("qa_score"),
                   prev_issues_count=len(_prev_issues))
 
-        aclient = AsyncAnthropic(api_key=anthropic_key)
-        # QA always uses Sonnet — cheaper than user's model, accurate for review
-        _qa_model_legacy = "claude-sonnet-5"  # QA upgraded to Sonnet 5 (better + cheaper than 4.6)
-        from services.api_retry import async_api_call_with_retry
-        response = await async_api_call_with_retry(lambda: aclient.messages.create(
-            model=_qa_model_legacy,
-            max_tokens=1000,
-            system=_QA_SYSTEM,
-            messages=[{"role": "user", "content": user_message}],
-        ))
-
         raw_text = ""
-        for block in response.content:
-            if hasattr(block, "text"):
-                raw_text += block.text
+        try:
+            aclient = AsyncAnthropic(api_key=anthropic_key)
+            _qa_model_legacy = "claude-sonnet-5"
+            from services.api_retry import async_api_call_with_retry
+            response = await async_api_call_with_retry(lambda: aclient.messages.create(
+                model=_qa_model_legacy,
+                max_tokens=1000,
+                system=_QA_SYSTEM,
+                messages=[{"role": "user", "content": user_message}],
+            ))
+            for block in response.content:
+                if hasattr(block, "text"):
+                    raw_text += block.text
+        except Exception as _qa_claude_err:
+            # GPT fallback — use OpenAI if no Anthropic key
+            _dlog("qa_for_changes_claude_fallback_to_gpt",
+                  error=str(_qa_claude_err)[:200], model=model)
+            try:
+                from services.api_retry import api_call_with_retry
+                _qa_oai_client = _get_client("")  # uses default OpenAI key
+                _qa_oai_resp = api_call_with_retry(lambda: _qa_oai_client.chat.completions.create(
+                    model="gpt-4.1",
+                    messages=[
+                        {"role": "system", "content": _QA_SYSTEM},
+                        {"role": "user", "content": user_message},
+                    ],
+                    temperature=0.1,
+                    response_format={"type": "json_object"},
+                ))
+                raw_text = _qa_oai_resp.choices[0].message.content or ""
+            except Exception as _qa_oai_err:
+                _dlog("qa_for_changes_both_failed",
+                      claude_err=str(_qa_claude_err)[:200],
+                      gpt_err=str(_qa_oai_err)[:200])
+                return _FALLBACK
 
         result = _extract_json_from_text(raw_text)
         # _extract_json_from_text is shadowed module-wide by a later duplicate
@@ -4069,18 +4093,25 @@ async def analyze_and_plan_stream(
         yield sse({"type": "progress", "content": "Parsing file structure..."})
         symbol_map = parser.parse(file_content, file_path)
         n_sym = len(symbol_map.symbols) if hasattr(symbol_map, "symbols") and symbol_map.symbols else 0
-        yield sse({"type": "progress", "content": f"Found {n_sym} symbols. Claude is analyzing..."})
+        yield sse({"type": "progress", "content": f"Found {n_sym} symbols. {architect_model} is analyzing..."})
 
         # ------------------------------------------------------------------
         # Step 2: Get Anthropic key and model
         # ------------------------------------------------------------------
-        anthropic_key = _get_anthropic_key(user_id)
         architect_model = get_setting("architect_model", "claude-sonnet-5")
-        # Ensure we're using a Claude model (user might have set a GPT model)
-        if not _is_claude_model(architect_model):
-            architect_model = "claude-sonnet-5"
-
-        aclient = AsyncAnthropic(api_key=anthropic_key)
+        _agent_use_claude = _is_claude_model(architect_model)
+        if _agent_use_claude:
+            anthropic_key = _get_anthropic_key(user_id)
+            aclient = AsyncAnthropic(api_key=anthropic_key)
+        else:
+            _agent_oai_client = _get_client(user_id)
+            anthropic_key = None  # may not have one
+            try:
+                anthropic_key = _get_anthropic_key(user_id)
+            except Exception:
+                pass  # GPT-only user — QA will fall back to GPT too
+        _dlog("agent_mode_model_route", model=architect_model,
+              use_claude=_agent_use_claude, user_id=user_id)
 
         # ------------------------------------------------------------------
         # Step 3: Search loop — Claude can request symbols via "search" intent
@@ -4113,32 +4144,50 @@ async def analyze_and_plan_stream(
             model_kwargs.update(_get_effort_kwargs(architect_model))
 
             full_text = ""
-            in_thinking = False
 
-            async with aclient.messages.stream(**model_kwargs) as stream:
-                async for event in stream:
-                    event_type = getattr(event, "type", None)
+            if _agent_use_claude:
+                in_thinking = False
+                async with aclient.messages.stream(**model_kwargs) as stream:
+                    async for event in stream:
+                        event_type = getattr(event, "type", None)
 
-                    if event_type == "content_block_start":
-                        block = getattr(event, "content_block", None)
-                        if block and getattr(block, "type", "") == "thinking":
-                            in_thinking = True
-                            yield sse({"type": "thinking_start", "content": ""})
+                        if event_type == "content_block_start":
+                            block = getattr(event, "content_block", None)
+                            if block and getattr(block, "type", "") == "thinking":
+                                in_thinking = True
+                                yield sse({"type": "thinking_start", "content": ""})
 
-                    elif event_type == "content_block_delta":
-                        delta = getattr(event, "delta", None)
-                        if delta:
-                            thinking_chunk = getattr(delta, "thinking", None)
-                            text_chunk = getattr(delta, "text", None)
-                            if thinking_chunk:
-                                yield sse({"type": "thinking", "content": thinking_chunk})
-                            elif text_chunk:
-                                full_text += text_chunk
+                        elif event_type == "content_block_delta":
+                            delta = getattr(event, "delta", None)
+                            if delta:
+                                thinking_chunk = getattr(delta, "thinking", None)
+                                text_chunk = getattr(delta, "text", None)
+                                if thinking_chunk:
+                                    yield sse({"type": "thinking", "content": thinking_chunk})
+                                elif text_chunk:
+                                    full_text += text_chunk
 
-                    elif event_type == "content_block_stop":
-                        if in_thinking:
-                            yield sse({"type": "thinking_end", "content": ""})
-                            in_thinking = False
+                        elif event_type == "content_block_stop":
+                            if in_thinking:
+                                yield sse({"type": "thinking_end", "content": ""})
+                                in_thinking = False
+            else:
+                # GPT path — blocking call, same prompt
+                yield sse({"type": "progress", "content": f"Architect ({architect_model}) analyzing..."})
+                _agent_oai_resp = await asyncio.to_thread(
+                    lambda: _chat_create(
+                        _agent_oai_client, architect_model,
+                        messages=[
+                            {"role": "system", "content": CLAUDE_EDITOR_SYSTEM},
+                            {"role": "user", "content": user_message},
+                        ],
+                        response_format={"type": "json_object"},
+                    )
+                )
+                full_text = _agent_oai_resp.choices[0].message.content or ""
+                _dlog("agent_mode_gpt_search_response", model=architect_model,
+                      round=round_num, response_len=len(full_text),
+                      session_id=session_id, user_id=user_id)
 
             # Parse JSON from response
             try:
@@ -4179,7 +4228,7 @@ async def analyze_and_plan_stream(
             break
 
         if plan_data is None:
-            yield sse({"type": "error", "content": "No response from Claude. Please try again."})
+            yield sse({"type": "error", "content": f"No response from {architect_model}. Please try again."})
             return
 
         intent = plan_data.get("intent", "edit")
@@ -4196,7 +4245,7 @@ async def analyze_and_plan_stream(
             return
 
         if intent != "edit":
-            yield sse({"type": "error", "content": f"Unexpected intent '{intent}' from Claude."})
+            yield sse({"type": "error", "content": f"Unexpected intent '{intent}' from {architect_model}."})
             return
 
         # ------------------------------------------------------------------
@@ -4372,14 +4421,66 @@ async def analyze_and_plan_stream(
                                   msg_count=len(_corr_msgs),
                                   fixes_so_far=len(_corr_changes))
                             try:
-                                _corr_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
-                                    model="claude-sonnet-5",  # correction uses Sonnet — cheaper + accurate
-                                    max_tokens=_max_output_tokens("claude-sonnet-5"),
-                                    system=CLAUDE_EDITOR_SYSTEM,
-                                    messages=_corr_msgs,
-                                    tools=CORRECTION_TOOLS,
-                                    tool_choice={"type": "auto"},
-                                )
+                                if _agent_use_claude:
+                                    _corr_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
+                                        model="claude-sonnet-5",
+                                        max_tokens=_max_output_tokens("claude-sonnet-5"),
+                                        system=CLAUDE_EDITOR_SYSTEM,
+                                        messages=_corr_msgs,
+                                        tools=CORRECTION_TOOLS,
+                                        tool_choice={"type": "auto"},
+                                    )
+                                else:
+                                    # GPT correction: use free-text JSON instead of tool_use
+                                    # (OpenAI multi-turn tool format differs from Claude)
+                                    _corr_oai_msgs = [
+                                        {"role": "system", "content": CLAUDE_EDITOR_SYSTEM},
+                                    ] + [
+                                        {"role": m.get("role", "user"),
+                                         "content": str(m.get("content", ""))[:8000]}
+                                        for m in _corr_msgs
+                                        if isinstance(m.get("content"), str)
+                                    ]
+                                    _corr_oai_resp = await asyncio.to_thread(
+                                        lambda: _chat_create(
+                                            _agent_oai_client, architect_model,
+                                            messages=_corr_oai_msgs,
+                                            response_format={"type": "json_object"},
+                                        )
+                                    )
+                                    # Simulate a done_fixing response to exit the loop
+                                    # and use the free-text retry path below instead
+                                    _corr_done = True
+                                    _corr_text = _corr_oai_resp.choices[0].message.content or ""
+                                    _raw_corr = _extract_json_from_text(_corr_text)
+                                    _corr_data = json.loads(_raw_corr) if isinstance(_raw_corr, str) else _raw_corr
+                                    for _rc in (_corr_data.get("changes", []) or []):
+                                        _rc_sp = _rc.get("symbol_path", "")
+                                        _rc_nc = _rc.get("new_code", "")
+                                        if _rc_sp and _rc_nc:
+                                            _fix_sym = None
+                                            for _s in symbol_map.symbols:
+                                                if getattr(_s, "full_path", None) == _rc_sp or getattr(_s, "name", None) == _rc_sp:
+                                                    _fix_sym = _s
+                                                    break
+                                            if _fix_sym:
+                                                _fix_diff = _make_diff(_fix_sym.code, _rc_nc, _rc_sp)
+                                                _fix_tgt, _fix_repl = _compute_target_element(_fix_sym.code, _rc_nc)
+                                                _corr_changes.append(SurgicalChange(
+                                                    id=str(uuid.uuid4()),
+                                                    symbol=_fix_sym,
+                                                    original_code=_fix_sym.code,
+                                                    new_code=_rc_nc,
+                                                    diff=_fix_diff,
+                                                    confidence=_rc.get("confidence", 9),
+                                                    description=_rc.get("description", "GPT correction"),
+                                                    target_element=_fix_tgt,
+                                                    replacement_code=_fix_repl,
+                                                ))
+                                    _dlog("agent_mode_gpt_correction_tool_use",
+                                          model=architect_model, changes=len(_corr_changes),
+                                          session_id=session_id)
+                                    break
                             except Exception as _corr_api_err:
                                 _dlog("correction_tool_use_api_error",
                                       session_id=session_id, turn=_corr_turn + 1,
@@ -4578,15 +4679,36 @@ async def analyze_and_plan_stream(
                                 f"The new_code must be COMPLETE — include all imports, all functions, nothing omitted."
                             )},
                         ]
-                        _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
-                            model="claude-sonnet-5",  # correction uses Sonnet — cheaper + accurate
-                            max_tokens=_max_output_tokens("claude-sonnet-5"),
-                            system=CLAUDE_EDITOR_SYSTEM,
-                            messages=_retry_msgs,
-                        )
-                        _retry_text = "".join(
-                            b.text for b in _retry_resp.content if hasattr(b, "text")
-                        )
+                        if _agent_use_claude:
+                            _retry_resp = await AsyncAnthropic(api_key=anthropic_key).messages.create(
+                                model="claude-sonnet-5",
+                                max_tokens=_max_output_tokens("claude-sonnet-5"),
+                                system=CLAUDE_EDITOR_SYSTEM,
+                                messages=_retry_msgs,
+                            )
+                            _retry_text = "".join(
+                                b.text for b in _retry_resp.content if hasattr(b, "text")
+                            )
+                        else:
+                            # GPT free-text correction
+                            _retry_oai_msgs = [
+                                {"role": "system", "content": CLAUDE_EDITOR_SYSTEM},
+                            ] + [
+                                {"role": m.get("role", "user"),
+                                 "content": str(m.get("content", ""))[:8000]}
+                                for m in _retry_msgs
+                                if isinstance(m.get("content"), str)
+                            ]
+                            _retry_oai_resp = await asyncio.to_thread(
+                                lambda: _chat_create(
+                                    _agent_oai_client, architect_model,
+                                    messages=_retry_oai_msgs,
+                                    response_format={"type": "json_object"},
+                                )
+                            )
+                            _retry_text = _retry_oai_resp.choices[0].message.content or ""
+                            _dlog("agent_mode_gpt_retry", model=architect_model,
+                                  response_len=len(_retry_text), session_id=session_id)
                         _raw_retry = _extract_json_from_text(_retry_text)
                         _retry_data = json.loads(_raw_retry) if isinstance(_raw_retry, str) else _raw_retry
                         _retry_changes_data = _retry_data.get("changes", [])
@@ -5684,15 +5806,16 @@ async def run_file_creator(
 
     Returns {filename, content, language, summary} or raises on failure.
     """
-    try:
-        aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
-    except Exception:
-        # Fall back to OpenAI if no Anthropic key
+    creator_model = get_setting("architect_model", "claude-sonnet-5")
+
+    # Route based on user's model — respect GPT selection instead of overriding
+    if not _is_claude_model(creator_model):
+        # GPT / OpenAI path — use the user's chosen model
         client = _get_client(user_id)
-        model = get_setting("architect_model", "gpt-4.1")
         user_msg = _build_creator_user_msg(file_spec, codebase_context)
+        _dlog("file_creator_gpt_path", model=creator_model, user_id=user_id)
         response = _chat_create(
-            client, model,
+            client, creator_model,
             messages=[
                 {"role": "system", "content": FILE_CREATOR_SYSTEM},
                 {"role": "user",   "content": user_msg},
@@ -5701,12 +5824,31 @@ async def run_file_creator(
             response_format={"type": "json_object"},
         )
         raw = response.choices[0].message.content
-        return json.loads(raw)
+        data = json.loads(raw)
+        data["filename"] = file_spec.get("filename", data.get("filename", "new_file.ts"))
+        return data
 
-    # Prefer Claude for file creation — it generates better structured code
-    creator_model = get_setting("architect_model", "claude-sonnet-5")
-    if not _is_claude_model(creator_model):
-        creator_model = "claude-sonnet-5"
+    # Claude path
+    try:
+        aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
+    except Exception:
+        # Fall back to OpenAI if no Anthropic key configured
+        client = _get_client(user_id)
+        user_msg = _build_creator_user_msg(file_spec, codebase_context)
+        _dlog("file_creator_claude_no_key_fallback", user_id=user_id)
+        response = _chat_create(
+            client, "gpt-4.1",
+            messages=[
+                {"role": "system", "content": FILE_CREATOR_SYSTEM},
+                {"role": "user",   "content": user_msg},
+            ],
+            temperature=0.2,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content
+        data = json.loads(raw)
+        data["filename"] = file_spec.get("filename", data.get("filename", "new_file.ts"))
+        return data
 
     user_msg = _build_creator_user_msg(file_spec, codebase_context)
 
@@ -6934,6 +7076,113 @@ async def _run_claude_direct_rewrite(
             }
 
     raise RuntimeError("[DIRECT_REWRITE] Claude did not call submit_file_rewrite — check model/key")
+
+
+async def _run_gpt_direct_rewrite(
+    file_content: str,
+    filename: str,
+    change_description: str,
+    new_logic: str,
+    architect_plan: dict,
+    user_id: str,
+    model: str,
+) -> dict:
+    """
+    GPT equivalent of _run_claude_direct_rewrite. Uses OpenAI tool_use to
+    output the COMPLETE new file — mirrors the Claude path for feature parity.
+    Returns {"new_file_content": str, "confidence": int, "notes": list}
+    """
+    client = _get_client(user_id)
+
+    _dr_tools_oai = [{
+        "type": "function",
+        "function": {
+            "name": "submit_file_rewrite",
+            "description": (
+                "Submit the COMPLETE rewritten file content. "
+                "You MUST output every line from the first import to the last closing brace. "
+                "No ellipsis, no truncation, no 'rest unchanged' comments."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "new_file_content": {
+                        "type": "string",
+                        "description": "The complete new file — every line from top to bottom"
+                    },
+                    "confidence": {
+                        "type": "integer",
+                        "description": "Confidence 1-10"
+                    },
+                    "notes": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Short notes about major changes made"
+                    }
+                },
+                "required": ["new_file_content", "confidence"]
+            }
+        }
+    }]
+
+    _dr_system = (
+        "You are a senior software engineer performing a large-scale code rewrite. "
+        "You will receive the CURRENT file and a description of what must change. "
+        "Output the COMPLETE new file using the submit_file_rewrite tool. "
+        "CRITICAL: Output EVERY line. Do NOT skip, truncate, or use ellipsis. "
+        "The file must be syntactically valid and complete."
+    )
+
+    _architect_risks = architect_plan.get("risks", [])
+    _risks_block = "\n".join(f"- {r}" for r in _architect_risks) if _architect_risks else "(none)"
+
+    _dr_user = (
+        f"FILE: {filename}\n\n"
+        f"CHANGE REQUIRED:\n{change_description}\n\n"
+        f"{'ADDITIONAL DETAILS:\n' + new_logic + chr(10) * 2 if new_logic and new_logic.strip() else ''}"
+        f"ARCHITECT RISKS TO ADDRESS:\n{_risks_block}\n\n"
+        f"CURRENT FILE CONTENT ({len(file_content.splitlines())} lines):\n"
+        f"```\n{file_content}\n```\n\n"
+        f"Rewrite the file. Output the COMPLETE new file via submit_file_rewrite."
+    )
+
+    _dlog("gpt_direct_rewrite_start", model=model, filename=filename,
+          file_lines=len(file_content.splitlines()), user_id=user_id)
+
+    response = _chat_create(
+        client, model,
+        messages=[
+            {"role": "system", "content": _dr_system},
+            {"role": "user", "content": _dr_user},
+        ],
+        tools=_dr_tools_oai,
+        tool_choice={"type": "function", "function": {"name": "submit_file_rewrite"}},
+    )
+
+    # Truncation guard
+    if getattr(response, "_sai_truncated", False):
+        _dlog("gpt_direct_rewrite_truncated", model=model, filename=filename)
+        raise RuntimeError(
+            f"[GPT_DIRECT_REWRITE] Output truncated — file too large for single-shot rewrite"
+        )
+
+    # Parse tool_calls
+    tool_calls = response.choices[0].message.tool_calls or []
+    for _tc in tool_calls:
+        if _tc.function.name == "submit_file_rewrite":
+            import json as _json_dr
+            _inp = _json_dr.loads(_tc.function.arguments)
+            _dlog("gpt_direct_rewrite_success", model=model, filename=filename,
+                  confidence=_inp.get("confidence", 0),
+                  new_lines=len(_inp.get("new_file_content", "").splitlines()))
+            return {
+                "new_file_content": _inp.get("new_file_content", ""),
+                "confidence": _inp.get("confidence", 8),
+                "notes": _inp.get("notes", []),
+            }
+
+    _dlog("gpt_direct_rewrite_no_tool_call", model=model, filename=filename)
+    raise RuntimeError("[GPT_DIRECT_REWRITE] GPT did not call submit_file_rewrite")
 
 
 async def run_smart_pipeline_stream(
@@ -8658,11 +8907,13 @@ USER REQUEST:
                         })
                     architect_messages = [
                         {"role": "system", "content": _oai_architect_system},
+                    ] + _arch_history_msgs + [
                         {"role": "user", "content": user_content}
                     ]
                 else:
                     architect_messages = [
                         {"role": "system", "content": _oai_architect_system},
+                    ] + _arch_history_msgs + [
                         {"role": "user", "content": _oai_context_msg}
                     ]
 
@@ -9368,7 +9619,6 @@ USER REQUEST:
             # v3.12: use original (pre-narrowing) size — narrowing must not defeat routing
             _use_direct_rewrite = (
                 (_is_redesign or _original_symbol_size > 250)
-                and _is_claude_model(_surg_model_route)
             )
 
             _dr_new_code = None
@@ -9381,18 +9631,29 @@ USER REQUEST:
             _dr_full_after_lint = None
 
             if _use_direct_rewrite:
-                yield sse({"type": "progress", "content": f"Full-file rewrite: Claude writing complete {matched_name} ({_symbol_size_route}L symbol)..."})
+                yield sse({"type": "progress", "content": f"Full-file rewrite: {_surg_model_route} writing complete {matched_name} ({_symbol_size_route}L symbol)..."})
                 _dr_ok = False
                 try:
-                    _dr = await _run_claude_direct_rewrite(
-                        file_content=sf["content"],
-                        filename=matched_name,
-                        change_description=change_target.description,
-                        new_logic=change_target.new_logic,
-                        architect_plan=plan,
-                        anthropic_key=_get_anthropic_key(user_id),
-                        model=_surg_model_route,
-                    )
+                    if _is_claude_model(_surg_model_route):
+                        _dr = await _run_claude_direct_rewrite(
+                            file_content=sf["content"],
+                            filename=matched_name,
+                            change_description=change_target.description,
+                            new_logic=change_target.new_logic,
+                            architect_plan=plan,
+                            anthropic_key=_get_anthropic_key(user_id),
+                            model=_surg_model_route,
+                        )
+                    else:
+                        _dr = await _run_gpt_direct_rewrite(
+                            file_content=sf["content"],
+                            filename=matched_name,
+                            change_description=change_target.description,
+                            new_logic=change_target.new_logic,
+                            architect_plan=plan,
+                            user_id=user_id,
+                            model=_surg_model_route,
+                        )
                     _dr_new_code = _dr["new_file_content"]
                     _dr_confidence = _dr.get("confidence", 8)
                     _dr_surg_notes = _dr.get("notes", [])
@@ -9687,10 +9948,14 @@ USER REQUEST:
                         # ── Lint self-heal: up to 3 Claude attempts ───────────
                         _lint_fixed = False
                         _MAX_LINT_ATTEMPTS = 3
-                        _lint_fix_client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
                         _lint_surg_model = get_setting("surgeon_model", "claude-sonnet-5")
-                        if not _is_claude_model(_lint_surg_model):
-                            _lint_surg_model = "claude-sonnet-5"
+                        _lint_use_claude = _is_claude_model(_lint_surg_model)
+                        if _lint_use_claude:
+                            _lint_fix_client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
+                        else:
+                            _lint_fix_oai_client = _get_client(user_id)
+                        _dlog("lint_fix_model_route", model=_lint_surg_model,
+                              use_claude=_lint_use_claude, user_id=user_id)
                         _lint_working = _full_after_lint          # updated each attempt
                         _lint_remaining = _linter_introduced_errors  # refreshed each attempt
                         # Improvement #3: collect every applied fix so a clean pass
@@ -9703,35 +9968,8 @@ USER REQUEST:
                                     for e in _lint_remaining
                                 )
                                 _attempt_label = f"attempt {_lint_attempt+1}/{_MAX_LINT_ATTEMPTS}"
-                                yield sse({"type": "progress", "content": f"🔧 Lint auto-fix {_attempt_label}: {len(_lint_remaining)} error(s) → Claude..."})
-                                _lint_fix_resp = await _lint_fix_client.messages.create(
-                                    model=_lint_surg_model,
-                                    max_tokens=8192,
-                                    tools=[{
-                                        "name": "fix_lint_errors",
-                                        "description": "Return SEARCH/REPLACE pairs to eliminate TypeScript lint errors. Each find must match the file exactly.",
-                                        "input_schema": {
-                                            "type": "object",
-                                            "properties": {
-                                                "fixes": {
-                                                    "type": "array",
-                                                    "items": {
-                                                        "type": "object",
-                                                        "properties": {
-                                                            "find": {"type": "string", "description": "Exact text to remove or replace (must match file exactly, including indentation)"},
-                                                            "replace": {"type": "string", "description": "Replacement text — use empty string \"\" to delete the line entirely"}
-                                                        },
-                                                        "required": ["find", "replace"]
-                                                    }
-                                                }
-                                            },
-                                            "required": ["fixes"]
-                                        }
-                                    }],
-                                    tool_choice={"type": "tool", "name": "fix_lint_errors"},
-                                    messages=[{
-                                        "role": "user",
-                                        "content": (
+                                yield sse({"type": "progress", "content": f"🔧 Lint auto-fix {_attempt_label}: {len(_lint_remaining)} error(s) → {_lint_surg_model}..."})
+                                _lint_user_msg = (
                                             f"You are a TypeScript lint fixer. This is attempt {_lint_attempt+1} of {_MAX_LINT_ATTEMPTS}.\n"
                                             f"Fix EVERY listed error in `{matched_name}`. There are {len(_lint_remaining)} errors remaining.\n\n"
                                             f"Rules:\n"
@@ -9746,23 +9984,96 @@ USER REQUEST:
                                             f"Errors to fix (line, column, TS code, message):\n{_lint_err_lines}\n\n"
                                             f"Current file content (this is the LIVE file — use exact text from here for your `find` strings):\n```typescript\n{_lint_working}\n```"
                                         )
-                                    }]
-                                )
-                                # Apply fixes from tool_use response
+                                # Branch: Claude tool_use vs OpenAI tool_calls
+                                _lint_fixes_list = []
+                                if _lint_use_claude:
+                                    _lint_fix_resp = await _lint_fix_client.messages.create(
+                                        model=_lint_surg_model,
+                                        max_tokens=8192,
+                                        tools=[{
+                                            "name": "fix_lint_errors",
+                                            "description": "Return SEARCH/REPLACE pairs to eliminate TypeScript lint errors. Each find must match the file exactly.",
+                                            "input_schema": {
+                                                "type": "object",
+                                                "properties": {
+                                                    "fixes": {
+                                                        "type": "array",
+                                                        "items": {
+                                                            "type": "object",
+                                                            "properties": {
+                                                                "find": {"type": "string", "description": "Exact text to remove or replace (must match file exactly, including indentation)"},
+                                                                "replace": {"type": "string", "description": "Replacement text — use empty string \"\" to delete the line entirely"}
+                                                            },
+                                                            "required": ["find", "replace"]
+                                                        }
+                                                    }
+                                                },
+                                                "required": ["fixes"]
+                                            }
+                                        }],
+                                        tool_choice={"type": "tool", "name": "fix_lint_errors"},
+                                        messages=[{"role": "user", "content": _lint_user_msg}]
+                                    )
+                                    for _lblock in _lint_fix_resp.content:
+                                        if hasattr(_lblock, "type") and _lblock.type == "tool_use":
+                                            _lint_fixes_list = (_lblock.input or {}).get("fixes", [])
+                                else:
+                                    # GPT / OpenAI path — same tool schema, OpenAI format
+                                    _lint_fix_resp_oai = _chat_create(
+                                        _lint_fix_oai_client, _lint_surg_model,
+                                        messages=[
+                                            {"role": "system", "content": "You are a TypeScript lint fixer. Return fixes using the fix_lint_errors tool."},
+                                            {"role": "user", "content": _lint_user_msg},
+                                        ],
+                                        tools=[{
+                                            "type": "function",
+                                            "function": {
+                                                "name": "fix_lint_errors",
+                                                "description": "Return SEARCH/REPLACE pairs to eliminate TypeScript lint errors.",
+                                                "parameters": {
+                                                    "type": "object",
+                                                    "properties": {
+                                                        "fixes": {
+                                                            "type": "array",
+                                                            "items": {
+                                                                "type": "object",
+                                                                "properties": {
+                                                                    "find": {"type": "string", "description": "Exact text to remove or replace"},
+                                                                    "replace": {"type": "string", "description": "Replacement text"}
+                                                                },
+                                                                "required": ["find", "replace"]
+                                                            }
+                                                        }
+                                                    },
+                                                    "required": ["fixes"]
+                                                }
+                                            }
+                                        }],
+                                        tool_choice={"type": "function", "function": {"name": "fix_lint_errors"}},
+                                    )
+                                    for _tc in (_lint_fix_resp_oai.choices[0].message.tool_calls or []):
+                                        try:
+                                            import json as _json_lint
+                                            _lint_fixes_list = _json_lint.loads(_tc.function.arguments).get("fixes", [])
+                                        except Exception:
+                                            _dlog("lint_fix_oai_parse_error", session_id=session_id,
+                                                  raw=str(getattr(_tc.function, "arguments", ""))[:300])
+                                    _dlog("lint_fix_oai_response", session_id=session_id,
+                                          fixes_count=len(_lint_fixes_list), model=_lint_surg_model)
+
+                                # Apply fixes (unified path for both providers)
                                 _lint_patched = _lint_working
                                 _fixes_applied = 0
-                                for _lblock in _lint_fix_resp.content:
-                                    if hasattr(_lblock, "type") and _lblock.type == "tool_use":
-                                        for _lfix in (_lblock.input or {}).get("fixes", []):
-                                            _lf = _lfix.get("find", "")
-                                            _lr = _lfix.get("replace", "")
-                                            if _lf and _lf in _lint_patched:
-                                                _lint_patched = _lint_patched.replace(_lf, _lr, 1)
-                                                _fixes_applied += 1
-                                                _lint_shipped_fixes.append({"find": _lf, "replace": _lr})
-                                                _dlog("lint_fix_applied", session_id=session_id,
-                                                      file=matched_name, attempt=_lint_attempt + 1,
-                                                      find_preview=_lf[:80], replace_preview=_lr[:80])
+                                for _lfix in _lint_fixes_list:
+                                    _lf = _lfix.get("find", "")
+                                    _lr = _lfix.get("replace", "")
+                                    if _lf and _lf in _lint_patched:
+                                        _lint_patched = _lint_patched.replace(_lf, _lr, 1)
+                                        _fixes_applied += 1
+                                        _lint_shipped_fixes.append({"find": _lf, "replace": _lr})
+                                        _dlog("lint_fix_applied", session_id=session_id,
+                                              file=matched_name, attempt=_lint_attempt + 1,
+                                              find_preview=_lf[:80], replace_preview=_lr[:80])
                                 # Re-run linter on patched content to get fresh error list
                                 _lint_retry_count = _count_lint(_lint_patched, matched_name)
                                 _lint_working = _lint_patched  # always advance, even if errors remain
@@ -11727,9 +12038,16 @@ async def run_natural_pipeline_stream(
 
     try:
         anthropic_key = _get_anthropic_key(user_id)
-        arch_model = get_setting("architect_model", "claude-sonnet-5")
+        _user_arch_model = get_setting("architect_model", "claude-sonnet-5")
+        arch_model = _user_arch_model
+        # Natural pipeline requires Claude (prompt caching, XML streaming, thinking).
+        # Log explicitly when a GPT model is overridden — not silent.
         if not _is_claude_model(arch_model):
             arch_model = "claude-sonnet-5"
+            _dlog("natural_pipeline_claude_override",
+                  user_model=_user_arch_model, effective_model=arch_model,
+                  reason="natural_pipeline_requires_claude_features",
+                  session_id=session_id, user_id=user_id)
 
         aclient = AsyncAnthropic(api_key=anthropic_key)
 
