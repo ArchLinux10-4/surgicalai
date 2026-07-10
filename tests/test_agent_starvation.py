@@ -75,16 +75,20 @@ class TestAgentModeStarvationRecoveryLogic(unittest.TestCase):
     """Verify the logic used by the Agent Mode starvation recovery path."""
 
     def test_initial_call_budget_capped_at_8000(self):
-        """Agent Mode initial call uses budget=8000 — verify it's capped."""
+        """Agent Mode initial call uses budget=8000 — adaptive models get type=adaptive."""
         kw = _get_thinking_kwargs("claude-sonnet-5", 8000)
-        self.assertEqual(kw["thinking"]["type"], "enabled")
-        self.assertEqual(kw["thinking"]["budget_tokens"], 8000)
+        # Adaptive models (claude-sonnet-5) MUST use type=adaptive —
+        # Anthropic API rejects type=enabled on these models (400 error).
+        # Budget capping is structurally impossible; starvation protection
+        # relies on the detect+retry layer in _safe_claude_call.
+        self.assertEqual(kw["thinking"]["type"], "adaptive")
+        self.assertNotIn("budget_tokens", kw["thinking"])
 
     def test_retry_budget_doubled_to_16000(self):
-        """On starvation, retry uses budget=16000."""
+        """On starvation retry — adaptive models still get type=adaptive."""
         kw = _get_thinking_kwargs("claude-sonnet-5", 16000)
-        self.assertEqual(kw["thinking"]["type"], "enabled")
-        self.assertEqual(kw["thinking"]["budget_tokens"], 16000)
+        self.assertEqual(kw["thinking"]["type"], "adaptive")
+        self.assertNotIn("budget_tokens", kw["thinking"])
 
     def test_retry_max_tokens_covers_text_and_thinking(self):
         """_bounded_thinking_params ensures max_tokens > budget so text has room."""
