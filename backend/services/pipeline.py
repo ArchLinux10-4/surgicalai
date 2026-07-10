@@ -13555,7 +13555,7 @@ async def run_natural_pipeline_stream(
                             yield sse({"type": "progress",
                                        "content": f"Retrying {_retry_sym} in {_retry_fname}..."})
                             _redit_task = asyncio.create_task(_retry_truncated_edit(
-                                aclient, arch_model,
+                                aclient, "claude-sonnet-5",  # R25: corrections always Claude
                                 _retry_fname, _retry_sym, _retry_content,
                                 _retry_smap, user_request,
                                 session_id, user_id
@@ -13611,7 +13611,7 @@ async def run_natural_pipeline_stream(
                         yield sse({"type": "progress",
                                    "content": f"Retrying {_retry_fname}..."})
                         _rnf_task = asyncio.create_task(_retry_truncated_newfile(
-                            aclient, arch_model,
+                            aclient, "claude-sonnet-5",  # R25: corrections always Claude
                             _retry_fname, user_request,
                             session_id, user_id
                         ))
@@ -13674,7 +13674,7 @@ async def run_natural_pipeline_stream(
                     # Run the edit as a task so we can emit progress heartbeats
                     # every 15s — prevents silent dead air during long API calls.
                     _edit_task = asyncio.ensure_future(_execute_single_edit(
-                        aclient, arch_model,
+                        aclient, "claude-sonnet-5",  # R25: corrections always Claude
                         p_filename, p_symbol, p_description,
                         p_content, p_smap, user_request,
                         session_id, user_id
@@ -14807,8 +14807,9 @@ async def run_natural_pipeline_stream(
 
             try:
                 # Run non-streaming call with keepalive pings so proxy stays alive
+                _corr_correction_model = "claude-sonnet-5"  # R25: corrections always use Claude
                 _corr_task = asyncio.create_task(aclient.messages.create(
-                    model=arch_model,
+                    model=_corr_correction_model,
                     max_tokens=8000,
                     system=system_prompt,
                     messages=correction_msgs,
@@ -14945,7 +14946,7 @@ async def run_natural_pipeline_stream(
                                 ]
                                 _fu_task = asyncio.create_task(
                                     aclient.messages.create(
-                                        model=arch_model,
+                                        model="claude-sonnet-5",  # R25: corrections always Claude
                                         max_tokens=8000,
                                         system=system_prompt,
                                         messages=_fu_msgs,
