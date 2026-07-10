@@ -4371,6 +4371,75 @@ async def analyze_and_plan_stream(
                             if in_thinking:
                                 yield sse({"type": "thinking_end", "content": ""})
                                 in_thinking = False
+
+                # -- Agent Mode starvation detection + auto-retry ----------
+                _dlog("agent_stream_done", model=architect_model,
+                      round=round_num, text_len=len(full_text),
+                      session_id=session_id, user_id=user_id)
+
+                if not full_text.strip():
+                    _retry_budget = 16_000
+                    _retry_max = _bounded_thinking_params(
+                        architect_model, _retry_budget
+                    )["max_tokens"]
+                    _dlog("agent_thinking_starvation_detected",
+                          model=architect_model, original_budget=8000,
+                          retry_budget=_retry_budget, retry_max=_retry_max,
+                          round=round_num, session_id=session_id,
+                          user_id=user_id)
+                    yield sse({"type": "progress",
+                               "content": "Re-analyzing with expanded capacity..."})
+
+                    _retry_kwargs = {
+                        "model": architect_model,
+                        "max_tokens": _retry_max,
+                        "system": CLAUDE_EDITOR_SYSTEM,
+                        "messages": messages,
+                    }
+                    _retry_kwargs.update(
+                        _get_thinking_kwargs(architect_model, _retry_budget)
+                    )
+                    _retry_kwargs.update(_get_effort_kwargs(architect_model))
+
+                    in_thinking = False
+                    async with aclient.messages.stream(**_retry_kwargs) as stream:
+                        async for event in stream:
+                            event_type = getattr(event, "type", None)
+
+                            if event_type == "content_block_start":
+                                block = getattr(event, "content_block", None)
+                                if block and getattr(block, "type", "") == "thinking":
+                                    in_thinking = True
+                                    yield sse({"type": "thinking_start",
+                                               "content": ""})
+
+                            elif event_type == "content_block_delta":
+                                delta = getattr(event, "delta", None)
+                                if delta:
+                                    t_chunk = getattr(delta, "thinking", None)
+                                    txt_chunk = getattr(delta, "text", None)
+                                    if t_chunk:
+                                        yield sse({"type": "thinking",
+                                                   "content": t_chunk})
+                                    elif txt_chunk:
+                                        full_text += txt_chunk
+
+                            elif event_type == "content_block_stop":
+                                if in_thinking:
+                                    yield sse({"type": "thinking_end",
+                                               "content": ""})
+                                    in_thinking = False
+
+                    _dlog("agent_starvation_retry_done",
+                          model=architect_model, retry_text_len=len(full_text),
+                          round=round_num, session_id=session_id,
+                          user_id=user_id)
+
+                    if not full_text.strip():
+                        _dlog("agent_starvation_final_fail",
+                              model=architect_model, round=round_num,
+                              session_id=session_id, user_id=user_id)
+                # -- End starvation recovery -------------------------------
             else:
                 # GPT path — blocking call, same prompt
                 yield sse({"type": "progress", "content": f"Architect ({architect_model}) analyzing..."})
