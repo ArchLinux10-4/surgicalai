@@ -5591,10 +5591,21 @@ Run all 5 checks and return the JSON verdict."""
 
     try:
         if _use_claude:
+            # Same fix as edit-QA: adaptive-thinking models need thinking
+            # config + sufficient budget or they spend all tokens thinking
+            # and emit zero text (session 69ee9da7).
+            _qc_think_kw = _get_thinking_kwargs(_model, 2000)
+            _qc_effort_kw = _get_effort_kwargs(_model)
+            _qc_max = 8000
+            _dlog("qa_create_call_config", model=_model,
+                  max_tokens=_qc_max, thinking_kw=_qc_think_kw,
+                  effort_kw=_qc_effort_kw)
             _msg = await _qa_aclient.messages.create(
-                model=_model, max_tokens=800,
+                model=_model, max_tokens=_qc_max,
                 system=QA_CREATE_SYSTEM,
                 messages=[{"role": "user", "content": user_msg}],
+                **_qc_think_kw,
+                **_qc_effort_kw,
             )
             # Iterate blocks defensively — adaptive-thinking models may emit
             # non-text blocks first, so content[0] is not guaranteed to be text.
@@ -6514,13 +6525,26 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
             # the response contained ONLY a thinking block and no text,
             # so 1500 total tokens left no room for the JSON verdict.
             # Attempt 2 gets extra headroom on top of that.
+            # Adaptive-thinking models (Sonnet 5, etc.) consume max_tokens
+            # for BOTH thinking + text.  Without explicit thinking config +
+            # sufficient budget, the model spends all tokens thinking and
+            # emits zero text (session 69ee9da7: 4× empty QA on 1763-line
+            # symbol).  Use the same helpers every other call site uses.
+            _qa_think_kw = _get_thinking_kwargs(_qa_model, 4000)
+            _qa_effort_kw = _get_effort_kwargs(_qa_model)
+            _qa_max = 16000 if _qa_attempt == 0 else 24000
+            _dlog("qa_call_config", session_id=session_id,
+                  model=_qa_model, max_tokens=_qa_max, attempt=_qa_attempt,
+                  thinking_kw=_qa_think_kw, effort_kw=_qa_effort_kw)
             _qa_msg = await _qa_aclient.messages.create(
                 model=_qa_model,
-                max_tokens=4000 if _qa_attempt == 0 else 6000,
+                max_tokens=_qa_max,
                 system=QA_SYSTEM,
                 messages=[
                     {"role": "user", "content": user_msg},
                 ],
+                **_qa_think_kw,
+                **_qa_effort_kw,
             )
             # Iterate blocks defensively — adaptive-thinking models may emit
             # non-text blocks first, so content[0] is not guaranteed to be text.
