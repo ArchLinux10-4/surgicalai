@@ -96,25 +96,25 @@ def get_available_models(request: Request):
     # account actually accepts are listed (others 404 at request time).
     claude_models = [
         {"id": "claude-fable-5", "name": "Claude Fable 5", "role": "architect",
-         "description": "Most capable model — ⚠️ Premium pricing ($10/$50 per M tokens)", "provider": "anthropic"},
+         "description": "Most capable model — ⚠️ Premium pricing ($10/$50 per M tokens)", "provider": "anthropic", "cost": 4},
         {"id": "claude-opus-4-8", "name": "Claude Opus 4.8", "role": "architect",
-         "description": "Complex agentic coding — powerful for multi-file work", "provider": "anthropic"},
+         "description": "Complex agentic coding — powerful for multi-file work", "provider": "anthropic", "cost": 4},
         {"id": "claude-sonnet-5", "name": "Claude Sonnet 5", "role": "architect",
-         "description": "Best speed + intelligence balance — recommended for most tasks", "provider": "anthropic"},
+         "description": "Best speed + intelligence balance — recommended for most tasks", "provider": "anthropic", "cost": 2},
         {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "role": "architect",
-         "description": "High-capability Opus — strong for large, multi-step changes", "provider": "anthropic"},
+         "description": "High-capability Opus — strong for large, multi-step changes", "provider": "anthropic", "cost": 3},
         {"id": "claude-sonnet-4-6", "name": "Claude Sonnet 4.6", "role": "architect",
-         "description": "Fast, intelligent — proven and reliable", "provider": "anthropic"},
+         "description": "Fast, intelligent — proven and reliable", "provider": "anthropic", "cost": 2},
         {"id": "claude-opus-4-6", "name": "Claude Opus 4.6", "role": "architect",
-         "description": "Capable Opus — great for complex, multi-file changes", "provider": "anthropic"},
+         "description": "Capable Opus — great for complex, multi-file changes", "provider": "anthropic", "cost": 3},
         {"id": "claude-sonnet-4-5", "name": "Claude Sonnet 4.5", "role": "architect",
-         "description": "Fast and capable — balanced speed and quality", "provider": "anthropic"},
+         "description": "Fast and capable — balanced speed and quality", "provider": "anthropic", "cost": 2},
         {"id": "claude-opus-4-5", "name": "Claude Opus 4.5", "role": "architect",
-         "description": "Opus 4.5 — deep reasoning for involved edits", "provider": "anthropic"},
+         "description": "Opus 4.5 — deep reasoning for involved edits", "provider": "anthropic", "cost": 3},
         {"id": "claude-opus-4-1", "name": "Claude Opus 4.1", "role": "architect",
-         "description": "Earlier Opus — solid for complex changes", "provider": "anthropic"},
+         "description": "Earlier Opus — solid for complex changes", "provider": "anthropic", "cost": 3},
         {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "role": "architect",
-         "description": "Fastest Claude — great for quick edits and simple changes", "provider": "anthropic"},
+         "description": "Fastest Claude — great for quick edits and simple changes", "provider": "anthropic", "cost": 1},
     ]
 
     # OpenAI models — only shown when an OpenAI key is configured
@@ -123,13 +123,13 @@ def get_available_models(request: Request):
     if has_openai:
         openai_models = [
             {"id": "gpt-5.5", "name": "GPT-5.5", "role": "architect",
-             "description": "Latest GPT — powerful general-purpose model", "provider": "openai"},
+             "description": "Latest GPT — powerful general-purpose model", "provider": "openai", "cost": 2},
             {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol", "role": "architect",
-             "description": "Frontier reasoning — hardest problems, 1M context", "provider": "openai"},
+             "description": "Frontier reasoning — hardest problems, 1M context", "provider": "openai", "cost": 3},
             {"id": "gpt-5.6-terra", "name": "GPT-5.6 Terra", "role": "architect",
-             "description": "Balanced reasoning — 2× cheaper than Sol, 1M context", "provider": "openai"},
+             "description": "Balanced reasoning — 2× cheaper than Sol, 1M context", "provider": "openai", "cost": 2},
             {"id": "gpt-5.6-luna", "name": "GPT-5.6 Luna", "role": "architect",
-             "description": "Fast reasoning — 5× cheaper than Sol, 1M context", "provider": "openai"},
+             "description": "Fast reasoning — 5× cheaper than Sol, 1M context", "provider": "openai", "cost": 1},
         ]
 
     return {

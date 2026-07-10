@@ -6,7 +6,7 @@ import { AdminUsersPanel } from './AdminUsersPanel'
 import { GitHubAppPanel } from './GitHubAppPanel'
 import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
-import { BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
+import { AttachMoney, BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
 type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'railway' | 'security' | 'debug'
 
@@ -56,7 +56,7 @@ export function SettingsModal() {
   const [githubConnecting, setGithubConnecting] = useState(false)
   const [githubStatus, setGithubStatus] = useState<any>(null)
   const [githubStatusMsg, setGithubStatusMsg] = useState('')
-  const [models, setModels] = useState<any[]>([])
+  const [models, setModels] = useState<{id: string; name: string; role: string; description?: string; cost?: number}[]>([])
 
   // Security tab — change password
   const [pwCurrent, setPwCurrent]         = useState('')
@@ -468,7 +468,7 @@ export function SettingsModal() {
                 <SectionHeader title="Model Configuration" subtitle="Select which AI model powers SurgicalAI" />
 
                 <Field label="AI Model">
-                  <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect').map((m) => ({ value: m.id, label: `${m.name} \u2014 ${m.description}` }))} />
+                  <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect').map((m) => ({ value: m.id, label: `${'$'.repeat(m.cost || 1)} — ${m.name} — ${m.description || ''}` }))} />
                 </Field>
 
                 {!form.architect_model.startsWith('claude-') && !form.architect_model.startsWith('gpt-5') && (

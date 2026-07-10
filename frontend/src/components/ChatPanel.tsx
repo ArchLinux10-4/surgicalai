@@ -11,9 +11,27 @@ import { SessionFilesTray } from './SessionFilesTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
-import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
+import { AccountTree, Add, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
 import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
+
+
+// ── Cost indicator for model picker ───────────────────────────────────────────
+function ModelCostIndicator({ cost }: { cost?: number }) {
+  if (!cost) return null
+  const filled = cost
+  const empty = 4 - cost
+  return (
+    <span className="inline-flex items-center ml-1.5" title={`Cost tier: ${cost}/4`}>
+      {Array.from({ length: filled }, (_, i) => (
+        <AttachMoney key={`f${i}`} sx={{ fontSize: 11, color: cost >= 4 ? '#ef4444' : cost >= 3 ? '#f59e0b' : '#22c55e', marginLeft: '-3px' }} />
+      ))}
+      {Array.from({ length: empty }, (_, i) => (
+        <AttachMoney key={`e${i}`} sx={{ fontSize: 11, opacity: 0.2, marginLeft: '-3px' }} />
+      ))}
+    </span>
+  )
+}
 
 // ── Strip internal protocol tags from model output ────────────────────────────
 function stripInternalTags(text: string, streaming = false): string {
@@ -784,7 +802,7 @@ export function ChatPanel() {
   const [thinkingText, setThinkingText] = useState('')
   const [isThinking, setIsThinking] = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
-  const [availableModels, setAvailableModels] = useState<{id: string; name: string; role: string; description?: string}[]>([])
+  const [availableModels, setAvailableModels] = useState<{id: string; name: string; role: string; description?: string; cost?: number}[]>([])
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -1683,7 +1701,7 @@ export function ChatPanel() {
                       onClick={() => handleModelChange(m.id)}
                       className={`w-full text-left px-3 py-1.5 text-[12px] hover:bg-overlay transition-colors ${settings?.architect_model === m.id ? 'text-accent font-medium' : 'text-ink'}`}
                     >
-                      <div className="font-mono">{m.id}</div>
+                      <div className="font-mono flex items-center">{m.id}<ModelCostIndicator cost={m.cost} /></div>
                       {m.description && <div className="text-[10px] text-muted/70 mt-0.5 truncate">{m.description}</div>}
                     </button>
                   ))}
