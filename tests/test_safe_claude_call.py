@@ -68,24 +68,23 @@ for fn_name in _FUNCS_TO_EXTRACT:
 class TestBoundedThinkingParams:
     """_bounded_thinking_params must cap thinking so text can't be starved."""
 
-    def test_adaptive_model_gets_enabled_with_budget(self):
-        """Adaptive models should get 'enabled' type, NOT 'adaptive'."""
+    def test_adaptive_model_gets_adaptive_type(self):
+        """Adaptive models MUST get 'adaptive' type — 'enabled' returns a 400 error."""
         params = _NS["_bounded_thinking_params"]("claude-sonnet-5", 8192, 10000)
         think = params.get("thinking", {})
-        assert think.get("type") == "enabled", \
-            f"Expected 'enabled' thinking for adaptive model, got {think.get('type')}"
-        assert "budget_tokens" in think, "Missing budget_tokens for adaptive model"
+        assert think.get("type") == "adaptive", \
+            f"Expected 'adaptive' thinking for adaptive model, got {think.get('type')}. " \
+            f"'enabled' is rejected by the API with a 400 error!"
+        assert "budget_tokens" not in think, \
+            "budget_tokens not supported on adaptive models — causes 400 error"
+        assert think.get("display") == "summarized", \
+            "display must be 'summarized' or thinking blocks return empty strings"
 
-    def test_adaptive_model_budget_capped(self):
-        """Budget must not exceed max_tokens - desired_text."""
+    def test_adaptive_model_has_max_tokens(self):
+        """Adaptive models should still get max_tokens even without budget_tokens."""
         params = _NS["_bounded_thinking_params"]("claude-sonnet-5", 8192, 200000)
-        think = params.get("thinking", {})
-        max_tok = params.get("max_tokens", 0)
-        budget = think.get("budget_tokens", 0)
-        # text headroom = max_tokens - budget must be >= desired_text_tokens
-        headroom = max_tok - budget
-        assert headroom >= 8192, \
-            f"Text headroom {headroom} < desired 8192. max_tokens={max_tok}, budget={budget}"
+        assert "max_tokens" in params, "Missing max_tokens for adaptive model"
+        assert params["max_tokens"] > 0
 
     def test_effort_included(self):
         """Adaptive models should get effort config."""
@@ -101,20 +100,24 @@ class TestBoundedThinkingParams:
 class TestGetThinkingKwargs:
     """_get_thinking_kwargs must return capped thinking for adaptive models."""
 
-    def test_adaptive_model_returns_enabled(self):
-        """After fix: adaptive models should get 'enabled', not 'adaptive'."""
+    def test_adaptive_model_returns_adaptive(self):
+        """Adaptive models MUST get 'adaptive' type — 'enabled' returns a 400 error."""
         kw = _NS["_get_thinking_kwargs"]("claude-sonnet-5", 10000)
         think = kw.get("thinking", {})
-        assert think.get("type") == "enabled", \
-            f"Expected 'enabled' for adaptive model, got {think.get('type')}. " \
-            f"If 'adaptive', the starvation bug is NOT fixed!"
-        assert think.get("budget_tokens") == 10000
+        assert think.get("type") == "adaptive", \
+            f"Expected 'adaptive' for adaptive model, got {think.get('type')}. " \
+            f"'enabled' is rejected by the API with a 400 error!"
+        assert "budget_tokens" not in think, \
+            "budget_tokens not supported on adaptive models"
+        assert think.get("display") == "summarized", \
+            "display must be 'summarized' or thinking blocks are empty strings"
 
-    def test_adaptive_model_honors_budget(self):
-        """Budget parameter must be respected."""
+    def test_adaptive_model_no_budget_tokens(self):
+        """Adaptive models must NOT have budget_tokens (causes 400 error)."""
         kw = _NS["_get_thinking_kwargs"]("claude-sonnet-5", 4000)
         think = kw.get("thinking", {})
-        assert think.get("budget_tokens") == 4000
+        assert "budget_tokens" not in think, \
+            "budget_tokens on adaptive models causes API 400 error"
 
     def test_manual_thinking_model(self):
         """Manual thinking models (e.g. claude-4.6) should also get 'enabled'."""

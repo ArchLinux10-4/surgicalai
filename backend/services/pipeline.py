@@ -483,10 +483,11 @@ def _get_thinking_kwargs(model: str, budget: int) -> dict:
     - All other models: {} (no thinking params, safe to ** spread)
     """
     if _uses_adaptive_thinking(model):
-        # Cap thinking to prevent starvation — adaptive has NO budget ceiling
-        # and the model can spend all tokens thinking → zero text output.
-        # Use "enabled" with explicit budget_tokens instead.
-        return {"thinking": {"type": "enabled", "budget_tokens": budget}}
+        # Adaptive models REJECT type:"enabled" / budget_tokens with a 400.
+        # Must use type:"adaptive" — budget caps aren't possible.
+        # Starvation protection comes from _safe_claude_call's retry layer.
+        # display must be "summarized" or thinking blocks are empty strings.
+        return {"thinking": {"type": "adaptive", "display": "summarized"}}
     if _supports_thinking(model):
         return {"thinking": {"type": "enabled", "budget_tokens": budget}}
     return {}
@@ -511,9 +512,10 @@ def _get_effort_kwargs(model: str) -> dict:
 # budget cap.  With small max_tokens + complex input the model can spend
 # ALL tokens thinking → zero text output ("thinking starvation").
 #
-# Solution: bounded calls use {"type": "enabled", "budget_tokens": N}
-# instead of {"type": "adaptive"}.  budget_tokens is a hard cap on
-# thinking within max_tokens, mathematically guaranteeing text headroom.
+# Solution: Manual-thinking models use {"type": "enabled", "budget_tokens": N}
+# which hard-caps thinking within max_tokens.  Adaptive models REJECT
+# type:"enabled" so they use {"type": "adaptive"} — starvation protection
+# comes from _safe_claude_call's detection + retry layer instead.
 #
 # Three layers of protection:
 #   1. _bounded_thinking_params() — correct params, budget < max_tokens
@@ -523,17 +525,18 @@ def _get_effort_kwargs(model: str) -> dict:
 
 def _bounded_thinking_params(model: str, desired_text_tokens: int,
                               thinking_budget: int | None = None) -> dict:
-    """Build Claude params with GUARANTEED text headroom.
+    """Build Claude params with text headroom protection.
 
-    Uses ``{"type": "enabled", "budget_tokens": N}`` (not adaptive) so the
-    model **cannot** consume all max_tokens on thinking.
+    Manual-thinking models: ``{"type": "enabled", "budget_tokens": N}``
+    hard-caps thinking so the model cannot consume all max_tokens.
 
-    Formula:
+    Adaptive models: ``{"type": "adaptive"}`` — these REJECT type:"enabled"
+    with a 400 error.  Starvation protection shifts to _safe_claude_call's
+    detection + retry layer.
+
+    Formula (manual models):
         max_tokens = min(desired_text + budget, model_limit)
         budget     = min(budget, max_tokens // 2)   # never >50 % thinking
-
-    For streaming calls with 128 K+ budget where the user watches output,
-    adaptive thinking is acceptable — use ``_get_thinking_kwargs`` there.
     """
     if not (_uses_adaptive_thinking(model) or _supports_thinking(model)):
         return {"max_tokens": desired_text_tokens}
@@ -541,19 +544,29 @@ def _bounded_thinking_params(model: str, desired_text_tokens: int,
     budget = thinking_budget if thinking_budget is not None else min(desired_text_tokens, 16_000)
     model_limit = _max_output_tokens(model)
     max_tok = min(desired_text_tokens + budget, model_limit)
+
+    if _uses_adaptive_thinking(model):
+        # Adaptive models REJECT type:"enabled" / budget_tokens with a 400.
+        # Can't hard-cap thinking — starvation protection comes from
+        # _safe_claude_call's detection + retry layer.
+        result: dict = {
+            "max_tokens": max_tok,
+            "thinking": {"type": "adaptive", "display": "summarized"},
+        }
+        effort = _get_effort_kwargs(model)
+        if effort:
+            result.update(effort)
+        return result
+
+    # Manual thinking models (3.7, older 4.x) — budget_tokens IS supported
     # Hard rule: thinking never takes more than half of max_tokens
     budget = min(budget, max_tok // 2)
     budget = max(budget, 1024)  # floor — always allow some thinking
 
-    result: dict = {
+    return {
         "max_tokens": max_tok,
         "thinking": {"type": "enabled", "budget_tokens": budget},
     }
-    if _uses_adaptive_thinking(model):
-        effort = _get_effort_kwargs(model)
-        if effort:
-            result.update(effort)
-    return result
 
 
 def _is_starved(response) -> bool:
