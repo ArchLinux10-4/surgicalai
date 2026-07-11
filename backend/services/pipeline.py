@@ -3871,6 +3871,259 @@ def _find_changed_windows(original_code: str, edited_code: str, context_lines: i
 
 
 # ---------------------------------------------------------------------------
+# Helper: _extract_qa_reference_lines  (find QA-referenced code locations)
+# ---------------------------------------------------------------------------
+
+def _extract_qa_reference_lines(
+    qa_dict: dict,
+    code: str,
+    context_lines: int = 20,
+) -> list:
+    """Extract line ranges referenced in QA feedback but not in diff windows.
+
+    QA often identifies issues at locations where code SHOULD HAVE changed but
+    DIDN'T (e.g., timed-out plan items left dead code).  Those locations won't
+    appear in any diff-based window, so the correction model literally can't
+    see the code it needs to fix.
+
+    Proven failure (session 82eb1056, line 542): QA said "update textWrapStyle
+    at line ~1830" but the correction window showed lines 1127-1167.  The
+    correction model emitted a <search_request> because it couldn't see line
+    1830.
+
+    Returns a list of (window_start_0, window_end_0) tuples (0-indexed,
+    inclusive) — ready to be turned into correction windows.
+    """
+    # Collect all text from QA feedback
+    texts = []
+    for key in ("summary", "plan_deviation"):
+        v = qa_dict.get(key)
+        if v:
+            texts.append(str(v))
+    for key in ("import_issues", "type_errors", "logic_errors",
+                "downstream_risks", "issues", "risk_verdicts"):
+        for item in (qa_dict.get(key) or []):
+            if isinstance(item, dict):
+                # Flatten dict values
+                texts.append(" ".join(str(v) for v in item.values() if v))
+            else:
+                texts.append(str(item))
+
+    if not texts:
+        return []
+
+    all_text = " ".join(texts)
+    code_lines = code.splitlines()
+    total = len(code_lines)
+    if total == 0:
+        return []
+
+    raw_ranges = []  # (start_0, end_0)
+
+    # ── 1. Extract explicit line-number references ────────────────────────
+    # Match: "line 1830", "line ~1830", "lines 1827-1920", "L1830"
+    for m in re.finditer(r'lines?\s*~?\s*(\d+)(?:\s*[-\u2013]\s*(\d+))?', all_text, re.IGNORECASE):
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else start
+        if 1 <= start <= total:
+            s0 = max(0, start - 1 - context_lines)
+            e0 = min(total - 1, end - 1 + context_lines)
+            raw_ranges.append((s0, e0))
+    for m in re.finditer(r'L(\d+)(?:\s*[-\u2013]\s*L?(\d+))?', all_text):
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else start
+        if 1 <= start <= total:
+            s0 = max(0, start - 1 - context_lines)
+            e0 = min(total - 1, end - 1 + context_lines)
+            raw_ranges.append((s0, e0))
+
+    # ── 2. Extract identifier references (camelCase/snake_case ≥ 5 chars) ─
+    # Find identifiers in QA text that actually appear in the code
+    identifiers = set(re.findall(r'[a-zA-Z_]\w{4,}', all_text))
+    # Filter to common English words / QA boilerplate
+    _stopwords = {
+        "should", "would", "could", "about", "after", "before", "between",
+        "being", "below", "above", "check", "error", "found", "function",
+        "their", "there", "these", "those", "through", "under", "which",
+        "while", "within", "without", "never", "still", "correctly",
+        "original", "missing", "existing", "appears", "import", "symbol",
+        "update", "updated", "needs", "lines", "score", "logic", "issue",
+        "issues", "added", "change", "changes", "value", "values", "style",
+        "return", "returns", "undefined", "unused", "defined", "request",
+        "component", "rendering", "properly", "implements",
+    }
+    identifiers -= _stopwords
+
+    ident_line_indices = set()
+    for i, line in enumerate(code_lines):
+        for ident in identifiers:
+            if ident in line:
+                ident_line_indices.add(i)
+
+    # Cluster nearby identifier lines
+    if ident_line_indices:
+        sorted_lines = sorted(ident_line_indices)
+        clusters = [[sorted_lines[0]]]
+        for ln in sorted_lines[1:]:
+            if ln - clusters[-1][-1] <= context_lines * 2:
+                clusters[-1].append(ln)
+            else:
+                clusters.append([ln])
+        for cluster in clusters:
+            s0 = max(0, min(cluster) - context_lines)
+            e0 = min(total - 1, max(cluster) + context_lines)
+            raw_ranges.append((s0, e0))
+
+    if not raw_ranges:
+        return []
+
+    # ── 3. Merge overlapping ranges ───────────────────────────────────────
+    raw_ranges.sort()
+    merged = [list(raw_ranges[0])]
+    for s, e in raw_ranges[1:]:
+        if s <= merged[-1][1] + context_lines:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+
+    _dlog("extract_qa_reference_lines",
+          qa_summary=(qa_dict.get("summary") or "")[:200],
+          total_code_lines=total,
+          identifiers_found=len(identifiers),
+          ident_code_matches=len(ident_line_indices),
+          raw_ranges_count=len(raw_ranges),
+          merged_count=len(merged),
+          merged_ranges=[(s + 1, e + 1) for s, e in merged])
+
+    return [(s, e) for s, e in merged]
+
+
+def _augment_windows_with_qa_refs(
+    diff_windows: list,
+    qa_dict: dict,
+    original_code: str,
+    edited_code: str,
+    context_lines: int = 20,
+) -> list:
+    """Add QA-referenced windows to diff-based windows.
+
+    For each QA-referenced line range NOT already covered by a diff window,
+    create a new correction window so the model can see and edit that code.
+
+    Returns the augmented window list (may be unchanged if all refs are covered).
+    """
+    qa_ranges = _extract_qa_reference_lines(qa_dict, edited_code, context_lines)
+    if not qa_ranges:
+        return diff_windows
+
+    # Determine which QA ranges are NOT covered by existing diff windows
+    def _is_covered(s0, e0):
+        for w in diff_windows:
+            if w["window_start"] <= s0 and w["window_end"] >= e0:
+                return True
+        return False
+
+    new_ranges = [(s, e) for s, e in qa_ranges if not _is_covered(s, e)]
+    if not new_ranges:
+        _dlog("augment_windows_all_covered",
+              qa_range_count=len(qa_ranges),
+              diff_window_count=len(diff_windows))
+        return diff_windows
+
+    # Build window dicts for uncovered QA ranges
+    edit_lines = edited_code.splitlines()
+    orig_lines = original_code.splitlines()
+    extra_windows = []
+    for ws, we in new_ranges:
+        we = min(we, len(edit_lines) - 1)
+        if ws > we:
+            continue
+        window_lines = edit_lines[ws:we + 1]
+        numbered_broken = "\n".join(
+            f"{ws + i + 1:4d} | {line}" for i, line in enumerate(window_lines)
+        )
+        ows = min(ws, len(orig_lines) - 1)
+        owe = min(we, len(orig_lines) - 1)
+        if ows <= owe and owe < len(orig_lines):
+            orig_window = orig_lines[ows:owe + 1]
+            numbered_original = "\n".join(
+                f"{ows + i + 1:4d} | {line}" for i, line in enumerate(orig_window)
+            )
+        else:
+            numbered_original = "(no corresponding original lines)"
+        extra_windows.append({
+            "window_start": ws,
+            "window_end": we,
+            "numbered_broken": numbered_broken,
+            "numbered_original": numbered_original,
+            "window_line_count": we - ws + 1,
+            "total_edit_lines": len(edit_lines),
+            "total_orig_lines": len(orig_lines),
+            "changed_line_count": 0,
+            "cluster_index": -1,  # re-indexed below
+            "total_clusters": -1,
+            "_source": "qa_reference",
+        })
+
+    if not extra_windows:
+        return diff_windows
+
+    # Merge all windows, sort by start, re-index
+    all_windows = list(diff_windows) + extra_windows
+    all_windows.sort(key=lambda w: w["window_start"])
+
+    # Merge overlapping windows
+    merged = [all_windows[0]]
+    for w in all_windows[1:]:
+        prev = merged[-1]
+        if w["window_start"] <= prev["window_end"] + context_lines:
+            # Merge: expand previous window
+            if w["window_end"] > prev["window_end"]:
+                new_we = w["window_end"]
+                prev["window_end"] = new_we
+                prev["window_line_count"] = new_we - prev["window_start"] + 1
+                # Rebuild numbered text for merged window
+                ws_m, we_m = prev["window_start"], new_we
+                prev["numbered_broken"] = "\n".join(
+                    f"{ws_m + i + 1:4d} | {edit_lines[ws_m + i]}"
+                    for i in range(we_m - ws_m + 1)
+                    if ws_m + i < len(edit_lines)
+                )
+                ows_m = min(ws_m, len(orig_lines) - 1)
+                owe_m = min(we_m, len(orig_lines) - 1)
+                if ows_m <= owe_m:
+                    prev["numbered_original"] = "\n".join(
+                        f"{ows_m + i + 1:4d} | {orig_lines[ows_m + i]}"
+                        for i in range(owe_m - ows_m + 1)
+                        if ows_m + i < len(orig_lines)
+                    )
+                prev["changed_line_count"] += w.get("changed_line_count", 0)
+        else:
+            merged.append(w)
+
+    # Re-index clusters
+    for ci, w in enumerate(merged):
+        w["cluster_index"] = ci
+        w["total_clusters"] = len(merged)
+
+    _dlog("augment_windows_with_qa_refs",
+          diff_window_count=len(diff_windows),
+          qa_range_count=len(qa_ranges),
+          uncovered_count=len(new_ranges),
+          extra_windows_built=len(extra_windows),
+          final_window_count=len(merged),
+          final_summary=[{
+              "ci": w["cluster_index"],
+              "ws": w["window_start"] + 1,
+              "we": w["window_end"] + 1,
+              "lines": w["window_line_count"],
+              "source": w.get("_source", "diff"),
+          } for w in merged])
+
+    return merged
+
+
+# ---------------------------------------------------------------------------
 # Helper: _apply_line_targeted_fixes  (line-number correction splice)
 # ---------------------------------------------------------------------------
 
@@ -14196,13 +14449,64 @@ async def run_natural_pipeline_stream(
         # ── Plan→Execute: focused per-symbol edit calls ──────────────────
         if edit_plan_data:
             _plan_exec_t0 = time.time()
+
+            # ── Group coupled same-symbol plan items (Fix 1) ──────────────
+            # When multiple plan items target the SAME (filename, symbol),
+            # they are coupled — e.g., item 0 adds a style token, item 3
+            # wires it into rendering.  Executing them individually causes
+            # the complex items to timeout (120s) and the simple items to
+            # succeed → dead code → QA collapse.
+            # Evidence (session 82eb1056): 4 plan items all targeted
+            # PasteBatchJobsModal.  Items 0-1 (add token, update metadata)
+            # finished in 3-12s.  Items 2-3 (wire into rendering) timed out
+            # at 120s each → scrollableCellTextStyle defined but never used
+            # → QA score dropped from 8 to 1.
+            # Fix: merge same-symbol items into ONE instruction so the
+            # surgeon makes all changes in a single pass.
+            from collections import OrderedDict as _OD_plan
+            _grouped_plan: _OD_plan = _OD_plan()
+            for _pi in edit_plan_data:
+                _gkey = (_pi.get("filename", ""), _pi.get("symbol", ""))
+                if _gkey not in _grouped_plan:
+                    _grouped_plan[_gkey] = []
+                _grouped_plan[_gkey].append(_pi)
+
+            _effective_plan = []
+            for _gkey, _gitems in _grouped_plan.items():
+                if len(_gitems) == 1:
+                    _effective_plan.append(_gitems[0])
+                else:
+                    # Merge descriptions into a single consolidated instruction
+                    _merged_desc = " AND ALSO ".join(
+                        f"({i+1}) {item.get('description', '')}"
+                        for i, item in enumerate(_gitems)
+                    )
+                    _effective_plan.append({
+                        "filename": _gkey[0],
+                        "symbol": _gkey[1],
+                        "description": _merged_desc,
+                    })
+                    _dlog("plan_items_grouped",
+                          session_id=session_id, user_id=user_id,
+                          filename=_gkey[0], symbol=_gkey[1],
+                          original_count=len(_gitems),
+                          merged_description=_merged_desc[:500],
+                          individual_descriptions=[
+                              it.get("description", "")[:200] for it in _gitems
+                          ])
+
             _dlog("plan_exec_phase_start",
                   session_id=session_id, user_id=user_id,
                   plan_count=len(edit_plan_data),
+                  effective_count=len(_effective_plan),
+                  grouped_symbols=[
+                      {"key": k, "count": len(v)}
+                      for k, v in _grouped_plan.items() if len(v) > 1
+                  ],
                   pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
             yield sse({"type": "progress",
-                       "content": f"Executing {len(edit_plan_data)} planned edit(s) individually..."})
-            for plan_idx, plan_item in enumerate(edit_plan_data):
+                       "content": f"Executing {len(_effective_plan)} planned edit(s)..."})
+            for plan_idx, plan_item in enumerate(_effective_plan):
                 p_filename = plan_item.get("filename", "")
                 p_symbol = plan_item.get("symbol", "")
                 p_description = plan_item.get("description", "")
@@ -15011,7 +15315,8 @@ async def run_natural_pipeline_stream(
                             _rebased_this_round.add(_akey)
 
                         _overlap_reason = None
-                        for (_ps, _pe) in _ln_applied_ranges.get(_akey, []):
+                        _applied_ranges = _ln_applied_ranges.get(_akey, [])
+                        for (_ps, _pe) in _applied_ranges:
                             if _isl <= _pe and _iel >= _ps:
                                 _overlap_reason = (
                                     f"lines {_isl}\u2013{_iel} overlap with already-applied "
@@ -15020,6 +15325,38 @@ async def run_natural_pipeline_stream(
                                     "target overlapping source regions."
                                 )
                                 break
+
+                        # ── Fix 3: Supersede check ─────────────────────────
+                        # When the new edit's range COMPLETELY CONTAINS all
+                        # previously applied ranges, it's a broader replacement
+                        # (e.g., lines 52-1955 supersedes a prior 1827-1920).
+                        # This is NOT a conflict — the surgeon produced a full-
+                        # symbol replacement that incorporates earlier changes.
+                        # Allow it by applying against the ACCUMULATED state and
+                        # clearing the prior ranges.
+                        # Evidence (session 82eb1056, turn 7): all 4 items
+                        # succeeded but resolution rejected lines 52-1955
+                        # as overlapping with 1827-1920 → correction introduced
+                        # duplicate ); })} closings → syntax error → QA score 1.
+                        if _overlap_reason and _applied_ranges:
+                            _all_contained = all(
+                                _isl <= _ps and _iel >= _pe
+                                for (_ps, _pe) in _applied_ranges
+                            )
+                            if _all_contained:
+                                _dlog("line_range_overlap_supersede",
+                                      session_id=session_id,
+                                      filename=filename, symbol=symbol_name,
+                                      new_range=(_isl, _iel),
+                                      superseded_ranges=list(_applied_ranges),
+                                      resolve_round=resolve_round,
+                                      user_id=user_id)
+                                # Clear prior ranges — superseded by the new edit.
+                                # The accumulated state already has prior edits
+                                # applied; the new broader edit builds on top.
+                                _ln_applied_ranges[_akey] = []
+                                _overlap_reason = None  # allow this edit
+
                         if _overlap_reason:
                             # Do NOT dead-end the edit (old behavior silently
                             # dropped it into skipped_changes_struct). Route it
@@ -16185,6 +16522,20 @@ async def run_natural_pipeline_stream(
                     #   3. Model returns corrected window (standard format)
                     #   4. Server splices window back (deterministic, no matching)
                     _all_windows = _find_changed_windows(symbol.code, cs["new_code"])
+
+                    # ── Fix 2: Augment with QA-referenced locations ───────
+                    # When QA identifies issues at locations NOT covered by
+                    # any diff window (e.g., timed-out plan items left dead
+                    # code at line 1830 but the diff only shows line ~165),
+                    # add windows there so the correction model can see AND
+                    # edit the code it needs to fix.
+                    # Evidence (session 82eb1056, line 542): correction
+                    # emitted <search_request> because the target code at
+                    # line ~1830 was outside all diff windows.
+                    _all_windows = _augment_windows_with_qa_refs(
+                        _all_windows, qa_d, symbol.code, cs["new_code"]
+                    )
+
                     if len(_all_windows) == 1:
                         _window_info = _all_windows[0]
                         _correction_window_info[idx] = _window_info
