@@ -976,6 +976,13 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
             _dlog("chat_create_max_tokens_dropped",
                   model=model, dropped=_popped,
                   kept_max_completion_tokens=kwargs["max_completion_tokens"])
+    # Reasoning models (GPT-5.x, o-series) do not support the `stop` parameter.
+    # Strip it centrally so no call site can accidentally trigger the 400 error.
+    if base_model in NO_TEMPERATURE_MODELS and "stop" in kwargs:
+        _popped_stop = kwargs.pop("stop")
+        _dlog("chat_create_stop_stripped",
+              model=model, base_model=base_model,
+              stripped_stop=_popped_stop)
     if base_model in NO_TEMPERATURE_MODELS:
         # ── GPT-5.x / o-series reasoning branch (Claude models never enter here) ──
         # Phase 1 hardening (flag: gpt5_hardening, default ON): 32k budget,
