@@ -29,6 +29,7 @@ import datetime as _dt
 import os as _os
 import uuid as _uuid_dlog
 import random as _rnd_dlog
+import hashlib as _hashlib
 
 _DLOG_PATH = "/tmp/surgical_debug.jsonl"
 _DLOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB cap — rotate by truncating oldest half
@@ -79,6 +80,158 @@ def _dlog(event: str, **kwargs):
 
 from database import get_setting, get_user_api_key
 from crypto_utils import decrypt_api_key
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE MANIFEST — tracks which files Claude has already seen per session.
+# DB-backed so it survives across chat turns.  Each file is hashed so we can
+# detect new files, unchanged files, and modified files.  The classification
+# is injected into the file context so Claude knows "this screenshot is new,
+# but that code file was already discussed 3 turns ago."
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _file_content_hash(content: str) -> str:
+    """Fast, stable hash of file content for change detection."""
+    return _hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _ensure_file_manifest_table():
+    """Create session_file_manifest table if it doesn't exist. Idempotent."""
+    try:
+        from database import get_db_connection
+        conn = get_db_connection()
+        try:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS session_file_manifest (
+                    session_id    TEXT NOT NULL,
+                    filename      TEXT NOT NULL,
+                    content_hash  TEXT NOT NULL,
+                    first_seen_turn INTEGER NOT NULL DEFAULT 0,
+                    last_seen_turn  INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (session_id, filename)
+                )
+            """)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        pass  # Table creation failure is non-fatal — falls back to "all files unknown"
+
+
+# File status constants used in context annotations
+_FILE_NEW      = "new"       # First time this file appears in this session
+_FILE_MODIFIED = "modified"  # File existed before but content changed
+_FILE_UNCHANGED = "unchanged" # File existed before with same content
+
+
+def _classify_session_files(session_id: str, session_files: list,
+                            conversation_history: list) -> dict:
+    """
+    Compare current session_files against the DB manifest.
+
+    Returns {filename: {"status": "new"|"modified"|"unchanged",
+                        "first_seen_turn": int, "detail": str}}
+
+    Updates the manifest in-place so the next turn sees current state.
+    """
+    if not session_id:
+        # No session tracking possible — treat everything as unknown
+        return {}
+
+    current_turn = max(len(conversation_history) // 2, 0)  # ~1 turn per user+assistant pair
+
+    _ensure_file_manifest_table()
+
+    # ── Load existing manifest from DB ──
+    existing = {}  # {filename: (content_hash, first_seen_turn, last_seen_turn)}
+    try:
+        from database import get_db_connection
+        conn = get_db_connection()
+        try:
+            rows = conn.execute(
+                "SELECT filename, content_hash, first_seen_turn, last_seen_turn "
+                "FROM session_file_manifest WHERE session_id = ?",
+                (session_id,)
+            ).fetchall()
+            for row in rows:
+                existing[row[0]] = (row[1], row[2], row[3])
+        finally:
+            conn.close()
+    except Exception as e:
+        _dlog("file_manifest_read_error", session_id=session_id, error=str(e))
+        return {}
+
+    # ── Classify each file ──
+    result = {}
+    upserts = []  # (session_id, filename, content_hash, first_seen_turn, last_seen_turn)
+
+    for sf in session_files:
+        fname = sf["filename"]
+        content = sf.get("content", "")
+        c_hash = _file_content_hash(content)
+
+        if fname in existing:
+            old_hash, first_turn, _ = existing[fname]
+            if c_hash == old_hash:
+                status = _FILE_UNCHANGED
+                detail = f"present since turn {first_turn}, no changes"
+            else:
+                status = _FILE_MODIFIED
+                detail = f"first seen turn {first_turn}, content changed this turn"
+            upserts.append((session_id, fname, c_hash, first_turn, current_turn))
+            result[fname] = {"status": status, "first_seen_turn": first_turn, "detail": detail}
+        else:
+            status = _FILE_NEW
+            detail = "added this turn"
+            upserts.append((session_id, fname, c_hash, current_turn, current_turn))
+            result[fname] = {"status": status, "first_seen_turn": current_turn, "detail": detail}
+
+    # ── Persist updated manifest ──
+    try:
+        from database import get_db_connection
+        conn = get_db_connection()
+        try:
+            for row in upserts:
+                # Upsert: INSERT OR REPLACE for SQLite, ON CONFLICT for Postgres
+                try:
+                    conn.execute(
+                        """INSERT INTO session_file_manifest
+                           (session_id, filename, content_hash, first_seen_turn, last_seen_turn)
+                           VALUES (?, ?, ?, ?, ?)
+                           ON CONFLICT (session_id, filename)
+                           DO UPDATE SET content_hash = ?, last_seen_turn = ?""",
+                        (row[0], row[1], row[2], row[3], row[4], row[2], row[4])
+                    )
+                except Exception:
+                    # Fallback: try INSERT OR REPLACE (SQLite)
+                    conn.execute(
+                        """INSERT OR REPLACE INTO session_file_manifest
+                           (session_id, filename, content_hash, first_seen_turn, last_seen_turn)
+                           VALUES (?, ?, ?, ?, ?)""",
+                        row
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        _dlog("file_manifest_write_error", session_id=session_id, error=str(e))
+
+    _dlog("file_manifest_classified",
+          session_id=session_id,
+          current_turn=current_turn,
+          classifications={fn: cl["status"] for fn, cl in result.items()})
+
+    return result
+
+
+def _file_status_badge(status: str) -> str:
+    """Human-readable badge for file status in context."""
+    if status == _FILE_NEW:
+        return "🆕 NEW"
+    elif status == _FILE_MODIFIED:
+        return "✏️ MODIFIED since last turn"
+    elif status == _FILE_UNCHANGED:
+        return "📎 UNCHANGED from previous turn"
+    return ""
 from models.schemas import (
     SurgicalOperation,
     ArchitectPlan, ChangeTarget, ChangeType, SurgicalChange,
@@ -810,6 +963,19 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
     Retries automatically on transient API errors (429, 500, 503, overloaded)."""
     from services.api_retry import api_call_with_retry
     base_model = model.split(":")[0].lower()
+    # OpenAI deprecated max_tokens; newer models (GPT-4.1+, o-series, GPT-5.x)
+    # require max_completion_tokens instead.  _chat_create is ONLY used with the
+    # OpenAI SDK, so this conversion is always safe.
+    if "max_tokens" in kwargs:
+        if "max_completion_tokens" not in kwargs:
+            kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+            _dlog("chat_create_max_tokens_renamed",
+                  model=model, max_completion_tokens=kwargs["max_completion_tokens"])
+        else:
+            _popped = kwargs.pop("max_tokens")
+            _dlog("chat_create_max_tokens_dropped",
+                  model=model, dropped=_popped,
+                  kept_max_completion_tokens=kwargs["max_completion_tokens"])
     if base_model in NO_TEMPERATURE_MODELS:
         # ── GPT-5.x / o-series reasoning branch (Claude models never enter here) ──
         # Phase 1 hardening (flag: gpt5_hardening, default ON): 32k budget,
@@ -7683,6 +7849,11 @@ Be warm, friendly, and encouraging. You're helping a person build something real
         # Parse all session files
         yield sse({"type": "progress", "content": f"Reading {len(session_files)} file(s)..."})
 
+        # ── Classify files: new vs unchanged vs modified ─────────────────
+        _smart_file_statuses = _classify_session_files(
+            session_id or "", session_files, conversation_history,
+        )
+
         file_summaries = []
         symbol_maps_by_name = {}
 
@@ -7693,10 +7864,15 @@ Be warm, friendly, and encouraging. You're helping a person build something real
             content = sf["content"]
             file_type = sf.get("file_type", "code")
 
+            # File status badge
+            _sfs = _smart_file_statuses.get(fname, {})
+            _sbadge = _file_status_badge(_sfs.get("status", "")) if _sfs else ""
+            _sbadge_suffix = f"  {_sbadge}" if _sbadge else ""
+
             if file_type == "image":
                 # Don't add to text summaries — will be passed as vision content block
                 image_files.append(sf)
-                file_summaries.append(f"FILE: {fname} [IMAGE — passed as visual context to GPT vision]")
+                file_summaries.append(f"FILE: {fname} [IMAGE — passed as visual context]{_sbadge_suffix}")
                 symbol_maps_by_name[fname] = (None, sf)
                 continue
 
@@ -7706,7 +7882,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 _data_limit = 60_000 if file_type in ("csv", "excel") else 8_000
                 preview = content[:_data_limit] + (f"\n... [{len(content) - _data_limit} more chars not shown]" if len(content) > _data_limit else "")
                 file_summaries.append(
-                    f"FILE: {fname} [{file_type.upper()}]\nCONTENT:\n{preview}"
+                    f"FILE: {fname} [{file_type.upper()}]{_sbadge_suffix}\nCONTENT:\n{preview}"
                 )
                 symbol_maps_by_name[fname] = (None, sf)
                 continue
@@ -7757,7 +7933,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 )
                 _file_summary = (
                     f"FILE: {fname} ({sf.get('lines', len(content.splitlines()))} lines, "
-                    f"{sf.get('language', 'code')})\n"
+                    f"{sf.get('language', 'code')}){_sbadge_suffix}\n"
                     f"{_sym_header}\n"
                     + ("\n".join(syms) if syms else "  (no symbols parsed)")
                     + _index_note
@@ -7895,6 +8071,15 @@ USER REQUEST:
                             _iv_mt = _iv_mime
                             _iv_b64 = _iv_data
                         if _iv_mt in _CLAUDE_VIS:
+                            # Annotate image with new/unchanged/modified status
+                            _iv_fname = _iv_sf.get("filename", "unknown")
+                            _iv_fs = _smart_file_statuses.get(_iv_fname, {})
+                            _iv_badge = _file_status_badge(_iv_fs.get("status", "")) if _iv_fs else ""
+                            if _iv_badge:
+                                _tu_user_content.append({
+                                    "type": "text",
+                                    "text": f"[Image: {_iv_fname} — {_iv_badge}]",
+                                })
                             _tu_user_content.append({
                                 "type": "image",
                                 "source": {"type": "base64", "media_type": _iv_mt, "data": _iv_b64}
@@ -8604,6 +8789,14 @@ USER REQUEST:
                                     f"[pipeline:smart] Unsupported media type {media_type!r} for {_fname!r} — skipping vision block"
                                 )
                                 continue
+                            # Annotate image with new/unchanged/modified status
+                            _rv_fs = _smart_file_statuses.get(_fname, {})
+                            _rv_badge = _file_status_badge(_rv_fs.get("status", "")) if _rv_fs else ""
+                            if _rv_badge:
+                                user_content.append({
+                                    "type": "text",
+                                    "text": f"[Image: {_fname} — {_rv_badge}]",
+                                })
                             user_content.append({
                                 "type": "image",
                                 "source": {"type": "base64", "media_type": media_type,
@@ -9198,12 +9391,21 @@ USER REQUEST:
                     user_content = [{"type": "text", "text": _oai_context_msg}]
                     for img_sf in image_files:
                         img_data = img_sf["content"]
+                        _oai_fname = img_sf.get("filename", "unknown")
                         if not img_data.startswith("data:"):
                             ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
                             mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
                                         "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}
                             mime = mime_map.get(ext, "image/png")
                             img_data = f"data:{mime};base64,{img_data}"
+                        # Annotate image with new/unchanged/modified status
+                        _oai_ifs = _smart_file_statuses.get(_oai_fname, {})
+                        _oai_ibadge = _file_status_badge(_oai_ifs.get("status", "")) if _oai_ifs else ""
+                        if _oai_ibadge:
+                            user_content.append({
+                                "type": "text",
+                                "text": f"[Image: {_oai_fname} — {_oai_ibadge}]",
+                            })
                         user_content.append({
                             "type": "image_url",
                             "image_url": {"url": img_data}
@@ -11499,6 +11701,7 @@ def _build_natural_file_context(
     full_context_limit: int = 8,
     session_id: str = "",
     user_id: str = "",
+    file_statuses: dict = None,
 ) -> str:
     """
     Build the file context string for the natural pipeline.
@@ -11589,9 +11792,14 @@ def _build_natural_file_context(
         file_type  = sf.get("file_type", "code")
         lines_count = sf.get("lines", len(content.splitlines()))
 
+        # File status badge (new / modified / unchanged)
+        _fs = file_statuses.get(fname, {}) if file_statuses else {}
+        _badge = _file_status_badge(_fs.get("status", "")) if _fs else ""
+        _badge_suffix = f"  {_badge}" if _badge else ""
+
         if file_type == "image":
             return (
-                f"FILE: {fname} [IMAGE — attached as vision block below, you can see it directly]\n"
+                f"FILE: {fname} [IMAGE — attached as vision block below]{_badge_suffix}\n"
             )
 
         if file_type in ("pdf", "csv", "excel", "text"):
@@ -11601,7 +11809,7 @@ def _build_natural_file_context(
             _data_limit = 60_000 if file_type in ("csv", "excel") else 8_000
             preview = content[:_data_limit] + (f"\n...[{len(content)-_data_limit} more chars not shown]" if len(content) > _data_limit else "")
             return (
-                f"FILE: {fname} [{file_type.upper()} — FULLY LOADED]\n"
+                f"FILE: {fname} [{file_type.upper()} — FULLY LOADED]{_badge_suffix}\n"
                 f"⚠️ This data is already fully loaded below. Do NOT use <file_request> for this file — analyze it directly.\n"
                 f"CONTENT:\n{preview}\n"
             )
@@ -11619,7 +11827,7 @@ def _build_natural_file_context(
                 )
             sym_index = "\n".join(sym_lines)
             header = (
-                f"FILE: {fname} ({lines_count} lines)\n"
+                f"FILE: {fname} ({lines_count} lines){_badge_suffix}\n"
                 f"SYMBOL INDEX (use these EXACT names in surgical_edit):\n{sym_index}\n"
             )
             if lines_count <= LARGE_FILE_WINDOW:
@@ -11656,15 +11864,20 @@ def _build_natural_file_context(
             return header
         else:
             preview = content[:1500] + (f"\n...[{len(content)-1500} chars]" if len(content) > 1500 else "")
-            return f"FILE: {fname} ({lines_count} lines)\nCONTENT:\n```\n{preview}\n```\n"
+            return f"FILE: {fname} ({lines_count} lines){_badge_suffix}\nCONTENT:\n```\n{preview}\n```\n"
 
     def _render_lean(sf: dict) -> str:
         fname       = sf["filename"]
         file_type   = sf.get("file_type", "code")
         lines_count = sf.get("lines", sf.get("content", "") and len(sf["content"].splitlines()) or 0)
 
+        # File status badge
+        _fs = file_statuses.get(fname, {}) if file_statuses else {}
+        _badge = _file_status_badge(_fs.get("status", "")) if _fs else ""
+        _badge_suffix = f"  {_badge}" if _badge else ""
+
         if file_type in ("image", "pdf", "csv", "excel", "text"):
-            return f"  {fname} [{file_type.upper()}, {lines_count}L] — use <file_request> to view"
+            return f"  {fname} [{file_type.upper()}, {lines_count}L]{_badge_suffix} — use <file_request> to view"
 
         smap, _ = symbol_maps_by_name.get(fname, (None, sf))
         symbols  = getattr(smap, "symbols", []) if smap else []
@@ -11675,9 +11888,9 @@ def _build_natural_file_context(
                 for s in symbols[:20]
             )
             suffix = f" +{len(symbols)-20} more" if len(symbols) > 20 else ""
-            return f"  {fname} ({lines_count}L, {len(symbols)} symbols) — {sym_names}{suffix}"
+            return f"  {fname} ({lines_count}L, {len(symbols)} symbols){_badge_suffix} — {sym_names}{suffix}"
         else:
-            return f"  {fname} ({lines_count}L)"
+            return f"  {fname} ({lines_count}L){_badge_suffix}"
 
     for sf in tier1:
         parts.append(_render_full(sf))
@@ -12326,6 +12539,21 @@ async def run_natural_pipeline_stream(
 
     _pipeline_t0 = time.time()
 
+    # ── Pipeline deadline — Railway kills SSE at 15 min (900s). ────────────
+    # We use 810s (13.5 min) to leave a 90s safety margin for final result
+    # assembly + SSE flush.  When the deadline fires, every post-execution
+    # phase (QA retries, corrections, re-QA) is skipped and the pipeline
+    # ships whatever it has.  Losing polish is always better than losing
+    # everything.
+    # Evidence: session 37d20c8b — 6 changes executed + QA passed, but
+    # multi-window correction window 4/5 was still running at 899.9s when
+    # Railway severed the connection.  All work was lost.
+    PIPELINE_DEADLINE_S = 810
+
+    def _pipeline_over_budget() -> bool:
+        """True when elapsed pipeline time exceeds the Railway safety margin."""
+        return (time.time() - _pipeline_t0) >= PIPELINE_DEADLINE_S
+
     EDIT_OPEN = "<surgical_edit>"
     EDIT_CLOSE = "</surgical_edit>"
     FILE_OPEN = "<new_file>"
@@ -12383,11 +12611,17 @@ async def run_natural_pipeline_stream(
             except Exception:
                 symbol_maps_by_name[fname] = (None, sf)
 
+        # ── Classify files: new vs unchanged vs modified ─────────────────
+        _file_statuses = _classify_session_files(
+            session_id or "", session_files, conversation_history,
+        )
+
         # ── Build file context ────────────────────────────────────────────
         file_context, _tier1_names = _build_natural_file_context(
             session_files, symbol_maps_by_name, user_request,
             project_memory=project_memory, session_summary=session_summary,
             session_id=session_id, user_id=user_id,
+            file_statuses=_file_statuses,
         )
         _dlog("file_context_built",
               session_id=session_id,
@@ -12568,6 +12802,15 @@ async def run_natural_pipeline_stream(
                         f"Please ask the user to re-upload as JPEG or PNG.]"
                     )
                     continue
+
+                # Annotate image with new/unchanged/modified status
+                _img_fs = _file_statuses.get(fname, {})
+                _img_badge = _file_status_badge(_img_fs.get("status", "")) if _img_fs else ""
+                if _img_badge:
+                    user_content.append({
+                        "type": "text",
+                        "text": f"[Image: {fname} — {_img_badge}]",
+                    })
 
                 user_content.append({
                     "type": "image",
@@ -15144,6 +15387,18 @@ async def run_natural_pipeline_stream(
                     try:
                         await asyncio.wait_for(asyncio.shield(_corr_task), timeout=20.0)
                     except asyncio.TimeoutError:
+                        # ── Pipeline deadline (symbol-reference correction) ─
+                        if _pipeline_over_budget():
+                            _corr_task.cancel()
+                            _dlog("pipeline_deadline_skip",
+                                  session_id=session_id, user_id=user_id,
+                                  phase="symbol_correction_keepalive",
+                                  resolve_round=resolve_round,
+                                  elapsed_s=round(time.time() - _pipeline_t0, 1),
+                                  deadline_s=PIPELINE_DEADLINE_S)
+                            raise TimeoutError(
+                                "pipeline deadline exceeded during symbol correction"
+                            )
                         _corr_elapsed = time.time() - _corr_t0
                         if _corr_elapsed >= 180.0:
                             _corr_task.cancel()
@@ -15720,6 +15975,17 @@ async def run_natural_pipeline_stream(
         MAX_QA_RETRIES = 2
 
         for _qa_retry_round in range(MAX_QA_RETRIES):
+            # ── Pipeline deadline gate ─────────────────────────────────────
+            if _pipeline_over_budget():
+                _dlog("pipeline_deadline_skip",
+                      session_id=session_id, user_id=user_id,
+                      phase="qa_retry_loop",
+                      retry_round=_qa_retry_round,
+                      elapsed_s=round(time.time() - _pipeline_t0, 1),
+                      deadline_s=PIPELINE_DEADLINE_S)
+                yield sse({"type": "progress",
+                           "content": "⏱️ Approaching time limit — shipping changes as-is (QA corrections skipped)"})
+                break
             _dlog("qa_retry_loop_start", session_id=session_id, user_id=user_id,
                   retry_round=_qa_retry_round, max_retries=MAX_QA_RETRIES,
                   total_changes=len(qa_results),
@@ -15823,6 +16089,18 @@ async def run_natural_pipeline_stream(
             _multi_window_pending = []   # Indices that need multi-window sequential correction
             _multi_window_meta = {}      # Per-idx saved prompt metadata for multi-window
             for idx in blocked_indices:
+                # ── Pipeline deadline gate (per-correction) ────────────────
+                if _pipeline_over_budget():
+                    _dlog("pipeline_deadline_skip",
+                          session_id=session_id, user_id=user_id,
+                          phase="correction_build_loop",
+                          retry_round=_qa_retry_round, idx=idx,
+                          remaining_blocked=[bi for bi in blocked_indices if bi >= idx],
+                          elapsed_s=round(time.time() - _pipeline_t0, 1),
+                          deadline_s=PIPELINE_DEADLINE_S)
+                    yield sse({"type": "progress",
+                               "content": "⏱️ Approaching time limit — skipping remaining corrections"})
+                    break
                 cs     = change_shells[idx]
                 qa_d   = qa_results[idx]
                 symbol = cs["symbol"]
@@ -16718,6 +16996,18 @@ async def run_natural_pipeline_stream(
             # its own API call.  Process bottom-to-top so line numbers stay
             # stable across splices.
             for _mw_idx in _multi_window_pending:
+                # ── Pipeline deadline gate (multi-window) ──────────────────
+                if _pipeline_over_budget():
+                    _dlog("pipeline_deadline_skip",
+                          session_id=session_id, user_id=user_id,
+                          phase="multi_window_pending_loop",
+                          retry_round=_qa_retry_round, mw_idx=_mw_idx,
+                          remaining_mw=[mi for mi in _multi_window_pending if mi >= _mw_idx],
+                          elapsed_s=round(time.time() - _pipeline_t0, 1),
+                          deadline_s=PIPELINE_DEADLINE_S)
+                    yield sse({"type": "progress",
+                               "content": "⏱️ Approaching time limit — skipping remaining multi-window corrections"})
+                    break
                 _mw_windows = _correction_window_info.get(_mw_idx)
                 if not isinstance(_mw_windows, list) or not _mw_windows:
                     _dlog("correction_multi_window_skip_invalid",
@@ -16840,6 +17130,19 @@ async def run_natural_pipeline_stream(
                             try:
                                 await asyncio.wait_for(asyncio.shield(_mw_task), timeout=20.0)
                             except asyncio.TimeoutError:
+                                # ── Pipeline deadline inside keepalive ─────
+                                if _pipeline_over_budget():
+                                    _mw_task.cancel()
+                                    _dlog("pipeline_deadline_skip",
+                                          session_id=session_id, user_id=user_id,
+                                          phase="multi_window_call_keepalive",
+                                          retry_round=_qa_retry_round,
+                                          mw_idx=_mw_idx, window_idx=_mw_wi,
+                                          elapsed_s=round(time.time() - _pipeline_t0, 1),
+                                          deadline_s=PIPELINE_DEADLINE_S)
+                                    raise TimeoutError(
+                                        "pipeline deadline exceeded during multi-window correction"
+                                    )
                                 yield sse({"type": "progress",
                                            "content": f"Multi-window correction {_mw_sym.name} "
                                                        f"window {_mw_wi + 1}/{len(_mw_windows)}…"})
@@ -17042,6 +17345,18 @@ async def run_natural_pipeline_stream(
                 break  # No code actually changed — stop retrying
 
             # Re-run QA on all fixed changes in parallel
+            # ── Pipeline deadline gate (re-QA) ─────────────────────────
+            if _pipeline_over_budget():
+                _dlog("pipeline_deadline_skip",
+                      session_id=session_id, user_id=user_id,
+                      phase="re_qa_after_corrections",
+                      retry_round=_qa_retry_round,
+                      fixed_count=len(fixed_indices),
+                      elapsed_s=round(time.time() - _pipeline_t0, 1),
+                      deadline_s=PIPELINE_DEADLINE_S)
+                yield sse({"type": "progress",
+                           "content": "⏱️ Approaching time limit — skipping re-QA, shipping corrected changes"})
+                break
             reqa_tasks = [
                 (idx, asyncio.create_task(run_qa_agent(
                     original_code=change_shells[idx]["symbol"].code,
