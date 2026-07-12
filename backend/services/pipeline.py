@@ -12822,6 +12822,14 @@ async def run_natural_pipeline_stream(
     # Railway severed the connection.  All work was lost.
     PIPELINE_DEADLINE_S = 810
 
+    # ── Streaming-phase deadlines (session a50319ca evidence) ──────────
+    # Opus 4.6 adaptive thinking consumed 277s (Stream 2) and 570s
+    # (Stream 3) without producing a single text token, hitting
+    # Railway's 15-min SSE limit.  These caps abort the streaming
+    # phase early so the pipeline can process whatever it has.
+    STREAMING_PHASE_DEADLINE_S = 480   # 8 min max for entire streaming phase (leaves 7 min for QA/fixes)
+    STREAMING_THINKING_STALL_S = 120   # 2 min of thinking-only in a round → abort
+
     def _pipeline_over_budget() -> bool:
         """True when elapsed pipeline time exceeds the Railway safety margin."""
         return (time.time() - _pipeline_t0) >= PIPELINE_DEADLINE_S
@@ -13174,8 +13182,10 @@ async def run_natural_pipeline_stream(
 
         # +2: one extra slot for the forced-edit round when budget exhausted
         _streaming_t0 = time.time()
+        _streaming_starvation_abort = False
         for search_round in range(MAX_SEARCH_ROUNDS + 2):
             _round_t0 = time.time()
+            _round_last_text_ts = time.time()
 
             state = "normal"    # "normal" | "in_edit" | "in_file" | "in_search" | "in_filereq" | "in_plan"
             normal_buf = ""
@@ -13405,6 +13415,7 @@ async def run_natural_pipeline_stream(
 
                                     elif text_chunk:
                                         full_response += text_chunk
+                                        _round_last_text_ts = time.time()
 
                                         # Append chunk to appropriate buffer (once per chunk)
                                         if state == "normal":
@@ -13542,6 +13553,32 @@ async def run_natural_pipeline_stream(
                                         yield sse({"type": "thinking_end", "content": ""})
                                         in_thinking = False
 
+                                # ── Streaming-phase deadline checks ───────
+                                # Abort if pipeline budget exhausted, streaming
+                                # phase exceeded 8 min, or 2 min of thinking
+                                # without any text token this round.
+                                _stall_elapsed = time.time() - _streaming_t0
+                                if (_pipeline_over_budget()
+                                        or _stall_elapsed >= STREAMING_PHASE_DEADLINE_S):
+                                    _dlog("streaming_deadline_abort",
+                                          session_id=session_id, user_id=user_id,
+                                          reason="pipeline_budget" if _pipeline_over_budget() else "phase_deadline",
+                                          elapsed_s=round(_stall_elapsed, 1),
+                                          text_len=len(full_response))
+                                    _streaming_starvation_abort = True
+                                    break
+                                if (had_thinking
+                                        and (time.time() - _round_last_text_ts)
+                                            > STREAMING_THINKING_STALL_S):
+                                    _dlog("streaming_thinking_stall",
+                                          session_id=session_id, user_id=user_id,
+                                          round=search_round,
+                                          stall_s=round(
+                                              time.time() - _round_last_text_ts, 1),
+                                          text_len=len(full_response))
+                                    _streaming_starvation_abort = True
+                                    break
+
                             # If a search, file, or github request was made, break out of the event loop
                             if search_requested is not None or file_request_data is not None or edit_plan_data is not None or github_requested is not None:
                                 # Improvement #4: this legacy mid-stream break skips the
@@ -13599,6 +13636,23 @@ async def run_natural_pipeline_stream(
                                   error=err_str[:300])
                             continue
                         raise
+
+            # ── Streaming starvation abort ─────────────────────────
+            # If adaptive thinking consumed the round without producing
+            # text, abort the streaming phase and process whatever we have.
+            if _streaming_starvation_abort:
+                _dlog("streaming_starvation_abort_exit",
+                      session_id=session_id, user_id=user_id,
+                      round=search_round,
+                      elapsed_s=round(time.time() - _streaming_t0, 1),
+                      full_response_len=len(full_response),
+                      edit_blocks=len(edit_blocks_raw))
+                yield sse({"type": "progress",
+                           "content": "⏱️ Thinking timeout — processing available changes..."})
+                if in_thinking:
+                    yield sse({"type": "thinking_end", "content": ""})
+                    in_thinking = False
+                break  # Exit search_round loop
 
             # ── Improvement #4: stop_sequence tag-close synthesizer ─────
             # When TAG_STOP_SEQUENCES is on, the API halts generation AT a

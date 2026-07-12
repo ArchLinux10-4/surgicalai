@@ -165,5 +165,80 @@ class TestAgentModeCodePresence(unittest.TestCase):
         self.assertNotIn("messages.create(", block)
 
 
+class TestStreamingPhaseDeadlines(unittest.TestCase):
+    """Verify streaming-phase deadline code exists in pipeline.py.
+
+    Evidence: session a50319ca — Opus 4.6 adaptive thinking consumed
+    277s (Stream 2) and 570s (Stream 3) without producing text tokens,
+    hitting Railway's 15-min SSE limit.
+    """
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_phase_deadline_constant_exists(self):
+        """STREAMING_PHASE_DEADLINE_S must be defined."""
+        self.assertIn("STREAMING_PHASE_DEADLINE_S = 480", self.src)
+
+    def test_thinking_stall_constant_exists(self):
+        """STREAMING_THINKING_STALL_S must be defined."""
+        self.assertIn("STREAMING_THINKING_STALL_S = 120", self.src)
+
+    def test_starvation_abort_flag_initialized(self):
+        """_streaming_starvation_abort must be initialized before search loop."""
+        idx_flag = self.src.index("_streaming_starvation_abort = False")
+        idx_loop = self.src.index("for search_round in range(MAX_SEARCH_ROUNDS")
+        self.assertLess(idx_flag, idx_loop,
+                        "Flag must be initialized before the search loop")
+
+    def test_round_text_timestamp_initialized(self):
+        """_round_last_text_ts must be set at start of each round."""
+        idx_round = self.src.index("_round_t0 = time.time()")
+        block = self.src[idx_round:idx_round + 200]
+        self.assertIn("_round_last_text_ts = time.time()", block)
+
+    def test_text_timestamp_updated_on_text_chunk(self):
+        """_round_last_text_ts must be updated when text_chunk is received."""
+        idx_text = self.src.index("full_response += text_chunk")
+        block = self.src[idx_text:idx_text + 200]
+        self.assertIn("_round_last_text_ts = time.time()", block)
+
+    def test_deadline_abort_dlog_exists(self):
+        """_dlog('streaming_deadline_abort', ...) must exist."""
+        self.assertIn("streaming_deadline_abort", self.src)
+
+    def test_thinking_stall_dlog_exists(self):
+        """_dlog('streaming_thinking_stall', ...) must exist."""
+        self.assertIn("streaming_thinking_stall", self.src)
+
+    def test_abort_exit_dlog_exists(self):
+        """_dlog('streaming_starvation_abort_exit', ...) must exist."""
+        self.assertIn("streaming_starvation_abort_exit", self.src)
+
+    def test_abort_closes_thinking_block(self):
+        """Abort handler must close thinking block (yield thinking_end)."""
+        idx = self.src.index("streaming_starvation_abort_exit")
+        block = self.src[idx:idx + 800]
+        self.assertIn("thinking_end", block)
+
+    def test_abort_yields_user_message(self):
+        """Abort handler must yield a progress message to the user."""
+        idx = self.src.index("streaming_starvation_abort_exit")
+        block = self.src[idx:idx + 500]
+        self.assertIn("Thinking timeout", block)
+
+    def test_phase_deadline_checks_pipeline_budget(self):
+        """Streaming deadline check must also check _pipeline_over_budget."""
+        idx = self.src.index("streaming_deadline_abort")
+        block = self.src[max(0, idx - 500):idx]
+        self.assertIn("_pipeline_over_budget()", block)
+
+    def test_thinking_stall_requires_had_thinking(self):
+        """Thinking stall check must guard on had_thinking."""
+        idx = self.src.index("streaming_thinking_stall")
+        block = self.src[max(0, idx - 300):idx]
+        self.assertIn("had_thinking", block)
+
+
 if __name__ == "__main__":
     unittest.main()
