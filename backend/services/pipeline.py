@@ -14842,6 +14842,20 @@ async def run_natural_pipeline_stream(
                     "natural_text": _fail_msg,
                 }
                 yield sse({"type": "smart_result", "content": json.dumps(_fail_result)})
+            elif full_response.strip() and not skipped_changes_struct:
+                # Model produced text (e.g. a plan/explanation) but no actual
+                # edit blocks.  The text was already streamed as tokens;
+                # send a clear notice so the user knows no files were changed.
+                _noedit_msg = (
+                    "\n\n⚠️ No code changes were produced — the response above "
+                    "was a plan/explanation only.  Please try again and I'll "
+                    "apply the edits directly."
+                )
+                _dlog("no_edits_text_only_notice",
+                      session_id=session_id, user_id=user_id,
+                      response_len=len(full_response),
+                      was_starvation_recovery=bool(_streaming_starvation_abort))
+                yield sse({"type": "token", "content": _noedit_msg})
             yield sse({"type": "done", "content": ""})
             return
 

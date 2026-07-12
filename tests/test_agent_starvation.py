@@ -295,6 +295,33 @@ class TestStarvationRecovery(unittest.TestCase):
         before = self.src[max(0, idx - 300):idx]
         self.assertIn("len(full_response.strip()) == 0", before)
 
+    def test_no_edits_text_only_sends_user_notice(self):
+        """When model produces text but no edit blocks, user must see a notice.
+
+        Evidence: session d02bc93f run 5 — recovery produced 1567 chars
+        of plan text but 0 edit blocks. no_edits_produced fired silently,
+        user saw the plan text streamed but got no indication that no
+        files were changed.
+        """
+        self.assertIn("no_edits_text_only_notice", self.src)
+        # The notice must contain a clear user-facing message
+        self.assertIn("No code changes were produced", self.src)
+
+    def test_no_edits_text_only_dlog(self):
+        """The text-only notice must log was_starvation_recovery flag."""
+        idx = self.src.find("no_edits_text_only_notice")
+        self.assertGreater(idx, 0)
+        after = self.src[idx:idx + 300]
+        self.assertIn("was_starvation_recovery", after)
+
+    def test_no_edits_text_only_after_skipped_changes_check(self):
+        """The text-only notice is an elif after skipped_changes_struct check,
+        so it only fires when no plan tasks ran."""
+        idx = self.src.find("no_edits_text_only_notice")
+        # Actual distance is ~570 chars; use 700 for margin
+        before = self.src[max(0, idx - 700):idx]
+        self.assertIn("elif full_response.strip()", before)
+
 
 if __name__ == "__main__":
     unittest.main()
