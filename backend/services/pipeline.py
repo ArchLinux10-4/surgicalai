@@ -3564,6 +3564,17 @@ def _apply_snippet_by_lines(
     rel_start = edit_start_line - symbol_start_line   # 0-based, inclusive
     rel_end   = edit_end_line   - symbol_start_line   # 0-based, inclusive
 
+    # ── Off-by-one clamp ──────────────────────────────────────────
+    # LLMs commonly include the trailing blank line immediately after
+    # a symbol's closing brace/bracket.  When rel_end is exactly one
+    # past the last valid index (rel_end == n), clamp it rather than
+    # rejecting.  This is safe because the blank line is cosmetic and
+    # the replacement new_code controls its own trailing whitespace.
+    _clamped = False
+    if rel_end == n and rel_start >= 0 and rel_start < n:
+        rel_end = n - 1
+        _clamped = True
+
     if rel_start < 0 or rel_end >= n or rel_start > rel_end:
         return None, False, (
             f"edit_start_line={edit_start_line}, edit_end_line={edit_end_line} "
@@ -3580,7 +3591,8 @@ def _apply_snippet_by_lines(
         replacement += "\n"
 
     full_new = before + replacement + after
-    return full_new, True, f"line-number-splice:{edit_start_line}-{edit_end_line}"
+    _clamp_tag = ",clamped" if _clamped else ""
+    return full_new, True, f"line-number-splice:{edit_start_line}-{edit_end_line}{_clamp_tag}"
 
 
 # ---------------------------------------------------------------------------
@@ -15065,9 +15077,18 @@ async def run_natural_pipeline_stream(
                                 default=None,
                             )
                             if (_first_sym_start and _first_sym_start > 1
-                                    and 1 <= _pre_isl <= _pre_iel
-                                    < _first_sym_start):
+                                    and 1 <= _pre_isl
+                                    and _pre_isl < _first_sym_start):
+                                # ── Fix C: cross-boundary preamble edits ──────
+                                # Original guard required _pre_iel < _first_sym_start
+                                # (pure preamble).  Now we also handle edits that
+                                # START in preamble but EXTEND into symbols — e.g.
+                                # "swap imports" (line 29) through CONFIDENCE_STYLES
+                                # (line 78).  The synthetic symbol covers lines 1
+                                # through max(edit_end, first_sym_start-1).
+                                _is_cross_boundary = _pre_iel >= _first_sym_start
                                 _fc_lines_pre = file_content.split("\n")
+                                _fc_total = len(_fc_lines_pre)
                                 _tgt_lines = [
                                     _l.strip() for _l in
                                     _fc_lines_pre[_pre_isl - 1:_pre_iel]
@@ -15090,7 +15111,13 @@ async def run_natural_pipeline_stream(
                                             SymbolInfo as _SI_pre,
                                             SymbolType as _ST_pre,
                                         )
-                                        _pre_end = _first_sym_start - 1
+                                        if _is_cross_boundary:
+                                            # Extend synthetic symbol to cover
+                                            # the full edit range (clamped to file).
+                                            _pre_end = min(_pre_iel, _fc_total)
+                                        else:
+                                            # Pure preamble — end at symbol boundary.
+                                            _pre_end = _first_sym_start - 1
                                         _correct_sym = _SI_pre(
                                             name="_preamble",
                                             symbol_type=_ST_pre.VARIABLE,
@@ -15103,7 +15130,9 @@ async def run_natural_pipeline_stream(
                                             ),
                                         )
                                         _correct_method = (
-                                            "auto_resolve_preamble"
+                                            "auto_resolve_preamble_cross"
+                                            if _is_cross_boundary
+                                            else "auto_resolve_preamble"
                                         )
                                         _dlog("symbol_auto_resolve_preamble",
                                               session_id=session_id,
@@ -15115,6 +15144,7 @@ async def run_natural_pipeline_stream(
                                               first_symbol_start=(
                                                   _first_sym_start
                                               ),
+                                              cross_boundary=_is_cross_boundary,
                                               content_match_ratio=round(
                                                   _pre_ratio, 3
                                               ),
@@ -15415,32 +15445,70 @@ async def run_natural_pipeline_stream(
                             edit_data.pop("edit_start_line", None)
                             edit_data.pop("edit_end_line", None)
                         else:
-                            _dlog("snippet_apply_failed",
-                                  session_id=session_id,
-                                  filename=filename,
-                                  symbol=symbol_name,
-                                  reason=snip_reason,
-                                  edit_start_line=_isl,
-                                  edit_end_line=_iel,
-                                  symbol_start_line=_sym_abs_start,
-                                  symbol_code_len=len(_accum_base),
-                                      user_id=user_id)
-                            still_unresolved.append({
-                                "filename": filename,
-                                "symbol": symbol_name,
-                                "new_code": new_code,
-                                "description": description,
-                                "_raw": edit_raw,
-                                "_snippet_reason": snip_reason,
-                                # CURRENT accumulated content — not symbol.code
-                                # (the pristine original). Showing stale content
-                                # made the correction model re-anchor against
-                                # lines that no longer exist (the correction-drop
-                                # bug).
-                                "_symbol_code": _accum_base,
-                                "_symbol_start": symbol.start_line,
-                            })
-                            continue
+                            # ── Fix B: Option B fail → file-level old_code fallback ─
+                            # When line-number splice fails (off-by-one, cross-
+                            # boundary, stale line numbers) but the LLM also
+                            # supplied old_code that matches the FILE verbatim,
+                            # use the file-level string-match path instead of
+                            # routing to the expensive correction loop.
+                            # Evidence: session 5b63f7b5 — CONFIDENCE_STYLES
+                            # and StatusBadge both had valid old_code that was
+                            # never tried because Option B ran exclusively.
+                            _optb_rescued = False
+                            if old_code:
+                                _rf_file = file_content_lookup.get(filename, "")
+                                if _rf_file:
+                                    _rf_old, _rf_ok, _rf_reason = _locate_snippet_in_text(
+                                        _rf_file, old_code
+                                    )
+                                    if _rf_ok and _rf_old:
+                                        # old_code found in file — apply as
+                                        # file-level find/replace.
+                                        edit_data["new_code"] = _accum_base  # no-op on symbol
+                                        edit_data.pop("old_code", None)
+                                        edit_data.pop("edit_start_line", None)
+                                        edit_data.pop("edit_end_line", None)
+                                        edit_data.setdefault("_extra_ops", []).append(
+                                            {"find": _rf_old, "replace": new_code}
+                                        )
+                                        _optb_rescued = True
+                                        _dlog("optb_file_level_rescue",
+                                              session_id=session_id,
+                                              filename=filename,
+                                              symbol=symbol_name,
+                                              original_snip_reason=snip_reason,
+                                              file_match_kind=_rf_reason,
+                                              old_code_preview=old_code[:200],
+                                              user_id=user_id)
+
+                            if not _optb_rescued:
+                                _dlog("snippet_apply_failed",
+                                      session_id=session_id,
+                                      filename=filename,
+                                      symbol=symbol_name,
+                                      reason=snip_reason,
+                                      edit_start_line=_isl,
+                                      edit_end_line=_iel,
+                                      symbol_start_line=_sym_abs_start,
+                                      symbol_code_len=len(_accum_base),
+                                      had_old_code=bool(old_code),
+                                          user_id=user_id)
+                                still_unresolved.append({
+                                    "filename": filename,
+                                    "symbol": symbol_name,
+                                    "new_code": new_code,
+                                    "description": description,
+                                    "_raw": edit_raw,
+                                    "_snippet_reason": snip_reason,
+                                    # CURRENT accumulated content — not symbol.code
+                                    # (the pristine original). Showing stale content
+                                    # made the correction model re-anchor against
+                                    # lines that no longer exist (the correction-drop
+                                    # bug).
+                                    "_symbol_code": _accum_base,
+                                    "_symbol_start": symbol.start_line,
+                                })
+                                continue
                     elif old_code:
                         # ── Option A: string-match splice (legacy fallback) ──
                         # Splice into the running (cumulative) symbol so a second
