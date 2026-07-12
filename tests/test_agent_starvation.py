@@ -240,5 +240,61 @@ class TestStreamingPhaseDeadlines(unittest.TestCase):
         self.assertIn("had_thinking", block)
 
 
+class TestStarvationRecovery(unittest.TestCase):
+    """Tests for the no-thinking retry recovery after starvation abort."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_recovery_retry_dlog_exists(self):
+        self.assertIn("starvation_recovery_retry", self.src)
+
+    def test_recovery_done_dlog_exists(self):
+        self.assertIn("starvation_recovery_done", self.src)
+
+    def test_recovery_error_dlog_exists(self):
+        self.assertIn("starvation_recovery_error", self.src)
+
+    def test_total_failure_dlog_exists(self):
+        self.assertIn("starvation_total_failure", self.src)
+
+    def test_thinking_stripped_from_retry(self):
+        """Retry kwargs must exclude 'thinking' key."""
+        self.assertIn('k: v for k, v in stream_kwargs.items() if k != "thinking"', self.src)
+
+    def test_output_config_stripped_from_retry(self):
+        """output_config (effort) must be stripped — not valid without thinking."""
+        self.assertIn('_retry_kwargs.pop("output_config"', self.src)
+
+    def test_recovery_user_message_on_retry(self):
+        """User should see a progress message when recovery retry starts."""
+        self.assertIn("retrying without extended thinking", self.src)
+
+    def test_recovery_user_message_on_total_failure(self):
+        """User must see an error if both original and recovery produce nothing."""
+        self.assertIn("spent all available time thinking", self.src)
+
+    def test_recovery_guards_pipeline_budget(self):
+        """Recovery retry must check _pipeline_over_budget before retrying."""
+        idx = self.src.find("starvation_recovery_retry")
+        # The budget check should appear before the dlog
+        budget_idx = self.src.rfind("_pipeline_over_budget", 0, idx)
+        self.assertGreater(budget_idx, 0,
+                           "_pipeline_over_budget check must precede recovery retry")
+
+    def test_recovery_replaces_main_variables(self):
+        """On success, recovery must overwrite full_response and edit_blocks_raw."""
+        idx = self.src.find("starvation_recovery_done")
+        after = self.src[idx:idx + 800]
+        self.assertIn("full_response = _retry_response", after)
+        self.assertIn("edit_blocks_raw = _retry_edit_blocks", after)
+
+    def test_recovery_only_when_empty_response(self):
+        """Recovery must only trigger when full_response is empty."""
+        idx = self.src.find("starvation_recovery_retry")
+        before = self.src[max(0, idx - 300):idx]
+        self.assertIn("len(full_response.strip()) == 0", before)
+
+
 if __name__ == "__main__":
     unittest.main()

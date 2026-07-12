@@ -14389,6 +14389,147 @@ async def run_natural_pipeline_stream(
         # are all handled by the universal end-of-stream finalizer
         # inside the search_round loop above.  No duplicate logic here.
 
+        # ── Starvation recovery: retry without thinking ─────────────────
+        # If adaptive thinking consumed the entire round producing zero text,
+        # retry once with thinking DISABLED so all tokens go to real output.
+        if (_streaming_starvation_abort
+                and len(full_response.strip()) == 0
+                and _natural_use_claude
+                and not _pipeline_over_budget()):
+            _dlog("starvation_recovery_retry",
+                  session_id=session_id, user_id=user_id,
+                  model=arch_model,
+                  original_thinking=stream_kwargs.get("thinking"),
+                  elapsed_s=round(time.time() - _streaming_t0, 1))
+            yield sse({"type": "progress",
+                       "content": "🔄 Thinking stalled — retrying without extended thinking..."})
+
+            # Build a no-thinking copy of stream_kwargs
+            _retry_kwargs = {k: v for k, v in stream_kwargs.items() if k != "thinking"}
+            # Also drop output_config/effort — not valid without thinking
+            _retry_kwargs.pop("output_config", None)
+
+            try:
+                _retry_response = ""
+                _retry_edit_blocks: list = []
+                _retry_new_file_blocks: list = []
+                _retry_state = "normal"
+                _retry_normal_buf = ""
+                _retry_tag_buf = ""
+
+                async with aclient.messages.stream(**{
+                    **_retry_kwargs,
+                    "messages": current_messages,
+                }) as _retry_stream:
+                    async for _rev in _retry_stream:
+                        _rev_type = getattr(_rev, "type", None)
+                        if _rev_type == "text":
+                            _text = _rev.text or ""
+                            _retry_response += _text
+
+                            if _retry_state == "normal":
+                                _retry_normal_buf += _text
+                            else:
+                                _retry_tag_buf += _text
+
+                            # Minimal tag parser for edit/file blocks
+                            while True:
+                                if _retry_state == "normal":
+                                    _found = False
+                                    for _tname in ("edit", "file"):
+                                        _topen = TAG_DEFS[_tname]["open"]
+                                        _ti = _retry_normal_buf.find(_topen)
+                                        if _ti != -1:
+                                            if _ti > 0:
+                                                yield sse({"type": "token", "content": _retry_normal_buf[:_ti]})
+                                            if _tname in ("edit", "file"):
+                                                yield sse({"type": "edit_start", "content": ""})
+                                            _retry_state = f"in_{_tname}"
+                                            _retry_tag_buf = _retry_normal_buf[_ti + len(_topen):]
+                                            _retry_normal_buf = ""
+                                            _found = True
+                                            break
+                                    if not _found:
+                                        # Flush safe prefix
+                                        _tail = max(len(TAG_DEFS[t]["open"]) for t in TAG_DEFS)
+                                        _safe = max(0, len(_retry_normal_buf) - _tail)
+                                        if _safe > 0:
+                                            yield sse({"type": "token", "content": _retry_normal_buf[:_safe]})
+                                            _retry_normal_buf = _retry_normal_buf[_safe:]
+                                        break
+                                elif _retry_state in ("in_edit", "in_file"):
+                                    _tname2 = _retry_state[3:]
+                                    _tclose = TAG_DEFS[_tname2]["close"]
+                                    _ci = _retry_tag_buf.find(_tclose)
+                                    if _ci != -1:
+                                        _block_content = _retry_tag_buf[:_ci]
+                                        if _tname2 == "edit":
+                                            _retry_edit_blocks.append(_block_content)
+                                        else:
+                                            _retry_new_file_blocks.append(_block_content)
+                                        yield sse({"type": "edit_end", "content": ""})
+                                        _retry_normal_buf = _retry_tag_buf[_ci + len(_tclose):]
+                                        _retry_tag_buf = ""
+                                        _retry_state = "normal"
+                                    else:
+                                        break
+                                else:
+                                    break
+
+                # Flush remaining normal text
+                if _retry_normal_buf.strip():
+                    yield sse({"type": "token", "content": _retry_normal_buf})
+
+                # Close any unclosed edit/file block via EOS recovery
+                if _retry_state in ("in_edit", "in_file"):
+                    _tname3 = _retry_state[3:]
+                    _tclose3 = TAG_DEFS[_tname3]["close"]
+                    _ci3 = _retry_tag_buf.find(_tclose3)
+                    if _ci3 != -1:
+                        _block3 = _retry_tag_buf[:_ci3]
+                        if _tname3 == "edit":
+                            _retry_edit_blocks.append(_block3)
+                        else:
+                            _retry_new_file_blocks.append(_block3)
+                    yield sse({"type": "edit_end", "content": ""})
+
+                _dlog("starvation_recovery_done",
+                      session_id=session_id, user_id=user_id,
+                      response_len=len(_retry_response),
+                      edit_blocks=len(_retry_edit_blocks),
+                      new_file_blocks=len(_retry_new_file_blocks))
+
+                # Replace main-path variables with recovery results
+                if _retry_response.strip() or _retry_edit_blocks or _retry_new_file_blocks:
+                    full_response = _retry_response
+                    edit_blocks_raw = _retry_edit_blocks
+                    new_file_blocks_raw = _retry_new_file_blocks
+
+            except Exception as _recovery_err:
+                _dlog("starvation_recovery_error",
+                      session_id=session_id, user_id=user_id,
+                      error=str(_recovery_err)[:300])
+                yield sse({"type": "token",
+                           "content": "\n\n⚠️ Extended thinking timed out and the recovery attempt also failed. "
+                                      "Please try again — a simpler prompt or a different model may help."})
+                yield sse({"type": "done", "content": ""})
+                return
+
+        # ── User-facing error when starvation produced nothing at all ────
+        if (_streaming_starvation_abort
+                and len(full_response.strip()) == 0
+                and not edit_blocks_raw
+                and not new_file_blocks_raw):
+            _dlog("starvation_total_failure",
+                  session_id=session_id, user_id=user_id,
+                  model=arch_model,
+                  elapsed_s=round(time.time() - _streaming_t0, 1))
+            yield sse({"type": "token",
+                       "content": "\n\n⚠️ The model spent all available time thinking without producing any output. "
+                                  "Please try again with a simpler prompt or a different model."})
+            yield sse({"type": "done", "content": ""})
+            return
+
         # Initialize skipped_changes early — truncation detection may append to it
         skipped_changes_struct: list = []
 
