@@ -1258,15 +1258,6 @@ export function ChatPanel() {
           setThinkingText(prev => { const next = prev + thinkToken; thinkingTextRef.current = next; return next })
         } else if (phase === 'end') {
           setIsThinking(false)
-          if (pendingInjectionRef.current) {
-            const inj = pendingInjectionRef.current
-            pendingInjectionRef.current = ''
-            setInjectionQueued(false)
-            abortRef.current?.abort()
-            setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
-            const combined = sentMessageRef.current + '\n\n[Context added while thinking]: ' + inj
-            setRestartSignal({ msg: combined, sid: sessionId })
-          }
         }
       },
       // onCompacting
@@ -1571,14 +1562,35 @@ export function ChatPanel() {
   // ── Send message ──────────────────────────────────────
   const handleSend = useCallback(async () => {
     if (!input.trim()) return
-    // Steer: if Claude is thinking, queue the input as mid-thought context
-    // instead of starting a new stream. Existing injection logic will
-    // abort + restart with the combined message when thinking ends.
-    if (isStreaming && isThinking && input.trim()) {
-      pendingInjectionRef.current = input.trim()
-      setInjectionQueued(true)
+    // Steer: if Claude is streaming (thinking or generating), inject the user's
+    // context immediately — abort current stream and restart with combined message.
+    // User sees their message bubble + Claude reacting, just like Tasklet.
+    if (isStreaming && input.trim()) {
+      const sid = streamSessionRef.current
+      if (!sid) return                       // no session — nothing to inject into
+      const inj = input.trim()
       setInput('')
       if (textareaRef.current) textareaRef.current.style.height = 'auto'
+      // Show user bubble so the injected message is visible in chat
+      addMessage({
+        id: Date.now().toString() + '_inj',
+        session_id: sid,
+        role: 'user',
+        content: inj,
+        created_at: new Date().toISOString(),
+      })
+      // Build combined message and update sentMessageRef so chained injections
+      // accumulate correctly (inject #2 includes inject #1's context)
+      const combined = sentMessageRef.current + '\n\n[Context added mid-stream]: ' + inj
+      sentMessageRef.current = combined
+      // Abort current stream and restart with combined context
+      pendingInjectionRef.current = ''
+      setInjectionQueued(false)
+      abortRef.current?.abort()
+      setIsStreaming(false)
+      setStreamingMessage('')
+      setStreamProgress('')
+      setRestartSignal({ msg: combined, sid })
       return
     }
     if (isStreaming) return
@@ -1760,11 +1772,11 @@ export function ChatPanel() {
             {isStreaming && (streamingMessage || streamProgress) && (
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} />
             )}
-            {/* Steer queued indicator — user typed in chat input during thinking */}
+            {/* Steer queued indicator — brief flash while injection restarts stream */}
             {injectionQueued && isStreaming && (
               <div className="mx-4 mt-1.5 flex items-center gap-1.5 text-[11px] text-purple/60">
                 <span className="w-1.5 h-1.5 rounded-full bg-purple/50 animate-pulse flex-shrink-0" />
-                Context queued — will apply when thinking ends
+                Injecting your context...
               </div>
             )}
             {error && (
