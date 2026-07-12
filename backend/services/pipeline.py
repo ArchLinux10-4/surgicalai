@@ -262,6 +262,9 @@ _MODEL_MAX_OUTPUT = {
     "claude-sonnet-5": 128000,
     "claude-fable-5": 128000,
     "claude-opus-4-8": 128000,
+    "claude-opus-4-7": 128000,
+    "claude-opus-4-6": 128000,
+    "claude-sonnet-4-6": 128000,
 }
 _MAX_OUTPUT_DEFAULT = 64000
 
