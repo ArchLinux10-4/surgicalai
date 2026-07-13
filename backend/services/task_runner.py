@@ -29,10 +29,15 @@ Safety properties
 - Workers reuse the per-task idempotency guard semantics: only a task in
   status "pending" may execute. Claiming is atomic (single UPDATE ... WHERE
   status='pending'), so a duplicate supervisor can never double-run a task.
-- Waves only parallelise tasks whose file targets are provably disjoint
-  (plan_validator already merges same-file tasks at plan time). A task with
-  no detectable file target runs alone. Seq order is never violated: wave
-  building stops at the first conflict instead of skipping ahead.
+- Waves only parallelise tasks whose file targets are provably disjoint.
+  Same-file tasks are never merged at plan time (that used to happen and
+  was removed — it silently collapsed most real task lists down to 1 task;
+  see plan_validator.py's module docstring for the evidence). Instead this
+  wave builder is the sole place that provides file-conflict safety: a
+  same-file task simply starts its own new wave and runs after the ones
+  before it, in seq order. A task with no detectable file target runs
+  alone. Seq order is never violated: wave building stops at the first
+  conflict instead of skipping ahead.
 - Every branch is _dlog'd. Every external call is wrapped; a failure
   degrades to the same blocked/halt semantics the client queue has today.
 - The in-process registry prevents double-starting a run. Orphaned
@@ -94,7 +99,7 @@ def run_status(run_id: str) -> dict:
 def _task_file_basenames(task: dict) -> set:
     """Extract target-file basenames from a task's detail text.
 
-    Reuses plan_validator's battle-tested extraction regex and its
+    Reuses plan_validator's file-extraction regex (_extract_files) and its
     basename normalisation ("src/Foo.vue" vs "Foo.vue" are the same file).
     Returns an empty set when no file targets are detectable.
     """
