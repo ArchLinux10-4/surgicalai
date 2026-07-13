@@ -240,13 +240,35 @@ function SessionList() {
     } catch { setMessages([]) }
   }
 
-  const promptDeleteSession = async (id: string) => {
+  const deleteSessionById = async (id: string) => {
     try {
-      const files = await api.sessionFiles.list(id)
-      setPendingDeleteFileCount(files.length)
-    } catch {
-      setPendingDeleteFileCount(0)
+      await api.chat.deleteSession(id)
+      if (activeSessions === id) { setActiveSession(null); setMessages([]) }
+      await loadSessions()
+      toast.success('Chat deleted')
+    } catch (e: any) {
+      toast.error('Delete failed', e.message)
     }
+  }
+
+  const promptDeleteSession = async (id: string) => {
+    const session = sessions.find((s: any) => s.id === id)
+    let files: SessionFile[] = []
+    try {
+      files = await api.sessionFiles.list(id)
+    } catch {
+      files = []
+    }
+    const hasHistory = !!session?.message_count
+    const hasFiles = files.length > 0
+    // Empty chats (no messages, no attached files) have nothing meaningful
+    // to lose, so skip the confirmation prompt. Sessions with history or
+    // files still go through the modal below.
+    if (!hasHistory && !hasFiles) {
+      await deleteSessionById(id)
+      return
+    }
+    setPendingDeleteFileCount(files.length)
     setPendingDeleteId(id)
   }
 
@@ -254,12 +276,7 @@ function SessionList() {
     if (!pendingDeleteId) return
     setDeleteConfirmLoading(true)
     try {
-      await api.chat.deleteSession(pendingDeleteId)
-      if (activeSessions === pendingDeleteId) { setActiveSession(null); setMessages([]) }
-      await loadSessions()
-      toast.success('Chat deleted')
-    } catch (e: any) {
-      toast.error('Delete failed', e.message)
+      await deleteSessionById(pendingDeleteId)
     } finally {
       setDeleteConfirmLoading(false)
       setPendingDeleteId(null)
@@ -301,14 +318,44 @@ function SessionList() {
     setSelectedIds(new Set())
   }
 
+  const deleteSessionsByIds = async (ids: string[]) => {
+    for (const id of ids) {
+      await api.chat.deleteSession(id)
+      if (activeSessions === id) { setActiveSession(null); setMessages([]) }
+    }
+    await loadSessions()
+    const count = ids.length
+    toast.success(`Deleted ${count} chat${count > 1 ? 's' : ''}`)
+    setSelectedIds(new Set())
+    setSelectMode(false)
+  }
+
   const promptBulkDelete = async () => {
     if (selectedIds.size === 0) return
     let totalFiles = 0
+    let anyHasContent = false
     for (const id of selectedIds) {
+      const session = sessions.find((s: any) => s.id === id)
+      if (session?.message_count) anyHasContent = true
       try {
         const files = await api.sessionFiles.list(id)
         totalFiles += files.length
+        if (files.length > 0) anyHasContent = true
       } catch { /* ignore */ }
+    }
+    // If every selected chat is empty (no history, no files), skip the
+    // confirmation modal. Any selected chat with history or files still
+    // prompts via the modal below, per the existing behavior.
+    if (!anyHasContent) {
+      setBulkDeleteLoading(true)
+      try {
+        await deleteSessionsByIds(Array.from(selectedIds))
+      } catch (e: any) {
+        toast.error('Bulk delete failed', e.message)
+      } finally {
+        setBulkDeleteLoading(false)
+      }
+      return
     }
     setBulkDeleteFileCount(totalFiles)
     setPendingBulkDelete(true)
@@ -317,15 +364,7 @@ function SessionList() {
   const confirmBulkDelete = async () => {
     setBulkDeleteLoading(true)
     try {
-      for (const id of selectedIds) {
-        await api.chat.deleteSession(id)
-        if (activeSessions === id) { setActiveSession(null); setMessages([]) }
-      }
-      await loadSessions()
-      const count = selectedIds.size
-      toast.success(`Deleted ${count} chat${count > 1 ? 's' : ''}`)
-      setSelectedIds(new Set())
-      setSelectMode(false)
+      await deleteSessionsByIds(Array.from(selectedIds))
     } catch (e: any) {
       toast.error('Bulk delete failed', e.message)
     } finally {
