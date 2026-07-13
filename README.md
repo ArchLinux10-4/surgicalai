@@ -1,30 +1,59 @@
 # ⚡ SurgicalAI
 
-**Local AI coding assistant with surgical precision.**  
-Built for developers who work with large codebases and need AI that actually understands what it's changing.
+**A local-first AI coding assistant and dev-ops control center.**
+Surgical, AST-aware code edits, multi-step autonomous agent runs, a fully offline mode, and built-in panels for GitHub, Railway, Vercel, and Linear — all running on your own machine.
 
 ---
 
 ## Features
 
-- **Dual-model pipeline** — Architect (GPT-5/4o) plans, Surgeon (GPT-4.1) executes with minimal hallucination
-- **Surgical code editor** — AST-aware changes to specific functions/classes without touching anything else
-- **Diff review** — Always see exactly what changes before applying
-- **Confidence scoring** — Every change rated 1–10; low-confidence changes flagged for review
-- **Auto-backup** — File backup before every change, one-click restore
-- **Full chat mode** — Regular coding assistant chat with file context
-- **Monaco editor** — VS Code-grade editor built in
-- **Git panel** — Status, diff, commit from within the app
-- **Multi-language** — Python, JS/TS, Go, Rust, Java, C/C++, Ruby, PHP, Swift, Kotlin, and more
-- **100% local** — All data stays on your machine. SQLite DB at `~/.surgicalai/`
+### Coding modes
+- **Full chat** — a regular AI coding assistant chat with file/project context.
+- **Surgical mode** — the AI reads a file's AST symbol map (not raw text), plans an exact change, and returns only the modified block. Every change shows a diff and a confidence score before it touches disk. File backups are taken automatically before every write.
+- **Agent mode** — multi-step autonomous task planning and execution (Claude models only). Tasks are tracked per session/run, can be cancelled individually or all at once, and show live progress in a dedicated Mission Control panel.
+- **Whole-file rewrite** — used automatically when Offline Mode is active (see below).
+
+### Models
+- Cloud: Claude (Sonnet 5, Opus, Haiku) and OpenAI (GPT-5.x family, o-series, GPT-4.1) — bring your own API key, stored encrypted in your local database (never in a cloud secret store).
+- **Offline Mode** — run entirely without a cloud API key using **Ollama + Qwen2.5-Coder:7b**. Fully isolated codebase (`backend/services/offline/`) that never touches the Claude/OpenAI pipeline; falls back automatically only when no cloud key is configured. Scoped deliberately to **plain chat + whole-file rewrite** — agent mode, tool-calling, and diff-style edits are evidence-backed as unreliable at the 7B scale and are intentionally not attempted offline.
+
+### Multi-language AST support
+- **Python** — native `ast` module (gold-standard accuracy).
+- **JavaScript / TypeScript / JSX / TSX** — `tree-sitter`, with automatic regex-based error recovery when the grammar chokes on unusual syntax, and a full regex fallback if `tree-sitter` isn't available.
+- Also supported: Go, Rust, Java, HTML, CSS, Markdown — plus a generic fallback for any other file type.
+
+### Multi-user & auth
+- First run creates an admin account; admins can create additional users, reset passwords, and see online/idle/offline presence.
+- JWT-based sessions, bcrypt password hashing, self-service password change with complexity rules enforced server-side.
+
+### Integrations (token-based, no OAuth app setup required)
+Paste a personal API token in Settings for any of these — it's encrypted and stored per-user in your local database:
+- **GitHub** — native PAT integration, plus a GitHub App flow for repo access.
+- **Railway** — projects, deployments, and build/runtime logs via Railway's GraphQL API.
+- **Vercel** — projects, deployments, and deployment logs via Vercel's REST API.
+- **Linear** — search/list issues, view details, comment, and mark issues done.
+- **Deploy Watcher** — polls your latest Vercel/Railway deployment and automatically extracts error lines from failed build logs.
+
+### Other tools
+- **Image Studio** — GPT-image generation and editing (multi-turn), via OpenAI's Responses API.
+- **DataLab** — natural-language spreadsheet/CSV transforms (feature-flagged).
+- Monaco-based code editor, Git panel (status/diff/commit), Live Preview, Test Runner panel, session file tray, and one-click session/all-file downloads.
+- Voice input for chat.
+
+### Data & privacy
+- SQLite by default; automatically uses Postgres if `DATABASE_URL` is set.
+- API keys and integration tokens are encrypted and stored in your own database — never sent anywhere except the relevant provider (OpenAI, Anthropic, GitHub, Railway, Vercel, Linear).
+- File backups stored at `.surgicalai_backups/` next to each modified file.
 
 ---
 
 ## Requirements
 
-- Python 3.11+
-- Node.js 18+
-- npm
+- Python 3 with `pip`
+- Node.js with `npm`
+- (Optional) [Ollama](https://ollama.com) — only needed if you want Offline Mode
+
+`install.sh` verifies these are present before doing anything else.
 
 ---
 
@@ -36,11 +65,20 @@ chmod +x install.sh start.sh start-dev.sh
 ./install.sh
 ```
 
+This will:
+1. Create a Python virtual environment and install backend dependencies
+2. Install frontend dependencies and build the production bundle
+3. Optionally set up **Offline Mode** (interactive — asks whether you're on macOS Apple Silicon or Linux, then installs Ollama, starts its server, and pulls `qwen2.5-coder:7b`)
+
+Every step logs full detail to `install-debug.log`, so a failed run can be diagnosed without reproducing it. Offline Mode setup is entirely optional and non-fatal — declining it, or a failure during it, never blocks the rest of the install.
+
+Supported platforms: **Debian Linux** and **macOS (Apple Silicon)**.
+
 ---
 
 ## Run
 
-**Production mode** (uses built frontend, fastest):
+**Production mode** (uses the built frontend):
 ```bash
 ./start.sh
 ```
@@ -50,35 +88,16 @@ chmod +x install.sh start.sh start-dev.sh
 ./start-dev.sh
 ```
 
-Then open: **http://127.0.0.1:8000** (production) or **http://127.0.0.1:5173** (dev)
-
 ---
 
 ## First-Time Setup
 
-1. Open the app → click ⚙️ Settings (top-left)
-2. Enter your OpenAI API key and click **Verify**
-3. Set your workspace folder path
-4. Configure your models:
-   - **Architect**: `gpt-4o` or `o4-mini` for planning (better reasoning)
-   - **Surgeon**: `gpt-4.1` for writing code (lowest hallucination)
-
----
-
-## How Surgical Mode Works
-
-1. Open a file from the sidebar
-2. Switch to **✂️ Surgical** mode in the chat
-3. Describe the change: _"Add input validation to the create_user function"_
-4. The **Architect** reads the file's symbol map → plans exactly what to change
-5. The **Surgeon** receives only the target code block + plan → writes the replacement
-6. Review the diff, check confidence scores, click **Apply**
-
-### Best Practices (baked in)
-
-1. **Read the map before touching the territory** — Architect works from AST symbol map, not raw code
-2. **Minimal footprint** — Surgeon only returns the target block, validated against the AST
-3. **Verify before commit** — Every change shows a diff + confidence score before writing to disk
+1. Open the app — the first visit prompts you to create an admin account.
+2. Go to **Settings** and either:
+   - Add an OpenAI and/or Anthropic API key, or
+   - Turn on **Offline Mode** if you ran the Ollama setup during install.
+3. (Optional) Connect GitHub, Railway, Vercel, and/or Linear from their Settings panels by pasting a personal API token — no OAuth app registration needed.
+4. Open a project folder from the sidebar and start chatting, or switch to **Surgical** mode for AST-aware targeted edits, or use **Agent mode** for multi-step autonomous tasks (Claude models only).
 
 ---
 
@@ -87,60 +106,48 @@ Then open: **http://127.0.0.1:8000** (production) or **http://127.0.0.1:5173** (
 ```
 surgicalai/
 ├── backend/
-│   ├── main.py                    # FastAPI entry point
-│   ├── database.py                # SQLite (settings, chat, history)
+│   ├── main.py                        # FastAPI entry point
+│   ├── database.py                    # SQLite/Postgres, settings, users, chat history
+│   ├── auth_utils.py / crypto_utils.py # JWT + encrypted key storage
 │   ├── requirements.txt
-│   ├── models/
-│   │   └── schemas.py             # Pydantic models
+│   ├── models/schemas.py              # Pydantic models
 │   ├── services/
-│   │   ├── ast_parser.py          # Multi-language AST parser
-│   │   ├── pipeline.py            # Architect + Surgeon pipeline
-│   │   ├── surgical_editor.py     # Apply changes to files
-│   │   └── git_service.py         # Git operations
+│   │   ├── ast_parser.py              # Multi-language AST/symbol-map parser
+│   │   ├── pipeline.py                # Architect + Surgeon pipeline (Claude/GPT)
+│   │   ├── surgical_editor.py         # Applies validated changes to files
+│   │   ├── task_planner.py / task_runner.py  # Agent mode (Claude-only)
+│   │   ├── offline/                   # Isolated Offline Mode (Ollama/Qwen2.5-Coder)
+│   │   ├── datalab/                   # Spreadsheet/CSV transform engine
+│   │   ├── github_app_auth.py, github_context_tools.py, github_natural_tag.py
+│   │   ├── deploy_status.py
+│   │   └── git_service.py
 │   └── routers/
-│       ├── settings.py            # API key management
-│       ├── chat.py                # Chat sessions + messages
-│       ├── files.py               # File browser + read/write
-│       ├── surgical.py            # Analyze + apply changes
-│       └── git.py                 # Git status/commit
+│       ├── auth.py                    # Login, setup, admin user management
+│       ├── chat.py                    # Chat sessions + streaming
+│       ├── surgical.py / tasks.py     # Surgical apply / agent task control
+│       ├── files.py / session_files.py
+│       ├── git.py / github.py / github_app.py
+│       ├── railway.py / vercel.py / linear.py / deploy_watch.py
+│       ├── images.py                  # Image Studio
+│       ├── datalab.py
+│       └── settings.py
 ├── frontend/
-│   ├── src/
-│   │   ├── App.tsx
-│   │   ├── api/client.ts          # Typed API client
-│   │   ├── stores/appStore.ts     # Zustand state
-│   │   ├── types/index.ts
-│   │   └── components/
-│   │       ├── Layout.tsx
-│   │       ├── Sidebar.tsx        # File tree + chat sessions
-│   │       ├── ChatPanel.tsx      # Chat + surgical mode
-│   │       ├── CodePanel.tsx      # Monaco editor + tabs
-│   │       ├── SurgicalPanel.tsx  # Change review
-│   │       ├── DiffView.tsx       # Before/after diff
-│   │       └── SettingsModal.tsx  # API key + model config
-│   └── package.json
+│   └── src/
+│       ├── App.tsx, stores/appStore.ts (Zustand), types/index.ts
+│       └── components/
+│           ├── Layout.tsx, Sidebar.tsx, ChatPanel.tsx, CodePanel.tsx
+│           ├── SurgicalPanel.tsx, DiffView.tsx, InlineDiffCard.tsx
+│           ├── AgentMissionControl.tsx, TaskListPanel.tsx
+│           ├── GitHubPanel.tsx, GitHubAppPanel.tsx, GitHubCommitModal.tsx
+│           ├── RailwayPanel.tsx, VercelPanel.tsx, LinearPanel.tsx
+│           ├── DeployStatusPanel.tsx, DeployWatcher.tsx
+│           ├── ImageStudio.tsx, DataLabModal.tsx, LivePreview.tsx
+│           ├── TestRunnerPanel.tsx, AdminUsersPanel.tsx, SettingsModal.tsx
+│           └── SessionFilesTray.tsx, DownloadAllButton.tsx
 ├── install.sh
 ├── start.sh
 └── start-dev.sh
 ```
-
----
-
-## Data Storage
-
-All data is local at `~/.surgicalai/surgicalai.db`:
-- API key (stored in SQLite, never sent to any service except OpenAI)
-- Chat sessions and history
-- Surgical change history
-- Settings
-
-File backups stored at `.surgicalai_backups/` next to each modified file.
-
----
-
-## Keyboard Shortcuts
-
-- `Ctrl+Enter` — Send message
-- `Ctrl+S` — Save file (in editor)
 
 ---
 
@@ -156,11 +163,13 @@ cd backend && python3 -m pip install -r requirements.txt
 cd frontend && npm install && npm run build
 ```
 
-**API key issues:**
-- Visit Settings → re-enter and verify your key
-- Make sure your key has GPT-4.1 / GPT-4o access
+**API key issues:** Settings → re-enter and verify your key for the provider you're using.
 
 **Port 8000 in use:**
 ```bash
 kill $(lsof -ti:8000) && ./start.sh
 ```
+
+**Offline Mode setup failed:** re-run `./install.sh` any time, or check `install-debug.log` for the exact error (port conflicts, missing `zstd`, or a slow model pull are the most common causes).
+
+**Integration not connecting (GitHub/Railway/Vercel/Linear):** make sure the pasted token has the right scopes for that provider, and check Settings → the integration's panel for the specific error returned by their API.
