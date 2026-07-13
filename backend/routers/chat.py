@@ -769,6 +769,20 @@ async def smart_stream(req: dict, request: Request):
                       task_count=len(tasks))
                 yield _sse({"type": "done"})
                 return
+            else:
+                # Planning failed or the model returned zero usable tasks.
+                # Previously this fell straight through to single-pass with
+                # no signal at all — the non-Claude branch above already
+                # tells the user when Agent Mode can't run; this mirrors it
+                # for the "Claude, but planning produced nothing" case so the
+                # user isn't left wondering why "create tasks" silently did
+                # a normal single-pass edit instead.
+                _dlog("sse_planning_empty_fallback", session_id=session_id,
+                      user_id=current_user_id, architect_model=_arch_model)
+                yield _sse({"type": "chat", "content": (
+                    "*Note: Agent Mode couldn't generate a task plan for this "
+                    "request. Running it as a normal single-pass request instead.*\n\n"
+                )})
         # ── End agentic task branch ───────────────────────────────────────
 
         _phase = "single_pass"

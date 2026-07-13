@@ -9,10 +9,12 @@ If anything goes wrong, returns the original plan unchanged.
 """
 
 import re
-import logging
 from typing import List, Dict
 
-logger = logging.getLogger(__name__)
+# `logging` here previously had no basicConfig/handler anywhere in backend/,
+# so logger.info/warning calls went nowhere — silent by construction. Swapped
+# to _dlog, the one logging path proven to actually surface output.
+from services.pipeline import _dlog
 
 # ── File-path extraction ────────────────────────────────────────────────
 # Matches common code file paths in task detail text.
@@ -125,16 +127,13 @@ def validate_and_merge(planned_tasks: List[Dict]) -> List[Dict]:
 
         # If no merging happened, return as-is
         if len(groups) == len(planned_tasks):
-            logger.info("[plan_validator] No overlapping files detected, %d tasks unchanged", len(planned_tasks))
+            _dlog("plan_validator_no_overlap", task_count=len(planned_tasks))
             return planned_tasks
 
         merged = [_merge_tasks([planned_tasks[i] for i in group]) for group in groups]
-        logger.info(
-            "[plan_validator] Merged %d tasks → %d tasks (shared file targets)",
-            len(planned_tasks), len(merged)
-        )
+        _dlog("plan_validator_merged", before=len(planned_tasks), after=len(merged))
         return merged
 
     except Exception as exc:
-        logger.warning("[plan_validator] Error during validation, returning original plan: %s", exc)
+        _dlog("plan_validator_error", error=str(exc), detail="returning original plan unchanged")
         return planned_tasks

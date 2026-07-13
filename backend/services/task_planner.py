@@ -19,7 +19,7 @@ import uuid
 from database import get_db, get_setting
 
 # Reuse the exact same key-resolution + model guard the pipeline uses.
-from services.pipeline import _get_anthropic_key, _is_claude_model
+from services.pipeline import _get_anthropic_key, _is_claude_model, _dlog
 
 TERMINAL_STATUSES = ("done", "blocked", "cancelled", "error")
 
@@ -111,7 +111,8 @@ async def plan_tasks(message: str, session_files: list, user_id: str = "") -> di
 
     try:
         anthropic_key = _get_anthropic_key(user_id)
-    except Exception:
+    except Exception as exc:
+        _dlog("task_planner_no_key", user_id=user_id, error=str(exc))
         return {"preamble": "", "tasks": []}
 
     model = get_setting("architect_model", "claude-sonnet-5")
@@ -126,9 +127,9 @@ async def plan_tasks(message: str, session_files: list, user_id: str = "") -> di
 
     user_block = f"User request:\n{message}{file_hint}"
 
-    print(f"[task_planner] planning with model={model}, num_files={len(session_files)}, "
-          f"files={[sf.get('filename','') for sf in session_files][:10]}, "
-          f"msg_len={len(message)}")
+    _dlog("task_planner_call_start", model=model, num_files=len(session_files),
+          files=[sf.get("filename", "") for sf in session_files][:10],
+          msg_len=len(message))
 
     try:
         client = AsyncAnthropic(api_key=anthropic_key)
@@ -148,21 +149,20 @@ async def plan_tasks(message: str, session_files: list, user_id: str = "") -> di
         _block_types = [getattr(b, "type", "?") for b in resp.content]
         _stop = getattr(resp, "stop_reason", None)
         _otoks = getattr(getattr(resp, "usage", None), "output_tokens", None)
-        print(f"[task_planner] plan response stop_reason={_stop} "
-              f"output_tokens={_otoks} block_types={_block_types} raw_len={len(raw)}")
+        _dlog("task_planner_call_done", stop_reason=_stop, output_tokens=_otoks,
+              block_types=_block_types, raw_len=len(raw))
         if not raw.strip():
             # Loud, attributable failure instead of a silent empty plan.
-            print(f"[task_planner] EMPTY TEXT from model (stop_reason={_stop}, "
-                  f"block_types={_block_types}) — planner degraded to no-task fallback")
+            _dlog("task_planner_empty_text", stop_reason=_stop, block_types=_block_types,
+                  detail="planner degraded to no-task fallback")
     except Exception as exc:
-        print(f"[task_planner] plan call failed: {exc}")
+        _dlog("task_planner_call_failed", error=str(exc))
         return {"preamble": "", "tasks": []}
 
     parsed = _extract_json(raw)
     if not parsed:
         if raw.strip():
-            print(f"[task_planner] response had text but no parseable JSON "
-                  f"(raw_len={len(raw)}, head={raw[:120]!r})")
+            _dlog("task_planner_unparseable_json", raw_len=len(raw), head=raw[:120])
         return {"preamble": "", "tasks": []}
 
     tasks = []
