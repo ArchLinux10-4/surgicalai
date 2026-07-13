@@ -482,6 +482,39 @@ export function SettingsModal() {
                 )}
 
                 {/* Confidence Threshold slider hidden — not wired to pipeline (uses hardcoded 8/10 gate) */}
+
+                <div className="mt-6 pt-5 border-t border-border">
+                  <SectionHeader title="Offline Mode" subtitle="Run fully locally via Ollama — no data leaves your machine" />
+                  <label className="flex items-start gap-3 cursor-pointer group mt-3">
+                    <input type="checkbox" checked={form.ollama_enabled} onChange={(e) => upd('ollama_enabled')(e.target.checked)}
+                      className="mt-0.5 accent-accent" />
+                    <div>
+                      <div className="text-sm font-medium text-ink">Enable offline mode (Qwen2.5-Coder via Ollama)</div>
+                      <div className="text-xs text-muted mt-0.5">
+                        Used when no cloud API key is configured. Plain chat plus single-file rewrites only —
+                        no agent mode / multi-step tasks, since local 7B models aren't reliable at those yet.
+                      </div>
+                    </div>
+                  </label>
+
+                  {form.ollama_enabled && (
+                    <div className="space-y-3 mt-4">
+                      <Field label="Ollama server URL">
+                        <input type="text" value={form.ollama_base_url} onChange={(e) => upd('ollama_base_url')(e.target.value)}
+                          placeholder="http://localhost:11434"
+                          className="w-full bg-overlay border border-border rounded-lg px-3 py-2 text-sm text-ink" />
+                      </Field>
+                      <Field label="Model">
+                        <input type="text" value={form.ollama_model} onChange={(e) => upd('ollama_model')(e.target.value)}
+                          placeholder="qwen2.5-coder:7b"
+                          className="w-full bg-overlay border border-border rounded-lg px-3 py-2 text-sm text-ink" />
+                      </Field>
+                      <div className="text-xs text-faint">
+                        Requires Ollama running locally with the model pulled (<code className="font-mono bg-overlay px-1 rounded">ollama pull qwen2.5-coder:7b</code>).
+                      </div>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 

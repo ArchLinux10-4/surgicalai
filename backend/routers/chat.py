@@ -774,7 +774,17 @@ async def smart_stream(req: dict, request: Request):
         _phase = "single_pass"
         _dlog("sse_single_pass_start", session_id=session_id, user_id=current_user_id,
               elapsed_s=round(time.time() - _stream_t0, 1))
-        _pipeline = run_natural_pipeline_stream if _use_natural else run_smart_pipeline_stream
+
+        # ── Offline mode dispatch (isolated codebase — see services/offline/) ──
+        # Fully separate pipeline for local Qwen2.5-Coder:7b via Ollama. Chosen
+        # only when offline mode is enabled AND no cloud key is configured for
+        # the active model, so Claude/GPT users are never routed here.
+        from services.pipeline import _should_use_ollama as _use_offline_check
+        if _use_offline_check(_arch_model, current_user_id):
+            from services.offline.offline_pipeline import run_offline_stream
+            _pipeline = run_offline_stream
+        else:
+            _pipeline = run_natural_pipeline_stream if _use_natural else run_smart_pipeline_stream
         _saved = False
 
         try:
