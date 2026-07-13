@@ -763,6 +763,7 @@ export function ChatPanel() {
     activeSessions, setActiveSession, messages, addMessage, setMessages,
     isStreaming, setIsStreaming, streamingMessage, setStreamingMessage,
     streamProgress, setStreamProgress, sessions, setSessions, settings, setSettings,
+    streamingSessions, setSessionStreaming, setSessionStreamingMessage, setSessionStreamProgress, clearSessionStream,
     sessionFiles, setSessionFiles, addSessionFile, removeSessionFile,
     agentTasks, setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble, setAgentPhase,
     pendingChatInput, setPendingChatInput,
@@ -822,8 +823,8 @@ export function ChatPanel() {
 
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const abortRef = useRef<AbortController | null>(null)
-  const streamSessionRef = useRef<string | null>(null)
+  const abortMapRef = useRef<Map<string, AbortController>>(new Map())
+  const sentMessageMapRef = useRef<Map<string, string>>(new Map())
   const thinkingTextRef = useRef('')
   const progressHistoryRef = useRef<string[]>([])
 
@@ -858,13 +859,17 @@ export function ChatPanel() {
 
   // Load session files when session changes
   useEffect(() => {
-    // Abort any stream from a previous session to prevent cross-session bleed
-    if (streamSessionRef.current && streamSessionRef.current !== activeSessions) {
-      abortRef.current?.abort()
-      stopStream()
-      streamSessionRef.current = null
-    }
+    // Concurrent sessions: no abort on switch — streams continue in background
     setResumableRun(null)  // stale banner never survives a session switch
+    // Reset local display state so stale flags from the previous session don't
+    // bleed into the new one (e.g. isCompacting disabling input permanently)
+    setIsThinking(false)
+    setIsCompacting(false)
+    setThinkingText('')
+    thinkingTextRef.current = ''
+    setIsBuildingEdit(false)
+    setProgressHistory([])
+    progressHistoryRef.current = []
     if (activeSessions) {
       api.sessionFiles.list(activeSessions)
         .then(files => setSessionFiles(files))
@@ -919,7 +924,12 @@ export function ChatPanel() {
       if ((e.ctrlKey || e.metaKey) && e.key === 'k') { e.preventDefault(); textareaRef.current?.focus() }
       if ((e.ctrlKey || e.metaKey) && e.key === 'n') { e.preventDefault(); newChat() }
       if ((e.ctrlKey || e.metaKey) && e.key === 'p') { e.preventDefault(); fileInputRef.current?.click() }
-      if (e.key === 'Escape' && isStreaming) { abortRef.current?.abort(); stopStream() }
+      if (e.key === 'Escape' && isStreaming) {
+        const sid = useAppStore.getState().activeSessions
+        if (sid) { abortMapRef.current.get(sid)?.abort(); abortMapRef.current.delete(sid) }
+        if (sid) clearSessionStream(sid)
+        else { setIsStreaming(false); setStreamingMessage(''); setStreamProgress('') }
+      }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
@@ -930,10 +940,10 @@ export function ChatPanel() {
     api.settings.getModels().then((d: any) => setAvailableModels(d.models || [])).catch(() => {})
   }, [])
 
-  const stopStream = () => {
-    setIsStreaming(false)
-    setStreamingMessage('')
-    setStreamProgress('')
+  const stopStream = (sessionId?: string) => {
+    const sid = sessionId || useAppStore.getState().activeSessions
+    if (sid) clearSessionStream(sid)
+    else { setIsStreaming(false); setStreamingMessage(''); setStreamProgress('') }
   }
 
   // ── v1.4 per-task execution queue ─────────────────────────────────────
@@ -984,9 +994,11 @@ export function ChatPanel() {
   }
 
   const finishTaskRun = (sid: string, onFinish?: () => void) => {
-    setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
-    setIsBuildingEdit(false)
-    setAgentPhase('complete')
+    clearSessionStream(sid)
+    if (useAppStore.getState().activeSessions === sid) {
+      setIsBuildingEdit(false)
+      setAgentPhase('complete')
+    }
     if (onFinish) onFinish()
     else api.chat.getSessions().then(setSessions).catch(() => {})
     api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
@@ -995,7 +1007,7 @@ export function ChatPanel() {
   const runTaskQueue = (sid: string, runId: string, tasks: any[], onFinish?: () => void) => {
     let idx = 0
     const runNext = () => {
-      if (useAppStore.getState().activeSessions !== sid || idx >= tasks.length) {
+      if (idx >= tasks.length) {
         finishTaskRun(sid, onFinish); return
       }
       const t = tasks[idx++]
@@ -1007,10 +1019,8 @@ export function ChatPanel() {
       let streamErr = ''
       const reconcileOnClose = () => {
         if (sawTerminal) return  // normal close after task_done — already advanced
-        if (useAppStore.getState().activeSessions !== sid) { finishTaskRun(sid, onFinish); return }
         api.tasks.list(sid, runId)
           .then((rows: any[]) => {
-            if (useAppStore.getState().activeSessions !== sid) { finishTaskRun(sid, onFinish); return }
             const row: any = (rows || []).find((r: any) => r.id === t.id)
             const status = row?.status
             if (status === 'done') {
@@ -1041,7 +1051,7 @@ export function ChatPanel() {
       }
       const ctrl = api.stream.executeTask(
         { session_id: sid, run_id: runId, task_id: t.id },
-        (progress) => { if (useAppStore.getState().activeSessions === sid) setStreamProgress(progress) },
+        (progress) => { setSessionStreamProgress(sid, progress) },
         (result) => addTaskResultCard(sid, result),
         reconcileOnClose,  // per-task stream closed
         (err) => { streamErr = err },  // defer: reconcileOnClose decides the outcome
@@ -1054,7 +1064,7 @@ export function ChatPanel() {
           else if (event.type === 'task_blocked' || event.type === 'task_cancelled') finishTaskRun(sid, onFinish)
         },
       )
-      abortRef.current = ctrl
+      abortMapRef.current.set(sid, ctrl)
     }
     runNext()
   }
@@ -1068,9 +1078,8 @@ export function ChatPanel() {
     const { sid, runId, tasks } = resumableRun
     setResumableRun(null)
     setError(null)
-    setIsStreaming(true)
-    setAgentPhase('executing')
-    streamSessionRef.current = sid
+    setSessionStreaming(sid, true)
+    if (useAppStore.getState().activeSessions === sid) setAgentPhase('executing')
     // Server runner (when enabled) also handles resume — /runs/start simply
     // executes whatever is still pending. Non-ok → client queue, as always.
     startServerRun(sid, runId, tasks)
@@ -1089,7 +1098,6 @@ export function ChatPanel() {
   const startServerRun = (sid: string, runId: string, tasks: any[], onFinish?: () => void) => {
     api.runs.start(sid, runId)
       .then((resp: any) => {
-        if (useAppStore.getState().activeSessions !== sid) return
         if (resp?.ok) {
           setAgentPhase('executing')
           setServerRun({ sid, runId, onFinish })
@@ -1099,13 +1107,12 @@ export function ChatPanel() {
         }
       })
       .catch(() => {
-        if (useAppStore.getState().activeSessions === sid) runTaskQueue(sid, runId, tasks, onFinish)
+        runTaskQueue(sid, runId, tasks, onFinish)
       })
   }
 
   useEffect(() => {
     if (!serverRun) return
-    if (useAppStore.getState().activeSessions !== serverRun.sid) { setServerRun(null); return }
     if (agentTasks.length === 0) return
     const TERMINAL = ['done', 'blocked', 'cancelled', 'error']
     if (!agentTasks.every(t => TERMINAL.includes(t.status))) return
@@ -1134,8 +1141,8 @@ export function ChatPanel() {
     const ctrl = api.stream.smart(
       { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id), force_tasks: agentModeOn() },
       (progress) => {
+        setSessionStreamProgress(sessionId, progress)
         if (useAppStore.getState().activeSessions !== sessionId) return
-        setStreamProgress(progress)
         setProgressHistory(prev => {
           if (prev[prev.length - 1] !== progress) {
             const next = [...prev, progress]
@@ -1145,7 +1152,7 @@ export function ChatPanel() {
           return prev
         })
       },
-      (token) => { if (useAppStore.getState().activeSessions !== sessionId) return; accumulated += token; setStreamingMessage(accumulated) },
+      (token) => { accumulated += token; setSessionStreamingMessage(sessionId, accumulated) },
       (result) => {
         gotResult = true
         const _thinking = thinkingTextRef.current
@@ -1155,8 +1162,8 @@ export function ChatPanel() {
           .replace(/<new_file>[\s\S]*$/, '')
           .trim()
 
-        setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
-        setIsBuildingEdit(false)
+        clearSessionStream(sessionId)
+        if (useAppStore.getState().activeSessions === sessionId) setIsBuildingEdit(false)
 
         if (naturalText.trim()) {
           addMessage({
@@ -1205,11 +1212,11 @@ export function ChatPanel() {
         if (gotResult) return
         // Planning was started but fell back to single_pass (< 2 tasks) —
         // reset the mission-control panel so the Architect card disappears.
-        clearAgentTasks()
+        if (useAppStore.getState().activeSessions === sessionId) clearAgentTasks()
         const _thinking = thinkingTextRef.current
         const _steps = [...progressHistoryRef.current]
-        setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
-        setIsBuildingEdit(false)
+        clearSessionStream(sessionId)
+        if (useAppStore.getState().activeSessions === sessionId) setIsBuildingEdit(false)
         if (fullText.trim()) {
           addMessage({
             id: Date.now().toString() + '_ai',
@@ -1238,9 +1245,9 @@ export function ChatPanel() {
           })
           gotResult = true
         }
-        setError(err)
-        setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
-        setIsBuildingEdit(false)
+        if (useAppStore.getState().activeSessions === sessionId) setError(err)
+        clearSessionStream(sessionId)
+        if (useAppStore.getState().activeSessions === sessionId) setIsBuildingEdit(false)
         setTimeout(async () => {
           try {
             if (useAppStore.getState().activeSessions !== sessionId) return
@@ -1262,6 +1269,7 @@ export function ChatPanel() {
       },
       // onCompacting
       (phase) => {
+        if (useAppStore.getState().activeSessions !== sessionId) return
         if (phase === 'start') {
           setIsCompacting(true)
         } else {
@@ -1320,7 +1328,7 @@ export function ChatPanel() {
         }
       }
     )
-    abortRef.current = ctrl
+    abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles]) // all setters are stable; only sessionFiles can change
 
   // Restart stream when an injection was queued — fires once isStreaming settles to false
@@ -1328,9 +1336,9 @@ export function ChatPanel() {
     if (!restartSignal || isStreaming) return
     const { msg, sid } = restartSignal
     setRestartSignal(null)
-    setIsStreaming(true)
-    setStreamProgress('Applying your context...')
-    setStreamingMessage('')
+    setSessionStreaming(sid, true)
+    setSessionStreamProgress(sid, 'Applying your context...')
+    setSessionStreamingMessage(sid, '')
     setProgressHistory(['Applying your context...'])
     setThinkingText('')
     setIsThinking(false)
@@ -1352,10 +1360,7 @@ export function ChatPanel() {
   }
 
   const newChat = async () => {
-    // Abort any running stream from the previous session
-    abortRef.current?.abort()
-    stopStream()
-    streamSessionRef.current = null
+    // Concurrent sessions: don't abort background streams
     try {
       const s = await api.chat.createSession({ title: 'New Chat' })
       const updated = await api.chat.getSessions()
@@ -1566,7 +1571,7 @@ export function ChatPanel() {
     // context immediately — abort current stream and restart with combined message.
     // User sees their message bubble + Claude reacting, just like Tasklet.
     if (isStreaming && input.trim()) {
-      const sid = streamSessionRef.current
+      const sid = activeSessions
       if (!sid) return                       // no session — nothing to inject into
       const inj = input.trim()
       setInput('')
@@ -1581,15 +1586,16 @@ export function ChatPanel() {
       })
       // Build combined message and update sentMessageRef so chained injections
       // accumulate correctly (inject #2 includes inject #1's context)
-      const combined = sentMessageRef.current + '\n\n[Context added mid-stream]: ' + inj
+      const lastMsg = sentMessageMapRef.current.get(sid) || sentMessageRef.current
+      const combined = lastMsg + '\n\n[Context added mid-stream]: ' + inj
       sentMessageRef.current = combined
+      sentMessageMapRef.current.set(sid, combined)
       // Abort current stream and restart with combined context
       pendingInjectionRef.current = ''
       setInjectionQueued(false)
-      abortRef.current?.abort()
-      setIsStreaming(false)
-      setStreamingMessage('')
-      setStreamProgress('')
+      abortMapRef.current.get(sid)?.abort()
+      abortMapRef.current.delete(sid)
+      clearSessionStream(sid)
       setRestartSignal({ msg: combined, sid })
       return
     }
@@ -1601,12 +1607,12 @@ export function ChatPanel() {
     setError(null)
     const text = input.trim()
     sentMessageRef.current = text
+    sentMessageMapRef.current.set(sessionId, text)
     setInput('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
     userScrolledUpRef.current = false  // snap to bottom on user's own send
 
     const sessionId = await ensureSession()
-    streamSessionRef.current = sessionId
 
     // Capture whether this is the first message so we can auto-name the session
     const isFirstMessage = messages.length === 0
@@ -1628,9 +1634,9 @@ export function ChatPanel() {
       created_at: new Date().toISOString(),
     })
 
-    setIsStreaming(true)
-    setStreamProgress('Thinking...')
-    setStreamingMessage('')
+    setSessionStreaming(sessionId, true)
+    setSessionStreamProgress(sessionId, 'Thinking...')
+    setSessionStreamingMessage(sessionId, '')
     setProgressHistory(['Thinking...'])
     setThinkingText('')
     setIsThinking(false)
@@ -1931,7 +1937,11 @@ export function ChatPanel() {
               <span className="text-[11px] text-faint mr-1 select-none">⌘↵</span>
               {isStreaming && (
                 <button
-                  onClick={() => { abortRef.current?.abort(); stopStream() }}
+                  onClick={() => {
+                    const sid = useAppStore.getState().activeSessions
+                    if (sid) { abortMapRef.current.get(sid)?.abort(); abortMapRef.current.delete(sid) }
+                    stopStream(sid || undefined)
+                  }}
                   className="h-8 px-3 rounded-lg bg-danger/15 text-danger text-xs font-semibold flex items-center gap-1.5 hover:bg-danger/25 transition-colors"
                 >
                   <Close sx={{ fontSize: 13 }} /> Stop

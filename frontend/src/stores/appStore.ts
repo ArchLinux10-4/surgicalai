@@ -67,6 +67,13 @@ interface AppState {
   streamProgress: string
   setStreamProgress: (p: string) => void
 
+  // Per-session streaming state (concurrent sessions)
+  streamingSessions: Record<string, { isStreaming: boolean; streamingMessage: string; streamProgress: string }>
+  setSessionStreaming: (sessionId: string, isStreaming: boolean) => void
+  setSessionStreamingMessage: (sessionId: string, msg: string) => void
+  setSessionStreamProgress: (sessionId: string, progress: string) => void
+  clearSessionStream: (sessionId: string) => void
+
   // Multi-file
   multiFileMode: boolean
   setMultiFileMode: (v: boolean) => void
@@ -93,7 +100,6 @@ interface AppState {
   taskPreamble: string
   setAgentTasks: (tasks: import('../types').AgentTask[]) => void
   updateAgentTask: (id: string, patch: Partial<import('../types').AgentTask>) => void
-  appendAgentTaskThinking: (id: string, chunk: string) => void
   clearAgentTasks: () => void
   setTaskRunId: (id: string | null) => void
   setTaskPreamble: (s: string) => void
@@ -123,7 +129,15 @@ export const useAppStore = create<AppState>((set) => ({
   messages: [],
   isLoading: false,
   setSessions: (sessions) => set({ sessions }),
-  setActiveSession: (activeSessions) => set({ activeSessions }),
+  setActiveSession: (activeSessions) => set((state) => {
+    const entry = activeSessions ? state.streamingSessions[activeSessions] : null
+    return {
+      activeSessions,
+      isStreaming: entry?.isStreaming ?? false,
+      streamingMessage: entry?.streamingMessage ?? '',
+      streamProgress: entry?.streamProgress ?? '',
+    }
+  }),
   setMessages: (messages) => set({ messages }),
   addMessage: (m) => set((state) => {
     // Guard: drop messages that belong to a different session (prevents
@@ -184,6 +198,34 @@ export const useAppStore = create<AppState>((set) => ({
   streamProgress: '',
   setStreamProgress: (streamProgress) => set({ streamProgress }),
 
+  // Per-session streaming state — enables concurrent sessions
+  streamingSessions: {},
+  setSessionStreaming: (sessionId, isStreaming) => set((state) => {
+    const entry = state.streamingSessions[sessionId] || { isStreaming: false, streamingMessage: '', streamProgress: '' }
+    const streamingSessions = { ...state.streamingSessions, [sessionId]: { ...entry, isStreaming } }
+    const display = state.activeSessions === sessionId ? { isStreaming } : {}
+    return { streamingSessions, ...display }
+  }),
+  setSessionStreamingMessage: (sessionId, streamingMessage) => set((state) => {
+    const entry = state.streamingSessions[sessionId] || { isStreaming: false, streamingMessage: '', streamProgress: '' }
+    const streamingSessions = { ...state.streamingSessions, [sessionId]: { ...entry, streamingMessage } }
+    const display = state.activeSessions === sessionId ? { streamingMessage } : {}
+    return { streamingSessions, ...display }
+  }),
+  setSessionStreamProgress: (sessionId, streamProgress) => set((state) => {
+    const entry = state.streamingSessions[sessionId] || { isStreaming: false, streamingMessage: '', streamProgress: '' }
+    const streamingSessions = { ...state.streamingSessions, [sessionId]: { ...entry, streamProgress } }
+    const display = state.activeSessions === sessionId ? { streamProgress } : {}
+    return { streamingSessions, ...display }
+  }),
+  clearSessionStream: (sessionId) => set((state) => {
+    const { [sessionId]: _, ...rest } = state.streamingSessions
+    const display = state.activeSessions === sessionId
+      ? { isStreaming: false, streamingMessage: '', streamProgress: '' }
+      : {}
+    return { streamingSessions: rest, ...display }
+  }),
+
   multiFileMode: false,
   setMultiFileMode: (multiFileMode) => set({ multiFileMode }),
   selectedFiles: [],
@@ -210,11 +252,6 @@ export const useAppStore = create<AppState>((set) => ({
   setAgentTasks: (agentTasks) => set({ agentTasks }),
   updateAgentTask: (id, patch) => set((state) => ({
     agentTasks: state.agentTasks.map(t => t.id === id ? { ...t, ...patch } : t)
-  })),
-  appendAgentTaskThinking: (id, chunk) => set((state) => ({
-    // Append streamed extended-thinking; cap to keep the store bounded.
-    agentTasks: state.agentTasks.map(t =>
-      t.id === id ? { ...t, thinking: ((t.thinking || '') + chunk).slice(-24000) } : t)
   })),
   clearAgentTasks: () => set({ agentTasks: [], taskRunId: null, taskPreamble: '', agentPhase: 'idle' }),
   setTaskRunId: (taskRunId) => set({ taskRunId }),

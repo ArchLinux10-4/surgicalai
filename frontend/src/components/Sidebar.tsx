@@ -87,8 +87,8 @@ function relativeTime(iso: string): string {
 }
 
 // ── Session Item ──────────────────────────────────────────────────────────────
-function SessionItem({ session, active, onLoad, onDelete, onRename, selectMode, selected, onToggleSelect }: {
-  session: any; active: boolean
+function SessionItem({ session, active, isSessionStreaming, onLoad, onDelete, onRename, selectMode, selected, onToggleSelect }: {
+  session: any; active: boolean; isSessionStreaming?: boolean
   onLoad: () => void; onDelete: () => void; onRename: (title: string) => void
   selectMode?: boolean; selected?: boolean; onToggleSelect?: () => void
 }) {
@@ -150,7 +150,12 @@ function SessionItem({ session, active, onLoad, onDelete, onRename, selectMode, 
             className="w-full bg-base border border-accent/50 text-ink text-[13px] rounded px-1.5 py-0.5 outline-none"
           />
         ) : (
-          <div className="text-[13px] font-medium truncate leading-snug">{session.title}</div>
+          <div className="text-[13px] font-medium truncate leading-snug flex items-center gap-1.5">
+            {session.title}
+            {isSessionStreaming && (
+              <span className="flex-shrink-0 w-2 h-2 rounded-full bg-accent animate-pulse" title="Streaming..." />
+            )}
+          </div>
         )}
         <div className="text-[11px] text-faint mt-0.5 flex items-center gap-1.5">
           <span>{session.message_count} msgs</span>
@@ -176,7 +181,7 @@ function SessionItem({ session, active, onLoad, onDelete, onRename, selectMode, 
 
 // ── Session List ──────────────────────────────────────────────────────────────
 function SessionList() {
-  const { sessions, setSessions, activeSessions, setActiveSession, setMessages } = useAppStore()
+  const { sessions, setSessions, activeSessions, setActiveSession, setMessages, streamingSessions } = useAppStore()
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<any[]>([])
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
@@ -425,6 +430,7 @@ function SessionList() {
               key={s.id}
               session={s}
               active={activeSessions === s.id}
+              isSessionStreaming={!!streamingSessions[s.id]?.isStreaming}
               onLoad={() => loadSession(s.id)}
               onDelete={() => promptDeleteSession(s.id)}
               onRename={(title) => renameSession(s.id, title)}
@@ -609,7 +615,7 @@ function SessionFilesPanel() {
           ref={fileInputRef}
           type="file"
           multiple
-          accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.rb,.php,.swift,.kt,.html,.css,.scss,.sass,.less,.json,.jsonl,.ndjson,.xml,.yaml,.yml,.toml,.ini,.cfg,.env,.properties,.md,.rst,.txt,.sh,.bash,.zsh,.fish,.sql,.cpp,.c,.h,.hpp,.cc,.cxx,.m,.mm,.vue,.svelte,.astro,.prisma,.graphql,.gql,.proto,.r,.R,.scala,.dart,.lua,.zig,.v,.nim,.ex,.exs,.erl,.hs,.ml,.clj,.tf,.hcl,.dockerfile,.conf,.nginx,.log,.diff,.patch,.tex,.bib,.makefile,image/*,.pdf,.csv,.tsv,.xlsx,.xls,.zip,.tar,.gz,.7z,.rar"
+          accept=".py,.js,.ts,.tsx,.jsx,.go,.rs,.java,.cs,.cpp,.c,.h,.html,.css,.scss,.json,.md,.sh,.sql,.yaml,.yml,.toml,.txt,.env,.rb,.php,.swift,.kt"
           className="hidden"
           onChange={(e) => handleUpload(e.target.files)}
         />
@@ -806,15 +812,6 @@ export function Sidebar() {
     }
   }
 
-  // Hovering over a rail icon previews that tab's content immediately — no
-  // click required. The panel's visibility is still governed by the existing
-  // hover-open delay (or a persisted pin); this just keeps the content in
-  // sync with whichever icon the mouse is currently over.
-  const handleRailHover = (id: TabId) => {
-    if (sidebarTab === id) return
-    setSidebarTab(id)
-  }
-
   const handleCollapse = () => {
     cancelTimers()
     persistPinned(false)
@@ -869,7 +866,6 @@ export function Sidebar() {
             <button
               key={id}
               onClick={() => handleRailClick(id)}
-              onMouseEnter={() => handleRailHover(id)}
               title={tooltip}
               className={`relative flex items-center justify-center w-8 h-8 rounded-lg transition-all ${
                 isActive
