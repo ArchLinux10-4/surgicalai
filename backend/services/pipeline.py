@@ -18050,6 +18050,93 @@ async def run_natural_pipeline_stream(
                 _mw_all_ok = True
                 _mw_correction_model = "claude-sonnet-5"  # correction upgraded to Sonnet 5
 
+                # ── Fix 2+3: Filter windows to only relevant ones ─────────
+                # Fix 2: Skip windows with changed_line_count == 0 (no diff
+                #   changes) — the edit didn't touch that region, so errors
+                #   there are pre-existing, not introduced by the surgeon.
+                # Fix 3: Use QA error line numbers to target correction at
+                #   specific windows — only correct windows that overlap with
+                #   at least one error line from QA feedback.
+                # Combined: a window is relevant if it has diff changes OR
+                #   contains at least one QA-reported error line.
+                # Exception: QA-reference windows (_source=="qa_reference")
+                #   are always relevant — QA explicitly flagged that location.
+                #
+                # Extract error line numbers from QA feedback.
+                _mw_error_lines = set()
+                _mw_qa_texts = []
+                for _mw_qk in ("summary", "plan_deviation"):
+                    _mw_qv = _mw_qa.get(_mw_qk)
+                    if _mw_qv:
+                        _mw_qa_texts.append(str(_mw_qv))
+                for _mw_qk in ("import_issues", "type_errors", "logic_errors",
+                                "downstream_risks", "issues", "risk_verdicts"):
+                    for _mw_qi in (_mw_qa.get(_mw_qk) or []):
+                        if isinstance(_mw_qi, dict):
+                            _mw_qa_texts.append(" ".join(str(v) for v in _mw_qi.values() if v))
+                        else:
+                            _mw_qa_texts.append(str(_mw_qi))
+                _mw_qa_all_text = " ".join(_mw_qa_texts)
+                # Match "line 1465", "Line ~2718", "lines 100-200", "L1465"
+                for _mw_lm in re.finditer(
+                    r'lines?\s*~?\s*(\d+)(?:\s*[-\u2013]\s*(\d+))?',
+                    _mw_qa_all_text, re.IGNORECASE
+                ):
+                    _mw_ls = int(_mw_lm.group(1))
+                    _mw_le = int(_mw_lm.group(2)) if _mw_lm.group(2) else _mw_ls
+                    for _mw_ln in range(_mw_ls, _mw_le + 1):
+                        _mw_error_lines.add(_mw_ln - 1)  # 0-indexed
+                for _mw_lm in re.finditer(
+                    r'L(\d+)(?:\s*[-\u2013]\s*L?(\d+))?', _mw_qa_all_text
+                ):
+                    _mw_ls = int(_mw_lm.group(1))
+                    _mw_le = int(_mw_lm.group(2)) if _mw_lm.group(2) else _mw_ls
+                    for _mw_ln in range(_mw_ls, _mw_le + 1):
+                        _mw_error_lines.add(_mw_ln - 1)  # 0-indexed
+
+                # Filter windows
+                _mw_relevant_windows = []
+                _mw_skipped_windows = []
+                for _mw_fw in _mw_windows:
+                    _fw_has_changes = _mw_fw.get("changed_line_count", 0) > 0
+                    _fw_is_qa_ref = _mw_fw.get("_source") == "qa_reference"
+                    _fw_has_error_line = bool(_mw_error_lines) and any(
+                        _mw_fw["window_start"] <= el <= _mw_fw["window_end"]
+                        for el in _mw_error_lines
+                    )
+                    if _fw_has_changes or _fw_is_qa_ref or _fw_has_error_line:
+                        _mw_relevant_windows.append(_mw_fw)
+                    else:
+                        _mw_skipped_windows.append(_mw_fw)
+
+                if _mw_skipped_windows:
+                    _dlog("correction_multi_window_filtered",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round, idx=_mw_idx,
+                          symbol=_mw_sym.name,
+                          original_window_count=len(_mw_windows),
+                          relevant_window_count=len(_mw_relevant_windows),
+                          skipped_window_count=len(_mw_skipped_windows),
+                          error_lines_found=len(_mw_error_lines),
+                          error_lines_sample=sorted(_mw_error_lines)[:20],
+                          skipped_summary=[{
+                              "ci": w["cluster_index"],
+                              "ws": w["window_start"] + 1,
+                              "we": w["window_end"] + 1,
+                              "changed": w.get("changed_line_count", 0),
+                              "source": w.get("_source", "diff"),
+                          } for w in _mw_skipped_windows])
+                    _mw_windows = _mw_relevant_windows
+
+                # If ALL windows were filtered out, skip this idx entirely
+                if not _mw_windows:
+                    _dlog("correction_multi_window_all_filtered",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round, idx=_mw_idx,
+                          symbol=_mw_sym.name,
+                          note="all windows filtered — no changes or error lines to correct")
+                    continue
+
                 _dlog("correction_multi_window_start",
                       session_id=session_id, user_id=user_id,
                       retry_round=_qa_retry_round, idx=_mw_idx,
@@ -18060,7 +18147,9 @@ async def run_natural_pipeline_stream(
                           "ws": w["window_start"] + 1,
                           "we": w["window_end"] + 1,
                           "lines": w["window_line_count"],
-                      } for w in _mw_windows])
+                          "changed": w.get("changed_line_count", 0),
+                      } for w in _mw_windows],
+                      error_lines_extracted=len(_mw_error_lines))
 
                 # Process windows BOTTOM-TO-TOP — splicing later windows first
                 # keeps earlier window line numbers valid.
