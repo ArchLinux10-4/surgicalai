@@ -14803,17 +14803,32 @@ async def run_natural_pipeline_stream(
 
             async def _recovery_stream_round(_msgs: list):
                 """Run one no-thinking streaming round and parse edit/file/
-                search tags. Yields live SSE frames as text streams in, then
-                yields exactly one dict tagged __recovery_result__=True with
-                the round's final response/edit_blocks/file_blocks/search_block.
+                search/plan tags. Yields live SSE frames as text streams in,
+                then yields exactly one dict tagged __recovery_result__=True
+                with the round's final parse results.
+
+                Evidence (session 9538f9f1, 2026-07-13): 4d565d8 told the
+                model to emit <edit_plan> for 3+ edits. When starvation
+                recovery fired, the model obeyed its prompt and emitted a
+                valid <edit_plan> with 8 items (~2020 chars). But the old
+                recovery parser only knew ("edit", "file", "search") — it
+                treated <edit_plan> as plain text, classified the round as
+                "narration," fired the forced-write nudge, and wasted the
+                remaining Railway window. Fix: parse ALL 5 tag types from
+                TAG_DEFS so recovery handles every tag the main flow does.
                 """
                 _resp = ""
                 _r_edit_blocks: list = []
                 _r_file_blocks: list = []
                 _r_search_block = None
+                _r_plan_block = None  # <edit_plan> content
                 _state = "normal"
                 _normal_buf = ""
                 _tag_buf = ""
+
+                # Parse ALL tags from TAG_DEFS — not a subset.
+                # Evidence: "plan" was missing → <edit_plan> treated as text.
+                _RECOVERY_TAGS = tuple(TAG_DEFS.keys())  # ("edit","file","search","filereq","plan")
 
                 async with aclient.messages.stream(**{
                     **_retry_kwargs,
@@ -14829,11 +14844,11 @@ async def run_natural_pipeline_stream(
                         else:
                             _tag_buf += _text
 
-                        # Minimal tag parser for edit/file/search blocks
+                        # Minimal tag parser — now covers ALL tag types
                         while True:
                             if _state == "normal":
                                 _found = False
-                                for _tname in ("edit", "file", "search"):
+                                for _tname in _RECOVERY_TAGS:
                                     _topen = TAG_DEFS[_tname]["open"]
                                     _ti = _normal_buf.find(_topen)
                                     if _ti != -1:
@@ -14854,8 +14869,10 @@ async def run_natural_pipeline_stream(
                                         yield {"type": "token", "content": _normal_buf[:_safe]}
                                         _normal_buf = _normal_buf[_safe:]
                                     break
-                            elif _state in ("in_edit", "in_file", "in_search"):
+                            elif _state.startswith("in_"):
                                 _tname2 = _state[3:]
+                                if _tname2 not in TAG_DEFS:
+                                    break  # safety — shouldn't happen
                                 _tclose = TAG_DEFS[_tname2]["close"]
                                 _ci = _tag_buf.find(_tclose)
                                 if _ci != -1:
@@ -14866,7 +14883,12 @@ async def run_natural_pipeline_stream(
                                     elif _tname2 == "file":
                                         _r_file_blocks.append(_block_content)
                                         yield {"type": "edit_end", "content": ""}
-                                    else:
+                                    elif _tname2 == "search":
+                                        _r_search_block = _block_content
+                                    elif _tname2 == "plan":
+                                        _r_plan_block = _block_content
+                                    # filereq: store as search for now (same fetch path)
+                                    elif _tname2 == "filereq":
                                         _r_search_block = _block_content
                                     _normal_buf = _tag_buf[_ci + len(_tclose):]
                                     _tag_buf = ""
@@ -14880,37 +14902,35 @@ async def run_natural_pipeline_stream(
                 if _normal_buf.strip():
                     yield {"type": "token", "content": _normal_buf}
 
-                # Close any unclosed edit/file/search block via EOS recovery.
+                # Close any unclosed tag via EOS recovery.
                 # Evidence (session b2f811a3, 2026-07-13): model opened
                 # <search_request> and wrote a full, valid terms/reason JSON
                 # body, but the stream ended before </search_request> ever
-                # printed. The old code only kept the block if the literal
-                # close tag was found (_ci3 != -1), so this real, usable
-                # request was silently discarded, the round logged
-                # search_requested=False, and the whole turn ended as
-                # "text-only, no progress" even though the model did the
-                # right thing. Fix: if the close tag never streamed, force-
-                # close using whatever content was collected instead of
-                # dropping it — same "don't discard real work" principle as
-                # the existing task-3 <surgical_edit> EOS recovery.
-                if _state in ("in_edit", "in_file", "in_search"):
+                # printed. Fix: force-close using whatever content was
+                # collected instead of dropping it.
+                if _state.startswith("in_"):
                     _tname3 = _state[3:]
-                    _tclose3 = TAG_DEFS[_tname3]["close"]
-                    _ci3 = _tag_buf.find(_tclose3)
-                    if _ci3 != -1:
-                        _block3 = _tag_buf[:_ci3]
-                    else:
-                        _dlog("starvation_recovery_eos_force_close",
-                              tag_type=_tname3, content_len=len(_tag_buf))
-                        _block3 = _tag_buf
-                    if _tname3 == "edit":
-                        _r_edit_blocks.append(_block3)
-                    elif _tname3 == "file":
-                        _r_file_blocks.append(_block3)
-                    else:
-                        _r_search_block = _block3
-                    if _tname3 in ("edit", "file"):
-                        yield {"type": "edit_end", "content": ""}
+                    if _tname3 in TAG_DEFS:
+                        _tclose3 = TAG_DEFS[_tname3]["close"]
+                        _ci3 = _tag_buf.find(_tclose3)
+                        if _ci3 != -1:
+                            _block3 = _tag_buf[:_ci3]
+                        else:
+                            _dlog("starvation_recovery_eos_force_close",
+                                  tag_type=_tname3, content_len=len(_tag_buf))
+                            _block3 = _tag_buf
+                        if _tname3 == "edit":
+                            _r_edit_blocks.append(_block3)
+                        elif _tname3 == "file":
+                            _r_file_blocks.append(_block3)
+                        elif _tname3 == "search":
+                            _r_search_block = _block3
+                        elif _tname3 == "plan":
+                            _r_plan_block = _block3
+                        elif _tname3 == "filereq":
+                            _r_search_block = _block3
+                        if _tname3 in ("edit", "file"):
+                            yield {"type": "edit_end", "content": ""}
 
                 yield {
                     "__recovery_result__": True,
@@ -14918,6 +14938,7 @@ async def run_natural_pipeline_stream(
                     "edit_blocks": _r_edit_blocks,
                     "file_blocks": _r_file_blocks,
                     "search_block": _r_search_block,
+                    "plan_block": _r_plan_block,
                 }
 
             try:
@@ -14946,6 +14967,7 @@ async def run_natural_pipeline_stream(
                     _final_edit_blocks = _round_result["edit_blocks"]
                     _final_file_blocks = _round_result["file_blocks"]
                     _search_block = _round_result["search_block"]
+                    _plan_block = _round_result.get("plan_block")
 
                     _dlog("starvation_recovery_round_done",
                           session_id=session_id, user_id=user_id,
@@ -14953,10 +14975,21 @@ async def run_natural_pipeline_stream(
                           response_len=len(_final_response),
                           edit_blocks=len(_final_edit_blocks),
                           file_blocks=len(_final_file_blocks),
-                          search_requested=bool(_search_block))
+                          search_requested=bool(_search_block),
+                          plan_found=bool(_plan_block))
 
                     if _final_edit_blocks or _final_file_blocks:
                         break  # got real edits — genuinely done
+
+                    # Evidence (session 9538f9f1): model emitted <edit_plan>
+                    # with 8 items in recovery. This IS real work — the main
+                    # flow's plan executor (line ~15220) will handle it.
+                    if _plan_block:
+                        _dlog("starvation_recovery_plan_found",
+                              session_id=session_id, user_id=user_id,
+                              recovery_round=_recovery_round,
+                              plan_content_len=len(_plan_block))
+                        break  # plan is actionable output — don't nudge
 
                     if _search_block:
                         if _recovery_round == RECOVERY_MAX_ROUNDS - 1:
@@ -15031,11 +15064,33 @@ async def run_natural_pipeline_stream(
                       edit_blocks=len(_final_edit_blocks),
                       new_file_blocks=len(_final_file_blocks))
 
-                # Replace main-path variables with recovery results
-                if _final_response.strip() or _final_edit_blocks or _final_file_blocks:
+                # Replace main-path variables with recovery results.
+                # Evidence (session 9538f9f1): recovery produced a valid
+                # <edit_plan> — must set edit_plan_data so the plan executor
+                # at line ~15250 fires and processes each edit individually.
+                if _final_response.strip() or _final_edit_blocks or _final_file_blocks or _plan_block:
                     full_response = _final_response
                     edit_blocks_raw = _final_edit_blocks
                     new_file_blocks_raw = _final_file_blocks
+
+                if _plan_block:
+                    import json as _json_plan
+                    try:
+                        _pd_recovery = _json_plan.loads(_plan_block.strip())
+                        if isinstance(_pd_recovery, list) and len(_pd_recovery) > 0:
+                            edit_plan_data = _pd_recovery
+                            _dlog("starvation_recovery_plan_activated",
+                                  session_id=session_id, user_id=user_id,
+                                  plan_items=len(edit_plan_data))
+                        else:
+                            _dlog("starvation_recovery_plan_parse_not_list",
+                                  session_id=session_id, user_id=user_id,
+                                  raw_preview=str(_pd_recovery)[:200])
+                    except Exception as _plan_err:
+                        _dlog("starvation_recovery_plan_parse_error",
+                              session_id=session_id, user_id=user_id,
+                              error=str(_plan_err)[:200],
+                              raw_preview=_plan_block[:200])
 
             except Exception as _recovery_err:
                 _dlog("starvation_recovery_error",
@@ -15051,7 +15106,8 @@ async def run_natural_pipeline_stream(
         if (_streaming_starvation_abort
                 and len(full_response.strip()) == 0
                 and not edit_blocks_raw
-                and not new_file_blocks_raw):
+                and not new_file_blocks_raw
+                and not edit_plan_data):
             _dlog("starvation_total_failure",
                   session_id=session_id, user_id=user_id,
                   model=arch_model,
