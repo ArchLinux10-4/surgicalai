@@ -3979,22 +3979,24 @@ def _extract_qa_reference_lines(
             e0 = min(total - 1, end - 1 + context_lines)
             raw_ranges.append((s0, e0))
 
-    # ── 2. Extract identifier references (camelCase/snake_case ≥ 5 chars) ─
-    # Find identifiers in QA text that actually appear in the code
-    identifiers = set(re.findall(r'[a-zA-Z_]\w{4,}', all_text))
-    # Filter to common English words / QA boilerplate
-    _stopwords = {
-        "should", "would", "could", "about", "after", "before", "between",
-        "being", "below", "above", "check", "error", "found", "function",
-        "their", "there", "these", "those", "through", "under", "which",
-        "while", "within", "without", "never", "still", "correctly",
-        "original", "missing", "existing", "appears", "import", "symbol",
-        "update", "updated", "needs", "lines", "score", "logic", "issue",
-        "issues", "added", "change", "changes", "value", "values", "style",
-        "return", "returns", "undefined", "unused", "defined", "request",
-        "component", "rendering", "properly", "implements",
-    }
-    identifiers -= _stopwords
+    # ── 2. Extract identifier references (PascalCase/camelCase only) ───────
+    # Bug fix: plain r'[a-zA-Z_]\w{4,}' matched English words like "bubble",
+    # "dialog", "modal", "table", "typing" — causing 82 matches → 49 lines →
+    # 3 giant QA-ref windows covering 65% of file (session d59e51e5).
+    # Fix: only match PascalCase (e.g. SuggestTitleDialog) or camelCase
+    # (e.g. swallowEscape) — real code identifiers, not prose.
+    _camel_or_pascal = re.findall(
+        r'\b([A-Z][a-z]+(?:[A-Z][a-z0-9]*)+)\b'  # PascalCase: SuggestTitleDialog
+        r'|'
+        r'\b([a-z][a-z0-9]*(?:[A-Z][a-z0-9]*)+)\b',  # camelCase: swallowEscape
+        all_text
+    )
+    # re.findall with groups returns tuples; flatten and dedupe
+    identifiers = set()
+    for groups in _camel_or_pascal:
+        for g in groups:
+            if g and len(g) >= 5:
+                identifiers.add(g)
 
     ident_line_indices = set()
     for i, line in enumerate(code_lines):
@@ -4119,7 +4121,15 @@ def _augment_windows_with_qa_refs(
     for w in all_windows[1:]:
         prev = merged[-1]
         if w["window_start"] <= prev["window_end"] + context_lines:
-            # Merge: expand previous window
+            # Merge: accumulate changed_line_count ALWAYS when merging,
+            # regardless of whether the window boundary extends.
+            # Bug fix: previously this was inside the `if w["window_end"] > ...`
+            # block, so a diff window (changed=12) fully contained inside a
+            # larger QA-ref window (changed=0) would silently drop its count.
+            # (session d59e51e5: diff window 269-366 changed=12 swallowed by
+            #  QA-ref window 0-531 changed=0 → merged changed=0)
+            prev["changed_line_count"] = prev.get("changed_line_count", 0) + w.get("changed_line_count", 0)
+            # Expand previous window boundary if needed
             if w["window_end"] > prev["window_end"]:
                 new_we = w["window_end"]
                 prev["window_end"] = new_we
@@ -4139,7 +4149,6 @@ def _augment_windows_with_qa_refs(
                         for i in range(owe_m - ows_m + 1)
                         if ows_m + i < len(orig_lines)
                     )
-                prev["changed_line_count"] += w.get("changed_line_count", 0)
         else:
             merged.append(w)
 
@@ -18048,6 +18057,8 @@ async def run_natural_pipeline_stream(
                 _mw_diff = _mw_meta.get("diff_block", "")
                 _mw_running_code = _mw_cs["new_code"]
                 _mw_all_ok = True
+                _mw_any_spliced = False   # Bug 3 fix: track partial success
+                _mw_hard_fail = False     # True on parse error / bounds — not on no_edit
                 _mw_correction_model = "claude-sonnet-5"  # correction upgraded to Sonnet 5
 
                 # ── Fix 2+3: Filter windows to only relevant ones ─────────
@@ -18277,14 +18288,21 @@ async def run_natural_pipeline_stream(
                         _mw_ec = _mw_text.find(EDIT_CLOSE, _mw_ei) if _mw_ei != -1 else -1
 
                         if _mw_ei == -1 or _mw_ec == -1:
+                            # Bug 3 fix: no_edit = model consciously declined
+                            # (e.g. "this is architectural"). Don't break — let
+                            # other windows that DID produce fixes still apply.
+                            # (session d59e51e5: Window 2 succeeded with 188-line
+                            #  splice but was rolled back because Window 1 said
+                            #  "no_edit".)
                             _dlog("correction_multi_window_no_edit",
                                   session_id=session_id, user_id=user_id,
                                   retry_round=_qa_retry_round, idx=_mw_idx,
                                   symbol=_mw_sym.name, window_idx=_mw_wi,
                                   response_len=len(_mw_text),
-                                  response_preview=_mw_text[:300])
+                                  response_preview=_mw_text[:300],
+                                  action="continue_partial")
                             _mw_all_ok = False
-                            break
+                            continue  # was: break — now allows partial success
 
                         _mw_raw = _mw_text[_mw_ei + len(EDIT_OPEN):_mw_ec]
                         _mw_edit = None
@@ -18311,6 +18329,7 @@ async def run_natural_pipeline_stream(
                                   symbol=_mw_sym.name, window_idx=_mw_wi,
                                   raw_preview=_mw_raw[:300])
                             _mw_all_ok = False
+                            _mw_hard_fail = True  # Bug 3: parse failure = hard fail
                             break
 
                         _dlog("correction_multi_window_parsed",
@@ -18384,12 +18403,15 @@ async def run_natural_pipeline_stream(
                                   ws0=_mw_ws0, we0=_mw_we0,
                                   broken_lines=len(_mw_broken_lines))
                             _mw_all_ok = False
+                            _mw_hard_fail = True  # Bug 3: bounds error = hard fail
                             break
 
                         _mw_expected = _mw_we0 - _mw_ws0 + 1
                         _mw_delta = len(_mw_corrected) - _mw_expected
                         _mw_broken_lines[_mw_ws0:_mw_we0 + 1] = _mw_corrected
                         _mw_running_code = "\n".join(_mw_broken_lines)
+
+                        _mw_any_spliced = True  # Bug 3: at least one window succeeded
 
                         _dlog("correction_multi_window_splice_done",
                               session_id=session_id, user_id=user_id,
@@ -18409,10 +18431,22 @@ async def run_natural_pipeline_stream(
                               symbol=_mw_sym.name, window_idx=_mw_wi,
                               error=str(_mw_exc), error_type=type(_mw_exc).__name__)
                         _mw_all_ok = False
+                        _mw_hard_fail = True  # Bug 3: exception = hard fail
                         break
 
                 # ── Final result for this multi-window idx ──
-                if _mw_all_ok:
+                # Bug 3 fix: Accept partial success. If at least one window
+                # spliced successfully and there was no hard failure (parse
+                # error, bounds error, exception), apply the running code.
+                # Previously, a single "no_edit" window rolled back ALL
+                # successful splices. (session d59e51e5: Window 2 succeeded
+                # with 188-line splice, thrown away because Window 1 said
+                # "no_edit".)
+                _mw_should_apply = (
+                    _mw_all_ok                         # all windows succeeded
+                    or (_mw_any_spliced and not _mw_hard_fail)  # partial: ≥1 spliced, no hard fail
+                )
+                if _mw_should_apply:
                     _mw_frag = _fragment_reason(_mw_sym.code, _mw_running_code)
                     if _mw_frag is None:
                         change_shells[_mw_idx]["new_code"] = _mw_running_code
@@ -18430,6 +18464,8 @@ async def run_natural_pipeline_stream(
                               retry_round=_qa_retry_round, idx=_mw_idx,
                               symbol=_mw_sym.name,
                               window_count=len(_mw_windows),
+                              all_ok=_mw_all_ok,
+                              partial=not _mw_all_ok and _mw_any_spliced,
                               original_lines=len(_mw_sym.code.splitlines()),
                               result_lines=len(_mw_running_code.splitlines()))
                     else:
@@ -18445,7 +18481,9 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id,
                           retry_round=_qa_retry_round, idx=_mw_idx,
                           symbol=_mw_sym.name,
-                          note="one or more window corrections failed — no changes applied")
+                          any_spliced=_mw_any_spliced,
+                          hard_fail=_mw_hard_fail,
+                          note="no windows spliced or hard failure — no changes applied")
 
             _dlog("qa_retry_fixed_indices", session_id=session_id, user_id=user_id,
                   retry_round=_qa_retry_round,
