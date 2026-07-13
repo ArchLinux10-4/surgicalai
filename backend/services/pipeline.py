@@ -14766,6 +14766,18 @@ async def run_natural_pipeline_stream(
         # ── Starvation recovery: retry without thinking ─────────────────
         # If adaptive thinking consumed the entire round producing zero text,
         # retry once with thinking DISABLED so all tokens go to real output.
+        #
+        # Evidence (session 74b5b2a8, task a61b7c74, 2026-07 live test):
+        # round 4 stalled on thinking for 123s and was aborted at 222s. The
+        # no-thinking recovery retry ran correctly and the model asked for
+        # two more code regions via a legitimate <search_request> tag —
+        # but this recovery parser only recognized <surgical_edit>/
+        # <new_file>, so the tag text was flushed as plain prose,
+        # `no_edits_produced` fired, and the whole task (236s, one full
+        # API round, real spend) was discarded even though the model did
+        # exactly the right thing. Fix: the recovery parser now also
+        # recognizes <search_request> and can fetch results for it, bounded
+        # to at most one follow-up round so it can never itself starve.
         if (_streaming_starvation_abort
                 and len(full_response.strip()) == 0
                 and _natural_use_claude
@@ -14783,101 +14795,191 @@ async def run_natural_pipeline_stream(
             # Also drop output_config/effort — not valid without thinking
             _retry_kwargs.pop("output_config", None)
 
-            try:
-                _retry_response = ""
-                _retry_edit_blocks: list = []
-                _retry_new_file_blocks: list = []
-                _retry_state = "normal"
-                _retry_normal_buf = ""
-                _retry_tag_buf = ""
+            async def _recovery_stream_round(_msgs: list):
+                """Run one no-thinking streaming round and parse edit/file/
+                search tags. Yields live SSE frames as text streams in, then
+                yields exactly one dict tagged __recovery_result__=True with
+                the round's final response/edit_blocks/file_blocks/search_block.
+                """
+                _resp = ""
+                _r_edit_blocks: list = []
+                _r_file_blocks: list = []
+                _r_search_block = None
+                _state = "normal"
+                _normal_buf = ""
+                _tag_buf = ""
 
                 async with aclient.messages.stream(**{
                     **_retry_kwargs,
-                    "messages": current_messages,
-                }) as _retry_stream:
-                    async for _rev in _retry_stream:
-                        _rev_type = getattr(_rev, "type", None)
-                        if _rev_type == "text":
-                            _text = _rev.text or ""
-                            _retry_response += _text
+                    "messages": _msgs,
+                }) as _stream:
+                    async for _rev in _stream:
+                        if getattr(_rev, "type", None) != "text":
+                            continue
+                        _text = _rev.text or ""
+                        _resp += _text
+                        if _state == "normal":
+                            _normal_buf += _text
+                        else:
+                            _tag_buf += _text
 
-                            if _retry_state == "normal":
-                                _retry_normal_buf += _text
-                            else:
-                                _retry_tag_buf += _text
-
-                            # Minimal tag parser for edit/file blocks
-                            while True:
-                                if _retry_state == "normal":
-                                    _found = False
-                                    for _tname in ("edit", "file"):
-                                        _topen = TAG_DEFS[_tname]["open"]
-                                        _ti = _retry_normal_buf.find(_topen)
-                                        if _ti != -1:
-                                            if _ti > 0:
-                                                yield sse({"type": "token", "content": _retry_normal_buf[:_ti]})
-                                            if _tname in ("edit", "file"):
-                                                yield sse({"type": "edit_start", "content": ""})
-                                            _retry_state = f"in_{_tname}"
-                                            _retry_tag_buf = _retry_normal_buf[_ti + len(_topen):]
-                                            _retry_normal_buf = ""
-                                            _found = True
-                                            break
-                                    if not _found:
-                                        # Flush safe prefix
-                                        _tail = max(len(TAG_DEFS[t]["open"]) for t in TAG_DEFS)
-                                        _safe = max(0, len(_retry_normal_buf) - _tail)
-                                        if _safe > 0:
-                                            yield sse({"type": "token", "content": _retry_normal_buf[:_safe]})
-                                            _retry_normal_buf = _retry_normal_buf[_safe:]
+                        # Minimal tag parser for edit/file/search blocks
+                        while True:
+                            if _state == "normal":
+                                _found = False
+                                for _tname in ("edit", "file", "search"):
+                                    _topen = TAG_DEFS[_tname]["open"]
+                                    _ti = _normal_buf.find(_topen)
+                                    if _ti != -1:
+                                        if _ti > 0:
+                                            yield {"type": "token", "content": _normal_buf[:_ti]}
+                                        if _tname in ("edit", "file"):
+                                            yield {"type": "edit_start", "content": ""}
+                                        _state = f"in_{_tname}"
+                                        _tag_buf = _normal_buf[_ti + len(_topen):]
+                                        _normal_buf = ""
+                                        _found = True
                                         break
-                                elif _retry_state in ("in_edit", "in_file"):
-                                    _tname2 = _retry_state[3:]
-                                    _tclose = TAG_DEFS[_tname2]["close"]
-                                    _ci = _retry_tag_buf.find(_tclose)
-                                    if _ci != -1:
-                                        _block_content = _retry_tag_buf[:_ci]
-                                        if _tname2 == "edit":
-                                            _retry_edit_blocks.append(_block_content)
-                                        else:
-                                            _retry_new_file_blocks.append(_block_content)
-                                        yield sse({"type": "edit_end", "content": ""})
-                                        _retry_normal_buf = _retry_tag_buf[_ci + len(_tclose):]
-                                        _retry_tag_buf = ""
-                                        _retry_state = "normal"
+                                if not _found:
+                                    # Flush safe prefix
+                                    _tail = max(len(TAG_DEFS[t]["open"]) for t in TAG_DEFS)
+                                    _safe = max(0, len(_normal_buf) - _tail)
+                                    if _safe > 0:
+                                        yield {"type": "token", "content": _normal_buf[:_safe]}
+                                        _normal_buf = _normal_buf[_safe:]
+                                    break
+                            elif _state in ("in_edit", "in_file", "in_search"):
+                                _tname2 = _state[3:]
+                                _tclose = TAG_DEFS[_tname2]["close"]
+                                _ci = _tag_buf.find(_tclose)
+                                if _ci != -1:
+                                    _block_content = _tag_buf[:_ci]
+                                    if _tname2 == "edit":
+                                        _r_edit_blocks.append(_block_content)
+                                        yield {"type": "edit_end", "content": ""}
+                                    elif _tname2 == "file":
+                                        _r_file_blocks.append(_block_content)
+                                        yield {"type": "edit_end", "content": ""}
                                     else:
-                                        break
+                                        _r_search_block = _block_content
+                                    _normal_buf = _tag_buf[_ci + len(_tclose):]
+                                    _tag_buf = ""
+                                    _state = "normal"
                                 else:
                                     break
+                            else:
+                                break
 
                 # Flush remaining normal text
-                if _retry_normal_buf.strip():
-                    yield sse({"type": "token", "content": _retry_normal_buf})
+                if _normal_buf.strip():
+                    yield {"type": "token", "content": _normal_buf}
 
-                # Close any unclosed edit/file block via EOS recovery
-                if _retry_state in ("in_edit", "in_file"):
-                    _tname3 = _retry_state[3:]
+                # Close any unclosed edit/file/search block via EOS recovery
+                if _state in ("in_edit", "in_file", "in_search"):
+                    _tname3 = _state[3:]
                     _tclose3 = TAG_DEFS[_tname3]["close"]
-                    _ci3 = _retry_tag_buf.find(_tclose3)
+                    _ci3 = _tag_buf.find(_tclose3)
                     if _ci3 != -1:
-                        _block3 = _retry_tag_buf[:_ci3]
+                        _block3 = _tag_buf[:_ci3]
                         if _tname3 == "edit":
-                            _retry_edit_blocks.append(_block3)
+                            _r_edit_blocks.append(_block3)
+                        elif _tname3 == "file":
+                            _r_file_blocks.append(_block3)
                         else:
-                            _retry_new_file_blocks.append(_block3)
-                    yield sse({"type": "edit_end", "content": ""})
+                            _r_search_block = _block3
+                    if _tname3 in ("edit", "file"):
+                        yield {"type": "edit_end", "content": ""}
+
+                yield {
+                    "__recovery_result__": True,
+                    "response": _resp,
+                    "edit_blocks": _r_edit_blocks,
+                    "file_blocks": _r_file_blocks,
+                    "search_block": _r_search_block,
+                }
+
+            try:
+                _final_response = ""
+                _final_edit_blocks: list = []
+                _final_file_blocks: list = []
+                _recovery_msgs = current_messages
+                # Bounded so a search-driven follow-up can never itself
+                # starve: 1 initial no-thinking attempt + at most 1
+                # search-fetch follow-up round.
+                RECOVERY_MAX_ROUNDS = 2
+
+                for _recovery_round in range(RECOVERY_MAX_ROUNDS):
+                    _round_result = None
+                    async for _ev in _recovery_stream_round(_recovery_msgs):
+                        if _ev.get("__recovery_result__"):
+                            _round_result = _ev
+                        else:
+                            yield sse(_ev)
+
+                    _final_response = _round_result["response"]
+                    _final_edit_blocks = _round_result["edit_blocks"]
+                    _final_file_blocks = _round_result["file_blocks"]
+                    _search_block = _round_result["search_block"]
+
+                    _dlog("starvation_recovery_round_done",
+                          session_id=session_id, user_id=user_id,
+                          recovery_round=_recovery_round,
+                          response_len=len(_final_response),
+                          edit_blocks=len(_final_edit_blocks),
+                          file_blocks=len(_final_file_blocks),
+                          search_requested=bool(_search_block))
+
+                    if not _search_block:
+                        break  # got edits, plain text, or nothing — done
+
+                    if _recovery_round == RECOVERY_MAX_ROUNDS - 1:
+                        # Bounded — no rounds left even though it asked again
+                        _dlog("starvation_recovery_search_limit_reached",
+                              session_id=session_id, user_id=user_id,
+                              search_block_preview=str(_search_block)[:200])
+                        break
+
+                    _sd = _parse_search_content(_search_block)
+                    _recovery_terms = ([str(t).strip() for t in _sd.get("terms", [])
+                                        if str(t).strip()] if _sd else [])
+                    if not _recovery_terms:
+                        _dlog("starvation_recovery_search_unparseable",
+                              session_id=session_id, user_id=user_id,
+                              raw_preview=str(_search_block)[:200])
+                        break
+
+                    yield sse({"type": "progress",
+                               "content": f"Fetching more code: {', '.join(_recovery_terms[:3])}..."})
+                    _recovery_search_results = _resolve_search_multifile(
+                        _recovery_terms, symbol_maps_by_name, file_content_lookup_stream
+                    )
+                    _dlog("starvation_recovery_search_results",
+                          session_id=session_id, user_id=user_id,
+                          terms=_recovery_terms,
+                          results_chars=len(_recovery_search_results))
+
+                    _recovery_msgs = _recovery_msgs + [
+                        {"role": "assistant", "content": _final_response or "(requesting more code...)"},
+                        {"role": "user", "content":
+                            "Here are the search results you requested:\n"
+                            + _recovery_search_results
+                            + "\n\nThis is your final chance — write your complete "
+                              "<surgical_edit> or <new_file> blocks now. Do NOT emit "
+                              "another <search_request>."},
+                    ]
+                    # loop continues for the bounded follow-up round
 
                 _dlog("starvation_recovery_done",
                       session_id=session_id, user_id=user_id,
-                      response_len=len(_retry_response),
-                      edit_blocks=len(_retry_edit_blocks),
-                      new_file_blocks=len(_retry_new_file_blocks))
+                      response_len=len(_final_response),
+                      edit_blocks=len(_final_edit_blocks),
+                      new_file_blocks=len(_final_file_blocks))
 
                 # Replace main-path variables with recovery results
-                if _retry_response.strip() or _retry_edit_blocks or _retry_new_file_blocks:
-                    full_response = _retry_response
-                    edit_blocks_raw = _retry_edit_blocks
-                    new_file_blocks_raw = _retry_new_file_blocks
+                if _final_response.strip() or _final_edit_blocks or _final_file_blocks:
+                    full_response = _final_response
+                    edit_blocks_raw = _final_edit_blocks
+                    new_file_blocks_raw = _final_file_blocks
 
             except Exception as _recovery_err:
                 _dlog("starvation_recovery_error",

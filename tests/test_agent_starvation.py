@@ -12,11 +12,6 @@ import os
 import textwrap
 import unittest
 
-# Portable path — matches the pattern in test_safe_claude_call.py. This was
-# previously a hardcoded sandbox-only path (/tmp/sgcheck/...) that only
-# existed in one debugging session; it broke test collection for every
-# fresh clone (CI, other machines, this repo re-cloned), aborting the
-# entire pytest run rather than just this file.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PIPELINE = os.path.normpath(os.path.join(_HERE, "..", "backend", "services", "pipeline.py"))
 
@@ -293,8 +288,8 @@ class TestStarvationRecovery(unittest.TestCase):
         """On success, recovery must overwrite full_response and edit_blocks_raw."""
         idx = self.src.find("starvation_recovery_done")
         after = self.src[idx:idx + 800]
-        self.assertIn("full_response = _retry_response", after)
-        self.assertIn("edit_blocks_raw = _retry_edit_blocks", after)
+        self.assertIn("full_response = _final_response", after)
+        self.assertIn("edit_blocks_raw = _final_edit_blocks", after)
 
     def test_recovery_only_when_empty_response(self):
         """Recovery must only trigger when full_response is empty."""
