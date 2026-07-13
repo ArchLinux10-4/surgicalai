@@ -14880,19 +14880,35 @@ async def run_natural_pipeline_stream(
                 if _normal_buf.strip():
                     yield {"type": "token", "content": _normal_buf}
 
-                # Close any unclosed edit/file/search block via EOS recovery
+                # Close any unclosed edit/file/search block via EOS recovery.
+                # Evidence (session b2f811a3, 2026-07-13): model opened
+                # <search_request> and wrote a full, valid terms/reason JSON
+                # body, but the stream ended before </search_request> ever
+                # printed. The old code only kept the block if the literal
+                # close tag was found (_ci3 != -1), so this real, usable
+                # request was silently discarded, the round logged
+                # search_requested=False, and the whole turn ended as
+                # "text-only, no progress" even though the model did the
+                # right thing. Fix: if the close tag never streamed, force-
+                # close using whatever content was collected instead of
+                # dropping it — same "don't discard real work" principle as
+                # the existing task-3 <surgical_edit> EOS recovery.
                 if _state in ("in_edit", "in_file", "in_search"):
                     _tname3 = _state[3:]
                     _tclose3 = TAG_DEFS[_tname3]["close"]
                     _ci3 = _tag_buf.find(_tclose3)
                     if _ci3 != -1:
                         _block3 = _tag_buf[:_ci3]
-                        if _tname3 == "edit":
-                            _r_edit_blocks.append(_block3)
-                        elif _tname3 == "file":
-                            _r_file_blocks.append(_block3)
-                        else:
-                            _r_search_block = _block3
+                    else:
+                        _dlog("starvation_recovery_eos_force_close",
+                              tag_type=_tname3, content_len=len(_tag_buf))
+                        _block3 = _tag_buf
+                    if _tname3 == "edit":
+                        _r_edit_blocks.append(_block3)
+                    elif _tname3 == "file":
+                        _r_file_blocks.append(_block3)
+                    else:
+                        _r_search_block = _block3
                     if _tname3 in ("edit", "file"):
                         yield {"type": "edit_end", "content": ""}
 
@@ -14909,10 +14925,14 @@ async def run_natural_pipeline_stream(
                 _final_edit_blocks: list = []
                 _final_file_blocks: list = []
                 _recovery_msgs = current_messages
-                # Bounded so a search-driven follow-up can never itself
-                # starve: 1 initial no-thinking attempt + at most 1
-                # search-fetch follow-up round.
-                RECOVERY_MAX_ROUNDS = 2
+                # Bounded so no follow-up path can ever starve: 1 initial
+                # no-thinking attempt + at most 1 search-fetch follow-up
+                # round + at most 1 forced-write nudge round. The two
+                # follow-up kinds are mutually exclusive per round (a round
+                # either asked for search OR narrated with no tags at all),
+                # so 3 rounds total is a hard ceiling, never a loop.
+                RECOVERY_MAX_ROUNDS = 3
+                _forced_write_nudge_sent = False
 
                 for _recovery_round in range(RECOVERY_MAX_ROUNDS):
                     _round_result = None
@@ -14935,45 +14955,75 @@ async def run_natural_pipeline_stream(
                           file_blocks=len(_final_file_blocks),
                           search_requested=bool(_search_block))
 
-                    if not _search_block:
-                        break  # got edits, plain text, or nothing — done
+                    if _final_edit_blocks or _final_file_blocks:
+                        break  # got real edits — genuinely done
 
-                    if _recovery_round == RECOVERY_MAX_ROUNDS - 1:
-                        # Bounded — no rounds left even though it asked again
-                        _dlog("starvation_recovery_search_limit_reached",
+                    if _search_block:
+                        if _recovery_round == RECOVERY_MAX_ROUNDS - 1:
+                            # Bounded — no rounds left even though it asked again
+                            _dlog("starvation_recovery_search_limit_reached",
+                                  session_id=session_id, user_id=user_id,
+                                  search_block_preview=str(_search_block)[:200])
+                            break
+
+                        _sd = _parse_search_content(_search_block)
+                        _recovery_terms = ([str(t).strip() for t in _sd.get("terms", [])
+                                            if str(t).strip()] if _sd else [])
+                        if not _recovery_terms:
+                            _dlog("starvation_recovery_search_unparseable",
+                                  session_id=session_id, user_id=user_id,
+                                  raw_preview=str(_search_block)[:200])
+                            break
+
+                        yield sse({"type": "progress",
+                                   "content": f"Fetching more code: {', '.join(_recovery_terms[:3])}..."})
+                        _recovery_search_results = _resolve_search_multifile(
+                            _recovery_terms, symbol_maps_by_name, file_content_lookup_stream
+                        )
+                        _dlog("starvation_recovery_search_results",
                               session_id=session_id, user_id=user_id,
-                              search_block_preview=str(_search_block)[:200])
-                        break
+                              terms=_recovery_terms,
+                              results_chars=len(_recovery_search_results))
 
-                    _sd = _parse_search_content(_search_block)
-                    _recovery_terms = ([str(t).strip() for t in _sd.get("terms", [])
-                                        if str(t).strip()] if _sd else [])
-                    if not _recovery_terms:
-                        _dlog("starvation_recovery_search_unparseable",
+                        _recovery_msgs = _recovery_msgs + [
+                            {"role": "assistant", "content": _final_response or "(requesting more code...)"},
+                            {"role": "user", "content":
+                                "Here are the search results you requested:\n"
+                                + _recovery_search_results
+                                + "\n\nThis is your final chance — write your complete "
+                                  "<surgical_edit> or <new_file> blocks now. Do NOT emit "
+                                  "another <search_request>."},
+                        ]
+                        # loop continues for the bounded follow-up round
+                        continue
+
+                    # No edits, no search request — the model narrated
+                    # instead of producing code (confirmed via session
+                    # b2f811a3: 648 chars of "Before writing the UI I need
+                    # three more things..." with no actionable tag).
+                    # Force exactly one bounded "stop explaining, write it
+                    # now" nudge — this mirrors the manual follow-up prompt
+                    # that reliably fixes it in practice — then give up
+                    # cleanly if it still doesn't produce edits.
+                    if not _forced_write_nudge_sent and _recovery_round < RECOVERY_MAX_ROUNDS - 1:
+                        _forced_write_nudge_sent = True
+                        _dlog("starvation_recovery_text_only_nudge",
                               session_id=session_id, user_id=user_id,
-                              raw_preview=str(_search_block)[:200])
-                        break
+                              recovery_round=_recovery_round,
+                              response_len=len(_final_response))
+                        yield sse({"type": "progress",
+                                   "content": "Model explained its plan but wrote no code — forcing it to write the edit now..."})
+                        _recovery_msgs = _recovery_msgs + [
+                            {"role": "assistant", "content": _final_response or "(thinking...)"},
+                            {"role": "user", "content":
+                                "You explained your reasoning but did not write any code. "
+                                "Do not write any more explanation, plans, or search requests. "
+                                "Using the code context you already have, emit the complete "
+                                "<surgical_edit> or <new_file> block(s) right now."},
+                        ]
+                        continue
 
-                    yield sse({"type": "progress",
-                               "content": f"Fetching more code: {', '.join(_recovery_terms[:3])}..."})
-                    _recovery_search_results = _resolve_search_multifile(
-                        _recovery_terms, symbol_maps_by_name, file_content_lookup_stream
-                    )
-                    _dlog("starvation_recovery_search_results",
-                          session_id=session_id, user_id=user_id,
-                          terms=_recovery_terms,
-                          results_chars=len(_recovery_search_results))
-
-                    _recovery_msgs = _recovery_msgs + [
-                        {"role": "assistant", "content": _final_response or "(requesting more code...)"},
-                        {"role": "user", "content":
-                            "Here are the search results you requested:\n"
-                            + _recovery_search_results
-                            + "\n\nThis is your final chance — write your complete "
-                              "<surgical_edit> or <new_file> blocks now. Do NOT emit "
-                              "another <search_request>."},
-                    ]
-                    # loop continues for the bounded follow-up round
+                    break  # already nudged once, or out of rounds — stop
 
                 _dlog("starvation_recovery_done",
                       session_id=session_id, user_id=user_id,
