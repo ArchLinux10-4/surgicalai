@@ -12378,7 +12378,7 @@ def _build_natural_file_context(
         parts.append(f"EARLIER CONVERSATION (compacted):\n{session_summary}\n")
 
     if not session_files:
-        return "\n".join(parts) if parts else ""
+        return ("\n".join(parts) if parts else ""), set()
 
     # ── Score every file for relevance ───────────────────────────────────
     terms = _extract_search_terms(user_request)
@@ -18915,9 +18915,11 @@ async def run_natural_pipeline_stream(
         yield sse({"type": "done", "content": ""})
 
     except Exception as e:
+        import traceback as _tb
         _dlog("execute_task_exception",
               session_id=session_id,
               error=str(e)[:500],
               error_type=type(e).__name__,
+              traceback=_tb.format_exc()[-2000:],
               user_id=user_id)
         yield f"data: {json.dumps({'type': 'error', 'content': _friendly_error(e)})}\n\n"
