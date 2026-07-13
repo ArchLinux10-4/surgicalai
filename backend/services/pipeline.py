@@ -5079,9 +5079,10 @@ async def analyze_and_plan_stream(
 
         # Structural QA: deterministic checks for missing imports, etc.
         try:
-            from services.structural_qa import run_structural_qa, has_blocking_issues as _sq_blocking
+            from services.structural_qa import run_structural_qa, has_blocking_issues as _sq_blocking, filter_preexisting_issues as _filter_sq_aps
         except ImportError:
             _sq_blocking = None
+            _filter_sq_aps = None
 
         _sq_has_errors = False
         if _sq_blocking is not None:
@@ -5097,6 +5098,20 @@ async def analyze_and_plan_stream(
                         for _c in changes
                     ],
                 )
+                # Filter out pre-existing issues (session d007eaf1 fix)
+                _sq_raw_count = len(_sq_issues)
+                if _filter_sq_aps is not None:
+                    _sq_issues = _filter_sq_aps(
+                        _sq_issues, _sq_orig, _sq_fname,
+                        file_content=file_content or "",
+                    )
+                if _sq_raw_count != len(_sq_issues):
+                    _dlog("aps_structural_qa_preexisting_filtered",
+                          session_id=session_id,
+                          raw_issues=_sq_raw_count,
+                          after_filter=len(_sq_issues),
+                          file=_sq_fname,
+                          user_id=user_id)
                 if _sq_blocking(_sq_issues):
                     _sq_has_errors = True
                     _sq_msgs = [si["message"] for si in _sq_issues if si["severity"] == "error"]
@@ -5533,6 +5548,19 @@ async def analyze_and_plan_stream(
                                             for _c in changes
                                         ],
                                     )
+                                    # Filter pre-existing (session d007eaf1 fix)
+                                    _sq_i2_raw = len(_sq_i2)
+                                    if _filter_sq_aps is not None:
+                                        _sq_i2 = _filter_sq_aps(
+                                            _sq_i2, _sq_o2, file_path or "",
+                                            file_content=file_content or "",
+                                        )
+                                    if _sq_i2_raw != len(_sq_i2):
+                                        _dlog("aps_rerun_tool_sq_preexisting_filtered",
+                                              session_id=session_id,
+                                              raw=_sq_i2_raw, after=len(_sq_i2),
+                                              attempt=_aps_attempt + 1,
+                                              user_id=user_id)
                                     if _sq_blocking(_sq_i2):
                                         _sq_still_bad = True
                                         _sq_m2 = [x["message"] for x in _sq_i2 if x["severity"] == "error"]
@@ -5667,6 +5695,19 @@ async def analyze_and_plan_stream(
                                             for _c in changes
                                         ],
                                     )
+                                        # Filter pre-existing (session d007eaf1 fix)
+                                        _sq_i2_raw = len(_sq_i2)
+                                        if _filter_sq_aps is not None:
+                                            _sq_i2 = _filter_sq_aps(
+                                                _sq_i2, _sq_o2, file_path or "",
+                                                file_content=file_content or "",
+                                            )
+                                        if _sq_i2_raw != len(_sq_i2):
+                                            _dlog("aps_rerun_freetext_sq_preexisting_filtered",
+                                                  session_id=session_id,
+                                                  raw=_sq_i2_raw, after=len(_sq_i2),
+                                                  attempt=_aps_attempt + 1,
+                                                  user_id=user_id)
                                         if _sq_blocking(_sq_i2):
                                             _sq_still_bad = True
                                             _sq_m2 = [x["message"] for x in _sq_i2 if x["severity"] == "error"]
@@ -16784,9 +16825,10 @@ async def run_natural_pipeline_stream(
         # issues are found, force the LLM QA verdict/score down so the retry
         # loop fires automatically.
         try:
-            from services.structural_qa import run_structural_qa, has_blocking_issues as _has_sq_blocking
+            from services.structural_qa import run_structural_qa, has_blocking_issues as _has_sq_blocking, filter_preexisting_issues as _filter_sq
         except ImportError:
             _has_sq_blocking = None
+            _filter_sq = None
 
         if _has_sq_blocking is not None:
             for _sq_i, _sq_cs in enumerate(change_shells):
@@ -16804,6 +16846,26 @@ async def run_natural_pipeline_stream(
                         for _s in change_shells
                     ],
                 )
+                # Filter out pre-existing issues in the ORIGINAL code before
+                # the edit — only block on errors the edit INTRODUCED.
+                # (session d007eaf1: pre-existing syntax errors at lines 1465
+                # and 2718 triggered 12 unnecessary correction rounds that
+                # introduced a NEW bug, shipping QA 3/10 instead of 9/10.)
+                if _filter_sq is not None:
+                    _sq_pre_count = len(_sq_issues)
+                    _sq_issues = _filter_sq(
+                        _sq_issues, _sq_orig, _sq_fname,
+                        file_content=_sq_cs.get("file_content") or "",
+                    )
+                    if _sq_pre_count != len(_sq_issues):
+                        _dlog("structural_qa_preexisting_filtered",
+                              session_id=session_id,
+                              filename=_sq_fname,
+                              symbol=_sq_cs["symbol"].name,
+                              orig_issue_count=_sq_pre_count,
+                              remaining_issue_count=len(_sq_issues),
+                              filtered_count=_sq_pre_count - len(_sq_issues),
+                              user_id=user_id)
                 if _has_sq_blocking(_sq_issues):
                     # Merge structural issues into LLM QA result so the retry
                     # prompt includes them and Claude knows exactly what to fix.

@@ -92,6 +92,35 @@ def run_structural_qa(
     return issues
 
 
+def filter_preexisting_issues(
+    issues: List[Dict],
+    original_code: str,
+    filename: str,
+    file_content: str = "",
+    all_changes: Optional[List[dict]] = None,
+) -> List[Dict]:
+    """Remove structural issues that already exist in the original (unedited) code.
+
+    Prevents false-positive blocks when the original file has pre-existing
+    errors (e.g. syntax errors at lines the edit never touched) that the
+    surgeon didn't cause.
+
+    Session d007eaf1: structural QA blocked on syntax errors at lines 1465 and
+    2718 of a 3,459-line symbol when the edit only touched 2 lines near L1792.
+    This triggered 12 unnecessary multi-window correction calls that introduced
+    a NEW bug, shipping QA 3/10 instead of the surgeon's correct 9/10 edit.
+    """
+    orig_issues = run_structural_qa(
+        original_code, original_code, filename,
+        file_content=file_content,
+        all_changes=all_changes or [],
+    )
+    if not orig_issues:
+        return issues  # no pre-existing issues, nothing to filter
+    orig_fingerprints = {(i["check"], i["message"]) for i in orig_issues}
+    return [i for i in issues if (i["check"], i["message"]) not in orig_fingerprints]
+
+
 def format_structural_feedback(issues: List[Dict]) -> str:
     """
     Format structural QA issues into a prompt block for Claude retry.
