@@ -11710,8 +11710,12 @@ on the real symbol. A new file is only correct when genuinely net-new code is re
 
 ━━━ MULTI-EDIT PLANNING (3+ EDITS) ━━━
 
-When your response requires 3 or more <surgical_edit> blocks, do NOT produce them all inline.
-Instead, first explain your approach naturally, then emit an <edit_plan> block:
+When your response requires 3 or more <surgical_edit> blocks, do NOT produce them all inline
+and do NOT write a long explanation first.
+
+In AT MOST 2 short sentences, state what you're about to do. Then IMMEDIATELY emit an
+<edit_plan> block — do not describe each file's changes in prose, that's what the
+"description" field below is for:
 
 <edit_plan>
 [
@@ -11720,9 +11724,11 @@ Instead, first explain your approach naturally, then emit an <edit_plan> block:
 ]
 </edit_plan>
 
-After emitting the plan, STOP writing. The system will execute each edit individually with
-focused context, preventing output truncation. For 1-2 edits, produce <surgical_edit> blocks
-directly as usual. You may still produce <new_file> blocks alongside an <edit_plan>.
+STOP WRITING immediately after the </edit_plan> tag closes. No commentary before, inside,
+between, or after the block beyond the 2-sentence intro. The system will execute each edit
+individually with focused context, preventing output truncation. For 1-2 edits, produce
+<surgical_edit> blocks directly as usual. You may still produce <new_file> blocks alongside
+an <edit_plan>.
 
 ━━━ CONVERSATION RECENCY ━━━
 
