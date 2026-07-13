@@ -980,8 +980,11 @@ export function ChatPanel() {
         updateAgentTask(event.id, { status: 'running', progress: undefined }); break
       case 'task_progress':
         updateAgentTask(event.id, { progress: event.content }); break
-      case 'task_thinking':
-        useAppStore.getState().appendAgentTaskThinking(event.id, event.content || ''); break
+      case 'task_thinking': {
+        const st = useAppStore.getState()
+        const existing = st.agentTasks.find(t => t.id === event.id)?.thinking || ''
+        updateAgentTask(event.id, { thinking: existing + (event.content || '') }); break
+      }
       case 'task_done':
         updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict }); break
       case 'task_blocked':
@@ -1607,12 +1610,12 @@ export function ChatPanel() {
     setError(null)
     const text = input.trim()
     sentMessageRef.current = text
-    sentMessageMapRef.current.set(sessionId, text)
     setInput('')
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
     userScrolledUpRef.current = false  // snap to bottom on user's own send
 
     const sessionId = await ensureSession()
+    sentMessageMapRef.current.set(sessionId, text)
 
     // Capture whether this is the first message so we can auto-name the session
     const isFirstMessage = messages.length === 0
