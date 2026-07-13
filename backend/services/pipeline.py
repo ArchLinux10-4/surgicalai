@@ -1668,6 +1668,26 @@ CORRECTION_TOOLS = [
 ]
 
 
+# ── Generic Anthropic→OpenAI tool format converter ─────────────────────────
+# Converts {"name": ..., "input_schema": ...} → {"type": "function", "function": {"name": ..., "parameters": ...}}
+# Used to give GPT models the same structured tool calls as Claude.
+def _anthropic_to_openai_tools(tools: list) -> list:
+    """Convert a list of Anthropic-format tools to OpenAI function-calling format."""
+    oai_tools = []
+    for t in tools:
+        oai_tools.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+            }
+        })
+    return oai_tools
+
+# Pre-built OpenAI versions of agentic + correction tools
+AGENTIC_TOOLS_V2_OPENAI = _anthropic_to_openai_tools(AGENTIC_TOOLS_V2)
+CORRECTION_TOOLS_OPENAI = _anthropic_to_openai_tools(CORRECTION_TOOLS)
 
 
 
@@ -5155,8 +5175,7 @@ async def analyze_and_plan_stream(
                                         tool_choice={"type": "auto"},
                                     )
                                 else:
-                                    # GPT correction: use free-text JSON instead of tool_use
-                                    # (OpenAI multi-turn tool format differs from Claude)
+                                    # GPT correction: structured tool_use (same tools as Claude)
                                     _corr_oai_msgs = [
                                         {"role": "system", "content": CLAUDE_EDITOR_SYSTEM},
                                     ] + [
@@ -5169,42 +5188,192 @@ async def analyze_and_plan_stream(
                                         lambda: _chat_create(
                                             _agent_oai_client, architect_model,
                                             messages=_corr_oai_msgs,
-                                            response_format={"type": "json_object"},
+                                            tools=CORRECTION_TOOLS_OPENAI,
                                         )
                                     )
-                                    # Simulate a done_fixing response to exit the loop
-                                    # and use the free-text retry path below instead
-                                    _corr_done = True
-                                    _corr_text = _corr_oai_resp.choices[0].message.content or ""
-                                    _raw_corr = _extract_json_from_text(_corr_text)
-                                    _corr_data = json.loads(_raw_corr) if isinstance(_raw_corr, str) else _raw_corr
-                                    for _rc in (_corr_data.get("changes", []) or []):
-                                        _rc_sp = _rc.get("symbol_path", "")
-                                        _rc_nc = _rc.get("new_code", "")
-                                        if _rc_sp and _rc_nc:
+                                    _corr_oai_msg = _corr_oai_resp.choices[0].message
+                                    _corr_oai_tcalls = _corr_oai_msg.tool_calls or []
+
+                                    if not _corr_oai_tcalls:
+                                        # No tool calls — try parsing text as JSON fallback
+                                        _corr_text = (_corr_oai_msg.content or "").strip()
+                                        _dlog("agent_mode_gpt_correction_no_tools_fallback",
+                                              model=architect_model, text_len=len(_corr_text),
+                                              session_id=session_id)
+                                        try:
+                                            _raw_corr = _extract_json_from_text(_corr_text)
+                                            _corr_data = json.loads(_raw_corr) if isinstance(_raw_corr, str) else _raw_corr
+                                            for _rc in (_corr_data.get("changes", []) or []):
+                                                _rc_sp = _rc.get("symbol_path", "")
+                                                _rc_nc = _rc.get("new_code", "")
+                                                if _rc_sp and _rc_nc:
+                                                    _fix_sym = None
+                                                    for _s in symbol_map.symbols:
+                                                        if getattr(_s, "full_path", None) == _rc_sp or getattr(_s, "name", None) == _rc_sp:
+                                                            _fix_sym = _s
+                                                            break
+                                                    if _fix_sym:
+                                                        _fix_diff = _make_diff(_fix_sym.code, _rc_nc, _rc_sp)
+                                                        _fix_tgt, _fix_repl = _compute_target_element(_fix_sym.code, _rc_nc)
+                                                        _corr_changes.append(SurgicalChange(
+                                                            id=str(uuid.uuid4()),
+                                                            symbol=_fix_sym,
+                                                            original_code=_fix_sym.code,
+                                                            new_code=_rc_nc,
+                                                            diff=_fix_diff,
+                                                            confidence=_rc.get("confidence", 9),
+                                                            description=_rc.get("description", "GPT correction"),
+                                                            applied=False,
+                                                            operations=[{"find": _fix_sym.code, "replace": _rc_nc}],
+                                                            target_element=_fix_tgt,
+                                                            replacement=_fix_repl,
+                                                        ))
+                                        except Exception:
+                                            pass
+                                        _corr_done = True
+                                        break
+
+                                    # Process tool calls (OpenAI format)
+                                    _corr_oai_tool_results = []
+                                    for _cotc in _corr_oai_tcalls:
+                                        _cotc_name = _cotc.function.name
+                                        try:
+                                            _cotc_input = json.loads(_cotc.function.arguments) if _cotc.function.arguments else {}
+                                        except json.JSONDecodeError:
+                                            _cotc_input = {}
+
+                                        if _cotc_name == "done_fixing":
+                                            _corr_done = True
+                                            _dlog("agent_mode_gpt_correction_done",
+                                                  session_id=session_id, turn=_corr_turn + 1,
+                                                  summary=_cotc_input.get("summary", ""),
+                                                  total_fixes=len(_corr_changes))
+                                            _corr_oai_tool_results.append({
+                                                "role": "tool",
+                                                "tool_call_id": _cotc.id,
+                                                "content": json.dumps({"status": "ok"}),
+                                            })
+                                            break
+
+                                        elif _cotc_name == "request_symbol_code":
+                                            _req_sp = _cotc_input.get("symbol_path", "")
+                                            _found_sym = None
+                                            for _s in symbol_map.symbols:
+                                                if getattr(_s, "full_path", None) == _req_sp or getattr(_s, "name", None) == _req_sp:
+                                                    _found_sym = _s
+                                                    break
+                                            if not _found_sym:
+                                                for _s in symbol_map.symbols:
+                                                    if _req_sp in (getattr(_s, "full_path", "") or "") or (getattr(_s, "name", "") or "") in _req_sp:
+                                                        _found_sym = _s
+                                                        break
+                                            if _found_sym:
+                                                _corr_oai_tool_results.append({
+                                                    "role": "tool",
+                                                    "tool_call_id": _cotc.id,
+                                                    "content": json.dumps({
+                                                        "symbol_path": _found_sym.full_path,
+                                                        "code": _found_sym.code,
+                                                        "lines": len((_found_sym.code or "").splitlines())
+                                                    }),
+                                                })
+                                            else:
+                                                _available = [getattr(_s, "full_path", getattr(_s, "name", "?")) for _s in symbol_map.symbols[:20]]
+                                                _corr_oai_tool_results.append({
+                                                    "role": "tool",
+                                                    "tool_call_id": _cotc.id,
+                                                    "content": json.dumps({
+                                                        "error": f"Symbol '{_req_sp}' not found",
+                                                        "available_symbols": _available
+                                                    }),
+                                                })
+
+                                        elif _cotc_name == "submit_fix":
+                                            _fix_sp = _cotc_input.get("symbol_path", "")
+                                            _fix_nc = _cotc_input.get("new_code", "")
+                                            _fix_desc = _cotc_input.get("description", "")
+                                            _fix_conf = _cotc_input.get("confidence", 9)
+
                                             _fix_sym = None
                                             for _s in symbol_map.symbols:
-                                                if getattr(_s, "full_path", None) == _rc_sp or getattr(_s, "name", None) == _rc_sp:
+                                                if getattr(_s, "full_path", None) == _fix_sp or getattr(_s, "name", None) == _fix_sp:
                                                     _fix_sym = _s
                                                     break
-                                            if _fix_sym:
-                                                _fix_diff = _make_diff(_fix_sym.code, _rc_nc, _rc_sp)
-                                                _fix_tgt, _fix_repl = _compute_target_element(_fix_sym.code, _rc_nc)
+                                            if not _fix_sym:
+                                                for _s in symbol_map.symbols:
+                                                    if _fix_sp in (getattr(_s, "full_path", "") or "") or (getattr(_s, "name", "") or "") in _fix_sp:
+                                                        _fix_sym = _s
+                                                        break
+
+                                            if _fix_sym and _fix_nc:
+                                                _fix_diff = _make_diff(_fix_sym.code, _fix_nc, _fix_sp)
+                                                _fix_tgt, _fix_repl = _compute_target_element(_fix_sym.code, _fix_nc)
                                                 _corr_changes.append(SurgicalChange(
                                                     id=str(uuid.uuid4()),
                                                     symbol=_fix_sym,
                                                     original_code=_fix_sym.code,
-                                                    new_code=_rc_nc,
+                                                    new_code=_fix_nc,
                                                     diff=_fix_diff,
-                                                    confidence=_rc.get("confidence", 9),
-                                                    description=_rc.get("description", "GPT correction"),
+                                                    confidence=_fix_conf,
+                                                    description=_fix_desc,
+                                                    applied=False,
+                                                    operations=[{"find": _fix_sym.code, "replace": _fix_nc}],
                                                     target_element=_fix_tgt,
-                                                    replacement_code=_fix_repl,
+                                                    replacement=_fix_repl,
                                                 ))
+                                                _dlog("agent_mode_gpt_correction_fix_accepted",
+                                                      session_id=session_id, symbol=_fix_sym.full_path,
+                                                      new_code_lines=len(_fix_nc.splitlines()),
+                                                      confidence=_fix_conf)
+                                                _corr_oai_tool_results.append({
+                                                    "role": "tool",
+                                                    "tool_call_id": _cotc.id,
+                                                    "content": json.dumps({
+                                                        "status": "accepted",
+                                                        "symbol": _fix_sym.full_path,
+                                                        "new_code_lines": len(_fix_nc.splitlines())
+                                                    }),
+                                                })
+                                            elif not _fix_sym:
+                                                _available = [getattr(_s, "full_path", getattr(_s, "name", "?")) for _s in symbol_map.symbols[:20]]
+                                                _corr_oai_tool_results.append({
+                                                    "role": "tool",
+                                                    "tool_call_id": _cotc.id,
+                                                    "content": json.dumps({
+                                                        "error": f"Symbol '{_fix_sp}' not found",
+                                                        "available_symbols": _available
+                                                    }),
+                                                })
+                                            else:
+                                                _corr_oai_tool_results.append({
+                                                    "role": "tool",
+                                                    "tool_call_id": _cotc.id,
+                                                    "content": json.dumps({"error": "new_code is empty"}),
+                                                })
+
+                                    # Check exit conditions
+                                    if _corr_done:
+                                        break
+                                    if not _corr_oai_tool_results:
+                                        _dlog("agent_mode_gpt_correction_no_tool_results",
+                                              session_id=session_id, turn=_corr_turn + 1)
+                                        break
+
+                                    # Add assistant + tool results for next turn (OpenAI format)
+                                    _corr_asst = {"role": "assistant", "content": _corr_oai_msg.content or None}
+                                    _corr_asst["tool_calls"] = [
+                                        {"id": tc.id, "type": "function",
+                                         "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                                        for tc in _corr_oai_tcalls
+                                    ]
+                                    _corr_oai_msgs.append(_corr_asst)
+                                    _corr_oai_msgs.extend(_corr_oai_tool_results)
+
                                     _dlog("agent_mode_gpt_correction_tool_use",
-                                          model=architect_model, changes=len(_corr_changes),
+                                          model=architect_model, turn=_corr_turn + 1,
+                                          changes=len(_corr_changes),
                                           session_id=session_id)
-                                    break
+                                    continue  # next correction turn
                             except Exception as _corr_api_err:
                                 _dlog("correction_tool_use_api_error",
                                       session_id=session_id, turn=_corr_turn + 1,
@@ -9491,241 +9660,131 @@ USER REQUEST:
                       session_id=session_id, user_id=user_id)
                 plan = json.loads(resp_oai.choices[0].message.content)
         else:
-            # ── OpenAI Architect with ReAct search loop ──
-            # Mirrors the Claude ReAct loop: multi-round grep search
-            # until the model has enough context to plan.
+            # ── OpenAI Architect with Tool-Use ReAct Loop ──────────────────
+            # Mirrors Claude's structured tool-use loop: GPT calls
+            # search_codebase/request_file tools for context gathering
+            # and submit_plan for the final plan.
+            # Uses AGENTIC_TOOLS_V2_OPENAI for structured tool calls.
             client = _get_client(user_id)
 
-            # OpenAI uses the same system prompt as Claude — no overrides needed
             _oai_architect_system = _architect_system
 
+            # Import once; failure degrades gracefully
+            try:
+                from services.architect_search_tools import execute_architect_search_tool
+                _dlog("oai_architect_search_tools_import_ok", session_id=session_id)
+            except Exception as _e_ast_imp:
+                execute_architect_search_tool = None
+                _dlog("oai_architect_search_tools_import_failed",
+                      error=str(_e_ast_imp), session_id=session_id)
 
-            # ReAct loop state — scale limits by file size (same as Claude path)
+            # Scale rounds by file size (same logic as Claude path)
             _largest_file_lines_oai = max(
                 (len(sf.get("content", "").split("\n")) for _, (_, sf) in symbol_maps_by_name.items()),
                 default=0
             )
             if _largest_file_lines_oai > 5000:
-                _OAI_REACT_MAX = 8
+                _OAI_REACT_MAX = 10
             elif _largest_file_lines_oai > 2000:
-                _OAI_REACT_MAX = 6
+                _OAI_REACT_MAX = 8
             else:
-                _OAI_REACT_MAX = 4
+                _OAI_REACT_MAX = 6
 
             _oai_round = 0
             _oai_searched_terms = set()
-            _oai_accumulated_context = ""
-            # ── Progress-based round extension (mirror of Claude loop) ──
-            # Terms are deduped via _oai_searched_terms, so any non-empty
-            # result for a new term is genuinely new information.
             _oai_abs_round = 0
-            _OAI_HARD_CEILING = 16
-            _oai_react_cache = getattr(session_files[0], "_react_grep_cache", {}) if session_files else {}
-            plan = {"intent": "search"}  # seed to enter loop
+            _OAI_HARD_CEILING = 20
+            _oai_extra_searched = set()
+            _oai_seen_across = set()
+            plan = None
+
+            # Build initial messages (with images if present)
+            if image_files:
+                _oai_user_content = [{"type": "text", "text": context_msg}]
+                for img_sf in image_files:
+                    img_data = img_sf["content"]
+                    _oai_fname = img_sf.get("filename", "unknown")
+                    if not img_data.startswith("data:"):
+                        ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
+                        mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                                    "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}
+                        mime = mime_map.get(ext, "image/png")
+                        img_data = f"data:{mime};base64,{img_data}"
+                    _oai_ifs = _smart_file_statuses.get(_oai_fname, {})
+                    _oai_ibadge = _file_status_badge(_oai_ifs.get("status", "")) if _oai_ifs else ""
+                    if _oai_ibadge:
+                        _oai_user_content.append({
+                            "type": "text",
+                            "text": f"[Image: {_oai_fname} — {_oai_ibadge}]",
+                        })
+                    _oai_user_content.append({
+                        "type": "image_url",
+                        "image_url": {"url": img_data}
+                    })
+                _oai_messages = [
+                    {"role": "system", "content": _oai_architect_system},
+                ] + _arch_history_msgs + [
+                    {"role": "user", "content": _oai_user_content}
+                ]
+            else:
+                _oai_messages = [
+                    {"role": "system", "content": _oai_architect_system},
+                ] + _arch_history_msgs + [
+                    {"role": "user", "content": context_msg}
+                ]
+
+            # Reasoning models need special kwargs
+            _arch_base = arch_model.split(":")[0].lower()
+            _is_reasoning = _arch_base in NO_TEMPERATURE_MODELS
+            _oai_arch_extra_kwargs = {}
+            if _is_reasoning and _arch_base in REASONING_EFFORT_MODELS:
+                _oai_arch_extra_kwargs["reasoning_effort"] = "low"
+
+            _OAI_ARCH_TIMEOUT = 120
 
             while _oai_round < _OAI_REACT_MAX:
-                _this_intent = plan.get("intent", "chat")
-                if _this_intent != "search":
-                    break  # Architect has enough context — exit loop
-
                 _oai_round += 1
                 _oai_abs_round += 1
-                _search_terms_oai = plan.get("search_terms", [])
-                _new_terms = [t for t in _search_terms_oai if t not in _oai_searched_terms]
+                print(f"[OAI_TOOL_USE] Round {_oai_round}/{_OAI_REACT_MAX} (abs={_oai_abs_round})")
 
-                if _oai_round > 1 and not _new_terms:
-                    break
+                # Inject budget warning on final round
+                if _oai_round == _OAI_REACT_MAX:
+                    _oai_messages.append({
+                        "role": "user",
+                        "content": (
+                            "[SEARCH BUDGET EXHAUSTED] You MUST call submit_plan now. "
+                            "No more search_codebase, request_file, find_callers, "
+                            "find_usages, or get_lines calls. "
+                            "Plan with the context you have."
+                        )
+                    })
 
-                # ── Grep pass (same 2-pass logic as Claude path) ──
-                _grep_results_oai = ""
-                for _st_oai in (_new_terms or _search_terms_oai)[:6]:
-                    _oai_searched_terms.add(_st_oai)
-                    if _st_oai in _oai_react_cache:
-                        _grep_results_oai += _oai_react_cache[_st_oai]
-                        continue
-                    _term_result = ""
-                    for _sfname, (_sm, _sf) in symbol_maps_by_name.items():
-                        _sfcontent = _sf.get("content", "")
-                        if not _sfcontent:
-                            continue
-                        # Pass 1: exact AST symbol match
-                        if _sm is None or not hasattr(_sm, "symbols") or not _sm.symbols:
-                            # No symbol map — skip to Pass 2 grep
-                            pass
-                        _matched_sym = None
-                        if _sm is not None and hasattr(_sm, "symbols") and _sm.symbols:
-                            for _sym_info in _sm.symbols:
-                                if _st_oai.lower() in _sym_info.name.lower() or _st_oai.lower() in _sym_info.full_path.lower():
-                                    _matched_sym = _sym_info
-                                    break
-                        if _matched_sym:
-                            _sym_start = _matched_sym.start_line - 1
-                            _sym_end = _matched_sym.end_line
-                            _sf_lines = _sfcontent.split("\n")
-                            _snippet = "\n".join(
-                                f"L{_sym_start+i+1}: {_sf_lines[_sym_start+i]}"
-                                for i in range(min(_sym_end - _sym_start, 80))
-                                if _sym_start + i < len(_sf_lines)
-                            )
-                            _term_result += f"\n--- {_sfname}: symbol '{_matched_sym.full_path}' (L{_sym_start+1}-{_sym_end}) ---\n{_snippet}\n"
-                            continue
-
-                        # Pass 2: keyword grep, expand to enclosing symbol
-                        _sf_lines = _sfcontent.split("\n")
-                        for _li, _ln in enumerate(_sf_lines):
-                            if _st_oai.lower() in _ln.lower():
-                                _enc_start, _enc_end = max(0, _li - 15), min(len(_sf_lines), _li + 25)
-                                for _sym_info2 in (_sm.symbols if _sm is not None and hasattr(_sm, "symbols") and _sm.symbols else []):
-                                    s2 = _sym_info2.start_line - 1
-                                    e2 = _sym_info2.end_line
-                                    if s2 <= _li < e2:
-                                        _enc_start = s2
-                                        _enc_end = min(e2, s2 + 80)
-                                        break
-                                _window = "\n".join(
-                                    f"L{_enc_start+j+1}: {_sf_lines[_enc_start+j]}"
-                                    for j in range(min(_enc_end - _enc_start, 80))
-                                    if _enc_start + j < len(_sf_lines)
-                                )
-                                if _window not in _term_result:
-                                    _term_result += f"\n--- {_sfname}: matches for '{_st_oai}' ---\n{_window}\n"
-                                break
-                    _oai_react_cache[_st_oai] = _term_result
-                    _grep_results_oai += _term_result
-
-                if _grep_results_oai:
-                    _oai_accumulated_context += _grep_results_oai
-
-                # ── Progress-based round extension ──
-                try:
-                    if _oai_abs_round == _OAI_HARD_CEILING:
-                        # Absolute ceiling: grant exactly one final
-                        # forced-planning round, then exit.
-                        _oai_round = _OAI_REACT_MAX - 1
-                        _dlog("oai_react_hard_ceiling",
-                              session_id=session_id, user_id=user_id,
-                              abs_round=_oai_abs_round,
-                              max_rounds=_OAI_REACT_MAX)
-                    elif _grep_results_oai and _oai_abs_round < _OAI_HARD_CEILING:
-                        # Productive round — refund it.
-                        _oai_round -= 1
-                        _dlog("oai_react_round_productive_extension",
-                              session_id=session_id, user_id=user_id,
-                              abs_round=_oai_abs_round,
-                              counted_round=_oai_round,
-                              result_chars=len(_grep_results_oai))
-                    else:
-                        _dlog("oai_react_round_stalled",
-                              session_id=session_id, user_id=user_id,
-                              abs_round=_oai_abs_round,
-                              counted_round=_oai_round,
-                              terms=(_new_terms or _search_terms_oai)[:5])
-                except Exception as _ext_exc_oai:
-                    # Extension is best-effort — never break the loop.
-                    _dlog("oai_react_extension_error",
-                          session_id=session_id, user_id=user_id,
-                          error=str(_ext_exc_oai),
-                          error_type=type(_ext_exc_oai).__name__)
-
-                # ── "No matches" feedback: tell the model explicitly when search found nothing ──
-                _no_match_terms = [t for t in (_new_terms or _search_terms_oai)[:6]
-                                   if not _oai_react_cache.get(t, "")]
-                if _no_match_terms:
-                    _no_match_msg = (
-                        f"\n⚠️ No matches found in any file for: "
-                        f"{', '.join(repr(t) for t in _no_match_terms)}\n"
-                        "These elements may not exist in the codebase. "
-                        "Try different search terms, or proceed with what you can see.\n"
-                    )
-                    _oai_accumulated_context += _no_match_msg
-
-                # ── Build architect message with accumulated context ──
                 _round_label = f" (search round {_oai_round}/{_OAI_REACT_MAX})" if _oai_round > 1 else ""
-                if _oai_round > 1 and _new_terms:
+                if _oai_round > 1:
                     elapsed = int(time.time() - start_time) if 'start_time' in dir() else 0
                     yield sse({"type": "progress", "content": f"Architect thinking{_round_label}... ({elapsed}s)"})
 
-                _budget_note = ""
-                if _oai_round >= _OAI_REACT_MAX:
-                    _budget_note = (
-                        "\n\n⚠️ SEARCH BUDGET EXHAUSTED — you MUST produce your final plan now. "
-                        "Use the code context you have gathered so far. Do NOT return intent=search again."
-                    )
-
-
-                _oai_context_msg = context_msg
-                if _oai_accumulated_context:
-                    _oai_context_msg += (
-                        f"\n\n=== SEARCH RESULTS (round {_oai_round}) ===\n"
-                        f"{_oai_accumulated_context[:8000]}"
-                        f"\nAlready searched: {', '.join(sorted(_oai_searched_terms))}"
-                        f"{_budget_note}"
-                    )
-
-                if image_files:
-                    user_content = [{"type": "text", "text": _oai_context_msg}]
-                    for img_sf in image_files:
-                        img_data = img_sf["content"]
-                        _oai_fname = img_sf.get("filename", "unknown")
-                        if not img_data.startswith("data:"):
-                            ext = Path(img_sf["filename"]).suffix.lower().lstrip(".")
-                            mime_map = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                                        "webp": "image/webp", "gif": "image/gif", "bmp": "image/bmp"}
-                            mime = mime_map.get(ext, "image/png")
-                            img_data = f"data:{mime};base64,{img_data}"
-                        # Annotate image with new/unchanged/modified status
-                        _oai_ifs = _smart_file_statuses.get(_oai_fname, {})
-                        _oai_ibadge = _file_status_badge(_oai_ifs.get("status", "")) if _oai_ifs else ""
-                        if _oai_ibadge:
-                            user_content.append({
-                                "type": "text",
-                                "text": f"[Image: {_oai_fname} — {_oai_ibadge}]",
-                            })
-                        user_content.append({
-                            "type": "image_url",
-                            "image_url": {"url": img_data}
-                        })
-                    architect_messages = [
-                        {"role": "system", "content": _oai_architect_system},
-                    ] + _arch_history_msgs + [
-                        {"role": "user", "content": user_content}
-                    ]
-                else:
-                    architect_messages = [
-                        {"role": "system", "content": _oai_architect_system},
-                    ] + _arch_history_msgs + [
-                        {"role": "user", "content": _oai_context_msg}
-                    ]
-
-                # Reasoning models (GPT-5.x) need low effort for architect planning —
-                # this is a JSON planning task, not deep reasoning. "low" cuts think
-                # time from 60s+ to ~10s. Only override for reasoning models.
-                _arch_base = arch_model.split(":")[0].lower()
-                _is_reasoning = _arch_base in NO_TEMPERATURE_MODELS
-                _oai_arch_extra_kwargs = {}
-                if _is_reasoning and _arch_base in REASONING_EFFORT_MODELS:
-                    _oai_arch_extra_kwargs["reasoning_effort"] = "low"
-                _dlog("oai_architect_call_setup",
+                _dlog("oai_tool_use_call_setup",
                       model=arch_model, is_reasoning=_is_reasoning,
                       reasoning_effort=_oai_arch_extra_kwargs.get("reasoning_effort", "<default>"),
                       react_round=_oai_round, has_images=bool(image_files),
-                      msg_count=len(architect_messages),
+                      msg_count=len(_oai_messages),
                       session_id=session_id, user_id=user_id)
 
-                _OAI_ARCH_TIMEOUT = 120  # seconds — generous for low-effort call
-
-                async def _call_architect_oai(msgs):
+                async def _call_architect_oai_tu(msgs):
+                    _call_kwargs = {
+                        "model": arch_model,
+                        "messages": msgs,
+                        "tools": AGENTIC_TOOLS_V2_OPENAI,
+                    }
+                    if not _is_reasoning:
+                        _call_kwargs["temperature"] = 0.3
+                    _call_kwargs.update(_oai_arch_extra_kwargs)
                     return await asyncio.to_thread(
-                        lambda: _chat_create(client,
-                            model=arch_model,
-                            messages=msgs,
-                            temperature=0.3,
-                            response_format={"type": "json_object"},
-                            **_oai_arch_extra_kwargs
-                        )
+                        lambda: _chat_create(client, **_call_kwargs)
                     )
 
-                arch_task = asyncio.create_task(_call_architect_oai(architect_messages))
+                arch_task = asyncio.create_task(_call_architect_oai_tu(_oai_messages))
                 start_time = time.time()
                 tick = 0
                 while not arch_task.done():
@@ -9734,132 +9793,397 @@ USER REQUEST:
                     elapsed = int(time.time() - start_time)
                     if tick % 3 == 0:
                         yield sse({"type": "progress", "content": f"Architect thinking{_round_label}... ({elapsed}s)"})
-                    # Timeout guard — bail if model thinks too long
                     if elapsed >= _OAI_ARCH_TIMEOUT and not arch_task.done():
                         arch_task.cancel()
-                        _dlog("oai_architect_timeout",
+                        _dlog("oai_tool_use_timeout",
                               model=arch_model, elapsed=elapsed,
                               timeout=_OAI_ARCH_TIMEOUT,
                               react_round=_oai_round,
                               session_id=session_id, user_id=user_id)
                         yield sse({"type": "progress", "content": f"⚠️ {arch_model} took too long ({elapsed}s). Try again or switch models."})
-                        yield sse({"type": "error", "content": f"The model timed out after {elapsed}s. This can happen with reasoning models on complex prompts. Please try again or switch to a different model."})
+                        yield sse({"type": "error", "content": f"The model timed out after {elapsed}s. Please try again or switch to a different model."})
                         return
 
                 try:
                     response = arch_task.result()
                     _arch_elapsed = round(time.time() - start_time, 1)
-                    # Log response stats for debugging
                     _arch_usage = getattr(response, "usage", None)
-                    _dlog("oai_architect_response_ok",
+                    _dlog("oai_tool_use_response_ok",
                           model=arch_model, elapsed_s=_arch_elapsed,
                           react_round=_oai_round,
                           prompt_tokens=getattr(_arch_usage, "prompt_tokens", None) if _arch_usage else None,
                           completion_tokens=getattr(_arch_usage, "completion_tokens", None) if _arch_usage else None,
-                          total_tokens=getattr(_arch_usage, "total_tokens", None) if _arch_usage else None,
-                          response_len=len(response.choices[0].message.content) if response.choices else 0,
+                          has_tool_calls=bool(response.choices[0].message.tool_calls),
                           session_id=session_id, user_id=user_id)
                 except asyncio.CancelledError:
-                    # Already handled above in timeout guard
                     return
-                except Exception as img_err:
+                except Exception as _oai_tu_err:
                     _arch_elapsed = round(time.time() - start_time, 1)
-                    err_str = str(img_err).lower()
-                    _dlog("oai_architect_error",
+                    err_str = str(_oai_tu_err).lower()
+                    _dlog("oai_tool_use_error",
                           model=arch_model, elapsed_s=_arch_elapsed,
-                          error=str(img_err)[:500], error_type=type(img_err).__name__,
+                          error=str(_oai_tu_err)[:500], error_type=type(_oai_tu_err).__name__,
                           react_round=_oai_round, has_images=bool(image_files),
                           session_id=session_id, user_id=user_id)
                     if image_files and ("image" in err_str or "unsupported" in err_str or "invalid" in err_str):
-                        yield sse({"type": "progress", "content": "⚠️ Images couldn't be read — falling back to text context..."})
-                        architect_messages = [
+                        yield sse({"type": "progress", "content": "⚠️ Images couldn't be read — falling back to text-only..."})
+                        _oai_messages = [
                             {"role": "system", "content": _oai_architect_system},
-                            {"role": "user", "content": _oai_context_msg}
+                        ] + _arch_history_msgs + [
+                            {"role": "user", "content": context_msg}
                         ]
-                        _dlog("oai_architect_image_fallback",
-                              model=arch_model, react_round=_oai_round,
-                              session_id=session_id, user_id=user_id)
-                        arch_task2 = asyncio.create_task(_call_architect_oai(architect_messages))
-                        start_time2 = time.time()
-                        while not arch_task2.done():
-                            await asyncio.sleep(1)
-                            tick += 1
-                            elapsed2 = int(time.time() - start_time2)
-                            if tick % 3 == 0:
-                                yield sse({"type": "progress", "content": f"Architect retrying{_round_label}... ({elapsed2}s)"})
-                            if elapsed2 >= _OAI_ARCH_TIMEOUT and not arch_task2.done():
-                                arch_task2.cancel()
-                                _dlog("oai_architect_retry_timeout",
-                                      model=arch_model, elapsed=elapsed2,
-                                      session_id=session_id, user_id=user_id)
-                                yield sse({"type": "error", "content": f"The model timed out on retry after {elapsed2}s. Please try again or switch models."})
-                                return
-                        try:
-                            response = arch_task2.result()
-                            _dlog("oai_architect_retry_ok",
-                                  model=arch_model,
-                                  elapsed_s=round(time.time() - start_time2, 1),
-                                  session_id=session_id, user_id=user_id)
-                        except asyncio.CancelledError:
-                            return
-                        except Exception as retry_err:
-                            _dlog("oai_architect_retry_error",
-                                  model=arch_model,
-                                  error=str(retry_err)[:500],
-                                  session_id=session_id, user_id=user_id)
-                            raise
-                    else:
-                        raise
+                        continue
+                    raise
 
-                # Defensive JSON parsing — GPT-5 models sometimes return
-                # concatenated JSON objects (known bug). Try normal parse first,
-                # then fall back to extracting the first valid JSON object.
-                _oai_plan_raw = response.choices[0].message.content
-                try:
-                    plan = json.loads(_oai_plan_raw)
-                except json.JSONDecodeError as _jde:
-                    _dlog("oai_architect_json_malformed",
-                          model=arch_model, error=str(_jde)[:200],
-                          raw_len=len(_oai_plan_raw),
-                          raw_preview=_oai_plan_raw[:300],
-                          session_id=session_id, user_id=user_id)
-                    # Try first line (concatenated JSONs are newline-separated)
-                    _first_line = _oai_plan_raw.strip().split("\n")[0]
-                    try:
-                        plan = json.loads(_first_line)
-                        _dlog("oai_architect_json_first_line_ok",
-                              model=arch_model,
-                              session_id=session_id, user_id=user_id)
-                    except json.JSONDecodeError:
-                        # Try extracting first {...} block
-                        _brace_start = _oai_plan_raw.find("{")
-                        if _brace_start >= 0:
-                            _depth = 0
-                            _brace_end = -1
-                            for _ci, _ch in enumerate(_oai_plan_raw[_brace_start:], _brace_start):
-                                if _ch == "{":
-                                    _depth += 1
-                                elif _ch == "}":
-                                    _depth -= 1
-                                    if _depth == 0:
-                                        _brace_end = _ci
-                                        break
-                            if _brace_end > _brace_start:
-                                plan = json.loads(_oai_plan_raw[_brace_start:_brace_end + 1])
-                                _dlog("oai_architect_json_brace_extract_ok",
-                                      model=arch_model,
-                                      session_id=session_id, user_id=user_id)
-                            else:
-                                raise
+                _oai_msg = response.choices[0].message
+                _oai_tool_calls = _oai_msg.tool_calls or []
+
+                # ── Check for submit_plan ──
+                _oai_submit = None
+                for _otc in _oai_tool_calls:
+                    if _otc.function.name == "submit_plan":
+                        try:
+                            _oai_submit = json.loads(_otc.function.arguments)
+                        except json.JSONDecodeError:
+                            _dlog("oai_tool_use_submit_plan_json_error",
+                                  raw=_otc.function.arguments[:200],
+                                  session_id=session_id, round=_oai_round)
+                        break
+
+                if _oai_submit is not None:
+                    plan = _oai_submit
+                    plan.setdefault("intent", "edit" if plan.get("targets") else "chat")
+                    print(f"[OAI_TOOL_USE] Plan submitted: intent={plan.get('intent')} targets={len(plan.get('targets', []))} round={_oai_round}")
+                    break
+
+                # ── No tool calls → text fallback ──
+                if not _oai_tool_calls:
+                    _oai_raw = (_oai_msg.content or "").strip()
+                    print(f"[OAI_TOOL_USE] No tools, text fallback ({len(_oai_raw)} chars)")
+                    if _oai_raw.startswith("```"):
+                        _fl = _oai_raw.split("\n")
+                        if _fl[-1].strip() == "```":
+                            _oai_raw = "\n".join(_fl[1:-1])
                         else:
-                            raise
-                _oai_intent = plan.get("intent", "unknown")
-                print(f"[OAI_REACT] Round {_oai_round}/{_OAI_REACT_MAX} → intent={_oai_intent}"
-                      f" | search_terms={plan.get('search_terms', [])}"
-                      f" | confidence={plan.get('confidence_if_found', plan.get('confidence', '?'))}"
-                      f" | targets={len(plan.get('targets', []))}"
-                      f" | reasoning={plan.get('reasoning', '')[:120]}")
-            # End of OpenAI ReAct while loop
+                            _oai_raw = "\n".join(_fl[1:])
+                    try:
+                        plan = json.loads(_oai_raw)
+                    except json.JSONDecodeError:
+                        try:
+                            plan = json.loads(_repair_json(_oai_raw))
+                        except json.JSONDecodeError:
+                            _bs = _oai_raw.find("{")
+                            _be = _oai_raw.rfind("}")
+                            if _bs >= 0 and _be > _bs:
+                                try:
+                                    plan = json.loads(_oai_raw[_bs:_be + 1])
+                                except json.JSONDecodeError:
+                                    plan = {"intent": "chat", "chat_response": _oai_raw}
+                            else:
+                                plan = {"intent": "chat", "chat_response": _oai_raw}
+                    break
+
+                # ── Execute tool calls ──
+                # Add assistant message with tool calls to conversation
+                _oai_asst_msg = {"role": "assistant", "content": _oai_msg.content or None}
+                _oai_asst_msg["tool_calls"] = [
+                    {
+                        "id": _otc.id,
+                        "type": "function",
+                        "function": {
+                            "name": _otc.function.name,
+                            "arguments": _otc.function.arguments,
+                        }
+                    }
+                    for _otc in _oai_tool_calls
+                ]
+                _oai_messages.append(_oai_asst_msg)
+
+                _oai_round_locs = set()
+                _oai_known_tools = {
+                    "search_codebase", "request_file",
+                    "find_callers", "find_usages", "get_lines",
+                    "list_prs", "get_pr_diff", "get_pr_comments",
+                    "list_issues", "get_issue_comments", "diff_branches",
+                    "list_files", "read_file", "search_code", "push_files",
+                    "push_session_file", "check_deploy",
+                    "create_spreadsheet",
+                }
+
+                for _otc in _oai_tool_calls:
+                    _otc_name = _otc.function.name
+                    try:
+                        _otc_input = json.loads(_otc.function.arguments) if _otc.function.arguments else {}
+                    except json.JSONDecodeError:
+                        _otc_input = {}
+                        _dlog("oai_tool_use_args_json_error", tool=_otc_name,
+                              raw=_otc.function.arguments[:200], session_id=session_id)
+
+                    _otc_result = ""
+
+                    if _otc_name == "search_codebase":
+                        _s_terms = _otc_input.get("terms", [])
+                        _s_new = [t for t in _s_terms if t.lower() not in {s.lower() for s in _oai_searched_terms}]
+                        if not _s_new:
+                            _otc_result = "All requested terms already searched. Call submit_plan with what you have."
+                        else:
+                            yield sse({"type": "progress", "content":
+                                       f"Searching for: {', '.join(_s_new[:3])} (round {_oai_round}/{_OAI_REACT_MAX})..."})
+                            _s_hits = []
+                            _s_seen = set()
+                            for _s_fn, (_s_sm, _s_sf) in symbol_maps_by_name.items():
+                                _s_ct = _s_sf.get("content", "") if isinstance(_s_sf, dict) else ""
+                                if not _s_ct:
+                                    continue
+                                _s_lns = _s_ct.splitlines()
+                                # Pass 1: AST symbol name match
+                                if _s_sm:
+                                    for _s_t in _s_new:
+                                        _s_tl = _s_t.lower()
+                                        for _s_sym in _s_sm.symbols:
+                                            if _s_sym.name.lower() == _s_tl or _s_sym.full_path.lower() == _s_tl:
+                                                _sk = f"{_s_fn}::{_s_sym.full_path}"
+                                                if _sk not in _s_seen:
+                                                    _s_seen.add(_sk)
+                                                    _sl = _s_sym.code.splitlines()
+                                                    _sn = "\n".join(
+                                                        f"{_s_sym.start_line + j:5d}: {_sl[j]}"
+                                                        for j in range(len(_sl))
+                                                    )
+                                                    _s_hits.append(
+                                                        f"SYMBOL MATCH [{_s_fn} :: {_s_sym.full_path} "
+                                                        f"({_s_sym.symbol_type.value}, L{_s_sym.start_line}–{_s_sym.end_line})]:\n{_sn}"
+                                                    )
+                                                break
+                                # Pass 2: keyword grep with enclosing symbol
+                                for _s_t in _s_new:
+                                    _s_tl = _s_t.lower()
+                                    for _s_li, _s_ln in enumerate(_s_lns):
+                                        if _s_tl not in _s_ln.lower():
+                                            continue
+                                        _s_lineno = _s_li + 1
+                                        _s_enc = None
+                                        if _s_sm:
+                                            _s_bsz = float("inf")
+                                            for _s_sym in _s_sm.symbols:
+                                                if _s_sym.start_line <= _s_lineno <= _s_sym.end_line:
+                                                    _sz = _s_sym.end_line - _s_sym.start_line
+                                                    if _sz < _s_bsz:
+                                                        _s_bsz = _sz
+                                                        _s_enc = _s_sym
+                                        if _s_enc:
+                                            _sk = f"{_s_fn}::{_s_enc.full_path}"
+                                            if _sk not in _s_seen:
+                                                _s_seen.add(_sk)
+                                                _el = _s_enc.code.splitlines()
+                                                _en = "\n".join(
+                                                    f"{_s_enc.start_line + j:5d}: {_el[j]}"
+                                                    for j in range(len(_el))
+                                                )
+                                                _s_hits.append(
+                                                    f"GREP MATCH ('{_s_t}') [{_s_fn} :: {_s_enc.full_path} "
+                                                    f"({_s_enc.symbol_type.value}, L{_s_enc.start_line}–{_s_enc.end_line})]:\n{_en}"
+                                                )
+                                        else:
+                                            _sk = f"{_s_fn}::L{_s_lineno}"
+                                            if _sk not in _s_seen:
+                                                _s_seen.add(_sk)
+                                                _ws = max(0, _s_li - 15)
+                                                _we = min(len(_s_lns), _s_li + 16)
+                                                _sr = "\n".join(
+                                                    f"{_ws + j + 1:5d}: {_s_lns[_ws + j]}"
+                                                    for j in range(_we - _ws)
+                                                )
+                                                _s_hits.append(f"GREP MATCH ('{_s_t}') [{_s_fn} L{_s_lineno}]:\n{_sr}")
+                                        break
+                            _oai_searched_terms.update(_s_new)
+                            _oai_round_locs.update(_s_seen)
+                            _otc_result = "\n\n".join(_s_hits) if _s_hits else "No matches found for: " + ", ".join(_s_new)
+                            if _s_hits:
+                                _hp = ", ".join(
+                                    h.split("::")[1].split("(")[0].strip() if "::" in h else h[:40]
+                                    for h in _s_hits[:3]
+                                )
+                                yield sse({"type": "progress", "content":
+                                           f"Found: {_hp}"
+                                           + (f" +{len(_s_hits)-3} more" if len(_s_hits) > 3 else "")})
+
+                    elif _otc_name == "request_file":
+                        _rf_name = _otc_input.get("filename", "")
+                        _rf_match = None
+                        for _rf_fn in symbol_maps_by_name:
+                            if _rf_fn == _rf_name or _rf_fn.endswith(_rf_name) or _rf_name.endswith(_rf_fn):
+                                _rf_match = _rf_fn
+                                break
+                        if _rf_match:
+                            _, _rf_sf = symbol_maps_by_name[_rf_match]
+                            _rf_ct = _rf_sf.get("content", "") if isinstance(_rf_sf, dict) else ""
+                            _rf_lns = _rf_ct.splitlines()
+                            _rf_num = "\n".join(f"{i+1:5d}: {l}" for i, l in enumerate(_rf_lns))
+                            _otc_result = f"FILE: {_rf_match} ({len(_rf_lns)} lines)\n{_rf_num}"
+                            yield sse({"type": "progress", "content": f"Loaded: {_rf_match} ({len(_rf_lns)} lines)"})
+                        else:
+                            _otc_result = f"File '{_rf_name}' not found. Available: {', '.join(symbol_maps_by_name.keys())}"
+
+                    elif _otc_name in ("find_callers", "find_usages", "get_lines"):
+                        _dlog("oai_tu_extra_search_tool_call", tool_name=_otc_name,
+                              tool_input=_otc_input, session_id=session_id, round=_oai_round)
+                        _es_key = f"{_otc_name}:{sorted(_otc_input.items())}"
+                        if _es_key in _oai_extra_searched:
+                            _otc_result = "Already requested — call submit_plan with what you have."
+                        elif execute_architect_search_tool is None:
+                            _otc_result = f"[{_otc_name} unavailable — module failed to load]"
+                        else:
+                            _oai_extra_searched.add(_es_key)
+                            _es_label = _otc_input.get("name") or _otc_input.get("filename", "")
+                            yield sse({"type": "progress", "content":
+                                       f"{_otc_name.replace('_', ' ').title()}: {_es_label}..."})
+                            _otc_result = execute_architect_search_tool(
+                                _otc_name, _otc_input, symbol_maps_by_name, dlog=_dlog
+                            )
+
+                    elif _otc_name == "push_files":
+                        _dlog("oai_tu_push_files_blocked",
+                              tool_input=_otc_input, session_id=session_id, round=_oai_round)
+                        _otc_result = (
+                            "[BLOCKED] push_files is not allowed during the search/planning phase. "
+                            "Include changes in submit_plan with intent='edit'."
+                        )
+
+                    elif _otc_name == "push_session_file":
+                        _dlog("oai_tu_push_session_file_call",
+                              tool_input=_otc_input, session_id=session_id, round=_oai_round)
+                        try:
+                            from services.github_natural_tag import push_session_file_from_db
+                            _psf_parsed = {"tool": "push_session_file", "args": _otc_input}
+                            _otc_result = push_session_file_from_db(
+                                _psf_parsed, user_id, session_id, dlog=_dlog)
+                        except Exception as _psf_err:
+                            _otc_result = f"[push_session_file failed: {_psf_err}]"
+
+                    elif _otc_name == "check_deploy":
+                        _dlog("oai_tu_check_deploy_call",
+                              tool_input=_otc_input, session_id=session_id, round=_oai_round)
+                        try:
+                            from services.deploy_status import check_deploy_status
+                            _otc_result = check_deploy_status(user_id, _otc_input, dlog=_dlog)
+                        except Exception as _cd_err:
+                            _otc_result = f"[check_deploy failed: {_cd_err}]"
+                        yield sse({"type": "progress", "content": "Checked deploy status"})
+
+                    elif _otc_name == "create_spreadsheet":
+                        _dlog("oai_tu_create_spreadsheet_call",
+                              tool_input=_otc_input, session_id=session_id, round=_oai_round)
+                        try:
+                            from services.datalab.config import datalab_enabled
+                            if not datalab_enabled():
+                                _otc_result = "[create_spreadsheet unavailable — DataLab is not enabled]"
+                            else:
+                                _cs_filename = _otc_input.get("filename", "output.csv")
+                                _cs_columns = _otc_input.get("columns", [])
+                                _cs_rows = _otc_input.get("rows", [])
+                                _cs_sheet = _otc_input.get("sheet_name", "Sheet1")
+                                _cs_ext = _cs_filename.rsplit(".", 1)[-1].lower() if "." in _cs_filename else "csv"
+                                _cs_kind = "csv" if _cs_ext in ("csv", "tsv") else "excel"
+                                from services.datalab import persist as _dl_persist
+                                _cs_desc = _dl_persist.persist_result(
+                                    session_id=session_id, source_file_id="",
+                                    source_filename=_cs_filename, source_kind=_cs_kind,
+                                    source_delimiter=",", columns=_cs_columns, rows=_cs_rows,
+                                    transform_sql="", origin="generated", sheet_name=_cs_sheet,
+                                )
+                                _otc_result = (
+                                    f"✅ Created {_cs_desc['filename']} "
+                                    f"({_cs_desc['row_count']} rows × {_cs_desc['column_count']} columns)"
+                                )
+                                yield sse({"type": "progress", "content":
+                                           f"Created: {_cs_desc['filename']} ({_cs_desc['row_count']} rows)"})
+                        except Exception as _cs_err:
+                            _otc_result = f"[create_spreadsheet failed: {_cs_err}]"
+
+                    elif _otc_name in ("list_prs", "get_pr_diff", "get_pr_comments", "list_issues", "get_issue_comments", "diff_branches", "list_files", "read_file", "search_code"):
+                        _dlog("oai_tu_github_context_tool_call", tool_name=_otc_name,
+                              tool_input=_otc_input, session_id=session_id, round=_oai_round)
+                        try:
+                            from services.github_context_tools import execute_github_context_tool
+                        except Exception as _e_gh_imp:
+                            execute_github_context_tool = None
+                        if execute_github_context_tool is None:
+                            _otc_result = f"[{_otc_name} unavailable — module failed to load]"
+                        else:
+                            yield sse({"type": "progress", "content":
+                                       f"GitHub: {_otc_name.replace('_', ' ')}..."})
+                            _otc_result = execute_github_context_tool(
+                                _otc_name, _otc_input, user_id, dlog=_dlog
+                            )
+                            # P7: Register read_file result as session file
+                            if _otc_name == "read_file" and _otc_result and not _otc_result.startswith("["):
+                                try:
+                                    from services.github_natural_tag import fetch_and_register_github_file
+                                    _rf_parsed = {"tool": "read_file", "args": _otc_input}
+                                    _rf_entry = fetch_and_register_github_file(
+                                        _rf_parsed, user_id, session_id, dlog=_dlog)
+                                    if _rf_entry and _rf_entry.get("content"):
+                                        _rf_fname = _rf_entry["filename"]
+                                        try:
+                                            _rf_smap = parser.parse(_rf_entry["content"], _rf_fname)
+                                            symbol_maps_by_name[_rf_fname] = (_rf_smap, _rf_entry)
+                                        except Exception:
+                                            symbol_maps_by_name[_rf_fname] = (None, _rf_entry)
+                                        _oai_searched_terms.clear()
+                                        _oai_round_locs.add(f"{_rf_fname}::REGISTERED")
+                                        _otc_result += (
+                                            f"\n\n[NOTE: '{_rf_fname}' is now loaded and EDITABLE + SEARCHABLE.]"
+                                        )
+                                except Exception:
+                                    pass
+
+                    else:
+                        _otc_result = f"[Unknown tool: {_otc_name}]"
+                        _dlog("oai_tu_unknown_tool", tool_name=_otc_name,
+                              session_id=session_id, round=_oai_round)
+
+                    # Add tool result to conversation (OpenAI format)
+                    _oai_messages.append({
+                        "role": "tool",
+                        "tool_call_id": _otc.id,
+                        "content": str(_otc_result)[:16000],
+                    })
+
+                # ── Adaptive round extension (mirrors Claude path) ──
+                try:
+                    _oai_new_locs = [
+                        loc for loc in _oai_round_locs
+                        if loc not in _oai_seen_across
+                    ]
+                    for loc in _oai_round_locs:
+                        _oai_seen_across.add(loc)
+                    if _oai_abs_round >= _OAI_HARD_CEILING:
+                        _oai_round = _OAI_REACT_MAX - 1
+                        _dlog("oai_tu_hard_ceiling",
+                              session_id=session_id, abs_round=_oai_abs_round,
+                              max_rounds=_OAI_REACT_MAX)
+                    elif _oai_new_locs and _oai_abs_round < _OAI_HARD_CEILING:
+                        _oai_round -= 1
+                        _dlog("oai_tu_round_productive_extension",
+                              session_id=session_id, abs_round=_oai_abs_round,
+                              counted_round=_oai_round,
+                              new_locations=len(_oai_new_locs))
+                    elif not _oai_new_locs:
+                        _dlog("oai_tu_round_stalled",
+                              session_id=session_id, abs_round=_oai_abs_round,
+                              counted_round=_oai_round)
+                except Exception as _oai_ext_err:
+                    _dlog("oai_tu_extension_error",
+                          session_id=session_id, error=str(_oai_ext_err))
+
+                print(f"[OAI_TOOL_USE] Round {_oai_round} done (abs={_oai_abs_round}, seen={len(_oai_seen_across)})")
+
+            # End of OpenAI tool-use while loop
+            if plan is None:
+                plan = {"intent": "chat", "chat_response": "I couldn't determine what to do."}
+            _oai_intent = plan.get("intent", "unknown")
+            print(f"[OAI_TOOL_USE] Final: intent={_oai_intent} targets={len(plan.get('targets', []))}")
 
         intent = plan.get("intent", "chat")
         compliance.set_intent(intent)
