@@ -10,7 +10,7 @@ import { LinearPanel } from './LinearPanel'
 import { VercelPanel } from './VercelPanel'
 import { RailwayPanel } from './RailwayPanel'
 import { useThemeStore } from '../stores/themeStore'
-import { Add, Chat, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
+import { Add, Chat, CloudOff, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile } from '../lib/fileClassify'
 import { DownloadSessionButton } from './DownloadSessionButton'
 
@@ -733,13 +733,38 @@ function LinearIcon({ size = 16 }: { size?: number }) {
   )
 }
 
+// Shown instead of VercelPanel/RailwayPanel while Offline Mode is on — those
+// integrations need real internet access to Vercel/Railway's cloud APIs,
+// which Offline Mode intentionally doesn't assume. No network calls fire.
+function OfflineModeDisabledPanel({ name }: { name: string }) {
+  return (
+    <div className="flex flex-col items-center justify-center h-full gap-2 px-6 text-center">
+      <div className="w-10 h-10 rounded-full bg-overlay flex items-center justify-center text-muted">
+        <CloudOff sx={{ fontSize: 18 }} />
+      </div>
+      <p className="text-sm font-medium text-ink">{name} is unavailable in Offline Mode</p>
+      <p className="text-xs text-faint max-w-[220px]">
+        {name} needs internet access to reach its cloud API. Turn off Offline Mode in Settings
+        to reconnect.
+      </p>
+    </div>
+  )
+}
+
 export function Sidebar() {
   const {
     sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, sidebarPanelOpen, setSidebarPanelOpen,
     imageStudioOpen, setImageStudioOpen, sidebarPinned: pinned, setSidebarPinned: persistPinned,
+    settings,
   } = useAppStore()
   const { theme, toggleTheme } = useThemeStore()
   const { user, logout } = useAuthStore()
+
+  // Offline Mode (local Ollama model) has no internet access to Vercel/Railway's
+  // cloud APIs by design — rather than let those panels spin/error against a
+  // network that isn't there, disable them proactively with a clear message.
+  const offlineModeActive = !!settings?.ollama_enabled
+  const CLOUD_ONLY_TABS: TabId[] = ['vercel', 'railway']
 
   // `pinned` = user has explicitly (manually) expanded the panel — persists
   // across reloads (sourced from the app store, which persists it to
@@ -801,6 +826,7 @@ export function Sidebar() {
   const panelVisible = pinned || hovering
 
   const handleRailClick = (id: TabId) => {
+    if (offlineModeActive && CLOUD_ONLY_TABS.includes(id)) return
     cancelTimers()
     if (sidebarTab === id && pinned) {
       // Clicking the already-pinned active tab hides the nav bar entirely.
@@ -862,13 +888,17 @@ export function Sidebar() {
         {RAIL_ITEMS.map(({ id, icon: Icon, tooltip }) => {
           const isActive = sidebarTab === id && panelVisible
           const badge = id === 'files' && fileCount > 0 ? fileCount : null
+          const disabledOffline = offlineModeActive && CLOUD_ONLY_TABS.includes(id)
           return (
             <button
               key={id}
               onClick={() => handleRailClick(id)}
-              title={tooltip}
+              disabled={disabledOffline}
+              title={disabledOffline ? `${tooltip} — unavailable in Offline Mode` : tooltip}
               className={`relative flex items-center justify-center w-8 h-8 rounded-lg transition-all ${
-                isActive
+                disabledOffline
+                  ? 'text-muted/40 cursor-not-allowed'
+                  : isActive
                   ? 'bg-accent/15 text-accent'
                   : 'text-muted hover:text-ink hover:bg-overlay'
               }`}
@@ -998,10 +1028,14 @@ export function Sidebar() {
             <LinearPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
           )}
           {sidebarTab === 'vercel'   && (
-            <VercelPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
+            offlineModeActive
+              ? <OfflineModeDisabledPanel name="Vercel" />
+              : <VercelPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
           )}
           {sidebarTab === 'railway'  && (
-            <RailwayPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
+            offlineModeActive
+              ? <OfflineModeDisabledPanel name="Railway" />
+              : <RailwayPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
           )}
         </div>
       </div>
