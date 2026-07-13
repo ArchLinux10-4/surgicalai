@@ -6,6 +6,7 @@ then writes a system message back into the conversation so Claude is aware.
 """
 from fastapi import APIRouter, Request
 from services import task_planner
+from services.pipeline import _dlog
 
 router = APIRouter()
 
@@ -13,13 +14,16 @@ router = APIRouter()
 @router.get("")
 def get_tasks(request: Request, session_id: str, run_id: str = None):
     """List tasks for a session (optionally scoped to a single run)."""
-    return task_planner.list_tasks(session_id, run_id)
+    rows = task_planner.list_tasks(session_id, run_id)
+    _dlog("tasks_router_list", session_id=session_id, run_id=run_id, count=len(rows))
+    return rows
 
 
 @router.post("/{task_id}/cancel")
 def cancel_task(task_id: str, request: Request):
     """Request cancellation of a single task."""
     ok = task_planner.request_cancel(task_id)
+    _dlog("tasks_router_cancel", task_id=task_id, ok=ok)
     return {"ok": ok, "task_id": task_id}
 
 
@@ -29,6 +33,8 @@ def cancel_all(body: dict, request: Request):
     session_id = body.get("session_id")
     run_id = body.get("run_id")
     if not session_id:
+        _dlog("tasks_router_cancel_all_missing_session")
         return {"ok": False, "cancelled": 0, "detail": "session_id required"}
     n = task_planner.request_cancel_all(session_id, run_id)
+    _dlog("tasks_router_cancel_all", session_id=session_id, run_id=run_id, cancelled=n)
     return {"ok": True, "cancelled": n}

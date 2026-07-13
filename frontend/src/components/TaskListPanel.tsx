@@ -4,6 +4,11 @@ import { api } from '../api/client'
 import type { AgentTask, AgentTaskStatus } from '../types'
 
 /**
+ * NOTE: This component is not currently imported or rendered anywhere in the
+ * app — AgentMissionControl.tsx fully replaced it. Kept intentionally (not
+ * deleted) in case it's needed again; do not wire it up without checking
+ * whether AgentMissionControl.tsx should be updated instead.
+ *
  * TaskListPanel — live GUI for the agentic task loop.
  *
  * Renders the plan Claude generated, tracks each task's status in real time,

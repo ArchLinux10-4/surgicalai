@@ -11,13 +11,48 @@ These tests exercise the REAL pure helpers (_apply_snippet_to_symbol, _fragment_
 _compute_target_element) extracted verbatim from pipeline.py, plus a faithful replica of
 the QA-fix-loop handler decision so the accept/reject policy is locked in.
 """
-import importlib.util, os
+import ast
+import os
+import types
 
-_spec = importlib.util.spec_from_file_location(
-    "_helpers_extracted", os.path.join(os.path.dirname(__file__), "_helpers_extracted.py")
-)
-H = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(H)
+# ── Extract real helpers from pipeline.py via AST ────────────────────────────
+# Previously this loaded a generated file, tests/_helpers_extracted.py, that
+# was never committed to git — broken on every fresh clone (confirmed via
+# `git ls-files`: the test file is tracked, the helper file it loads is not).
+# Fixed to use the same in-repo AST-extraction pattern as
+# tests/test_safe_claude_call.py: pull the exact shipped functions straight
+# out of pipeline.py, so there's no separate artifact to go stale or get lost.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PIPELINE = os.path.normpath(os.path.join(_HERE, "..", "services", "pipeline.py"))
+_FUNCS_TO_EXTRACT = ["_apply_snippet_to_symbol", "_fragment_reason", "_compute_target_element"]
+
+
+def _extract_helpers():
+    src = open(_PIPELINE, encoding="utf-8").read()
+    tree = ast.parse(src)
+    ns = {"_dlog": lambda *a, **kw: None}
+    # Pull in top-level stdlib imports (e.g. `re`) the extracted functions
+    # rely on but don't carry with them as AST source segments.
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            segment = ast.get_source_segment(src, node)
+            if segment:
+                try:
+                    exec(segment, ns)
+                except Exception:
+                    pass
+    for node in ast.iter_child_nodes(tree):
+        if isinstance(node, ast.FunctionDef) and node.name in _FUNCS_TO_EXTRACT:
+            segment = ast.get_source_segment(src, node)
+            if segment:
+                exec(segment, ns)
+    for fn_name in _FUNCS_TO_EXTRACT:
+        assert fn_name in ns, f"Failed to extract {fn_name} from pipeline.py"
+    mod = types.SimpleNamespace(**{k: v for k, v in ns.items() if k in _FUNCS_TO_EXTRACT})
+    return mod
+
+
+H = _extract_helpers()
 
 
 # Build a realistic 850-line component symbol.

@@ -8,10 +8,17 @@ These tests extract and execute the pure-logic helpers from pipeline.py
 rather than mocking the full async generator.
 """
 import ast
+import os
 import textwrap
 import unittest
 
-_PIPELINE = "/tmp/sgcheck/backend/services/pipeline.py"
+# Portable path — matches the pattern in test_safe_claude_call.py. This was
+# previously a hardcoded sandbox-only path (/tmp/sgcheck/...) that only
+# existed in one debugging session; it broke test collection for every
+# fresh clone (CI, other machines, this repo re-cloned), aborting the
+# entire pytest run rather than just this file.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PIPELINE = os.path.normpath(os.path.join(_HERE, "..", "backend", "services", "pipeline.py"))
 
 # ---------------------------------------------------------------------------
 # Extract helper functions from pipeline.py the same way test_safe_claude_call does
