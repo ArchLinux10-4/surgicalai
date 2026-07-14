@@ -714,13 +714,15 @@ def _get_thinking_kwargs(model: str, budget: int) -> dict:
 def _get_effort_kwargs(model: str) -> dict:
     """Return output_config kwargs for models that support effort control.
 
-    Adaptive thinking models benefit greatly from effort='xhigh' for coding tasks.
-    Anthropic changed the default effort from 'high' to 'medium' which caused a
-    significant quality regression — explicitly set xhigh for agentic/coding work.
-    Returns {} for all other models (safe to ** spread).
+    Adaptive thinking models are set to effort='medium' — the balanced middle
+    level. 'xhigh' was previously used but drove thinking phases past the
+    streaming no-text ceiling (proven from trace 7c213236: 181s of continuous
+    thinking on a 3-file task before any text, then a ceiling abort with zero
+    edits). 'medium' keeps thinking depth reasonable so a turn produces output
+    within the phase budget. Returns {} for all other models (safe to ** spread).
     """
-    if _uses_adaptive_thinking(model) and not any(m in model for m in _NO_XHIGH_EFFORT_MODELS):
-        return {"output_config": {"effort": "xhigh"}}
+    if _uses_adaptive_thinking(model):
+        return {"output_config": {"effort": "medium"}}
     return {}
 
 
@@ -840,12 +842,17 @@ async def _safe_claude_call(aclient_inst, *, model: str,
     if not retry_on_starve:
         return msg
 
-    # Double both budgets, drop effort to "high" to discourage overthinking
+    # Starvation rescue: double the budget AND drop effort to "low".
+    # This path fires only after the model already overthought so hard it
+    # burned the whole token budget before writing text. Two counter-levers:
+    # (1) 2x budget = more room, (2) lower thinking depth = less appetite for
+    # thinking. Never escalate depth here — deeper thinking is the exact cause
+    # of the starve. On an emergency retry, forcing text out beats overthinking.
     retry_budget = (thinking_budget or min(desired_text_tokens, 16_000)) * 2
     retry_params = _bounded_thinking_params(
         model, desired_text_tokens * 2, retry_budget)
     if "output_config" in retry_params:
-        retry_params["output_config"] = {"effort": "high"}
+        retry_params["output_config"] = {"effort": "low"}
 
     _dlog("thinking_starvation_retry",
           model=model, retry_max=retry_params.get("max_tokens"),
@@ -903,11 +910,14 @@ def _safe_claude_call_sync(sync_client, *, model: str,
     if not retry_on_starve:
         return msg
 
+    # Starvation rescue (sync): double the budget AND drop effort to "low".
+    # Same rationale as the async path — this fires only after an overthink
+    # starve, so counter with more room + shallower thinking. Never escalate.
     retry_budget = (thinking_budget or min(desired_text_tokens, 16_000)) * 2
     retry_params = _bounded_thinking_params(
         model, desired_text_tokens * 2, retry_budget)
     if "output_config" in retry_params:
-        retry_params["output_config"] = {"effort": "high"}
+        retry_params["output_config"] = {"effort": "low"}
 
     _dlog("thinking_starvation_retry_sync",
           model=model, retry_max=retry_params.get("max_tokens"))
@@ -13763,6 +13773,7 @@ async def run_natural_pipeline_stream(
             _round_last_activity_ts = time.time()
             _round_last_thinking_ts = 0.0
             _round_thinking_deltas = 0
+            _ceiling_waived_logged = False  # log "thinking active, ceiling waived" once per turn
             _edit_hb_bytes = 0
             _edit_hb_last = 0
             _last_hb_ts = time.time()
@@ -13941,7 +13952,14 @@ async def run_natural_pipeline_stream(
                                     _streaming_starvation_abort = True
                                     break
                                 if (not full_response
+                                        and not had_thinking
                                         and _stall_elapsed >= STREAMING_NO_TEXT_CEILING_S):
+                                    # Ceiling only fires on a genuinely dead stream:
+                                    # no text AND no thinking. A model streaming
+                                    # thinking is working, not starving — it is
+                                    # governed by the thinking-stall guard (no
+                                    # activity for STREAMING_THINKING_STALL_S) and
+                                    # the phase deadline below, never by this wall.
                                     _dlog("streaming_no_text_ceiling_abort",
                                           session_id=session_id, user_id=user_id, turn=_turn,
                                           elapsed_s=round(_stall_elapsed, 1),
@@ -13949,6 +13967,21 @@ async def run_natural_pipeline_stream(
                                           had_thinking=had_thinking)
                                     _streaming_starvation_abort = True
                                     break
+                                if (not full_response
+                                        and had_thinking
+                                        and not _ceiling_waived_logged
+                                        and _stall_elapsed >= STREAMING_NO_TEXT_CEILING_S):
+                                    # Observability (once per turn): thinking is
+                                    # active, so the ceiling correctly declines to
+                                    # abort. This event proves the guard is working —
+                                    # it should appear instead of a ceiling abort on
+                                    # long-thinking turns.
+                                    _ceiling_waived_logged = True
+                                    _dlog("streaming_thinking_active_no_abort",
+                                          session_id=session_id, user_id=user_id, turn=_turn,
+                                          elapsed_s=round(_stall_elapsed, 1),
+                                          thinking_deltas=_round_thinking_deltas,
+                                          last_activity_age_s=round(time.time() - _round_last_activity_ts, 1))
                                 if (had_thinking
                                         and (time.time() - _round_last_activity_ts)
                                             > STREAMING_THINKING_STALL_S):

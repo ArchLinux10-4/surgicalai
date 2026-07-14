@@ -183,9 +183,17 @@ class TestGetEffortKwargs:
     """_get_effort_kwargs returns correct effort config."""
 
     def test_adaptive_model_gets_effort(self):
+        # Effort is set to 'medium' — the balanced middle level. 'xhigh' was
+        # dropped because it drove thinking phases past the no-text ceiling
+        # (proven from trace 7c213236: 181s of thinking, zero edits, ceiling abort).
         kw = _NS["_get_effort_kwargs"]("claude-sonnet-5")
         assert "output_config" in kw
-        assert kw["output_config"]["effort"] in ("xhigh", "high")
+        assert kw["output_config"]["effort"] == "medium"
+
+    def test_46_adaptive_model_gets_medium(self):
+        # 4.6-gen adaptive models support medium (they rejected xhigh with a 400).
+        kw = _NS["_get_effort_kwargs"]("claude-sonnet-4-6")
+        assert kw["output_config"]["effort"] == "medium"
 
     def test_non_adaptive_model_empty(self):
         kw = _NS["_get_effort_kwargs"]("gpt-4.1")
