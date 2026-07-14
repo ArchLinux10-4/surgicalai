@@ -13547,8 +13547,8 @@ async def run_natural_pipeline_stream(
             sf["filename"]: sf.get("content", "") for sf in session_files
         }
 
-        MAX_SEARCH_ROUNDS = 10
-        SEARCH_TIME_BUDGET_S = 180               # 3 min max in search phase (leaves 12 min for edits)
+        MAX_SEARCH_ROUNDS = 3                    # hard cap — 3 rounds of search is plenty (was 10; trace 8a7b9037 did 5 rounds → 17K+ context → stall)
+        SEARCH_TIME_BUDGET_S = 150               # 2.5 min; 30s buffer so a round that starts at 149s can't stall past 300s
         TOTAL_PREEDIT_BUDGET_S = 420             # 7 min max before edits must start (Railway=15 min)
         _last_stop_reason: str | None = None     # capture Claude's stop_reason per round
         _matched_stop_seq: str | None = None     # which stop_sequence halted the round (Improvement #4)
@@ -13587,7 +13587,7 @@ async def run_natural_pipeline_stream(
                     yield sse({"type": "progress",
                                "content": "⏱️ Search time limit reached — writing edits now..."})
                     forced_msg = (
-                        f"TIME BUDGET EXCEEDED ({int(_search_elapsed)}s of {SEARCH_TIME_BUDGET_S}s). "
+                        f"TIME BUDGET REACHED ({int(_search_elapsed)}s of {SEARCH_TIME_BUDGET_S}s). "
                         "You already have all the code you need from previous results. "
                         "Write your complete <surgical_edit> or <new_file> blocks RIGHT NOW. "
                         "Do NOT emit another <search_request> — there is no time left for searching. "
@@ -14796,6 +14796,7 @@ async def run_natural_pipeline_stream(
                   session_id=session_id, user_id=user_id,
                   total_rounds=search_round + 1,
                   streaming_duration_s=round(time.time() - _streaming_t0, 1),
+                  last_round_duration_s=round(time.time() - _round_t0, 1),
                   pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1),
                   edit_blocks=len(edit_blocks_raw),
                   new_file_blocks=len(new_file_blocks_raw),
@@ -14888,6 +14889,8 @@ async def run_natural_pipeline_stream(
                 # Evidence: "plan" was missing → <edit_plan> treated as text.
                 _RECOVERY_TAGS = tuple(TAG_DEFS.keys())  # ("edit","file","search","filereq","plan")
 
+                _r_stop_reason = None
+                _r_usage = None
                 async with aclient.messages.stream(**{
                     **_retry_kwargs,
                     "messages": _msgs,
@@ -14956,6 +14959,21 @@ async def run_natural_pipeline_stream(
                             else:
                                 break
 
+                    # Capture API response metadata for diagnostics
+                    # Evidence: trace 8a7b9037 — recovery round took 152s
+                    # producing 0 text; no way to know if model hit max_tokens,
+                    # end_turn, or something else without this.
+                    try:
+                        _r_final = await _stream.get_final_message()
+                        _r_stop_reason = _r_final.stop_reason if _r_final else None
+                        if _r_final and hasattr(_r_final, "usage"):
+                            _r_usage = {
+                                "input": getattr(_r_final.usage, "input_tokens", None),
+                                "output": getattr(_r_final.usage, "output_tokens", None),
+                            }
+                    except Exception:
+                        pass
+
                 # Flush remaining normal text
                 if _normal_buf.strip():
                     yield {"type": "token", "content": _normal_buf}
@@ -14997,6 +15015,8 @@ async def run_natural_pipeline_stream(
                     "file_blocks": _r_file_blocks,
                     "search_block": _r_search_block,
                     "plan_block": _r_plan_block,
+                    "stop_reason": _r_stop_reason,
+                    "usage": _r_usage,
                 }
 
             try:
@@ -15046,7 +15066,9 @@ async def run_natural_pipeline_stream(
                           edit_blocks=len(_final_edit_blocks),
                           file_blocks=len(_final_file_blocks),
                           search_requested=bool(_search_block),
-                          plan_found=bool(_plan_block))
+                          plan_found=bool(_plan_block),
+                          stop_reason=_round_result.get("stop_reason"),
+                          usage=_round_result.get("usage"))
 
                     if _final_edit_blocks or _final_file_blocks:
                         break  # got real edits — genuinely done
@@ -15060,6 +15082,37 @@ async def run_natural_pipeline_stream(
                               recovery_round=_recovery_round,
                               plan_content_len=len(_plan_block))
                         break  # plan is actionable output — don't nudge
+
+                    # ── Zero-output emergency nudge (before budget check) ────
+                    # If recovery produced absolutely nothing (0 text, 0 edits,
+                    # 0 plan, 0 search), try a nudge BEFORE the budget check.
+                    # Without this, budget break guarantees total failure.
+                    # Evidence: trace 8a7b9037 — recovery round 0 had 0 output,
+                    # budget check at 449s > 420s broke before nudge could fire.
+                    _zero_output = (
+                        not _final_edit_blocks and not _final_file_blocks
+                        and not _plan_block and not _search_block
+                        and len(_final_response.strip()) == 0
+                    )
+                    if (_zero_output
+                            and not _forced_write_nudge_sent
+                            and _recovery_round < RECOVERY_MAX_ROUNDS - 1):
+                        _forced_write_nudge_sent = True
+                        _dlog("starvation_recovery_zero_output_nudge",
+                              session_id=session_id, user_id=user_id,
+                              recovery_round=_recovery_round,
+                              elapsed_s=round(time.time() - _streaming_t0, 1))
+                        yield sse({"type": "progress",
+                                   "content": "Model produced no output — forcing one more attempt..."})
+                        _recovery_msgs = _recovery_msgs + [
+                            {"role": "assistant", "content": "(no output produced)"},
+                            {"role": "user", "content":
+                                "You produced no output at all. This is your FINAL chance. "
+                                "Using the code context you already have, emit <surgical_edit> "
+                                "or <new_file> block(s) RIGHT NOW. Do not think, plan, or search — "
+                                "write the code changes immediately."},
+                        ]
+                        continue
 
                     # Post-round elapsed check — even if this round produced
                     # a search request, don't start another round if we've
