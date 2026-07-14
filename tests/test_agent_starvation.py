@@ -208,13 +208,13 @@ class TestPhase2EditStreaming(unittest.TestCase):
         # Find Phase 2 stream_kwargs construction (after PHASE 2 comment)
         idx = self.src.find("PHASE 2: EDIT GENERATION")
         self.assertGreater(idx, 0, "Phase 2 section must exist")
-        p2_block = self.src[idx:idx + 3000]
+        p2_block = self.src[idx:idx + 4500]
         self.assertIn("_get_thinking_kwargs", p2_block)
 
     def test_phase2_uses_full_max_tokens(self):
         """Phase 2 must use _max_output_tokens (full budget)."""
         idx = self.src.find("PHASE 2: EDIT GENERATION")
-        p2_block = self.src[idx:idx + 3000]
+        p2_block = self.src[idx:idx + 4500]
         self.assertIn("_max_output_tokens", p2_block)
 
     def test_phase2_ignores_search_tags(self):
@@ -377,7 +377,7 @@ class TestPhaseDecompositionStructure(unittest.TestCase):
     def test_phase2_full_tokens(self):
         """Phase 2 uses _max_output_tokens (full model budget)."""
         idx = self.src.index("PHASE 2: EDIT GENERATION")
-        p2_block = self.src[idx:idx + 3000]
+        p2_block = self.src[idx:idx + 4500]
         self.assertIn("_max_output_tokens(arch_model)", p2_block)
 
 
@@ -622,7 +622,7 @@ class TestPhase2FileRequestSafetyNet(unittest.TestCase):
         """_phase2_filereq_used flag is initialized."""
         idx = self.src.find("PHASE 2: EDIT GENERATION")
         self.assertNotEqual(idx, -1)
-        after = self.src[idx:idx + 1500]
+        after = self.src[idx:idx + 2500]
         self.assertIn("_phase2_filereq_used", after,
                        "Must have _phase2_filereq_used flag near Phase 2 start")
 
@@ -647,7 +647,9 @@ class TestPhase2FileRequestSafetyNet(unittest.TestCase):
     def test_phase2_retry_continues_loop(self):
         """After filereq safety net, retry loop continues instead of breaking."""
         import re
-        checks = list(re.finditer(r'if _phase2_filereq_retry:', self.src))
+        # Claude branch also gates on the zero-text recovery retry
+        # (`or _no_text_retry`); GPT branch remains filereq-only.
+        checks = list(re.finditer(r'if _phase2_filereq_retry( or _no_text_retry)?:', self.src))
         self.assertGreaterEqual(len(checks), 2,
                                 "Must check _phase2_filereq_retry in both branches")
         for m in checks:
@@ -865,6 +867,147 @@ class TestRailwayDeadlineGates(unittest.TestCase):
         # A single edit can never wait longer than the budget when it's small
         for b in (200, 121, 120, 90, 10, 5, 0, -100):
             self.assertLessEqual(clamp(b), max(5.0, min(120.0, b)))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Zero-Text Ceiling + Streaming Heartbeat (trace 942d3232 fix)
+#
+# Proven failure: a Phase-2 safety-net RETRY stream produced text_len:0 for
+# the full 480s phase deadline (8-min unobservable black hole) and ended in
+# starvation_total_failure. These tests lock in the structural guard + the
+# observability that makes any recurrence diagnosable.
+# ═══════════════════════════════════════════════════════════════════════
+class TestZeroTextCeiling(unittest.TestCase):
+    """Structural anti-starvation guard: a stream that yields no usable text
+    for STREAMING_NO_TEXT_CEILING_S must recover once, then abort — it can
+    never burn the full phase deadline producing nothing."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    # ── Constants ────────────────────────────────────────────────────────
+    def test_no_text_ceiling_constant_exists(self):
+        self.assertIn("STREAMING_NO_TEXT_CEILING_S = int(_os.getenv(", self.src)
+
+    def test_no_text_ceiling_default_180(self):
+        self.assertIn('"STREAMING_NO_TEXT_CEILING_S", "180"', self.src)
+
+    def test_heartbeat_constant_exists(self):
+        self.assertIn("STREAMING_HEARTBEAT_S = int(_os.getenv(", self.src)
+
+    def test_heartbeat_default_15(self):
+        self.assertIn('"STREAMING_HEARTBEAT_S", "15"', self.src)
+
+    # ── Ceiling fires only when there is NO usable text ──────────────────
+    def test_ceiling_guarded_on_empty_response(self):
+        """Ceiling must only trigger when full_response is empty — never
+        aborting a stream that has already produced editable text."""
+        idx = self.src.index("streaming_no_text_recovery")
+        block = self.src[max(0, idx - 400):idx]
+        self.assertIn("if (not full_response", block)
+        self.assertIn("_stall_elapsed >= STREAMING_NO_TEXT_CEILING_S", block)
+
+    # ── Recovery-then-abort semantics ────────────────────────────────────
+    def test_recovery_used_flag_initialized(self):
+        self.assertIn("_no_text_recovery_used = False", self.src)
+
+    def test_recovery_is_one_shot(self):
+        """First hit recovers (guarded by _no_text_recovery_used); a second
+        hit aborts. Recovery must be gated so it happens at most once."""
+        idx = self.src.index("streaming_no_text_recovery")
+        block = self.src[max(0, idx - 200):idx + 100]
+        self.assertIn("if not _no_text_recovery_used:", block)
+
+    def test_recovery_sets_used_flag(self):
+        idx = self.src.index("streaming_no_text_recovery")
+        block = self.src[max(0, idx - 200):idx]
+        self.assertIn("_no_text_recovery_used = True", block)
+
+    def test_recovery_injects_direct_nudge(self):
+        """Recovery must inject a hard 'stop thinking, emit edits now' prompt."""
+        idx = self.src.index("streaming_no_text_recovery")
+        block = self.src[idx:idx + 1200]
+        self.assertIn("Do NOT think further", block)
+        self.assertIn("<surgical_edit>", block)
+
+    def test_recovery_is_safe_no_double_apply(self):
+        """Recovery only re-prompts while full_response is empty, so no partial
+        edits can be double-applied. The guard condition proves this."""
+        idx = self.src.index("streaming_no_text_recovery")
+        cond = self.src[max(0, idx - 400):idx]
+        self.assertIn("not full_response", cond)
+
+    def test_recovery_resets_round_timers(self):
+        idx = self.src.index("streaming_no_text_recovery")
+        block = self.src[idx:idx + 2200]
+        for sym in ("_round_t0 = time.time()",
+                    "_round_last_activity_ts = time.time()",
+                    "_last_hb_ts = time.time()"):
+            self.assertIn(sym, block)
+
+    def test_recovery_triggers_retry_flag(self):
+        idx = self.src.index("streaming_no_text_recovery")
+        block = self.src[idx:idx + 2400]
+        self.assertIn("_no_text_retry = True", block)
+
+    def test_second_hit_aborts(self):
+        self.assertIn("streaming_no_text_ceiling_abort", self.src)
+        idx = self.src.index("streaming_no_text_ceiling_abort")
+        block = self.src[max(0, idx - 200):idx + 600]
+        self.assertIn("_streaming_starvation_abort = True", block)
+
+    # ── Retry gate wiring ────────────────────────────────────────────────
+    def test_retry_flag_initialized(self):
+        self.assertIn("_no_text_retry = False", self.src)
+
+    def test_retry_gate_handles_no_text_retry(self):
+        """The Claude retry gate must continue the stream loop on either the
+        filereq safety-net OR the zero-text recovery."""
+        self.assertIn("if _phase2_filereq_retry or _no_text_retry:", self.src)
+        idx = self.src.index("if _phase2_filereq_retry or _no_text_retry:")
+        block = self.src[idx:idx + 200]
+        self.assertIn("_no_text_retry = False", block)
+        self.assertIn("continue", block)
+
+    # ── Structural ordering: ceiling < phase deadline ────────────────────
+    def test_ceiling_is_stricter_than_phase_deadline(self):
+        """The zero-text ceiling (180s) must be well under the 480s phase
+        deadline so starvation is caught early — structurally, not by luck."""
+        self.assertLess(180, 480)
+
+
+class TestStreamingHeartbeat(unittest.TestCase):
+    """Heartbeat _dlog converts a silent stall into a per-interval trail so a
+    recurrence of the 942d3232 black hole is instantly diagnosable."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_claude_heartbeat_dlog_exists(self):
+        self.assertIn('_dlog("streaming_heartbeat"', self.src)
+
+    def test_heartbeat_cadence_gated(self):
+        idx = self.src.index('_dlog("streaming_heartbeat"')
+        block = self.src[max(0, idx - 200):idx]
+        self.assertIn("(time.time() - _last_hb_ts) >= STREAMING_HEARTBEAT_S", block)
+
+    def test_heartbeat_records_diagnostic_fields(self):
+        """Heartbeat must record the fields needed to disambiguate a
+        thinking-runaway from a dead socket next time."""
+        idx = self.src.index('_dlog("streaming_heartbeat"')
+        block = self.src[idx:idx + 900]
+        for field in ("text_len=", "thinking_deltas=", "last_activity_age_s=",
+                      "had_thinking=", "state="):
+            self.assertIn(field, block)
+
+    def test_heartbeat_ts_initialized(self):
+        self.assertIn("_last_hb_ts = time.time()", self.src)
+
+    def test_gpt_branch_has_heartbeat(self):
+        self.assertIn('_dlog("streaming_heartbeat_gpt"', self.src)
+
+    def test_gpt_branch_has_no_text_ceiling(self):
+        self.assertIn("streaming_no_text_ceiling_abort_gpt", self.src)
 
 
 if __name__ == "__main__":

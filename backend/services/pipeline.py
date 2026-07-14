@@ -14237,8 +14237,21 @@ async def run_natural_pipeline_stream(
         # ── Edit-phase streaming ──────────────────────────────────────
         STREAMING_PHASE_DEADLINE_S = 480   # 8 min max for edit streaming
         STREAMING_THINKING_STALL_S = 120   # 2 min thinking stall → abort
+        # Zero-text ceiling: structural anti-starvation guard. If the stream
+        # produces NO usable text (text_len==0) for this long — whether it is
+        # thinking silently or emitting only non-content events — abort early
+        # instead of burning the full phase deadline on nothing. Proven by
+        # trace 942d3232: safety-net retry stream ran 480s with text_len:0.
+        STREAMING_NO_TEXT_CEILING_S = int(_os.getenv("STREAMING_NO_TEXT_CEILING_S", "180"))
+        # Heartbeat cadence: emit a _dlog snapshot at most this often during
+        # streaming so a silent stall leaves a per-interval trail instead of an
+        # unobservable black hole.
+        STREAMING_HEARTBEAT_S = int(_os.getenv("STREAMING_HEARTBEAT_S", "15"))
         _phase2_filereq_used = False       # safety net: allow one file_request in Phase 2
         _phase2_filereq_retry = False      # set when filereq safety net triggers a retry
+        _no_text_retry = False             # set when zero-text ceiling triggers a recovery retry
+        _no_text_recovery_used = False     # at most one zero-text recovery attempt
+        _last_hb_ts = time.time()          # last streaming heartbeat emit
 
         state = "normal"
         normal_buf = ""
@@ -14434,6 +14447,7 @@ async def run_natural_pipeline_stream(
                                                     _round_last_activity_ts = time.time()
                                                     _round_thinking_deltas = 0
                                                     _round_last_thinking_ts = 0.0
+                                                    _last_hb_ts = time.time()
                                                     stream_kwargs["messages"] = current_messages
                                                     yield sse({"type": "progress",
                                                                "content": "Loading additional files and retrying..."})
@@ -14471,6 +14485,21 @@ async def run_natural_pipeline_stream(
 
                             # Deadline checks
                             _stall_elapsed = time.time() - _round_t0
+                            # Heartbeat: periodic observability so a silent stall
+                            # leaves a per-interval trail instead of an unobservable
+                            # black hole (trace 942d3232 had an 8-min gap here).
+                            if (time.time() - _last_hb_ts) >= STREAMING_HEARTBEAT_S:
+                                _last_hb_ts = time.time()
+                                _dlog("streaming_heartbeat",
+                                      session_id=session_id, user_id=user_id,
+                                      elapsed_s=round(_stall_elapsed, 1),
+                                      text_len=len(full_response),
+                                      thinking_deltas=_round_thinking_deltas,
+                                      last_activity_age_s=round(time.time() - _round_last_activity_ts, 1),
+                                      last_text_age_s=round(time.time() - _round_last_text_ts, 1),
+                                      had_thinking=had_thinking,
+                                      state=state,
+                                      attempt=_attempt)
                             if (_pipeline_over_budget()
                                     or _stall_elapsed >= STREAMING_PHASE_DEADLINE_S):
                                 _dlog("streaming_deadline_abort",
@@ -14480,6 +14509,56 @@ async def run_natural_pipeline_stream(
                                       text_len=len(full_response))
                                 _streaming_starvation_abort = True
                                 break
+                            # ZERO-TEXT CEILING: the stream has produced no usable
+                            # text for too long (thinking-runaway OR silent/keepalive
+                            # events). Recover once with a hard "emit edits now" nudge
+                            # (safe: full_response is empty → no double-apply), then
+                            # abort. Makes token starvation structurally impossible.
+                            if (not full_response
+                                    and _stall_elapsed >= STREAMING_NO_TEXT_CEILING_S):
+                                if not _no_text_recovery_used:
+                                    _no_text_recovery_used = True
+                                    _dlog("streaming_no_text_recovery",
+                                          session_id=session_id, user_id=user_id,
+                                          elapsed_s=round(_stall_elapsed, 1),
+                                          thinking_deltas=_round_thinking_deltas,
+                                          had_thinking=had_thinking,
+                                          attempt=_attempt)
+                                    current_messages = current_messages + [
+                                        {"role": "assistant",
+                                         "content": "(no output produced)"},
+                                        {"role": "user", "content":
+                                            "You have not produced any code changes yet. "
+                                            "Do NOT think further. Immediately output the "
+                                            "changes now, beginning your reply directly with "
+                                            "<surgical_edit>, <new_file>, or <edit_plan>."},
+                                    ]
+                                    stream_kwargs["messages"] = current_messages
+                                    full_response = ""
+                                    state = "normal"
+                                    normal_buf = ""
+                                    tag_buf = ""
+                                    had_thinking = False
+                                    _edit_hb_bytes = 0
+                                    _edit_hb_last = 0
+                                    _round_t0 = time.time()
+                                    _round_last_text_ts = time.time()
+                                    _round_last_activity_ts = time.time()
+                                    _round_thinking_deltas = 0
+                                    _round_last_thinking_ts = 0.0
+                                    _last_hb_ts = time.time()
+                                    yield sse({"type": "progress",
+                                               "content": "No changes produced yet — retrying with a direct prompt..."})
+                                    _no_text_retry = True
+                                    break
+                                else:
+                                    _dlog("streaming_no_text_ceiling_abort",
+                                          session_id=session_id, user_id=user_id,
+                                          elapsed_s=round(_stall_elapsed, 1),
+                                          thinking_deltas=_round_thinking_deltas,
+                                          had_thinking=had_thinking)
+                                    _streaming_starvation_abort = True
+                                    break
                             # DEAD-STREAM guard: abort only when NO bytes of any
                             # kind (thinking OR text) have arrived for the timeout.
                             # A model actively streaming thinking is working, not
@@ -14519,9 +14598,11 @@ async def run_natural_pipeline_stream(
                               matched=str(_matched_stop_seq)[:60],
                               state_at_halt=state, tag_buf_len=len(tag_buf))
 
-                    # Phase 2 file_request safety net triggered — retry with injected files
-                    if _phase2_filereq_retry:
+                    # Phase 2 file_request safety net OR zero-text recovery
+                    # triggered — retry with updated messages.
+                    if _phase2_filereq_retry or _no_text_retry:
                         _phase2_filereq_retry = False
+                        _no_text_retry = False
                         continue  # retry the for-loop with updated messages
 
                     break  # success
@@ -14575,6 +14656,16 @@ async def run_natural_pipeline_stream(
                         # genuinely runaway / silently-hung GPT stream, matching
                         # the Claude ceiling (pipeline budget + phase deadline).
                         _gpt_stall_elapsed = time.time() - _round_t0
+                        # Heartbeat: observability parity with the Claude branch.
+                        if (time.time() - _last_hb_ts) >= STREAMING_HEARTBEAT_S:
+                            _last_hb_ts = time.time()
+                            _dlog("streaming_heartbeat_gpt",
+                                  session_id=session_id, user_id=user_id,
+                                  elapsed_s=round(_gpt_stall_elapsed, 1),
+                                  text_len=len(full_response),
+                                  last_text_age_s=round(time.time() - _round_last_text_ts, 1),
+                                  state=state,
+                                  attempt=_attempt)
                         if (_pipeline_over_budget()
                                 or _gpt_stall_elapsed >= STREAMING_PHASE_DEADLINE_S):
                             _dlog("streaming_deadline_abort_gpt",
@@ -14582,6 +14673,16 @@ async def run_natural_pipeline_stream(
                                   reason="pipeline_budget" if _pipeline_over_budget() else "phase_deadline",
                                   elapsed_s=round(_gpt_stall_elapsed, 1),
                                   text_len=len(full_response))
+                            _streaming_starvation_abort = True
+                            break
+                        # ZERO-TEXT CEILING (parity with Claude branch): bound a
+                        # GPT stream that produces no usable text so it cannot burn
+                        # the full phase deadline on nothing.
+                        if (not full_response
+                                and _gpt_stall_elapsed >= STREAMING_NO_TEXT_CEILING_S):
+                            _dlog("streaming_no_text_ceiling_abort_gpt",
+                                  session_id=session_id, user_id=user_id,
+                                  elapsed_s=round(_gpt_stall_elapsed, 1))
                             _streaming_starvation_abort = True
                             break
                         _gpt_delta = getattr(_gpt_choice, "delta", None)
