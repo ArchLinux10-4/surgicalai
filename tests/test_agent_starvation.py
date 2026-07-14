@@ -542,3 +542,121 @@ class TestNoEditsTextOnlyNotice(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPhase1NoActionNudge(unittest.TestCase):
+    """Fix 1: Phase 1 no-action should nudge, not exit immediately."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_consecutive_no_action_counter_exists(self):
+        """_consecutive_no_action counter is initialized before Phase 1 loop."""
+        idx = self.src.find("for _search_round in range(PHASE1_MAX_SEARCH_ROUNDS)")
+        self.assertNotEqual(idx, -1)
+        before = self.src[max(0, idx - 500):idx]
+        self.assertIn("_consecutive_no_action", before,
+                       "Must initialize _consecutive_no_action before loop")
+
+    def test_no_action_sends_nudge_not_break(self):
+        """First no-action sends a nudge message, not an immediate break."""
+        idx = self.src.find("phase1_no_action")
+        self.assertNotEqual(idx, -1)
+        after = self.src[idx:idx + 1500]
+        self.assertIn("_consecutive_no_action", after,
+                       "No-action handler must track consecutive count")
+        self.assertIn("You MUST pick one", after,
+                       "No-action handler must nudge model to pick an action")
+        self.assertIn("continue", after,
+                       "First no-action must continue the loop, not break")
+
+    def test_second_no_action_exits(self):
+        """Second consecutive no-action exits the loop."""
+        idx = self.src.find("phase1_no_action")
+        self.assertNotEqual(idx, -1)
+        after = self.src[idx:idx + 1500]
+        self.assertIn("consecutive_no_action >= 2", after,
+                       "Must exit on 2nd consecutive no-action")
+
+    def test_action_resets_counter(self):
+        """Taking an action resets the consecutive no-action counter."""
+        idx = self.src.find("READY_TO_EDIT — model says it has enough context")
+        self.assertNotEqual(idx, -1)
+        before = self.src[max(0, idx - 500):idx]
+        self.assertIn("_consecutive_no_action = 0", before,
+                       "Action must reset no-action counter")
+
+
+class TestPhase1PostSearchHint(unittest.TestCase):
+    """Fix 2: After search results, hint about file_request if no full files yet."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_grep_snippet_hint_exists(self):
+        """Post-search message includes hint about grep snippets when no files requested."""
+        idx = self.src.find("_filereq_hint")
+        self.assertNotEqual(idx, -1, "Must have _filereq_hint variable")
+        block = self.src[idx:idx + 500]
+        self.assertIn("grep snippets", block,
+                       "Hint must explain that search results are grep snippets")
+        self.assertIn("file_request", block,
+                       "Hint must suggest using <file_request>")
+
+    def test_hint_only_when_no_files_requested(self):
+        """Hint only appears when no full files have been requested yet."""
+        idx = self.src.find("_filereq_hint")
+        self.assertNotEqual(idx, -1)
+        block = self.src[idx:idx + 300]
+        self.assertIn("not requested_files", block,
+                       "Hint condition must check that no files were requested yet")
+
+
+class TestPhase2FileRequestSafetyNet(unittest.TestCase):
+    """Fix 3: Phase 2 fulfills one file_request as safety net instead of ignoring."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_phase2_filereq_flag_exists(self):
+        """_phase2_filereq_used flag is initialized."""
+        idx = self.src.find("PHASE 2: EDIT GENERATION")
+        self.assertNotEqual(idx, -1)
+        after = self.src[idx:idx + 1500]
+        self.assertIn("_phase2_filereq_used", after,
+                       "Must have _phase2_filereq_used flag near Phase 2 start")
+
+    def test_phase2_filereq_fulfills_files(self):
+        """Phase 2 branches set retry flag after fulfilling file requests."""
+        self.assertIn("phase2_filereq_safety_net", self.src,
+                       "Must have phase2_filereq_safety_net dlog")
+        # Both Claude and GPT branches must set the retry flag
+        self.assertGreaterEqual(
+            self.src.count("_phase2_filereq_retry = True"), 2,
+            "Must set _phase2_filereq_retry=True in both Claude and GPT branches")
+
+    def test_phase2_filereq_limited_to_once(self):
+        """Phase 2 file_request safety net only fires once."""
+        count = self.src.count('not _phase2_filereq_used')
+        self.assertGreaterEqual(count, 2,
+                                "Guard must appear in both Claude and GPT branches")
+        count_set = self.src.count('_phase2_filereq_used = True')
+        self.assertGreaterEqual(count_set, 2,
+                                "Flag must be set in both Claude and GPT branches")
+
+    def test_phase2_retry_continues_loop(self):
+        """After filereq safety net, retry loop continues instead of breaking."""
+        import re
+        checks = list(re.finditer(r'if _phase2_filereq_retry:', self.src))
+        self.assertGreaterEqual(len(checks), 2,
+                                "Must check _phase2_filereq_retry in both branches")
+        for m in checks:
+            after = self.src[m.start():m.start() + 300]
+            self.assertIn("continue", after,
+                           f"Must continue retry loop at pos {m.start()}")
+
+    def test_gpt_phase2_filereq_safety_net(self):
+        """GPT branch also has file_request safety net."""
+        idx = self.src.find("phase2_filereq_safety_net_gpt")
+        self.assertNotEqual(idx, -1,
+                            "GPT branch must have phase2_filereq_safety_net_gpt dlog")

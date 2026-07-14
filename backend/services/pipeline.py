@@ -13560,6 +13560,7 @@ async def run_natural_pipeline_stream(
         _p1_stop_seqs = [TAG_DEFS[t]["close"] for t in _P1_TAGS if t in TAG_DEFS]
 
         _search_round = 0  # will be updated in loop
+        _consecutive_no_action = 0  # nudge on first no-action, exit on second
 
         for _search_round in range(PHASE1_MAX_SEARCH_ROUNDS):
             _round_t0 = time.time()
@@ -13881,6 +13882,10 @@ async def run_natural_pipeline_stream(
                   had_github=bool(github_requested),
                   ready_to_edit="READY_TO_EDIT" in _p1_response.upper())
 
+            # Reset no-action counter when model took any action
+            if search_requested or file_request_data or github_requested:
+                _consecutive_no_action = 0
+
             # ── READY_TO_EDIT — model says it has enough context ──────
             if ("READY_TO_EDIT" in _p1_response.upper()
                     and not search_requested
@@ -13922,13 +13927,21 @@ async def run_natural_pipeline_stream(
                       results_chars=len(search_results))
 
                 is_last = (_search_round == PHASE1_MAX_SEARCH_ROUNDS - 1)
+                _filereq_hint = ""
+                if not requested_files and not is_last:
+                    # Model has only grep snippets — hint that full files are available
+                    _filereq_hint = (
+                        "\n\nThese are grep snippets (limited context). "
+                        "To see full file contents for editing, emit a <file_request> tag with the filenames you need."
+                    )
                 _phase1_msgs = list(messages) + [
                     {"role": "assistant", "content": _p1_response or "(searching for code...)"},
                     {"role": "user", "content":
                         "Here are the search results"
                         + (f" ({reason})" if reason else "")
                         + ":\n" + search_results
-                        + ("\n\nDo you need more code? Emit another <search_request>, or reply READY_TO_EDIT."
+                        + (_filereq_hint if not is_last else "")
+                        + ("\n\nDo you need more code? Emit another <search_request> or <file_request>, or reply READY_TO_EDIT."
                            if not is_last else
                            "\n\nThis was the final search round. Reply READY_TO_EDIT.")
                     },
@@ -14092,8 +14105,28 @@ async def run_natural_pipeline_stream(
             _dlog("phase1_no_action",
                   session_id=session_id, user_id=user_id,
                   round=_search_round,
-                  response_preview=_p1_response[:300])
-            break
+                  response_preview=_p1_response[:300],
+                  consecutive_no_action=_consecutive_no_action + 1)
+
+            _consecutive_no_action += 1
+            if _consecutive_no_action >= 2 or _search_round >= PHASE1_MAX_SEARCH_ROUNDS - 1:
+                # Two consecutive no-actions or last round — give up
+                _dlog("phase1_no_action_exit",
+                      session_id=session_id, user_id=user_id,
+                      reason="consecutive" if _consecutive_no_action >= 2 else "last_round")
+                break
+
+            # Nudge: model went off-protocol, guide it back
+            _phase1_msgs = list(messages) + [
+                {"role": "assistant", "content": _p1_response or "(analyzing...)"},
+                {"role": "user", "content":
+                    "You responded with reasoning but didn't take an action.\n"
+                    "• To see full file contents, emit a <file_request> tag.\n"
+                    "• To search for more code, emit a <search_request> tag.\n"
+                    "• If you have enough context, reply READY_TO_EDIT.\n"
+                    "You MUST pick one of these three options."},
+            ]
+            continue
 
         _phase1_duration = time.time() - _streaming_t0
         _dlog("phase1_complete",
@@ -14127,6 +14160,8 @@ async def run_natural_pipeline_stream(
         # ── Edit-phase streaming ──────────────────────────────────────
         STREAMING_PHASE_DEADLINE_S = 480   # 8 min max for edit streaming
         STREAMING_THINKING_STALL_S = 120   # 2 min thinking stall → abort
+        _phase2_filereq_used = False       # safety net: allow one file_request in Phase 2
+        _phase2_filereq_retry = False      # set when filereq safety net triggers a retry
 
         state = "normal"
         normal_buf = ""
@@ -14253,8 +14288,68 @@ async def run_natural_pipeline_stream(
                                             if _pd is not None:
                                                 edit_plan_data = _pd
                                             _break_stream = True
+                                        elif _tag_name == "filereq" and not _phase2_filereq_used:
+                                            # Phase 2 safety net: model needs files Phase 1 didn't get
+                                            _p2_fnames = _parse_filereq_content(_content)
+                                            if _p2_fnames:
+                                                _phase2_filereq_used = True
+                                                _p2_file_parts = []
+                                                for _p2fn in _p2_fnames[:5]:
+                                                    _p2c = file_content_lookup_stream.get(_p2fn, "")
+                                                    if _p2c:
+                                                        _p2_file_parts.append(
+                                                            f"FILE: {_p2fn} ({len(_p2c.splitlines())} lines)\n"
+                                                            f"FULL CONTENT:\n```\n{_p2c}\n```")
+                                                    else:
+                                                        _p2_cands = [
+                                                            k for k in file_content_lookup_stream
+                                                            if _p2fn.lower() in k.lower()
+                                                            or k.lower() in _p2fn.lower()
+                                                        ]
+                                                        if _p2_cands:
+                                                            _p2_file_parts.append(
+                                                                f"FILE NOT FOUND: '{_p2fn}' — did you mean: "
+                                                                f"{', '.join(_p2_cands[:3])}?")
+                                                        else:
+                                                            _p2_file_parts.append(
+                                                                f"FILE NOT FOUND: '{_p2fn}'")
+                                                if _p2_file_parts:
+                                                    _dlog("phase2_filereq_safety_net",
+                                                          session_id=session_id, user_id=user_id,
+                                                          filenames=_p2_fnames[:5],
+                                                          found_count=sum(1 for p in _p2_file_parts
+                                                                         if not p.startswith("FILE NOT FOUND")))
+                                                    # Inject files and restart Phase 2
+                                                    current_messages = current_messages + [
+                                                        {"role": "assistant", "content": full_response or "(requesting files...)"},
+                                                        {"role": "user", "content":
+                                                            "Here are the files you requested:\n\n"
+                                                            + "\n\n".join(_p2_file_parts)
+                                                            + "\n\nNow apply the requested changes using "
+                                                            "<surgical_edit>, <new_file>, or <edit_plan> tags."},
+                                                    ]
+                                                    # Reset Phase 2 state for retry
+                                                    full_response = ""
+                                                    state = "normal"
+                                                    normal_buf = ""
+                                                    tag_buf = ""
+                                                    had_thinking = False
+                                                    _edit_hb_bytes = 0
+                                                    _edit_hb_last = 0
+                                                    _round_t0 = time.time()
+                                                    _round_last_text_ts = time.time()
+                                                    stream_kwargs["messages"] = current_messages
+                                                    yield sse({"type": "progress",
+                                                               "content": "Loading additional files and retrying..."})
+                                                    _phase2_filereq_retry = True
+                                                    break  # break inner stream → retry loop picks up
+                                            else:
+                                                _dlog("phase2_search_tag_ignored",
+                                                      session_id=session_id, user_id=user_id,
+                                                      tag_type=_tag_name,
+                                                      content_preview=_content[:200])
                                         elif _tag_name in ("search", "filereq", "github"):
-                                            # Model emitted search in edit phase — log and ignore
+                                            # Model emitted search/filereq(2nd time)/github — log and ignore
                                             _dlog("phase2_search_tag_ignored",
                                                   session_id=session_id, user_id=user_id,
                                                   tag_type=_tag_name,
@@ -14317,6 +14412,11 @@ async def run_natural_pipeline_stream(
                               session_id=session_id, user_id=user_id,
                               matched=str(_matched_stop_seq)[:60],
                               state_at_halt=state, tag_buf_len=len(tag_buf))
+
+                    # Phase 2 file_request safety net triggered — retry with injected files
+                    if _phase2_filereq_retry:
+                        _phase2_filereq_retry = False
+                        continue  # retry the for-loop with updated messages
 
                     break  # success
 
@@ -14421,6 +14521,47 @@ async def run_natural_pipeline_stream(
                                         _pd = _parse_plan_content(_content)
                                         if _pd is not None:
                                             edit_plan_data = _pd
+                                    elif _tag_name == "filereq" and not _phase2_filereq_used:
+                                        # GPT Phase 2 safety net
+                                        _p2_fnames = _parse_filereq_content(_content)
+                                        if _p2_fnames:
+                                            _phase2_filereq_used = True
+                                            _p2_file_parts = []
+                                            for _p2fn in _p2_fnames[:5]:
+                                                _p2c = file_content_lookup_stream.get(_p2fn, "")
+                                                if _p2c:
+                                                    _p2_file_parts.append(
+                                                        f"FILE: {_p2fn} ({len(_p2c.splitlines())} lines)\n"
+                                                        f"FULL CONTENT:\n```\n{_p2c}\n```")
+                                                else:
+                                                    _p2_file_parts.append(f"FILE NOT FOUND: '{_p2fn}'")
+                                            if _p2_file_parts:
+                                                _dlog("phase2_filereq_safety_net_gpt",
+                                                      session_id=session_id, user_id=user_id,
+                                                      filenames=_p2_fnames[:5])
+                                                _gpt_msgs = _gpt_msgs + [
+                                                    {"role": "assistant", "content": full_response or "(requesting files...)"},
+                                                    {"role": "user", "content":
+                                                        "Here are the files you requested:\n\n"
+                                                        + "\n\n".join(_p2_file_parts)
+                                                        + "\n\nNow apply the requested changes using "
+                                                        "<surgical_edit>, <new_file>, or <edit_plan> tags."},
+                                                ]
+                                                full_response = ""
+                                                state = "normal"
+                                                normal_buf = ""
+                                                tag_buf = ""
+                                                _edit_hb_bytes = 0
+                                                _edit_hb_last = 0
+                                                _round_last_text_ts = time.time()
+                                                _phase2_filereq_retry = True
+                                                yield sse({"type": "progress",
+                                                           "content": "Loading additional files and retrying..."})
+                                                break  # break inner stream
+                                        else:
+                                            _dlog("phase2_search_tag_ignored_gpt",
+                                                  session_id=session_id, user_id=user_id,
+                                                  tag_type=_tag_name)
                                     elif _tag_name in ("search", "filereq"):
                                         _dlog("phase2_search_tag_ignored_gpt",
                                               session_id=session_id, user_id=user_id,
@@ -14432,6 +14573,11 @@ async def run_natural_pipeline_stream(
                                         break
                                     if not _remainder:
                                         break
+
+                    # Phase 2 file_request safety net triggered — retry
+                    if _phase2_filereq_retry:
+                        _phase2_filereq_retry = False
+                        continue
 
                     break  # success
 
