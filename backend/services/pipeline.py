@@ -14778,29 +14778,74 @@ async def run_natural_pipeline_stream(
                     _grouped_plan[_gkey] = []
                 _grouped_plan[_gkey].append(_pi)
 
+            # ── Large-symbol merge bypass (session 336ac3bf) ─────────
+            # When the target symbol exceeds LARGE_SYMBOL_LINES, merging
+            # N descriptions into ONE instruction forces the model to
+            # output old_code+new_code spanning the full edit range.
+            # Evidence: AutoMatchModal (761 lines), 5 merged edits
+            # spanning lines 1568→2063 = ~500 lines of output → model
+            # timed out at 120s producing ~0 tokens.
+            # Fix: skip merging for large symbols.  Run each edit
+            # individually — the downstream cumulative splice logic
+            # (line ~15998) already handles sequential same-symbol edits.
+            # Small symbols (<= threshold) still merge per Fix 1
+            # (session 82eb1056: dead-code from split edits on
+            # PasteBatchJobsModal).
+            LARGE_SYMBOL_LINES = 400
+
             _effective_plan = []
             for _gkey, _gitems in _grouped_plan.items():
                 if len(_gitems) == 1:
                     _effective_plan.append(_gitems[0])
                 else:
-                    # Merge descriptions into a single consolidated instruction
-                    _merged_desc = " AND ALSO ".join(
-                        f"({i+1}) {item.get('description', '')}"
-                        for i, item in enumerate(_gitems)
-                    )
-                    _effective_plan.append({
-                        "filename": _gkey[0],
-                        "symbol": _gkey[1],
-                        "description": _merged_desc,
-                    })
-                    _dlog("plan_items_grouped",
-                          session_id=session_id, user_id=user_id,
-                          filename=_gkey[0], symbol=_gkey[1],
-                          original_count=len(_gitems),
-                          merged_description=_merged_desc[:500],
-                          individual_descriptions=[
-                              it.get("description", "")[:200] for it in _gitems
-                          ])
+                    # Check symbol size to decide merge vs. individual
+                    _sym_line_count = 0
+                    _sym_fname, _sym_name = _gkey
+                    _sym_entry = symbol_maps_by_name.get(_sym_fname, (None, None))
+                    if _sym_entry[0]:
+                        for _s in _sym_entry[0].symbols:
+                            if getattr(_s, 'full_path', '') == _sym_name or getattr(_s, 'name', '') == _sym_name:
+                                _sym_line_count = _s.end_line - _s.start_line + 1
+                                break
+
+                    if _sym_line_count > LARGE_SYMBOL_LINES:
+                        # Large symbol — keep edits separate to avoid
+                        # merged-output timeout.  Each individual edit
+                        # produces a small surgical block that completes
+                        # well within 120s.
+                        _dlog("plan_items_large_symbol_skip_merge",
+                              session_id=session_id, user_id=user_id,
+                              filename=_sym_fname, symbol=_sym_name,
+                              symbol_lines=_sym_line_count,
+                              threshold=LARGE_SYMBOL_LINES,
+                              item_count=len(_gitems),
+                              descriptions=[
+                                  it.get("description", "")[:200]
+                                  for it in _gitems
+                              ])
+                        for _gi in _gitems:
+                            _effective_plan.append(_gi)
+                    else:
+                        # Small symbol — merge to prevent dead-code
+                        # from partial success (session 82eb1056).
+                        _merged_desc = " AND ALSO ".join(
+                            f"({i+1}) {item.get('description', '')}"
+                            for i, item in enumerate(_gitems)
+                        )
+                        _effective_plan.append({
+                            "filename": _gkey[0],
+                            "symbol": _gkey[1],
+                            "description": _merged_desc,
+                        })
+                        _dlog("plan_items_grouped",
+                              session_id=session_id, user_id=user_id,
+                              filename=_gkey[0], symbol=_gkey[1],
+                              original_count=len(_gitems),
+                              merged_description=_merged_desc[:500],
+                              individual_descriptions=[
+                                  it.get("description", "")[:200]
+                                  for it in _gitems
+                              ])
 
             _dlog("plan_exec_phase_start",
                   session_id=session_id, user_id=user_id,
