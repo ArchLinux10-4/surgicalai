@@ -660,3 +660,50 @@ class TestPhase2FileRequestSafetyNet(unittest.TestCase):
         idx = self.src.find("phase2_filereq_safety_net_gpt")
         self.assertNotEqual(idx, -1,
                             "GPT branch must have phase2_filereq_safety_net_gpt dlog")
+
+
+class TestPhase2ThinkingStallDeadStream(unittest.TestCase):
+    """Phase 2 stall detector must measure a DEAD stream (no bytes of any
+    kind), not "thinking without text". Adaptive models (claude-sonnet-5)
+    with summarized thinking can legitimately think >2 min before the first
+    edit token — especially after the safety-net re-injects full files.
+    Regression for trace surgical_debug_aaade983 (120s thinking -> false abort,
+    0 edits)."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_activity_ts_initialized(self):
+        self.assertIn("_round_last_activity_ts = time.time()", self.src)
+
+    def test_thinking_delta_resets_activity(self):
+        # The thinking-delta handler must reset the activity timer + count and
+        # then yield the thinking chunk (all in one block).
+        i = self.src.find("_round_thinking_deltas += 1")
+        self.assertNotEqual(i, -1)
+        window = self.src[max(0, i - 200):i + 200]
+        self.assertIn("_round_last_activity_ts = time.time()", window)
+        self.assertIn("_round_last_thinking_ts", window)
+        self.assertIn('yield sse({"type": "thinking", "content": thinking_chunk})', window)
+
+    def test_stall_check_uses_activity_not_text(self):
+        # The stall abort must key off activity (any byte), never text-only.
+        i = self.src.find("STREAMING_THINKING_STALL_S):")
+        self.assertNotEqual(i, -1)
+        window = self.src[max(0, i - 200):i]
+        self.assertIn("_round_last_activity_ts", window)
+
+    def test_stall_log_records_thinking_activity(self):
+        # Diagnostics must record thinking-delta count so future traces prove
+        # whether the stream was truly dead vs legitimately thinking.
+        i = self.src.find('_dlog("streaming_thinking_stall"')
+        self.assertNotEqual(i, -1)
+        window = self.src[i:i + 600]
+        self.assertIn("thinking_deltas=", window)
+        self.assertIn("last_thinking_age_s", window)
+
+    def test_runaway_backstops_still_present(self):
+        # Dead-stream guard must NOT be the only bound — the phase deadline and
+        # pipeline budget remain the runaway guards.
+        self.assertIn("STREAMING_PHASE_DEADLINE_S", self.src)
+        self.assertIn("_pipeline_over_budget()", self.src)

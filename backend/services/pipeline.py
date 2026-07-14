@@ -14173,6 +14173,14 @@ async def run_natural_pipeline_stream(
         _edit_hb_last = 0
         _round_t0 = time.time()
         _round_last_text_ts = time.time()
+        # Stall detection measures a DEAD stream (no bytes of ANY kind), not
+        # "thinking without text". Adaptive models (e.g. claude-sonnet-5) with
+        # summarized thinking can legitimately think >2 min before the first
+        # edit token, especially after the safety-net re-injects full files.
+        # Runaway is bounded separately by STREAMING_PHASE_DEADLINE_S + budget.
+        _round_last_activity_ts = time.time()  # resets on ANY delta (thinking OR text)
+        _round_thinking_deltas = 0             # thinking deltas seen this stream
+        _round_last_thinking_ts = 0.0          # last time a thinking delta arrived
 
         _tag_stop_enabled = _os.getenv("TAG_STOP_SEQUENCES", "true").strip().lower() == "true"
         _tag_stop_seqs = [TAG_DEFS["plan"]["close"]] if _tag_stop_enabled else []
@@ -14214,11 +14222,19 @@ async def run_natural_pipeline_stream(
                                 text_chunk = getattr(delta, "text", None)
 
                                 if thinking_chunk:
+                                    # Thinking IS activity — the model is working,
+                                    # not starving. Reset the stall timer so a
+                                    # legitimate long thinking phase is never
+                                    # falsely aborted as starvation.
+                                    _round_last_activity_ts = time.time()
+                                    _round_last_thinking_ts = _round_last_activity_ts
+                                    _round_thinking_deltas += 1
                                     yield sse({"type": "thinking", "content": thinking_chunk})
 
                                 elif text_chunk:
                                     full_response += text_chunk
                                     _round_last_text_ts = time.time()
+                                    _round_last_activity_ts = _round_last_text_ts
 
                                     if state == "normal":
                                         normal_buf += text_chunk
@@ -14338,6 +14354,9 @@ async def run_natural_pipeline_stream(
                                                     _edit_hb_last = 0
                                                     _round_t0 = time.time()
                                                     _round_last_text_ts = time.time()
+                                                    _round_last_activity_ts = time.time()
+                                                    _round_thinking_deltas = 0
+                                                    _round_last_thinking_ts = 0.0
                                                     stream_kwargs["messages"] = current_messages
                                                     yield sse({"type": "progress",
                                                                "content": "Loading additional files and retrying..."})
@@ -14384,12 +14403,22 @@ async def run_natural_pipeline_stream(
                                       text_len=len(full_response))
                                 _streaming_starvation_abort = True
                                 break
+                            # DEAD-STREAM guard: abort only when NO bytes of any
+                            # kind (thinking OR text) have arrived for the timeout.
+                            # A model actively streaming thinking is working, not
+                            # starving. Runaway (thinks forever) is bounded above
+                            # by STREAMING_PHASE_DEADLINE_S + _pipeline_over_budget().
                             if (had_thinking
-                                    and (time.time() - _round_last_text_ts)
+                                    and (time.time() - _round_last_activity_ts)
                                         > STREAMING_THINKING_STALL_S):
                                 _dlog("streaming_thinking_stall",
                                       session_id=session_id, user_id=user_id,
-                                      stall_s=round(time.time() - _round_last_text_ts, 1),
+                                      stall_s=round(time.time() - _round_last_activity_ts, 1),
+                                      no_text_for_s=round(time.time() - _round_last_text_ts, 1),
+                                      thinking_deltas=_round_thinking_deltas,
+                                      last_thinking_age_s=(
+                                          round(time.time() - _round_last_thinking_ts, 1)
+                                          if _round_last_thinking_ts else None),
                                       text_len=len(full_response))
                                 _streaming_starvation_abort = True
                                 break
