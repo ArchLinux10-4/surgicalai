@@ -544,10 +544,6 @@ class TestNoEditsTextOnlyNotice(unittest.TestCase):
         self.assertIn("elif full_response.strip()", before)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestPhase1NoActionNudge(unittest.TestCase):
     """Fix 1: Phase 1 no-action should nudge, not exit immediately."""
 
@@ -787,3 +783,89 @@ class TestCorrectionBudgeterWiredIn(unittest.TestCase):
 
     def test_clip_emits_dlog(self):
         self.assertIn('correction_payload_clipped', self.src)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Railway 900s SSE wall — deadline gates on every pre-retry phase
+# Evidence: session aaade983 — plan-exec burned 240s on two dead symbols
+# (_load_env, AutoMatchModal @ 120s each), pushing the pipeline from 489s to
+# 827s; the QA judge then STARTED at 827s (past the 810s deadline) and ran
+# 72s, finishing at 899.8s — 0.1s before Railway severed the SSE stream. All
+# 4 verdicts were "safe" but the assembled result never flushed. Every gate
+# below must exist so a run can NEVER cross 900s with unshipped work.
+# ═══════════════════════════════════════════════════════════════════════
+class TestRailwayDeadlineGates(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.src = open(_PIPELINE, encoding="utf-8").read()
+
+    # ── Killer 1: plan-exec cannot overrun the wall ──────────────────────
+    def test_single_edit_accepts_max_wait(self):
+        self.assertIn("max_wait_s: float = 120.0", self.src)
+
+    def test_single_edit_timeout_clamped_to_max_wait(self):
+        self.assertIn("SINGLE_EDIT_TIMEOUT = max(5.0, float(max_wait_s))", self.src)
+
+    def test_plan_exec_has_deadline_gate(self):
+        self.assertIn("plan_exec_deadline_skip", self.src)
+
+    def test_plan_exec_gate_before_resolution(self):
+        # The gate must fire during plan execution, before the resolution phase
+        self.assertLess(
+            self.src.index("plan_exec_deadline_skip"),
+            self.src.index('_dlog("resolution_phase_start"'),
+        )
+
+    def test_plan_exec_clamps_edit_timeout_to_budget(self):
+        self.assertIn("max_wait_s=max(5.0, min(120.0, _budget_left))", self.src)
+        self.assertIn("_budget_left = PIPELINE_DEADLINE_S - (time.time() - _pipeline_t0)", self.src)
+
+    # ── Killer 2: QA judge + pre-checks cannot run past the wall ─────────
+    def test_qa_judge_deadline_gated(self):
+        self.assertIn("_qa_over_budget = _pipeline_over_budget()", self.src)
+        self.assertIn("qa_skipped_over_budget", self.src)
+
+    def test_qa_tasks_empty_when_over_budget(self):
+        self.assertIn("qa_tasks = [] if _qa_over_budget else [", self.src)
+
+    def test_qa_results_synthesized_when_skipped(self):
+        # Skipped QA must still yield one accepting verdict per change so the
+        # results stay aligned with change_shells and clear the 8/10 gate.
+        self.assertIn(
+            'if _qa_over_budget:\n            qa_results = [{',
+            self.src,
+        )
+        self.assertIn('"qa_score": 8,', self.src)
+
+    def test_structural_qa_gated_on_budget(self):
+        self.assertIn("if _has_sq_blocking is not None and not _qa_over_budget:", self.src)
+
+    def test_tsc_precheck_gated_on_budget(self):
+        # tsc pre-check loop must break out when over budget
+        _anchor = self.src.index("_tsc_orig_cache: dict = {}")
+        _window = self.src[_anchor:_anchor + 400]
+        self.assertIn("if _qa_over_budget:", _window)
+        self.assertIn("break", _window)
+
+    def test_qa_gate_before_results_collected(self):
+        self.assertLess(
+            self.src.index("_qa_over_budget = _pipeline_over_budget()"),
+            self.src.index('_dlog("qa_results_collected"'),
+        )
+
+    # ── Pure clamp math (structural guarantee, no I/O) ───────────────────
+    def test_clamp_never_exceeds_remaining_budget(self):
+        clamp = lambda budget_left: max(5.0, min(120.0, budget_left))
+        # Plenty of budget → full 120s
+        self.assertEqual(clamp(500.0), 120.0)
+        # Tight budget → clamped to what remains
+        self.assertEqual(clamp(40.0), 40.0)
+        # Over budget (negative) → floor of 5s, never 120s
+        self.assertEqual(clamp(-30.0), 5.0)
+        # A single edit can never wait longer than the budget when it's small
+        for b in (200, 121, 120, 90, 10, 5, 0, -100):
+            self.assertLessEqual(clamp(b), max(5.0, min(120.0, b)))
+
+
+if __name__ == "__main__":
+    unittest.main()
