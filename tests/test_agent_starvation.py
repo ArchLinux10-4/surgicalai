@@ -1,22 +1,22 @@
 """
-Tests for Agent Mode streaming starvation detection and auto-retry.
+Tests for decomposed pipeline: Phase 1 (search) + Phase 2 (edit).
 
-Verifies the starvation recovery path added after the Agent Mode initial
-Claude streaming call (line ~4375 in pipeline.py).
+Verifies:
+- Phase 1: search rounds, token budget, tag parsing, search results
+- Phase 2: edit streaming, tag parsing, deadline checks
+- Phase separation: search cannot starve edits (structural guarantee)
 
-These tests extract and execute the pure-logic helpers from pipeline.py
-rather than mocking the full async generator.
+Replaces the old monolithic starvation recovery tests (b88174c and prior).
 """
 import ast
 import os
-import textwrap
 import unittest
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PIPELINE = os.path.normpath(os.path.join(_HERE, "..", "backend", "services", "pipeline.py"))
 
 # ---------------------------------------------------------------------------
-# Extract helper functions from pipeline.py the same way test_safe_claude_call does
+# Extract helper functions from pipeline.py
 # ---------------------------------------------------------------------------
 _MODEL_CONST_NAMES = [
     "_ADAPTIVE_THINKING_MODELS",
@@ -41,10 +41,8 @@ _FUNCS_TO_EXTRACT = [
 def _extract_functions():
     src = open(_PIPELINE, encoding="utf-8").read()
     tree = ast.parse(src)
+    ns = {"_dlog": lambda *a, **kw: None}
 
-    ns = {"_dlog": lambda *a, **kw: None}  # no-op logger
-
-    # Extract constants
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -53,7 +51,6 @@ def _extract_functions():
                     if code:
                         exec(code, ns)
 
-    # Extract functions
     for node in ast.iter_child_nodes(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             if node.name in _FUNCS_TO_EXTRACT:
@@ -73,107 +70,165 @@ _bounded_thinking_params = NS["_bounded_thinking_params"]
 _max_output_tokens = NS["_max_output_tokens"]
 
 
-class TestAgentModeStarvationRecoveryLogic(unittest.TestCase):
-    """Verify the logic used by the Agent Mode starvation recovery path."""
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 1: Code Discovery Tests
+# ═══════════════════════════════════════════════════════════════════════
 
-    def test_initial_call_budget_capped_at_8000(self):
-        """Agent Mode initial call uses budget=8000 — adaptive models get type=adaptive."""
-        kw = _get_thinking_kwargs("claude-sonnet-5", 8000)
-        # Adaptive models (claude-sonnet-5) MUST use type=adaptive —
-        # Anthropic API rejects type=enabled on these models (400 error).
-        # Budget capping is structurally impossible; starvation protection
-        # relies on the detect+retry layer in _safe_claude_call.
-        self.assertEqual(kw["thinking"]["type"], "adaptive")
-        self.assertNotIn("budget_tokens", kw["thinking"])
-
-    def test_retry_budget_doubled_to_16000(self):
-        """On starvation retry — adaptive models still get type=adaptive."""
-        kw = _get_thinking_kwargs("claude-sonnet-5", 16000)
-        self.assertEqual(kw["thinking"]["type"], "adaptive")
-        self.assertNotIn("budget_tokens", kw["thinking"])
-
-    def test_retry_max_tokens_covers_text_and_thinking(self):
-        """_bounded_thinking_params ensures max_tokens > budget so text has room."""
-        params = _bounded_thinking_params("claude-sonnet-5", 16000)
-        max_t = params["max_tokens"]
-        # max_tokens must be > budget (text needs room)
-        self.assertGreater(max_t, 16000)
-        # Should include a text margin (at least 4096 based on implementation)
-        self.assertGreaterEqual(max_t - 16000, 4096)
-
-    def test_bounded_params_never_exceed_model_cap(self):
-        """max_tokens from _bounded_thinking_params must not exceed model cap."""
-        model_cap = _max_output_tokens("claude-sonnet-5")
-        for budget in [8000, 16000, 32000, 64000, 100000]:
-            params = _bounded_thinking_params("claude-sonnet-5", budget)
-            self.assertLessEqual(params["max_tokens"], model_cap,
-                                 f"budget={budget} exceeded model cap {model_cap}")
-
-    def test_starvation_detection_empty_text(self):
-        """Starvation condition: full_text.strip() == '' triggers retry."""
-        # These are the exact conditions checked in the agent starvation code
-        self.assertTrue(not "".strip())
-        self.assertTrue(not "   ".strip())
-        self.assertTrue(not "\n\n".strip())
-
-    def test_starvation_detection_has_text(self):
-        """Non-empty text should NOT trigger starvation."""
-        self.assertFalse(not '{"intent": "edit"}'.strip())
-        self.assertFalse(not "hello".strip())
-
-
-class TestAgentModeCodePresence(unittest.TestCase):
-    """Verify the starvation recovery code exists in pipeline.py."""
+class TestPhase1SearchConstants(unittest.TestCase):
+    """Verify Phase 1 constants and structure exist."""
 
     def setUp(self):
         self.src = open(_PIPELINE, encoding="utf-8").read()
 
-    def test_starvation_detection_log_exists(self):
-        """_dlog('agent_thinking_starvation_detected', ...) must exist."""
-        self.assertIn("agent_thinking_starvation_detected", self.src)
+    def test_phase1_max_search_rounds_exists(self):
+        """PHASE1_MAX_SEARCH_ROUNDS must be defined."""
+        self.assertIn("PHASE1_MAX_SEARCH_ROUNDS = 3", self.src)
 
-    def test_starvation_retry_done_log_exists(self):
-        """_dlog('agent_starvation_retry_done', ...) must exist."""
-        self.assertIn("agent_starvation_retry_done", self.src)
+    def test_phase1_max_tokens_exists(self):
+        """PHASE1_MAX_TOKENS must be small (search only needs tiny budget)."""
+        self.assertIn("PHASE1_MAX_TOKENS = 4096", self.src)
 
-    def test_starvation_final_fail_log_exists(self):
-        """_dlog('agent_starvation_final_fail', ...) must exist."""
-        self.assertIn("agent_starvation_final_fail", self.src)
+    def test_phase1_instruction_exists(self):
+        """Phase 1 instruction must tell model to search OR say READY_TO_EDIT."""
+        self.assertIn("PHASE: CODE DISCOVERY", self.src)
+        self.assertIn("READY_TO_EDIT", self.src)
 
-    def test_agent_stream_done_log_exists(self):
-        """_dlog('agent_stream_done', ...) must exist."""
-        self.assertIn("agent_stream_done", self.src)
+    def test_phase1_no_thinking(self):
+        """Phase 1 must NOT include thinking kwargs — fast search only."""
+        # Find Phase 1 kwargs construction
+        idx = self.src.find("PHASE1_MAX_TOKENS")
+        p1_block = self.src[idx:idx + 500]
+        # _get_effort_kwargs is fine but _get_thinking_kwargs should NOT be there
+        self.assertNotIn("_get_thinking_kwargs", p1_block)
 
-    def test_retry_uses_bounded_thinking_params(self):
-        """Retry path must call _bounded_thinking_params for safe max_tokens."""
-        # Find the starvation block and verify _bounded_thinking_params is called
-        idx = self.src.index("agent_thinking_starvation_detected")
-        # Within 500 chars before the log, _bounded_thinking_params should appear
-        block = self.src[max(0, idx - 500):idx + 500]
-        self.assertIn("_bounded_thinking_params", block)
+    def test_phase1_complete_dlog_exists(self):
+        """Phase 1 must log completion with stats."""
+        self.assertIn("phase1_complete", self.src)
 
-    def test_retry_uses_doubled_budget(self):
-        """Retry must use 16_000 budget (double the initial 8000)."""
-        idx = self.src.index("agent_thinking_starvation_detected")
-        block = self.src[max(0, idx - 300):idx]
-        self.assertIn("16_000", block)
+    def test_phase1_ready_to_edit_dlog_exists(self):
+        """Phase 1 must log when model says READY_TO_EDIT."""
+        self.assertIn("phase1_ready_to_edit", self.src)
 
-    def test_no_messages_create_in_agent_mode(self):
-        """Agent mode must NOT use messages.create() — only streaming."""
-        # Find the agent mode function
-        start = self.src.index("Agent Mode starvation detection")
-        # Check 2000 chars around it — no messages.create()
-        block = self.src[max(0, start - 1000):start + 1000]
-        self.assertNotIn("messages.create(", block)
+    def test_phase1_search_round_done_dlog_exists(self):
+        """Phase 1 must log each round completion."""
+        self.assertIn("phase1_search_round_done", self.src)
+
+    def test_phase1_search_requested_dlog_exists(self):
+        """Phase 1 must log search requests."""
+        self.assertIn("phase1_search_requested", self.src)
+
+    def test_phase1_search_results_dlog_exists(self):
+        """Phase 1 must log search results."""
+        self.assertIn("phase1_search_results", self.src)
 
 
-class TestStreamingPhaseDeadlines(unittest.TestCase):
-    """Verify streaming-phase deadline code exists in pipeline.py.
+class TestPhase1SearchDedup(unittest.TestCase):
+    """Verify Phase 1 deduplicates search terms."""
 
-    Evidence: session a50319ca — Opus 4.6 adaptive thinking consumed
-    277s (Stream 2) and 570s (Stream 3) without producing text tokens,
-    hitting Railway's 15-min SSE limit.
-    """
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_searched_terms_tracked(self):
+        """searched_terms must accumulate across rounds."""
+        self.assertIn("searched_terms: list = []", self.src)
+        self.assertIn("searched_terms.extend(new_terms)", self.src)
+
+    def test_dedup_logic_exists(self):
+        """New terms must be filtered against already-searched terms."""
+        self.assertIn("if t.lower() not in", self.src)
+
+    def test_all_terms_searched_exits(self):
+        """If all terms already searched, break out of search loop."""
+        self.assertIn("phase1_all_terms_searched", self.src)
+
+
+class TestPhase1FileRequest(unittest.TestCase):
+    """Verify Phase 1 file request handling."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_tier1_guard_exists(self):
+        """Tier-1 guard must prevent re-fetching files already in context."""
+        self.assertIn("phase1_filereq_tier1_guard", self.src)
+
+    def test_max_file_req_total_exists(self):
+        """MAX_FILE_REQ_TOTAL must cap total fetchable files."""
+        self.assertIn("MAX_FILE_REQ_TOTAL = 15", self.src)
+
+    def test_file_request_resolved_dlog_exists(self):
+        """Phase 1 must log resolved file requests."""
+        self.assertIn("phase1_file_request_resolved", self.src)
+
+    def test_missing_file_note(self):
+        """Missing files must produce a user-visible note."""
+        self.assertIn("MISSING FILES", self.src)
+
+
+class TestPhase1GitHub(unittest.TestCase):
+    """Verify Phase 1 GitHub request handling."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_github_budget_constants(self):
+        """GitHub round and attempt limits must exist."""
+        self.assertIn("MAX_GITHUB_ROUNDS = 6", self.src)
+        self.assertIn("MAX_GITHUB_ATTEMPTS = 12", self.src)
+
+    def test_github_budget_exhausted_dlog(self):
+        """Must log when GitHub budget is exhausted."""
+        self.assertIn("phase1_github_budget_exhausted", self.src)
+
+    def test_github_result_dlog(self):
+        """Must log GitHub results."""
+        self.assertIn("phase1_github_result", self.src)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 2: Edit Generation Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPhase2EditStreaming(unittest.TestCase):
+    """Verify Phase 2 edit streaming structure."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_phase2_complete_dlog_exists(self):
+        """Phase 2 must log completion with stats."""
+        self.assertIn("phase2_complete", self.src)
+
+    def test_phase2_uses_full_thinking(self):
+        """Phase 2 must use _get_thinking_kwargs for full thinking."""
+        # Find Phase 2 stream_kwargs construction (after PHASE 2 comment)
+        idx = self.src.find("PHASE 2: EDIT GENERATION")
+        self.assertGreater(idx, 0, "Phase 2 section must exist")
+        p2_block = self.src[idx:idx + 3000]
+        self.assertIn("_get_thinking_kwargs", p2_block)
+
+    def test_phase2_uses_full_max_tokens(self):
+        """Phase 2 must use _max_output_tokens (full budget)."""
+        idx = self.src.find("PHASE 2: EDIT GENERATION")
+        p2_block = self.src[idx:idx + 3000]
+        self.assertIn("_max_output_tokens", p2_block)
+
+    def test_phase2_ignores_search_tags(self):
+        """Phase 2 must ignore search/filereq tags (search phase is over)."""
+        self.assertIn("phase2_search_tag_ignored", self.src)
+
+    def test_phase2_search_injection(self):
+        """Phase 2 must inject accumulated search results into messages."""
+        self.assertIn("accumulated_search_results", self.src)
+        self.assertIn("all code discovery is complete", self.src)
+
+    def test_edit_heartbeat_exists(self):
+        """Edit heartbeat progress must emit during long edits."""
+        self.assertIn("Writing code changes", self.src)
+
+
+class TestPhase2DeadlineChecks(unittest.TestCase):
+    """Verify Phase 2 deadline and stall detection."""
 
     def setUp(self):
         self.src = open(_PIPELINE, encoding="utf-8").read()
@@ -187,16 +242,17 @@ class TestStreamingPhaseDeadlines(unittest.TestCase):
         self.assertIn("STREAMING_THINKING_STALL_S = 120", self.src)
 
     def test_starvation_abort_flag_initialized(self):
-        """_streaming_starvation_abort must be initialized before search loop."""
+        """_streaming_starvation_abort must be initialized before Phase 2."""
         idx_flag = self.src.index("_streaming_starvation_abort = False")
-        idx_loop = self.src.index("for search_round in range(MAX_SEARCH_ROUNDS")
-        self.assertLess(idx_flag, idx_loop,
-                        "Flag must be initialized before the search loop")
+        idx_p2 = self.src.index("PHASE 2: EDIT GENERATION")
+        self.assertLess(idx_flag, idx_p2,
+                        "Flag must be initialized before Phase 2")
 
     def test_round_text_timestamp_initialized(self):
-        """_round_last_text_ts must be set at start of each round."""
-        idx_round = self.src.index("_round_t0 = time.time()")
-        block = self.src[idx_round:idx_round + 200]
+        """_round_last_text_ts must be set at start of Phase 2."""
+        # Find the Phase 2 _round_t0
+        idx_p2 = self.src.index("PHASE 2: EDIT GENERATION")
+        block = self.src[idx_p2:idx_p2 + 5000]
         self.assertIn("_round_last_text_ts = time.time()", block)
 
     def test_text_timestamp_updated_on_text_chunk(self):
@@ -242,85 +298,244 @@ class TestStreamingPhaseDeadlines(unittest.TestCase):
         self.assertIn("had_thinking", block)
 
 
-class TestStarvationRecovery(unittest.TestCase):
-    """Tests for the no-thinking retry recovery after starvation abort."""
+class TestPhase2TotalFailure(unittest.TestCase):
+    """Verify Phase 2 total failure handling (no recovery needed)."""
 
     def setUp(self):
         self.src = open(_PIPELINE, encoding="utf-8").read()
 
-    def test_recovery_retry_dlog_exists(self):
-        self.assertIn("starvation_recovery_retry", self.src)
-
-    def test_recovery_done_dlog_exists(self):
-        self.assertIn("starvation_recovery_done", self.src)
-
-    def test_recovery_error_dlog_exists(self):
-        self.assertIn("starvation_recovery_error", self.src)
-
     def test_total_failure_dlog_exists(self):
         self.assertIn("starvation_total_failure", self.src)
 
-    def test_thinking_stripped_from_retry(self):
-        """Retry kwargs must exclude 'thinking' key."""
-        self.assertIn('k: v for k, v in stream_kwargs.items() if k != "thinking"', self.src)
-
-    def test_output_config_stripped_from_retry(self):
-        """output_config (effort) must be stripped — not valid without thinking."""
-        self.assertIn('_retry_kwargs.pop("output_config"', self.src)
-
-    def test_recovery_user_message_on_retry(self):
-        """User should see a progress message when recovery retry starts."""
-        self.assertIn("retrying without extended thinking", self.src)
-
-    def test_recovery_user_message_on_total_failure(self):
-        """User must see an error if both original and recovery produce nothing."""
+    def test_total_failure_user_message(self):
+        """User must see an error if Phase 2 produces nothing."""
         self.assertIn("spent all available time thinking", self.src)
 
-    def test_recovery_guards_pipeline_budget(self):
-        """Recovery retry must check _pipeline_over_budget before retrying."""
-        idx = self.src.find("starvation_recovery_retry")
-        # The budget check should appear before the dlog
-        budget_idx = self.src.rfind("_pipeline_over_budget", 0, idx)
-        self.assertGreater(budget_idx, 0,
-                           "_pipeline_over_budget check must precede recovery retry")
+    def test_total_failure_returns(self):
+        """Total failure must yield done and return."""
+        idx = self.src.find("starvation_total_failure")
+        after = self.src[idx:idx + 1000]
+        self.assertIn('"done"', after)
+        self.assertIn("return", after)
 
-    def test_recovery_replaces_main_variables(self):
-        """On success, recovery must overwrite full_response and edit_blocks_raw."""
-        idx = self.src.find("starvation_recovery_done")
-        after = self.src[idx:idx + 800]
-        self.assertIn("full_response = _final_response", after)
-        self.assertIn("edit_blocks_raw = _final_edit_blocks", after)
 
-    def test_recovery_only_when_empty_response(self):
-        """Recovery must only trigger when full_response is empty."""
-        idx = self.src.find("starvation_recovery_retry")
-        before = self.src[max(0, idx - 300):idx]
-        self.assertIn("len(full_response.strip()) == 0", before)
+# ═══════════════════════════════════════════════════════════════════════
+# Structural Guarantee Tests
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPhaseDecompositionStructure(unittest.TestCase):
+    """Verify the structural guarantee: Phase 1 and Phase 2 are separate.
+
+    The core invariant: search (Phase 1) physically cannot starve
+    edits (Phase 2) because they are separate API calls with
+    independent token budgets.
+    """
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_two_phases_exist(self):
+        """Both PHASE 1 and PHASE 2 sections must exist."""
+        self.assertIn("PHASE 1: CODE DISCOVERY", self.src)
+        self.assertIn("PHASE 2: EDIT GENERATION", self.src)
+
+    def test_phase1_before_phase2(self):
+        """Phase 1 must come before Phase 2."""
+        idx1 = self.src.index("PHASE 1: CODE DISCOVERY")
+        idx2 = self.src.index("PHASE 2: EDIT GENERATION")
+        self.assertLess(idx1, idx2)
+
+    def test_no_monolithic_search_loop(self):
+        """Old monolithic search loop (search_round in range(MAX_SEARCH_ROUNDS))
+        must NOT exist — replaced by Phase 1 loop."""
+        # The old loop used "for search_round in range(MAX_SEARCH_ROUNDS"
+        self.assertNotIn("for search_round in range(MAX_SEARCH_ROUNDS", self.src)
+
+    def test_no_starvation_recovery_loop(self):
+        """Old starvation recovery (recovery_stream_round, forced_write_nudge)
+        must NOT exist — structurally unnecessary with decomposed phases."""
+        self.assertNotIn("_recovery_stream_round", self.src)
+        self.assertNotIn("RECOVERY_MAX_ROUNDS", self.src)
+        self.assertNotIn("_forced_write_nudge_sent", self.src)
+
+    def test_no_search_time_budget(self):
+        """Old SEARCH_TIME_BUDGET_S must NOT exist — Phase 1 has round limits."""
+        self.assertNotIn("SEARCH_TIME_BUDGET_S", self.src)
+
+    def test_no_total_preedit_budget(self):
+        """Old TOTAL_PREEDIT_BUDGET_S must NOT exist — each phase has own budget."""
+        self.assertNotIn("TOTAL_PREEDIT_BUDGET_S", self.src)
+
+    def test_phase1_small_tokens(self):
+        """Phase 1 uses PHASE1_MAX_TOKENS (small), not full model budget."""
+        self.assertIn("PHASE1_MAX_TOKENS = 4096", self.src)
+
+    def test_phase2_full_tokens(self):
+        """Phase 2 uses _max_output_tokens (full model budget)."""
+        idx = self.src.index("PHASE 2: EDIT GENERATION")
+        p2_block = self.src[idx:idx + 3000]
+        self.assertIn("_max_output_tokens(arch_model)", p2_block)
+
+
+class TestPhase1TagParsing(unittest.TestCase):
+    """Verify Phase 1 tag parsing only handles search-phase tags."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_p1_tags_defined(self):
+        """Phase 1 tag set must include search and filereq."""
+        self.assertIn('"search", "filereq"', self.src)
+
+    def test_p1_stop_sequences(self):
+        """Phase 1 must use stop sequences for its tag set."""
+        self.assertIn("_p1_stop_seqs", self.src)
+
+    def test_unclosed_tag_handling(self):
+        """Phase 1 must handle unclosed tags from stop_sequence."""
+        idx = self.src.find("phase1_search_round_done")
+        # Before that dlog, unclosed tag handling should exist
+        block = self.src[max(0, idx - 2000):idx]
+        self.assertIn("_p1_state.startswith", block)
+
+
+class TestPhase2TagParsing(unittest.TestCase):
+    """Verify Phase 2 tag parsing handles all tags correctly."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_edit_blocks_collected(self):
+        """Phase 2 must collect edit blocks."""
+        self.assertIn("edit_blocks_raw.append(_content)", self.src)
+
+    def test_new_file_blocks_collected(self):
+        """Phase 2 must collect new file blocks."""
+        self.assertIn("new_file_blocks_raw.append(_content)", self.src)
+
+    def test_plan_parsed(self):
+        """Phase 2 must parse edit_plan tags."""
+        self.assertIn("_parse_plan_content(_content)", self.src)
+
+    def test_eos_finalizer_exists(self):
+        """End-of-stream finalizer must handle unclosed tags."""
+        self.assertIn("eos_finalizer_triggered", self.src)
+
+    def test_eos_edit_recovery(self):
+        """EOS finalizer must recover unclosed edit blocks."""
+        self.assertIn("eos_edit_recovered", self.src)
+
+    def test_eos_plan_recovery(self):
+        """EOS finalizer must recover unclosed plan blocks."""
+        self.assertIn("eos_plan_recovered", self.src)
+
+    def test_stop_sequence_synthesizer(self):
+        """Stop-sequence tag-close synthesizer must exist."""
+        self.assertIn("tag_closed_via_stop_sequence", self.src)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Agent Mode Tests (unchanged — separate code path)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestAgentModeStarvationRecoveryLogic(unittest.TestCase):
+    """Verify the logic used by the Agent Mode starvation recovery path."""
+
+    def test_initial_call_budget_capped_at_8000(self):
+        """Agent Mode initial call uses budget=8000 — adaptive models get type=adaptive."""
+        kw = _get_thinking_kwargs("claude-sonnet-5", 8000)
+        self.assertEqual(kw["thinking"]["type"], "adaptive")
+        self.assertNotIn("budget_tokens", kw["thinking"])
+
+    def test_retry_budget_doubled_to_16000(self):
+        """On starvation retry — adaptive models still get type=adaptive."""
+        kw = _get_thinking_kwargs("claude-sonnet-5", 16000)
+        self.assertEqual(kw["thinking"]["type"], "adaptive")
+        self.assertNotIn("budget_tokens", kw["thinking"])
+
+    def test_retry_max_tokens_covers_text_and_thinking(self):
+        """_bounded_thinking_params ensures max_tokens > budget so text has room."""
+        params = _bounded_thinking_params("claude-sonnet-5", 16000)
+        max_t = params["max_tokens"]
+        self.assertGreater(max_t, 16000)
+        self.assertGreaterEqual(max_t - 16000, 4096)
+
+    def test_bounded_params_never_exceed_model_cap(self):
+        """max_tokens from _bounded_thinking_params must not exceed model cap."""
+        model_cap = _max_output_tokens("claude-sonnet-5")
+        for budget in [8000, 16000, 32000, 64000, 100000]:
+            params = _bounded_thinking_params("claude-sonnet-5", budget)
+            self.assertLessEqual(params["max_tokens"], model_cap,
+                                 f"budget={budget} exceeded model cap {model_cap}")
+
+    def test_starvation_detection_empty_text(self):
+        """Starvation condition: full_text.strip() == '' triggers retry."""
+        self.assertTrue(not "".strip())
+        self.assertTrue(not "   ".strip())
+        self.assertTrue(not "\n\n".strip())
+
+    def test_starvation_detection_has_text(self):
+        """Non-empty text should NOT trigger starvation."""
+        self.assertFalse(not '{"intent": "edit"}'.strip())
+        self.assertFalse(not "hello".strip())
+
+
+class TestAgentModeCodePresence(unittest.TestCase):
+    """Verify the Agent Mode starvation recovery code exists in pipeline.py."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_starvation_detection_log_exists(self):
+        self.assertIn("agent_thinking_starvation_detected", self.src)
+
+    def test_starvation_retry_done_log_exists(self):
+        self.assertIn("agent_starvation_retry_done", self.src)
+
+    def test_starvation_final_fail_log_exists(self):
+        self.assertIn("agent_starvation_final_fail", self.src)
+
+    def test_agent_stream_done_log_exists(self):
+        self.assertIn("agent_stream_done", self.src)
+
+    def test_retry_uses_bounded_thinking_params(self):
+        idx = self.src.index("agent_thinking_starvation_detected")
+        block = self.src[max(0, idx - 500):idx + 500]
+        self.assertIn("_bounded_thinking_params", block)
+
+    def test_retry_uses_doubled_budget(self):
+        idx = self.src.index("agent_thinking_starvation_detected")
+        block = self.src[max(0, idx - 300):idx]
+        self.assertIn("16_000", block)
+
+    def test_no_messages_create_in_agent_mode(self):
+        start = self.src.index("Agent Mode starvation detection")
+        block = self.src[max(0, start - 1000):start + 1000]
+        self.assertNotIn("messages.create(", block)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# No-edits text-only notice (unchanged — in resolution phase)
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestNoEditsTextOnlyNotice(unittest.TestCase):
+    """When model produces text but no edit blocks, user must see a notice."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
 
     def test_no_edits_text_only_sends_user_notice(self):
-        """When model produces text but no edit blocks, user must see a notice.
-
-        Evidence: session d02bc93f run 5 — recovery produced 1567 chars
-        of plan text but 0 edit blocks. no_edits_produced fired silently,
-        user saw the plan text streamed but got no indication that no
-        files were changed.
-        """
         self.assertIn("no_edits_text_only_notice", self.src)
-        # The notice must contain a clear user-facing message
         self.assertIn("No code changes were produced", self.src)
 
     def test_no_edits_text_only_dlog(self):
-        """The text-only notice must log was_starvation_recovery flag."""
         idx = self.src.find("no_edits_text_only_notice")
         self.assertGreater(idx, 0)
         after = self.src[idx:idx + 300]
         self.assertIn("was_starvation_recovery", after)
 
     def test_no_edits_text_only_after_skipped_changes_check(self):
-        """The text-only notice is an elif after skipped_changes_struct check,
-        so it only fires when no plan tasks ran."""
         idx = self.src.find("no_edits_text_only_notice")
-        # Actual distance is ~570 chars; use 700 for margin
         before = self.src[max(0, idx - 700):idx]
         self.assertIn("elif full_response.strip()", before)
 

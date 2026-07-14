@@ -13502,39 +13502,17 @@ async def run_natural_pipeline_stream(
         # ── Stream model's response ───────────────────────────────────────
         yield sse({"type": "progress", "content": "Thinking..."})
 
-        # ── Round-trip tags for stop-sequence optimization ────────────────
-        _ROUND_TRIP_TAGS = ("search", "filereq", "plan", "github")
-        _tag_stop_enabled = _os.getenv("TAG_STOP_SEQUENCES", "true").strip().lower() == "true"
-        _tag_stop_seqs = [TAG_DEFS[_tn]["close"] for _tn in _ROUND_TRIP_TAGS if _tn in TAG_DEFS] if _tag_stop_enabled else []
-
-        if _natural_use_claude:
-            stream_kwargs = {
-                "model": arch_model,
-                "max_tokens": _max_output_tokens(arch_model),
-                "system": system_prompt,
-                "messages": messages,
-            }
-            stream_kwargs.update(_get_thinking_kwargs(arch_model, 10000))
-            stream_kwargs.update(_get_effort_kwargs(arch_model))
-            if _tag_stop_enabled:
-                stream_kwargs["stop_sequences"] = _tag_stop_seqs
-                _dlog("tag_stop_sequences_enabled",
-                      session_id=session_id, user_id=user_id,
-                      sequences=_tag_stop_seqs)
-            else:
-                _dlog("tag_stop_sequences_disabled",
-                      session_id=session_id, user_id=user_id)
-        else:
-            # GPT: prepare stop sequences for OpenAI format (max 4)
-            _gpt_stop = _tag_stop_seqs[:4] if _tag_stop_enabled else None
-            _dlog("natural_gpt_stream_setup",
-                  model=arch_model, session_id=session_id,
-                  stop_seqs=_gpt_stop, user_id=user_id)
-
-        # ── Streaming loop with ReAct search + edit/file/search tag parsing ─────
-        # Claude can emit <search_request>, <surgical_edit>, or <new_file> tags.
-        # Search tags trigger a silent code-fetch + re-call loop (max 4 rounds).
-        # Edit/file tags are buffered and processed after streaming completes.
+        # ═══════════════════════════════════════════════════════════════════
+        # DECOMPOSED PIPELINE — Phase 1 (search) + Phase 2 (edit)
+        #
+        # Each phase is a SEPARATE API call with its own token budget.
+        # Search can never starve edits. No starvation recovery needed.
+        #
+        # Phase 1: Code Discovery — small token budget, no thinking,
+        #          up to 3 rounds of search/file_request/github.
+        # Phase 2: Edit Generation — full token budget, full thinking,
+        #          single API call, only edit/file/plan tags parsed.
+        # ═══════════════════════════════════════════════════════════════════
 
         edit_blocks_raw: list = []
         new_file_blocks_raw: list = []
@@ -13542,950 +13520,393 @@ async def run_natural_pipeline_stream(
         full_response = ""
         in_thinking = False
 
-        # Build the per-file content lookup once (reused across search rounds)
+        # Build the per-file content lookup once (reused across both phases)
         file_content_lookup_stream: dict = {
             sf["filename"]: sf.get("content", "") for sf in session_files
         }
 
-        MAX_SEARCH_ROUNDS = 3                    # hard cap — 3 rounds of search is plenty (was 10; trace 8a7b9037 did 5 rounds → 17K+ context → stall)
-        SEARCH_TIME_BUDGET_S = 150               # 2.5 min; 30s buffer so a round that starts at 149s can't stall past 300s
-        TOTAL_PREEDIT_BUDGET_S = 420             # 7 min max before edits must start (Railway=15 min)
-        _last_stop_reason: str | None = None     # capture Claude's stop_reason per round
-        _matched_stop_seq: str | None = None     # which stop_sequence halted the round (Improvement #4)
-        searched_terms: list = []                # terms fetched so far (avoid re-fetching)
-        requested_files: set = set()             # files fetched via <file_request>
-        MAX_FILE_REQ_TOTAL = 15                  # cap total fetchable via <file_request>                # terms fetched so far (avoid re-fetching)
-        accumulated_search_results = ""          # injected into context each round
-        current_messages = list(messages)        # grows with search result turns
-        _forced_edit_round_done = False          # only one forced-edit round allowed
-        _thinking_only_retries = 0               # max 1 auto-retry for thinking-only responses
-        _gh_announce_retries = 0                 # max 1 auto-retry for announce-without-action stalls
-        MAX_GITHUB_ROUNDS = 6                    # cap PRODUCTIVE <github_request> rounds per prompt
-        MAX_GITHUB_ATTEMPTS = 12                 # hard cap on total attempts (incl. invalid JSON / tool failures)
-        _github_rounds_used = 0                  # counts only rounds that returned data (session ff4ff718 fix)
-        _github_attempts = 0                     # counts every attempt — loop-safety backstop
+        # ───────────────────────────────────────────────────────────────────
+        # PHASE 1: CODE DISCOVERY
+        # ───────────────────────────────────────────────────────────────────
 
-        # +2: one extra slot for the forced-edit round when budget exhausted
+        PHASE1_MAX_SEARCH_ROUNDS = 3     # max search rounds
+        PHASE1_MAX_TOKENS = 4096         # search terms are tiny
+        MAX_FILE_REQ_TOTAL = 15          # cap total fetchable via <file_request>
+        searched_terms: list = []
+        requested_files: set = set()
+        accumulated_search_results = ""
+        _phase1_msgs = list(messages)
+
+        # GitHub state
+        MAX_GITHUB_ROUNDS = 6
+        MAX_GITHUB_ATTEMPTS = 12
+        _github_rounds_used = 0
+        _github_attempts = 0
+
         _streaming_t0 = time.time()
-        _streaming_starvation_abort = False
-        for search_round in range(MAX_SEARCH_ROUNDS + 2):
-            # ── Time budget gate (session a3140cd3 fix) ──────────────
-            # Prevents search phase from consuming so much time that
-            # Railway's 15-min HTTP limit kills the request before edits
-            # finish. Evidence: trace 9538f9f1 burned 780s in search
-            # before any edit, leaving only 113s for 12-item plan.
-            _search_elapsed = time.time() - _streaming_t0
-            if search_round > 0 and _search_elapsed > SEARCH_TIME_BUDGET_S:
-                _dlog("search_time_budget_exceeded",
-                      session_id=session_id, user_id=user_id,
-                      search_round=search_round,
-                      elapsed_s=round(_search_elapsed, 1),
-                      budget_s=SEARCH_TIME_BUDGET_S)
-                if not _forced_edit_round_done:
-                    # Give model one final shot to write edits
-                    _forced_edit_round_done = True
-                    yield sse({"type": "progress",
-                               "content": "⏱️ Search time limit reached — writing edits now..."})
-                    forced_msg = (
-                        f"TIME BUDGET REACHED ({int(_search_elapsed)}s of {SEARCH_TIME_BUDGET_S}s). "
-                        "You already have all the code you need from previous results. "
-                        "Write your complete <surgical_edit> or <new_file> blocks RIGHT NOW. "
-                        "Do NOT emit another <search_request> — there is no time left for searching. "
-                        "Use the exact symbol names from the search results you already received."
-                    )
-                    current_messages = current_messages + [
-                        {"role": "assistant", "content": full_response or "(analyzing gathered code...)"},
-                        {"role": "user", "content": forced_msg},
-                    ]
-                    full_response = ""
-                    search_requested = None
-                    # Fall through to streaming code below — do NOT 'continue',
-                    # which would hit the budget check again and break immediately
-                    # (bug: trace 8a7b9037 — forced edit message was injected but
-                    # model never streamed because continue → budget → break).
-                else:
-                    _dlog("search_time_budget_forced_exit",
-                          session_id=session_id, user_id=user_id,
-                          elapsed_s=round(_search_elapsed, 1))
-                    break  # Already tried forced round — exit to edit phase
+        _streaming_starvation_abort = False   # only set in Phase 2
+
+        _PHASE1_INSTRUCTION = (
+            "\n\n[PHASE: CODE DISCOVERY]\n"
+            "Analyze the user's request and the code context available. "
+            "If you need to see more code to make the changes, emit a <search_request> or <file_request> tag. "
+            "If you already have enough context to write the changes, respond with: READY_TO_EDIT\n"
+            "Do NOT write any <surgical_edit>, <new_file>, or <edit_plan> blocks yet — that happens next."
+        )
+
+        _P1_TAGS = {"search", "filereq"}
+        if _gh_nat_enabled:
+            _P1_TAGS.add("github")
+        _p1_stop_seqs = [TAG_DEFS[t]["close"] for t in _P1_TAGS if t in TAG_DEFS]
+
+        _search_round = 0  # will be updated in loop
+
+        for _search_round in range(PHASE1_MAX_SEARCH_ROUNDS):
             _round_t0 = time.time()
-            _round_last_text_ts = time.time()
 
-            state = "normal"    # "normal" | "in_edit" | "in_file" | "in_search" | "in_filereq" | "in_plan"
-            normal_buf = ""
-            tag_buf = ""        # unified buffer for all non-normal tag states
-            search_requested: dict | None = None  # set when a search block completes
-            file_request_data: list | None = None  # set when a file_request block completes
-            github_requested: dict | None = None  # set when a github_request block completes
-            had_thinking = False                    # track if Claude produced thinking this round
-            # ── Edit-stream heartbeat (session e4e9d098 fix 3) ──────────
-            # Evidence: 2.5 minutes of edit-block generation produced ZERO
-            # visible output (edit tokens are suppressed from chat) — the
-            # UI showed only a static "Preparing code change..." box, which
-            # reads as hung and invites a client abort (the disconnect that
-            # killed that run).  Emit a byte-count progress heartbeat while
-            # inside <surgical_edit>/<new_file> so long generations read as
-            # alive and moving.
-            _edit_hb_bytes = 0
-            _edit_hb_last = 0
+            # ── Build search-phase messages ────────────────────────────
+            if _search_round == 0:
+                _round_msgs = list(_phase1_msgs)
+                _last_msg = _round_msgs[-1]
+                if isinstance(_last_msg.get("content"), str):
+                    _round_msgs[-1] = {**_last_msg, "content": _last_msg["content"] + _PHASE1_INSTRUCTION}
+                elif isinstance(_last_msg.get("content"), list):
+                    _round_msgs[-1] = {
+                        **_last_msg,
+                        "content": list(_last_msg["content"]) + [{"type": "text", "text": _PHASE1_INSTRUCTION}],
+                    }
+            else:
+                _round_msgs = _phase1_msgs
 
-            # ── GPT streaming branch (R25) ────────────────────────────────
-            if not _natural_use_claude:
-                _gpt_client = _get_client(user_id)
-                _gpt_msgs = [{"role": "system", "content": _gpt_system_text}] + list(current_messages)
-                _gpt_finish_reason = None
+            if _search_round > 0:
+                yield sse({"type": "progress",
+                           "content": f"Analyzing code context (round {_search_round + 1})..."})
+
+            # ── Per-round state ────────────────────────────────────────
+            _p1_response = ""
+            _p1_state = "normal"
+            _p1_normal_buf = ""
+            _p1_tag_buf = ""
+            search_requested: dict | None = None
+            file_request_data: list | None = None
+            github_requested: dict | None = None
+            _p1_last_stop_reason: str | None = None
+
+            if _natural_use_claude:
+                _p1_kwargs = {
+                    "model": arch_model,
+                    "max_tokens": PHASE1_MAX_TOKENS,
+                    "system": system_prompt,
+                    "messages": _round_msgs,
+                }
+                # No thinking for search phase — fast and focused
+                _p1_kwargs.update(_get_effort_kwargs(arch_model))
+                if _p1_stop_seqs:
+                    _p1_kwargs["stop_sequences"] = _p1_stop_seqs
 
                 for _attempt in range(3):
                     try:
-                        _gpt_stream = _chat_create(
-                            _gpt_client, model=arch_model,
-                            messages=_gpt_msgs,
-                            stream=True,
-                            max_tokens=_max_output_tokens(arch_model),
-                            stop=_gpt_stop if _tag_stop_enabled else None,
-                        )
-                        for _gpt_chunk in _gpt_stream:
-                            _gpt_choice = _gpt_chunk.choices[0]
-                            if _gpt_choice.finish_reason:
-                                _gpt_finish_reason = _gpt_choice.finish_reason
-                            _gpt_text = _gpt_choice.delta.content if _gpt_choice.delta else None
-                            if not _gpt_text:
-                                continue
+                        async with aclient.messages.stream(**_p1_kwargs) as _p1_stream:
+                            async for _p1_ev in _p1_stream:
+                                _p1_etype = getattr(_p1_ev, "type", None)
 
-                            full_response += _gpt_text
+                                if _p1_etype == "content_block_delta":
+                                    _p1_delta = getattr(_p1_ev, "delta", None)
+                                    if not _p1_delta:
+                                        continue
+                                    _p1_text = getattr(_p1_delta, "text", None)
+                                    _p1_thinking = getattr(_p1_delta, "thinking", None)
 
-                            # Append to appropriate buffer
-                            if state == "normal":
-                                normal_buf += _gpt_text
-                            else:
-                                tag_buf += _gpt_text
-                                # Edit heartbeat
-                                if state in ("in_edit", "in_file"):
-                                    _edit_hb_bytes += len(_gpt_text)
-                                    if _edit_hb_bytes - _edit_hb_last >= 2048:
-                                        _edit_hb_last = _edit_hb_bytes
-                                        yield sse({
-                                            "type": "progress",
-                                            "content": f"✍️ Writing code changes… {_edit_hb_bytes/1024:.1f} KB",
-                                        })
+                                    if _p1_thinking:
+                                        pass  # Skip thinking in search phase
 
-                            # ── Tag parsing state machine (shared logic) ──
-                            while True:
-                                if state == "normal":
-                                    _found_open = False
-                                    while True:
-                                        candidates = []
-                                        for _tname, _tdef in TAG_DEFS.items():
-                                            _ti = normal_buf.find(_tdef["open"])
-                                            if _ti != -1:
-                                                candidates.append((_ti, _tname))
-                                        if not candidates:
-                                            tail = max(len(td["open"]) for td in TAG_DEFS.values())
-                                            safe = max(0, len(normal_buf) - tail)
-                                            if safe > 0:
-                                                yield sse({"type": "token", "content": normal_buf[:safe]})
-                                                normal_buf = normal_buf[safe:]
-                                            break
-                                        first_idx, first_tag = min(candidates, key=lambda x: x[0])
-                                        if first_idx > 0:
-                                            yield sse({"type": "token", "content": normal_buf[:first_idx]})
-                                        if first_tag in ("edit", "file"):
-                                            yield sse({"type": "edit_start", "content": ""})
-                                        state = f"in_{first_tag}"
-                                        tag_buf = normal_buf[first_idx + len(TAG_DEFS[first_tag]["open"]):]
-                                        normal_buf = ""
-                                        _found_open = True
-                                        _dlog("tag_opened",
-                                              session_id=session_id, user_id=user_id,
-                                              tag_type=first_tag, state=state)
+                                    elif _p1_text:
+                                        _p1_response += _p1_text
+                                        if _p1_state == "normal":
+                                            _p1_normal_buf += _p1_text
+                                        else:
+                                            _p1_tag_buf += _p1_text
+
+                                        # Tag parser for search-phase tags
+                                        while True:
+                                            if _p1_state == "normal":
+                                                candidates = []
+                                                for _tname in _P1_TAGS:
+                                                    if _tname not in TAG_DEFS:
+                                                        continue
+                                                    _ti = _p1_normal_buf.find(TAG_DEFS[_tname]["open"])
+                                                    if _ti != -1:
+                                                        candidates.append((_ti, _tname))
+                                                if not candidates:
+                                                    _tail = max(len(TAG_DEFS[t]["open"]) for t in _P1_TAGS if t in TAG_DEFS)
+                                                    _safe = max(0, len(_p1_normal_buf) - _tail)
+                                                    if _safe > 0:
+                                                        _p1_normal_buf = _p1_normal_buf[_safe:]
+                                                    break
+                                                _fi, _ft = min(candidates, key=lambda x: x[0])
+                                                _p1_state = f"in_{_ft}"
+                                                _p1_tag_buf = _p1_normal_buf[_fi + len(TAG_DEFS[_ft]["open"]):]
+                                                _p1_normal_buf = ""
+
+                                                # Check for close tag immediately
+                                                _ct = TAG_DEFS[_ft]["close"]
+                                                _ci = _p1_tag_buf.find(_ct)
+                                                if _ci != -1:
+                                                    _block = _p1_tag_buf[:_ci]
+                                                    if _ft == "search":
+                                                        _sd = _parse_search_content(_block)
+                                                        if _sd is not None:
+                                                            search_requested = _sd
+                                                    elif _ft == "filereq":
+                                                        fnames = _parse_filereq_content(_block)
+                                                        if fnames:
+                                                            file_request_data = fnames[:5]
+                                                    elif _ft == "github":
+                                                        _gd = parse_github_request(_block, dlog=_dlog)
+                                                        github_requested = (
+                                                            _gd if _gd is not None
+                                                            else {"_invalid": _block[:500]}
+                                                        )
+                                                    _p1_normal_buf = _p1_tag_buf[_ci + len(_ct):]
+                                                    _p1_tag_buf = ""
+                                                    _p1_state = "normal"
+                                                else:
+                                                    break  # Wait for more data
+
+                                            elif _p1_state.startswith("in_"):
+                                                _cn = _p1_state[3:]
+                                                if _cn not in TAG_DEFS:
+                                                    break
+                                                _ct2 = TAG_DEFS[_cn]["close"]
+                                                _ci2 = _p1_tag_buf.find(_ct2)
+                                                if _ci2 != -1:
+                                                    _block2 = _p1_tag_buf[:_ci2]
+                                                    if _cn == "search":
+                                                        _sd = _parse_search_content(_block2)
+                                                        if _sd is not None:
+                                                            search_requested = _sd
+                                                    elif _cn == "filereq":
+                                                        fnames = _parse_filereq_content(_block2)
+                                                        if fnames:
+                                                            file_request_data = fnames[:5]
+                                                    elif _cn == "github":
+                                                        _gd = parse_github_request(_block2, dlog=_dlog)
+                                                        github_requested = (
+                                                            _gd if _gd is not None
+                                                            else {"_invalid": _block2[:500]}
+                                                        )
+                                                    _p1_normal_buf = _p1_tag_buf[_ci2 + len(_ct2):]
+                                                    _p1_tag_buf = ""
+                                                    _p1_state = "normal"
+                                                else:
+                                                    break
+                                            else:
+                                                break
+
+                                    # Break streaming if we found an action tag
+                                    if (search_requested is not None
+                                            or file_request_data is not None
+                                            or github_requested is not None):
                                         break
-                                    if not _found_open:
-                                        break
 
-                                # ── Close-tag handler ──
-                                _tag_name = state[3:]
-                                if _tag_name not in TAG_DEFS:
-                                    break
-                                _close_tag = TAG_DEFS[_tag_name]["close"]
-                                idx = tag_buf.find(_close_tag)
-                                if idx == -1:
-                                    break
-                                _content = tag_buf[:idx]
-                                _remainder = tag_buf[idx + len(_close_tag):]
-                                _break_stream = False
-
-                                if _tag_name == "edit":
-                                    edit_blocks_raw.append(_content)
-                                    yield sse({"type": "edit_end", "content": ""})
-                                elif _tag_name == "file":
-                                    new_file_blocks_raw.append(_content)
-                                    yield sse({"type": "edit_end", "content": ""})
-                                elif _tag_name == "search":
-                                    _sd = _parse_search_content(_content)
-                                    if _sd is not None:
-                                        search_requested = _sd
-                                    _break_stream = True
-                                elif _tag_name == "filereq":
-                                    fnames = _parse_filereq_content(_content)
-                                    if fnames:
-                                        file_request_data = fnames[:5]
-                                    _break_stream = True
-                                elif _tag_name == "plan":
-                                    _pd = _parse_plan_content(_content)
-                                    if _pd is not None:
-                                        edit_plan_data = _pd
-                                    _break_stream = True
-                                elif _tag_name == "github":
-                                    _gd = parse_github_request(_content, dlog=_dlog)
-                                    github_requested = (
-                                        _gd if _gd is not None
-                                        else {"_invalid": _content[:500]}
-                                    )
-                                    _break_stream = True
-
-                                state = "normal"
-                                normal_buf = _remainder
-                                tag_buf = ""
-                                _dlog("tag_closed",
-                                      session_id=session_id, user_id=user_id,
-                                      tag_type=_tag_name,
-                                      content_len=len(_content),
-                                      break_stream=_break_stream)
-
-                                if _break_stream:
-                                    break
-                                if not _remainder:
-                                    break
-
-                            # Break out of streaming if round-trip tag fired
-                            if (search_requested is not None or file_request_data is not None
-                                    or edit_plan_data is not None or github_requested is not None):
-                                _last_stop_reason = None
-                                _matched_stop_seq = None
-                                break
-
-                        # ── Map GPT finish_reason to Claude-compatible values ──
-                        if search_requested or file_request_data or edit_plan_data or github_requested:
-                            pass  # Already cleared above
-                        elif _gpt_finish_reason == "length":
-                            _last_stop_reason = "max_tokens"
-                            _matched_stop_seq = None
-                        elif _gpt_finish_reason == "stop":
-                            if state in ("in_search", "in_filereq", "in_plan", "in_github"):
-                                _last_stop_reason = "stop_sequence"
-                                _matched_stop_seq = TAG_DEFS[state[3:]]["close"]
-                                _dlog("gpt_stop_sequence_detected",
-                                      session_id=session_id, user_id=user_id,
-                                      state=state, matched=str(_matched_stop_seq)[:60])
-                            else:
-                                _last_stop_reason = "end_turn"
-                                _matched_stop_seq = None
-                        else:
-                            _last_stop_reason = _gpt_finish_reason
-                            _matched_stop_seq = None
+                            # Capture stop reason
+                            try:
+                                _p1_final = await _p1_stream.get_final_message()
+                                _p1_last_stop_reason = _p1_final.stop_reason if _p1_final else None
+                            except Exception:
+                                pass
 
                         break  # success — exit retry loop
 
-                    except Exception as _gpt_err:
-                        _gpt_err_str = str(_gpt_err)
-                        _gpt_transient = (
-                            "500" in _gpt_err_str or "529" in _gpt_err_str
-                            or "overloaded" in _gpt_err_str.lower()
-                            or "rate" in _gpt_err_str.lower()
+                    except Exception as _p1_err:
+                        _err_str = str(_p1_err)
+                        _is_transient = (
+                            "500" in _err_str or "529" in _err_str
+                            or "overloaded" in _err_str.lower()
+                            or "internal_server_error" in _err_str.lower()
                         )
-                        _dlog("natural_gpt_stream_error",
-                              session_id=session_id, user_id=user_id,
-                              attempt=_attempt, transient=_gpt_transient,
-                              error=_gpt_err_str[:300])
-                        if _gpt_transient and _attempt < 2:
+                        if _is_transient and _attempt < 2:
                             yield sse({"type": "progress",
                                        "content": f"Service busy — retrying ({_attempt+1}/3)..."})
                             await asyncio.sleep(5 * (_attempt + 1))
                             continue
-                        raise
+                        if (_p1_kwargs.get("stop_sequences")
+                                and "stop_sequence" in _err_str.lower()
+                                and _attempt < 2):
+                            _p1_kwargs.pop("stop_sequences", None)
+                            continue
+                        _dlog("phase1_search_error", session_id=session_id, user_id=user_id,
+                              round=_search_round, error=_err_str[:300])
+                        break
 
-            # ── Claude streaming branch (existing logic) ──────────────
-            if _natural_use_claude:
-                # Retry loop for transient API errors
+            else:
+                # ── GPT search phase ──────────────────────────────────
+                _gpt_client = _get_client(user_id)
+                _gpt_p1_msgs = [{"role": "system", "content": _gpt_system_text}] + list(_round_msgs)
+                _gpt_p1_stop = [TAG_DEFS[t]["close"] for t in _P1_TAGS if t in TAG_DEFS][:4]
+
                 for _attempt in range(3):
                     try:
-                        async with aclient.messages.stream(**{
-                            **stream_kwargs,
-                            "messages": current_messages,
-                        }) as astream:
-                            current_block_type = None
-                            async for event in astream:
-                                etype = getattr(event, "type", None)
+                        _gpt_p1_stream = _chat_create(
+                            _gpt_client, model=arch_model,
+                            messages=_gpt_p1_msgs, stream=True,
+                            max_tokens=PHASE1_MAX_TOKENS,
+                            stop=_gpt_p1_stop,
+                        )
+                        for _gpt_chunk in _gpt_p1_stream:
+                            _gpt_choice = _gpt_chunk.choices[0]
+                            if _gpt_choice.finish_reason:
+                                _p1_last_stop_reason = _gpt_choice.finish_reason
+                                break
+                            _gpt_delta = getattr(_gpt_choice, "delta", None)
+                            if _gpt_delta and hasattr(_gpt_delta, "content") and _gpt_delta.content:
+                                _p1_text = _gpt_delta.content
+                                _p1_response += _p1_text
+                                if _p1_state == "normal":
+                                    _p1_normal_buf += _p1_text
+                                else:
+                                    _p1_tag_buf += _p1_text
 
-                                if etype == "content_block_start":
-                                    current_block_type = getattr(
-                                        getattr(event, "content_block", None), "type", None
-                                    )
-                                    if current_block_type == "thinking":
-                                        in_thinking = True
-                                        had_thinking = True
-                                        yield sse({"type": "thinking_start", "content": ""})
-
-                                elif etype == "content_block_delta":
-                                    delta = getattr(event, "delta", None)
-                                    if not delta:
-                                        continue
-
-                                    thinking_chunk = getattr(delta, "thinking", None)
-                                    text_chunk = getattr(delta, "text", None)
-
-                                    if thinking_chunk:
-                                        yield sse({"type": "thinking", "content": thinking_chunk})
-
-                                    elif text_chunk:
-                                        full_response += text_chunk
-                                        _round_last_text_ts = time.time()
-
-                                        # Append chunk to appropriate buffer (once per chunk)
-                                        if state == "normal":
-                                            normal_buf += text_chunk
-                                        else:
-                                            tag_buf += text_chunk
-                                            # Heartbeat: visible progress while
-                                            # writing suppressed edit/file blocks
-                                            if state in ("in_edit", "in_file"):
-                                                _edit_hb_bytes += len(text_chunk)
-                                                if (_edit_hb_bytes - _edit_hb_last
-                                                        >= 2048):
-                                                    _edit_hb_last = _edit_hb_bytes
-                                                    _hb_kb = _edit_hb_bytes / 1024
-                                                    yield sse({
-                                                        "type": "progress",
-                                                        "content": (
-                                                            "✍️ Writing code "
-                                                            f"changes… {_hb_kb:.1f} KB"
-                                                        ),
-                                                    })
-
-                                        # ── Processing loop: open→close→re-scan until stable ──
-                                        while True:
-                                            if state == "normal":
-                                                # Drain buffer watching for any opening tag
-                                                _found_open = False
-                                                while True:
-                                                    # Table-driven open-tag scan
-                                                    candidates = []
-                                                    for _tname, _tdef in TAG_DEFS.items():
-                                                        _ti = normal_buf.find(_tdef["open"])
-                                                        if _ti != -1:
-                                                            candidates.append((_ti, _tname))
-
-                                                    if not candidates:
-                                                        # No tags — yield safely (keep tail in case tag is split)
-                                                        tail = max(len(td["open"]) for td in TAG_DEFS.values())
-                                                        safe = max(0, len(normal_buf) - tail)
-                                                        if safe > 0:
-                                                            yield sse({"type": "token", "content": normal_buf[:safe]})
-                                                            normal_buf = normal_buf[safe:]
-                                                        break
-
-                                                    first_idx, first_tag = min(candidates, key=lambda x: x[0])
-
-                                                    # Yield text before the tag
-                                                    if first_idx > 0:
-                                                        yield sse({"type": "token", "content": normal_buf[:first_idx]})
-
-                                                    # Emit edit_start SSE for edit/file types
-                                                    if first_tag in ("edit", "file"):
-                                                        yield sse({"type": "edit_start", "content": ""})
-
-                                                    state = f"in_{first_tag}"
-                                                    tag_buf = normal_buf[first_idx + len(TAG_DEFS[first_tag]["open"]):]
-                                                    normal_buf = ""
-                                                    _found_open = True
-                                                    _dlog("tag_opened",
-                                                          session_id=session_id, user_id=user_id,
-                                                          tag_type=first_tag, state=state)
-                                                    break
-
-                                                if not _found_open:
-                                                    break  # No tag found — stable, wait for next chunk
-
-                                            # ── Unified close-tag handler for ALL tag states ──
-                                            _tag_name = state[3:]  # "in_edit" → "edit"
-                                            _close_tag = TAG_DEFS[_tag_name]["close"]
-                                            idx = tag_buf.find(_close_tag)
-                                            if idx == -1:
-                                                break  # No close tag yet — wait for next chunk
-
-                                            _content = tag_buf[:idx]
-                                            _remainder = tag_buf[idx + len(_close_tag):]
-
-                                            # ── Tag-specific processing ──
-                                            _break_stream = False
-
-                                            if _tag_name == "edit":
-                                                edit_blocks_raw.append(_content)
-                                                yield sse({"type": "edit_end", "content": ""})
-
-                                            elif _tag_name == "file":
-                                                new_file_blocks_raw.append(_content)
-                                                yield sse({"type": "edit_end", "content": ""})
-
-                                            elif _tag_name == "search":
-                                                _sd = _parse_search_content(_content)
+                                while True:
+                                    if _p1_state == "normal":
+                                        candidates = []
+                                        for _tname in _P1_TAGS:
+                                            if _tname not in TAG_DEFS:
+                                                continue
+                                            _ti = _p1_normal_buf.find(TAG_DEFS[_tname]["open"])
+                                            if _ti != -1:
+                                                candidates.append((_ti, _tname))
+                                        if not candidates:
+                                            _tail = max(len(TAG_DEFS[t]["open"]) for t in _P1_TAGS if t in TAG_DEFS)
+                                            _safe = max(0, len(_p1_normal_buf) - _tail)
+                                            if _safe > 0:
+                                                _p1_normal_buf = _p1_normal_buf[_safe:]
+                                            break
+                                        _fi, _ft = min(candidates, key=lambda x: x[0])
+                                        _p1_state = f"in_{_ft}"
+                                        _p1_tag_buf = _p1_normal_buf[_fi + len(TAG_DEFS[_ft]["open"]):]
+                                        _p1_normal_buf = ""
+                                    elif _p1_state.startswith("in_"):
+                                        _cn = _p1_state[3:]
+                                        if _cn not in TAG_DEFS:
+                                            break
+                                        _ct = TAG_DEFS[_cn]["close"]
+                                        _ci = _p1_tag_buf.find(_ct)
+                                        if _ci != -1:
+                                            _block = _p1_tag_buf[:_ci]
+                                            if _cn == "search":
+                                                _sd = _parse_search_content(_block)
                                                 if _sd is not None:
                                                     search_requested = _sd
-                                                _break_stream = True
-
-                                            elif _tag_name == "filereq":
-                                                fnames = _parse_filereq_content(_content)
+                                            elif _cn == "filereq":
+                                                fnames = _parse_filereq_content(_block)
                                                 if fnames:
                                                     file_request_data = fnames[:5]
-                                                _break_stream = True
+                                            _p1_normal_buf = _p1_tag_buf[_ci + len(_ct):]
+                                            _p1_tag_buf = ""
+                                            _p1_state = "normal"
+                                        else:
+                                            break
+                                    else:
+                                        break
 
-                                            elif _tag_name == "plan":
-                                                _pd = _parse_plan_content(_content)
-                                                if _pd is not None:
-                                                    edit_plan_data = _pd
-                                                _break_stream = True
-
-                                            elif _tag_name == "github":
-                                                # Only reachable when the tag was
-                                                # registered (flag on + linked user),
-                                                # so parse_github_request is bound.
-                                                _gd = parse_github_request(_content, dlog=_dlog)
-                                                github_requested = (
-                                                    _gd if _gd is not None
-                                                    else {"_invalid": _content[:500]}
-                                                )
-                                                _break_stream = True
-
-                                            state = "normal"
-                                            normal_buf = _remainder
-                                            tag_buf = ""
-                                            _dlog("tag_closed",
-                                                  session_id=session_id, user_id=user_id,
-                                                  tag_type=_tag_name,
-                                                  content_len=len(_content),
-                                                  break_stream=_break_stream)
-
-                                            if _break_stream:
-                                                break  # Exit processing loop; event-loop break via check below
-
-                                            if not _remainder:
-                                                break  # Nothing more to process
-                                            # else: continue loop — re-scan remainder for more tags
-
-                                elif etype == "content_block_stop":
-                                    if in_thinking and current_block_type == "thinking":
-                                        yield sse({"type": "thinking_end", "content": ""})
-                                        in_thinking = False
-
-                                # ── Streaming-phase deadline checks ───────
-                                # Abort if pipeline budget exhausted, streaming
-                                # phase exceeded 8 min, or 2 min of thinking
-                                # without any text token this round.
-                                _stall_elapsed = time.time() - _streaming_t0
-                                if (_pipeline_over_budget()
-                                        or _stall_elapsed >= STREAMING_PHASE_DEADLINE_S):
-                                    _dlog("streaming_deadline_abort",
-                                          session_id=session_id, user_id=user_id,
-                                          reason="pipeline_budget" if _pipeline_over_budget() else "phase_deadline",
-                                          elapsed_s=round(_stall_elapsed, 1),
-                                          text_len=len(full_response))
-                                    _streaming_starvation_abort = True
-                                    break
-                                if (had_thinking
-                                        and (time.time() - _round_last_text_ts)
-                                            > STREAMING_THINKING_STALL_S):
-                                    _dlog("streaming_thinking_stall",
-                                          session_id=session_id, user_id=user_id,
-                                          round=search_round,
-                                          stall_s=round(
-                                              time.time() - _round_last_text_ts, 1),
-                                          text_len=len(full_response))
-                                    _streaming_starvation_abort = True
-                                    break
-
-                            # If a search, file, or github request was made, break out of the event loop
-                            if search_requested is not None or file_request_data is not None or edit_plan_data is not None or github_requested is not None:
-                                # Improvement #4: this legacy mid-stream break skips the
-                                # stop_reason capture below — clear the value from a
-                                # previous round so the max_tokens truncation detector
-                                # can't fire on stale data.
-                                _last_stop_reason = None
-                                _matched_stop_seq = None
+                            if (search_requested is not None
+                                    or file_request_data is not None):
                                 break
 
-                        # Capture stop_reason from the stream
-                        try:
-                            _final = await astream.get_final_message()
-                            _last_stop_reason = _final.stop_reason if _final else None
-                            # Improvement #4: which custom stop sequence halted us (if any)
-                            _matched_stop_seq = getattr(_final, "stop_sequence", None) if _final else None
-                        except Exception:
-                            _last_stop_reason = None
-                            _matched_stop_seq = None
-                        if _last_stop_reason == "stop_sequence":
-                            _dlog("stream_halted_at_stop_sequence",
-                                  session_id=session_id, user_id=user_id,
-                                  matched=str(_matched_stop_seq)[:60],
-                                  state_at_halt=state, tag_buf_len=len(tag_buf))
-                            if state == "normal":
-                                # Fired outside a tag body (e.g. model emitted a closer
-                                # with no opener) — should not happen; log loudly.
-                                _dlog("stop_sequence_outside_tag",
-                                      session_id=session_id, user_id=user_id,
-                                      matched=str(_matched_stop_seq)[:60])
+                        break  # success
 
-                        break  # success — exit transient-error retry loop
-
-                    except Exception as stream_err:
-                        err_str = str(stream_err)
-                        is_transient = (
-                            "500" in err_str or "529" in err_str
-                            or "overloaded" in err_str.lower()
-                            or "internal_server_error" in err_str.lower()
-                        )
-                        if is_transient and _attempt < 2:
+                    except Exception as _gpt_err:
+                        if ("500" in str(_gpt_err) or "529" in str(_gpt_err)
+                                or "overloaded" in str(_gpt_err).lower()) and _attempt < 2:
                             yield sse({"type": "progress",
                                        "content": f"Service busy — retrying ({_attempt+1}/3)..."})
                             await asyncio.sleep(5 * (_attempt + 1))
                             continue
-                        # Improvement #4: if the API ever rejects the stop_sequences
-                        # parameter itself (400), drop it and retry once instead of
-                        # failing the whole round. Never breaks the main path.
-                        if (stream_kwargs.get("stop_sequences")
-                                and "stop_sequence" in err_str.lower()
-                                and _attempt < 2):
-                            stream_kwargs.pop("stop_sequences", None)
-                            _dlog("tag_stop_sequences_rejected_disabled",
-                                  session_id=session_id, user_id=user_id,
-                                  error=err_str[:300])
-                            continue
-                        raise
+                        _dlog("phase1_search_gpt_error", session_id=session_id, user_id=user_id,
+                              error=str(_gpt_err)[:300])
+                        break
 
-            # ── Streaming starvation abort ─────────────────────────
-            # If adaptive thinking consumed the round without producing
-            # text, abort the streaming phase and process whatever we have.
-            if _streaming_starvation_abort:
-                _dlog("streaming_starvation_abort_exit",
+            # ── Handle unclosed tags (stop_sequence fired) ─────────────
+            if (_p1_last_stop_reason in ("stop_sequence", "stop")
+                    and _p1_state.startswith("in_")):
+                _uc_tag = _p1_state[3:]
+                _uc_content = _p1_tag_buf
+                if _uc_tag == "search":
+                    _sd = _parse_search_content(_uc_content)
+                    if _sd is not None:
+                        search_requested = _sd
+                elif _uc_tag == "filereq":
+                    fnames = _parse_filereq_content(_uc_content)
+                    if fnames:
+                        file_request_data = fnames[:5]
+                elif _uc_tag == "github":
+                    _gd = parse_github_request(_uc_content, dlog=_dlog)
+                    github_requested = (
+                        _gd if _gd is not None
+                        else {"_invalid": _uc_content[:500]}
+                    )
+                _p1_state = "normal"
+                _p1_tag_buf = ""
+
+            # EOS recovery for unclosed tags (stream ended without close)
+            if _p1_state.startswith("in_"):
+                _uc2 = _p1_state[3:]
+                if _uc2 in TAG_DEFS:
+                    _uc2_match = re.search(
+                        re.escape(TAG_DEFS[_uc2]["open"]) + r"(.*)",
+                        _p1_response, re.DOTALL
+                    )
+                    if _uc2_match:
+                        _uc2_block = _uc2_match.group(1)
+                        if _uc2 == "search":
+                            _sd = _parse_search_content(_uc2_block)
+                            if _sd is not None:
+                                search_requested = _sd
+                        elif _uc2 == "filereq":
+                            fnames = _parse_filereq_content(_uc2_block)
+                            if fnames:
+                                file_request_data = fnames[:5]
+                    _p1_state = "normal"
+                    _p1_tag_buf = ""
+
+            _round_duration = time.time() - _round_t0
+            _dlog("phase1_search_round_done",
+                  session_id=session_id, user_id=user_id,
+                  round=_search_round,
+                  duration_s=round(_round_duration, 1),
+                  response_len=len(_p1_response),
+                  had_search=bool(search_requested),
+                  had_filereq=bool(file_request_data),
+                  had_github=bool(github_requested),
+                  ready_to_edit="READY_TO_EDIT" in _p1_response.upper())
+
+            # ── READY_TO_EDIT — model says it has enough context ──────
+            if ("READY_TO_EDIT" in _p1_response.upper()
+                    and not search_requested
+                    and not file_request_data
+                    and not github_requested):
+                _dlog("phase1_ready_to_edit",
                       session_id=session_id, user_id=user_id,
-                      round=search_round,
-                      elapsed_s=round(time.time() - _streaming_t0, 1),
-                      full_response_len=len(full_response),
-                      edit_blocks=len(edit_blocks_raw))
-                yield sse({"type": "progress",
-                           "content": "⏱️ Thinking timeout — processing available changes..."})
-                if in_thinking:
-                    yield sse({"type": "thinking_end", "content": ""})
-                    in_thinking = False
-                break  # Exit search_round loop
+                      rounds_used=_search_round + 1)
+                break
 
-            # ── Improvement #4: stop_sequence tag-close synthesizer ─────
-            # When TAG_STOP_SEQUENCES is on, the API halts generation AT a
-            # round-trip tag closer — and per Anthropic docs the closer text
-            # itself is never emitted. The chunk parser is therefore left in
-            # the in_* state with the COMPLETE tag body in tag_buf.
-            # Synthesize the tag close here. The legacy EOS finalizer below
-            # is untouched and still covers every non-stop_sequence case.
-            if (_last_stop_reason == "stop_sequence"
-                    and state in ("in_search", "in_filereq", "in_plan", "in_github")):
-                _ss_tag = state[3:]
-                _ss_content = tag_buf
-                try:
-                    if _ss_tag == "search":
-                        _sd = _parse_search_content(_ss_content)
-                        if _sd is not None:
-                            search_requested = _sd
-                    elif _ss_tag == "filereq":
-                        fnames = _parse_filereq_content(_ss_content)
-                        if fnames:
-                            file_request_data = fnames[:5]
-                    elif _ss_tag == "plan":
-                        _pd = _parse_plan_content(_ss_content)
-                        if _pd is not None:
-                            edit_plan_data = _pd
-                    elif _ss_tag == "github":
-                        # Only reachable when the github tag was registered,
-                        # so parse_github_request is bound.
-                        _gd = parse_github_request(_ss_content, dlog=_dlog)
-                        github_requested = (
-                            _gd if _gd is not None
-                            else {"_invalid": _ss_content[:500]}
-                        )
-                    # Re-append the closer so the assistant turn fed back into
-                    # current_messages stays well-formed for the next round.
-                    full_response += TAG_DEFS[_ss_tag]["close"]
-                    state = "normal"
-                    tag_buf = ""
-                    _dlog("tag_closed_via_stop_sequence",
-                          session_id=session_id, user_id=user_id,
-                          tag_type=_ss_tag, content_len=len(_ss_content),
-                          matched=str(_matched_stop_seq)[:60])
-                except Exception as _ss_exc:
-                    # Leave state untouched → legacy finalizer logs no_close_tag
-                    _dlog("stop_sequence_synthesize_error",
-                          session_id=session_id, user_id=user_id,
-                          tag_type=_ss_tag, error=str(_ss_exc)[:300])
-
-            # ── Universal end-of-stream finalizer ───────────────────────
-            # After the stream exhausts, if the state machine is stuck in
-            # any non-normal state, use full_response to recover ALL tags
-            # that the chunk-by-chunk parser missed.  One mechanism for
-            # every tag type — eliminates the entire class of "last chunk
-            # ate the tag" bugs.
-            if state != "normal":
-                _dlog("eos_finalizer_triggered",
-                      session_id=session_id, user_id=user_id,
-                      stuck_state=state,
-                      full_response_len=len(full_response))
-
-                # ── file_request recovery ──
-                if state == "in_filereq":
-                    _fr_match = re.search(
-                        r"<file_request>(.*?)</file_request>",
-                        full_response, re.DOTALL
-                    )
-                    if _fr_match:
-                        fnames = _parse_filereq_content(_fr_match.group(1))
-                        if fnames:
-                            file_request_data = fnames[:5]
-                        state = "normal"
-                        tag_buf = ""
-                        _dlog("eos_filereq_recovered",
-                              session_id=session_id, user_id=user_id,
-                              filenames=file_request_data,
-                              raw_len=len(_fr_match.group(0)))
-                    else:
-                        _dlog("eos_filereq_no_close_tag",
-                              session_id=session_id, user_id=user_id,
-                              buf_preview=tag_buf[:300])
-
-                # ── search_request recovery ──
-                elif state == "in_search":
-                    _sr_match = re.search(
-                        r"<search_request>(.*?)</search_request>",
-                        full_response, re.DOTALL
-                    )
-                    if _sr_match:
-                        _sd = _parse_search_content(_sr_match.group(1))
-                        if _sd is not None:
-                            search_requested = _sd
-                        state = "normal"
-                        tag_buf = ""
-                        _dlog("eos_search_recovered",
-                              session_id=session_id, user_id=user_id,
-                              search_data=str(search_requested)[:200])
-                    else:
-                        _dlog("eos_search_no_close_tag",
-                              session_id=session_id, user_id=user_id,
-                              buf_preview=tag_buf[:300])
-
-                # ── github_request recovery ──
-                elif state == "in_github":
-                    _gh_match = re.search(
-                        r"<github_request>(.*?)</github_request>",
-                        full_response, re.DOTALL
-                    )
-                    if _gh_match:
-                        _gd = parse_github_request(_gh_match.group(1), dlog=_dlog)
-                        github_requested = (
-                            _gd if _gd is not None
-                            else {"_invalid": _gh_match.group(1)[:500]}
-                        )
-                        state = "normal"
-                        tag_buf = ""
-                        _dlog("eos_github_recovered",
-                              session_id=session_id, user_id=user_id,
-                              github_data=str(github_requested)[:200])
-                    else:
-                        _dlog("eos_github_no_close_tag",
-                              session_id=session_id, user_id=user_id,
-                              buf_preview=tag_buf[:300])
-
-                # ── edit_plan recovery ──
-                elif state == "in_plan":
-                    _pl_match = re.search(
-                        r"<edit_plan>(.*?)</edit_plan>",
-                        full_response, re.DOTALL
-                    )
-                    if _pl_match:
-                        _pd = _parse_plan_content(_pl_match.group(1))
-                        if _pd is not None:
-                            edit_plan_data = _pd
-                        state = "normal"
-                        tag_buf = ""
-                        _dlog("eos_plan_recovered",
-                              session_id=session_id, user_id=user_id,
-                              plan_items=len(edit_plan_data) if edit_plan_data else 0)
-                    else:
-                        _dlog("eos_plan_no_close_tag",
-                              session_id=session_id, user_id=user_id,
-                              buf_preview=tag_buf[:300])
-
-                # ── surgical_edit recovery ──
-                elif state == "in_edit":
-                    _new_count, _partial_kept, _had_matches = _eos_recover_blocks(
-                        EDIT_OPEN, EDIT_CLOSE, full_response, tag_buf, edit_blocks_raw)
-                    if _had_matches:
-                        state = "normal"
-                        tag_buf = ""
-                        _dlog("eos_edit_recovered",
-                              session_id=session_id, user_id=user_id,
-                              recovered_count=_new_count,
-                              partial_kept=_partial_kept,
-                              total_edit_blocks=len(edit_blocks_raw))
-                    else:
-                        _dlog("eos_edit_no_close_tag",
-                              session_id=session_id, user_id=user_id,
-                              buf_len=len(tag_buf))
-                    yield sse({"type": "edit_end", "content": ""})
-
-                # ── new_file recovery ──
-                elif state == "in_file":
-                    _new_count, _partial_kept, _had_matches = _eos_recover_blocks(
-                        FILE_OPEN, FILE_CLOSE, full_response, tag_buf, new_file_blocks_raw)
-                    if _had_matches:
-                        state = "normal"
-                        tag_buf = ""
-                        _dlog("eos_newfile_recovered",
-                              session_id=session_id, user_id=user_id,
-                              recovered_count=_new_count,
-                              partial_kept=_partial_kept,
-                              total_file_blocks=len(new_file_blocks_raw))
-                    else:
-                        _dlog("eos_newfile_no_close_tag",
-                              session_id=session_id, user_id=user_id,
-                              buf_len=len(tag_buf))
-                    yield sse({"type": "edit_end", "content": ""})
-
-                else:
-                    _dlog("eos_unknown_state",
-                          session_id=session_id, user_id=user_id,
-                          state=state)
-
-            # Flush any normal text buffered at end of this round
-            if state == "normal" and normal_buf.strip():
-                yield sse({"type": "token", "content": normal_buf})
-
-            # ── Handle edit plan ──────────────────────────────────────────
-            if edit_plan_data is not None:
-                _dlog("edit_plan_received",
-                      session_id=session_id, user_id=user_id,
-                      plan_items=len(edit_plan_data),
-                      plan=edit_plan_data)
-                break  # Exit search_round loop — enter execute phase
-
-            # ── Handle file request ───────────────────────────────────────
-            if file_request_data is not None:
-                fnames_req = file_request_data
-                file_request_data = None
-
-                # ── Tier-1 guard: skip files already in full context ──
-                _tier1_overlap = [fn for fn in fnames_req if fn in _tier1_names]
-                if _tier1_overlap and all(fn in _tier1_names for fn in fnames_req):
-                    _all_data = all(
-                        symbol_maps_by_name.get(fn, (None, {}))[1].get("file_type") in ("csv", "excel", "pdf", "text")
-                        for fn in _tier1_overlap
-                    )
-                    _redirect = (
-                        "Those data files are already fully loaded in your context as markdown tables above. "
-                        "Analyze the data directly and respond to the user's question. "
-                        "You can create new CSV or Excel (.xlsx) files using <new_file> if needed."
-                    ) if _all_data else (
-                        "Those files are already fully loaded in your context above. "
-                        "Use the content shown above — do NOT re-request."
-                    )
-                    _dlog("filereq_tier1_guard",
-                          session_id=session_id, user_id=user_id,
-                          requested=fnames_req, tier1_overlap=_tier1_overlap,
-                          all_data=_all_data)
-                    current_messages = current_messages + [
-                        {"role": "assistant", "content": full_response or "(requesting files...)"},
-                        {"role": "user", "content": _redirect},
-                    ]
-                    full_response = ""
-                    continue
-
-                # Filter already-requested files
-                new_fnames = [fn for fn in fnames_req if fn not in requested_files]
-
-                if len(requested_files) >= MAX_FILE_REQ_TOTAL:
-                    current_messages = current_messages + [
-                        {"role": "assistant", "content": full_response or "(requesting files...)"},
-                        {"role": "user", "content":
-                            f"File request limit reached ({MAX_FILE_REQ_TOTAL} files already fetched). "
-                            "Write your <surgical_edit> blocks now using the code you have."},
-                    ]
-                    full_response = ""
-                    continue
-
-                if not new_fnames:
-                    current_messages = current_messages + [
-                        {"role": "assistant", "content": full_response or "(requesting files...)"},
-                        {"role": "user", "content":
-                            "Those files are already in your context. "
-                            "Use the content already shown above."},
-                    ]
-                    full_response = ""
-                    continue
-
-                yield sse({"type": "progress",
-                           "content": f"Loading: {', '.join(new_fnames[:3])}{'...' if len(new_fnames)>3 else ''}"})
-
-                file_result_parts = []
-                for fn in new_fnames:
-                    content = file_content_lookup_stream.get(fn, "")
-                    if not content:
-                        # Fuzzy match — find closest filename
-                        candidates_f = [
-                            k for k in file_content_lookup_stream
-                            if fn.lower() in k.lower() or k.lower() in fn.lower()
-                        ]
-                        if candidates_f:
-                            file_result_parts.append(
-                                f"FILE NOT FOUND: '{fn}' — did you mean: {', '.join(candidates_f[:3])}?"
-                            )
-                        else:
-                            file_result_parts.append(
-                                f"FILE NOT FOUND: '{fn}' — not in uploaded files."
-                            )
-                        continue
-
-                    requested_files.add(fn)
-                    file_lines = content.splitlines()
-                    lines_count = len(file_lines)
-
-                    # Include symbol index if available
-                    smap_fr, _ = symbol_maps_by_name.get(fn, (None, None))
-                    if smap_fr and smap_fr.symbols:
-                        sym_lines = []
-                        for s in smap_fr.symbols:
-                            size = s.end_line - s.start_line + 1
-                            flag = " ⚠️LARGE" if size > 300 else ""
-                            sym_lines.append(
-                                f"  [{s.symbol_type.value}] {s.full_path:<45} "
-                                f"L{s.start_line}–{s.end_line}  ({size}L){flag}"
-                            )
-                        sym_index = "\n".join(sym_lines)
-                        header = (
-                            f"FILE: {fn} ({lines_count} lines)\n"
-                            f"SYMBOL INDEX (use these EXACT names in surgical_edit):\n{sym_index}\n"
-                        )
-                    else:
-                        header = f"FILE: {fn} ({lines_count} lines)\n"
-
-                    file_result_parts.append(
-                        f"{header}FULL CONTENT:\n```\n{content}\n```"
-                    )
-
-                _dlog("file_request_resolved",
-                      session_id=session_id,
-                      filenames=new_fnames,
-                      found=[fn for fn in new_fnames if fn in requested_files],
-                      total_requested=len(requested_files),
-                      user_id=user_id)
-
-                # ── Missing-file honesty (session 0183c92e fix) ──────────────
-                # When a requested file is NOT in the session, the old message
-                # ("Write your <surgical_edit> blocks now") invited the model to
-                # invent an architectural workaround. Proven: the model asked for
-                # appStore.ts, got found=[], then re-implemented store state as
-                # local component state with a mismatched localStorage key — QA
-                # correctly blocked it at 3/10. Tell the model to surface the
-                # missing file to the user instead of improvising.
-                _missing_fnames = [fn for fn in new_fnames if fn not in requested_files]
-                _missing_note = ""
-                if _missing_fnames:
-                    _missing_note = (
-                        "\n\n\u26a0\ufe0f MISSING FILES: "
-                        + ", ".join(_missing_fnames)
-                        + " — these files are NOT loaded in this session and you cannot "
-                        "see or edit them.\n"
-                        "RULES for missing files:\n"
-                        "1. Do NOT invent a workaround that re-architects around the "
-                        "missing file (e.g. duplicating store/context state locally, "
-                        "inventing new storage keys, or re-declaring shared logic).\n"
-                        "2. If the correct implementation requires editing a missing "
-                        "file, say so PLAINLY in prose before any edit blocks: name the "
-                        "file, describe the exact change it needs, and tell the user to "
-                        "add that file to the session and re-run.\n"
-                        "3. Only emit <surgical_edit> blocks that remain fully correct "
-                        "even without the missing file. If no such edit exists, emit no "
-                        "edit blocks — an honest explanation beats a broken change."
-                    )
-
-                file_injection = (
-                    "Here are the files you requested:\n\n"
-                    + "\n\n".join(file_result_parts)
-                    + _missing_note
-                    + "\n\nWrite your complete <surgical_edit> or <new_file> blocks now. "
-                    "Use the EXACT symbol names shown above."
-                )
-
-                current_messages = current_messages + [
-                    {"role": "assistant", "content": full_response or "(requesting files...)"},
-                    {"role": "user", "content": file_injection},
-                ]
-                full_response = ""
-                continue
-
-            # ── Handle search request ─────────────────────────────────────
+            # ── Handle search request ─────────────────────────────────
             if search_requested is not None:
                 raw_terms = search_requested.get("terms", [])
                 reason = search_requested.get("reason", "")
-                _dlog("search_requested",
-                      session_id=session_id,
-                      round=search_round,
-                      terms=raw_terms,
-                      reason=reason,
-                          user_id=user_id)
-                # --- debug: context size tracking per search round ---
-                if search_round > 0:
-                    _ctx_chars = sum(len(str(m.get("content",""))) for m in current_messages)
-                    _dlog("search_round_context",
-                          session_id=session_id,
-                          round=search_round,
-                          message_count=len(current_messages),
-                          total_chars=_ctx_chars,
-                          estimated_tokens=_ctx_chars // 4,
-                          user_id=user_id)
+                _dlog("phase1_search_requested",
+                      session_id=session_id, user_id=user_id,
+                      round=_search_round, terms=raw_terms, reason=reason)
 
-                # Budget exhausted — do one forced-edit round, then stop
-                if search_round >= MAX_SEARCH_ROUNDS or _forced_edit_round_done:
-                    if not _forced_edit_round_done:
-                        _forced_edit_round_done = True
-                        yield sse({"type": "progress",
-                                   "content": "Search limit reached — writing edits now..."})
-                        forced_msg = (
-                            f"You have used all {MAX_SEARCH_ROUNDS} search rounds. "
-                            "You already have all the code you need from previous results. "
-                            "Write your complete <surgical_edit> or <new_file> blocks RIGHT NOW. "
-                            "Do NOT emit another <search_request> — there are no more search rounds. "
-                            "Use the exact symbol names from the search results you already received."
-                        )
-                        current_messages = current_messages + [
-                            {"role": "assistant", "content": full_response or "(analyzing gathered code...)"},
-                            {"role": "user", "content": forced_msg},
-                        ]
-                        full_response = ""
-                        search_requested = None
-                        continue  # One final forced-edit round
-                    else:
-                        # Already tried forced round and Claude still wants to search — give up
-                        break
-
-                # Filter out already-searched terms
                 new_terms = [t for t in raw_terms
                              if t.lower() not in {s.lower() for s in searched_terms}]
 
                 if not new_terms:
-                    # All requested terms already searched — tell Claude to write edits
-                    current_messages = current_messages + [
-                        {"role": "assistant", "content": full_response},
-                        {"role": "user", "content":
-                            "All the terms you requested have already been searched. "
-                            "Write your <surgical_edit> blocks now using the information you have."},
-                    ]
-                    full_response = ""
-                    continue
+                    _dlog("phase1_all_terms_searched",
+                          session_id=session_id, user_id=user_id,
+                          terms=raw_terms)
+                    break  # All terms already searched — move to edit phase
 
                 yield sse({"type": "progress",
                            "content": f"Searching: {', '.join(new_terms[:3])}{'...' if len(new_terms)>3 else ''}"})
@@ -14495,765 +13916,632 @@ async def run_natural_pipeline_stream(
                 )
                 searched_terms.extend(new_terms)
                 accumulated_search_results += search_results
-                _dlog("search_results_returned",
-                      session_id=session_id,
+                _dlog("phase1_search_results",
+                      session_id=session_id, user_id=user_id,
                       terms=new_terms,
-                      results_chars=len(search_results),
-                      results_preview=search_results,
-                          user_id=user_id)
+                      results_chars=len(search_results))
 
-                # On the last permitted search round, add a strong write-now warning
-                is_last_search_round = (search_round == MAX_SEARCH_ROUNDS - 1)
-                last_round_warning = (
-                    "\n\n⚠️ FINAL SEARCH ROUND: This is the last search available. "
-                    "After reading these results you MUST write your <surgical_edit> "
-                    "or <new_file> blocks immediately. Do NOT emit another <search_request>."
-                ) if is_last_search_round else ""
-
-                search_injection = (
-                    "Here are the search results you requested"
-                    + (f" ({reason})" if reason else "")
-                    + ":\n"
-                    + search_results
-                    + "\n\nWrite your complete <surgical_edit> or <new_file> blocks now. "
-                    "Use the EXACT symbol names shown in the results above."
-                    + last_round_warning
-                )
-
-                current_messages = current_messages + [
-                    {"role": "assistant", "content": full_response or "(searching for code...)"},
-                    {"role": "user", "content": search_injection},
+                is_last = (_search_round == PHASE1_MAX_SEARCH_ROUNDS - 1)
+                _phase1_msgs = list(messages) + [
+                    {"role": "assistant", "content": _p1_response or "(searching for code...)"},
+                    {"role": "user", "content":
+                        "Here are the search results"
+                        + (f" ({reason})" if reason else "")
+                        + ":\n" + search_results
+                        + ("\n\nDo you need more code? Emit another <search_request>, or reply READY_TO_EDIT."
+                           if not is_last else
+                           "\n\nThis was the final search round. Reply READY_TO_EDIT.")
+                    },
                 ]
-                full_response = ""  # Reset for next round
                 search_requested = None
-                continue  # Next search round
+                continue
 
-            # ── Handle GitHub request (natural-chat <github_request> tag) ──
+            # ── Handle file request ───────────────────────────────────
+            if file_request_data is not None:
+                fnames_req = file_request_data
+                file_request_data = None
+
+                # Tier-1 guard: skip files already in full context
+                _tier1_overlap = [fn for fn in fnames_req if fn in _tier1_names]
+                if _tier1_overlap and all(fn in _tier1_names for fn in fnames_req):
+                    _all_data = all(
+                        symbol_maps_by_name.get(fn, (None, {}))[1].get("file_type") in ("csv", "excel", "pdf", "text")
+                        for fn in _tier1_overlap
+                    )
+                    _redirect = (
+                        "Those data files are already fully loaded in your context as markdown tables above. "
+                        "Reply READY_TO_EDIT to proceed."
+                    ) if _all_data else (
+                        "Those files are already fully loaded in your context above. "
+                        "Reply READY_TO_EDIT to proceed."
+                    )
+                    _dlog("phase1_filereq_tier1_guard",
+                          session_id=session_id, user_id=user_id,
+                          requested=fnames_req, tier1_overlap=_tier1_overlap)
+                    _phase1_msgs = list(messages) + [
+                        {"role": "assistant", "content": _p1_response or "(requesting files...)"},
+                        {"role": "user", "content": _redirect},
+                    ]
+                    continue
+
+                new_fnames = [fn for fn in fnames_req if fn not in requested_files]
+                if len(requested_files) >= MAX_FILE_REQ_TOTAL or not new_fnames:
+                    _phase1_msgs = list(messages) + [
+                        {"role": "assistant", "content": _p1_response or "(requesting files...)"},
+                        {"role": "user", "content":
+                            "File request limit reached. Reply READY_TO_EDIT to proceed."
+                            if len(requested_files) >= MAX_FILE_REQ_TOTAL
+                            else "Those files are already in your context. Reply READY_TO_EDIT."},
+                    ]
+                    continue
+
+                yield sse({"type": "progress",
+                           "content": f"Loading: {', '.join(new_fnames[:3])}{'...' if len(new_fnames)>3 else ''}"})
+
+                file_result_parts = []
+                for fn in new_fnames:
+                    content = file_content_lookup_stream.get(fn, "")
+                    if not content:
+                        candidates_f = [
+                            k for k in file_content_lookup_stream
+                            if fn.lower() in k.lower() or k.lower() in fn.lower()
+                        ]
+                        if candidates_f:
+                            file_result_parts.append(
+                                f"FILE NOT FOUND: '{fn}' — did you mean: {', '.join(candidates_f[:3])}?")
+                        else:
+                            file_result_parts.append(f"FILE NOT FOUND: '{fn}' — not in uploaded files.")
+                        continue
+
+                    requested_files.add(fn)
+                    file_lines = content.splitlines()
+                    smap_fr, _ = symbol_maps_by_name.get(fn, (None, None))
+                    if smap_fr and smap_fr.symbols:
+                        sym_lines = []
+                        for s in smap_fr.symbols:
+                            size = s.end_line - s.start_line + 1
+                            flag = " ⚠️LARGE" if size > 300 else ""
+                            sym_lines.append(
+                                f"  [{s.symbol_type.value}] {s.full_path:<45} "
+                                f"L{s.start_line}–{s.end_line}  ({size}L){flag}")
+                        header = (
+                            f"FILE: {fn} ({len(file_lines)} lines)\n"
+                            f"SYMBOL INDEX (use these EXACT names in surgical_edit):\n"
+                            + "\n".join(sym_lines) + "\n")
+                    else:
+                        header = f"FILE: {fn} ({len(file_lines)} lines)\n"
+                    file_result_parts.append(f"{header}FULL CONTENT:\n```\n{content}\n```")
+
+                _missing_fnames = [fn for fn in new_fnames if fn not in requested_files]
+                _missing_note = ""
+                if _missing_fnames:
+                    _missing_note = (
+                        "\n\n⚠️ MISSING FILES: "
+                        + ", ".join(_missing_fnames)
+                        + " — these files are NOT loaded in this session."
+                    )
+
+                _phase1_msgs = list(messages) + [
+                    {"role": "assistant", "content": _p1_response or "(requesting files...)"},
+                    {"role": "user", "content":
+                        "Here are the files you requested:\n\n"
+                        + "\n\n".join(file_result_parts)
+                        + _missing_note
+                        + "\n\nDo you need more files? Emit another <file_request> or <search_request>, "
+                        "or reply READY_TO_EDIT."},
+                ]
+                _dlog("phase1_file_request_resolved",
+                      session_id=session_id, user_id=user_id,
+                      filenames=new_fnames,
+                      found=[fn for fn in new_fnames if fn in requested_files])
+                continue
+
+            # ── Handle GitHub request ─────────────────────────────────
             if github_requested is not None:
                 _gh_req = github_requested
                 github_requested = None
                 _github_attempts += 1
-                _dlog("natural_github_round",
-                      session_id=session_id, user_id=user_id,
-                      round=search_round,
-                      github_rounds_used=_github_rounds_used,
-                      github_attempts=_github_attempts,
-                      request=str(_gh_req)[:300])
 
-                # Budget exhausted — tell Claude to answer with what it has.
-                # Only PRODUCTIVE rounds (data returned) count against
-                # MAX_GITHUB_ROUNDS; wasted rounds (invalid JSON, tool crash)
-                # get a free retry, bounded by MAX_GITHUB_ATTEMPTS so a
-                # failure loop can never run forever. (session ff4ff718 fix)
                 if (_github_rounds_used >= MAX_GITHUB_ROUNDS
                         or _github_attempts > MAX_GITHUB_ATTEMPTS):
-                    _dlog("natural_github_budget_exhausted",
+                    _dlog("phase1_github_budget_exhausted",
                           session_id=session_id, user_id=user_id,
-                          github_rounds_used=_github_rounds_used,
-                          github_attempts=_github_attempts)
-                    current_messages = current_messages + [
-                        {"role": "assistant", "content": full_response or "(checking GitHub...)"},
-                        {"role": "user", "content":
-                            f"GitHub request limit reached ({MAX_GITHUB_ROUNDS} requests already made). "
-                            "Do NOT emit another <github_request>. "
-                            "Answer the user's question now using the GitHub data you already received."},
-                    ]
-                    full_response = ""
-                    continue
+                          rounds=_github_rounds_used, attempts=_github_attempts)
+                    break
 
-                # Invalid JSON in the tag — feed the error back so Claude retries
                 if "_invalid" in _gh_req:
-                    _dlog("natural_github_invalid_json",
-                          session_id=session_id, user_id=user_id,
-                          raw_preview=_gh_req["_invalid"][:200])
-                    current_messages = current_messages + [
-                        {"role": "assistant", "content": full_response or "(checking GitHub...)"},
+                    _phase1_msgs = list(messages) + [
+                        {"role": "assistant", "content": _p1_response or "(github request...)"},
                         {"role": "user", "content":
-                            "Your <github_request> tag did not contain valid JSON or used an "
-                            "unknown tool. The body must be a single JSON object like: "
-                            '{"tool": "list_prs", "args": {"owner": "X", "repo": "Y"}, "reason": "..."}. '
-                            "Valid tools: list_repos, list_prs, get_pr_diff, get_pr_comments, "
-                            "list_issues, get_issue_comments, diff_branches. Try again."},
+                            "Your <github_request> was not valid JSON. "
+                            "Emit a corrected <github_request> or reply READY_TO_EDIT."},
                     ]
-                    full_response = ""
                     continue
 
                 yield sse({"type": "progress",
-                           "content": f"GitHub: {_gh_req['tool'].replace('_', ' ')}..."})
+                           "content": f"GitHub: {_gh_req.get('tool', 'request')}..."})
 
-                # ── ADDITIVE: push_session_file needs session_id, so it is
-                # routed here instead of through execute_github_request. The
-                # server pushes the already-applied DB content — the model
-                # never carries file bytes. Fully guarded: any failure becomes
-                # a normal string result and the loop continues unchanged.
-                if _gh_req.get("tool") == "push_session_file":
-                    try:
-                        from services.github_natural_tag import (
-                            push_session_file_from_db,
-                        )
-                        _gh_result = push_session_file_from_db(
-                            _gh_req, user_id, session_id, dlog=_dlog)
-                    except Exception as _gh_push_err:
-                        _dlog("gh_push_session_route_error",
-                              session_id=session_id, user_id=user_id,
-                              error=str(_gh_push_err))
-                        _gh_result = f"[push_session_file failed: {_gh_push_err}]"
-                else:
-                    _gh_result = execute_github_request(_gh_req, user_id, dlog=_dlog)
-                # ── Budget accounting (session ff4ff718 fix): only rounds that
-                # actually returned data consume the MAX_GITHUB_ROUNDS budget.
-                # Failure strings from execute_github_request/context_tools are
-                # always bracket- or "Missing"-prefixed (github_context_tools.py
-                # returns, natural_tag.py:277) — those rounds are free retries.
-                _gh_round_failed = _gh_result.startswith((
-                    "[GitHub tool failed", "[GitHub request failed",
-                    "[push_session_file failed", "Missing "))
-                if not _gh_round_failed:
-                    _github_rounds_used += 1
-                _dlog("natural_github_result",
-                      session_id=session_id, user_id=user_id,
-                      tool=_gh_req.get("tool"),
-                      counted=not _gh_round_failed,
-                      github_rounds_used=_github_rounds_used,
-                      result_len=len(_gh_result),
-                      result_preview=_gh_result[:300])
-
-                # ── ADDITIVE: register read_file result as a session file ──
-                # After a successful read_file, fetch + persist the COMPLETE
-                # file (same row shape as /api/github-app/load) and inject it
-                # into this request's in-memory session context. From here the
-                # normal edit pipeline treats it exactly like an upload: edit
-                # blocks resolve, diff cards render, QA runs, apply works.
-                # Fully guarded — any failure logs and falls through to
-                # today's read-only behavior unchanged.
                 try:
-                    if _gh_req.get("tool") == "read_file":
-                        _gh_args = _gh_req.get("args", {}) or {}
-                        _gh_path = (_gh_args.get("path") or "").strip().lstrip("/")
-                        _gh_basename = _gh_path.rsplit("/", 1)[-1] if _gh_path else ""
-                        if _gh_basename and _gh_basename in file_content_lookup_stream:
-                            _dlog("github_session_file_already_registered",
-                                  session_id=session_id, user_id=user_id,
-                                  filename=_gh_basename)
-                        elif _gh_basename:
-                            from services.github_natural_tag import (
-                                fetch_and_register_github_file,
-                            )
-                            _gh_entry = fetch_and_register_github_file(
-                                _gh_req, user_id, session_id, dlog=_dlog)
-                            if _gh_entry and _gh_entry.get("content"):
-                                _gh_fname = _gh_entry["filename"]
-                                session_files.append(_gh_entry)
-                                file_content_lookup_stream[_gh_fname] = _gh_entry["content"]
-                                try:
-                                    _gh_smap = parser.parse(_gh_entry["content"], _gh_fname)
-                                    symbol_maps_by_name[_gh_fname] = (_gh_smap, _gh_entry)
-                                except Exception as _gh_parse_err:
-                                    symbol_maps_by_name[_gh_fname] = (None, _gh_entry)
-                                    _dlog("github_session_file_parse_failed",
-                                          session_id=session_id, user_id=user_id,
-                                          filename=_gh_fname,
-                                          error=str(_gh_parse_err))
-                                _dlog("github_session_file_registered",
-                                      session_id=session_id, user_id=user_id,
-                                      filename=_gh_fname,
-                                      file_id=_gh_entry.get("id"),
-                                      content_chars=len(_gh_entry["content"]),
-                                      lines=_gh_entry.get("lines"),
-                                      symbol_count=_gh_entry.get("symbol_count"),
-                                      total_session_files=len(session_files))
-                                _gh_result = (
-                                    _gh_result
-                                    + f"\n\n[NOTE: The complete file '{_gh_fname}' "
-                                    f"({_gh_entry.get('lines')} lines) is now loaded in this "
-                                    f"session and is EDITABLE. To modify it, emit standard "
-                                    f"<surgical_edit> blocks with filename \"{_gh_fname}\" — "
-                                    f"the user will see a diff card with a QA score. Do NOT "
-                                    f"use push_files unless the user explicitly asked to "
-                                    f"push/commit.]"
-                                )
-                            else:
-                                _dlog("github_session_file_not_registered",
-                                      session_id=session_id, user_id=user_id,
-                                      path=_gh_path)
-                except Exception as _gh_reg_err:
-                    _dlog("github_session_file_register_error",
+                    _gh_result = await execute_github_request(
+                        _gh_req, user_id, session_id, dlog=_dlog)
+                    _github_rounds_used += 1
+                    _dlog("phase1_github_result",
                           session_id=session_id, user_id=user_id,
-                          error=str(_gh_reg_err))
+                          tool=_gh_req.get("tool", ""),
+                          result_chars=len(str(_gh_result)))
 
-                github_injection = (
-                    f"Here is the GitHub data you requested ({_gh_req.get('tool')})"
-                    + (f" — {_gh_req.get('reason')}" if _gh_req.get("reason") else "")
-                    + ":\n\n"
-                    + _gh_result
-                    + "\n\nAnswer the user's question naturally using this data. "
-                    "If you genuinely need more GitHub data, emit ONE more <github_request>."
-                )
-
-                current_messages = current_messages + [
-                    {"role": "assistant", "content": full_response or "(checking GitHub...)"},
-                    {"role": "user", "content": github_injection},
-                ]
-                full_response = ""
-                continue  # Next round
-
-            # ── Thinking-only detection ───────────────────────────────────
-            # Claude produced thinking blocks but zero visible text, zero tags.
-            # Auto-retry once with a nudge instead of silently dropping.
-            if (not full_response.strip()
-                    and had_thinking
-                    and not edit_blocks_raw
-                    and not new_file_blocks_raw
-                    and not edit_plan_data):
-                if _thinking_only_retries < 1:
-                    _thinking_only_retries += 1
-                    _dlog("thinking_only_response",
-                          session_id=session_id, user_id=user_id,
-                          search_round=search_round,
-                          retries=_thinking_only_retries)
-                    yield sse({"type": "progress",
-                               "content": "Formulating response..."})
-                    # Close any open thinking block before retry
-                    if in_thinking:
-                        yield sse({"type": "thinking_end", "content": ""})
-                        in_thinking = False
-                    current_messages = current_messages + [
-                        {"role": "assistant",
-                         "content": "(internal reasoning completed)"},
-                        {"role": "user",
-                         "content":
-                            "You completed your reasoning but didn't produce a visible response. "
-                            "Please respond now: if you need a file, emit <file_request>. "
-                            "If you need to search code, emit <search_request>. "
-                            "If you're answering a question or discussing code, just respond naturally. "
-                            "You must always produce visible text for the user."},
+                    _phase1_msgs = list(messages) + [
+                        {"role": "assistant", "content": _p1_response or "(github request...)"},
+                        {"role": "user", "content":
+                            f"GitHub result:\n{json.dumps(_gh_result, indent=2, default=str)[:8000]}"
+                            "\n\nDo you need more information? Emit another request, or reply READY_TO_EDIT."},
                     ]
-                    full_response = ""
-                    had_thinking = False
-                    continue  # Retry round
-                else:
-                    # Retry exhausted — send a visible message instead of silent drop
-                    _dlog("thinking_only_retry_exhausted",
-                          session_id=session_id, user_id=user_id)
-                    if in_thinking:
-                        yield sse({"type": "thinking_end", "content": ""})
-                    yield sse({"type": "token",
-                               "content": "I was reasoning about your request but couldn't "
-                                          "formulate a complete response. Could you rephrase "
-                                          "or provide more detail?"})
-                    yield sse({"type": "done", "content": ""})
-                    return
+                except Exception as _gh_err:
+                    _dlog("phase1_github_error",
+                          session_id=session_id, user_id=user_id,
+                          error=str(_gh_err)[:300])
+                    _phase1_msgs = list(messages) + [
+                        {"role": "assistant", "content": _p1_response or "(github request...)"},
+                        {"role": "user", "content":
+                            f"GitHub request failed: {str(_gh_err)[:200]}. "
+                            "Reply READY_TO_EDIT to proceed with the code you have."},
+                    ]
+                continue
 
-            # ── GitHub announce-without-action detection (additive) ───────
-            # Claude produced a tiny visible response (e.g. "Let me check the
-            # deployment status...") with thinking, but emitted no tag, no
-            # edits, and no plan — then stopped. This is a silent stall: the
-            # model "performed" the action inside its thinking block instead
-            # of typing the tag. Nudge once, mirroring the thinking-only
-            # retry pattern above. Guarded so it can never fire twice and
-            # never touches rounds where any tool/edit/plan was produced.
-            if (_gh_nat_enabled
-                    and _github_attempts == 0
-                    and _gh_announce_retries < 1
-                    and had_thinking
-                    and full_response.strip()
-                    and len(full_response.strip()) < 200
-                    and not edit_blocks_raw
-                    and not new_file_blocks_raw
-                    and not edit_plan_data):
-                _gh_announce_retries += 1
-                _dlog("gh_announce_without_action",
-                      session_id=session_id, user_id=user_id,
-                      search_round=search_round,
-                      response_len=len(full_response.strip()),
-                      response_preview=full_response.strip()[:120],
-                      retries=_gh_announce_retries)
-                yield sse({"type": "progress",
-                           "content": "Completing the check..."})
-                if in_thinking:
-                    yield sse({"type": "thinking_end", "content": ""})
-                    in_thinking = False
-                current_messages = current_messages + [
-                    {"role": "assistant", "content": full_response},
-                    {"role": "user",
-                     "content":
-                        "Your response ended after a brief statement without "
-                        "performing any action. If you announced or intended a "
-                        "check or lookup (deploy status, GitHub data, code "
-                        "search, file contents), perform it NOW by emitting the "
-                        "corresponding tag (<github_request>, <search_request>, "
-                        "or <file_request>) in your visible response — tags "
-                        "typed inside thinking are never executed. If your "
-                        "brief message was genuinely your complete answer, "
-                        "restate it now with the key details and evidence."},
-                ]
-                full_response = ""
-                had_thinking = False
-                continue  # Retry round
-
-            # ── No search request — streaming is done ─────────────────────
-            _dlog("streaming_phase_done",
+            # ── No action tag — model didn't search, didn't say READY ─
+            _dlog("phase1_no_action",
                   session_id=session_id, user_id=user_id,
-                  total_rounds=search_round + 1,
-                  streaming_duration_s=round(time.time() - _streaming_t0, 1),
-                  last_round_duration_s=round(time.time() - _round_t0, 1),
-                  pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1),
-                  edit_blocks=len(edit_blocks_raw),
-                  new_file_blocks=len(new_file_blocks_raw),
-                  has_plan=edit_plan_data is not None,
-                  response_len=len(full_response))
+                  round=_search_round,
+                  response_preview=_p1_response[:300])
             break
 
-        # Final flush for edge cases (Claude ended inside a block)
-        if in_thinking:
-            yield sse({"type": "thinking_end", "content": ""})
-        # NOTE: in_edit / in_file / in_search / in_filereq / in_plan
-        # are all handled by the universal end-of-stream finalizer
-        # inside the search_round loop above.  No duplicate logic here.
+        _phase1_duration = time.time() - _streaming_t0
+        _dlog("phase1_complete",
+              session_id=session_id, user_id=user_id,
+              total_duration_s=round(_phase1_duration, 1),
+              search_rounds=min(_search_round + 1, PHASE1_MAX_SEARCH_ROUNDS),
+              accumulated_results_chars=len(accumulated_search_results),
+              searched_terms=searched_terms,
+              requested_files=list(requested_files))
 
-        # ── Starvation recovery: retry without thinking ─────────────────
-        # If adaptive thinking consumed the entire round producing zero text,
-        # retry once with thinking DISABLED so all tokens go to real output.
-        #
-        # Evidence (session 74b5b2a8, task a61b7c74, 2026-07 live test):
-        # round 4 stalled on thinking for 123s and was aborted at 222s. The
-        # no-thinking recovery retry ran correctly and the model asked for
-        # two more code regions via a legitimate <search_request> tag —
-        # but this recovery parser only recognized <surgical_edit>/
-        # <new_file>, so the tag text was flushed as plain prose,
-        # `no_edits_produced` fired, and the whole task (236s, one full
-        # API round, real spend) was discarded even though the model did
-        # exactly the right thing. Fix: the recovery parser now also
-        # recognizes <search_request> and can fetch results for it, bounded
-        # to at most one follow-up round so it can never itself starve.
-        # ── Pre-edit time budget gate for recovery (session a3140cd3) ────
-        # If starvation fired but we've already burned >TOTAL_PREEDIT_BUDGET_S,
-        # skip recovery entirely — there's not enough time left for recovery
-        # rounds AND edit execution before Railway's 15-min kill.
-        _preedit_elapsed = time.time() - _streaming_t0
-        _recovery_time_ok = _preedit_elapsed <= TOTAL_PREEDIT_BUDGET_S
+        # ───────────────────────────────────────────────────────────────────
+        # PHASE 2: EDIT GENERATION
+        # Full token budget, full thinking. Single API call.
+        # Search cannot starve this — it's a completely separate call.
+        # ───────────────────────────────────────────────────────────────────
 
-        if (_streaming_starvation_abort
-                and len(full_response.strip()) == 0
-                and _natural_use_claude
-                and not _pipeline_over_budget()
-                and _recovery_time_ok):
-            _dlog("starvation_recovery_retry",
-                  session_id=session_id, user_id=user_id,
-                  model=arch_model,
-                  original_thinking=stream_kwargs.get("thinking"),
-                  elapsed_s=round(_preedit_elapsed, 1))
-            yield sse({"type": "progress",
-                       "content": "🔄 Thinking stalled — retrying without extended thinking..."})
+        # Build edit-phase messages with search results injected
+        current_messages = list(messages)
+        if accumulated_search_results:
+            current_messages = current_messages + [
+                {"role": "assistant", "content": "(I've analyzed the codebase and gathered the code I need.)"},
+                {"role": "user", "content":
+                    "Here is additional code context from your analysis:\n\n"
+                    + accumulated_search_results
+                    + "\n\nNow apply the requested changes. Use <surgical_edit>, <new_file>, "
+                    "or <edit_plan> tags. Do NOT emit <search_request> — all code discovery is complete."},
+            ]
 
-            # Build a no-thinking copy of stream_kwargs
-            _retry_kwargs = {k: v for k, v in stream_kwargs.items() if k != "thinking"}
-            # Also drop output_config/effort — not valid without thinking
-            _retry_kwargs.pop("output_config", None)
-            # Cap recovery max_tokens — full 128K lets model ramble for 6+ min
-            # per round (sessions a3140cd3, fc4347dc). 16K is enough for a plan.
-            _RECOVERY_MAX_TOKENS = 16000
-            if _retry_kwargs.get("max_tokens", 0) > _RECOVERY_MAX_TOKENS:
-                _dlog("recovery_max_tokens_capped",
-                      session_id=session_id, user_id=user_id,
-                      original=_retry_kwargs["max_tokens"],
-                      capped=_RECOVERY_MAX_TOKENS)
-                _retry_kwargs["max_tokens"] = _RECOVERY_MAX_TOKENS
+        yield sse({"type": "progress", "content": "Writing code changes..."})
 
-            async def _recovery_stream_round(_msgs: list):
-                """Run one no-thinking streaming round and parse edit/file/
-                search/plan tags. Yields live SSE frames as text streams in,
-                then yields exactly one dict tagged __recovery_result__=True
-                with the round's final parse results.
+        # ── Edit-phase streaming ──────────────────────────────────────
+        STREAMING_PHASE_DEADLINE_S = 480   # 8 min max for edit streaming
+        STREAMING_THINKING_STALL_S = 120   # 2 min thinking stall → abort
 
-                Evidence (session 9538f9f1, 2026-07-13): 4d565d8 told the
-                model to emit <edit_plan> for 3+ edits. When starvation
-                recovery fired, the model obeyed its prompt and emitted a
-                valid <edit_plan> with 8 items (~2020 chars). But the old
-                recovery parser only knew ("edit", "file", "search") — it
-                treated <edit_plan> as plain text, classified the round as
-                "narration," fired the forced-write nudge, and wasted the
-                remaining Railway window. Fix: parse ALL 5 tag types from
-                TAG_DEFS so recovery handles every tag the main flow does.
-                """
-                _resp = ""
-                _r_edit_blocks: list = []
-                _r_file_blocks: list = []
-                _r_search_block = None
-                _r_plan_block = None  # <edit_plan> content
-                _state = "normal"
-                _normal_buf = ""
-                _tag_buf = ""
+        state = "normal"
+        normal_buf = ""
+        tag_buf = ""
+        had_thinking = False
+        _last_stop_reason: str | None = None
+        _matched_stop_seq: str | None = None
+        _edit_hb_bytes = 0
+        _edit_hb_last = 0
+        _round_t0 = time.time()
+        _round_last_text_ts = time.time()
 
-                # Parse ALL tags from TAG_DEFS — not a subset.
-                # Evidence: "plan" was missing → <edit_plan> treated as text.
-                _RECOVERY_TAGS = tuple(TAG_DEFS.keys())  # ("edit","file","search","filereq","plan")
+        _tag_stop_enabled = _os.getenv("TAG_STOP_SEQUENCES", "true").strip().lower() == "true"
+        _tag_stop_seqs = [TAG_DEFS["plan"]["close"]] if _tag_stop_enabled else []
 
-                _r_stop_reason = None
-                _r_usage = None
-                async with aclient.messages.stream(**{
-                    **_retry_kwargs,
-                    "messages": _msgs,
-                }) as _stream:
-                    async for _rev in _stream:
-                        if getattr(_rev, "type", None) != "text":
-                            continue
-                        _text = _rev.text or ""
-                        _resp += _text
-                        if _state == "normal":
-                            _normal_buf += _text
-                        else:
-                            _tag_buf += _text
+        if _natural_use_claude:
+            stream_kwargs = {
+                "model": arch_model,
+                "max_tokens": _max_output_tokens(arch_model),
+                "system": system_prompt,
+                "messages": current_messages,
+            }
+            stream_kwargs.update(_get_thinking_kwargs(arch_model, 10000))
+            stream_kwargs.update(_get_effort_kwargs(arch_model))
+            if _tag_stop_seqs:
+                stream_kwargs["stop_sequences"] = _tag_stop_seqs
 
-                        # Minimal tag parser — now covers ALL tag types
-                        while True:
-                            if _state == "normal":
-                                _found = False
-                                for _tname in _RECOVERY_TAGS:
-                                    _topen = TAG_DEFS[_tname]["open"]
-                                    _ti = _normal_buf.find(_topen)
-                                    if _ti != -1:
-                                        if _ti > 0:
-                                            yield {"type": "token", "content": _normal_buf[:_ti]}
-                                        if _tname in ("edit", "file"):
-                                            yield {"type": "edit_start", "content": ""}
-                                        _state = f"in_{_tname}"
-                                        _tag_buf = _normal_buf[_ti + len(_topen):]
-                                        _normal_buf = ""
-                                        _found = True
-                                        break
-                                if not _found:
-                                    # Flush safe prefix
-                                    _tail = max(len(TAG_DEFS[t]["open"]) for t in TAG_DEFS)
-                                    _safe = max(0, len(_normal_buf) - _tail)
-                                    if _safe > 0:
-                                        yield {"type": "token", "content": _normal_buf[:_safe]}
-                                        _normal_buf = _normal_buf[_safe:]
-                                    break
-                            elif _state.startswith("in_"):
-                                _tname2 = _state[3:]
-                                if _tname2 not in TAG_DEFS:
-                                    break  # safety — shouldn't happen
-                                _tclose = TAG_DEFS[_tname2]["close"]
-                                _ci = _tag_buf.find(_tclose)
-                                if _ci != -1:
-                                    _block_content = _tag_buf[:_ci]
-                                    if _tname2 == "edit":
-                                        _r_edit_blocks.append(_block_content)
-                                        yield {"type": "edit_end", "content": ""}
-                                    elif _tname2 == "file":
-                                        _r_file_blocks.append(_block_content)
-                                        yield {"type": "edit_end", "content": ""}
-                                    elif _tname2 == "search":
-                                        _r_search_block = _block_content
-                                    elif _tname2 == "plan":
-                                        _r_plan_block = _block_content
-                                    # filereq: store as search for now (same fetch path)
-                                    elif _tname2 == "filereq":
-                                        _r_search_block = _block_content
-                                    _normal_buf = _tag_buf[_ci + len(_tclose):]
-                                    _tag_buf = ""
-                                    _state = "normal"
-                                else:
-                                    break
-                            else:
+            for _attempt in range(3):
+                try:
+                    async with aclient.messages.stream(**stream_kwargs) as astream:
+                        current_block_type = None
+                        async for event in astream:
+                            etype = getattr(event, "type", None)
+
+                            if etype == "content_block_start":
+                                current_block_type = getattr(
+                                    getattr(event, "content_block", None), "type", None
+                                )
+                                if current_block_type == "thinking":
+                                    in_thinking = True
+                                    had_thinking = True
+                                    yield sse({"type": "thinking_start", "content": ""})
+
+                            elif etype == "content_block_delta":
+                                delta = getattr(event, "delta", None)
+                                if not delta:
+                                    continue
+
+                                thinking_chunk = getattr(delta, "thinking", None)
+                                text_chunk = getattr(delta, "text", None)
+
+                                if thinking_chunk:
+                                    yield sse({"type": "thinking", "content": thinking_chunk})
+
+                                elif text_chunk:
+                                    full_response += text_chunk
+                                    _round_last_text_ts = time.time()
+
+                                    if state == "normal":
+                                        normal_buf += text_chunk
+                                    else:
+                                        tag_buf += text_chunk
+                                        if state in ("in_edit", "in_file"):
+                                            _edit_hb_bytes += len(text_chunk)
+                                            if (_edit_hb_bytes - _edit_hb_last >= 2048):
+                                                _edit_hb_last = _edit_hb_bytes
+                                                yield sse({
+                                                    "type": "progress",
+                                                    "content": f"✍️ Writing code changes… {_edit_hb_bytes/1024:.1f} KB",
+                                                })
+
+                                    # Tag parser (edit/file/plan — search/filereq ignored in Phase 2)
+                                    while True:
+                                        if state == "normal":
+                                            _found_open = False
+                                            while True:
+                                                candidates = []
+                                                for _tname in TAG_DEFS:
+                                                    _ti = normal_buf.find(TAG_DEFS[_tname]["open"])
+                                                    if _ti != -1:
+                                                        candidates.append((_ti, _tname))
+                                                if not candidates:
+                                                    tail = max(len(td["open"]) for td in TAG_DEFS.values())
+                                                    safe = max(0, len(normal_buf) - tail)
+                                                    if safe > 0:
+                                                        yield sse({"type": "token", "content": normal_buf[:safe]})
+                                                        normal_buf = normal_buf[safe:]
+                                                    break
+                                                first_idx, first_tag = min(candidates, key=lambda x: x[0])
+                                                if first_idx > 0:
+                                                    yield sse({"type": "token", "content": normal_buf[:first_idx]})
+                                                if first_tag in ("edit", "file"):
+                                                    yield sse({"type": "edit_start", "content": ""})
+                                                state = f"in_{first_tag}"
+                                                tag_buf = normal_buf[first_idx + len(TAG_DEFS[first_tag]["open"]):]
+                                                normal_buf = ""
+                                                _found_open = True
+                                                _dlog("tag_opened",
+                                                      session_id=session_id, user_id=user_id,
+                                                      tag_type=first_tag, state=state)
+                                                break
+                                            if not _found_open:
+                                                break
+
+                                        _tag_name = state[3:]
+                                        if _tag_name not in TAG_DEFS:
+                                            break
+                                        _close_tag = TAG_DEFS[_tag_name]["close"]
+                                        idx = tag_buf.find(_close_tag)
+                                        if idx == -1:
+                                            break
+                                        _content = tag_buf[:idx]
+                                        _remainder = tag_buf[idx + len(_close_tag):]
+                                        _break_stream = False
+
+                                        if _tag_name == "edit":
+                                            edit_blocks_raw.append(_content)
+                                            yield sse({"type": "edit_end", "content": ""})
+                                        elif _tag_name == "file":
+                                            new_file_blocks_raw.append(_content)
+                                            yield sse({"type": "edit_end", "content": ""})
+                                        elif _tag_name == "plan":
+                                            _pd = _parse_plan_content(_content)
+                                            if _pd is not None:
+                                                edit_plan_data = _pd
+                                            _break_stream = True
+                                        elif _tag_name in ("search", "filereq", "github"):
+                                            # Model emitted search in edit phase — log and ignore
+                                            _dlog("phase2_search_tag_ignored",
+                                                  session_id=session_id, user_id=user_id,
+                                                  tag_type=_tag_name,
+                                                  content_preview=_content[:200])
+
+                                        state = "normal"
+                                        normal_buf = _remainder
+                                        tag_buf = ""
+                                        _dlog("tag_closed",
+                                              session_id=session_id, user_id=user_id,
+                                              tag_type=_tag_name,
+                                              content_len=len(_content),
+                                              break_stream=_break_stream)
+                                        if _break_stream:
+                                            break
+                                        if not _remainder:
+                                            break
+
+                            elif etype == "content_block_stop":
+                                if in_thinking and current_block_type == "thinking":
+                                    yield sse({"type": "thinking_end", "content": ""})
+                                    in_thinking = False
+
+                            # Deadline checks
+                            _stall_elapsed = time.time() - _round_t0
+                            if (_pipeline_over_budget()
+                                    or _stall_elapsed >= STREAMING_PHASE_DEADLINE_S):
+                                _dlog("streaming_deadline_abort",
+                                      session_id=session_id, user_id=user_id,
+                                      reason="pipeline_budget" if _pipeline_over_budget() else "phase_deadline",
+                                      elapsed_s=round(_stall_elapsed, 1),
+                                      text_len=len(full_response))
+                                _streaming_starvation_abort = True
+                                break
+                            if (had_thinking
+                                    and (time.time() - _round_last_text_ts)
+                                        > STREAMING_THINKING_STALL_S):
+                                _dlog("streaming_thinking_stall",
+                                      session_id=session_id, user_id=user_id,
+                                      stall_s=round(time.time() - _round_last_text_ts, 1),
+                                      text_len=len(full_response))
+                                _streaming_starvation_abort = True
                                 break
 
-                    # Capture API response metadata for diagnostics
-                    # Evidence: trace 8a7b9037 — recovery round took 152s
-                    # producing 0 text; no way to know if model hit max_tokens,
-                    # end_turn, or something else without this.
+                            # Break if plan was found
+                            if edit_plan_data is not None:
+                                break
+
+                    # Capture stop_reason
                     try:
-                        _r_final = await _stream.get_final_message()
-                        _r_stop_reason = _r_final.stop_reason if _r_final else None
-                        if _r_final and hasattr(_r_final, "usage"):
-                            _r_usage = {
-                                "input": getattr(_r_final.usage, "input_tokens", None),
-                                "output": getattr(_r_final.usage, "output_tokens", None),
-                            }
+                        _final = await astream.get_final_message()
+                        _last_stop_reason = _final.stop_reason if _final else None
+                        _matched_stop_seq = getattr(_final, "stop_sequence", None) if _final else None
                     except Exception:
-                        pass
+                        _last_stop_reason = None
+                        _matched_stop_seq = None
 
-                # Flush remaining normal text
-                if _normal_buf.strip():
-                    yield {"type": "token", "content": _normal_buf}
-
-                # Close any unclosed tag via EOS recovery.
-                # Evidence (session b2f811a3, 2026-07-13): model opened
-                # <search_request> and wrote a full, valid terms/reason JSON
-                # body, but the stream ended before </search_request> ever
-                # printed. Fix: force-close using whatever content was
-                # collected instead of dropping it.
-                if _state.startswith("in_"):
-                    _tname3 = _state[3:]
-                    if _tname3 in TAG_DEFS:
-                        _tclose3 = TAG_DEFS[_tname3]["close"]
-                        _ci3 = _tag_buf.find(_tclose3)
-                        if _ci3 != -1:
-                            _block3 = _tag_buf[:_ci3]
-                        else:
-                            _dlog("starvation_recovery_eos_force_close",
-                                  tag_type=_tname3, content_len=len(_tag_buf))
-                            _block3 = _tag_buf
-                        if _tname3 == "edit":
-                            _r_edit_blocks.append(_block3)
-                        elif _tname3 == "file":
-                            _r_file_blocks.append(_block3)
-                        elif _tname3 == "search":
-                            _r_search_block = _block3
-                        elif _tname3 == "plan":
-                            _r_plan_block = _block3
-                        elif _tname3 == "filereq":
-                            _r_search_block = _block3
-                        if _tname3 in ("edit", "file"):
-                            yield {"type": "edit_end", "content": ""}
-
-                yield {
-                    "__recovery_result__": True,
-                    "response": _resp,
-                    "edit_blocks": _r_edit_blocks,
-                    "file_blocks": _r_file_blocks,
-                    "search_block": _r_search_block,
-                    "plan_block": _r_plan_block,
-                    "stop_reason": _r_stop_reason,
-                    "usage": _r_usage,
-                }
-
-            try:
-                _final_response = ""
-                _final_edit_blocks: list = []
-                _final_file_blocks: list = []
-                _recovery_msgs = current_messages
-                # Bounded so no follow-up path can ever starve: 1 initial
-                # no-thinking attempt + at most 1 search-fetch follow-up
-                # round + at most 1 forced-write nudge round. The two
-                # follow-up kinds are mutually exclusive per round (a round
-                # either asked for search OR narrated with no tags at all),
-                # so 3 rounds total is a hard ceiling, never a loop.
-                RECOVERY_MAX_ROUNDS = 3
-                _forced_write_nudge_sent = False
-
-                for _recovery_round in range(RECOVERY_MAX_ROUNDS):
-                    # Time budget check inside recovery loop (session a3140cd3)
-                    _recovery_elapsed = time.time() - _streaming_t0
-                    if _recovery_round > 0 and _recovery_elapsed > TOTAL_PREEDIT_BUDGET_S:
-                        _dlog("starvation_recovery_time_budget_exit",
+                    if _last_stop_reason == "stop_sequence":
+                        _dlog("stream_halted_at_stop_sequence",
                               session_id=session_id, user_id=user_id,
-                              recovery_round=_recovery_round,
-                              elapsed_s=round(_recovery_elapsed, 1),
-                              budget_s=TOTAL_PREEDIT_BUDGET_S)
-                        yield sse({"type": "progress",
-                                   "content": "⏱️ Time budget reached — proceeding with what we have..."})
-                        break
+                              matched=str(_matched_stop_seq)[:60],
+                              state_at_halt=state, tag_buf_len=len(tag_buf))
 
-                    _round_result = None
-                    async for _ev in _recovery_stream_round(_recovery_msgs):
-                        if _ev.get("__recovery_result__"):
-                            _round_result = _ev
-                        else:
-                            yield sse(_ev)
+                    break  # success
 
-                    _final_response = _round_result["response"]
-                    _final_edit_blocks = _round_result["edit_blocks"]
-                    _final_file_blocks = _round_result["file_blocks"]
-                    _search_block = _round_result["search_block"]
-                    _plan_block = _round_result.get("plan_block")
-
-                    _dlog("starvation_recovery_round_done",
-                          session_id=session_id, user_id=user_id,
-                          recovery_round=_recovery_round,
-                          response_len=len(_final_response),
-                          edit_blocks=len(_final_edit_blocks),
-                          file_blocks=len(_final_file_blocks),
-                          search_requested=bool(_search_block),
-                          plan_found=bool(_plan_block),
-                          stop_reason=_round_result.get("stop_reason"),
-                          usage=_round_result.get("usage"))
-
-                    if _final_edit_blocks or _final_file_blocks:
-                        break  # got real edits — genuinely done
-
-                    # Evidence (session 9538f9f1): model emitted <edit_plan>
-                    # with 8 items in recovery. This IS real work — the main
-                    # flow's plan executor (line ~15220) will handle it.
-                    if _plan_block:
-                        _dlog("starvation_recovery_plan_found",
-                              session_id=session_id, user_id=user_id,
-                              recovery_round=_recovery_round,
-                              plan_content_len=len(_plan_block))
-                        break  # plan is actionable output — don't nudge
-
-                    # ── Zero-output emergency nudge (before budget check) ────
-                    # If recovery produced absolutely nothing (0 text, 0 edits,
-                    # 0 plan, 0 search), try a nudge BEFORE the budget check.
-                    # Without this, budget break guarantees total failure.
-                    # Evidence: trace 8a7b9037 — recovery round 0 had 0 output,
-                    # budget check at 449s > 420s broke before nudge could fire.
-                    _zero_output = (
-                        not _final_edit_blocks and not _final_file_blocks
-                        and not _plan_block and not _search_block
-                        and len(_final_response.strip()) == 0
+                except Exception as stream_err:
+                    err_str = str(stream_err)
+                    is_transient = (
+                        "500" in err_str or "529" in err_str
+                        or "overloaded" in err_str.lower()
+                        or "internal_server_error" in err_str.lower()
                     )
-                    if (_zero_output
-                            and not _forced_write_nudge_sent
-                            and _recovery_round < RECOVERY_MAX_ROUNDS - 1):
-                        _forced_write_nudge_sent = True
-                        _dlog("starvation_recovery_zero_output_nudge",
-                              session_id=session_id, user_id=user_id,
-                              recovery_round=_recovery_round,
-                              elapsed_s=round(time.time() - _streaming_t0, 1))
+                    if is_transient and _attempt < 2:
                         yield sse({"type": "progress",
-                                   "content": "Model produced no output — forcing one more attempt..."})
-                        _recovery_msgs = _recovery_msgs + [
-                            {"role": "assistant", "content": "(no output produced)"},
-                            {"role": "user", "content":
-                                "You produced no output at all. This is your FINAL chance. "
-                                "Using the code context you already have, emit <surgical_edit> "
-                                "or <new_file> block(s) RIGHT NOW. Do not think, plan, or search — "
-                                "write the code changes immediately."},
-                        ]
+                                   "content": f"Service busy — retrying ({_attempt+1}/3)..."})
+                        await asyncio.sleep(5 * (_attempt + 1))
                         continue
-
-                    # Post-round elapsed check — even if this round produced
-                    # a search request, don't start another round if we've
-                    # burned too much time. Evidence: sessions fc4347dc had
-                    # recovery round 2 START at 354s (under 600s gate) but
-                    # RUN for 396s, finishing at 749s with only 151s left.
-                    _post_round_elapsed = time.time() - _streaming_t0
-                    if _post_round_elapsed > TOTAL_PREEDIT_BUDGET_S:
-                        _dlog("starvation_recovery_post_round_budget_exit",
+                    if (stream_kwargs.get("stop_sequences")
+                            and "stop_sequence" in err_str.lower()
+                            and _attempt < 2):
+                        stream_kwargs.pop("stop_sequences", None)
+                        _dlog("tag_stop_sequences_rejected_disabled",
                               session_id=session_id, user_id=user_id,
-                              recovery_round=_recovery_round,
-                              elapsed_s=round(_post_round_elapsed, 1),
-                              budget_s=TOTAL_PREEDIT_BUDGET_S)
-                        yield sse({"type": "progress",
-                                   "content": "⏱️ Time budget reached — proceeding with best available result..."})
-                        break
+                              error=err_str[:300])
+                        continue
+                    raise
 
-                    if _search_block:
-                        if _recovery_round == RECOVERY_MAX_ROUNDS - 1:
-                            # Bounded — no rounds left even though it asked again
-                            _dlog("starvation_recovery_search_limit_reached",
-                                  session_id=session_id, user_id=user_id,
-                                  search_block_preview=str(_search_block)[:200])
+        else:
+            # ── GPT edit phase ─────────────────────────────────────────
+            _gpt_client = _get_client(user_id)
+            _gpt_msgs = [{"role": "system", "content": _gpt_system_text}] + list(current_messages)
+            _gpt_stop = _tag_stop_seqs[:4] if _tag_stop_enabled else None
+
+            for _attempt in range(3):
+                try:
+                    _gpt_stream = _chat_create(
+                        _gpt_client, model=arch_model,
+                        messages=_gpt_msgs,
+                        stream=True,
+                        max_tokens=_max_output_tokens(arch_model),
+                        stop=_gpt_stop,
+                    )
+                    for _gpt_chunk in _gpt_stream:
+                        _gpt_choice = _gpt_chunk.choices[0]
+                        if _gpt_choice.finish_reason:
+                            _last_stop_reason = _gpt_choice.finish_reason
                             break
+                        _gpt_delta = getattr(_gpt_choice, "delta", None)
+                        if _gpt_delta and hasattr(_gpt_delta, "content") and _gpt_delta.content:
+                            text_chunk = _gpt_delta.content
+                            full_response += text_chunk
+                            _round_last_text_ts = time.time()
+                            if state == "normal":
+                                normal_buf += text_chunk
+                            else:
+                                tag_buf += text_chunk
+                                if state in ("in_edit", "in_file"):
+                                    _edit_hb_bytes += len(text_chunk)
+                                    if (_edit_hb_bytes - _edit_hb_last >= 2048):
+                                        _edit_hb_last = _edit_hb_bytes
+                                        yield sse({"type": "progress",
+                                                   "content": f"✍️ Writing code changes… {_edit_hb_bytes/1024:.1f} KB"})
 
-                        _sd = _parse_search_content(_search_block)
-                        _recovery_terms = ([str(t).strip() for t in _sd.get("terms", [])
-                                            if str(t).strip()] if _sd else [])
-                        if not _recovery_terms:
-                            _dlog("starvation_recovery_search_unparseable",
-                                  session_id=session_id, user_id=user_id,
-                                  raw_preview=str(_search_block)[:200])
-                            break
+                            # Tag parser — same as Claude branch
+                            while True:
+                                if state == "normal":
+                                    candidates = []
+                                    for _tname in TAG_DEFS:
+                                        _ti = normal_buf.find(TAG_DEFS[_tname]["open"])
+                                        if _ti != -1:
+                                            candidates.append((_ti, _tname))
+                                    if not candidates:
+                                        tail = max(len(td["open"]) for td in TAG_DEFS.values())
+                                        safe = max(0, len(normal_buf) - tail)
+                                        if safe > 0:
+                                            yield sse({"type": "token", "content": normal_buf[:safe]})
+                                            normal_buf = normal_buf[safe:]
+                                        break
+                                    first_idx, first_tag = min(candidates, key=lambda x: x[0])
+                                    if first_idx > 0:
+                                        yield sse({"type": "token", "content": normal_buf[:first_idx]})
+                                    if first_tag in ("edit", "file"):
+                                        yield sse({"type": "edit_start", "content": ""})
+                                    state = f"in_{first_tag}"
+                                    tag_buf = normal_buf[first_idx + len(TAG_DEFS[first_tag]["open"]):]
+                                    normal_buf = ""
+                                else:
+                                    _tag_name = state[3:]
+                                    if _tag_name not in TAG_DEFS:
+                                        break
+                                    _close_tag = TAG_DEFS[_tag_name]["close"]
+                                    ci = tag_buf.find(_close_tag)
+                                    if ci == -1:
+                                        break
+                                    _content = tag_buf[:ci]
+                                    _remainder = tag_buf[ci + len(_close_tag):]
+                                    if _tag_name == "edit":
+                                        edit_blocks_raw.append(_content)
+                                        yield sse({"type": "edit_end", "content": ""})
+                                    elif _tag_name == "file":
+                                        new_file_blocks_raw.append(_content)
+                                        yield sse({"type": "edit_end", "content": ""})
+                                    elif _tag_name == "plan":
+                                        _pd = _parse_plan_content(_content)
+                                        if _pd is not None:
+                                            edit_plan_data = _pd
+                                    elif _tag_name in ("search", "filereq"):
+                                        _dlog("phase2_search_tag_ignored_gpt",
+                                              session_id=session_id, user_id=user_id,
+                                              tag_type=_tag_name)
+                                    state = "normal"
+                                    normal_buf = _remainder
+                                    tag_buf = ""
+                                    if _tag_name == "plan" and edit_plan_data:
+                                        break
+                                    if not _remainder:
+                                        break
 
+                    break  # success
+
+                except Exception as _gpt_err:
+                    if (("500" in str(_gpt_err) or "529" in str(_gpt_err)
+                            or "overloaded" in str(_gpt_err).lower())
+                            and _attempt < 2):
                         yield sse({"type": "progress",
-                                   "content": f"Fetching more code: {', '.join(_recovery_terms[:3])}..."})
-                        _recovery_search_results = _resolve_search_multifile(
-                            _recovery_terms, symbol_maps_by_name, file_content_lookup_stream
-                        )
-                        _dlog("starvation_recovery_search_results",
-                              session_id=session_id, user_id=user_id,
-                              terms=_recovery_terms,
-                              results_chars=len(_recovery_search_results))
-
-                        _recovery_msgs = _recovery_msgs + [
-                            {"role": "assistant", "content": _final_response or "(requesting more code...)"},
-                            {"role": "user", "content":
-                                "Here are the search results you requested:\n"
-                                + _recovery_search_results
-                                + "\n\nThis is your final chance — write your complete "
-                                  "<surgical_edit> or <new_file> blocks now. Do NOT emit "
-                                  "another <search_request>."},
-                        ]
-                        # loop continues for the bounded follow-up round
+                                   "content": f"Service busy — retrying ({_attempt+1}/3)..."})
+                        await asyncio.sleep(5 * (_attempt + 1))
                         continue
+                    raise
 
-                    # No edits, no search request — the model narrated
-                    # instead of producing code (confirmed via session
-                    # b2f811a3: 648 chars of "Before writing the UI I need
-                    # three more things..." with no actionable tag).
-                    # Force exactly one bounded "stop explaining, write it
-                    # now" nudge — this mirrors the manual follow-up prompt
-                    # that reliably fixes it in practice — then give up
-                    # cleanly if it still doesn't produce edits.
-                    if not _forced_write_nudge_sent and _recovery_round < RECOVERY_MAX_ROUNDS - 1:
-                        _forced_write_nudge_sent = True
-                        _dlog("starvation_recovery_text_only_nudge",
-                              session_id=session_id, user_id=user_id,
-                              recovery_round=_recovery_round,
-                              response_len=len(_final_response))
-                        yield sse({"type": "progress",
-                                   "content": "Model explained its plan but wrote no code — forcing it to write the edit now..."})
-                        _recovery_msgs = _recovery_msgs + [
-                            {"role": "assistant", "content": _final_response or "(thinking...)"},
-                            {"role": "user", "content":
-                                "You explained your reasoning but did not write any code. "
-                                "Do not write any more explanation, plans, or search requests. "
-                                "Using the code context you already have, emit the complete "
-                                "<surgical_edit> or <new_file> block(s) right now."},
-                        ]
-                        continue
-
-                    break  # already nudged once, or out of rounds — stop
-
-                _dlog("starvation_recovery_done",
-                      session_id=session_id, user_id=user_id,
-                      response_len=len(_final_response),
-                      edit_blocks=len(_final_edit_blocks),
-                      new_file_blocks=len(_final_file_blocks))
-
-                # Replace main-path variables with recovery results.
-                # Evidence (session 9538f9f1): recovery produced a valid
-                # <edit_plan> — must set edit_plan_data so the plan executor
-                # at line ~15250 fires and processes each edit individually.
-                if _final_response.strip() or _final_edit_blocks or _final_file_blocks or _plan_block:
-                    full_response = _final_response
-                    edit_blocks_raw = _final_edit_blocks
-                    new_file_blocks_raw = _final_file_blocks
-
-                if _plan_block:
-                    import json as _json_plan
-                    try:
-                        _pd_recovery = _json_plan.loads(_plan_block.strip())
-                        if isinstance(_pd_recovery, list) and len(_pd_recovery) > 0:
-                            edit_plan_data = _pd_recovery
-                            _dlog("starvation_recovery_plan_activated",
-                                  session_id=session_id, user_id=user_id,
-                                  plan_items=len(edit_plan_data))
-                        else:
-                            _dlog("starvation_recovery_plan_parse_not_list",
-                                  session_id=session_id, user_id=user_id,
-                                  raw_preview=str(_pd_recovery)[:200])
-                    except Exception as _plan_err:
-                        _dlog("starvation_recovery_plan_parse_error",
-                              session_id=session_id, user_id=user_id,
-                              error=str(_plan_err)[:200],
-                              raw_preview=_plan_block[:200])
-
-            except Exception as _recovery_err:
-                _dlog("starvation_recovery_error",
-                      session_id=session_id, user_id=user_id,
-                      error=str(_recovery_err)[:300])
-                yield sse({"type": "token",
-                           "content": "\n\n⚠️ Extended thinking timed out and the recovery attempt also failed. "
-                                      "Please try again — a simpler prompt or a different model may help."})
-                yield sse({"type": "done", "content": ""})
-                return
-
-        # Log when starvation recovery was skipped due to time budget
-        if (_streaming_starvation_abort
-                and len(full_response.strip()) == 0
-                and _natural_use_claude
-                and not _recovery_time_ok):
-            _dlog("starvation_recovery_skipped_time_budget",
+        # ── Post-streaming cleanup ────────────────────────────────────
+        if _streaming_starvation_abort:
+            _dlog("streaming_starvation_abort_exit",
                   session_id=session_id, user_id=user_id,
-                  elapsed_s=round(_preedit_elapsed, 1),
-                  budget_s=TOTAL_PREEDIT_BUDGET_S)
+                  elapsed_s=round(time.time() - _round_t0, 1),
+                  full_response_len=len(full_response),
+                  edit_blocks=len(edit_blocks_raw))
             yield sse({"type": "progress",
-                       "content": "⏱️ Time budget exceeded — skipping recovery to preserve edit time..."})
+                       "content": "⏱️ Thinking timeout — processing available changes..."})
+            if in_thinking:
+                yield sse({"type": "thinking_end", "content": ""})
+                in_thinking = False
 
-        # ── User-facing error when starvation produced nothing at all ────
+        # ── Stop-sequence tag-close synthesizer ───────────────────────
+        if (_last_stop_reason == "stop_sequence"
+                and state.startswith("in_")):
+            _ss_tag = state[3:]
+            _ss_content = tag_buf
+            try:
+                if _ss_tag == "plan":
+                    _pd = _parse_plan_content(_ss_content)
+                    if _pd is not None:
+                        edit_plan_data = _pd
+                full_response += TAG_DEFS.get(_ss_tag, {}).get("close", "")
+                state = "normal"
+                tag_buf = ""
+                _dlog("tag_closed_via_stop_sequence",
+                      session_id=session_id, user_id=user_id,
+                      tag_type=_ss_tag, content_len=len(_ss_content))
+            except Exception as _ss_exc:
+                _dlog("stop_sequence_synthesize_error",
+                      session_id=session_id, user_id=user_id,
+                      tag_type=_ss_tag, error=str(_ss_exc)[:300])
+
+        # ── Universal end-of-stream finalizer ─────────────────────────
+        if state != "normal":
+            _dlog("eos_finalizer_triggered",
+                  session_id=session_id, user_id=user_id,
+                  stuck_state=state,
+                  full_response_len=len(full_response))
+
+            if state == "in_edit":
+                _new_count, _partial_kept, _had_matches = _eos_recover_blocks(
+                    EDIT_OPEN, EDIT_CLOSE, full_response, tag_buf, edit_blocks_raw)
+                if _had_matches:
+                    state = "normal"
+                    tag_buf = ""
+                    _dlog("eos_edit_recovered",
+                          session_id=session_id, user_id=user_id,
+                          recovered_count=_new_count,
+                          partial_kept=_partial_kept,
+                          total_edit_blocks=len(edit_blocks_raw))
+                yield sse({"type": "edit_end", "content": ""})
+
+            elif state == "in_file":
+                _new_count, _partial_kept, _had_matches = _eos_recover_blocks(
+                    FILE_OPEN, FILE_CLOSE, full_response, tag_buf, new_file_blocks_raw)
+                if _had_matches:
+                    state = "normal"
+                    tag_buf = ""
+                    _dlog("eos_newfile_recovered",
+                          session_id=session_id, user_id=user_id,
+                          recovered_count=_new_count,
+                          partial_kept=_partial_kept,
+                          total_file_blocks=len(new_file_blocks_raw))
+                yield sse({"type": "edit_end", "content": ""})
+
+            elif state == "in_plan":
+                _pl_match = re.search(
+                    r"<edit_plan>(.*?)</edit_plan>",
+                    full_response, re.DOTALL)
+                if _pl_match:
+                    _pd = _parse_plan_content(_pl_match.group(1))
+                    if _pd is not None:
+                        edit_plan_data = _pd
+                    state = "normal"
+                    tag_buf = ""
+                    _dlog("eos_plan_recovered",
+                          session_id=session_id, user_id=user_id,
+                          plan_items=len(edit_plan_data) if edit_plan_data else 0)
+
+            else:
+                _dlog("eos_unknown_state",
+                      session_id=session_id, user_id=user_id,
+                      state=state)
+
+        # Flush any normal text buffered
+        if state == "normal" and normal_buf.strip():
+            yield sse({"type": "token", "content": normal_buf})
+
+        if in_thinking:
+            yield sse({"type": "thinking_end", "content": ""})
+
+        # ── Starvation handling (Phase 2 only — no recovery needed) ───
+        # With decomposed phases, total starvation only happens if the
+        # model's thinking stalls for 2+ minutes. No complex recovery
+        # loop — just report and stop.
         if (_streaming_starvation_abort
                 and len(full_response.strip()) == 0
                 and not edit_blocks_raw
@@ -15268,6 +14556,17 @@ async def run_natural_pipeline_stream(
                                   "Please try again with a simpler prompt or a different model."})
             yield sse({"type": "done", "content": ""})
             return
+
+        _dlog("phase2_complete",
+              session_id=session_id, user_id=user_id,
+              duration_s=round(time.time() - _round_t0, 1),
+              total_pipeline_s=round(time.time() - _pipeline_t0, 1),
+              edit_blocks=len(edit_blocks_raw),
+              new_file_blocks=len(new_file_blocks_raw),
+              has_plan=edit_plan_data is not None,
+              response_len=len(full_response),
+              was_starvation_abort=_streaming_starvation_abort)
+
 
         # Initialize skipped_changes early — truncation detection may append to it
         skipped_changes_struct: list = []
