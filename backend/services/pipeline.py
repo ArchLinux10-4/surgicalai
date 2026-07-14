@@ -12455,7 +12455,7 @@ def _build_natural_file_context(
         parts.append(f"EARLIER CONVERSATION (compacted):\n{session_summary}\n")
 
     if not session_files:
-        return ("\n".join(parts) if parts else ""), set()
+        return ("\n".join(parts) if parts else ""), set(), set()
 
     # ── Score every file for relevance ───────────────────────────────────
     terms = _extract_search_terms(user_request)
@@ -12511,6 +12511,14 @@ def _build_natural_file_context(
             f"{len(tier1)} most relevant. The other {len(tier2)} are listed below as "
             f"lean indexes — use <file_request> (by name) or <search_request> (by keyword) to fetch their code.\n"
         )
+
+    # Tier-1 files that were rendered as EXCERPT ONLY (grep window for large
+    # files, or truncated preview for symbol-less files) — NOT full content.
+    # The file_request guard must NOT tell the model these are "already fully
+    # loaded"; it must let the request fall through so the handler can serve
+    # the complete file once.  (Small code files ≤ LARGE_FILE_WINDOW and data
+    # files are genuinely full and stay out of this set.)
+    tier1_excerpt_only: set = set()
 
     def _render_full(sf: dict) -> str:
         fname      = sf["filename"]
@@ -12582,6 +12590,7 @@ def _build_natural_file_context(
                         f"(e.g. actual text, variable names, function names) to find the code to edit.\n"
                         f"NEVER guess or invent code you haven\'t seen.\n"
                     )
+                tier1_excerpt_only.add(fname)
                 _dlog("natural_large_file_context",
                       session_id=session_id, user_id=user_id,
                       filename=fname, total_lines=lines_count,
@@ -12589,6 +12598,8 @@ def _build_natural_file_context(
                       grep_chars=len(_grep_sections) if _grep_sections else 0)
             return header
         else:
+            if len(content) > 1500:
+                tier1_excerpt_only.add(fname)
             preview = content[:1500] + (f"\n...[{len(content)-1500} chars]" if len(content) > 1500 else "")
             return f"FILE: {fname} ({lines_count} lines){_badge_suffix}\nCONTENT:\n```\n{preview}\n```\n"
 
@@ -12630,7 +12641,7 @@ def _build_natural_file_context(
         for sf in tier2:
             parts.append(_render_lean(sf))
 
-    return "\n".join(parts), tier1_names
+    return "\n".join(parts), tier1_names, tier1_excerpt_only
 
 
 def _clean_history_content(content: str) -> str:
@@ -13357,7 +13368,7 @@ async def run_natural_pipeline_stream(
         )
 
         # ── Build file context ────────────────────────────────────────────
-        file_context, _tier1_names = _build_natural_file_context(
+        file_context, _tier1_names, _tier1_excerpt_only = _build_natural_file_context(
             session_files, symbol_maps_by_name, user_request,
             project_memory=project_memory, session_summary=session_summary,
             session_id=session_id, user_id=user_id,
@@ -14195,8 +14206,25 @@ async def run_natural_pipeline_stream(
 
                 if _kind == "file":
                     fnames_req = _data if isinstance(_data, list) else []
-                    _tier1_overlap = [fn for fn in fnames_req if fn in _tier1_names]
-                    if _tier1_overlap and all(fn in _tier1_names for fn in fnames_req):
+                    # A file is genuinely "fully loaded" only if it is tier-1
+                    # AND was not rendered as an excerpt (large grep window or
+                    # truncated preview).  Excerpt-only files must fall through
+                    # to the handler below so the full file is served once —
+                    # otherwise the model is told to "use what it has" when it
+                    # only ever saw grep snippets, and can never write an edit.
+                    _excerpt_req = [fn for fn in fnames_req if fn in _tier1_excerpt_only]
+                    if _excerpt_req:
+                        _dlog("agent_filereq_largefile_passthrough",
+                              session_id=session_id, user_id=user_id, turn=_turn,
+                              requested=fnames_req, excerpt_only=_excerpt_req)
+                    _tier1_full = [
+                        fn for fn in fnames_req
+                        if fn in _tier1_names and fn not in _tier1_excerpt_only
+                    ]
+                    if (not _excerpt_req) and _tier1_full and all(
+                            fn in _tier1_names and fn not in _tier1_excerpt_only
+                            for fn in fnames_req):
+                        _tier1_overlap = _tier1_full
                         _all_data = all(
                             symbol_maps_by_name.get(fn, (None, {}))[1].get("file_type")
                                 in ("csv", "excel", "pdf", "text")
