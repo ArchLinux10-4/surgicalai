@@ -15940,7 +15940,7 @@ async def run_natural_pipeline_stream(
                                       find_preview=_rf_old[:200],
                                       replace_preview=new_code[:200],
                                       user_id=user_id)
-                                # fall through to the resolved path (no continue)
+                                # fall through to the resolved path below
                             else:
                                 _dlog("snippet_apply_failed",
                                       session_id=session_id,
@@ -15952,26 +15952,26 @@ async def run_natural_pipeline_stream(
                                           else "match lies inside the target symbol"
                                       ),
                                       old_code_sent=old_code,
-                                  old_code_len=len(old_code),
-                                  symbol_code_actual=_accum_base,
-                                  symbol_code_len=len(_accum_base),
+                                      old_code_len=len(old_code),
+                                      symbol_code_actual=_accum_base,
+                                      symbol_code_len=len(_accum_base),
                                       user_id=user_id)
-                            still_unresolved.append({
-                                "filename": filename,
-                                "symbol": symbol_name,
-                                "new_code": new_code,
-                                "description": description,
-                                "_raw": edit_raw,
-                                "_snippet_reason": snip_reason,
-                                # CURRENT accumulated content — not symbol.code
-                                # (the pristine original). Showing stale content
-                                # made the correction model re-anchor against
-                                # lines that no longer exist (the correction-drop
-                                # bug).
-                                "_symbol_code": _accum_base,
-                                "_symbol_start": symbol.start_line,
-                            })
-                            continue
+                                still_unresolved.append({
+                                    "filename": filename,
+                                    "symbol": symbol_name,
+                                    "new_code": new_code,
+                                    "description": description,
+                                    "_raw": edit_raw,
+                                    "_snippet_reason": snip_reason,
+                                    # CURRENT accumulated content — not symbol.code
+                                    # (the pristine original). Showing stale content
+                                    # made the correction model re-anchor against
+                                    # lines that no longer exist (the correction-drop
+                                    # bug).
+                                    "_symbol_code": _accum_base,
+                                    "_symbol_start": symbol.start_line,
+                                })
+                                continue
                     else:
                         # ── Degenerate-fragment guard ────────────────────────
                         # No old_code was supplied. If new_code is clearly only a
