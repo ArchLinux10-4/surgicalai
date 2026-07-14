@@ -18445,6 +18445,28 @@ async def run_natural_pipeline_stream(
                           symbol=change_shells[idx]["symbol"].name,
                           error=str(_reqa_exc), error_type=type(_reqa_exc).__name__)
 
+            # ── Bug 3+4 fix: update history entries with actual re-QA results ──
+            # History was recorded right after correction, before re-QA.
+            # Now that re-QA has run, update the latest entry with the ACTUAL
+            # QA score, summary, and whether it truly passed.  Without this,
+            # round N+1 sees "Accepted: True" for code that re-QA blocked,
+            # causing the model to repeat the same failing approach.
+            for idx in fixed_indices:
+                if idx in _correction_history and _correction_history[idx]:
+                    _latest = _correction_history[idx][-1]
+                    _reqa_d = qa_results[idx] if idx < len(qa_results) else {}
+                    _reqa_verdict = _reqa_d.get("verdict", "?")
+                    _reqa_score = _reqa_d.get("qa_score", "?")
+                    _latest["qa_score"] = _reqa_score
+                    _latest["qa_summary"] = _reqa_d.get("summary", _latest.get("qa_summary", ""))
+                    _latest["accepted"] = _reqa_verdict in ("safe", "warning")
+                    _dlog("correction_history_updated_post_reqa",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round, idx=idx,
+                          symbol=change_shells[idx]["symbol"].name,
+                          reqa_score=_reqa_score, reqa_verdict=_reqa_verdict,
+                          accepted=_latest["accepted"])
+
         # ── tsc compile check — final verification after all retries ──────────
         # Re-run tsc on the FINAL content of every change. Anything that still
         # introduces a compile error is marked verdict="blocked" / score<=3 via
