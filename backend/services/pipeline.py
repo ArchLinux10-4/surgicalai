@@ -15156,7 +15156,25 @@ async def run_natural_pipeline_stream(
                 edit_start_line = edit_data.get("edit_start_line")   # Option B: line-number path
                 edit_end_line   = edit_data.get("edit_end_line")
 
-                if not filename or not new_code:
+                # Guard: filename is required.  new_code may be "" for a
+                # DELETION edit (remove lines entirely) — that's valid.
+                # Only skip when new_code is None (field missing) AND there's
+                # no old_code / line-number targeting that could drive a
+                # non-replacement edit.
+                if not filename:
+                    _dlog("edit_skip_no_filename",
+                          session_id=session_id, user_id=user_id,
+                          symbol=symbol_name, raw_preview=str(edit_raw)[:200])
+                    continue
+                if new_code is None and not old_code and not edit_start_line:
+                    _dlog("edit_skip_no_content",
+                          session_id=session_id, user_id=user_id,
+                          filename=filename, symbol=symbol_name)
+                    skipped_changes_struct.append({
+                        "filename": filename,
+                        "symbol": symbol_name or "(unknown)",
+                        "reason": "Edit block had no new_code, old_code, or line targeting",
+                    })
                     continue
 
                 file_content = file_content_lookup.get(filename, "")
@@ -15523,18 +15541,24 @@ async def run_natural_pipeline_stream(
                         # file share the name "_gap_bridge" so _symbol_accum
                         # chains them correctly (bottom-to-top sort safe).
                         # ── Gap-bridge guard (session 52802d58 apply-409 fix) ──
-                        # When the model named the symbol CORRECTLY (exact name
-                        # match) but supplied stale line numbers (from an older
-                        # file snapshot), do NOT discard the exact match in
-                        # favor of a whole-file gap bridge.  A whole-file change
-                        # anchors on the ENTIRE analysis-time file, which can
-                        # never relocate after any drift → guaranteed 409 at
-                        # apply time (proven: 6/6 apply failures on lines 1-991
-                        # in server log 1783375017500).  Keeping the exact-name
-                        # symbol lets the snippet path fail naturally into the
-                        # correction loop, which re-anchors against CURRENT
-                        # symbol content and produces a precise, applyable edit.
-                        if not _correct_sym and match_method == "exact":
+                        # When the model named the symbol CORRECTLY but gave
+                        # stale line numbers that OVERLAP the symbol range, do
+                        # NOT discard the exact match — route to correction
+                        # loop instead.  BUT when the edit range has ZERO
+                        # overlap with the symbol range (edit_start > sym_end
+                        # or edit_end < sym_start), the model clearly targeted
+                        # a different region of the file (wrong symbol name,
+                        # e.g. "run" for a __main__ block) — allow gap bridge
+                        # so the line-number splice can delete/replace the
+                        # correct lines.  Proven: session 3780a835 deletion
+                        # edit on lines 953-972 vs symbol "run" at 724-921.
+                        _edit_has_zero_overlap = False
+                        if edit_start_line and edit_end_line:
+                            _esl = int(edit_start_line)
+                            _eel = int(edit_end_line)
+                            if _esl > symbol.end_line or _eel < symbol.start_line:
+                                _edit_has_zero_overlap = True
+                        if not _correct_sym and match_method == "exact" and not _edit_has_zero_overlap:
                             _dlog("symbol_auto_resolve_gap_bridge_skipped",
                                   session_id=session_id,
                                   filename=filename,
