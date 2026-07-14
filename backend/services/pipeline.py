@@ -13548,6 +13548,8 @@ async def run_natural_pipeline_stream(
         }
 
         MAX_SEARCH_ROUNDS = 10
+        SEARCH_TIME_BUDGET_S = 300               # 5 min max in search phase (leaves 10 min for edits)
+        TOTAL_PREEDIT_BUDGET_S = 600             # 10 min max before edits must start (Railway=15 min)
         _last_stop_reason: str | None = None     # capture Claude's stop_reason per round
         _matched_stop_seq: str | None = None     # which stop_sequence halted the round (Improvement #4)
         searched_terms: list = []                # terms fetched so far (avoid re-fetching)
@@ -13567,6 +13569,42 @@ async def run_natural_pipeline_stream(
         _streaming_t0 = time.time()
         _streaming_starvation_abort = False
         for search_round in range(MAX_SEARCH_ROUNDS + 2):
+            # ── Time budget gate (session a3140cd3 fix) ──────────────
+            # Prevents search phase from consuming so much time that
+            # Railway's 15-min HTTP limit kills the request before edits
+            # finish. Evidence: trace 9538f9f1 burned 780s in search
+            # before any edit, leaving only 113s for 12-item plan.
+            _search_elapsed = time.time() - _streaming_t0
+            if search_round > 0 and _search_elapsed > SEARCH_TIME_BUDGET_S:
+                _dlog("search_time_budget_exceeded",
+                      session_id=session_id, user_id=user_id,
+                      search_round=search_round,
+                      elapsed_s=round(_search_elapsed, 1),
+                      budget_s=SEARCH_TIME_BUDGET_S)
+                if not _forced_edit_round_done:
+                    # Give model one final shot to write edits
+                    _forced_edit_round_done = True
+                    yield sse({"type": "progress",
+                               "content": "⏱️ Search time limit reached — writing edits now..."})
+                    forced_msg = (
+                        f"TIME BUDGET EXCEEDED ({int(_search_elapsed)}s of {SEARCH_TIME_BUDGET_S}s). "
+                        "You already have all the code you need from previous results. "
+                        "Write your complete <surgical_edit> or <new_file> blocks RIGHT NOW. "
+                        "Do NOT emit another <search_request> — there is no time left for searching. "
+                        "Use the exact symbol names from the search results you already received."
+                    )
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": full_response or "(analyzing gathered code...)"},
+                        {"role": "user", "content": forced_msg},
+                    ]
+                    full_response = ""
+                    search_requested = None
+                    continue  # One final forced-edit round
+                else:
+                    _dlog("search_time_budget_forced_exit",
+                          session_id=session_id, user_id=user_id,
+                          elapsed_s=round(_search_elapsed, 1))
+                    break  # Already tried forced round — exit to edit phase
             _round_t0 = time.time()
             _round_last_text_ts = time.time()
 
@@ -14784,15 +14822,23 @@ async def run_natural_pipeline_stream(
         # exactly the right thing. Fix: the recovery parser now also
         # recognizes <search_request> and can fetch results for it, bounded
         # to at most one follow-up round so it can never itself starve.
+        # ── Pre-edit time budget gate for recovery (session a3140cd3) ────
+        # If starvation fired but we've already burned >TOTAL_PREEDIT_BUDGET_S,
+        # skip recovery entirely — there's not enough time left for recovery
+        # rounds AND edit execution before Railway's 15-min kill.
+        _preedit_elapsed = time.time() - _streaming_t0
+        _recovery_time_ok = _preedit_elapsed <= TOTAL_PREEDIT_BUDGET_S
+
         if (_streaming_starvation_abort
                 and len(full_response.strip()) == 0
                 and _natural_use_claude
-                and not _pipeline_over_budget()):
+                and not _pipeline_over_budget()
+                and _recovery_time_ok):
             _dlog("starvation_recovery_retry",
                   session_id=session_id, user_id=user_id,
                   model=arch_model,
                   original_thinking=stream_kwargs.get("thinking"),
-                  elapsed_s=round(time.time() - _streaming_t0, 1))
+                  elapsed_s=round(_preedit_elapsed, 1))
             yield sse({"type": "progress",
                        "content": "🔄 Thinking stalled — retrying without extended thinking..."})
 
@@ -14956,6 +15002,18 @@ async def run_natural_pipeline_stream(
                 _forced_write_nudge_sent = False
 
                 for _recovery_round in range(RECOVERY_MAX_ROUNDS):
+                    # Time budget check inside recovery loop (session a3140cd3)
+                    _recovery_elapsed = time.time() - _streaming_t0
+                    if _recovery_round > 0 and _recovery_elapsed > TOTAL_PREEDIT_BUDGET_S:
+                        _dlog("starvation_recovery_time_budget_exit",
+                              session_id=session_id, user_id=user_id,
+                              recovery_round=_recovery_round,
+                              elapsed_s=round(_recovery_elapsed, 1),
+                              budget_s=TOTAL_PREEDIT_BUDGET_S)
+                        yield sse({"type": "progress",
+                                   "content": "⏱️ Time budget reached — proceeding with what we have..."})
+                        break
+
                     _round_result = None
                     async for _ev in _recovery_stream_round(_recovery_msgs):
                         if _ev.get("__recovery_result__"):
@@ -15101,6 +15159,18 @@ async def run_natural_pipeline_stream(
                                       "Please try again — a simpler prompt or a different model may help."})
                 yield sse({"type": "done", "content": ""})
                 return
+
+        # Log when starvation recovery was skipped due to time budget
+        if (_streaming_starvation_abort
+                and len(full_response.strip()) == 0
+                and _natural_use_claude
+                and not _recovery_time_ok):
+            _dlog("starvation_recovery_skipped_time_budget",
+                  session_id=session_id, user_id=user_id,
+                  elapsed_s=round(_preedit_elapsed, 1),
+                  budget_s=TOTAL_PREEDIT_BUDGET_S)
+            yield sse({"type": "progress",
+                       "content": "⏱️ Time budget exceeded — skipping recovery to preserve edit time..."})
 
         # ── User-facing error when starvation produced nothing at all ────
         if (_streaming_starvation_abort
