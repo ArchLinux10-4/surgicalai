@@ -29,6 +29,75 @@ function authHeaders(): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {}
 }
 
+/** Build the ws://|wss:// URL for a streaming endpoint.
+ *  Mirrors BASE (`{VITE_API_URL||origin}/api`) but swaps the scheme and
+ *  carries the JWT as `?token=` because browsers cannot attach Authorization
+ *  headers to a WebSocket handshake (and the HTTP auth middleware does not run
+ *  for WS scopes — the backend re-auths from this same query param). */
+function wsUrl(path: string): string {
+  const apiRoot = (import.meta.env.VITE_API_URL ?? '') || window.location.origin
+  const wsRoot = apiRoot.replace(/^http/i, 'ws') // http→ws, https→wss
+  const token = getAuthToken() ?? ''
+  return `${wsRoot}/api${path}?token=${encodeURIComponent(token)}`
+}
+
+/**
+ * Stream a request over WebSocket, feeding each `data: ` line to `processLine`
+ * exactly as the SSE path does (identical framing — the backend forwards the
+ * same StreamingResponse chunks verbatim).
+ *
+ * WHY WS: Railway caps HTTP requests at 15 min and closes idle ones; WS is
+ * exempt from both limits, so long agent runs no longer hit a transport wall.
+ *
+ * SAFETY — fall back to HTTP (`onOpenFail`) ONLY when the socket never opens.
+ * Once the socket is open the server may have already started work; re-running
+ * over HTTP would double-apply edits.  A mid-stream drop therefore does NOT
+ * fall back — it just ends the stream, and the backend safety-net persists any
+ * partial work.  Abort (session switch) mirrors the fetch path: no onDone.
+ */
+function streamViaWS(
+  path: string,
+  data: unknown,
+  controller: AbortController,
+  processLine: (line: string) => void,
+  fireDone: () => void,
+  onOpenFail: () => void,
+): void {
+  let ws: WebSocket
+  try {
+    ws = new WebSocket(wsUrl(path))
+  } catch {
+    onOpenFail()
+    return
+  }
+  let opened = false
+  let aborted = false
+  let buffer = ''
+
+  const closeWs = () => { aborted = true; try { ws.close() } catch { /* noop */ } }
+  controller.signal.addEventListener('abort', closeWs)
+
+  ws.onopen = () => { opened = true; ws.send(JSON.stringify(data)) }
+
+  ws.onmessage = (ev: MessageEvent) => {
+    buffer += typeof ev.data === 'string' ? ev.data : ''
+    const parts = buffer.split('\n')
+    buffer = parts.pop() ?? ''
+    for (const line of parts) processLine(line.trimEnd())
+  }
+
+  // onerror always precedes onclose; do all decisions in onclose (fires once).
+  ws.onerror = () => { /* handled in onclose */ }
+
+  ws.onclose = () => {
+    controller.signal.removeEventListener('abort', closeWs)
+    if (!opened) { onOpenFail(); return }   // never connected → safe to fall back
+    if (aborted) return                     // user cancelled → match fetch: no onDone
+    if (buffer.trim()) processLine(buffer.trimEnd())
+    fireDone()                              // idempotent — no-op if `done` already fired
+  }
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...authHeaders(), ...options?.headers },
@@ -185,67 +254,79 @@ export const api = {
       let doneCalled = false
       const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone(tokens.join('')) } }
 
-      fetch(`${BASE}/chat/smart-stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify(data),
-        signal: controller.signal,
-      }).then(async res => {
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({ detail: res.statusText }))
-          onError(err.detail || `HTTP ${res.status}`)
-          fireDone()
-          return
-        }
-        const reader = res.body!.getReader()
-        const decoder = new TextDecoder()
-        let lineBuffer = ''
-
-        const processLine = (line: string) => {
-          if (!line.startsWith('data: ')) return
-          try {
-            const chunk = JSON.parse(line.slice(6))
-            if (chunk.type === 'progress') onProgress(chunk.content)
-            else if (chunk.type === 'token') { tokens.push(chunk.content); onToken(chunk.content) }
-            else if (chunk.type === 'smart_result') {
-              // Natural pipeline: result may include natural_text already streamed as tokens
-              const result = JSON.parse(chunk.content)
-              onResult(result)
-            }
-            else if (chunk.type === 'chat') { tokens.push(chunk.content); onToken(chunk.content) }
-            else if (chunk.type === 'done') fireDone()
-            else if (chunk.type === 'error') onError(chunk.content)
-            else if (chunk.type === 'thinking_start') onThinking?.('', 'start')
-            else if (chunk.type === 'thinking') onThinking?.(chunk.content, 'delta')
-            else if (chunk.type === 'thinking_end') onThinking?.('', 'end')
-            else if (chunk.type === 'compacting') onCompacting?.('start')
-            else if (chunk.type === 'compacting_done') onCompacting?.('done')
-            else if (chunk.type === 'edit_start') onEditStart?.()
-            else if (chunk.type === 'edit_end') onEditEnd?.()
-            else if (
-              chunk.type === 'planning_started' ||
-              chunk.type === 'task_plan' || chunk.type === 'task_start' ||
-              chunk.type === 'task_progress' || chunk.type === 'task_done' ||
-              chunk.type === 'task_thinking' ||
-              chunk.type === 'task_blocked' || chunk.type === 'task_cancelled' ||
-              chunk.type === 'tasks_complete'
-            ) onTask?.(chunk)
-          } catch {}
-        }
-
-        const pump = () => reader.read().then(({ done, value }) => {
-          if (done) { fireDone(); return }
-          lineBuffer += decoder.decode(value, { stream: true })
-          const parts = lineBuffer.split('\n')
-          lineBuffer = parts.pop() ?? ''
-          for (const line of parts) {
-            processLine(line.trimEnd())
+      // Transport-independent SSE line handler — shared by WS and fetch paths.
+      const processLine = (line: string) => {
+        if (!line.startsWith('data: ')) return
+        try {
+          const chunk = JSON.parse(line.slice(6))
+          if (chunk.type === 'progress') onProgress(chunk.content)
+          else if (chunk.type === 'token') { tokens.push(chunk.content); onToken(chunk.content) }
+          else if (chunk.type === 'smart_result') {
+            // Natural pipeline: result may include natural_text already streamed as tokens
+            const result = JSON.parse(chunk.content)
+            onResult(result)
           }
+          else if (chunk.type === 'chat') { tokens.push(chunk.content); onToken(chunk.content) }
+          else if (chunk.type === 'done') fireDone()
+          else if (chunk.type === 'error') onError(chunk.content)
+          else if (chunk.type === 'thinking_start') onThinking?.('', 'start')
+          else if (chunk.type === 'thinking') onThinking?.(chunk.content, 'delta')
+          else if (chunk.type === 'thinking_end') onThinking?.('', 'end')
+          else if (chunk.type === 'compacting') onCompacting?.('start')
+          else if (chunk.type === 'compacting_done') onCompacting?.('done')
+          else if (chunk.type === 'edit_start') onEditStart?.()
+          else if (chunk.type === 'edit_end') onEditEnd?.()
+          else if (
+            chunk.type === 'planning_started' ||
+            chunk.type === 'task_plan' || chunk.type === 'task_start' ||
+            chunk.type === 'task_progress' || chunk.type === 'task_done' ||
+            chunk.type === 'task_thinking' ||
+            chunk.type === 'task_blocked' || chunk.type === 'task_cancelled' ||
+            chunk.type === 'tasks_complete'
+          ) onTask?.(chunk)
+        } catch {}
+      }
+
+      // HTTP/SSE transport (also the fallback when the WS never opens).
+      const runViaFetch = () => {
+        fetch(`${BASE}/chat/smart-stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          body: JSON.stringify(data),
+          signal: controller.signal,
+        }).then(async res => {
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({ detail: res.statusText }))
+            onError(err.detail || `HTTP ${res.status}`)
+            fireDone()
+            return
+          }
+          const reader = res.body!.getReader()
+          const decoder = new TextDecoder()
+          let lineBuffer = ''
+
+          const pump = () => reader.read().then(({ done, value }) => {
+            if (done) { fireDone(); return }
+            lineBuffer += decoder.decode(value, { stream: true })
+            const parts = lineBuffer.split('\n')
+            lineBuffer = parts.pop() ?? ''
+            for (const line of parts) {
+              processLine(line.trimEnd())
+            }
+            pump()
+          }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
+
           pump()
         }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
+      }
 
-        pump()
-      }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
+      // WebSocket-first (removes Railway's 15-min transport wall); on a
+      // connect-time failure only, transparently fall back to HTTP/SSE.
+      if (typeof WebSocket !== 'undefined') {
+        streamViaWS('/chat/ws/smart-stream', data, controller, processLine, fireDone, runViaFetch)
+      } else {
+        runViaFetch()
+      }
 
       return controller
     },
@@ -265,52 +346,64 @@ export const api = {
       let doneCalled = false
       const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone() } }
 
-      fetch(`${BASE}/chat/execute-task`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...authHeaders() },
-        body: JSON.stringify(data),
-        signal: controller.signal,
-      }).then(async res => {
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({ detail: res.statusText }))
-          onError(err.detail || `HTTP ${res.status}`)
-          fireDone()
-          return
-        }
-        const reader = res.body!.getReader()
-        const decoder = new TextDecoder()
-        let lineBuffer = ''
+      // Transport-independent SSE line handler — shared by WS and fetch paths.
+      const processLine = (line: string) => {
+        if (!line.startsWith('data: ')) return
+        try {
+          const chunk = JSON.parse(line.slice(6))
+          if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
+          else if (chunk.type === 'done') fireDone()
+          else if (chunk.type === 'error') onError(chunk.content)
+          else if (
+            chunk.type === 'task_start' || chunk.type === 'task_progress' ||
+            chunk.type === 'task_thinking' ||
+            chunk.type === 'task_done' || chunk.type === 'task_blocked' ||
+            chunk.type === 'task_cancelled' || chunk.type === 'tasks_complete'
+          ) {
+            if (chunk.type === 'task_progress') onProgress(chunk.content)
+            onTask(chunk)
+          }
+        } catch {}
+      }
 
-        const processLine = (line: string) => {
-          if (!line.startsWith('data: ')) return
-          try {
-            const chunk = JSON.parse(line.slice(6))
-            if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
-            else if (chunk.type === 'done') fireDone()
-            else if (chunk.type === 'error') onError(chunk.content)
-            else if (
-              chunk.type === 'task_start' || chunk.type === 'task_progress' ||
-              chunk.type === 'task_thinking' ||
-              chunk.type === 'task_done' || chunk.type === 'task_blocked' ||
-              chunk.type === 'task_cancelled' || chunk.type === 'tasks_complete'
-            ) {
-              if (chunk.type === 'task_progress') onProgress(chunk.content)
-              onTask(chunk)
-            }
-          } catch {}
-        }
+      // HTTP/SSE transport (also the fallback when the WS never opens).
+      const runViaFetch = () => {
+        fetch(`${BASE}/chat/execute-task`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...authHeaders() },
+          body: JSON.stringify(data),
+          signal: controller.signal,
+        }).then(async res => {
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({ detail: res.statusText }))
+            onError(err.detail || `HTTP ${res.status}`)
+            fireDone()
+            return
+          }
+          const reader = res.body!.getReader()
+          const decoder = new TextDecoder()
+          let lineBuffer = ''
 
-        const pump = () => reader.read().then(({ done, value }) => {
-          if (done) { fireDone(); return }
-          lineBuffer += decoder.decode(value, { stream: true })
-          const parts = lineBuffer.split('\n')
-          lineBuffer = parts.pop() ?? ''
-          for (const line of parts) processLine(line.trimEnd())
+          const pump = () => reader.read().then(({ done, value }) => {
+            if (done) { fireDone(); return }
+            lineBuffer += decoder.decode(value, { stream: true })
+            const parts = lineBuffer.split('\n')
+            lineBuffer = parts.pop() ?? ''
+            for (const line of parts) processLine(line.trimEnd())
+            pump()
+          }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
+
           pump()
         }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
+      }
 
-        pump()
-      }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
+      // WebSocket-first (removes Railway's 15-min transport wall); on a
+      // connect-time failure only, transparently fall back to HTTP/SSE.
+      if (typeof WebSocket !== 'undefined') {
+        streamViaWS('/chat/ws/execute-task', data, controller, processLine, fireDone, runViaFetch)
+      } else {
+        runViaFetch()
+      }
 
       return controller
     },

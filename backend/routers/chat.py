@@ -1416,3 +1416,159 @@ async def execute_task(req: dict, request: Request):
         "Cache-Control": "no-cache",
         "X-Accel-Buffering": "no",
     })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# WebSocket transport  (additive · fully isolated)
+#
+# WHY: Railway caps HTTP/SSE requests at 15 min (900s) and closes idle ones.
+# Long agent runs (architect + QA + fix loops) can legitimately approach that
+# wall even though the app-level PIPELINE_DEADLINE_S governor keeps real work
+# bounded.  Per Railway's official docs, *WebSocket* connections are exempt
+# from both the duration and the inactivity limits — so WS removes only the
+# transport ceiling, nothing else.
+#
+# ISOLATION CONTRACT (do not violate):
+#   • These handlers REUSE the existing smart_stream / execute_task coroutines
+#     verbatim.  They do NOT touch the SSE path, the pipeline, or any budget
+#     governor.  PIPELINE_DEADLINE_S, per-symbol timeouts and the deadline
+#     gates all remain in force.
+#   • The HTTP auth middleware in main.py does NOT run for WebSocket scopes
+#     (Starlette limitation), so auth is re-implemented here, mirroring that
+#     middleware exactly: token → decode_token(token) → state.{user_id,
+#     username, is_admin}.
+#   • Each handler returns a StreamingResponse whose .body_iterator yields the
+#     exact same `data: {...}\n\n` SSE strings the browser already parses.  We
+#     forward those frames over the socket unchanged, so the frontend line
+#     parser is reused as-is.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class _WSRequestShim:
+    """Minimal stand-in for fastapi.Request for the two stream handlers.
+
+    Audited (grep `request.` in this file): the smart_stream / execute_task
+    coroutines read ONLY `request.state.user_id`.  We additionally mirror
+    username / is_admin for forward-safety.  Nothing else is accessed, so a
+    SimpleNamespace-backed `.state` is a complete, faithful substitute.
+    """
+
+    def __init__(self, user_id: str, username: str = "", is_admin: bool = False):
+        from types import SimpleNamespace
+        self.state = SimpleNamespace(
+            user_id=user_id, username=username, is_admin=is_admin
+        )
+
+
+async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
+    """Authenticate, receive the request body, run `handler`, pump SSE → WS.
+
+    `handler` is the existing smart_stream or execute_task coroutine
+    (signature: `async def(req: dict, request: Request) -> StreamingResponse`).
+    """
+    from auth_utils import decode_token
+
+    # ── Auth BEFORE accept() ──────────────────────────────────────────────
+    # Rejecting the handshake (close without accept) makes the browser's
+    # WebSocket fail to open, which is exactly the signal the frontend uses to
+    # fall back to the HTTP/SSE path (where a bad token yields a clean 401 →
+    # logout).  Mirrors main.py auth_middleware: ?token= → decode_token → sub.
+    token = websocket.query_params.get("token", "") or ""
+    try:
+        payload = decode_token(token)
+        user_id = payload["sub"]
+        username = payload.get("username", "") or ""
+        is_admin = bool(payload.get("is_admin", False))
+    except Exception:
+        _dlog("ws_auth_reject", endpoint=endpoint_name)
+        try:
+            await websocket.close(code=1008)  # 1008 = policy violation
+        except Exception:
+            pass
+        return
+
+    await websocket.accept()
+
+    # Presence parity with the HTTP middleware (never fatal).
+    try:
+        from services.presence import touch as _presence_touch
+        _presence_touch(user_id, username, f"/api/chat/{endpoint_name}")
+    except Exception:
+        pass
+
+    # ── Receive the single request body (same JSON the POST body carries) ──
+    try:
+        raw = await websocket.receive_text()
+        req = json.loads(raw)
+        if not isinstance(req, dict):
+            raise ValueError("request body must be a JSON object")
+    except WebSocketDisconnect:
+        return
+    except Exception as _e:
+        _dlog("ws_bad_request", endpoint=endpoint_name, user_id=user_id,
+              error=str(_e)[:200])
+        try:
+            await websocket.send_text(
+                "data: " + json.dumps({"type": "error",
+                                       "content": "Malformed request"}) + "\n\n")
+        except Exception:
+            pass
+        try:
+            await websocket.close(code=1003)  # 1003 = unsupported data
+        except Exception:
+            pass
+        return
+
+    shim = _WSRequestShim(user_id, username, is_admin)
+
+    # ── Run the EXISTING handler and pump its SSE body over the socket ─────
+    body_iter = None
+    try:
+        resp = await handler(req, shim)          # StreamingResponse
+        body_iter = resp.body_iterator
+        async for chunk in body_iter:
+            if isinstance(chunk, (bytes, bytearray)):
+                chunk = bytes(chunk).decode("utf-8", "replace")
+            await websocket.send_text(chunk)
+    except WebSocketDisconnect:
+        # Client navigated away / switched sessions.  Closing the generator
+        # runs its `finally` (safety-net save + orphan-task reset) exactly like
+        # an SSE client disconnect would.  We do NOT restart work.
+        _dlog("ws_client_disconnect", endpoint=endpoint_name, user_id=user_id)
+        if body_iter is not None:
+            try:
+                await body_iter.aclose()
+            except Exception:
+                pass
+        return
+    except Exception as _e:
+        _dlog("ws_pump_error", endpoint=endpoint_name, user_id=user_id,
+              error=str(_e)[:300])
+        if body_iter is not None:
+            try:
+                await body_iter.aclose()
+            except Exception:
+                pass
+        try:
+            await websocket.send_text(
+                "data: " + json.dumps({"type": "error",
+                                       "content": "Stream error"}) + "\n\n")
+        except Exception:
+            pass
+    finally:
+        try:
+            await websocket.close()
+        except Exception:
+            pass
+
+
+@router.websocket("/ws/smart-stream")
+async def ws_smart_stream(websocket: WebSocket):
+    """WebSocket transport for smart_stream (see isolation contract above)."""
+    await _ws_pump(websocket, smart_stream, "ws/smart-stream")
+
+
+@router.websocket("/ws/execute-task")
+async def ws_execute_task(websocket: WebSocket):
+    """WebSocket transport for execute_task (see isolation contract above)."""
+    await _ws_pump(websocket, execute_task, "ws/execute-task")
