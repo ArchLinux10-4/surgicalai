@@ -14936,6 +14936,83 @@ async def run_natural_pipeline_stream(
                         edit_blocks_raw.append(result_raw)
                         yield sse({"type": "progress",
                                    "content": f"✅ {p_symbol} complete"})
+
+                        # ── Chain same-file edits ──────────────────────
+                        # When multiple edits target the same file, each
+                        # must see the UPDATED content from prior edits.
+                        # Without this, all edits are generated from the
+                        # original file → overlapping edits overwrite
+                        # each other's changes during resolution.
+                        # Evidence: session 336ac3bf — 5 edits to
+                        # AutoMatchModal all got the same base → Edit 2
+                        # (lines 1546-1635) superseded Edit 1 (1549-1572),
+                        # losing Edit 1's additions → QA score 1/10.
+                        # Best-effort: if parsing or application fails,
+                        # behavior is unchanged (current baseline).
+                        try:
+                            import json as _cj
+                            import re as _cre
+                            _parsed = None
+                            try:
+                                _parsed = _cj.loads(result_raw)
+                            except Exception:
+                                # Fallback: extract fields via regex for
+                                # JSON with unescaped quotes in JSX/CSS.
+                                pass
+                            if _parsed and isinstance(_parsed, dict):
+                                _c_esl = _parsed.get("edit_start_line")
+                                _c_eel = _parsed.get("edit_end_line")
+                                _c_nc = _parsed.get("new_code")
+                                _c_oc = _parsed.get("old_code")
+                                _c_lines = p_content.splitlines(keepends=True)
+                                _chain_ok = False
+                                if _c_esl and _c_eel and _c_nc is not None:
+                                    # Line-number splice at file level
+                                    _si = int(_c_esl) - 1  # 0-based
+                                    _ei = int(_c_eel)       # exclusive
+                                    if 0 <= _si < len(_c_lines) and _ei <= len(_c_lines):
+                                        _repl = _c_nc
+                                        if _repl and not _repl.endswith("\n"):
+                                            _repl += "\n"
+                                        _new_content = (
+                                            "".join(_c_lines[:_si])
+                                            + _repl
+                                            + "".join(_c_lines[_ei:])
+                                        )
+                                        file_content_lookup_stream[p_filename] = _new_content
+                                        _chain_ok = True
+                                elif _c_oc and _c_nc is not None and _c_oc in p_content:
+                                    # old_code string replacement
+                                    file_content_lookup_stream[p_filename] = p_content.replace(
+                                        _c_oc, _c_nc, 1
+                                    )
+                                    _chain_ok = True
+                                # Tag the edit block with its generation
+                                # sequence so resolution preserves order.
+                                # Chained edits MUST be applied in generation
+                                # order — the bottom-to-top sort would
+                                # reorder them, causing line-number mismatch
+                                # (Edit 2's lines are relative to post-Edit-1).
+                                if _chain_ok and _parsed:
+                                    _parsed["_chain_seq"] = plan_idx
+                                    try:
+                                        _reser = _cj.dumps(_parsed)
+                                        edit_blocks_raw[-1] = _reser
+                                    except Exception:
+                                        pass  # best-effort
+                                _dlog("plan_chain_update",
+                                      session_id=session_id, user_id=user_id,
+                                      filename=p_filename, symbol=p_symbol,
+                                      method="line_splice" if (_c_esl and _c_eel) else "old_code_replace",
+                                      applied=_chain_ok,
+                                      chain_seq=plan_idx if _chain_ok else None,
+                                      file_len_before=len(p_content),
+                                      file_len_after=len(file_content_lookup_stream.get(p_filename, "")))
+                        except Exception as _chain_err:
+                            _dlog("plan_chain_update_error",
+                                  session_id=session_id, user_id=user_id,
+                                  filename=p_filename, symbol=p_symbol,
+                                  error=str(_chain_err))
                     else:
                         skipped_changes_struct.append({
                             "filename": p_filename,
@@ -15061,6 +15138,17 @@ async def run_natural_pipeline_stream(
         def _ln_sort_key(raw):
             try:
                 d = json.loads(raw.strip()) if isinstance(raw, str) else raw
+                # ── Chained edits: preserve generation order ──────────
+                # Chained edits have _chain_seq set during generation.
+                # They MUST be applied in ascending sequence order because
+                # each edit's line numbers are relative to the file state
+                # AFTER the prior edit.  Bottom-to-top sort would break
+                # line-number alignment with resolution's _symbol_accum.
+                # Use high descending keys so reverse=True yields
+                # ascending _chain_seq order (seq 0 first, seq 4 last).
+                cs = d.get("_chain_seq")
+                if cs is not None:
+                    return 1_000_000 - int(cs)
                 sl = d.get("edit_start_line")
                 return int(sl) if sl else -1
             except Exception:
