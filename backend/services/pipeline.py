@@ -288,6 +288,68 @@ def _max_output_tokens(model: str) -> int:
         return _MAX_OUTPUT_DEFAULT
 
 
+# ── QA-correction payload budgeter ──────────────────────────────────────────
+# Guarantees a correction/retry payload fits the model context WITHOUT ever
+# starving it. Replaces the old blind per-message `str(content)[:8000]` chop
+# (~2k tokens) that silently deleted the full symbol code and the model's prior
+# changes on any non-trivial file. Shared by BOTH OpenAI and Claude correction
+# paths so neither can silently overflow or under-feed.
+#
+# ~300k chars ≈ ~75k tokens: >15x a realistic max correction payload (a
+# 2,140-line file ≈ ~20k tokens) yet safely under the smallest context window
+# we run. Realistic payloads pass through UNTOUCHED — clipping is a last resort
+# for a pathological single message, and when it happens we clip head+tail
+# (both ends preserved, never a blind head-chop) and emit a _dlog.
+_CORRECTION_INPUT_CHAR_BUDGET = 300_000
+
+
+def _fit_correction_messages(messages, *, session_id: str = "", user_id: str = ""):
+    """Return messages guaranteed to fit context, preserving content when it fits.
+
+    - Total under budget  -> returned unchanged (the normal case).
+    - Total over budget   -> clip ONLY the single largest string message,
+      head+tail, just enough to fit; emit a _dlog so traces show the clip.
+    Never raises; on any error returns the input untouched.
+    """
+    try:
+        msgs = list(messages or [])
+
+        def _clen(m):
+            c = m.get("content")
+            return len(c) if isinstance(c, str) else 0
+
+        total = sum(_clen(m) for m in msgs)
+        if total <= _CORRECTION_INPUT_CHAR_BUDGET:
+            return msgs
+
+        # Over budget: find the single largest string message and clip it head+tail.
+        idx = max(range(len(msgs)), key=lambda i: _clen(msgs[i]), default=-1)
+        if idx < 0:
+            return msgs
+        content = msgs[idx].get("content", "")
+        others = total - len(content)
+        allow = max(4000, _CORRECTION_INPUT_CHAR_BUDGET - others)
+        if len(content) <= allow:
+            return msgs
+        head = allow * 2 // 3
+        tail = allow - head - 200  # room for the marker
+        clipped = (
+            content[:head]
+            + f"\n\n... [{len(content) - head - tail} chars omitted to fit context] ...\n\n"
+            + content[-tail:]
+        )
+        new_msgs = list(msgs)
+        new_msgs[idx] = {**msgs[idx], "content": clipped}
+        _dlog("correction_payload_clipped",
+              original_chars=len(content), kept_chars=len(clipped),
+              total_before=total, budget=_CORRECTION_INPUT_CHAR_BUDGET,
+              message_index=idx, session_id=session_id, user_id=user_id)
+        return new_msgs
+    except Exception as _fce:
+        _dlog("correction_payload_fit_error", error=str(_fce)[:200])
+        return list(messages or [])
+
+
 # Models that do NOT accept a temperature parameter (reasoning / latest-gen models)
 NO_TEMPERATURE_MODELS = {
     "gpt-5", "gpt-5-mini", "gpt-5-nano",
@@ -5194,20 +5256,25 @@ async def analyze_and_plan_stream(
                                         model="claude-sonnet-5",
                                         desired_text_tokens=64000,
                                         system=CLAUDE_EDITOR_SYSTEM,
-                                        messages=_corr_msgs,
+                                        messages=_fit_correction_messages(
+                                            _corr_msgs, session_id=session_id, user_id=user_id),
                                         tools=CORRECTION_TOOLS,
                                         tool_choice={"type": "auto"},
                                     )
                                 else:
                                     # GPT correction: structured tool_use (same tools as Claude)
-                                    _corr_oai_msgs = [
-                                        {"role": "system", "content": CLAUDE_EDITOR_SYSTEM},
-                                    ] + [
-                                        {"role": m.get("role", "user"),
-                                         "content": str(m.get("content", ""))[:8000]}
-                                        for m in _corr_msgs
-                                        if isinstance(m.get("content"), str)
-                                    ]
+                                    # Budget the payload so the full symbol + prior changes
+                                    # survive (no blind 8k chop); clip head+tail only if huge.
+                                    _corr_oai_msgs = _fit_correction_messages(
+                                        [{"role": "system", "content": CLAUDE_EDITOR_SYSTEM}]
+                                        + [
+                                            {"role": m.get("role", "user"),
+                                             "content": str(m.get("content", ""))}
+                                            for m in _corr_msgs
+                                            if isinstance(m.get("content"), str)
+                                        ],
+                                        session_id=session_id, user_id=user_id,
+                                    )
                                     _corr_oai_resp = await asyncio.to_thread(
                                         lambda: _chat_create(
                                             _agent_oai_client, architect_model,
@@ -5626,14 +5693,18 @@ async def analyze_and_plan_stream(
                             )
                         else:
                             # GPT free-text correction
-                            _retry_oai_msgs = [
-                                {"role": "system", "content": CLAUDE_EDITOR_SYSTEM},
-                            ] + [
-                                {"role": m.get("role", "user"),
-                                 "content": str(m.get("content", ""))[:8000]}
-                                for m in _retry_msgs
-                                if isinstance(m.get("content"), str)
-                            ]
+                            # Budget the payload so the full symbol + prior changes survive
+                            # (no blind 8k chop); clip head+tail only if pathologically huge.
+                            _retry_oai_msgs = _fit_correction_messages(
+                                [{"role": "system", "content": CLAUDE_EDITOR_SYSTEM}]
+                                + [
+                                    {"role": m.get("role", "user"),
+                                     "content": str(m.get("content", ""))}
+                                    for m in _retry_msgs
+                                    if isinstance(m.get("content"), str)
+                                ],
+                                session_id=session_id, user_id=user_id,
+                            )
                             _retry_oai_resp = await asyncio.to_thread(
                                 lambda: _chat_create(
                                     _agent_oai_client, architect_model,
@@ -14490,6 +14561,22 @@ async def run_natural_pipeline_stream(
                         _gpt_choice = _gpt_chunk.choices[0]
                         if _gpt_choice.finish_reason:
                             _last_stop_reason = _gpt_choice.finish_reason
+                            break
+                        # Runaway guard — symmetry with the Claude branch.
+                        # GPT has no client-side thinking deltas (reasoning is
+                        # server-side), so there is no thinking-stall detector
+                        # and no false-abort risk here. This only bounds a
+                        # genuinely runaway / silently-hung GPT stream, matching
+                        # the Claude ceiling (pipeline budget + phase deadline).
+                        _gpt_stall_elapsed = time.time() - _round_t0
+                        if (_pipeline_over_budget()
+                                or _gpt_stall_elapsed >= STREAMING_PHASE_DEADLINE_S):
+                            _dlog("streaming_deadline_abort_gpt",
+                                  session_id=session_id, user_id=user_id,
+                                  reason="pipeline_budget" if _pipeline_over_budget() else "phase_deadline",
+                                  elapsed_s=round(_gpt_stall_elapsed, 1),
+                                  text_len=len(full_response))
+                            _streaming_starvation_abort = True
                             break
                         _gpt_delta = getattr(_gpt_choice, "delta", None)
                         if _gpt_delta and hasattr(_gpt_delta, "content") and _gpt_delta.content:

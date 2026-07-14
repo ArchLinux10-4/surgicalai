@@ -23,6 +23,7 @@ _MODEL_CONST_NAMES = [
     "_THINKING_MODELS",
     "_MODEL_MAX_OUTPUT",
     "_NO_XHIGH_EFFORT_MODELS",
+    "_CORRECTION_INPUT_CHAR_BUDGET",
 ]
 
 _FUNCS_TO_EXTRACT = [
@@ -35,6 +36,7 @@ _FUNCS_TO_EXTRACT = [
     "_max_output_tokens",
     "_bounded_thinking_params",
     "_is_starved",
+    "_fit_correction_messages",
 ]
 
 
@@ -68,6 +70,8 @@ NS = _extract_functions()
 _get_thinking_kwargs = NS["_get_thinking_kwargs"]
 _bounded_thinking_params = NS["_bounded_thinking_params"]
 _max_output_tokens = NS["_max_output_tokens"]
+_fit_correction_messages = NS["_fit_correction_messages"]
+_CORRECTION_INPUT_CHAR_BUDGET = NS["_CORRECTION_INPUT_CHAR_BUDGET"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -707,3 +711,79 @@ class TestPhase2ThinkingStallDeadStream(unittest.TestCase):
         # pipeline budget remain the runaway guards.
         self.assertIn("STREAMING_PHASE_DEADLINE_S", self.src)
         self.assertIn("_pipeline_over_budget()", self.src)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# QA-Correction Payload Budgeter Tests
+# Guards against the blind [:8000] chop that silently deleted the full symbol
+# code + prior changes from GPT correction calls (bomb on large files).
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestCorrectionPayloadBudgeter(unittest.TestCase):
+    """_fit_correction_messages must preserve content that fits, clip only when huge."""
+
+    def test_small_payload_untouched(self):
+        """Realistic payloads pass through byte-for-byte — no starvation."""
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "def foo():\n    return 1\n" * 100},
+        ]
+        out = _fit_correction_messages(msgs)
+        self.assertEqual(out, msgs)
+
+    def test_large_file_not_chopped_to_8k(self):
+        """A 2,140-line-class file (well under budget) must survive intact.
+
+        This is the exact bomb: old code did [:8000] and destroyed it.
+        """
+        big = "x = 1\n" * 40000  # ~240k chars, under 300k budget
+        self.assertLess(len(big), _CORRECTION_INPUT_CHAR_BUDGET)
+        msgs = [{"role": "user", "content": big}]
+        out = _fit_correction_messages(msgs)
+        self.assertEqual(out[0]["content"], big)  # NOT truncated
+        self.assertGreater(len(out[0]["content"]), 8000)
+
+    def test_pathological_payload_clipped_head_and_tail(self):
+        """Only when total exceeds budget do we clip — head+tail, never blind chop."""
+        head_marker = "HEAD_START_UNIQUE\n"
+        tail_marker = "\nTAIL_END_UNIQUE"
+        huge = head_marker + ("z = 0\n" * 100000) + tail_marker  # ~600k chars
+        self.assertGreater(len(huge), _CORRECTION_INPUT_CHAR_BUDGET)
+        msgs = [{"role": "user", "content": huge}]
+        out = _fit_correction_messages(msgs)
+        result = out[0]["content"]
+        self.assertLessEqual(len(result), _CORRECTION_INPUT_CHAR_BUDGET + 500)
+        # BOTH ends preserved (not a blind head-only chop)
+        self.assertIn("HEAD_START_UNIQUE", result)
+        self.assertIn("TAIL_END_UNIQUE", result)
+        self.assertIn("omitted to fit context", result)
+
+    def test_budget_is_far_above_old_8k_cap(self):
+        """Structural guarantee: budget dwarfs the old 2k-token bomb."""
+        self.assertGreaterEqual(_CORRECTION_INPUT_CHAR_BUDGET, 200_000)
+
+    def test_never_raises_on_bad_input(self):
+        """Must be crash-proof — returns input on any weirdness."""
+        self.assertEqual(_fit_correction_messages(None), [])
+        self.assertEqual(_fit_correction_messages([]), [])
+        # non-string content is ignored, not crashed on
+        weird = [{"role": "user", "content": {"nested": "obj"}}]
+        self.assertEqual(_fit_correction_messages(weird), weird)
+
+
+class TestCorrectionBudgeterWiredIn(unittest.TestCase):
+    """The old blind [:8000] chop must be gone and the budgeter wired into all 4 sites."""
+
+    def setUp(self):
+        self.src = open(_PIPELINE, encoding="utf-8").read()
+
+    def test_no_blind_8000_char_chop_remains(self):
+        # The exact bomb pattern: per-correction-message content chopped to 8k.
+        self.assertNotIn('str(m.get("content", ""))[:8000]', self.src)
+
+    def test_budgeter_used_by_both_gpt_and_claude(self):
+        # 4 call sites: 2 GPT (tool_use + free-text) + 2 Claude (tool_use + free-text)
+        self.assertGreaterEqual(self.src.count("_fit_correction_messages("), 4)
+
+    def test_clip_emits_dlog(self):
+        self.assertIn('correction_payload_clipped', self.src)
