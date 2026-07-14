@@ -4114,6 +4114,56 @@ def _extract_qa_reference_lines(
     return [(s, e) for s, e in merged]
 
 
+def _build_cross_edit_context(change_shells: list, current_idx: int, *, max_chars: int = 2000) -> str:
+    """Build a summary of new symbols introduced by sibling edits.
+
+    When correcting edit N, the correction model cannot see what edits 0..N-1
+    and N+1..M added.  If edit #1 adds ``process_deep_batch()`` and edit #2
+    calls it, the correction model fixing edit #2 has no idea the function
+    exists.  This helper extracts function/class/method signatures from every
+    *other* edit's ``new_code`` that do NOT appear in the original, giving the
+    correction model a compact "what's new from sibling edits" block.
+
+    Returns an empty string when there is nothing useful to inject.
+    """
+    _sig_re = re.compile(
+        r'^[ \t]*((?:async\s+)?def\s+\w+\s*\([^)]*\)|class\s+\w+[^:]*:)',
+        re.MULTILINE,
+    )
+    sibling_sigs: list[str] = []
+    total_chars = 0
+    for _si, _cs in enumerate(change_shells):
+        if _si == current_idx:
+            continue
+        _new = _cs.get("new_code", "") or ""
+        _orig = getattr(_cs.get("symbol"), "code", "") or ""
+        if not _new:
+            continue
+        # Extract signatures present in new_code but NOT in original
+        _new_sigs = set(_sig_re.findall(_new))
+        _orig_sigs = set(_sig_re.findall(_orig))
+        _added = _new_sigs - _orig_sigs
+        if not _added:
+            continue
+        _sym_name = _cs.get("symbol")
+        _sym_label = getattr(_sym_name, "name", str(_sym_name)) if _sym_name else f"edit_{_si}"
+        for _sig in sorted(_added):
+            _line = f"  • [{_sym_label}] {_sig.strip()}"
+            if total_chars + len(_line) > max_chars:
+                break
+            sibling_sigs.append(_line)
+            total_chars += len(_line)
+
+    if not sibling_sigs:
+        return ""
+    return (
+        "\n\nNEW SYMBOLS FROM SIBLING EDITS (these exist in the codebase now — "
+        "you can call/reference them):\n"
+        + "\n".join(sibling_sigs)
+        + "\n"
+    )
+
+
 def _augment_windows_with_qa_refs(
     diff_windows: list,
     qa_dict: dict,
@@ -16723,6 +16773,9 @@ async def run_natural_pipeline_stream(
         # Sends QA findings back to Claude, re-runs QA on the fix.
 
         MAX_QA_RETRIES = 2
+        # ── Correction history: track what each idx tried + why it was rejected ──
+        # Key = change index, value = list of {round, code_preview, qa_summary}
+        _correction_history: dict[int, list[dict]] = {}
 
         for _qa_retry_round in range(MAX_QA_RETRIES):
             # ── Pipeline deadline gate ─────────────────────────────────────
@@ -17073,6 +17126,42 @@ async def run_natural_pipeline_stream(
                         f"```\n{cs['new_code']}\n```"
                     )
 
+                # ── Cross-edit context: what new symbols did sibling edits add? ──
+                _cross_edit_ctx = _build_cross_edit_context(change_shells, idx)
+                if _cross_edit_ctx:
+                    _dlog("correction_cross_edit_injected",
+                          session_id=session_id, user_id=user_id,
+                          symbol=symbol.name,
+                          retry_round=_qa_retry_round,
+                          cross_edit_chars=len(_cross_edit_ctx))
+
+                # ── Correction history: what was tried before + why it failed ──
+                _history_block = ""
+                _prev_attempts = _correction_history.get(idx, [])
+                if _prev_attempts:
+                    _hist_parts = []
+                    for _ha in _prev_attempts:
+                        _hist_parts.append(
+                            f"  Round {_ha['round']}: "
+                            f"QA rejected (score {_ha.get('qa_score', '?')}/10) — "
+                            f"{_ha.get('qa_summary', 'no summary')}"
+                        )
+                        if _ha.get("code_preview"):
+                            _hist_parts.append(
+                                f"    Code tried: {_ha['code_preview']}"
+                            )
+                    _history_block = (
+                        "\n\nPREVIOUS CORRECTION ATTEMPTS (do NOT repeat these — "
+                        "they were already tried and rejected):\n"
+                        + "\n".join(_hist_parts) + "\n"
+                    )
+                    _dlog("correction_history_injected",
+                          session_id=session_id, user_id=user_id,
+                          symbol=symbol.name,
+                          retry_round=_qa_retry_round,
+                          prior_attempts=len(_prev_attempts),
+                          history_chars=len(_history_block))
+
                 correction_prompt = (
                     f"QA reviewed your <surgical_edit> for `{symbol.name}` in "
                     f"`{cs['filename']}` and found it BLOCKED (score "
@@ -17081,7 +17170,9 @@ async def run_natural_pipeline_stream(
                     f"Issues to fix:\n{issues_block}"
                     f"{diff_block}\n\n"
                     f"{_original_code_block}\n\n"
-                    f"{_broken_code_block}\n\n"
+                    f"{_broken_code_block}"
+                    f"{_cross_edit_ctx}"
+                    f"{_history_block}\n\n"
                     f"Requirements:\n"
                     f"1. Fix every issue listed above\n"
                     f"2. Still implement the original request: {cs['description']}\n"
@@ -17738,6 +17829,27 @@ async def run_natural_pipeline_stream(
                                   retry_round=_qa_retry_round, idx=idx,
                                   symbol=change_shells[idx]["symbol"].name,
                                   reason="corrected_code_identical_to_original")
+
+                        # ── Record this attempt in correction history (Bug 2 fix) ──
+                        # Every attempt — accepted or not — goes into history so
+                        # round N+1 sees what was already tried + why it failed.
+                        _qa_d_for_hist = qa_results[idx] if idx < len(qa_results) else {}
+                        _hist_entry = {
+                            "round": _qa_retry_round,
+                            "qa_score": _qa_d_for_hist.get("qa_score", "?"),
+                            "qa_summary": "; ".join(
+                                _qa_d_for_hist.get("issues", [])[:3]
+                            ) if _qa_d_for_hist.get("issues") else _qa_d_for_hist.get("verdict", "no details"),
+                            "code_preview": (corrected_code or "")[:200],
+                            "accepted": accepted is not None and accepted != change_shells[idx]["new_code"],
+                        }
+                        _correction_history.setdefault(idx, []).append(_hist_entry)
+                        _dlog("correction_history_recorded",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=idx,
+                              symbol=change_shells[idx]["symbol"].name,
+                              total_attempts=len(_correction_history[idx]),
+                              accepted=_hist_entry["accepted"])
                         if accepted is not None and accepted != change_shells[idx]["new_code"]:
                             change_shells[idx]["new_code"] = accepted
                             # Keep target_element/replacement consistent with the new full
@@ -17942,6 +18054,39 @@ async def run_natural_pipeline_stream(
                             f"\n\nLINES AFTER YOUR WINDOW (read-only — do NOT include these in your output):\n"
                             f"```\n{_mw_sfx_preview}\n```"
                         )
+                    # ── Cross-edit context for multi-window (Bug 1 fix) ──
+                    _mw_cross_edit = _build_cross_edit_context(change_shells, _mw_idx)
+                    if _mw_cross_edit:
+                        _dlog("correction_mw_cross_edit_injected",
+                              session_id=session_id, user_id=user_id,
+                              symbol=_mw_sym.name,
+                              retry_round=_qa_retry_round,
+                              window_idx=_mw_wi,
+                              cross_edit_chars=len(_mw_cross_edit))
+
+                    # ── Correction history for multi-window (Bug 2 fix) ──
+                    _mw_history_block = ""
+                    _mw_prev = _correction_history.get(_mw_idx, [])
+                    if _mw_prev:
+                        _mw_hist_parts = []
+                        for _mwh in _mw_prev:
+                            _mw_hist_parts.append(
+                                f"  Round {_mwh['round']}: "
+                                f"QA rejected (score {_mwh.get('qa_score', '?')}/10) — "
+                                f"{_mwh.get('qa_summary', 'no summary')}"
+                            )
+                        _mw_history_block = (
+                            "\n\nPREVIOUS CORRECTION ATTEMPTS (do NOT repeat these):\n"
+                            + "\n".join(_mw_hist_parts) + "\n"
+                        )
+                        _dlog("correction_mw_history_injected",
+                              session_id=session_id, user_id=user_id,
+                              symbol=_mw_sym.name,
+                              retry_round=_qa_retry_round,
+                              window_idx=_mw_wi,
+                              prior_attempts=len(_mw_prev),
+                              history_chars=len(_mw_history_block))
+
                     _mw_prompt = (
                         f"QA reviewed your <surgical_edit> for `{_mw_sym.name}` in "
                         f"`{_mw_cs['filename']}` and found it BLOCKED (score "
@@ -17949,7 +18094,9 @@ async def run_natural_pipeline_stream(
                         f"Issues to fix:\n{_mw_issues}"
                         f"{_mw_diff}\n\n"
                         f"{_mw_orig_block}\n\n"
-                        f"{_mw_broken_block}\n\n"
+                        f"{_mw_broken_block}"
+                        f"{_mw_cross_edit}"
+                        f"{_mw_history_block}\n\n"
                         f"Requirements:\n"
                         f"1. Fix every issue listed above\n"
                         f"2. Still implement the original request: {_mw_cs['description']}\n"
@@ -18215,6 +18362,25 @@ async def run_natural_pipeline_stream(
                           any_spliced=_mw_any_spliced,
                           hard_fail=_mw_hard_fail,
                           note="no windows spliced or hard failure — no changes applied")
+
+                # ── Record multi-window attempt in correction history (Bug 2 fix) ──
+                _mw_qa_for_hist = qa_results[_mw_idx] if _mw_idx < len(qa_results) else {}
+                _mw_hist_entry = {
+                    "round": _qa_retry_round,
+                    "qa_score": _mw_qa_for_hist.get("qa_score", "?"),
+                    "qa_summary": "; ".join(
+                        _mw_qa_for_hist.get("issues", [])[:3]
+                    ) if _mw_qa_for_hist.get("issues") else _mw_qa_for_hist.get("verdict", "no details"),
+                    "code_preview": "",  # multi-window: too fragmented for preview
+                    "accepted": _mw_idx in fixed_indices,
+                }
+                _correction_history.setdefault(_mw_idx, []).append(_mw_hist_entry)
+                _dlog("correction_mw_history_recorded",
+                      session_id=session_id, user_id=user_id,
+                      retry_round=_qa_retry_round, idx=_mw_idx,
+                      symbol=_mw_sym.name,
+                      total_attempts=len(_correction_history[_mw_idx]),
+                      accepted=_mw_hist_entry["accepted"])
 
             _dlog("qa_retry_fixed_indices", session_id=session_id, user_id=user_id,
                   retry_round=_qa_retry_round,
