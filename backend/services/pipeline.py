@@ -13548,8 +13548,8 @@ async def run_natural_pipeline_stream(
         }
 
         MAX_SEARCH_ROUNDS = 10
-        SEARCH_TIME_BUDGET_S = 300               # 5 min max in search phase (leaves 10 min for edits)
-        TOTAL_PREEDIT_BUDGET_S = 600             # 10 min max before edits must start (Railway=15 min)
+        SEARCH_TIME_BUDGET_S = 180               # 3 min max in search phase (leaves 12 min for edits)
+        TOTAL_PREEDIT_BUDGET_S = 420             # 7 min max before edits must start (Railway=15 min)
         _last_stop_reason: str | None = None     # capture Claude's stop_reason per round
         _matched_stop_seq: str | None = None     # which stop_sequence halted the round (Improvement #4)
         searched_terms: list = []                # terms fetched so far (avoid re-fetching)
@@ -14846,6 +14846,15 @@ async def run_natural_pipeline_stream(
             _retry_kwargs = {k: v for k, v in stream_kwargs.items() if k != "thinking"}
             # Also drop output_config/effort — not valid without thinking
             _retry_kwargs.pop("output_config", None)
+            # Cap recovery max_tokens — full 128K lets model ramble for 6+ min
+            # per round (sessions a3140cd3, fc4347dc). 16K is enough for a plan.
+            _RECOVERY_MAX_TOKENS = 16000
+            if _retry_kwargs.get("max_tokens", 0) > _RECOVERY_MAX_TOKENS:
+                _dlog("recovery_max_tokens_capped",
+                      session_id=session_id, user_id=user_id,
+                      original=_retry_kwargs["max_tokens"],
+                      capped=_RECOVERY_MAX_TOKENS)
+                _retry_kwargs["max_tokens"] = _RECOVERY_MAX_TOKENS
 
             async def _recovery_stream_round(_msgs: list):
                 """Run one no-thinking streaming round and parse edit/file/
@@ -15048,6 +15057,22 @@ async def run_natural_pipeline_stream(
                               recovery_round=_recovery_round,
                               plan_content_len=len(_plan_block))
                         break  # plan is actionable output — don't nudge
+
+                    # Post-round elapsed check — even if this round produced
+                    # a search request, don't start another round if we've
+                    # burned too much time. Evidence: sessions fc4347dc had
+                    # recovery round 2 START at 354s (under 600s gate) but
+                    # RUN for 396s, finishing at 749s with only 151s left.
+                    _post_round_elapsed = time.time() - _streaming_t0
+                    if _post_round_elapsed > TOTAL_PREEDIT_BUDGET_S:
+                        _dlog("starvation_recovery_post_round_budget_exit",
+                              session_id=session_id, user_id=user_id,
+                              recovery_round=_recovery_round,
+                              elapsed_s=round(_post_round_elapsed, 1),
+                              budget_s=TOTAL_PREEDIT_BUDGET_S)
+                        yield sse({"type": "progress",
+                                   "content": "⏱️ Time budget reached — proceeding with best available result..."})
+                        break
 
                     if _search_block:
                         if _recovery_round == RECOVERY_MAX_ROUNDS - 1:
