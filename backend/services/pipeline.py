@@ -13599,7 +13599,10 @@ async def run_natural_pipeline_stream(
                     ]
                     full_response = ""
                     search_requested = None
-                    continue  # One final forced-edit round
+                    # Fall through to streaming code below — do NOT 'continue',
+                    # which would hit the budget check again and break immediately
+                    # (bug: trace 8a7b9037 — forced edit message was injected but
+                    # model never streamed because continue → budget → break).
                 else:
                     _dlog("search_time_budget_forced_exit",
                           session_id=session_id, user_id=user_id,
