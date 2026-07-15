@@ -8047,6 +8047,77 @@ def _repair_json(text: str) -> str:
     return ''.join(result)
 
 
+def _infer_new_file_from_raw(raw_content: str, user_request: str) -> dict | None:
+    """
+    Fallback for GPT models that write raw file content inside <new_file>
+    tags without the required JSON wrapper {"filename", "content", ...}.
+
+    Attempts to infer the filename from:
+      1. A header line in the raw content (e.g. "// filename: foo.tsx")
+      2. File extensions / paths mentioned in the user's request
+      3. Content signature detection (<!DOCTYPE → .html, import React → .tsx, etc.)
+
+    Returns {"filename", "content", "language", "summary"} or None if
+    the raw content doesn't look like actual file content.
+    """
+    if not raw_content or len(raw_content) < 20:
+        return None
+
+    lines = raw_content.split("\n", 5)
+    first_line = lines[0].strip() if lines else ""
+
+    # ── 1. Header-line filename (model wrote "// filename: X" or "filename: X") ──
+    import re as _re_inf
+    _header_pat = _re_inf.match(
+        r'^(?://|#|/\*|<!--)?\s*(?:file(?:name)?|path)\s*[:=]\s*["\']?(.+?)["\']?\s*(?:\*/|-->)?$',
+        first_line, _re_inf.IGNORECASE,
+    )
+    if _header_pat:
+        inferred_name = _header_pat.group(1).strip()
+        content = "\n".join(lines[1:]) if len(lines) > 1 else raw_content
+    else:
+        inferred_name = None
+        content = raw_content
+
+    # ── 2. Filename from user request ──
+    if not inferred_name:
+        _file_pat = _re_inf.findall(
+            r'[\w./-]+\.(?:html|htm|tsx|jsx|ts|js|py|css|scss|json|md|go|rs|vue|svelte|yaml|yml|toml|sh)',
+            user_request,
+        )
+        if _file_pat:
+            inferred_name = _file_pat[0]
+
+    # ── 3. Content signature detection ──
+    _sig_map = [
+        (r'^\s*<!DOCTYPE\s+html|^\s*<html', 'index.html', 'html'),
+        (r'^\s*import\s+React|^\s*"use client"', 'Component.tsx', 'typescript'),
+        (r'^\s*from\s+\w+\s+import|^\s*import\s+\w+|^\s*def\s+\w+|^\s*class\s+\w+', 'module.py', 'python'),
+        (r'^\s*package\s+main', 'main.go', 'go'),
+        (r'^\s*fn\s+main|^\s*use\s+std', 'main.rs', 'rust'),
+        (r'^\s*<template>|^\s*<script\s+setup', 'Component.vue', 'vue'),
+        (r'^\s*\{', 'data.json', 'json'),
+    ]
+    detected_lang = ""
+    for _pat, _default_name, _lang in _sig_map:
+        if _re_inf.search(_pat, raw_content[:500], _re_inf.MULTILINE | _re_inf.IGNORECASE):
+            if not inferred_name:
+                inferred_name = _default_name
+            detected_lang = _lang
+            break
+
+    if not inferred_name:
+        # Last resort: can't determine filename, don't guess blindly
+        return None
+
+    return {
+        "filename": inferred_name,
+        "content": content.strip(),
+        "language": detected_lang,
+        "summary": f"New file (recovered from raw model output)",
+    }
+
+
 async def _run_claude_direct_rewrite(
     file_content: str,
     filename: str,
@@ -18802,7 +18873,25 @@ async def run_natural_pipeline_stream(
                 try:
                     file_data = json.loads(_repair_json(file_raw.strip()))
                 except Exception:
-                    continue
+                    # ── GPT raw-content fallback ──────────────────────────────
+                    # GPT models sometimes write raw file content inside
+                    # <new_file> tags instead of the required JSON wrapper.
+                    # Detect this and recover instead of silently dropping.
+                    _raw_stripped = file_raw.strip()
+                    _inferred = _infer_new_file_from_raw(_raw_stripped, user_request)
+                    if _inferred:
+                        _dlog("newfile_json_parse_recovered",
+                              session_id=session_id, user_id=user_id,
+                              inferred_filename=_inferred["filename"],
+                              content_len=len(_inferred["content"]),
+                              raw_preview=_raw_stripped[:120])
+                        file_data = _inferred
+                    else:
+                        _dlog("newfile_json_parse_failed",
+                              session_id=session_id, user_id=user_id,
+                              raw_len=len(_raw_stripped),
+                              raw_preview=_raw_stripped[:200])
+                        continue
 
             filename = file_data.get("filename", "")
             content = file_data.get("content", "")
