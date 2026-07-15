@@ -8,6 +8,7 @@ export interface ChatMessage {
   surgical_data?: string
   _thinking?: string
   _steps?: string[]
+  _model?: string
 }
 
 export interface ChatSession {
