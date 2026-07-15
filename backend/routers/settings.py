@@ -65,13 +65,21 @@ def update_settings(req: SettingsUpdate, request: Request):
     user_id = _get_user_id(request)
     is_admin = getattr(request.state, "is_admin", False)
 
-    attempted_admin_only = _ADMIN_ONLY_SETTINGS.intersection(updates.keys())
-    if attempted_admin_only and not is_admin:
-        _dlog("settings_admin_only_rejected", user_id=user_id, keys=list(attempted_admin_only))
-        raise HTTPException(
-            status_code=403,
-            detail=f"Admin access required to change: {', '.join(sorted(attempted_admin_only))}"
-        )
+    # For admin-only settings: reject if non-admin tries to CHANGE the value;
+    # silently skip if the submitted value matches what's already stored
+    # (the frontend sends all fields on every save).
+    if not is_admin:
+        for admin_key in _ADMIN_ONLY_SETTINGS.intersection(updates.keys()):
+            current_val = get_setting(admin_key, "")
+            if str(updates[admin_key]) != current_val:
+                _dlog("settings_admin_only_rejected", user_id=user_id, key=admin_key,
+                       submitted=str(updates[admin_key]), current=current_val)
+                raise HTTPException(
+                    status_code=403,
+                    detail=f"Admin access required to change: {admin_key}"
+                )
+            # Value unchanged — silently drop it so we don't re-write
+            del updates[admin_key]
 
     for key, val in updates.items():
         if key == "workspace_path":
