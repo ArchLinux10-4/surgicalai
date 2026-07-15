@@ -44,6 +44,7 @@ export function ImageStudio() {
   const [busy, setBusy] = useState(false)
   const [elapsed, setElapsed] = useState(0)
   const [quality, setQuality] = useState('auto') // auto | low | medium | high
+  const [model, setModel] = useState('gpt-5.5') // gpt-5.5 | gpt-5.6-sol | gpt-5.6-terra | gpt-5.6-luna
   const fileRef = useRef<HTMLInputElement>(null)
   const threadRef = useRef<HTMLDivElement>(null)
 
@@ -123,6 +124,7 @@ export function ImageStudio() {
     try {
       const res: ImageStudioResult = await generateImage({
         prompt: prompt.trim(),
+        model,
         // First turn only: optional uploaded source image. Follow-up turns
         // inherit image context through previous_response_id chaining.
         image_base64: hasSession ? undefined : inputImage?.base64,
@@ -174,6 +176,7 @@ export function ImageStudio() {
     setError('')
     setIsRefusal(false)
     setQuality('auto')
+    setModel('gpt-5.5')
     // File inputs keep their last value even after state clears — wipe it so
     // re-uploading the same file still fires onChange.
     if (fileRef.current) fileRef.current.value = ''
@@ -263,6 +266,21 @@ export function ImageStudio() {
                         className="w-full flex-1 min-h-[120px] rounded-lg border border-border bg-base p-3 text-sm resize-none focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/30"
                       />
                       <span className="text-[11px] text-muted">Ctrl+Enter to generate · Esc to close</span>
+                    </div>
+
+                    <div className="flex flex-col gap-1.5">
+                      <label className="text-xs font-medium text-muted uppercase tracking-wide">Model</label>
+                      <select
+                        value={model}
+                        onChange={e => setModel(e.target.value)}
+                        disabled={busy}
+                        className="w-full rounded-lg border border-border bg-base px-3 py-2 text-sm disabled:opacity-50 focus:outline-none focus:border-accent/60"
+                      >
+                        <option value="gpt-5.5">GPT-5.5 (battle-tested)</option>
+                        <option value="gpt-5.6-sol">GPT-5.6 Sol (flagship)</option>
+                        <option value="gpt-5.6-terra">GPT-5.6 Terra (balanced)</option>
+                        <option value="gpt-5.6-luna">GPT-5.6 Luna (fastest)</option>
+                      </select>
                     </div>
 
                     <div className="flex flex-col gap-1.5">
@@ -375,6 +393,18 @@ export function ImageStudio() {
                         className="w-full rounded-lg border border-border bg-base p-3 text-sm resize-none focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/30"
                       />
                       <div className="flex items-center gap-2">
+                        <select
+                          value={model}
+                          onChange={e => setModel(e.target.value)}
+                          disabled={busy}
+                          title="Model for the next edit"
+                          className="rounded-lg border border-border bg-base px-2 py-2 text-xs disabled:opacity-50 focus:outline-none focus:border-accent/60"
+                        >
+                          <option value="gpt-5.5">GPT-5.5</option>
+                          <option value="gpt-5.6-sol">5.6 Sol</option>
+                          <option value="gpt-5.6-terra">5.6 Terra</option>
+                          <option value="gpt-5.6-luna">5.6 Luna</option>
+                        </select>
                         <select
                           value={quality}
                           onChange={e => setQuality(e.target.value)}

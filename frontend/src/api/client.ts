@@ -694,6 +694,7 @@ export interface ImageStudioResult {
  *  rather than thrown, except for network/auth failures thrown by request(). */
 export function generateImage(body: {
   prompt: string
+  model?: string // gpt-5.5 (default) | gpt-5.6-sol | gpt-5.6-terra | gpt-5.6-luna
   image_base64?: string
   image_mime?: string
   quality?: string // low | medium | high — omitted means auto

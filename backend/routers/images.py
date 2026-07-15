@@ -39,7 +39,13 @@ logger = logging.getLogger("image_studio")
 router = APIRouter()
 
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
-IMAGE_MODEL = "gpt-5.5"          # must match the id exposed by /api/settings/models
+IMAGE_MODEL = "gpt-5.5"          # default — battle-tested, never changed
+ALLOWED_IMAGE_MODELS = {
+    "gpt-5.5",
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+}
 REQUEST_TIMEOUT_S = 180          # image generation routinely takes 30-120s
 MAX_INPUT_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MB decoded — sanity cap
 
@@ -48,6 +54,7 @@ ALLOWED_INPUT_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
 class ImageRequest(BaseModel):
     prompt: str
+    model: str | None = None          # user-selected model; None → IMAGE_MODEL default
     image_base64: str | None = None   # bare base64, no data: prefix
     image_mime: str | None = None     # e.g. "image/jpeg"
     quality: str | None = None        # docs: low | medium | high | auto
@@ -132,6 +139,10 @@ def _build_payload(body: ImageRequest) -> dict:
       - action left at default "auto": docs state "edit" errors when no image
         is in context, so "auto" is the safe, documented default for both modes.
     """
+    # Resolve model: user pick if whitelisted, else safe default
+    resolved_model = body.model if body.model in ALLOWED_IMAGE_MODELS else IMAGE_MODEL
+    _dlog(f"model_resolution requested={body.model!r} resolved={resolved_model} rejected={body.model not in ALLOWED_IMAGE_MODELS and body.model is not None}")
+
     content: list[dict] = [{"type": "input_text", "text": body.prompt.strip()}]
     if body.image_base64:
         data_url = f"data:{body.image_mime};base64,{body.image_base64}"
@@ -149,7 +160,7 @@ def _build_payload(body: ImageRequest) -> dict:
             _dlog(f"quality ignored value={body.quality!r}")
 
     payload = {
-        "model": IMAGE_MODEL,
+        "model": resolved_model,
         "input": [{"role": "user", "content": content}],
         "tools": [tool],
         # Docs: "To force the image generation tool call, you can set the
@@ -166,7 +177,7 @@ def _build_payload(body: ImageRequest) -> dict:
         payload["previous_response_id"] = body.previous_response_id.strip()
 
     _dlog(
-        f"payload model={IMAGE_MODEL} has_input_image={bool(body.image_base64)} "
+        f"payload model={resolved_model} has_input_image={bool(body.image_base64)} "
         f"prompt_len={len(body.prompt)} quality={tool.get('quality', 'auto')} "
         f"chained={bool(body.previous_response_id)} tool_choice=image_generation"
     )
@@ -269,7 +280,7 @@ def _map_api_error(status_code: int, body_text: str) -> dict:
 def generate_image(body: ImageRequest, request: Request):
     """Generate a new image, or edit the uploaded one, from a text prompt."""
     user_id = getattr(request.state, "user_id", "")
-    _dlog(f"request user_id={user_id} mode={'edit' if body.image_base64 else 'generate'}")
+    _dlog(f"request user_id={user_id} mode={'edit' if body.image_base64 else 'generate'} requested_model={body.model!r}")
 
     invalid = _validate(body)
     if invalid:
@@ -323,7 +334,7 @@ def generate_image(body: ImageRequest, request: Request):
     # Wrapped so a logging hiccup can never break a successful generation.
     try:
         _dlog(
-            f"audit user_id={user_id} ok={result.get('ok')} "
+            f"audit user_id={user_id} model={payload['model']} ok={result.get('ok')} "
             f"mode={'edit' if body.image_base64 else 'generate'} "
             f"chained={bool(body.previous_response_id)} "
             f"quality={body.quality or 'auto'} elapsed={elapsed:.1f}s "
