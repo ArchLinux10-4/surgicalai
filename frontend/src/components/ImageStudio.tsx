@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { generateImage, type ImageStudioResult } from '../api/client'
 import { useAppStore } from '../stores/appStore'
+import { useAuthStore } from '../stores/authStore'
 import { AddPhotoAlternateOutlined, AutoAwesome, Close, FileDownload, ImageOutlined, RestartAlt, WarningAmber } from '@mui/icons-material'
 
 /**
@@ -45,6 +46,7 @@ export function ImageStudio() {
   const [elapsed, setElapsed] = useState(0)
   const [quality, setQuality] = useState('auto') // auto | low | medium | high
   const [model, setModel] = useState('gpt-5.5') // gpt-5.5 | gpt-5.6-sol | gpt-5.6-terra | gpt-5.6-luna
+  const isAdmin = useAuthStore(s => s.user?.is_admin ?? false)
   const fileRef = useRef<HTMLInputElement>(null)
   const threadRef = useRef<HTMLDivElement>(null)
 
@@ -268,6 +270,7 @@ export function ImageStudio() {
                       <span className="text-[11px] text-muted">Ctrl+Enter to generate · Esc to close</span>
                     </div>
 
+                    {isAdmin && (
                     <div className="flex flex-col gap-1.5">
                       <label className="text-xs font-medium text-muted uppercase tracking-wide">Model</label>
                       <select
@@ -282,6 +285,7 @@ export function ImageStudio() {
                         <option value="gpt-5.6-luna">GPT-5.6 Luna (fastest)</option>
                       </select>
                     </div>
+                    )}
 
                     <div className="flex flex-col gap-1.5">
                       <label className="text-xs font-medium text-muted uppercase tracking-wide">Quality</label>
@@ -393,6 +397,7 @@ export function ImageStudio() {
                         className="w-full rounded-lg border border-border bg-base p-3 text-sm resize-none focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/30"
                       />
                       <div className="flex items-center gap-2">
+                        {isAdmin && (
                         <select
                           value={model}
                           onChange={e => setModel(e.target.value)}
@@ -405,6 +410,7 @@ export function ImageStudio() {
                           <option value="gpt-5.6-terra">5.6 Terra</option>
                           <option value="gpt-5.6-luna">5.6 Luna</option>
                         </select>
+                        )}
                         <select
                           value={quality}
                           onChange={e => setQuality(e.target.value)}

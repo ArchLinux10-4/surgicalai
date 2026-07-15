@@ -21,16 +21,15 @@ def _get_user_id(request: Request) -> str:
 
 
 def _resolve_api_key(user_id: str, key_type: str) -> str:
-    """Get the decrypted API key for a user. Falls back to global settings for migration."""
+    """Get the decrypted API key for a user. Per-user only — no global fallback."""
     if user_id:
         encrypted = get_user_api_key(user_id, key_type)
         if encrypted:
             try:
                 return decrypt_api_key(encrypted)
             except Exception:
-                pass  # Corrupted? Fall through to global
-    # Fallback: legacy global setting
-    return get_setting(f"{key_type}_api_key", "")
+                _dlog("api_key_decrypt_failed", user_id=user_id, key_type=key_type)
+    return ""
 
 
 @router.get("", response_model=SettingsResponse)
@@ -38,7 +37,7 @@ def get_settings(request: Request):
     s = get_all_settings()
     user_id = _get_user_id(request)
 
-    # Check per-user keys first, then global
+    # Per-user keys only — no global/shared keys
     has_openai = bool(_resolve_api_key(user_id, "openai"))
     has_anthropic = bool(_resolve_api_key(user_id, "anthropic"))
 
@@ -144,7 +143,7 @@ def clear_api_key(request: Request):
     user_id = _get_user_id(request)
     if user_id:
         set_user_api_key(user_id, "openai", "")
-    set_setting("openai_api_key", "")
+        _dlog("api_key_deleted", user_id=user_id, key_type="openai")
     return {"ok": True}
 
 
@@ -163,8 +162,6 @@ def verify_key(body: dict, request: Request):
         if user_id:
             encrypted = encrypt_api_key(key)
             set_user_api_key(user_id, "openai", encrypted)
-        # Also store globally for pipeline access (legacy compat)
-        set_setting("openai_api_key", key)
         return {"ok": True, "message": "API key verified, encrypted, and saved"}
     except AuthenticationError:
         raise HTTPException(status_code=401, detail="Invalid API key")
@@ -191,8 +188,6 @@ def verify_anthropic_key(body: dict, request: Request):
         if user_id:
             encrypted = encrypt_api_key(key)
             set_user_api_key(user_id, "anthropic", encrypted)
-        # Also store globally for pipeline access
-        set_setting("anthropic_api_key", key)
         return {"ok": True, "message": "Anthropic key verified, encrypted, and saved"}
     except Exception as e:
         err_msg = str(e)
@@ -223,7 +218,7 @@ def verify_gemini_key(body: dict, request: Request):
         if user_id:
             encrypted = encrypt_api_key(key)
             set_user_api_key(user_id, "gemini", encrypted)
-        set_setting("gemini_api_key", key)
+        # Per-user only — no global write
         return {"ok": True, "message": "Gemini API key verified and saved"}
     except Exception as e:
         err = str(e).lower()

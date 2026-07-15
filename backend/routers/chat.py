@@ -7,7 +7,20 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from fastapi.responses import StreamingResponse
 from models.schemas import ChatRequest, NewSessionRequest, ChatSession
 from database import get_db, get_db_ctx, get_setting, get_user_api_key, GLOBAL_MEMORY_KEY
+from crypto_utils import decrypt_api_key
 from services.pipeline import run_chat, run_chat_stream, _dlog
+
+
+def _resolve_chat_key(user_id: str, key_type: str) -> str:
+    """Decrypt per-user API key. Per-user only — no global/shared keys."""
+    if user_id:
+        encrypted = get_user_api_key(user_id, key_type)
+        if encrypted:
+            try:
+                return decrypt_api_key(encrypted)
+            except Exception:
+                _dlog("api_key_decrypt_failed", user_id=user_id, key_type=key_type)
+    return ""
 
 router = APIRouter()
 
@@ -245,8 +258,8 @@ async def _compact_session(session_id: str, user_id: str) -> str:
                 "Be concise but complete. Under 400 words. Use bullet points."
             )
 
-            openai_key = get_setting("openai_api_key") or (get_user_api_key(user_id, "openai") if user_id else "")
-            anthropic_key = get_setting("anthropic_api_key") or (get_user_api_key(user_id, "anthropic") if user_id else "")
+            openai_key = _resolve_chat_key(user_id, "openai")
+            anthropic_key = _resolve_chat_key(user_id, "anthropic")
 
             new_summary = ""
             if openai_key:
@@ -352,8 +365,11 @@ def get_messages(session_id: str):
 
 
 @router.post("/send")
-def send_message(req: ChatRequest):
-    if not get_setting("openai_api_key") and not get_setting("anthropic_api_key") and get_setting("ollama_enabled") != "true":
+def send_message(req: ChatRequest, request: Request):
+    user_id = getattr(request.state, "user_id", "") or ""
+    has_openai = bool(_resolve_chat_key(user_id, "openai"))
+    has_anthropic = bool(_resolve_chat_key(user_id, "anthropic"))
+    if not has_openai and not has_anthropic and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured. Go to Settings.")
 
     with get_db_ctx() as conn:
@@ -425,9 +441,12 @@ def send_message(req: ChatRequest):
 
 
 @router.post("/stream")
-async def stream_message(req: ChatRequest):
+async def stream_message(req: ChatRequest, request: Request):
     """Streaming version of chat send. Returns SSE stream."""
-    if not get_setting("openai_api_key") and not get_setting("anthropic_api_key") and get_setting("ollama_enabled") != "true":
+    user_id = getattr(request.state, "user_id", "") or ""
+    has_openai = bool(_resolve_chat_key(user_id, "openai"))
+    has_anthropic = bool(_resolve_chat_key(user_id, "anthropic"))
+    if not has_openai and not has_anthropic and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured.")
 
     with get_db_ctx() as conn:
@@ -471,7 +490,7 @@ async def stream_message(req: ChatRequest):
     async def stream_and_collect():
         collected = []
         async for chunk in run_chat_stream(
-            messages, req.file_content, req.symbol_context, req.model, pinned_context, project_memory
+            messages, req.file_content, req.symbol_context, req.model, pinned_context, project_memory, user_id=user_id
         ):
             if chunk.startswith("data: "):
                 try:
@@ -556,10 +575,9 @@ async def smart_stream(req: dict, request: Request):
     force_tasks = bool(req.get("force_tasks", False))
     current_user_id = getattr(request.state, "user_id", "") or ""
 
-    # Check per-user encrypted keys AND global settings
-    from database import get_user_api_key
-    has_openai = bool(get_setting("openai_api_key")) or bool(get_user_api_key(current_user_id, "openai") if current_user_id else "")
-    has_anthropic = bool(get_setting("anthropic_api_key")) or bool(get_user_api_key(current_user_id, "anthropic") if current_user_id else "")
+    # Per-user keys only — no global/shared keys
+    has_openai = bool(_resolve_chat_key(current_user_id, "openai"))
+    has_anthropic = bool(_resolve_chat_key(current_user_id, "anthropic"))
     if not has_openai and not has_anthropic and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured. Go to Settings.")
 

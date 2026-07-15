@@ -71,8 +71,7 @@ def _dlog(msg: str) -> None:
 
 
 def _resolve_openai_key(user_id: str) -> str:
-    """Per-user key first (encrypted), then global setting. Same precedence
-    as settings.py:_resolve_api_key. Any failure degrades to global key."""
+    """Per-user key only — no global fallback. Keys are never shared."""
     try:
         encrypted = get_user_api_key(user_id, "openai")
         if encrypted:
@@ -81,10 +80,9 @@ def _resolve_openai_key(user_id: str) -> str:
                 _dlog(f"key_resolution=user user_id={user_id}")
                 return key
     except Exception as e:
-        _dlog(f"key_resolution user-key failed, falling back to global: {e}")
-    key = get_setting("openai_api_key", "")
-    _dlog(f"key_resolution=global present={bool(key)}")
-    return key
+        _dlog(f"key_resolution_failed user_id={user_id}: {e}")
+    _dlog(f"no_per_user_key user_id={user_id} key_type=openai")
+    return ""
 
 
 def _error(code: str, detail: str, status: int = 200) -> dict:
@@ -280,7 +278,14 @@ def _map_api_error(status_code: int, body_text: str) -> dict:
 def generate_image(body: ImageRequest, request: Request):
     """Generate a new image, or edit the uploaded one, from a text prompt."""
     user_id = getattr(request.state, "user_id", "")
-    _dlog(f"request user_id={user_id} mode={'edit' if body.image_base64 else 'generate'} requested_model={body.model!r}")
+    is_admin = getattr(request.state, "is_admin", False)
+
+    # Non-admin users cannot override model — silently force default
+    if body.model and not is_admin:
+        _dlog(f"model_override_denied user_id={user_id} requested={body.model!r} is_admin={is_admin}")
+        body.model = None  # will resolve to IMAGE_MODEL (gpt-5.5) in _build_payload
+
+    _dlog(f"request user_id={user_id} is_admin={is_admin} mode={'edit' if body.image_base64 else 'generate'} requested_model={body.model!r}")
 
     invalid = _validate(body)
     if invalid:

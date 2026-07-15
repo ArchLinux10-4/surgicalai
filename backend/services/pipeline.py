@@ -954,15 +954,15 @@ def _extract_claude_text(response) -> str:
 
 
 def _resolve_key(user_id: str, key_type: str) -> str:
-    """Decrypt per-user API key, fall back to global setting."""
+    """Decrypt per-user API key. No global fallback — keys are per-user only."""
     if user_id:
         encrypted = get_user_api_key(user_id, key_type)
         if encrypted:
             try:
                 return decrypt_api_key(encrypted)
             except Exception:
-                pass
-    return get_setting(f"{key_type}_api_key", "")
+                _dlog("api_key_decrypt_failed", user_id=user_id, key_type=key_type)
+    return ""
 
 
 def _get_anthropic_key(user_id: str = "") -> str:
@@ -1124,18 +1124,15 @@ def _get_client(user_id: str = "") -> OpenAI:
 
 
 def _get_gemini_key(user_id: str = "") -> str:
-    """Resolve Gemini/Google API key for user."""
+    """Resolve Gemini/Google API key for user. Per-user only — no global fallback."""
     if user_id:
         encrypted = get_user_api_key(user_id, "gemini")
         if encrypted:
             try:
                 return decrypt_api_key(encrypted)
             except Exception:
-                pass
-    key = get_setting("gemini_api_key", "")
-    if not key:
-        raise ValueError("Google Gemini API key not configured. Go to Settings → API Keys to add it.")
-    return key
+                _dlog("api_key_decrypt_failed", user_id=user_id, key_type="gemini")
+    raise ValueError("Google Gemini API key not configured. Go to Settings → API Keys to add it.")
 
 
 def _get_client_for_model(model: str, user_id: str = "") -> OpenAI:
