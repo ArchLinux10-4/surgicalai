@@ -358,6 +358,7 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-2">
           <span className="text-[12px] font-semibold text-ink/80">SurgicalAI</span>
+          {msg._model && <span className="text-[9px] font-mono text-muted/60 bg-overlay/50 px-1.5 py-0.5 rounded">{msg._model}</span>}
           <span className="text-[10px] text-faint opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
         </div>
 
@@ -970,6 +971,7 @@ export function ChatPanel() {
       surgical_data: JSON.stringify(result),
       content: naturalText,
       created_at: new Date().toISOString(),
+      _model: result._model || 'N/A',
     })
     api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
   }
@@ -1140,6 +1142,7 @@ export function ChatPanel() {
   ) => {
     let accumulated = ''
     let gotResult = false
+    let streamModel = ''
 
     const ctrl = api.stream.smart(
       { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id), force_tasks: agentModeOn() },
@@ -1158,6 +1161,7 @@ export function ChatPanel() {
       (token) => { accumulated += token; setSessionStreamingMessage(sessionId, accumulated) },
       (result) => {
         gotResult = true
+        if (result._model) streamModel = result._model
         const _thinking = thinkingTextRef.current
         const _steps = [...progressHistoryRef.current]
         const naturalText = (result.natural_text || accumulated)
@@ -1179,6 +1183,7 @@ export function ChatPanel() {
             created_at: new Date().toISOString(),
             _thinking,
             _steps,
+            _model: streamModel || 'N/A',
           })
         } else {
           addMessage({
@@ -1191,13 +1196,15 @@ export function ChatPanel() {
             created_at: new Date().toISOString(),
             _thinking,
             _steps,
+            _model: streamModel || 'N/A',
           })
         }
         if (isFirst) autoRename()
         else api.chat.getSessions().then(setSessions).catch(() => {})
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
-      (fullText) => {
+      (fullText: string, model?: string) => {
+        if (model) streamModel = model
         // Planning stream closed — if a task run was planned, start executing
         // tasks one at a time (each in its own SSE stream) instead of the
         // single-pass teardown below.
@@ -1229,6 +1236,7 @@ export function ChatPanel() {
             created_at: new Date().toISOString(),
             _thinking,
             _steps,
+            _model: streamModel || 'N/A',
           })
         }
         if (isFirst) autoRename()
@@ -1245,6 +1253,7 @@ export function ChatPanel() {
             created_at: new Date().toISOString(),
             _thinking: thinkingTextRef.current,
             _steps: [...progressHistoryRef.current],
+            _model: streamModel || 'N/A',
           })
           gotResult = true
         }

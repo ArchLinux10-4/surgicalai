@@ -241,7 +241,7 @@ export const api = {
       onProgress: (msg: string) => void,
       onToken: (token: string) => void,
       onResult: (result: any) => void,
-      onDone: (fullText: string) => void,
+      onDone: (fullText: string, model?: string) => void,
       onError: (err: string) => void,
       onThinking?: (text: string, phase: 'start' | 'delta' | 'end') => void,
       onCompacting?: (phase: 'start' | 'done') => void,
@@ -252,7 +252,8 @@ export const api = {
       const controller = new AbortController()
       const tokens: string[] = []
       let doneCalled = false
-      const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone(tokens.join('')) } }
+      let _modelUsed = ''
+      const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone(tokens.join(''), _modelUsed) } }
 
       // Transport-independent SSE line handler — shared by WS and fetch paths.
       const processLine = (line: string) => {
@@ -264,10 +265,11 @@ export const api = {
           else if (chunk.type === 'smart_result') {
             // Natural pipeline: result may include natural_text already streamed as tokens
             const result = JSON.parse(chunk.content)
+            if (chunk.model) { _modelUsed = chunk.model; result._model = chunk.model }
             onResult(result)
           }
           else if (chunk.type === 'chat') { tokens.push(chunk.content); onToken(chunk.content) }
-          else if (chunk.type === 'done') fireDone()
+          else if (chunk.type === 'done') { if (chunk.model) _modelUsed = chunk.model; fireDone() }
           else if (chunk.type === 'error') onError(chunk.content)
           else if (chunk.type === 'thinking_start') onThinking?.('', 'start')
           else if (chunk.type === 'thinking') onThinking?.(chunk.content, 'delta')

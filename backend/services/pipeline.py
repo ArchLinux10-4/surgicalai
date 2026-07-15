@@ -3090,6 +3090,7 @@ async def run_chat_stream(
     Used by the /api/chat/stream endpoint.
     """
     chat_model = model or get_setting("architect_model", "gpt-4.1")
+    _model_used = chat_model
 
     system_parts = [CHAT_PERSONA]
 
@@ -3222,7 +3223,7 @@ async def run_chat_stream(
               error=str(e)[:300], user_id=user_id)
         yield sse({"type": "error", "content": _friendly_error(e)})
 
-    yield f"data: {json.dumps({'type': 'done', 'content': ''})}\n\n"
+    yield f"data: {json.dumps({'type': 'done', 'content': '', 'model': _model_used})}\n\n"
 
 
 
@@ -4904,6 +4905,7 @@ async def analyze_and_plan_stream(
         # Step 2: Get Anthropic key and model
         # ------------------------------------------------------------------
         architect_model = get_setting("architect_model", "claude-sonnet-5")
+        _model_used = architect_model
         _agent_use_claude = _is_claude_model(architect_model)
         if _agent_use_claude:
             anthropic_key = _get_anthropic_key(user_id)
@@ -5115,7 +5117,7 @@ async def analyze_and_plan_stream(
                 "clarification_response", ""
             )
             yield sse({"type": "chat", "content": response_text})
-            yield sse({"type": "done", "content": ""})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         if intent != "edit":
@@ -5131,7 +5133,7 @@ async def analyze_and_plan_stream(
                 "reasoning", "No changes needed — the code already satisfies your request."
             )
             yield sse({"type": "chat", "content": response})
-            yield sse({"type": "done", "content": ""})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         yield sse({"type": "progress", "content": f"Running QA on {len(changes_data)} change(s)..."})
@@ -5197,7 +5199,7 @@ async def analyze_and_plan_stream(
                     "Please re-upload the file and try again."
                 ),
             })
-            yield sse({"type": "done", "content": ""})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         # ------------------------------------------------------------------
@@ -5886,7 +5888,7 @@ async def analyze_and_plan_stream(
         )
 
         yield sse({"type": "result", "content": result_obj.model_dump_json()})
-        yield sse({"type": "done", "content": ""})
+        yield sse({"type": "done", "content": "", "model": _model_used})
 
     except Exception as e:
         yield f"data: {json.dumps({'type': 'error', 'content': _friendly_error(e)})}\n\n"
@@ -8377,6 +8379,7 @@ async def run_smart_pipeline_stream(
         return f"data: {json.dumps(obj)}\n\n"
 
     run_id = str(uuid.uuid4())
+    _model_used = ""
     compliance = ComplianceTracker(run_id=run_id, session_id=session_id or "", intent="unknown")
 
     try:
@@ -8398,6 +8401,7 @@ async def run_smart_pipeline_stream(
             compliance.mark("architect_routing", ran=True, output_summary="no-files pure chat")
             yield sse({"type": "progress", "content": "Thinking..."})
             chat_model = get_setting("architect_model", "gpt-4.1")
+            _model_used = chat_model
             system = """You are SurgicalAI, a world-class coding assistant. You help people build real software.
 
 CRITICAL BEHAVIOR — SCOPE BEFORE YOU CODE:
@@ -8451,7 +8455,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                         elif event.type == "content_block_stop":
                             if current_block == "thinking":
                                 yield sse({"type": "thinking_end", "content": ""})
-                yield sse({"type": "done", "content": ""})
+                yield sse({"type": "done", "content": "", "model": _model_used})
                 return
             elif _is_gemini_model(chat_model) and HAS_GOOGLE_GENAI:
                 # ── Gemini streaming with thinking blocks ──
@@ -8486,7 +8490,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                                 yield sse({"type": "token", "content": gpart.text})
                 if in_thinking:
                     yield sse({"type": "thinking_end", "content": ""})
-                yield sse({"type": "done", "content": ""})
+                yield sse({"type": "done", "content": "", "model": _model_used})
                 return
             elif _should_use_ollama(chat_model):
                 # ── Ollama streaming with <think> tag parsing ──
@@ -8530,7 +8534,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                                 pass
                 if in_thinking:
                     yield sse({"type": "thinking_end", "content": ""})
-                yield sse({"type": "done", "content": ""})
+                yield sse({"type": "done", "content": "", "model": _model_used})
                 return
 
             client = _get_client(user_id)
@@ -8539,7 +8543,7 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 delta = chunk.choices[0].delta
                 if delta.content:
                     yield sse({"type": "token", "content": delta.content})
-            yield sse({"type": "done", "content": ""})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         # Parse all session files
@@ -8693,6 +8697,7 @@ USER REQUEST:
             context_msg = f"EARLIER CONVERSATION SUMMARY (compacted history before recent turns):\n{session_summary}\n\n" + context_msg
 
         arch_model = get_setting("architect_model", "gpt-4.1")
+        _model_used = arch_model
 
         # Detect if this is a diagnostic request — inject extra guidance if so
         _req_lower = user_request.lower()
@@ -10477,7 +10482,7 @@ USER REQUEST:
             if buffer:
                 yield sse({"type": "token", "content": " ".join(buffer)})
             compliance.save()
-            yield sse({"type": "done", "content": ""})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         if intent == "chat":
@@ -10495,7 +10500,7 @@ USER REQUEST:
             if buffer:
                 yield sse({"type": "token", "content": " ".join(buffer)})
             compliance.save()
-            yield sse({"type": "done", "content": ""})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         # ── CREATE intent — Claude writes brand-new files ──────────────────
@@ -10506,7 +10511,7 @@ USER REQUEST:
                 # Malformed plan — fall back to clarification
                 yield sse({"type": "token", "content": "I understood you want to create something new, but couldn't determine the file details. Could you describe what the file should do?"})
                 compliance.save()
-                yield sse({"type": "done", "content": ""})
+                yield sse({"type": "done", "content": "", "model": _model_used})
                 return
 
             # Build codebase context for the file creator
@@ -10548,7 +10553,7 @@ USER REQUEST:
             if not created_files:
                 yield sse({"type": "token", "content": "File creation failed. Try being more specific about what the file should contain."})
                 compliance.save()
-                yield sse({"type": "done", "content": ""})
+                yield sse({"type": "done", "content": "", "model": _model_used})
                 return
 
             compliance.mark("file_creation", ran=True,
@@ -10576,8 +10581,8 @@ USER REQUEST:
             else:
                 compliance.save()
                 result_json = json.dumps(create_result)
-                yield sse({"type": "smart_result", "content": result_json})
-                yield sse({"type": "done", "content": ""})
+                yield sse({"type": "smart_result", "model": _model_used, "content": result_json})
+                yield sse({"type": "done", "content": "", "model": _model_used})
                 return
 
         else:
@@ -10591,7 +10596,7 @@ USER REQUEST:
             for word in fallback.split(" "):
                 yield sse({"type": "token", "content": word + " "})
                 await asyncio.sleep(0.005)
-            yield sse({"type": "done", "content": ""})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         yield sse({"type": "progress", "content": f"Plan ready: {len(targets)} change(s) identified"})
@@ -11644,8 +11649,8 @@ USER REQUEST:
             # still emit the create result
             if _pending_create_result:
                 compliance.save()
-                yield sse({"type": "smart_result", "content": json.dumps(_pending_create_result)})
-                yield sse({"type": "done", "content": ""})
+                yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(_pending_create_result)})
+                yield sse({"type": "done", "content": "", "model": _model_used})
                 return
 
             # Build a helpful message depending on what happened
@@ -11675,7 +11680,7 @@ USER REQUEST:
                 )
             for word in fallback.split(" "):
                 yield sse({"type": "token", "content": word + " "})
-            yield sse({"type": "done", "content": ""})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         result = {
@@ -11713,8 +11718,8 @@ USER REQUEST:
         result["run_id"] = run_id
         result["compliance"] = compliance.to_dict()
 
-        yield sse({"type": "smart_result", "content": json.dumps(result)})
-        yield sse({"type": "done", "content": ""})
+        yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(result)})
+        yield sse({"type": "done", "content": "", "model": _model_used})
 
     except Exception as e:
         import traceback
@@ -13459,6 +13464,7 @@ async def run_natural_pipeline_stream(
     try:
         _user_arch_model = get_setting("architect_model", "claude-sonnet-5")
         arch_model = _user_arch_model
+        _model_used = arch_model
         _natural_use_claude = _is_claude_model(arch_model)
         if _natural_use_claude:
             anthropic_key = _get_anthropic_key(user_id)
@@ -14677,7 +14683,7 @@ async def run_natural_pipeline_stream(
                                "available. Attaching the specific file(s) involved — or "
                                "naming the exact symbol I should focus on — will let me "
                                "complete it on the next run."})
-            yield sse({"type": "done", "content": ""})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         _dlog("phase2_complete",
@@ -15157,7 +15163,7 @@ async def run_natural_pipeline_stream(
                     "new_files": [],
                     "natural_text": _fail_msg,
                 }
-                yield sse({"type": "smart_result", "content": json.dumps(_fail_result)})
+                yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(_fail_result)})
             elif full_response.strip() and not skipped_changes_struct:
                 # Model produced text (e.g. a plan/explanation) but no actual
                 # edit blocks.  The text was already streamed as tokens;
@@ -15172,7 +15178,7 @@ async def run_natural_pipeline_stream(
                       response_len=len(full_response),
                       was_starvation_recovery=bool(_streaming_starvation_abort))
                 yield sse({"type": "token", "content": _noedit_msg})
-            yield sse({"type": "done", "content": ""})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         _resolution_t0 = time.time()
@@ -19036,8 +19042,8 @@ async def run_natural_pipeline_stream(
                     "new_files": [],
                     "natural_text": _msg,
                 }
-                yield sse({"type": "smart_result", "content": json.dumps(_fail_result)})
-            yield sse({"type": "done", "content": ""})
+                yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(_fail_result)})
+            yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
         # Determine intent: create if any new files, edit otherwise, mixed if both
@@ -19073,11 +19079,11 @@ async def run_natural_pipeline_stream(
               skipped_count=len(skipped_changes_struct),
               files=list(changes_by_file.keys()),
               user_id=user_id)
-        yield sse({"type": "smart_result", "content": json.dumps(result)})
+        yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(result)})
         _dlog("pipeline_complete",
               session_id=session_id, user_id=user_id,
               pipeline_total_s=round(time.time() - _pipeline_t0, 1))
-        yield sse({"type": "done", "content": ""})
+        yield sse({"type": "done", "content": "", "model": _model_used})
 
     except Exception as e:
         import traceback as _tb
