@@ -4,24 +4,32 @@ File size validation for SurgicalAI uploads.
 Limits:
   - Text/code files: 1 MB per file
   - Image files:    10 MB per file
-  - Session total:  20 MB across all files
+  - PDF files:      15 MB per file
+  - Session total:  30 MB across all files
 """
 
 from fastapi import HTTPException
 
 MAX_TEXT_FILE_BYTES  = 1  * 1024 * 1024   # 1 MB
 MAX_IMAGE_FILE_BYTES = 10 * 1024 * 1024   # 10 MB
-MAX_SESSION_BYTES    = 20 * 1024 * 1024   # 20 MB
+MAX_PDF_FILE_BYTES   = 15 * 1024 * 1024   # 15 MB
+MAX_SESSION_BYTES    = 30 * 1024 * 1024   # 30 MB
 
 IMAGE_EXTENSIONS = frozenset({
     "png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "heic", "heif",
 })
 
+PDF_EXTENSIONS = frozenset({"pdf"})
+
 
 def _file_limit(filename: str) -> int:
     """Return max allowed bytes based on file extension."""
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    return MAX_IMAGE_FILE_BYTES if ext in IMAGE_EXTENSIONS else MAX_TEXT_FILE_BYTES
+    if ext in IMAGE_EXTENSIONS:
+        return MAX_IMAGE_FILE_BYTES
+    if ext in PDF_EXTENSIONS:
+        return MAX_PDF_FILE_BYTES
+    return MAX_TEXT_FILE_BYTES
 
 
 def validate_file_size(filename: str, size_bytes: int) -> None:
@@ -31,7 +39,12 @@ def validate_file_size(filename: str, size_bytes: int) -> None:
         limit_mb = limit / (1024 * 1024)
         size_mb  = size_bytes / (1024 * 1024)
         ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-        kind = "Image" if ext in IMAGE_EXTENSIONS else "Text/code"
+        if ext in IMAGE_EXTENSIONS:
+            kind = "Image"
+        elif ext in PDF_EXTENSIONS:
+            kind = "PDF"
+        else:
+            kind = "Text/code"
         raise HTTPException(
             status_code=413,
             detail=f"{kind} file too large: {size_mb:.1f}MB (limit: {limit_mb:.0f}MB)",
