@@ -14891,6 +14891,12 @@ async def run_natural_pipeline_stream(
                 new_file_blocks_raw = _good_files
 
 
+        # ── Snapshot file content BEFORE plan executor modifies it ────────
+        # Plan executor chain-updates mutate file_content_lookup_stream
+        # in-place.  The resolution phase (below) needs ORIGINAL content
+        # so old_code matching works.  Capture a shallow copy now.
+        _file_content_pre_plan: dict = dict(file_content_lookup_stream)
+
         # ── Plan→Execute: focused per-symbol edit calls ──────────────────
         if edit_plan_data:
             _plan_exec_t0 = time.time()
@@ -15251,6 +15257,13 @@ async def run_natural_pipeline_stream(
 
         # Build file content lookup
         file_content_lookup: dict = {sf["filename"]: sf.get("content", "") for sf in session_files}
+        # Merge GitHub-fetched files (and any other agent-loop-acquired
+        # files) into the resolution lookup.  Uses the pre-plan snapshot
+        # so old_code matching works against ORIGINAL content, not the
+        # post-chain-update version.
+        for _pre_fname, _pre_content in _file_content_pre_plan.items():
+            if _pre_fname not in file_content_lookup and _pre_content:
+                file_content_lookup[_pre_fname] = _pre_content
 
         changes_by_file: dict = {}
         all_qa_risks: list = []
