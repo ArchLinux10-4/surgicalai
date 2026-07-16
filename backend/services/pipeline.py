@@ -14494,7 +14494,7 @@ async def run_natural_pipeline_stream(
                                "content": f"GitHub: {_gh_req.get('tool', 'request')}..."})
                     try:
                         _gh_result = await execute_github_request(
-                            _gh_req, user_id, session_id, dlog=_dlog)
+                            _gh_req, user_id, dlog=_dlog)
                         _github_rounds_used += 1
                         _dlog("agent_github_result",
                               session_id=session_id, user_id=user_id,
