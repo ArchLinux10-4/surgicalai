@@ -51,16 +51,37 @@ OLLAMA_URL="http://127.0.0.1:${OLLAMA_PORT}"
 
 echo -e "${BOLD}Checking prerequisites...${NC}"
 
-if ! command -v python3 &>/dev/null; then
-  _dlog "FAIL: python3 not found. PATH=$PATH"
-  echo "❌ Python 3 not found. Please install Python 3.11+"
+# Prefer a modern interpreter — macOS system python3 is often 3.9, which
+# cannot parse PEP 604 unions (dict | None) used throughout the backend.
+PYTHON_BIN=""
+for candidate in python3.13 python3.12 python3.11 python3.10 python3; do
+  if command -v "$candidate" &>/dev/null; then
+    PYTHON_BIN="$(command -v "$candidate")"
+    break
+  fi
+done
+
+if [ -z "$PYTHON_BIN" ]; then
+  _dlog "FAIL: no python3 found. PATH=$PATH"
+  echo "❌ Python 3 not found. Please install Python 3.10+"
   echo "   (details logged to $LOGFILE)"
   exit 1
 fi
 
-PYTHON_VERSION=$(python3 --version 2>&1 | awk '{print $2}')
-_dlog "python3 OK: $PYTHON_VERSION ($(command -v python3))"
-echo "  ✅ Python $PYTHON_VERSION"
+PYTHON_VERSION=$("$PYTHON_BIN" --version 2>&1 | awk '{print $2}')
+PYTHON_MAJOR=$("$PYTHON_BIN" -c 'import sys; print(sys.version_info.major)')
+PYTHON_MINOR=$("$PYTHON_BIN" -c 'import sys; print(sys.version_info.minor)')
+if [ "$PYTHON_MAJOR" -lt 3 ] || { [ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -lt 10 ]; }; then
+  _dlog "FAIL: Python $PYTHON_VERSION at $PYTHON_BIN is too old (need 3.10+)"
+  echo "❌ Python $PYTHON_VERSION is too old. SurgicalAI requires Python 3.10+."
+  echo "   Found: $PYTHON_BIN"
+  echo "   Install e.g. brew install python@3.12, then re-run ./install.sh"
+  echo "   (details logged to $LOGFILE)"
+  exit 1
+fi
+
+_dlog "python OK: $PYTHON_VERSION ($PYTHON_BIN)"
+echo "  ✅ Python $PYTHON_VERSION ($PYTHON_BIN)"
 
 if ! command -v node &>/dev/null; then
   _dlog "FAIL: node not found. PATH=$PATH"
@@ -89,8 +110,14 @@ echo -e "${BOLD}Installing backend dependencies...${NC}"
 cd "$BACKEND_DIR"
 _dlog "cd $BACKEND_DIR; disk free: $(df -h . 2>&1 | tail -1)"
 
-if ! python3 -m venv .venv; then
-  _dlog "FAIL: python3 -m venv .venv failed"
+# Drop a stale venv built with the wrong interpreter (e.g. system 3.9).
+if [ -d .venv ]; then
+  _dlog "removing existing .venv before recreate with $PYTHON_BIN"
+  rm -rf .venv
+fi
+
+if ! "$PYTHON_BIN" -m venv .venv; then
+  _dlog "FAIL: $PYTHON_BIN -m venv .venv failed"
   echo "❌ Failed to create Python virtual environment."
   echo "   (details logged to $LOGFILE)"
   exit 1

@@ -103,9 +103,40 @@ def update_settings(req: SettingsUpdate, request: Request):
 
 
 def _open_directory_dialog(result: dict) -> None:
-    """Run on a background thread — tkinter's askdirectory() blocks until the
-    user closes the dialog, so it must never run on the FastAPI event loop."""
+    """Run on a background thread — the OS folder picker blocks until the
+    user closes the dialog, so it must never run on the FastAPI event loop.
+
+    On macOS, tkinter from a non-main thread is unreliable (dialog often never
+    appears). Prefer AppleScript's `choose folder`, which works from any thread.
+    Fall back to tkinter on Linux / when osascript is unavailable.
+    """
+    import platform
+    import subprocess
+
     try:
+        if platform.system() == "Darwin":
+            proc = subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'POSIX path of (choose folder with prompt "Select SurgicalAI workspace folder")',
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            stdout = (proc.stdout or "").strip().rstrip("/")
+            stderr = (proc.stderr or "").strip()
+            # User cancelled the dialog — treat as empty selection, not an error.
+            if proc.returncode != 0:
+                if "User canceled" in stderr or "user cancelled" in stderr.lower() or not stderr:
+                    result["path"] = ""
+                else:
+                    result["error"] = stderr or f"osascript failed ({proc.returncode})"
+                return
+            result["path"] = stdout
+            return
+
         import tkinter as tk
         from tkinter import filedialog
         root = tk.Tk()
