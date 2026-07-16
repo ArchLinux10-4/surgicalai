@@ -13388,9 +13388,18 @@ async def run_natural_pipeline_stream(
     project_memory: str = None,
     session_summary: str = "",
     user_id: str = "",
+    client_inbox=None,
 ):
     """
     Natural conversation pipeline — Claude talks like Claude.
+
+    client_inbox : optional asyncio.Queue back-channel to the client. Present
+        only on the WebSocket transport (bidirectional). When the agent loop
+        needs a file that is neither in the session nor fetchable from GitHub,
+        it pauses, emits a `file_needed` event, and awaits the user's reply on
+        this queue (human-in-the-loop). Absent (None) on plain HTTP/SSE and
+        offline transports → the loop degrades gracefully to the old
+        "tell the user and stop" behaviour. See `_await_user_file` below.
 
     Claude responds in natural markdown. When it wants to edit code,
     it embeds <surgical_edit> XML tags. This function:
@@ -13438,6 +13447,104 @@ async def run_natural_pipeline_stream(
     def _pipeline_over_budget() -> bool:
         """True when elapsed pipeline time exceeds the Railway safety margin."""
         return (time.time() - _pipeline_t0) >= PIPELINE_DEADLINE_S
+
+    # ── Human-in-the-loop: pause and ask the user for a missing file ───────
+    # Max time to wait for the user to respond to a file request. The socket
+    # stays warm the whole time because `_with_heartbeat` (chat.py) emits an
+    # SSE keepalive every 5s during any stall, and we also cap the wait so a
+    # silent user never hangs the pipeline against its Railway deadline.
+    FILE_WAIT_TIMEOUT_S = 240
+
+    async def _await_user_file(missing_fn: str, outcome: dict, is_retry: bool = False):
+        """Pause the agent loop and ask the user to supply a file that is not
+        in the session and could not be auto-fetched from GitHub.
+
+        Yields SSE strings (`file_needed`, then `file_needed_cleared`). The
+        result is written into the caller-supplied `outcome` dict:
+          outcome["content"]  — file text if the user provided it
+          outcome["filename"] — the name under which it was provided
+          outcome["message"]  — instruction text for the model otherwise
+
+        Degrades gracefully when there is no back-channel (plain HTTP/SSE or
+        offline transport): it never blocks, it just returns a "tell the user
+        and stop" instruction so the model won't fabricate file contents.
+        """
+        # No back-channel → cannot pause. Preserve prior behaviour.
+        if client_inbox is None:
+            outcome["message"] = (
+                f"FILE NOT FOUND: '{missing_fn}' — it is not in this session "
+                f"and no source is available to fetch it automatically. Tell "
+                f"the user you need this file to continue and stop. Do NOT "
+                f"fabricate or guess its contents.")
+            _dlog("agent_filereq_no_backchannel", session_id=session_id,
+                  user_id=user_id, filename=missing_fn)
+            return
+
+        # Discard any stale replies so we never consume a previous file's answer.
+        try:
+            while True:
+                client_inbox.get_nowait()
+        except Exception:
+            pass
+
+        _dlog("agent_filereq_pause_ask", session_id=session_id,
+              user_id=user_id, filename=missing_fn, is_retry=is_retry)
+        yield sse({
+            "type": "file_needed",
+            "filename": missing_fn,
+            "retry": is_retry,
+            "content": (
+                (f"That doesn't look like the right **{missing_fn}** for what I "
+                 f"need — could you upload the correct one? Or skip and I'll "
+                 f"work without it.")
+                if is_retry else
+                (f"I need **{missing_fn}** to continue, but it isn't in "
+                 f"this session and I couldn't fetch it automatically. "
+                 f"Upload it and I'll pick up right where I left off — "
+                 f"or skip and I'll work without it.")),
+        })
+
+        _wait_t0 = time.time()
+        _resp = None
+        while (time.time() - _wait_t0) < FILE_WAIT_TIMEOUT_S:
+            if _pipeline_over_budget():
+                break
+            try:
+                _resp = await asyncio.wait_for(client_inbox.get(), timeout=5)
+                break
+            except asyncio.TimeoutError:
+                continue  # keepalive from _with_heartbeat keeps the socket warm
+
+        if _resp is None:
+            outcome["message"] = (
+                f"FILE NOT PROVIDED: '{missing_fn}' — the user did not supply "
+                f"it in time. Proceed with the files you already have. Do NOT "
+                f"guess this file's contents; if you cannot proceed safely, "
+                f"say so clearly.")
+            _dlog("agent_filereq_pause_timeout", session_id=session_id,
+                  user_id=user_id, filename=missing_fn,
+                  waited_s=round(time.time() - _wait_t0, 1))
+            yield sse({"type": "file_needed_cleared", "filename": missing_fn})
+            return
+
+        _action = str(_resp.get("action") or "").lower()
+        _provided_name = _resp.get("filename") or missing_fn
+        _provided_content = _resp.get("content")
+        if _action == "skip" or not _provided_content:
+            outcome["message"] = (
+                f"FILE SKIPPED: '{missing_fn}' — the user chose not to provide "
+                f"it. Proceed without it. Do NOT fabricate its contents.")
+            _dlog("agent_filereq_pause_skip", session_id=session_id,
+                  user_id=user_id, filename=missing_fn)
+            yield sse({"type": "file_needed_cleared", "filename": missing_fn})
+            return
+
+        outcome["content"] = _provided_content
+        outcome["filename"] = _provided_name
+        _dlog("agent_filereq_pause_provided", session_id=session_id,
+              user_id=user_id, filename=missing_fn,
+              provided_as=_provided_name, content_len=len(_provided_content))
+        yield sse({"type": "file_needed_cleared", "filename": missing_fn})
 
     EDIT_OPEN = "<surgical_edit>"
     EDIT_CLOSE = "</surgical_edit>"
@@ -13787,6 +13894,12 @@ async def run_natural_pipeline_stream(
         # ---- Discovery state (accumulates across turns; no phase wall resets it) ----
         searched_terms: list = []
         requested_files: set = set()
+        # Files supplied by the user via the HITL pause. Only these are eligible
+        # for a same-name re-request (they may be the wrong file); GitHub/session
+        # files are authoritative and are never re-paused.
+        user_supplied_files: set = set()
+        # Count of honored same-name correction re-requests, keyed by filename.
+        same_name_retries: dict = {}
         _github_reads_used = 0
         _github_writes_used = 0
         _github_attempts = 0
@@ -13867,6 +13980,7 @@ async def run_natural_pipeline_stream(
 
         _turn = 0
         _consecutive_empty_turns = 0
+        _consecutive_text_only_turns = 0
 
         while True:
             _turn += 1
@@ -14404,15 +14518,34 @@ async def run_natural_pipeline_stream(
                             {"role": "user", "content": _redirect},
                         ]
                         continue
-                    new_fnames = [fn for fn in fnames_req if fn not in requested_files]
-                    if len(requested_files) >= MAX_FILE_REQ_TOTAL or not new_fnames:
+                    # A same-name re-request is honored ONLY when the earlier copy
+                    # came from a user upload (so it may be the WRONG file) and the
+                    # per-file correction budget is not yet spent. This lets the
+                    # model self-correct when the user uploads the wrong file, while
+                    # the total-file and turn backstops still bound the whole run.
+                    _rerequestable = {
+                        fn for fn in fnames_req
+                        if fn in requested_files
+                        and fn in user_supplied_files
+                        and same_name_retries.get(fn, 0) < MAX_SAME_FILE_RETRIES
+                    }
+                    new_fnames = [
+                        fn for fn in fnames_req
+                        if fn not in requested_files or fn in _rerequestable
+                    ]
+                    # The total-file cap only blocks pulling NEW distinct files; a
+                    # re-request of an already-loaded user file does not count.
+                    _new_distinct = [fn for fn in fnames_req if fn not in requested_files]
+                    _hit_total_limit = (
+                        len(requested_files) >= MAX_FILE_REQ_TOTAL and bool(_new_distinct))
+                    if not new_fnames or _hit_total_limit:
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
                             {"role": "user", "content":
                                 ("You've reached the file-request limit. Write your edits with "
                                  "the context you have, or explain what's blocking you with "
                                  "<blocked>…</blocked>."
-                                 if len(requested_files) >= MAX_FILE_REQ_TOTAL
+                                 if _hit_total_limit
                                  else "Those files are already in your context above. Use them "
                                  "and write your edits.")},
                         ]
@@ -14421,18 +14554,113 @@ async def run_natural_pipeline_stream(
                                "content": f"Loading: {', '.join(new_fnames[:3])}{'...' if len(new_fnames)>3 else ''}"})
                     file_result_parts = []
                     for fn in new_fnames:
-                        content = file_content_lookup_stream.get(fn, "")
+                        _is_reretry = fn in _rerequestable
+                        if _is_reretry:
+                            # Force a fresh HITL pause: drop the wrong copy and skip
+                            # GitHub (the file came from the user, not a repo). Spend
+                            # one correction from this file's budget.
+                            same_name_retries[fn] = same_name_retries.get(fn, 0) + 1
+                            content = ""
+                            _dlog("agent_filereq_same_name_reretry",
+                                  session_id=session_id, user_id=user_id, turn=_turn,
+                                  filename=fn, attempt=same_name_retries[fn])
+                        else:
+                            content = file_content_lookup_stream.get(fn, "")
                         if not content:
-                            candidates_f = [
-                                k for k in file_content_lookup_stream
-                                if fn.lower() in k.lower() or k.lower() in fn.lower()]
-                            if candidates_f:
-                                file_result_parts.append(
-                                    f"FILE NOT FOUND: '{fn}' — did you mean: {', '.join(candidates_f[:3])}?")
+                            # ── Step 1: GitHub fallback — try to fetch the file
+                            #    from the known repo before bothering the user.
+                            #    Skipped on a same-name correction re-request: that
+                            #    file came from the user, not the repo. ──
+                            if not _is_reretry and _gh_nat_enabled and _gh_known_repos:
+                                _gh_fb_owner_repo = _gh_known_repos[0]
+                                _gh_fb_owner, _gh_fb_repo = (
+                                    _gh_fb_owner_repo.split("/", 1)
+                                    if "/" in _gh_fb_owner_repo
+                                    else (_gh_fb_owner_repo, ""))
+                                if _gh_fb_repo:
+                                    # Try common paths for the file
+                                    _gh_fb_candidates = [
+                                        fn,
+                                        f"backend/{fn}",
+                                        f"backend/services/{fn}",
+                                        f"backend/routers/{fn}",
+                                        f"frontend/src/{fn}",
+                                        f"frontend/src/components/{fn}",
+                                        f"frontend/src/utils/{fn}",
+                                    ]
+                                    for _gh_fb_path in _gh_fb_candidates:
+                                        try:
+                                            from services.github_natural_tag import (
+                                                fetch_and_register_github_file,
+                                            )
+                                            _gh_fb_parsed = {
+                                                "tool": "read_file",
+                                                "args": {
+                                                    "owner": _gh_fb_owner,
+                                                    "repo": _gh_fb_repo,
+                                                    "path": _gh_fb_path,
+                                                },
+                                                "reason": f"Auto-fetch missing file: {fn}",
+                                            }
+                                            _gh_fb_entry = fetch_and_register_github_file(
+                                                _gh_fb_parsed, user_id,
+                                                session_id, dlog=_dlog)
+                                            if _gh_fb_entry and _gh_fb_entry.get("content"):
+                                                content = _gh_fb_entry["content"]
+                                                file_content_lookup_stream[fn] = content
+                                                try:
+                                                    _gh_fb_smap = parser.parse(content, fn)
+                                                    symbol_maps_by_name[fn] = (
+                                                        _gh_fb_smap, _gh_fb_entry)
+                                                except Exception:
+                                                    pass
+                                                _dlog("agent_filereq_github_fallback_ok",
+                                                      session_id=session_id,
+                                                      user_id=user_id, turn=_turn,
+                                                      filename=fn,
+                                                      github_path=_gh_fb_path,
+                                                      content_len=len(content))
+                                                break
+                                        except Exception as _gh_fb_err:
+                                            _dlog("agent_filereq_github_fallback_err",
+                                                  session_id=session_id,
+                                                  user_id=user_id, turn=_turn,
+                                                  filename=fn,
+                                                  github_path=_gh_fb_path,
+                                                  error=str(_gh_fb_err)[:200])
+                                            continue
+
+                        if not content:
+                            # ── Step 2: Human-in-the-loop — pause and ask the
+                            #    user to supply the file. Degrades to a "tell
+                            #    the user and stop" instruction when there is no
+                            #    back-channel (plain HTTP/SSE / offline). ──
+                            _fr_outcome: dict = {}
+                            async for _fr_ev in _await_user_file(
+                                    fn, _fr_outcome, is_retry=_is_reretry):
+                                yield _fr_ev
+                            if _fr_outcome.get("content"):
+                                content = _fr_outcome["content"]
+                                file_content_lookup_stream[fn] = content
+                                user_supplied_files.add(fn)
+                                try:
+                                    _fr_smap = parser.parse(content, fn)
+                                    symbol_maps_by_name[fn] = (
+                                        _fr_smap,
+                                        {"filename": fn, "content": content})
+                                except Exception:
+                                    pass
                             else:
-                                file_result_parts.append(
+                                _fr_msg = _fr_outcome.get("message") or (
                                     f"FILE NOT FOUND: '{fn}' — not in uploaded files.")
-                            continue
+                                _fr_cands = [
+                                    k for k in file_content_lookup_stream
+                                    if fn.lower() in k.lower() or k.lower() in fn.lower()]
+                                if _fr_cands:
+                                    _fr_msg += (f" (Similar files available: "
+                                                f"{', '.join(_fr_cands[:3])}.)")
+                                file_result_parts.append(_fr_msg)
+                                continue
                         requested_files.add(fn)
                         file_lines = content.splitlines()
                         smap_fr, _ = symbol_maps_by_name.get(fn, (None, None))
@@ -14583,8 +14811,8 @@ async def run_natural_pipeline_stream(
                     continue
 
             # ── No tool requested — the turn either produced edits or is terminal ──
-            _turn_produced = (
-                bool(full_response.strip()) or _new_edits > 0 or edit_plan_data is not None)
+            _has_edits_or_plan = (_new_edits > 0 or edit_plan_data is not None)
+            _turn_produced = (bool(full_response.strip()) or _has_edits_or_plan)
             if not _turn_produced:
                 _consecutive_empty_turns += 1
                 if _consecutive_empty_turns >= 2:
@@ -14601,6 +14829,29 @@ async def run_natural_pipeline_stream(
                         "<surgical_edit>/<new_file>/<edit_plan>, or explain what's blocking you "
                         "with <blocked>…</blocked>."},
                 ]
+                continue
+
+            # ── Text-only turn: model explained instead of editing ──
+            if not _has_edits_or_plan and full_response.strip():
+                _consecutive_text_only_turns += 1
+                if _consecutive_text_only_turns >= 2:
+                    _dlog("agent_loop_text_only_exit",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          response_len=len(full_response))
+                    break
+                _dlog("agent_loop_text_only_nudge",
+                      session_id=session_id, user_id=user_id, turn=_turn,
+                      response_len=len(full_response),
+                      response_preview=full_response[:300])
+                current_messages = current_messages + [
+                    {"role": "assistant", "content": full_response},
+                    {"role": "user", "content":
+                        "You wrote an explanation but did not produce any code changes. "
+                        "You MUST produce edits now using <surgical_edit>, <new_file>, "
+                        "or <edit_plan> tags. Work with the context you already have — "
+                        "do not request more files or searches."},
+                ]
+                full_response = ""
                 continue
 
             _dlog("agent_loop_done",

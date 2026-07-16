@@ -62,6 +62,7 @@ function streamViaWS(
   processLine: (line: string) => void,
   fireDone: () => void,
   onOpenFail: () => void,
+  registerSender?: (send: ((msg: unknown) => void) | null) => void,
 ): void {
   let ws: WebSocket
   try {
@@ -77,7 +78,16 @@ function streamViaWS(
   const closeWs = () => { aborted = true; try { ws.close() } catch { /* noop */ } }
   controller.signal.addEventListener('abort', closeWs)
 
-  ws.onopen = () => { opened = true; ws.send(JSON.stringify(data)) }
+  ws.onopen = () => {
+    opened = true
+    ws.send(JSON.stringify(data))
+    // Expose a back-channel sender (human-in-the-loop file responses). Only
+    // the WS transport is bidirectional, so this is the sole path that can
+    // answer a `file_needed` prompt.
+    registerSender?.((msg: unknown) => {
+      try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg)) } catch { /* noop */ }
+    })
+  }
 
   ws.onmessage = (ev: MessageEvent) => {
     buffer += typeof ev.data === 'string' ? ev.data : ''
@@ -91,6 +101,7 @@ function streamViaWS(
 
   ws.onclose = () => {
     controller.signal.removeEventListener('abort', closeWs)
+    registerSender?.(null)                  // back-channel is gone
     if (!opened) { onOpenFail(); return }   // never connected → safe to fall back
     if (aborted) return                     // user cancelled → match fetch: no onDone
     if (buffer.trim()) processLine(buffer.trimEnd())
@@ -247,12 +258,23 @@ export const api = {
       onCompacting?: (phase: 'start' | 'done') => void,
       onEditStart?: () => void,
       onEditEnd?: () => void,
-      onTask?: (event: any) => void
+      onTask?: (event: any) => void,
+      // Human-in-the-loop: the agent paused because it needs a file that isn't
+      // in the session. `respond` sends the file (or a skip) back over the same
+      // WebSocket. `onFileCleared` fires when the prompt should be dismissed
+      // (provided / skipped / timed out).
+      onFileNeeded?: (
+        info: { filename: string; message: string },
+        respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => void,
+      ) => void,
+      onFileCleared?: (filename: string) => void,
     ): AbortController => {
       const controller = new AbortController()
       const tokens: string[] = []
       let doneCalled = false
       let _modelUsed = ''
+      // Back-channel sender, populated once the WS opens (null on HTTP/SSE).
+      let sendToServer: ((msg: unknown) => void) | null = null
       const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone(tokens.join(''), _modelUsed) } }
 
       // Transport-independent SSE line handler — shared by WS and fetch paths.
@@ -278,6 +300,13 @@ export const api = {
           else if (chunk.type === 'compacting_done') onCompacting?.('done')
           else if (chunk.type === 'edit_start') onEditStart?.()
           else if (chunk.type === 'edit_end') onEditEnd?.()
+          else if (chunk.type === 'file_needed') {
+            onFileNeeded?.(
+              { filename: chunk.filename, message: chunk.content, retry: chunk.retry },
+              (resp) => sendToServer?.({ type: 'file_response', ...resp }),
+            )
+          }
+          else if (chunk.type === 'file_needed_cleared') onFileCleared?.(chunk.filename)
           else if (
             chunk.type === 'planning_started' ||
             chunk.type === 'task_plan' || chunk.type === 'task_start' ||
@@ -325,7 +354,8 @@ export const api = {
       // WebSocket-first (removes Railway's 15-min transport wall); on a
       // connect-time failure only, transparently fall back to HTTP/SSE.
       if (typeof WebSocket !== 'undefined') {
-        streamViaWS('/chat/ws/smart-stream', data, controller, processLine, fireDone, runViaFetch)
+        streamViaWS('/chat/ws/smart-stream', data, controller, processLine, fireDone, runViaFetch,
+          (send) => { sendToServer = send })
       } else {
         runViaFetch()
       }

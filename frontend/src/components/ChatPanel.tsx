@@ -839,6 +839,19 @@ export function ChatPanel() {
   const pendingRunRef = useRef<{ runId: string; tasks: any[]; serverRun?: boolean } | null>(null)
   const [restartSignal, setRestartSignal] = useState<{ msg: string; sid: string } | null>(null)
 
+  // ── Human-in-the-loop file request ──────────────────────────────────────
+  // The agent paused mid-run because it needs a file that isn't in the
+  // session and couldn't be auto-fetched. We surface an inline prompt so the
+  // user can upload it (run resumes) or skip (run continues without it).
+  const [fileRequest, setFileRequest] = useState<{
+    sessionId: string
+    filename: string
+    message: string
+    respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => void
+  } | null>(null)
+  const fileRequestInputRef = useRef<HTMLInputElement>(null)
+  const [fileRequestBusy, setFileRequestBusy] = useState(false)
+
   // Smart auto-scroll: only scroll to bottom when user is already at the bottom.
   // If user scrolls up to read, don't yank them back down.
   useEffect(() => {
@@ -1338,7 +1351,23 @@ export function ChatPanel() {
             setAgentPhase('complete')
             break
         }
-      }
+      },
+      // onFileNeeded — agent paused; it needs a file not in the session.
+      (info, respond) => {
+        // If the user isn't looking at this session, auto-skip so the run
+        // never hangs on a prompt nobody can see.
+        if (useAppStore.getState().activeSessions !== sessionId) {
+          respond({ action: 'skip' })
+          return
+        }
+        setFileRequestBusy(false)
+        setFileRequest({ sessionId, filename: info.filename, message: info.message, retry: info.retry, respond })
+      },
+      // onFileCleared — prompt resolved (provided / skipped / timed out).
+      (_filename) => {
+        setFileRequest(null)
+        setFileRequestBusy(false)
+      },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles]) // all setters are stable; only sessionFiles can change
@@ -1360,6 +1389,32 @@ export function ChatPanel() {
       api.chat.getSessions().then(setSessions).catch(() => {})
     })
   }, [restartSignal, isStreaming, doStream])
+
+  // ── Human-in-the-loop file request handlers ────────────────────────────
+  const handleFileRequestUpload = () => fileRequestInputRef.current?.click()
+
+  const handleFileRequestFileChosen = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''            // allow re-selecting the same filename later
+    const req = fileRequest
+    if (!file || !req) return
+    const sizeErr = validateFileSize(file.name, file.size)
+    if (sizeErr) { setError(sizeErr); return }
+    setFileRequestBusy(true)
+    try {
+      const content = await file.text()
+      req.respond({ filename: file.name, content })
+    } catch {
+      setFileRequestBusy(false)
+      setError('Could not read that file — please try again or skip.')
+    }
+  }
+
+  const handleFileRequestSkip = () => {
+    if (!fileRequest) return
+    setFileRequestBusy(true)
+    fileRequest.respond({ action: 'skip' })
+  }
 
   const handleModelChange = async (modelId: string) => {
     if (!settings) return
@@ -1789,6 +1844,45 @@ export function ChatPanel() {
             <AgentMissionControl />
             {isStreaming && (streamingMessage || streamProgress) && (
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} />
+            )}
+            {/* Human-in-the-loop: agent needs a file that isn't in the session */}
+            {fileRequest && fileRequest.sessionId === activeSessions && (
+              <div className="mx-4 my-3 rounded-xl border border-accent/40 bg-accent/10 px-4 py-3.5 animate-slide-up">
+                <div className="flex items-start gap-2.5">
+                  <AttachFile sx={{ fontSize: 16 }} className="flex-shrink-0 mt-0.5 text-accent" />
+                  <div className="flex-1 min-w-0">
+                    <div className="text-[13px] font-semibold text-ink flex items-center gap-1.5">
+                      File needed to continue
+                      <code className="px-1.5 py-0.5 rounded bg-surface/70 border border-border text-[11px] font-mono text-accent">{fileRequest.filename}</code>
+                    </div>
+                    <p className="mt-1 text-[12px] text-muted leading-snug">{fileRequest.message}</p>
+                    <div className="mt-2.5 flex items-center gap-2">
+                      <button
+                        onClick={handleFileRequestUpload}
+                        disabled={fileRequestBusy}
+                        className="text-[12px] font-semibold px-3 py-1.5 rounded-lg text-white bg-accent hover:bg-accent/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors inline-flex items-center gap-1.5"
+                      >
+                        <AttachFile sx={{ fontSize: 13 }} />
+                        {fileRequestBusy ? 'Sending…' : 'Upload file'}
+                      </button>
+                      <button
+                        onClick={handleFileRequestSkip}
+                        disabled={fileRequestBusy}
+                        className="text-[12px] font-medium px-2.5 py-1.5 rounded-lg text-muted hover:bg-overlay/60 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        Skip
+                      </button>
+                      <span className="text-[10.5px] text-muted/60 ml-auto">Waiting… the run resumes as soon as you respond</span>
+                    </div>
+                  </div>
+                </div>
+                <input
+                  ref={fileRequestInputRef}
+                  type="file"
+                  className="hidden"
+                  onChange={handleFileRequestFileChosen}
+                />
+              </div>
             )}
             {/* Steer queued indicator — brief flash while injection restarts stream */}
             {injectionQueued && isStreaming && (

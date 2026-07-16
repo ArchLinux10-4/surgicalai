@@ -822,7 +822,7 @@ async def smart_stream(req: dict, request: Request):
         _saved = False
 
         try:
-            async for chunk in _with_heartbeat(_pipeline(
+            _pipe_kwargs = dict(
                 session_files=session_files,
                 user_request=message,
                 conversation_history=conversation_history,
@@ -830,7 +830,15 @@ async def smart_stream(req: dict, request: Request):
                 project_memory=project_memory,
                 session_summary=current_summary,
                 user_id=current_user_id,
-            )):
+            )
+            # Human-in-the-loop back-channel only exists on the WS transport and
+            # only the natural pipeline knows how to use it. Passing it solely
+            # to run_natural_pipeline_stream keeps the single-pass and offline
+            # signatures untouched.
+            if _pipeline is run_natural_pipeline_stream:
+                _pipe_kwargs["client_inbox"] = getattr(
+                    request.state, "client_inbox", None)
+            async for chunk in _with_heartbeat(_pipeline(**_pipe_kwargs)):
                 if chunk.startswith("data: "):
                     try:
                         data = _json.loads(chunk[6:])
@@ -1266,6 +1274,7 @@ async def execute_task(req: dict, request: Request):
                 project_memory=project_memory,
                 session_summary=session_summary,
                 user_id=current_user_id,
+                client_inbox=getattr(request.state, "client_inbox", None),
             )):
                 poll += 1
                 if poll % 20 == 0 and cancel_requested_for_run(session_id, run_id):
@@ -1471,10 +1480,16 @@ class _WSRequestShim:
     SimpleNamespace-backed `.state` is a complete, faithful substitute.
     """
 
-    def __init__(self, user_id: str, username: str = "", is_admin: bool = False):
+    def __init__(self, user_id: str, username: str = "", is_admin: bool = False,
+                 client_inbox=None):
         from types import SimpleNamespace
+        # client_inbox: bidirectional back-channel (asyncio.Queue) unique to the
+        # WebSocket transport. The natural pipeline reads it to pause and ask the
+        # user for a missing file (human-in-the-loop). HTTP/SSE has no shim and
+        # thus no inbox → pipeline degrades gracefully.
         self.state = SimpleNamespace(
-            user_id=user_id, username=username, is_admin=is_admin
+            user_id=user_id, username=username, is_admin=is_admin,
+            client_inbox=client_inbox,
         )
 
 
@@ -1537,7 +1552,32 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
             pass
         return
 
-    shim = _WSRequestShim(user_id, username, is_admin)
+    # ── Back-channel for human-in-the-loop (e.g. "I need this file") ──────
+    # The WebSocket is bidirectional, but the SSE pump below only sends. We run
+    # a concurrent receiver that funnels client→server messages into an inbox
+    # queue the pipeline can await on. HTTP/SSE clients have no shim/inbox, so
+    # the pipeline transparently falls back to non-interactive behaviour.
+    inbox: asyncio.Queue = asyncio.Queue()
+    shim = _WSRequestShim(user_id, username, is_admin, client_inbox=inbox)
+
+    async def _client_receiver():
+        """Forward client→server messages to the inbox for the duration of the
+        stream. Only `file_response` messages are consumed today; unknown
+        shapes are ignored so the channel stays forward-compatible. Any receive
+        error (disconnect / closed socket) ends the receiver cleanly."""
+        while True:
+            try:
+                raw_in = await websocket.receive_text()
+            except Exception:
+                break
+            try:
+                msg_in = json.loads(raw_in)
+            except Exception:
+                continue
+            if isinstance(msg_in, dict) and msg_in.get("type") == "file_response":
+                await inbox.put(msg_in)
+
+    recv_task = asyncio.create_task(_client_receiver())
 
     # ── Run the EXISTING handler and pump its SSE body over the socket ─────
     body_iter = None
@@ -1574,6 +1614,11 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
         except Exception:
             pass
     finally:
+        recv_task.cancel()
+        try:
+            await recv_task
+        except Exception:
+            pass
         try:
             await websocket.close()
         except Exception:
