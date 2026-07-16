@@ -34,6 +34,19 @@ def _is_transient(exc: Exception) -> bool:
     ))
 
 
+def _is_overloaded(exc: Exception) -> bool:
+    """Return True when the API is globally overloaded (HTTP 529 / 'overloaded').
+
+    Overloaded is a *sustained* server-side state — immediate retries (1-3 s)
+    never help and waste pipeline time.  Propagate at once so callers can decide
+    (e.g. QA skips gracefully, surgeon surfaces an error quickly).
+    """
+    if getattr(exc, "status_code", None) == 529:
+        return True
+    msg = str(exc).lower()
+    return "overloaded" in msg or "529" in msg
+
+
 def api_call_with_retry(fn, max_retries=2, backoff=(1, 3)):
     """Call fn(), retry on transient API failures.
 
@@ -50,6 +63,13 @@ def api_call_with_retry(fn, max_retries=2, backoff=(1, 3)):
         try:
             return fn()
         except Exception as e:
+            # Overloaded = global API state — propagate immediately (no retry).
+            if _is_overloaded(e):
+                logger.warning(
+                    "[API_RETRY] overloaded — not retrying (attempt %d/%d): %s",
+                    attempt + 1, 1 + max_retries, str(e)[:120],
+                )
+                raise
             if attempt < max_retries and _is_transient(e):
                 wait = backoff[min(attempt, len(backoff) - 1)]
                 logger.warning(
@@ -68,6 +88,15 @@ async def async_api_call_with_retry(fn, max_retries=2, backoff=(1, 3)):
         try:
             return await fn()
         except Exception as e:
+            # Overloaded = global API state.  Retrying in 1-3 s is pointless
+            # and burns pipeline time (observed: 6 failed calls × ~15 s = ~90 s).
+            # Propagate immediately so the caller can skip or surface quickly.
+            if _is_overloaded(e):
+                logger.warning(
+                    "[API_RETRY] overloaded — not retrying (attempt %d/%d): %s",
+                    attempt + 1, 1 + max_retries, str(e)[:120],
+                )
+                raise
             if attempt < max_retries and _is_transient(e):
                 wait = backoff[min(attempt, len(backoff) - 1)]
                 logger.warning(

@@ -7741,15 +7741,22 @@ ARCHITECT PRE-ANALYSIS RISKS (evaluate each in risk_verdicts):
 
       except Exception as _qa_e:
         _last_qa_err = _qa_e
+        _qa_is_overloaded = (
+            "overloaded" in str(_qa_e).lower()
+            or getattr(_qa_e, "status_code", None) == 529
+        )
         _dlog("qa_agent_error",
               session_id=session_id, filename=filename,
               symbol=symbol_path, attempt=_qa_attempt,
               error_type=type(_qa_e).__name__,
               error=str(_qa_e)[:300],
+              is_overloaded=_qa_is_overloaded,
               user_id=user_id)
-        if _qa_attempt == 0:
+        # Overloaded = sustained global API state.  api_retry already propagated
+        # immediately (no inner retries).  Don't waste another cycle here either.
+        if _qa_attempt == 0 and not _qa_is_overloaded:
             await asyncio.sleep(1)
-            continue  # retry once
+            continue  # retry once (non-overload errors only)
         # Both attempts failed — surface the real error type
         _err_type = type(_qa_e).__name__
         _err_short = str(_qa_e)[:120]

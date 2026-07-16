@@ -1568,7 +1568,9 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
         while True:
             try:
                 raw_in = await websocket.receive_text()
-            except Exception:
+            except BaseException:
+                # BaseException catches CancelledError (Python 3.8+) in addition
+                # to regular exceptions — ensures clean exit on task cancellation.
                 break
             try:
                 msg_in = json.loads(raw_in)
@@ -1617,7 +1619,10 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
         recv_task.cancel()
         try:
             await recv_task
-        except Exception:
+        except BaseException:
+            # CancelledError (BaseException subclass) propagated here when
+            # recv_task was cancelled above — swallow it cleanly so uvicorn
+            # never sees it as an unhandled ASGI exception.
             pass
         try:
             await websocket.close()
