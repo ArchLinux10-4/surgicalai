@@ -14493,7 +14493,7 @@ async def run_natural_pipeline_stream(
                     yield sse({"type": "progress",
                                "content": f"GitHub: {_gh_req.get('tool', 'request')}..."})
                     try:
-                        _gh_result = await execute_github_request(
+                        _gh_result = execute_github_request(
                             _gh_req, user_id, dlog=_dlog)
                         _github_rounds_used += 1
                         _dlog("agent_github_result",
