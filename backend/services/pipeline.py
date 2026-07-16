@@ -7138,11 +7138,33 @@ def _extract_json_from_text(text: str) -> str:
     start = stripped.find("{")
     if start == -1:
         return stripped  # Let json.loads fail naturally with a clear error
-    # Find matching closing brace
+    # Find matching closing brace.
+    # Bug fix (proven session 97b7046f): a naive counter treats every "{"/"}"
+    # as structural, even ones that appear INSIDE quoted JSON string values
+    # (e.g. QA prose describing broken code: "...stray '</span></div>))}'
+    # fragment..." or "...'{ label: \"Virtual scrolling\", ... }'...").
+    # That closes the object dozens/hundreds of chars early, produces an
+    # unparseable fragment, and the caller mislabels a COMPLETE, valid
+    # response as "truncated by max_tokens" (stop_reason was actually
+    # end_turn — verified against raw model response in that session).
+    # Track whether we're inside a JSON string (honoring backslash escapes)
+    # so braces inside string values never affect nesting depth.
     depth = 0
     end = -1
+    in_string = False
+    escape = False
     for i, ch in enumerate(stripped[start:], start=start):
-        if ch == "{":
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
             depth += 1
         elif ch == "}":
             depth -= 1
