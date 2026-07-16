@@ -14585,14 +14585,15 @@ async def run_natural_pipeline_stream(
                                         f"backend/services/{fn}",
                                         f"backend/routers/{fn}",
                                         f"frontend/src/{fn}",
+                                        f"frontend/src/api/{fn}",
                                         f"frontend/src/components/{fn}",
                                         f"frontend/src/utils/{fn}",
                                     ]
+                                    from services.github_natural_tag import (
+                                        fetch_and_register_github_file,
+                                    )
                                     for _gh_fb_path in _gh_fb_candidates:
                                         try:
-                                            from services.github_natural_tag import (
-                                                fetch_and_register_github_file,
-                                            )
                                             _gh_fb_parsed = {
                                                 "tool": "read_file",
                                                 "args": {
@@ -14629,6 +14630,92 @@ async def run_natural_pipeline_stream(
                                                   github_path=_gh_fb_path,
                                                   error=str(_gh_fb_err)[:200])
                                             continue
+
+                                    # ── Step 1b: Dynamic search — if hardcoded
+                                    #    prefixes all missed, use search_code to
+                                    #    find the file by name anywhere in repo,
+                                    #    then read_file the discovered path. ──
+                                    if not content:
+                                        try:
+                                            from services.github_context_tools import (
+                                                execute_github_context_tool,
+                                            )
+                                            _gh_search_q = f"filename:{fn}"
+                                            _dlog("agent_filereq_search_code_start",
+                                                  session_id=session_id,
+                                                  user_id=user_id, turn=_turn,
+                                                  filename=fn, query=_gh_search_q)
+                                            _gh_search_res = execute_github_context_tool(
+                                                "search_code",
+                                                {"owner": _gh_fb_owner,
+                                                 "repo": _gh_fb_repo,
+                                                 "query": _gh_search_q},
+                                                user_id, dlog=_dlog,
+                                            )
+                                            # Parse paths from search results.
+                                            # Each hit line is just the path, e.g.
+                                            #   "frontend/src/api/client.ts"
+                                            _gh_search_paths = []
+                                            for _sr_line in (_gh_search_res or "").splitlines():
+                                                _sr_line = _sr_line.strip()
+                                                if (not _sr_line
+                                                        or _sr_line.startswith("Code search")
+                                                        or _sr_line.startswith("(no match")
+                                                        or _sr_line.startswith("[")):
+                                                    continue
+                                                # Only keep paths whose basename
+                                                # matches the requested filename
+                                                if _sr_line.split("/")[-1] == fn:
+                                                    _gh_search_paths.append(_sr_line)
+                                            _dlog("agent_filereq_search_code_results",
+                                                  session_id=session_id,
+                                                  user_id=user_id, turn=_turn,
+                                                  filename=fn,
+                                                  paths=_gh_search_paths[:5])
+                                            for _sr_path in _gh_search_paths[:3]:
+                                                try:
+                                                    _sr_parsed = {
+                                                        "tool": "read_file",
+                                                        "args": {
+                                                            "owner": _gh_fb_owner,
+                                                            "repo": _gh_fb_repo,
+                                                            "path": _sr_path,
+                                                        },
+                                                        "reason": f"Auto-fetch via search: {fn}",
+                                                    }
+                                                    _sr_entry = fetch_and_register_github_file(
+                                                        _sr_parsed, user_id,
+                                                        session_id, dlog=_dlog)
+                                                    if _sr_entry and _sr_entry.get("content"):
+                                                        content = _sr_entry["content"]
+                                                        file_content_lookup_stream[fn] = content
+                                                        try:
+                                                            _sr_smap = parser.parse(content, fn)
+                                                            symbol_maps_by_name[fn] = (
+                                                                _sr_smap, _sr_entry)
+                                                        except Exception:
+                                                            pass
+                                                        _dlog("agent_filereq_search_fallback_ok",
+                                                              session_id=session_id,
+                                                              user_id=user_id, turn=_turn,
+                                                              filename=fn,
+                                                              github_path=_sr_path,
+                                                              content_len=len(content))
+                                                        break
+                                                except Exception as _sr_err:
+                                                    _dlog("agent_filereq_search_fallback_err",
+                                                          session_id=session_id,
+                                                          user_id=user_id, turn=_turn,
+                                                          filename=fn,
+                                                          github_path=_sr_path,
+                                                          error=str(_sr_err)[:200])
+                                                    continue
+                                        except Exception as _gh_search_err:
+                                            _dlog("agent_filereq_search_code_failed",
+                                                  session_id=session_id,
+                                                  user_id=user_id, turn=_turn,
+                                                  filename=fn,
+                                                  error=str(_gh_search_err)[:200])
 
                         if not content:
                             # ── Step 2: Human-in-the-loop — pause and ask the

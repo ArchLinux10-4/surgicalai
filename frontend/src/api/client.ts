@@ -725,9 +725,12 @@ export interface ImageStudioResult {
 export function generateImage(body: {
   prompt: string
   model?: string // gpt-5.5 (default) | gpt-5.6-sol | gpt-5.6-terra | gpt-5.6-luna
-  image_base64?: string
+  images?: { base64: string; mime: string }[] // up to 5 reference images
+  image_base64?: string // legacy single-image compat
   image_mime?: string
   quality?: string // low | medium | high — omitted means auto
+  size?: string // auto | 1024x1024 | 1536x1024 | 1024x1536
+  output_format?: string // png | jpeg | webp
   previous_response_id?: string // multi-turn editing: edit the previous result
 }): Promise<ImageStudioResult> {
   return request<ImageStudioResult>('/images/generate', {

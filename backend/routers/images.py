@@ -51,18 +51,31 @@ MAX_INPUT_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MB decoded — sanity cap
 
 ALLOWED_INPUT_MIMES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
 
+MAX_INPUT_IMAGES = 5  # API supports multiple input_image items; cap for sanity
+
+# Official values per docs (tools-image-generation). Anything else is ignored.
+ALLOWED_QUALITIES = {"low", "medium", "high", "auto"}
+ALLOWED_SIZES = {"auto", "1024x1024", "1536x1024", "1024x1536", "2048x2048"}
+ALLOWED_OUTPUT_FORMATS = {"png", "jpeg", "webp"}
+
+
+class InputImage(BaseModel):
+    base64: str
+    mime: str
+
 
 class ImageRequest(BaseModel):
     prompt: str
     model: str | None = None          # user-selected model; None → IMAGE_MODEL default
+    # Multi-image: up to 5 reference images (new). Takes priority over legacy single fields.
+    images: list[InputImage] | None = None
+    # Legacy single-image fields — still accepted for backward compat
     image_base64: str | None = None   # bare base64, no data: prefix
     image_mime: str | None = None     # e.g. "image/jpeg"
     quality: str | None = None        # docs: low | medium | high | auto
+    size: str | None = None           # docs: auto | 1024x1024 | 1536x1024 | 1024x1536
+    output_format: str | None = None  # docs: png | jpeg | webp
     previous_response_id: str | None = None  # multi-turn editing (docs: resp_…)
-
-
-# Official values per docs (tools-image-generation). Anything else is ignored.
-ALLOWED_QUALITIES = {"low", "medium", "high", "auto"}
 
 
 def _dlog(msg: str) -> None:
@@ -91,28 +104,40 @@ def _error(code: str, detail: str, status: int = 200) -> dict:
     return {"ok": False, "error_code": code, "detail": detail}
 
 
+def _normalize_images(body: ImageRequest) -> list[InputImage]:
+    """Merge legacy single-image fields into the images list. Returns unified list."""
+    if body.images:
+        return body.images[:MAX_INPUT_IMAGES]
+    if body.image_base64:
+        return [InputImage(base64=body.image_base64, mime=body.image_mime or "image/png")]
+    return []
+
+
 def _validate(body: ImageRequest) -> dict | None:
     """Returns an error dict if the request is invalid, else None."""
     if not body.prompt or not body.prompt.strip():
         return _error("empty_prompt", "Prompt is required.")
-    if body.image_base64:
-        mime = (body.image_mime or "").lower()
+    images = _normalize_images(body)
+    if len(images) > MAX_INPUT_IMAGES:
+        return _error("too_many_images", f"Maximum {MAX_INPUT_IMAGES} images allowed.")
+    for idx, img in enumerate(images):
+        mime = (img.mime or "").lower()
         if mime not in ALLOWED_INPUT_MIMES:
             return _error(
                 "bad_mime",
-                f"Unsupported image type '{body.image_mime}'. "
+                f"Image {idx + 1}: unsupported type '{img.mime}'. "
                 "Use PNG, JPEG, WebP, or GIF.",
             )
         try:
-            raw = base64.b64decode(body.image_base64, validate=True)
+            raw = base64.b64decode(img.base64, validate=True)
         except Exception:
-            return _error("bad_base64", "Uploaded image is not valid base64.")
+            return _error("bad_base64", f"Image {idx + 1} is not valid base64.")
         if len(raw) > MAX_INPUT_IMAGE_BYTES:
             return _error(
                 "image_too_large",
-                f"Image is {len(raw) // (1024 * 1024)} MB — max is 20 MB.",
+                f"Image {idx + 1} is {len(raw) // (1024 * 1024)} MB — max is 20 MB.",
             )
-        _dlog(f"input_image mime={mime} decoded_bytes={len(raw)}")
+        _dlog(f"input_image[{idx}] mime={mime} decoded_bytes={len(raw)}")
     if body.previous_response_id is not None:
         rid = body.previous_response_id.strip()
         if not rid or not rid.startswith("resp_") or len(rid) > 200:
@@ -142,13 +167,15 @@ def _build_payload(body: ImageRequest) -> dict:
     _dlog(f"model_resolution requested={body.model!r} resolved={resolved_model} rejected={body.model not in ALLOWED_IMAGE_MODELS and body.model is not None}")
 
     content: list[dict] = [{"type": "input_text", "text": body.prompt.strip()}]
-    if body.image_base64:
-        data_url = f"data:{body.image_mime};base64,{body.image_base64}"
+    images = _normalize_images(body)
+    for idx, img in enumerate(images):
+        data_url = f"data:{img.mime};base64,{img.base64}"
         content.append({"type": "input_image", "image_url": data_url})
+    _dlog(f"content_items text=1 images={len(images)}")
 
-    # Quality is an official tool option (docs: size/quality/format on the tool
-    # object). Whitelist-validated; anything unexpected is ignored so a bad
-    # value can never break generation. Omitting it == today's default (auto).
+    # Quality, size, output_format are official tool options (docs: size/quality/
+    # format on the tool object). Whitelist-validated; anything unexpected is
+    # ignored so a bad value can never break generation.
     tool: dict = {"type": "image_generation"}
     if body.quality:
         if body.quality in ALLOWED_QUALITIES and body.quality != "auto":
@@ -156,6 +183,18 @@ def _build_payload(body: ImageRequest) -> dict:
             _dlog(f"quality applied={body.quality}")
         else:
             _dlog(f"quality ignored value={body.quality!r}")
+    if body.size:
+        if body.size in ALLOWED_SIZES and body.size != "auto":
+            tool["size"] = body.size
+            _dlog(f"size applied={body.size}")
+        else:
+            _dlog(f"size ignored value={body.size!r}")
+    if body.output_format:
+        if body.output_format in ALLOWED_OUTPUT_FORMATS:
+            tool["output_format"] = body.output_format
+            _dlog(f"output_format applied={body.output_format}")
+        else:
+            _dlog(f"output_format ignored value={body.output_format!r}")
 
     payload = {
         "model": resolved_model,
@@ -175,8 +214,9 @@ def _build_payload(body: ImageRequest) -> dict:
         payload["previous_response_id"] = body.previous_response_id.strip()
 
     _dlog(
-        f"payload model={resolved_model} has_input_image={bool(body.image_base64)} "
+        f"payload model={resolved_model} input_images={len(images)} "
         f"prompt_len={len(body.prompt)} quality={tool.get('quality', 'auto')} "
+        f"size={tool.get('size', 'auto')} format={tool.get('output_format', 'png')} "
         f"chained={bool(body.previous_response_id)} tool_choice=image_generation"
     )
     return payload
@@ -285,7 +325,7 @@ def generate_image(body: ImageRequest, request: Request):
         _dlog(f"model_override_denied user_id={user_id} requested={body.model!r} is_admin={is_admin}")
         body.model = None  # will resolve to IMAGE_MODEL (gpt-5.5) in _build_payload
 
-    _dlog(f"request user_id={user_id} is_admin={is_admin} mode={'edit' if body.image_base64 else 'generate'} requested_model={body.model!r}")
+    _dlog(f"request user_id={user_id} is_admin={is_admin} mode={'edit' if _normalize_images(body) else 'generate'} requested_model={body.model!r}")
 
     invalid = _validate(body)
     if invalid:
@@ -337,12 +377,15 @@ def generate_image(body: ImageRequest, request: Request):
 
     # Audit trail: one greppable line per completed call — who spent what.
     # Wrapped so a logging hiccup can never break a successful generation.
+    audit_images = _normalize_images(body)
     try:
         _dlog(
             f"audit user_id={user_id} model={payload['model']} ok={result.get('ok')} "
-            f"mode={'edit' if body.image_base64 else 'generate'} "
+            f"mode={'edit' if audit_images else 'generate'} "
+            f"input_images={len(audit_images)} "
             f"chained={bool(body.previous_response_id)} "
-            f"quality={body.quality or 'auto'} elapsed={elapsed:.1f}s "
+            f"quality={body.quality or 'auto'} size={body.size or 'auto'} "
+            f"format={body.output_format or 'png'} elapsed={elapsed:.1f}s "
             f"image_b64_len={len(result.get('image_base64') or '')} "
             f"prompt={body.prompt.strip()[:120]!r}"
         )

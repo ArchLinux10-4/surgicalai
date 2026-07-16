@@ -22,7 +22,22 @@ import { AddPhotoAlternateOutlined, AutoAwesome, Close, FileDownload, ImageOutli
  */
 
 const MAX_UPLOAD_BYTES = 20 * 1024 * 1024 // must match backend cap
+const MAX_INPUT_IMAGES = 5 // up to 5 reference images per generation
 const ALLOWED_MIMES = ['image/png', 'image/jpeg', 'image/webp', 'image/gif']
+
+const SIZE_OPTIONS = [
+  { value: 'auto', label: 'Auto' },
+  { value: '1024x1024', label: 'Square (1024×1024)' },
+  { value: '1536x1024', label: 'Landscape (1536×1024)' },
+  { value: '1024x1536', label: 'Portrait (1024×1536)' },
+  { value: '2048x2048', label: 'Large Square (2048×2048)' },
+] as const
+
+const FORMAT_OPTIONS = [
+  { value: 'png', label: 'PNG (lossless)' },
+  { value: 'jpeg', label: 'JPEG (faster)' },
+  { value: 'webp', label: 'WebP (smaller)' },
+] as const
 
 /** One completed generation/edit turn in the session. */
 interface Turn {
@@ -37,7 +52,7 @@ export function ImageStudio() {
   const open = useAppStore(s => s.imageStudioOpen)
   const setOpen = useAppStore(s => s.setImageStudioOpen)
   const [prompt, setPrompt] = useState('')
-  const [inputImage, setInputImage] = useState<{ base64: string; mime: string; name: string } | null>(null)
+  const [inputImages, setInputImages] = useState<{ base64: string; mime: string; name: string }[]>([])
   const [turns, setTurns] = useState<Turn[]>([])
   const [activeIdx, setActiveIdx] = useState(0) // version shown on canvas + chain target
   const [error, setError] = useState('')
@@ -45,8 +60,11 @@ export function ImageStudio() {
   const [busy, setBusy] = useState(false)
   const [elapsed, setElapsed] = useState(0)
   const [quality, setQuality] = useState('auto') // auto | low | medium | high
+  const [size, setSize] = useState('auto') // auto | 1024x1024 | 1536x1024 | 1024x1536
+  const [outputFormat, setOutputFormat] = useState('png') // png | jpeg | webp
   const [model, setModel] = useState('gpt-5.5') // gpt-5.5 | gpt-5.6-sol | gpt-5.6-terra | gpt-5.6-luna
   const isAdmin = useAuthStore(s => s.user?.is_admin ?? false)
+  const [dragging, setDragging] = useState(false) // drag-over visual feedback
   const fileRef = useRef<HTMLInputElement>(null)
   const threadRef = useRef<HTMLDivElement>(null)
 
@@ -84,29 +102,47 @@ export function ImageStudio() {
     setOpen(false)
   }
 
-  const onFile = (file: File | undefined) => {
+  const onFiles = (files: FileList | null) => {
     setError('')
-    if (!file) return
-    if (!ALLOWED_MIMES.includes(file.type)) {
-      setError(`Unsupported file type "${file.type || 'unknown'}" — use PNG, JPEG, WebP, or GIF.`)
+    if (!files || files.length === 0) return
+    const remaining = MAX_INPUT_IMAGES - inputImages.length
+    if (remaining <= 0) {
+      setError(`Maximum ${MAX_INPUT_IMAGES} images allowed.`)
       return
     }
-    if (file.size > MAX_UPLOAD_BYTES) {
-      setError(`Image is ${Math.round(file.size / 1024 / 1024)} MB — max is 20 MB.`)
-      return
+    const toAdd = Array.from(files).slice(0, remaining)
+    if (files.length > remaining) {
+      setError(`Only ${remaining} more image${remaining === 1 ? '' : 's'} allowed — extra files skipped.`)
     }
-    const reader = new FileReader()
-    reader.onload = () => {
-      const dataUrl = String(reader.result || '')
-      const base64 = dataUrl.split(',')[1] || ''
-      if (!base64) {
-        setError('Could not read the image file.')
+    for (const file of toAdd) {
+      if (!ALLOWED_MIMES.includes(file.type)) {
+        setError(`"${file.name}" — unsupported type. Use PNG, JPEG, WebP, or GIF.`)
         return
       }
-      setInputImage({ base64, mime: file.type, name: file.name })
+      if (file.size > MAX_UPLOAD_BYTES) {
+        setError(`"${file.name}" is ${Math.round(file.size / 1024 / 1024)} MB — max is 20 MB.`)
+        return
+      }
     }
-    reader.onerror = () => setError('Could not read the image file.')
-    reader.readAsDataURL(file)
+    // Read all valid files
+    for (const file of toAdd) {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const dataUrl = String(reader.result || '')
+        const b64 = dataUrl.split(',')[1] || ''
+        if (!b64) return
+        setInputImages(prev => {
+          if (prev.length >= MAX_INPUT_IMAGES) return prev
+          return [...prev, { base64: b64, mime: file.type, name: file.name }]
+        })
+      }
+      reader.onerror = () => setError(`Could not read "${file.name}".`)
+      reader.readAsDataURL(file)
+    }
+  }
+
+  const removeImage = (idx: number) => {
+    setInputImages(prev => prev.filter((_, i) => i !== idx))
   }
 
   /** Runs one turn: fresh generation when no session, chained edit otherwise. */
@@ -127,12 +163,15 @@ export function ImageStudio() {
       const res: ImageStudioResult = await generateImage({
         prompt: prompt.trim(),
         model,
-        // First turn only: optional uploaded source image. Follow-up turns
+        // First turn only: optional uploaded source images. Follow-up turns
         // inherit image context through previous_response_id chaining.
-        image_base64: hasSession ? undefined : inputImage?.base64,
-        image_mime: hasSession ? undefined : inputImage?.mime,
-        // Omit "auto" so the default request stays byte-identical to before.
+        images: !hasSession && inputImages.length > 0
+          ? inputImages.map(img => ({ base64: img.base64, mime: img.mime }))
+          : undefined,
+        // Omit defaults so the request stays byte-identical to before when unchanged.
         quality: quality !== 'auto' ? quality : undefined,
+        size: size !== 'auto' ? size : undefined,
+        output_format: outputFormat !== 'png' ? outputFormat : undefined,
         previous_response_id: hasSession ? active!.responseId : undefined,
       })
       if (res.ok && res.image_base64) {
@@ -172,12 +211,14 @@ export function ImageStudio() {
     if (busy) return
     if (turns.length > 0 && !window.confirm('Start a new session? Your current versions will be lost.')) return
     setPrompt('')
-    setInputImage(null)
+    setInputImages([])
     setTurns([])
     setActiveIdx(0)
     setError('')
     setIsRefusal(false)
     setQuality('auto')
+    setSize('auto')
+    setOutputFormat('png')
     setModel('gpt-5.5')
     // File inputs keep their last value even after state clears — wipe it so
     // re-uploading the same file still fires onChange.
@@ -261,9 +302,9 @@ export function ImageStudio() {
                       <textarea
                         value={prompt}
                         onChange={e => setPrompt(e.target.value)}
-                        placeholder={inputImage
-                          ? 'Describe how to edit the uploaded image…'
-                          : 'Describe the image to generate — or upload one to edit…'}
+                        placeholder={inputImages.length > 0
+                          ? `Describe how to use your ${inputImages.length} image${inputImages.length > 1 ? 's' : ''}…`
+                          : 'Describe the image to generate — or upload images to edit…'}
                         onKeyDown={onPromptKeyDown}
                         className="w-full flex-1 min-h-[120px] rounded-lg border border-border bg-base p-3 text-sm resize-none focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/30"
                       />
@@ -303,32 +344,69 @@ export function ImageStudio() {
                     </div>
 
                     <div className="flex flex-col gap-1.5">
-                      <label className="text-xs font-medium text-muted uppercase tracking-wide">Source image (optional)</label>
+                      <label className="text-xs font-medium text-muted uppercase tracking-wide">
+                        Reference images <span className="font-normal">(optional, up to {MAX_INPUT_IMAGES})</span>
+                      </label>
                       <input
                         ref={fileRef}
                         type="file"
                         accept={ALLOWED_MIMES.join(',')}
+                        multiple
                         className="hidden"
-                        onChange={e => onFile(e.target.files?.[0])}
+                        onChange={e => { onFiles(e.target.files); if (fileRef.current) fileRef.current.value = '' }}
                       />
-                      <button
-                        onClick={() => fileRef.current?.click()}
-                        disabled={busy}
-                        className="w-full px-3 py-2 rounded-lg border border-dashed border-border text-sm text-muted hover:text-fg hover:border-accent/60 disabled:opacity-50 transition-colors flex items-center justify-center gap-1.5"
-                      >
-                        <AddPhotoAlternateOutlined sx={{ fontSize: 16 }} /> {inputImage ? 'Replace image' : 'Upload image to edit'}
-                      </button>
-                      {inputImage && (
-                        <div className="flex items-center gap-2 text-xs text-muted rounded-lg border border-border p-2">
-                          <img
-                            src={`data:${inputImage.mime};base64,${inputImage.base64}`}
-                            alt="input"
-                            className="h-10 w-10 object-cover rounded border border-border"
-                          />
-                          <span className="flex-1 truncate">{inputImage.name}</span>
-                          <button onClick={() => setInputImage(null)} disabled={busy} className="text-muted hover:text-fg flex items-center" title="Remove"><Close sx={{ fontSize: 16 }} /></button>
+                      {inputImages.length < MAX_INPUT_IMAGES && (
+                        <button
+                          onClick={() => fileRef.current?.click()}
+                          disabled={busy}
+                          className="w-full px-3 py-2 rounded-lg border border-dashed border-border text-sm text-muted hover:text-fg hover:border-accent/60 disabled:opacity-50 transition-colors flex items-center justify-center gap-1.5"
+                        >
+                          <AddPhotoAlternateOutlined sx={{ fontSize: 16 }} />
+                          {inputImages.length === 0 ? 'Upload images' : `Add more (${inputImages.length}/${MAX_INPUT_IMAGES})`}
+                        </button>
+                      )}
+                      {inputImages.length > 0 && (
+                        <div className="flex flex-col gap-1.5 max-h-[200px] overflow-y-auto">
+                          {inputImages.map((img, i) => (
+                            <div key={i} className="flex items-center gap-2 text-xs text-muted rounded-lg border border-border p-2">
+                              <img
+                                src={`data:${img.mime};base64,${img.base64}`}
+                                alt={`input ${i + 1}`}
+                                className="h-10 w-10 object-cover rounded border border-border shrink-0"
+                              />
+                              <span className="flex-1 truncate">{img.name}</span>
+                              <button onClick={() => removeImage(i)} disabled={busy} className="text-muted hover:text-fg flex items-center shrink-0" title="Remove">
+                                <Close sx={{ fontSize: 16 }} />
+                              </button>
+                            </div>
+                          ))}
                         </div>
                       )}
+                    </div>
+
+                    <div className="flex gap-2">
+                      <div className="flex flex-col gap-1.5 flex-1">
+                        <label className="text-xs font-medium text-muted uppercase tracking-wide">Size</label>
+                        <select
+                          value={size}
+                          onChange={e => setSize(e.target.value)}
+                          disabled={busy}
+                          className="w-full rounded-lg border border-border bg-base px-3 py-2 text-sm disabled:opacity-50 focus:outline-none focus:border-accent/60"
+                        >
+                          {SIZE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      </div>
+                      <div className="flex flex-col gap-1.5 flex-1">
+                        <label className="text-xs font-medium text-muted uppercase tracking-wide">Format</label>
+                        <select
+                          value={outputFormat}
+                          onChange={e => setOutputFormat(e.target.value)}
+                          disabled={busy}
+                          className="w-full rounded-lg border border-border bg-base px-3 py-2 text-sm disabled:opacity-50 focus:outline-none focus:border-accent/60"
+                        >
+                          {FORMAT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                      </div>
                     </div>
 
                     <button
@@ -338,7 +416,7 @@ export function ImageStudio() {
                     >
                       {busy
                         ? `Generating… ${elapsed}s`
-                        : inputImage ? 'Edit image' : 'Generate image'}
+                        : inputImages.length > 0 ? `Edit${inputImages.length > 1 ? ` (${inputImages.length} images)` : ' image'}` : 'Generate image'}
                     </button>
                     {busy && (
                       <p className="text-[11px] text-muted text-center -mt-2">Image models can take 1–2 minutes</p>
@@ -396,7 +474,7 @@ export function ImageStudio() {
                         rows={3}
                         className="w-full rounded-lg border border-border bg-base p-3 text-sm resize-none focus:outline-none focus:border-accent/60 focus:ring-1 focus:ring-accent/30"
                       />
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 flex-wrap">
                         {isAdmin && (
                         <select
                           value={model}
@@ -415,13 +493,31 @@ export function ImageStudio() {
                           value={quality}
                           onChange={e => setQuality(e.target.value)}
                           disabled={busy}
-                          title="Quality for the next edit"
+                          title="Quality"
                           className="rounded-lg border border-border bg-base px-2 py-2 text-xs disabled:opacity-50 focus:outline-none focus:border-accent/60"
                         >
                           <option value="auto">Auto</option>
                           <option value="low">Low</option>
                           <option value="medium">Medium</option>
                           <option value="high">High</option>
+                        </select>
+                        <select
+                          value={size}
+                          onChange={e => setSize(e.target.value)}
+                          disabled={busy}
+                          title="Size"
+                          className="rounded-lg border border-border bg-base px-2 py-2 text-xs disabled:opacity-50 focus:outline-none focus:border-accent/60"
+                        >
+                          {SIZE_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
+                        </select>
+                        <select
+                          value={outputFormat}
+                          onChange={e => setOutputFormat(e.target.value)}
+                          disabled={busy}
+                          title="Output format"
+                          className="rounded-lg border border-border bg-base px-2 py-2 text-xs disabled:opacity-50 focus:outline-none focus:border-accent/60"
+                        >
+                          {FORMAT_OPTIONS.map(o => <option key={o.value} value={o.value}>{o.label}</option>)}
                         </select>
                         <button
                           onClick={run}
