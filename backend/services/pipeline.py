@@ -439,6 +439,124 @@ def _parse_search_content(raw: str):
         return None
 
 
+def pick_no_edits_notice(
+    hit_agent_max_turns: bool,
+    has_skipped_changes: bool,
+    normal_buf: str,
+    full_response: str,
+    agent_max_turns: int,
+):
+    """Choose the right "no code changes" notice to show the user when an
+    agent-mode turn ends with zero edit blocks and zero skipped-plan-items.
+
+    Returns (event_name_for_dlog, message_or_None). message is None when
+    nothing should be shown (caller still yields the "done" event).
+
+    Proven bug (session 6930f196): `full_response` is reset every turn (it's
+    the LAST turn's transcript only — see the per-turn state reset in the
+    main loop) and can contain raw, un-executed <search_request>/<filereq>/
+    <github> tag text that was NEVER streamed to the user — only
+    `normal_buf` is actually sent as "token" SSE events. The old code
+    checked `full_response.strip()` and unconditionally said "the response
+    above was a plan/explanation only," which is false when the cutoff
+    happened mid-tool-call (e.g. AGENT_MAX_TURNS hit while composing a
+    <search_request>). This function picks an honest, specific message
+    instead, distinguishing:
+      1. Ran out of turns entirely (mid-search) -> say so explicitly.
+      2. Real user-visible prose exists (normal_buf) -> the old "plan only" msg.
+      3. Cut off some other way with no real prose to show -> honest fallback.
+      4. Nothing at all -> no notice (caller just sends "done").
+    """
+    if hit_agent_max_turns:
+        return "no_edits_max_turns_notice", (
+            f"\n\n⚠️ I ran out of turns ({agent_max_turns}) while still "
+            "searching/reading files and never got to write an edit. "
+            "Try pointing me directly at the specific file and "
+            "function/section to change — that skips the search step "
+            "and leaves more turns for the actual edit."
+        )
+    if normal_buf.strip():
+        return "no_edits_text_only_notice", (
+            "\n\n⚠️ No code changes were produced — the response above "
+            "was a plan/explanation only.  Please try again and I'll "
+            "apply the edits directly."
+        )
+    if full_response.strip():
+        return "no_edits_notext_notice", (
+            "\n\n⚠️ No code changes were produced and I ran out of time "
+            "before finishing my search. Try a more specific request "
+            "(exact file + function) so I can skip straight to editing."
+        )
+    return "no_edits_silent", None
+
+
+_FILEREQ_EXT_SWAP = {"ts": "tsx", "tsx": "ts", "js": "jsx", "jsx": "js"}
+_FILEREQ_BARREL_NAMES = ("index.ts", "index.tsx", "index.js", "index.jsx")
+
+
+def build_filereq_search_variants(fn: str):
+    """Build an ordered list of GitHub `filename:` search-query variants to try
+    for a requested filename `fn`, plus how to validate each variant's hits.
+
+    Proven necessary against real repo data (session 6930f196): the model
+    asked for "lib/fileClassify.ts" (real file is
+    "frontend/src/lib/fileClassify.tsx" — .ts vs .tsx) and "types.ts" (real
+    file is "frontend/src/types/index.ts" — an index-barrel), and the old
+    single-shot exact-match search returned/matched nothing for either.
+
+    Returns a list of (query_basename, acceptable_basenames, allow_barrel)
+    tuples, in the order they should be tried. Stop at the first variant
+    whose search actually returns a matching path.
+    """
+    base = fn.split("/")[-1]
+    stem, dot, ext = base.rpartition(".")
+    swapped_ext = _FILEREQ_EXT_SWAP.get(ext) if dot else None
+    swapped_base = f"{stem}.{swapped_ext}" if swapped_ext else None
+
+    # Accept either the requested extension or its swapped sibling on the
+    # "as given" / "bare basename" queries — GitHub's filename: qualifier can
+    # (and does, verified live) return a hit whose real extension differs
+    # from what was requested (e.g. asked "fileClassify.ts", found
+    # "fileClassify.tsx") on the very first, unmodified query.
+    _primary_ok_bases = {base, swapped_base} if swapped_base else {base}
+
+    # 1) Try the request as given first — GitHub's filename: qualifier
+    #    matches on path suffix, so a correct directory hint helps narrow
+    #    results even though we only validate the basename below.
+    variants = [(fn, _primary_ok_bases, False)]
+    if fn != base:
+        # 2) fn had a (possibly wrong) directory prefix — also try the bare
+        #    basename in case the guessed subdir was itself wrong.
+        variants.append((base, _primary_ok_bases, False))
+    if swapped_base:
+        # 3) Extension variant (.ts<->.tsx, .js<->.jsx) as its own query, in
+        #    case the as-given/basename queries returned nothing at all.
+        variants.append((swapped_base, {swapped_base}, False))
+    if dot:
+        # 4) index-barrel: requested "X.ts" may really be a folder "X/" whose
+        #    entry point is "X/index.ts" (or .tsx/.js/.jsx)
+        variants.append((f"{stem}/index.ts", set(), True))
+        variants.append((f"{stem}/index.tsx", set(), True))
+    return variants
+
+
+def filereq_path_matches(path: str, acceptable_basenames: set, allow_barrel: bool, stem: str) -> bool:
+    """Check whether a GitHub search-result `path` counts as a real match for
+    a file-request variant. Compares basenames (not full paths — a requested
+    name never includes the repo's directory structure), and separately
+    recognizes the index-barrel pattern ("<stem>/index.ts" etc.)."""
+    result_base = path.split("/")[-1]
+    if result_base in acceptable_basenames:
+        return True
+    if allow_barrel:
+        parts = path.rsplit("/", 1)
+        if len(parts) == 2:
+            parent_name = parts[0].rsplit("/", 1)[-1]
+            if parent_name == stem and parts[1] in _FILEREQ_BARREL_NAMES:
+                return True
+    return False
+
+
 def _parse_plan_content(raw: str):
     """Parse edit_plan tag content — JSON list. Returns list or None."""
     try:
@@ -13915,6 +14033,7 @@ async def run_natural_pipeline_stream(
         tag_buf = ""
         _phase2_thinking_buf = ""
         _streaming_starvation_abort = False
+        _hit_agent_max_turns = False       # set True only by the AGENT_MAX_TURNS ceiling break
         _phase2_filereq_used = False      # retained: read by post-stream starvation dlog
         _no_text_recovery_used = False    # retained: read by post-stream starvation dlog
 
@@ -14045,6 +14164,7 @@ async def run_natural_pipeline_stream(
                     _streaming_starvation_abort = True
                 break
             if _turn > AGENT_MAX_TURNS:
+                _hit_agent_max_turns = True
                 _dlog("agent_loop_max_turns",
                       session_id=session_id, user_id=user_id,
                       turn=_turn, edit_blocks=len(edit_blocks_raw),
@@ -14688,38 +14808,67 @@ async def run_natural_pipeline_stream(
                                             from services.github_context_tools import (
                                                 execute_github_context_tool,
                                             )
-                                            _gh_search_q = f"filename:{fn}"
-                                            _dlog("agent_filereq_search_code_start",
-                                                  session_id=session_id,
-                                                  user_id=user_id, turn=_turn,
-                                                  filename=fn, query=_gh_search_q)
-                                            _gh_search_res = execute_github_context_tool(
-                                                "search_code",
-                                                {"owner": _gh_fb_owner,
-                                                 "repo": _gh_fb_repo,
-                                                 "query": _gh_search_q},
-                                                user_id, dlog=_dlog,
-                                            )
-                                            # Parse paths from search results.
-                                            # Each hit line is just the path, e.g.
-                                            #   "frontend/src/api/client.ts"
+                                            # ── Try an ordered list of query
+                                            #    variants + acceptable-basename
+                                            #    matchers (see
+                                            #    build_filereq_search_variants
+                                            #    docstring for the proof).
+                                            #    Stop at the first variant
+                                            #    that yields a real match, so
+                                            #    a wrong subdir guess or a
+                                            #    .ts/.tsx (or .js/.jsx)
+                                            #    mismatch doesn't sink the
+                                            #    whole lookup. ──
+                                            _fr_stem = fn.split("/")[-1].rpartition(".")[0]
+                                            _fr_variants = build_filereq_search_variants(fn)
+
                                             _gh_search_paths = []
-                                            for _sr_line in (_gh_search_res or "").splitlines():
-                                                _sr_line = _sr_line.strip()
-                                                if (not _sr_line
-                                                        or _sr_line.startswith("Code search")
-                                                        or _sr_line.startswith("(no match")
-                                                        or _sr_line.startswith("[")):
-                                                    continue
-                                                # Only keep paths whose basename
-                                                # matches the requested filename
-                                                if _sr_line.split("/")[-1] == fn:
-                                                    _gh_search_paths.append(_sr_line)
-                                            _dlog("agent_filereq_search_code_results",
-                                                  session_id=session_id,
-                                                  user_id=user_id, turn=_turn,
-                                                  filename=fn,
-                                                  paths=_gh_search_paths[:5])
+                                            _fr_matched_variant = None
+                                            for _fr_query_base, _fr_ok_bases, _fr_allow_barrel in _fr_variants:
+                                                _gh_search_q = f"filename:{_fr_query_base}"
+                                                _dlog("agent_filereq_search_code_start",
+                                                      session_id=session_id,
+                                                      user_id=user_id, turn=_turn,
+                                                      filename=fn, query=_gh_search_q)
+                                                _gh_search_res = execute_github_context_tool(
+                                                    "search_code",
+                                                    {"owner": _gh_fb_owner,
+                                                     "repo": _gh_fb_repo,
+                                                     "query": _gh_search_q},
+                                                    user_id, dlog=_dlog,
+                                                )
+                                                # Parse paths from search results.
+                                                # Each hit line is just the path, e.g.
+                                                #   "frontend/src/api/client.ts"
+                                                _variant_paths = []
+                                                for _sr_line in (_gh_search_res or "").splitlines():
+                                                    _sr_line = _sr_line.strip()
+                                                    if (not _sr_line
+                                                            or _sr_line.startswith("Code search")
+                                                            or _sr_line.startswith("(no match")
+                                                            or _sr_line.startswith("[")):
+                                                        continue
+                                                    if filereq_path_matches(
+                                                            _sr_line, _fr_ok_bases,
+                                                            _fr_allow_barrel, _fr_stem):
+                                                        _variant_paths.append(_sr_line)
+                                                _dlog("agent_filereq_search_code_results",
+                                                      session_id=session_id,
+                                                      user_id=user_id, turn=_turn,
+                                                      filename=fn,
+                                                      query=_gh_search_q,
+                                                      paths=_variant_paths[:5])
+                                                if _variant_paths:
+                                                    _gh_search_paths = _variant_paths
+                                                    _fr_matched_variant = _gh_search_q
+                                                    break
+                                            if _gh_search_paths:
+                                                _dlog("agent_filereq_search_code_variant_matched",
+                                                      session_id=session_id,
+                                                      user_id=user_id, turn=_turn,
+                                                      filename=fn,
+                                                      matched_query=_fr_matched_variant,
+                                                      paths=_gh_search_paths[:5])
                                             for _sr_path in _gh_search_paths[:3]:
                                                 try:
                                                     _sr_parsed = {
@@ -15618,20 +15767,28 @@ async def run_natural_pipeline_stream(
                     "natural_text": _fail_msg,
                 }
                 yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(_fail_result)})
-            elif full_response.strip() and not skipped_changes_struct:
-                # Model produced text (e.g. a plan/explanation) but no actual
-                # edit blocks.  The text was already streamed as tokens;
-                # send a clear notice so the user knows no files were changed.
-                _noedit_msg = (
-                    "\n\n⚠️ No code changes were produced — the response above "
-                    "was a plan/explanation only.  Please try again and I'll "
-                    "apply the edits directly."
+            elif not skipped_changes_struct:
+                # Pick an honest, specific "no edits" notice. See
+                # pick_no_edits_notice docstring for the full proof (session
+                # 6930f196): full_response is reset every turn and can hold
+                # raw un-executed tag text that was never actually streamed
+                # to the user (only normal_buf is streamed as "token"
+                # events), so we must not treat non-empty full_response as
+                # equivalent to "the model showed you a plan."
+                _notice_event, _noedit_msg = pick_no_edits_notice(
+                    _hit_agent_max_turns, bool(skipped_changes_struct),
+                    normal_buf, full_response, AGENT_MAX_TURNS,
                 )
-                _dlog("no_edits_text_only_notice",
+                _dlog(_notice_event,
                       session_id=session_id, user_id=user_id,
                       response_len=len(full_response),
+                      normal_buf_len=len(normal_buf),
+                      tag_buf_len=len(tag_buf),
+                      state_at_cutoff=state,
+                      turns_used=_turn,
                       was_starvation_recovery=bool(_streaming_starvation_abort))
-                yield sse({"type": "token", "content": _noedit_msg})
+                if _noedit_msg:
+                    yield sse({"type": "token", "content": _noedit_msg})
             yield sse({"type": "done", "content": "", "model": _model_used})
             return
 
