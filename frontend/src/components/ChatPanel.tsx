@@ -847,6 +847,7 @@ export function ChatPanel() {
     sessionId: string
     filename: string
     message: string
+    retry?: boolean
     respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => void
   } | null>(null)
   const fileRequestInputRef = useRef<HTMLInputElement>(null)

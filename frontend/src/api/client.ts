@@ -264,7 +264,7 @@ export const api = {
       // WebSocket. `onFileCleared` fires when the prompt should be dismissed
       // (provided / skipped / timed out).
       onFileNeeded?: (
-        info: { filename: string; message: string },
+        info: { filename: string; message: string; retry?: boolean },
         respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => void,
       ) => void,
       onFileCleared?: (filename: string) => void,
