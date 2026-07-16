@@ -65,6 +65,7 @@ export function ImageStudio() {
   const [model, setModel] = useState('gpt-5.5') // gpt-5.5 | gpt-5.6-sol | gpt-5.6-terra | gpt-5.6-luna
   const isAdmin = useAuthStore(s => s.user?.is_admin ?? false)
   const [dragging, setDragging] = useState(false) // drag-over visual feedback
+  const [versionTipDismissed, setVersionTipDismissed] = useState(false) // one-time branching tip
   const fileRef = useRef<HTMLInputElement>(null)
   const threadRef = useRef<HTMLDivElement>(null)
 
@@ -431,7 +432,7 @@ export function ImageStudio() {
                       {turns.map((t, i) => (
                         <button
                           key={i}
-                          onClick={() => !busy && setActiveIdx(i)}
+                          onClick={() => { if (!busy) { setActiveIdx(i); setVersionTipDismissed(true) } }}
                           className={`text-left rounded-lg border p-3 flex gap-3 items-start transition-colors ${
                             i === activeIdx
                               ? 'border-accent/60 bg-accent/5'
@@ -466,6 +467,21 @@ export function ImageStudio() {
                         Editing from <span className="text-fg font-medium">v{activeIdx + 1}</span>
                         {activeIdx !== turns.length - 1 && ' (branching from an earlier version)'}
                       </p>
+                      {turns.length >= 2 && !versionTipDismissed && (
+                        <div className="flex items-center gap-2 rounded-md bg-accent/10 border border-accent/20 px-3 py-1.5 text-[11px] text-muted">
+                          <span>💡</span>
+                          <span className="flex-1">
+                            <span className="font-medium text-fg">Tip:</span> Click any version above to edit from it. By default, edits continue from the latest.
+                          </span>
+                          <button
+                            onClick={() => setVersionTipDismissed(true)}
+                            className="text-muted hover:text-fg transition-colors ml-1 shrink-0"
+                            title="Dismiss tip"
+                          >
+                            <Close sx={{ fontSize: 14 }} />
+                          </button>
+                        </div>
+                      )}
                       <textarea
                         value={prompt}
                         onChange={e => setPrompt(e.target.value)}
@@ -555,7 +571,7 @@ export function ImageStudio() {
                         {turns.map((t, i) => (
                           <button
                             key={i}
-                            onClick={() => !busy && setActiveIdx(i)}
+                            onClick={() => { if (!busy) { setActiveIdx(i); setVersionTipDismissed(true) } }}
                             title={`v${i + 1}: ${t.prompt.slice(0, 80)}`}
                             className={`relative shrink-0 rounded-lg overflow-hidden border-2 transition-colors ${
                               i === activeIdx ? 'border-accent' : 'border-border hover:border-accent/50'
