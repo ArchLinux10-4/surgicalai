@@ -14515,11 +14515,59 @@ async def run_natural_pipeline_stream(
                               tool=_gh_tool, kind="read" if _gh_is_read else "write",
                               reads=_github_reads_used, writes=_github_writes_used,
                               result_chars=len(str(_gh_result)))
+
+                        # ── Bridge: register GitHub-read files so plan
+                        #    executor can edit them (they need to be in
+                        #    file_content_lookup_stream + symbol_maps_by_name,
+                        #    not just in the conversation history) ──
+                        _gh_note = ""
+                        if _gh_tool == "read_file" and _gh_result and not str(_gh_result).startswith("["):
+                            try:
+                                from services.github_natural_tag import (
+                                    fetch_and_register_github_file,
+                                )
+                                _rf_entry = fetch_and_register_github_file(
+                                    _gh_req, user_id, session_id, dlog=_dlog)
+                                if _rf_entry and _rf_entry.get("content"):
+                                    _rf_fname = _rf_entry["filename"]
+                                    # Inject into file_content_lookup_stream
+                                    # so plan executor can find + edit it
+                                    file_content_lookup_stream[_rf_fname] = (
+                                        _rf_entry["content"])
+                                    # Also register in symbol_maps_by_name
+                                    # so search_codebase works on it
+                                    try:
+                                        _rf_smap = parser.parse(
+                                            _rf_entry["content"], _rf_fname)
+                                        symbol_maps_by_name[_rf_fname] = (
+                                            _rf_smap, _rf_entry)
+                                    except Exception:
+                                        symbol_maps_by_name[_rf_fname] = (
+                                            None, _rf_entry)
+                                    _gh_note = (
+                                        f"\n\n[NOTE: '{_rf_fname}' is now "
+                                        f"loaded as an EDITABLE session file. "
+                                        f"You can edit it with <surgical_edit> "
+                                        f"or include it in an <edit_plan>.]")
+                                    _dlog("agent_github_file_registered",
+                                          session_id=session_id,
+                                          user_id=user_id,
+                                          filename=_rf_fname,
+                                          content_chars=len(_rf_entry["content"]),
+                                          in_lookup=_rf_fname in file_content_lookup_stream,
+                                          in_symbols=_rf_fname in symbol_maps_by_name)
+                            except Exception as _rf_err:
+                                _dlog("agent_github_file_register_failed",
+                                      session_id=session_id,
+                                      user_id=user_id,
+                                      error=str(_rf_err)[:300])
+
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
                             {"role": "user", "content":
                                 f"GitHub result:\n{json.dumps(_gh_result, indent=2, default=str)[:8000]}"
-                                "\n\nRequest more if you need it, or write your edits now."},
+                                + _gh_note
+                                + "\n\nRequest more if you need it, or write your edits now."},
                         ]
                     except Exception as _gh_err:
                         _dlog("agent_github_error",
