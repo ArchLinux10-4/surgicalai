@@ -13778,13 +13778,16 @@ async def run_natural_pipeline_stream(
         # Runaway backstop only — real termination is the deadline/budget above.
         AGENT_MAX_TURNS = int(_os.getenv("AGENT_MAX_TURNS", "24"))
         MAX_FILE_REQ_TOTAL = 15
-        MAX_GITHUB_ROUNDS = 6
-        MAX_GITHUB_ATTEMPTS = 12
+        MAX_GITHUB_READ_ROUNDS = 30
+        MAX_GITHUB_WRITE_ROUNDS = 30
+        MAX_GITHUB_ATTEMPTS = 60
+        _GITHUB_READ_TOOLS = frozenset({"list_files", "read_file", "search_code", "check_deploy", "list_repos"})
 
         # ---- Discovery state (accumulates across turns; no phase wall resets it) ----
         searched_terms: list = []
         requested_files: set = set()
-        _github_rounds_used = 0
+        _github_reads_used = 0
+        _github_writes_used = 0
         _github_attempts = 0
 
         _streaming_t0 = time.time()
@@ -14469,11 +14472,19 @@ async def run_natural_pipeline_stream(
                 if _kind == "github":
                     _gh_req = _data if isinstance(_data, dict) else {"_invalid": str(_data)[:500]}
                     _github_attempts += 1
-                    if (_github_rounds_used >= MAX_GITHUB_ROUNDS
-                            or _github_attempts > MAX_GITHUB_ATTEMPTS):
+                    _gh_tool = _gh_req.get("tool", "")
+                    _gh_is_read = _gh_tool in _GITHUB_READ_TOOLS
+                    _gh_over_budget = (
+                        (_gh_is_read and _github_reads_used >= MAX_GITHUB_READ_ROUNDS)
+                        or (not _gh_is_read and _github_writes_used >= MAX_GITHUB_WRITE_ROUNDS)
+                        or _github_attempts > MAX_GITHUB_ATTEMPTS
+                    )
+                    if _gh_over_budget:
                         _dlog("agent_github_budget_exhausted",
                               session_id=session_id, user_id=user_id,
-                              rounds=_github_rounds_used, attempts=_github_attempts)
+                              kind="read" if _gh_is_read else "write",
+                              reads=_github_reads_used, writes=_github_writes_used,
+                              attempts=_github_attempts)
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
                             {"role": "user", "content":
@@ -14495,10 +14506,15 @@ async def run_natural_pipeline_stream(
                     try:
                         _gh_result = execute_github_request(
                             _gh_req, user_id, dlog=_dlog)
-                        _github_rounds_used += 1
+                        if _gh_is_read:
+                            _github_reads_used += 1
+                        else:
+                            _github_writes_used += 1
                         _dlog("agent_github_result",
                               session_id=session_id, user_id=user_id,
-                              tool=_gh_req.get("tool", ""), result_chars=len(str(_gh_result)))
+                              tool=_gh_tool, kind="read" if _gh_is_read else "write",
+                              reads=_github_reads_used, writes=_github_writes_used,
+                              result_chars=len(str(_gh_result)))
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
                             {"role": "user", "content":
