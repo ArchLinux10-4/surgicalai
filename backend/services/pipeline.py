@@ -505,6 +505,11 @@ _ADAPTIVE_THINKING_MODELS = ("claude-opus-4-8", "claude-opus-4-7", "claude-opus-
 # Omitting effort entirely defaults to 'high' which is correct for these models.
 _NO_XHIGH_EFFORT_MODELS = ("claude-opus-4-6", "claude-sonnet-4-6")
 
+# Default architect model — single source of truth for all get_setting fallbacks.
+# Change here to update every call site at once.
+_DEFAULT_ARCH_MODEL: str = "gpt-4.1"
+
+
 # -- ReAct agentic search: per-session grep cache ----------------------------
 # Keyed by session_cache_key -> accumulated grep text from prior search rounds.
 # Avoids re-scanning large files on follow-up edits in the same session.
@@ -1773,7 +1778,7 @@ def run_architect(
     GPT-5 (Architect): reads symbol map + request → produces structured change plan.
     Never sees raw code — works from the symbol map for efficiency and accuracy.
     """
-    arch_model = model or get_setting("architect_model", "gpt-4.1")
+    arch_model = model or get_setting("architect_model", _DEFAULT_ARCH_MODEL)
     temp = float(get_setting("temperature_architect", "0.0"))
     client = _get_client_for_model(arch_model, user_id)
 
@@ -3033,7 +3038,7 @@ def run_chat(
     Streams response and returns full text.
     DEPRECATED: prefer run_chat_stream() for all new callers.
     """
-    chat_model = model or get_setting("architect_model", "gpt-4.1")
+    chat_model = model or get_setting("architect_model", _DEFAULT_ARCH_MODEL)
 
     system_parts = [CHAT_PERSONA]
 
@@ -3086,7 +3091,7 @@ async def run_chat_stream(
     Streaming version of run_chat. Yields SSE chunks.
     Used by the /api/chat/stream endpoint.
     """
-    chat_model = model or get_setting("architect_model", "gpt-4.1")
+    chat_model = model or get_setting("architect_model", _DEFAULT_ARCH_MODEL)
     _model_used = chat_model
 
     system_parts = [CHAT_PERSONA]
@@ -4680,7 +4685,8 @@ async def run_qa_for_changes(
     file_content: str,
     user_request: str,
     anthropic_key: str,
-    model: str,
+    model: str,  # kept for API compat; QA logic selects model internally
+    user_id: str = "",  # must be real user_id for per-user key isolation
     qa_feedback: dict = None,
 ) -> dict:
     """
@@ -4807,7 +4813,8 @@ async def run_qa_for_changes(
                   error=str(_qa_claude_err)[:200], model=model)
             try:
                 from services.api_retry import api_call_with_retry
-                _qa_oai_client = _get_client("")  # uses default OpenAI key
+                _dlog("qa_for_changes_gpt_fallback", user_id=user_id)
+                _qa_oai_client = _get_client(user_id)  # per-user key isolation
                 _qa_oai_resp = api_call_with_retry(lambda: _qa_oai_client.chat.completions.create(
                     model="gpt-4.1",
                     messages=[
@@ -4901,7 +4908,7 @@ async def analyze_and_plan_stream(
         # ------------------------------------------------------------------
         # Step 2: Get Anthropic key and model
         # ------------------------------------------------------------------
-        architect_model = get_setting("architect_model", "claude-sonnet-5")
+        architect_model = get_setting("architect_model", _DEFAULT_ARCH_MODEL)
         _model_used = architect_model
         _agent_use_claude = _is_claude_model(architect_model)
         if _agent_use_claude:
@@ -5204,7 +5211,7 @@ async def analyze_and_plan_stream(
         # ------------------------------------------------------------------
         yield sse({"type": "progress", "content": "Running QA..."})
 
-        qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model)
+        qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model, user_id=user_id)
         qa_risks = qa.get("risks", [])
 
         # Structural QA: deterministic checks for missing imports, etc.
@@ -5667,7 +5674,7 @@ async def analyze_and_plan_stream(
                             _dlog("correction_tool_use_applying",
                                   session_id=session_id, num_fixes=len(_corr_changes))
                             # Re-run QA on the fix (pass prior qa as feedback so judge can verify fix)
-                            qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model, qa_feedback=qa)
+                            qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model, user_id=user_id, qa_feedback=qa)
                             qa_risks = qa.get("risks", [])
                             # Re-run structural QA
                             if _sq_blocking is not None:
@@ -5818,7 +5825,7 @@ async def analyze_and_plan_stream(
                             if _new_changes:
                                 changes = _new_changes
                                 # Re-run QA on the fix (pass prior qa as feedback so judge can verify fix)
-                                qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model, qa_feedback=qa)
+                                qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model, user_id=user_id, qa_feedback=qa)
                                 qa_risks = qa.get("risks", [])
                                 # Re-run structural QA
                                 if _sq_blocking is not None:
@@ -5915,7 +5922,7 @@ def analyze_multi_file(file_paths: list, file_contents: dict, user_request: str,
 
     # Single architect call for ALL files
     client = _get_client(user_id)
-    arch_model = get_setting("architect_model", "gpt-4.1")
+    arch_model = get_setting("architect_model", _DEFAULT_ARCH_MODEL)
 
     multi_user_msg = f"""MULTI-FILE ANALYSIS REQUEST
 
@@ -6887,7 +6894,7 @@ async def run_file_creator(
 
     Returns {filename, content, language, summary} or raises on failure.
     """
-    creator_model = get_setting("architect_model", "claude-sonnet-5")
+    creator_model = get_setting("architect_model", _DEFAULT_ARCH_MODEL)
 
     # Route based on user's model — respect GPT selection instead of overriding
     if not _is_claude_model(creator_model):
@@ -8397,7 +8404,7 @@ async def run_smart_pipeline_stream(
             compliance.set_intent("chat")
             compliance.mark("architect_routing", ran=True, output_summary="no-files pure chat")
             yield sse({"type": "progress", "content": "Thinking..."})
-            chat_model = get_setting("architect_model", "gpt-4.1")
+            chat_model = get_setting("architect_model", _DEFAULT_ARCH_MODEL)
             _model_used = chat_model
             system = """You are SurgicalAI, a world-class coding assistant. You help people build real software.
 
@@ -8693,7 +8700,7 @@ USER REQUEST:
         if session_summary:
             context_msg = f"EARLIER CONVERSATION SUMMARY (compacted history before recent turns):\n{session_summary}\n\n" + context_msg
 
-        arch_model = get_setting("architect_model", "gpt-4.1")
+        arch_model = get_setting("architect_model", _DEFAULT_ARCH_MODEL)
         _model_used = arch_model
 
         # Detect if this is a diagnostic request — inject extra guidance if so
@@ -13567,7 +13574,7 @@ async def run_natural_pipeline_stream(
     }
 
     try:
-        _user_arch_model = get_setting("architect_model", "claude-sonnet-5")
+        _user_arch_model = get_setting("architect_model", _DEFAULT_ARCH_MODEL)
         arch_model = _user_arch_model
         _model_used = arch_model
         _natural_use_claude = _is_claude_model(arch_model)
