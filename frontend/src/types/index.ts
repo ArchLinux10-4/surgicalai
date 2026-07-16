@@ -116,6 +116,7 @@ export interface AppSettings {
   theme: string
   font_size: number
   workspace_path: string
+  is_hosted?: boolean
 }
 
 export interface GitStatus {

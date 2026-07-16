@@ -57,6 +57,7 @@ export function SettingsModal() {
   const [githubStatus, setGithubStatus] = useState<any>(null)
   const [githubStatusMsg, setGithubStatusMsg] = useState('')
   const [models, setModels] = useState<{id: string; name: string; role: string; description?: string; cost?: number}[]>([])
+  const [browsingDir, setBrowsingDir] = useState(false)
 
   // Security tab — change password
   const [pwCurrent, setPwCurrent]         = useState('')
@@ -196,6 +197,21 @@ export function SettingsModal() {
       setGithubStatusMsg('Disconnected')
     } catch (e: any) {
       setGithubStatusMsg(e.message || 'Failed to disconnect')
+    }
+  }
+
+  const handleBrowseDirectory = async () => {
+    setBrowsingDir(true)
+    try {
+      const res: any = await api.settings.browseDirectory()
+      if (res?.path) {
+        setForm((s) => ({ ...s, workspace_path: res.path }))
+        toast.success('Folder selected', res.path)
+      }
+    } catch (e: any) {
+      toast.error('Could not open folder picker', e.message || 'Please type the path manually')
+    } finally {
+      setBrowsingDir(false)
     }
   }
 
@@ -419,7 +435,7 @@ export function SettingsModal() {
                             const pasted = e.clipboardData.getData('text').trim()
                             if (pasted) { setApiKey(pasted); setKeyStatus('idle') }
                           }}
-                          placeholder={settings?.openai_api_key_set ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' : 'sk-proj-\u2026'}
+                          placeholder={settings?.openai_api_key_set ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' : 'sk-proj-\u2026'}
                           className={`input pr-10 ${keyStatus === 'ok' ? 'border-success focus:border-success' : keyStatus === 'error' ? 'border-danger' : ''}`}
                           onKeyDown={(e) => e.key === 'Enter' && handleVerifyKey()}
                           autoComplete="off"
@@ -520,16 +536,49 @@ export function SettingsModal() {
 
             {tab === 'workspace' && (
               <div className="space-y-4">
-                <SectionHeader title="Workspace" subtitle="Default project folder for the file browser" />
-                <Field label="Default workspace path">
-                  <input
-                    value={form.workspace_path}
-                    onChange={(e) => upd('workspace_path')(e.target.value)}
-                    placeholder="/home/user/projects/my-app"
-                    className="input"
-                  />
-                  <div className="text-[11px] text-faint mt-1">Opens automatically when the app starts</div>
-                </Field>
+                {settings?.is_hosted ? (
+                  <>
+                    <SectionHeader title="Workspace" subtitle="Hosted instances don't expose a local filesystem" />
+                    <div className="text-sm text-muted">
+                      This is a hosted SurgicalAI instance, so there's no local folder for it to browse — connect a GitHub repository instead and SurgicalAI will read and edit files there.
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setTab('github')}
+                      className="btn-primary px-4 py-2 text-sm flex items-center gap-2 w-fit"
+                    >
+                      <GitHub sx={{ fontSize: 16 }} />
+                      Connect GitHub
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <SectionHeader title="Workspace" subtitle="Default project folder for the file browser" />
+                    <Field label="Default workspace path">
+                      <div className="flex gap-2">
+                        <input
+                          value={form.workspace_path}
+                          onChange={(e) => upd('workspace_path')(e.target.value)}
+                          placeholder="/home/user/projects/my-app"
+                          className="input flex-1"
+                        />
+                        <button
+                          type="button"
+                          onClick={handleBrowseDirectory}
+                          disabled={browsingDir}
+                          className="btn-ghost border border-border px-3 text-sm disabled:opacity-50 flex-shrink-0 flex items-center gap-1.5"
+                        >
+                          <FolderOpen sx={{ fontSize: 14 }} />
+                          {browsingDir ? 'Opening…' : 'Browse…'}
+                        </button>
+                      </div>
+                      <div className="text-[11px] text-faint mt-1">Opens automatically when the app starts</div>
+                      <div className="text-[11px] text-faint mt-1">
+                        "Browse…" opens a native folder picker on the machine running SurgicalAI's backend — only works when running locally with a display available.
+                      </div>
+                    </Field>
+                  </>
+                )}
               </div>
             )}
 

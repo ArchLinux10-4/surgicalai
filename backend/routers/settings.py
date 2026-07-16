@@ -1,15 +1,22 @@
 """Settings & API key management router — per-user encrypted key storage."""
 import httpx
+import threading
 from fastapi import APIRouter, HTTPException, Request
 from models.schemas import SettingsUpdate, SettingsResponse
-from database import get_all_settings, set_setting, get_setting, set_user_api_key, get_user_api_key, _dlog
+from database import get_all_settings, set_setting, get_setting, set_user_api_key, get_user_api_key, _dlog, USE_POSTGRES
 from crypto_utils import encrypt_api_key, decrypt_api_key
 
 # Settings that control server-side infrastructure (not just per-user UI
 # preferences) — changing these can affect every user on the instance, so
-# they require admin. workspace_path in particular is the trust root for
-# the entire file browser sandbox (see routers/files.py:_safe_path) — a
-# non-admin able to repoint it could read/write anywhere the process can.
+# they require admin ON HOSTED (Postgres/Railway) instances. workspace_path
+# in particular is the trust root for the entire file browser sandbox (see
+# routers/files.py:_safe_path) — a non-admin able to repoint it on a shared
+# hosted instance could read/write anywhere the process can.
+#
+# On a local/SQLite install this restriction is unnecessary friction with no
+# security benefit: the install is inherently single-user (one person, one
+# machine, one folder) by the nature of how it's run, so the gate is skipped
+# there. See browse_directory() below for the matching rationale.
 _ADMIN_ONLY_SETTINGS = {"workspace_path"}
 
 router = APIRouter()
@@ -56,6 +63,7 @@ def get_settings(request: Request):
         ollama_enabled=s.get("ollama_enabled", "false").lower() == "true",
         ollama_base_url=s.get("ollama_base_url", "http://localhost:11434"),
         ollama_model=s.get("ollama_model", "qwen2.5-coder:7b"),
+        is_hosted=USE_POSTGRES,
     )
 
 
@@ -65,10 +73,13 @@ def update_settings(req: SettingsUpdate, request: Request):
     user_id = _get_user_id(request)
     is_admin = getattr(request.state, "is_admin", False)
 
-    # For admin-only settings: reject if non-admin tries to CHANGE the value;
-    # silently skip if the submitted value matches what's already stored
-    # (the frontend sends all fields on every save).
-    if not is_admin:
+    # Admin-only gating only matters on hosted (multi-tenant) instances —
+    # workspace_path is the trust root for the file browser sandbox and a
+    # non-admin repointing it there could read/write anywhere the shared
+    # process can reach. A local/SQLite install is inherently single-user
+    # (one person, one machine, one folder), so there's no multi-tenant risk
+    # and this restriction would just be friction with no security benefit.
+    if USE_POSTGRES and not is_admin:
         for admin_key in _ADMIN_ONLY_SETTINGS.intersection(updates.keys()):
             current_val = get_setting(admin_key, "")
             if str(updates[admin_key]) != current_val:
@@ -89,6 +100,80 @@ def update_settings(req: SettingsUpdate, request: Request):
 
     _dlog("settings_updated", user_id=user_id, keys=list(updates.keys()))
     return {"ok": True, "updated": list(updates.keys())}
+
+
+def _open_directory_dialog(result: dict) -> None:
+    """Run on a background thread — tkinter's askdirectory() blocks until the
+    user closes the dialog, so it must never run on the FastAPI event loop."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        # Expose the root window immediately so the caller can force-close it
+        # if this thread times out (browse_directory joins with a timeout) —
+        # otherwise a stray Tk window would linger on the host machine forever.
+        result["root"] = root
+        path = filedialog.askdirectory(title="Select SurgicalAI workspace folder")
+        root.destroy()
+        result["path"] = path or ""
+    except Exception as e:
+        result["error"] = str(e)
+
+
+@router.post("/browse-directory")
+def browse_directory(request: Request):
+    """Open a native OS folder picker on the machine running this backend and
+    return the absolute path the user selected.
+
+    Only meaningful when SurgicalAI's backend runs locally on the user's own
+    machine (the intended install target) — it requires a GUI/display session
+    and Python's stdlib `tkinter`. If either is unavailable (e.g. a headless
+    server), this fails clearly and the user falls back to typing the path.
+
+    Admin-gated ONLY on hosted (Postgres) instances — workspace_path is the
+    trust root for the entire file browser sandbox (see routers/files.py:_safe_path)
+    there, so only admins may set it on a shared instance. A local/SQLite install
+    is single-user by nature (one person, one machine, one folder), so there's
+    no multi-tenant risk and any authenticated user may browse.
+    """
+    is_admin = getattr(request.state, "is_admin", False)
+    user_id = _get_user_id(request)
+    if USE_POSTGRES and not is_admin:
+        raise HTTPException(status_code=403, detail="Admin access required to browse for a workspace directory")
+
+    result: dict = {}
+    dialog_thread = threading.Thread(target=_open_directory_dialog, args=(result,), daemon=True)
+    dialog_thread.start()
+    dialog_thread.join(timeout=120)
+
+    if dialog_thread.is_alive():
+        # The user didn't respond in time — force-close the dialog's Tk window
+        # so it doesn't linger indefinitely on the host machine. tkinter isn't
+        # officially thread-safe, but destroying the root from here is the
+        # only practical way to reclaim it: the dialog thread is stuck inside
+        # a blocking native call and cannot check for cancellation itself.
+        root = result.get("root")
+        if root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+        _dlog("settings_browse_directory_timeout", user_id=user_id)
+        raise HTTPException(status_code=504, detail="Directory picker timed out — please type the path manually")
+
+    if "error" in result:
+        _dlog("settings_browse_directory_failed", user_id=user_id, error=result["error"])
+        raise HTTPException(
+            status_code=500,
+            detail="Could not open a folder picker on this machine (no display or tkinter unavailable). "
+                   "Please type the path manually instead."
+        )
+
+    path = result.get("path", "")
+    _dlog("settings_browse_directory_picked", user_id=user_id, path=path)
+    return {"path": path}
 
 
 @router.get("/models")

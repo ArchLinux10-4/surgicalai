@@ -164,6 +164,7 @@ export const api = {
     getModels: () => request<any>('/settings/models'),
     geminiStatus: () => request<any>('/settings/gemini-status'),
     verifyGeminiKey: (key: string) => request('/settings/verify-gemini-key', { method: 'POST', body: JSON.stringify({ key }) }),
+    browseDirectory: () => request<any>('/settings/browse-directory', { method: 'POST' }),
   },
   chat: {
     createSession: (data: any) => request<any>('/chat/sessions', { method: 'POST', body: JSON.stringify(data) }),
