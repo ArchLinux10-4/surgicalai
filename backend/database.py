@@ -500,14 +500,29 @@ def _init_sqlite():
     """)
 
     _seed_defaults_sqlite(cur)
+    _migrate_sqlite(cur)
     conn.commit()
     conn.close()
     print(f"✅ SQLite database initialized at {DB_PATH}")
 
 
+def _migrate_sqlite(cur):
+    """One-time data migrations that run on every startup (idempotent).
+    Safe for Railway/Vercel — those DBs won't have gpt-5 seeded so this is a no-op there."""
+    # Bug fix: gpt-5 was incorrectly seeded as the default architect model in early versions.
+    # gpt-5 is real but extremely slow (30-40s) with no visible progress — users see a frozen UI.
+    # Migrate any existing installs to gpt-4.1.
+    cur.execute(
+        "UPDATE settings SET value = 'gpt-4.1', updated_at = CURRENT_TIMESTAMP "
+        "WHERE key = 'architect_model' AND value = 'gpt-5'"
+    )
+    if cur.rowcount:
+        print("🔧 Migrated architect_model from gpt-5 → gpt-4.1")
+
+
 def _seed_defaults_sqlite(cur):
     defaults = {
-        "architect_model": "gpt-5",
+        "architect_model": "gpt-4.1",
         "surgeon_model": "gpt-4.1",
         "openai_api_key": "",
         "temperature_architect": "0.3",
@@ -784,15 +799,27 @@ def _init_postgres():
         conn.commit()
 
         _seed_defaults_postgres(conn)
+        _migrate_postgres(conn)
         conn.commit()
     finally:
         conn.close()
     print("✅ PostgreSQL database initialized")
 
 
+def _migrate_postgres(conn):
+    """One-time idempotent data migrations for Postgres. Safe — no-op if value already correct."""
+    # Bug fix: gpt-5 was incorrectly seeded as default architect_model in early versions.
+    cur = conn.execute(
+        "UPDATE settings SET value = 'gpt-4.1', updated_at = CURRENT_TIMESTAMP "
+        "WHERE key = 'architect_model' AND value = 'gpt-5'"
+    )
+    if cur.rowcount:
+        print("🔧 Migrated architect_model from gpt-5 → gpt-4.1")
+
+
 def _seed_defaults_postgres(conn):
     defaults = {
-        "architect_model": "gpt-5",
+        "architect_model": "gpt-4.1",
         "surgeon_model": "gpt-4.1",
         "openai_api_key": "",
         "temperature_architect": "0.3",

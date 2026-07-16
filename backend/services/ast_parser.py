@@ -368,12 +368,19 @@ class ASTParser:
                     if size >= 3:
                         _add(name, "FUNCTION", target)
                 elif val_type == "value":
-                    # Template literals, objects, arrays — only if multi-line
-                    if size >= 3:
-                        _add(name, "VARIABLE", target)
+                    # Template literals, objects, arrays.
+                    # Previously gated at size >= 3, which silently dropped compact
+                    # single-line style constants (e.g. DashboardStyles.js export const
+                    # S_POS_ABS_TOP_1REM_RIGHT_0_D_FLEX = { ... }).  Those never appeared
+                    # in the symbol map → _fuzzy_find_symbol returned None →
+                    # resolution_summary showed symbol_not_found → degenerate_drop with
+                    # 0 changes applied.  Arrow functions have always had no size gate;
+                    # value constants deserve the same treatment.
+                    _add(name, "VARIABLE", target)
                 else:
-                    if size >= 3:
-                        _add(name, "VARIABLE", target)
+                    # Fallback: any other declaration shape — index it.
+                    # Same reasoning: don't silently drop symbols just because they're compact.
+                    _add(name, "VARIABLE", target)
 
         # ── Walk top-level statements ──────────────────────────────────
         for child in root.children:

@@ -583,16 +583,24 @@ def apply_changes_to_file(
     If file_content is provided and the file does not exist on disk (uploaded in cloud mode),
     applies changes in-memory and returns result without writing to disk.
     """
-    on_disk = os.path.exists(file_path)
-
-    if not on_disk and not file_content:
-        raise FileNotFoundError(f"File not found: {file_path}")
-
-    if on_disk:
+    # IMPORTANT: Check file_content BEFORE os.path.exists().
+    # On local installs, a relative path like "main.py" from a GitHub session file
+    # can collide with the backend's own files (CWD = backend/), causing the editor
+    # to read/overwrite the wrong file. When the caller already provides content,
+    # always use it directly — no disk access needed. Only fall through to disk when
+    # file_content is explicitly absent (local workspace file editing).
+    # Railway/Vercel: always provides file_content; os.path.exists() = False there anyway — no change.
+    if file_content is not None:
+        on_disk = False
+        original_content = file_content
+        _dlog(f"[surgical_editor] cloud/session mode for {file_path!r} (file_content provided, skipping disk)")
+    elif os.path.exists(file_path):
+        on_disk = True
         with open(file_path, "r", encoding="utf-8") as f:
             original_content = f.read()
+        _dlog(f"[surgical_editor] disk mode for {file_path!r}")
     else:
-        original_content = file_content
+        raise FileNotFoundError(f"File not found and no content provided: {file_path}")
 
     # Filter to only requested changes
     to_apply = changes
