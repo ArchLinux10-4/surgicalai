@@ -583,6 +583,16 @@ def apply_changes_to_file(
     If file_content is provided and the file does not exist on disk (uploaded in cloud mode),
     applies changes in-memory and returns result without writing to disk.
     """
+    # _dlog must be bound BEFORE any branch that references it below — a local
+    # `import _dlog` anywhere in this function makes the name local to the
+    # WHOLE function (Python scoping rule), so referencing it before this point
+    # raises UnboundLocalError. Bind it first, unconditionally.
+    try:
+        from services.pipeline import _dlog
+    except Exception:
+        def _dlog(event, **kwargs):
+            pass
+
     # IMPORTANT: Check file_content BEFORE os.path.exists().
     # On local installs, a relative path like "main.py" from a GitHub session file
     # can collide with the backend's own files (CWD = backend/), causing the editor
@@ -619,12 +629,6 @@ def apply_changes_to_file(
     # must be applied FIRST, establishing the correct baseline; the other edits'
     # own stale-line relocation (by their own small, unique anchor text) then
     # safely absorbs any line-number shift gap_bridge introduces.
-    try:
-        from services.pipeline import _dlog
-    except Exception:
-        def _dlog(event, **kwargs):
-            pass
-
     _gap_bridge_count = sum(
         1 for c in to_apply if getattr(c.symbol, "name", "") == "_gap_bridge"
     )

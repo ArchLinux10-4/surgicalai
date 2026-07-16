@@ -2727,7 +2727,7 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
             try:
                 _dlog("surgeon_tool_use_call_config", model=surg_model,
                       wrapper="safe_claude_call_sync", user_id=user_id,
-                      session_id=session_id)
+                      session_id=getattr(target, '_session_id', ''))
                 _tu_resp = _safe_claude_call_sync(
                     _sync_aclient, model=surg_model,
                     desired_text_tokens=12000, thinking_budget=4000,
@@ -3420,8 +3420,10 @@ def _build_claude_context(
                 parts.append("RELEVANT SECTIONS (grep):")
                 parts.append(grep_sections)
         except Exception as _grep_exc:
+            # _build_claude_context has no user_id parameter — referencing it here
+            # masked the real grep failure behind a NameError. Omit it.
             _dlog("grep_relevant_sections_failed",
-                  error=str(_grep_exc)[:200], user_id=user_id)
+                  error=str(_grep_exc)[:200])
 
     parts.append("")
 
@@ -4891,6 +4893,7 @@ async def analyze_and_plan_stream(
     """
     # Lazy imports from the parent pipeline module context
     # (these will be resolved at call time from the merged module namespace)
+    import asyncio
     from models.schemas import SurgicalChange, SurgicalAnalyzeResponse, ArchitectPlan  # noqa: F401
 
     try:
@@ -4903,12 +4906,17 @@ async def analyze_and_plan_stream(
         yield sse({"type": "progress", "content": "Parsing file structure..."})
         symbol_map = parser.parse(file_content, file_path)
         n_sym = len(symbol_map.symbols) if hasattr(symbol_map, "symbols") and symbol_map.symbols else 0
-        yield sse({"type": "progress", "content": f"Found {n_sym} symbols. {architect_model} is analyzing..."})
 
         # ------------------------------------------------------------------
         # Step 2: Get Anthropic key and model
         # ------------------------------------------------------------------
+        # NOTE: architect_model must be resolved BEFORE the progress message below
+        # references it — referencing it earlier caused a guaranteed
+        # UnboundLocalError on the very first yield of every agent-mode run
+        # (Python scoping: any assignment anywhere in the function makes the
+        # name local to the whole function).
         architect_model = get_setting("architect_model", _DEFAULT_ARCH_MODEL)
+        yield sse({"type": "progress", "content": f"Found {n_sym} symbols. {architect_model} is analyzing..."})
         _model_used = architect_model
         _agent_use_claude = _is_claude_model(architect_model)
         if _agent_use_claude:
@@ -8146,6 +8154,7 @@ async def _run_claude_direct_rewrite(
     tool_use to output the COMPLETE new file — no truncation, no focused window needed.
     Returns {"new_file_content": str, "confidence": int, "notes": list}
     """
+    import asyncio
     from anthropic import AsyncAnthropic as _DirectAnthropic
     _da_client = _DirectAnthropic(api_key=anthropic_key)
 
@@ -13011,6 +13020,7 @@ async def _retry_truncated_edit(
     this gives it just ONE file and asks for ONE edit block.
     Returns the raw edit block JSON string, or None on failure.
     """
+    import asyncio
     import json as _json
 
     # Build a focused symbol index for this file
@@ -13130,6 +13140,7 @@ async def _retry_truncated_newfile(
     ONE filename and asks it to write the complete file from scratch.
     Returns the raw new_file block JSON string, or None on failure.
     """
+    import asyncio
     import json as _json
 
     focused_system = (
@@ -14537,6 +14548,7 @@ async def run_natural_pipeline_stream(
                     # per-file correction budget is not yet spent. This lets the
                     # model self-correct when the user uploads the wrong file, while
                     # the total-file and turn backstops still bound the whole run.
+                    MAX_SAME_FILE_RETRIES = 1  # was referenced but never defined — guaranteed NameError
                     _rerequestable = {
                         fn for fn in fnames_req
                         if fn in requested_files
