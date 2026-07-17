@@ -255,6 +255,37 @@ def get_available_models(request: Request):
              "description": "Fast reasoning — 5× cheaper than Sol, 1M context", "provider": "openai", "cost": 1},
         ]
 
+    # Offline mode — return ONLY Ollama models, hide cloud models entirely
+    s = get_all_settings()
+    if s.get("ollama_enabled", "false").lower() == "true":
+        base_url = s.get("ollama_base_url", "http://localhost:11434")
+        ollama_models = []
+        try:
+            resp = httpx.get(f"{base_url}/api/tags", timeout=3)
+            resp.raise_for_status()
+            for m in resp.json().get("models", []):
+                name = m.get("name", "unknown")
+                size_gb = round(m.get("size", 0) / 1e9, 1)
+                ollama_models.append({
+                    "id": f"ollama:{name}", "name": f"{name}", "role": "architect",
+                    "description": f"Local model ({size_gb} GB) — free, private, no API key",
+                    "provider": "ollama", "cost": 0,
+                })
+        except Exception:
+            # Ollama unreachable — show configured default as fallback
+            fallback = s.get("ollama_model", "qwen2.5-coder:7b")
+            ollama_models = [
+                {"id": f"ollama:{fallback}", "name": f"{fallback}", "role": "architect",
+                 "description": "Local model via Ollama (offline — could not reach Ollama to list models)",
+                 "provider": "ollama", "cost": 0},
+            ]
+        return {
+            "models": ollama_models,
+            "pipeline_modes": [
+                {"id": "auto", "name": "Auto", "description": "SurgicalAI natural pipeline (recommended)"},
+            ]
+        }
+
     return {
         "models": claude_models + openai_models,
         "pipeline_modes": [
