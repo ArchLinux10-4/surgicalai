@@ -3194,6 +3194,25 @@ def run_chat(
     return response.choices[0].message.content
 
 
+_ASK_PLAN_TOOL_INSTRUCTIONS = """
+## Tools available in this conversation
+The file index above is names/sizes only — you have NOT been shown file contents.
+Do NOT guess about code you have not seen. You have two tags to inspect the
+real codebase before answering:
+
+<search_request>{"terms": ["exact_symbol_or_keyword", "another_term"]}</search_request>
+Use to find a specific function/class/keyword across all session files.
+
+<file_request>["filename1.py", "filename2.tsx"]</file_request>
+Use to view the full contents of specific file(s) by exact name.
+
+Emit ONLY ONE tag at a time, then STOP your response immediately — the
+results will be returned to you and you may continue. You may use these
+tags across multiple turns of this exchange (up to 3 rounds) before giving
+your final answer in plain prose (no tags in your final answer).
+"""
+
+
 async def run_chat_stream(
     messages: list,
     file_content: Optional[str] = None,
@@ -3201,14 +3220,25 @@ async def run_chat_stream(
     model: Optional[str] = None,
     pinned_context: Optional[list] = None,
     project_memory: Optional[str] = None,
-    user_id: str = ""
+    user_id: str = "",
+    session_id: Optional[str] = None,
+    session_files: Optional[list] = None,
 ):
     """
     Streaming version of run_chat. Yields SSE chunks.
-    Used by the /api/chat/stream endpoint.
+    Used by the /api/chat/stream endpoint and by the Ask/Plan mode branch.
+
+    `session_files` (optional): when provided AND the resolved model is
+    Claude, this enables the same <search_request>/<file_request> tag tools
+    the Edit pipeline already has (proven pattern, reused verbatim) so
+    Ask/Plan can inspect real code instead of only seeing a 300-line
+    preview of one file. When omitted (legacy callers) or the model isn't
+    Claude, behavior is byte-identical to before — zero regression risk to
+    existing working paths.
     """
     chat_model = model or get_setting("architect_model", _DEFAULT_ARCH_MODEL)
     _model_used = chat_model
+    _ask_plan_tools_enabled = bool(session_files) and _is_claude_model(chat_model)
 
     system_parts = [CHAT_PERSONA]
 
@@ -3221,7 +3251,32 @@ async def run_chat_stream(
         for pin in pinned_context:
             system_parts.append(f"\n## Pinned Context: {pin.get('label', pin.get('file_path', ''))}\n```\n{pin.get('content', '')}\n```")
 
-    if file_content:
+    symbol_maps_by_name: dict = {}
+    file_content_lookup: dict = {}
+    if _ask_plan_tools_enabled:
+        for sf in session_files:
+            fname = sf.get("filename", "") or ""
+            content = sf.get("content", "") or ""
+            if not fname:
+                continue
+            file_content_lookup[fname] = content
+            try:
+                symbol_maps_by_name[fname] = (parser.parse(content, fname), sf)
+            except Exception:
+                symbol_maps_by_name[fname] = (None, sf)
+        _idx_lines = [
+            f"- {fn} ({len((c or '').splitlines())} lines)"
+            for fn, c in file_content_lookup.items()
+        ]
+        system_parts.append(
+            "\n## Session Files (index only)\n" + "\n".join(_idx_lines)
+        )
+        system_parts.append(_ASK_PLAN_TOOL_INSTRUCTIONS)
+        _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
+              model=chat_model, num_files=len(file_content_lookup))
+    elif file_content:
+        # Legacy path — unchanged for non-Claude models / callers with no
+        # session_files (e.g. the plain /api/chat/stream simple-chat page).
         lines = file_content.splitlines()
         preview = "\n".join(lines[:300])
         if len(lines) > 300:
@@ -3330,39 +3385,106 @@ async def run_chat_stream(
             # Anthropic API: system is a separate param, messages must not contain role=system
             _sys_text = next((m["content"] for m in all_messages if m["role"] == "system"), "")
             _claude_msgs = [m for m in all_messages if m["role"] != "system"]
-            _claude_kwargs = {
-                "model": chat_model,
-                "max_tokens": _max_output_tokens(chat_model),
-                "system": _sys_text or "You are a helpful assistant.",
-                "messages": _claude_msgs,
-            }
-            _claude_kwargs.update(_get_thinking_kwargs(chat_model, 8000))
-            _claude_kwargs.update(_get_effort_kwargs(chat_model))
-            _dlog("run_chat_stream_claude", model=chat_model, user_id=user_id)
-            in_thinking = False
-            async with aclient.messages.stream(**_claude_kwargs) as _cstream:
-                async for event in _cstream:
-                    event_type = getattr(event, "type", None)
-                    if event_type == "content_block_start":
-                        block = getattr(event, "content_block", None)
-                        if block and getattr(block, "type", "") == "thinking":
-                            in_thinking = True
-                            yield sse({"type": "thinking_start", "content": ""})
-                    elif event_type == "content_block_delta":
-                        delta = getattr(event, "delta", None)
-                        if delta:
-                            thinking_chunk = getattr(delta, "thinking", None)
-                            text_chunk = getattr(delta, "text", None)
-                            if thinking_chunk:
-                                yield sse({"type": "thinking", "content": thinking_chunk})
-                            elif text_chunk:
-                                yield sse({"type": "token", "content": text_chunk})
-                    elif event_type == "content_block_stop":
-                        if in_thinking:
-                            yield sse({"type": "thinking_end", "content": ""})
-                            in_thinking = False
-            if in_thinking:
-                yield sse({"type": "thinking_end", "content": ""})
+
+            def _strip_tool_tags(text: str) -> str:
+                text = re.sub(r'<search_request>.*?</search_request>', '', text, flags=re.DOTALL)
+                text = re.sub(r'<file_request>.*?</file_request>', '', text, flags=re.DOTALL)
+                return text.strip()
+
+            _ASK_PLAN_MAX_ROUNDS = 3
+            _tool_round = 0
+            while True:
+                _claude_kwargs = {
+                    "model": chat_model,
+                    "max_tokens": _max_output_tokens(chat_model),
+                    "system": _sys_text or "You are a helpful assistant.",
+                    "messages": _claude_msgs,
+                }
+                _claude_kwargs.update(_get_thinking_kwargs(chat_model, 8000))
+                _claude_kwargs.update(_get_effort_kwargs(chat_model))
+                _dlog("run_chat_stream_claude", model=chat_model, user_id=user_id,
+                      session_id=session_id, tool_round=_tool_round,
+                      tools_enabled=_ask_plan_tools_enabled)
+                in_thinking = False
+                _round_text = ""
+                async with aclient.messages.stream(**_claude_kwargs) as _cstream:
+                    async for event in _cstream:
+                        event_type = getattr(event, "type", None)
+                        if event_type == "content_block_start":
+                            block = getattr(event, "content_block", None)
+                            if block and getattr(block, "type", "") == "thinking":
+                                in_thinking = True
+                                yield sse({"type": "thinking_start", "content": ""})
+                        elif event_type == "content_block_delta":
+                            delta = getattr(event, "delta", None)
+                            if delta:
+                                thinking_chunk = getattr(delta, "thinking", None)
+                                text_chunk = getattr(delta, "text", None)
+                                if thinking_chunk:
+                                    yield sse({"type": "thinking", "content": thinking_chunk})
+                                elif text_chunk:
+                                    _round_text += text_chunk
+                                    if not _ask_plan_tools_enabled:
+                                        # Legacy behavior: stream tokens live as they arrive.
+                                        yield sse({"type": "token", "content": text_chunk})
+                        elif event_type == "content_block_stop":
+                            if in_thinking:
+                                yield sse({"type": "thinking_end", "content": ""})
+                                in_thinking = False
+                if in_thinking:
+                    yield sse({"type": "thinking_end", "content": ""})
+
+                if not _ask_plan_tools_enabled:
+                    break  # legacy path already streamed live above — done.
+
+                # ── Tool round: did Claude ask for search/file context? ──
+                _sr_match = re.search(r'<search_request>\s*(.*?)\s*</search_request>', _round_text, re.DOTALL)
+                _fr_match = re.search(r'<file_request>\s*(.*?)\s*</file_request>', _round_text, re.DOTALL)
+
+                if (not _sr_match and not _fr_match) or _tool_round >= _ASK_PLAN_MAX_ROUNDS:
+                    _clean_text = _strip_tool_tags(_round_text) if (_sr_match or _fr_match) else _round_text
+                    if not _clean_text.strip():
+                        _clean_text = ("I looked at the available code but couldn't fully answer within "
+                                       "my lookup budget — try asking about a more specific file or function.")
+                    yield sse({"type": "token", "content": _clean_text})
+                    _dlog("ask_plan_tool_final_answer", session_id=session_id, user_id=user_id,
+                          tool_round=_tool_round, chars=len(_clean_text))
+                    break
+
+                yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
+                _tool_parts = []
+                if _sr_match:
+                    _sr_data = _parse_search_content(_sr_match.group(1))
+                    _sr_terms = _sr_data.get("terms", []) if isinstance(_sr_data, dict) else []
+                    if _sr_terms:
+                        _sr_result = _resolve_search_multifile(_sr_terms, symbol_maps_by_name, file_content_lookup)
+                        _tool_parts.append(f"Search results for {_sr_terms}:\n{_sr_result}")
+                        _dlog("ask_plan_search_executed", session_id=session_id, user_id=user_id,
+                              tool_round=_tool_round, terms=_sr_terms, result_chars=len(_sr_result))
+                if _fr_match:
+                    _fr_names = _parse_filereq_content(_fr_match.group(1))
+                    for _fr_fn in _fr_names[:5]:
+                        _fr_content = file_content_lookup.get(_fr_fn, "")
+                        if not _fr_content:
+                            _fr_cands = [k for k in file_content_lookup
+                                         if _fr_fn.lower() in k.lower() or k.lower() in _fr_fn.lower()]
+                            if _fr_cands:
+                                _fr_fn = _fr_cands[0]
+                                _fr_content = file_content_lookup.get(_fr_fn, "")
+                        if _fr_content:
+                            _tool_parts.append(f"FILE: {_fr_fn} ({len(_fr_content.splitlines())} lines)\n```\n{_fr_content}\n```")
+                        else:
+                            _tool_parts.append(f"FILE NOT FOUND: '{_fr_fn}'")
+                    _dlog("ask_plan_file_fetched", session_id=session_id, user_id=user_id,
+                          tool_round=_tool_round, requested=_fr_names[:5])
+
+                if not _tool_parts:
+                    yield sse({"type": "token", "content": _round_text})
+                    break
+
+                _claude_msgs.append({"role": "assistant", "content": _round_text})
+                _claude_msgs.append({"role": "user", "content": "\n\n".join(_tool_parts)})
+                _tool_round += 1
         else:
             # ── OpenAI / GPT streaming ──
             client = _get_client(user_id)
@@ -3379,7 +3501,7 @@ async def run_chat_stream(
     except Exception as e:
         _dlog("streaming_error",
               error_type=type(e).__name__,
-              error=str(e)[:300], user_id=user_id)
+              error=str(e)[:300], user_id=user_id, session_id=session_id)
         yield sse({"type": "error", "content": _friendly_error(e)})
 
     yield f"data: {json.dumps({'type': 'done', 'content': '', 'model': _model_used})}\n\n"

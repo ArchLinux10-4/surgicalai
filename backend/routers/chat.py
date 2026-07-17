@@ -721,7 +721,10 @@ async def smart_stream(req: dict, request: Request):
             _directive = _mode_directive(_eff_mode)
 
             # Build the file context string from session files (same shape the
-            # single-pass path loads). run_chat_stream previews the first 300 lines.
+            # single-pass path loads). run_chat_stream previews the first 300
+            # lines. Kept as a fallback for non-Claude backends (GPT/Gemini/
+            # Ollama), which don't get the tag-based tool loop below — their
+            # Ask/Plan behavior stays exactly as it was (no regression).
             _mode_file_ctx = None
             if session_files:
                 _mode_file_ctx = "\n\n".join(
@@ -749,6 +752,8 @@ async def smart_stream(req: dict, request: Request):
                     file_content=_mode_file_ctx,
                     project_memory=project_memory,
                     user_id=current_user_id,
+                    session_id=session_id,
+                    session_files=session_files,
                 ):
                     # run_chat_stream emits token / thinking_* / done / error —
                     # all already handled by the smart-stream frontend consumer.
