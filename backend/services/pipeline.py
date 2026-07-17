@@ -14156,6 +14156,36 @@ async def run_natural_pipeline_stream(
                 b["text"] for b in system_prompt
                 if isinstance(b, dict) and "text" in b
             )
+            # ── GPT-only content-anchor override (session e387acd9 evidence) ──
+            # The shared prompt above tells every model "PREFER
+            # edit_start_line/edit_end_line whenever you can see line
+            # numbers." Claude follows that reliably. GPT does not: trace
+            # e387acd9 showed 5/5 gap-bridge escalations on a 1050-line file
+            # were GPT edits with edit_start_line set and old_code EMPTY,
+            # and the line numbers landed outside the named symbol (one
+            # request even pointed past end-of-file). Because there was no
+            # old_code, the content-match recovery path (Strategy 2) never
+            # ran, so a single bad line number destroyed the whole edit.
+            # This block is Claude-untouched: it only appends to
+            # _gpt_system_text, which is never used on the Claude branch.
+            _gpt_system_text += (
+                "\n\n━━━ IMPORTANT — LINE NUMBERS FOR THIS MODEL ━━━\n"
+                "You (this model) have been observed miscounting exact file "
+                "line numbers on large files, which silently destroys edits. "
+                "For every <surgical_edit> you emit:\n"
+                "- ALWAYS include \"old_code\" with the exact original text "
+                "you are replacing, copied verbatim — this is your primary "
+                "anchor, not the line numbers.\n"
+                "- edit_start_line/edit_end_line are OPTIONAL extra context "
+                "for you; they are not required and are not a substitute "
+                "for old_code.\n"
+                "- Never omit old_code just because you can see line "
+                "numbers in the file listing — your line counting on large "
+                "files is not reliable enough to use alone.\n"
+            )
+            _dlog("gpt_content_anchor_prompt_override_applied",
+                  session_id=session_id, model=arch_model,
+                  override_chars=len(_gpt_system_text), user_id=user_id)
 
         # ── Clean conversation history — strip JSON artifacts ─────────────
         clean_history = []
@@ -16648,7 +16678,58 @@ async def run_natural_pipeline_stream(
                             _eel = int(edit_end_line)
                             if _esl > symbol.end_line or _eel < symbol.start_line:
                                 _edit_has_zero_overlap = True
-                        if not _correct_sym and match_method == "exact" and not _edit_has_zero_overlap:
+
+                        # ── GPT-only guard (session e387acd9 evidence) ──────────
+                        # GPT has been observed emitting edit_start_line /
+                        # edit_end_line with ZERO old_code anchor, landing
+                        # outside the named symbol's real range (e.g. symbol
+                        # "handleLogin" 381-496, edit_start_line 792; another
+                        # request in the same trace asked for line 1073 on a
+                        # 1050-line file). With no old_code, Strategy 2
+                        # (content match) never runs, so gap-bridge silently
+                        # escalates to a whole-file synthetic symbol — the
+                        # largest, most corruption-prone edit shape that
+                        # exists in this pipeline. Evidence: trace
+                        # e387acd9, 5/5 gap_bridge triggers had
+                        # has_old_code=False; file length grew 930->1120+
+                        # lines across the session without ever converging.
+                        # Refuse the escalation for GPT and fall through to
+                        # the existing "symbol_auto_resolve_failed" path
+                        # instead, which routes to the correction loop
+                        # working on the ORIGINAL (small) symbol — bounds-
+                        # checked and proven safe by _apply_snippet_by_lines
+                        # (returns ok=False rather than corrupting on an
+                        # out-of-range splice). Claude is UNCHANGED — this
+                        # branch is gated strictly on `not _natural_use_claude`
+                        # and only fires when GPT gave zero old_code AND zero
+                        # line overlap with the named symbol.
+                        _gpt_no_anchor_gap_blocked = (
+                            (not _natural_use_claude)
+                            and not old_code
+                            and _edit_has_zero_overlap
+                        )
+                        if _gpt_no_anchor_gap_blocked:
+                            _dlog("symbol_auto_resolve_gpt_gap_bridge_blocked",
+                                  session_id=session_id,
+                                  filename=filename,
+                                  model=arch_model,
+                                  symbol_name=symbol.name,
+                                  symbol_range=(
+                                      f"{symbol.start_line}-{symbol.end_line}"
+                                  ),
+                                  edit_start_line=str(edit_start_line) if edit_start_line else None,
+                                  edit_end_line=str(edit_end_line) if edit_end_line else None,
+                                  reason=(
+                                      "gpt_line_number_no_content_anchor: GPT gave "
+                                      "edit_start_line/edit_end_line with zero "
+                                      "old_code anchor and zero overlap with the "
+                                      "named symbol; refusing whole-file "
+                                      "gap-bridge escalation, falling through to "
+                                      "the bounds-checked correction-loop path "
+                                      "instead"
+                                  ),
+                                  user_id=user_id)
+                        elif not _correct_sym and match_method == "exact" and not _edit_has_zero_overlap:
                             _dlog("symbol_auto_resolve_gap_bridge_skipped",
                                   session_id=session_id,
                                   filename=filename,
