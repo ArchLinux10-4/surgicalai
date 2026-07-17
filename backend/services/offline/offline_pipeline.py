@@ -6,9 +6,9 @@ Explicitly OUT OF SCOPE for v1 (per evidence-based decision, see OFFLINE_MODE.md
   - Tool-calling / function-calling of any kind
   - SEARCH/REPLACE surgical diffs (unreliable at 7B — whole-file rewrite instead)
   - Multi-file edits in one pass (v1 edits the single most relevant attached file)
-  - Auto-apply of edits — the rewritten file is shown to the user to review/apply
-    manually, since local-model output is materially less reliable than
-    Claude/GPT and should not be silently applied to disk.
+  - Auto-apply saves the rewrite to the DB (with previous_content for undo).
+    The file panel refreshes automatically. User can Undo if the local model
+    produced bad output.
 
 This module never imports from services.pipeline's Claude/OpenAI logic, and
 services.pipeline is never modified to support this. The only integration
@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 from typing import AsyncIterator, Optional
+
+from database import get_db_ctx
 
 from .offline_client import (
     ollama_chat_stream,
@@ -94,7 +96,8 @@ async def run_offline_stream(
                 yield evt
         else:
             async for evt in _run_offline_chat(
-                user_request, conversation_history, session_summary, project_memory, session_id, user_id
+                user_request, conversation_history, session_summary, project_memory, session_id, user_id,
+                session_files=session_files,
             ):
                 yield evt
     except OfflineModelError as e:
@@ -113,12 +116,33 @@ async def _run_offline_chat(
     project_memory: str,
     session_id: str,
     user_id: str,
+    session_files: list | None = None,
 ) -> AsyncIterator[str]:
     messages = [{"role": "system", "content": OFFLINE_CHAT_SYSTEM}]
     if project_memory:
         messages.append({"role": "system", "content": f"Team conventions/memory:\n{project_memory}"})
     if session_summary:
         messages.append({"role": "system", "content": f"Earlier conversation summary:\n{session_summary}"})
+    # Inject attached file contents so the model can see and reference them
+    if session_files:
+        file_parts = []
+        total_chars = 0
+        max_chars = 24_000  # ~6k tokens budget for file context (7B model limit)
+        for f in session_files:
+            fname = f.get("filename", "file")
+            content = f.get("content", "")
+            if total_chars + len(content) > max_chars:
+                # Truncate large files to fit within context budget
+                remaining = max(0, max_chars - total_chars)
+                if remaining > 200:
+                    content = content[:remaining] + f"\n... [truncated — {len(f.get('content', '')) - remaining} more chars]"
+                else:
+                    file_parts.append(f"--- {fname} --- (skipped, context budget exhausted)")
+                    continue
+            file_parts.append(f"--- {fname} ---\n{content}\n--- end {fname} ---")
+            total_chars += len(content)
+        files_block = "\n\n".join(file_parts)
+        messages.append({"role": "system", "content": f"Attached files:\n\n{files_block}"})
     for turn in conversation_history[-20:]:
         messages.append({"role": turn.get("role", "user"), "content": turn.get("content", "")})
     messages.append({"role": "user", "content": user_request})
@@ -196,19 +220,55 @@ async def _run_offline_edit(
             "type": "chat",
             "content": (
                 "\u26a0\ufe0f *The local model's response was cut off before finishing "
-                f"(file may be too large for a single pass). Showing the partial rewrite of `{filename}` "
-                "below \u2014 please review carefully before using it.*\n\n"
+                f"(file may be too large for a single pass). The partial rewrite of `{filename}` "
+                "has been saved \u2014 please review carefully and use Undo if needed.*\n\n"
             ),
         })
 
-    ext = filename.split(".")[-1] if "." in filename else ""
-    body = (
-        f"{explanation}\n\n"
-        f"Here is the rewritten `{filename}` \u2014 review it and apply manually "
-        f"(offline mode does not auto-apply edits):\n\n"
-        f"```{ext}\n{rewritten}\n```\n"
-    )
+    # ── Save rewritten file to DB (with previous_content for undo) ──
+    file_id = target_file.get("id")
+    saved = False
+    if file_id:
+        try:
+            with get_db_ctx() as conn:
+                row = conn.execute(
+                    "SELECT content, updated_at FROM session_files WHERE id = ? AND session_id = ?",
+                    (file_id, session_id)
+                ).fetchone()
+                if row:
+                    prev_content = row["content"] if hasattr(row, "__getitem__") else row[0]
+                    row_updated_at = row["updated_at"] if hasattr(row, "__getitem__") else row[1]
+                    new_lines = len(rewritten.splitlines())
+                    conn.execute(
+                        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, "
+                        "edited = 1, updated_at = CURRENT_TIMESTAMP "
+                        "WHERE id = ? AND session_id = ? AND updated_at = ?",
+                        (rewritten, prev_content, new_lines, file_id, session_id, row_updated_at)
+                    )
+                    conn.commit()
+                    saved = True
+                    _dlog("offline_edit_saved", session_id=session_id, user_id=user_id,
+                          filename=filename, file_id=file_id, new_lines=new_lines)
+        except Exception as exc:
+            _dlog("offline_edit_save_error", session_id=session_id, user_id=user_id,
+                  filename=filename, error=str(exc))
+
+    if saved:
+        body = (
+            f"{explanation}\n\n"
+            f"\u2705 **`{filename}` has been updated.** "
+            f"The file panel will refresh automatically. "
+            f"Use the **Undo** button if you want to revert.\n"
+        )
+    else:
+        # Fallback: couldn't save — show the code so the user can copy it
+        ext = filename.split(".")[-1] if "." in filename else ""
+        body = (
+            f"{explanation}\n\n"
+            f"Could not auto-save `{filename}` — here is the rewritten file:\n\n"
+            f"```{ext}\n{rewritten}\n```\n"
+        )
     yield _sse({"type": "chat", "content": body})
 
     _dlog("offline_edit_done", session_id=session_id, user_id=user_id, filename=filename,
-          out_len=len(rewritten), truncated=truncated)
+          out_len=len(rewritten), truncated=truncated, saved=saved)
