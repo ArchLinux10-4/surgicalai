@@ -11,7 +11,7 @@ import { VercelPanel } from './VercelPanel'
 import { RailwayPanel } from './RailwayPanel'
 import { useThemeStore } from '../stores/themeStore'
 import { Add, Chat, CloudOff, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
-import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile } from '../lib/fileClassify'
+import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile, DiffStatsBadge } from '../lib/fileClassify'
 import { DownloadSessionButton } from './DownloadSessionButton'
 
 // ── File icon helper ─────────────────────────────────────────────────────────
@@ -685,7 +685,7 @@ function SessionFilesPanel() {
           </div>
         ) : visibleFiles.length === 0 ? (
           <div className="px-4 py-6 text-center text-[12px] text-muted/60">
-            No {fileFilter === 'new' ? 'new' : 'current'} files in this chat
+            No {fileFilter === 'new' ? 'new' : fileFilter === 'edited' ? 'AI-edited' : 'current'} files in this chat
           </div>
         ) : (
           <div className="px-2 py-1 space-y-0.5">
@@ -704,6 +704,7 @@ function SessionFilesPanel() {
                         <span className="w-1.5 h-1.5 rounded-full bg-success inline-block" /> Edited
                       </span>
                     )}
+                    <DiffStatsBadge fileId={file.id} />
                   </div>
                   {file.lines > 0 && (
                     <p className="text-[10px] text-faint">{file.lines} lines{file.symbol_count > 0 ? ` · ${file.symbol_count} symbols` : ''}</p>

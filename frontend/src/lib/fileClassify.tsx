@@ -22,10 +22,9 @@ export function isCreatedFile(f: SessionFile): boolean {
   return (f as any).origin === 'created'
 }
 
-/** File whose content changed after it was first added (AI edit or re-upload). */
+/** File whose content was changed by the AI pipeline. */
 export function isEditedFile(f: SessionFile): boolean {
-  if ((f as any).origin === 'edited') return true
-  return !!(f.updated_at && f.updated_at !== f.created_at)
+  return f.origin === 'edited'
 }
 
 /** Spreadsheet/CSV file — eligible for the DataLab transform affordance. */
@@ -46,6 +45,7 @@ export function fileKind(f: SessionFile): FileKind {
 export function matchesFileFilter(f: SessionFile, filter: FileFilter): boolean {
   if (filter === 'all') return true
   if (filter === 'new') return isCreatedFile(f)
+  if (filter === 'edited') return isEditedFile(f)
   return !isCreatedFile(f) // 'current' = everything that isn't AI-created
 }
 
@@ -53,10 +53,14 @@ export function filterFiles(files: SessionFile[], filter: FileFilter): SessionFi
   return files.filter(f => matchesFileFilter(f, filter))
 }
 
-export function fileCounts(files: SessionFile[]): { all: number; current: number; new: number } {
+export function fileCounts(files: SessionFile[]): { all: number; current: number; new: number; edited: number } {
   let created = 0
-  for (const f of files) if (isCreatedFile(f)) created++
-  return { all: files.length, new: created, current: files.length - created }
+  let edited = 0
+  for (const f of files) {
+    if (isCreatedFile(f)) created++
+    if (isEditedFile(f)) edited++
+  }
+  return { all: files.length, new: created, current: files.length - created, edited }
 }
 
 /* ── Leading kind glyph ───────────────────────────────────────────────────
@@ -117,7 +121,7 @@ export function FileFilterTabs({
   size = 'md',
   className = '',
 }: {
-  counts: { all: number; current: number; new: number }
+  counts: { all: number; current: number; new: number; edited: number }
   size?: 'sm' | 'md'
   className?: string
 }) {
@@ -127,6 +131,7 @@ export function FileFilterTabs({
   const items: { id: FileFilter; label: string; n: number }[] = [
     { id: 'current', label: 'Current', n: counts.current },
     { id: 'new', label: 'New', n: counts.new },
+    { id: 'edited', label: 'Edited', n: counts.edited },
     { id: 'all', label: 'All', n: counts.all },
   ]
 
@@ -156,5 +161,78 @@ export function FileFilterTabs({
         )
       })}
     </div>
+  )
+}
+
+/* ── Per-file diff-stats tracker ──────────────────────────────────────────
+   Tracks cumulative added/removed line counts per file, sourced from the
+   QA diff card's own line counts at apply-time (recordDiffStats) and
+   reversed on undo (revertDiffStats). Persisted to localStorage — mirrors
+   the applied/skipped persistence pattern already used for diff cards —
+   and broadcasts a DOM event so every mounted badge re-renders instantly. */
+export interface DiffStats { added: number; removed: number }
+
+const diffStatsKey = (fileId: string) => `sai-diffstats:${fileId}`
+const DIFF_STATS_EVENT = 'sai-diffstats-changed'
+
+export function readDiffStats(fileId: string): DiffStats {
+  try {
+    const raw = localStorage.getItem(diffStatsKey(fileId))
+    if (raw) return JSON.parse(raw)
+  } catch {}
+  return { added: 0, removed: 0 }
+}
+
+function writeDiffStats(fileId: string, stats: DiffStats) {
+  try {
+    if (stats.added === 0 && stats.removed === 0) {
+      localStorage.removeItem(diffStatsKey(fileId))
+    } else {
+      localStorage.setItem(diffStatsKey(fileId), JSON.stringify(stats))
+    }
+  } catch {}
+  try {
+    document.dispatchEvent(new CustomEvent(DIFF_STATS_EVENT, { detail: { fileId } }))
+  } catch {}
+}
+
+/** Call when a diff card is applied — accumulates added/removed lines for the file. */
+export function recordDiffStats(fileId: string, added: number, removed: number) {
+  const cur = readDiffStats(fileId)
+  writeDiffStats(fileId, { added: cur.added + added, removed: cur.removed + removed })
+}
+
+/** Call when an applied diff is undone — reverses the previously recorded stats. */
+export function revertDiffStats(fileId: string, added: number, removed: number) {
+  const cur = readDiffStats(fileId)
+  writeDiffStats(fileId, {
+    added: Math.max(0, cur.added - added),
+    removed: Math.max(0, cur.removed - removed),
+  })
+}
+
+/** Live-updating hook so badges re-render immediately as edits are applied/undone. */
+export function useDiffStats(fileId: string): DiffStats {
+  const [stats, setStats] = React.useState<DiffStats>(() => readDiffStats(fileId))
+  React.useEffect(() => {
+    const handler = (e: Event) => {
+      const detail = (e as CustomEvent).detail
+      if (!detail || detail.fileId === fileId) setStats(readDiffStats(fileId))
+    }
+    document.addEventListener(DIFF_STATS_EVENT, handler)
+    return () => document.removeEventListener(DIFF_STATS_EVENT, handler)
+  }, [fileId])
+  return stats
+}
+
+/** Compact +N/-N badge shown next to the AI-Edited pill. Renders nothing until stats exist. */
+export function DiffStatsBadge({ fileId }: { fileId: string }) {
+  const { added, removed } = useDiffStats(fileId)
+  if (added === 0 && removed === 0) return null
+  return (
+    <span className="flex items-center gap-1 text-[9px] font-medium px-1.5 py-0.5 bg-overlay text-muted border border-border rounded-md" title={`+${added} / -${removed} lines`}>
+      {added > 0 && <span className="text-success">+{added}</span>}
+      {removed > 0 && <span className="text-danger">-{removed}</span>}
+    </span>
   )
 }

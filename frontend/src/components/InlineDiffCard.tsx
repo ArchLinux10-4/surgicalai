@@ -9,8 +9,8 @@ import { toast } from '../lib/toast'
 import type { SmartResult, QAResult } from '../types'
 import { LivePreview, isVisualFile } from './LivePreview'
 import { useAppStore } from '../stores/appStore'
+import { recordDiffStats, revertDiffStats } from '../lib/fileClassify'
 import { Cancel, CheckCircle, Description, FileDownload, KeyboardArrowDown, KeyboardArrowUp, Replay, SkipNext, Visibility, Warning } from '@mui/icons-material';
-
 interface Props {
   result: SmartResult
   sessionId: string
@@ -48,6 +48,14 @@ const saveApplied = (sessionId: string, changeId: string) => {
 
 const saveSkipped = (sessionId: string, changeId: string) => {
   try { localStorage.setItem(skippedKey(sessionId, changeId), '1') } catch {}
+}
+
+/** Count added/removed lines in a unified diff — used to track per-file diff stats. */
+function diffLineCounts(diff: string): { added: number; removed: number } {
+  const lines = (diff || '').split('\n')
+  const added = lines.filter(l => l.startsWith('+') && !l.startsWith('+++')).length
+  const removed = lines.filter(l => l.startsWith('-') && !l.startsWith('---')).length
+  return { added, removed }
 }
 // ------------------------------------------------------------------------------------------------------------------------------------------
 
@@ -662,12 +670,17 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     return () => window.removeEventListener('keydown', handler)
   }, [])
 
-  const markApplied = (changeId: string) => {
+  const markApplied = (changeId: string, diff?: string) => {
     saveApplied(sessionId, changeId)
     setApplied(p => ({ ...p, [changeId]: true }))
     setSkipped(p => { const n = { ...p }; delete n[changeId]; return n })
     // Persist to backend DB so applied state survives page refresh
     if (sessionId) api.surgical.markApplied(sessionId, changeId).catch(() => {})
+    // Track lines added/removed for this file — powers the diff-stats badge in the file drawer
+    if (diff) {
+      const { added, removed } = diffLineCounts(diff)
+      recordDiffStats(fileData.file_id, added, removed)
+    }
     onChangeApplied?.()
   }
 
@@ -742,7 +755,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
       onApplied?.(filename, newContent)
       for (const change of selectedChanges) {
-        if (!failedIds.has(change.id)) markApplied(change.id)
+        if (!failedIds.has(change.id)) markApplied(change.id, change.diff)
       }
       // Signal ApplyAllButton to re-check applied state (replicates refresh sync)
       window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
@@ -753,6 +766,10 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         for (const change of selectedChanges) {
           saveApplied(sessionId, change.id)
           setApplied(p => ({ ...p, [change.id]: true }))
+          if (change.diff) {
+            const { added, removed } = diffLineCounts(change.diff)
+            recordDiffStats(fileData.file_id, added, removed)
+          }
         }
         // Re-sync originalCode from DB — the file is already modified,
         // so our in-memory originalCode is stale. Replicate refresh.
@@ -783,6 +800,11 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       try { localStorage.removeItem(skippedKey(sessionId, change.id)) } catch {}
       // Remove from backend DB too
       if (sessionId) api.surgical.unmarkApplied(sessionId, change.id).catch(() => {})
+      // Reverse the diff-stats contribution this change made when it was applied
+      if (change.diff) {
+        const { added, removed } = diffLineCounts(change.diff)
+        revertDiffStats(fileData.file_id, added, removed)
+      }
       setApplied(p => { const next = { ...p }; delete next[change.id]; return next })
       setSkipped(p => { const next = { ...p }; delete next[change.id]; return next })
       setModifiedCode(undefined)
