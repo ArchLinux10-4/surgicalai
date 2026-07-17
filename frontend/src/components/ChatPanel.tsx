@@ -829,7 +829,7 @@ export function ChatPanel() {
   const [thinkingText, setThinkingText] = useState('')
   const [isThinking, setIsThinking] = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
-  const [availableModels, setAvailableModels] = useState<{id: string; name: string; role: string; description?: string; cost?: number}[]>([])
+  const [availableModels, setAvailableModels] = useState<{id: string; name: string; role: string; description?: string; cost?: number; provider?: string}[]>([])
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -869,6 +869,14 @@ export function ChatPanel() {
   const effectiveMode: ChatMode = isOffline
     ? (chatMode === 'agent' ? 'edit' : chatMode === 'plan' ? 'ask' : chatMode)
     : chatMode
+  // Ask/Plan file-search & lookup tools are Claude-only today (backend gate:
+  // `_ask_plan_tools_enabled = bool(session_files) and _is_claude_model(...)`
+  // in pipeline.py). If the current architect model is GPT while the user is
+  // in Ask or Plan mode, flag it — the run will still work but silently
+  // degrades to a 300-line file preview instead of real search/lookup.
+  const currentModelProvider = availableModels.find(m => m.id === settings?.architect_model)?.provider
+  const searchToolsUnavailableForCurrentModel =
+    (effectiveMode === 'ask' || effectiveMode === 'plan') && currentModelProvider === 'openai'
   // Ref so doStream (deps: [sessionFiles]) reads the live offline flag with no
   // stale closure and without widening its dependency array.
   const isOfflineRef = useRef(isOffline)
@@ -1832,8 +1840,15 @@ export function ChatPanel() {
             <button
               onClick={() => setModelPickerOpen(v => !v)}
               className="text-[11px] font-mono text-muted/70 hover:text-accent bg-overlay/40 hover:bg-overlay px-1.5 py-0.5 rounded transition-colors leading-none flex items-center gap-1"
-              title="Change model"
+              title={
+                searchToolsUnavailableForCurrentModel
+                  ? `${settings?.architect_model || 'claude-sonnet-4-6'} — file search/lookup tools are Claude-only in ${MODE_META[effectiveMode].label} mode. This model will use a basic file preview instead.`
+                  : 'Change model'
+              }
             >
+              {searchToolsUnavailableForCurrentModel && (
+                <Warning sx={{ fontSize: 11 }} className="text-warning" />
+              )}
               {settings?.architect_model || 'claude-sonnet-4-6'}
               <span className="text-[9px]">▾</span>
             </button>
@@ -1841,16 +1856,39 @@ export function ChatPanel() {
               <>
                 <div className="fixed inset-0 z-40" onClick={() => setModelPickerOpen(false)} />
                 <div className="absolute right-0 top-full mt-1 z-50 bg-surface border border-border rounded-lg shadow-xl py-1 min-w-[220px] max-h-[300px] overflow-y-auto">
-                  {availableModels.filter(m => m.role === 'architect').map(m => (
-                    <button
-                      key={m.id}
-                      onClick={() => handleModelChange(m.id)}
-                      className={`w-full text-left px-3 py-1.5 text-[12px] hover:bg-overlay transition-colors ${settings?.architect_model === m.id ? 'text-accent font-medium' : 'text-ink'}`}
-                    >
-                      <div className="font-mono flex items-center">{m.id}<ModelCostIndicator cost={m.cost} /></div>
-                      {m.description && <div className="text-[10px] text-muted/70 mt-0.5 truncate">{m.description}</div>}
-                    </button>
-                  ))}
+                  {(effectiveMode === 'ask' || effectiveMode === 'plan') && (
+                    <div className="px-3 py-1.5 mb-1 border-b border-border/60 text-[10px] text-muted/80 leading-snug">
+                      File search &amp; lookup tools work with Claude models only in {MODE_META[effectiveMode].label} mode.
+                    </div>
+                  )}
+                  {availableModels.filter(m => m.role === 'architect').map(m => {
+                    const locked = (effectiveMode === 'ask' || effectiveMode === 'plan') && m.provider === 'openai'
+                    return (
+                      <button
+                        key={m.id}
+                        onClick={() => { if (!locked) handleModelChange(m.id) }}
+                        disabled={locked}
+                        title={locked ? `File search & lookup tools are Claude-only in ${MODE_META[effectiveMode].label} mode. ${m.id} would fall back to a basic file preview — not recommended.` : undefined}
+                        className={`w-full text-left px-3 py-1.5 text-[12px] transition-colors ${
+                          locked
+                            ? 'opacity-45 cursor-not-allowed select-none'
+                            : 'hover:bg-overlay'
+                        } ${settings?.architect_model === m.id ? 'text-accent font-medium' : 'text-ink'}`}
+                      >
+                        <div className="font-mono flex items-center gap-1">
+                          {m.id}
+                          <ModelCostIndicator cost={m.cost} />
+                          {locked && (
+                            <span className="ml-auto flex items-center gap-0.5 text-[9px] uppercase tracking-wide text-muted shrink-0">
+                              <Lock sx={{ fontSize: 11 }} className="text-muted" />
+                              No search
+                            </span>
+                          )}
+                        </div>
+                        {m.description && <div className="text-[10px] text-muted/70 mt-0.5 truncate">{m.description}</div>}
+                      </button>
+                    )
+                  })}
                 </div>
               </>
             )}
