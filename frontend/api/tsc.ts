@@ -36,6 +36,13 @@ interface TscError {
   column: number;
   message: string;
   detail: string;
+  // `code` is the numeric TS diagnostic code prefixed with "TS" (e.g. "TS1005").
+  // `kind` records which diagnostic pass produced it: only 'syntactic' errors
+  // are a pure function of the single file and safe for the backend to BLOCK on
+  // when type-checking in isolation (no node_modules / sibling modules). See the
+  // backend _tsc_error_kind() rationale (session 6930f196 round 2).
+  code: string;
+  kind: 'syntactic' | 'semantic';
 }
 
 const MAX_SOURCE_BYTES = 2_000_000; // 2 MB guard
@@ -109,13 +116,22 @@ function checkSource(code: string, filename: string): TscError[] {
   };
 
   const program = ts.createProgram([virtualName], options, host);
-  const diagnostics = [
-    ...program.getSemanticDiagnostics(sourceFile),
-    ...program.getSyntacticDiagnostics(sourceFile),
+  // Tag each diagnostic with the pass that produced it. In isolation only
+  // SYNTACTIC diagnostics are trustworthy (see TscError.kind rationale); the
+  // backend blocks on introduced syntactic errors and treats semantic ones as
+  // advisory. Syntactic diagnostics carry no TS code range that overlaps the
+  // semantic set, but tagging by source is exact and future-proof.
+  const tagged: Array<[ts.Diagnostic, 'syntactic' | 'semantic']> = [
+    ...program.getSyntacticDiagnostics(sourceFile).map(
+      (d) => [d, 'syntactic'] as [ts.Diagnostic, 'syntactic'],
+    ),
+    ...program.getSemanticDiagnostics(sourceFile).map(
+      (d) => [d, 'semantic'] as [ts.Diagnostic, 'semantic'],
+    ),
   ];
 
   const errors: TscError[] = [];
-  for (const d of diagnostics) {
+  for (const [d, kind] of tagged) {
     if (d.category !== ts.DiagnosticCategory.Error) continue;
     // Keep only diagnostics anchored to our source file.
     if (!d.file || d.file.fileName !== virtualName) continue;
@@ -133,6 +149,8 @@ function checkSource(code: string, filename: string): TscError[] {
       column,
       message,
       detail: `line ${line}, col ${column}: ${message}`,
+      code: `TS${d.code}`,
+      kind,
     });
     if (errors.length >= MAX_ERRORS) break;
   }

@@ -251,7 +251,13 @@ def _run_tsc_via_service(code: str, filename: str, allow_js: bool = False) -> Li
         col = int(e.get("column", 0) or 0)
         msg = str(e.get("message", "")).strip()
         detail = str(e.get("detail") or f"line {line}, col {col}: {msg}")
-        errors.append(_make_err(line, col, msg, detail))
+        # `code` and `kind` are emitted by frontend/api/tsc.ts. Older service
+        # deploys omit them -> _make_err classifies as 'semantic' (advisory),
+        # which is the fail-safe direction (never block on an unclassifiable
+        # diagnostic). Once the service redeploys, classification is exact.
+        code = str(e.get("code", "") or "")
+        kind = e.get("kind") if e.get("kind") in ("syntactic", "semantic") else None
+        errors.append(_make_err(line, col, msg, detail, code=code, kind=kind))
     return errors[:8]
 
 
@@ -315,7 +321,7 @@ def _parse_tsc_output(output: str, basename: str) -> List[Dict]:
     errors: List[Dict] = []
     pattern = re.compile(
         r"^(?P<file>[^(]+)\((?P<line>\d+),(?P<col>\d+)\):\s+"
-        r"(?P<severity>error|warning)\s+TS\d+:\s+(?P<msg>.+)$",
+        r"(?P<severity>error|warning)\s+TS(?P<code>\d+):\s+(?P<msg>.+)$",
         re.MULTILINE,
     )
     for m in pattern.finditer(output):
@@ -329,7 +335,8 @@ def _parse_tsc_output(output: str, basename: str) -> List[Dict]:
         line = int(m.group("line"))
         col  = int(m.group("col"))
         msg  = m.group("msg").strip()
-        errors.append(_make_err(line, col, msg, f"line {line}, col {col}: {msg}"))
+        errors.append(_make_err(line, col, msg, f"line {line}, col {col}: {msg}",
+                                code=f"TS{m.group('code')}"))
 
     return errors[:8]
 
@@ -342,8 +349,48 @@ def _ext(filename: str) -> str:
     return ("." + filename.rsplit(".", 1)[-1].lower()) if "." in filename else ""
 
 
-def _make_err(line: int, col: int, message: str, detail: str) -> Dict:
-    return {"line": line, "column": col, "message": message, "detail": detail}
+def _tsc_error_kind(code, kind_hint=None) -> str:
+    """
+    Classify a tsc diagnostic as 'syntactic' or 'semantic'.
+
+    WHY (session 6930f196 round 2): when a file is type-checked in ISOLATION
+    (the sandbox / Vercel sidecar has no node_modules, no sibling modules and no
+    tsconfig path mappings), only SYNTACTIC diagnostics are trustworthy — they
+    are a pure function of the single file's token stream. SEMANTIC diagnostics
+    depend on the module graph that does not exist here, so their presence, and
+    any original-vs-edited delta, is unreliable: an unrelated edit can flip an
+    inferred type (e.g. any <-> {}) and manufacture a phantom "introduced" error
+    such as ``Property 'length' does not exist on type '{}'`` at a line the edit
+    never touched. Callers use this to BLOCK only on introduced syntactic errors.
+
+    Preference order:
+      1. explicit ``kind_hint`` from the tsc service ('syntactic' / 'semantic')
+      2. TS code range: 1000-1999 == syntactic (parser); everything else semantic
+      3. unknown (no code / unparseable) -> 'semantic' — fail-safe: never block
+         on a diagnostic we cannot positively classify as syntactic.
+    """
+    if kind_hint in ("syntactic", "semantic"):
+        return kind_hint
+    n = None
+    if isinstance(code, bool):
+        n = None
+    elif isinstance(code, int):
+        n = code
+    elif isinstance(code, str):
+        m = re.search(r"(\d+)", code)
+        if m:
+            n = int(m.group(1))
+    if n is not None and 1000 <= n < 2000:
+        return "syntactic"
+    return "semantic"
+
+
+def _make_err(line: int, col: int, message: str, detail: str,
+              code: str = "", kind=None) -> Dict:
+    return {
+        "line": line, "column": col, "message": message, "detail": detail,
+        "code": code, "kind": kind or _tsc_error_kind(code, kind),
+    }
 
 
 def _find_tsc() -> Optional[str]:

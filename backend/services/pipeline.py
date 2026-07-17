@@ -17663,10 +17663,32 @@ async def run_natural_pipeline_stream(
                 _new_errs = await asyncio.to_thread(_vl, composed, fname)
             except Exception:
                 return []
-            _introduced = diff_introduced_errors(_orig_errs, _new_errs)
+            _introduced_all = diff_introduced_errors(_orig_errs, _new_errs)
+            # ── Long-term structural fix (session 6930f196 round 2) ───────────
+            # An ISOLATED single-file compile has no module graph (no
+            # node_modules, no sibling modules, no tsconfig paths). SEMANTIC
+            # diagnostics therefore depend on types that cannot resolve, so an
+            # unrelated edit can flip an inferred type (any <-> {}) and
+            # manufacture a phantom "introduced" error — e.g. TS "Property
+            # 'length' does not exist on type '{}'" at a line the edit never
+            # touched. That error is unfixable by the correction loop (it is not
+            # in the edited symbol) and wrongly blocked a correct edit at 3/10.
+            #
+            # Only SYNTACTIC diagnostics are a pure function of the single file
+            # and safe to BLOCK on. Semantic introduced errors are surfaced as
+            # advisory-only: logged here, never blocking, never driving the
+            # correction loop. Real semantic type-checking belongs in CI with
+            # the full project. This makes it structurally impossible for a
+            # module-resolution inference artifact to block a valid edit.
+            from services.linter_validator import _tsc_error_kind as _tk
+            _introduced = [e for e in _introduced_all
+                           if _tk(e.get("code", ""), e.get("kind")) == "syntactic"]
+            _advisory_semantic = [e for e in _introduced_all
+                                  if _tk(e.get("code", ""), e.get("kind")) != "syntactic"]
             # Session 6930f196: the actual TS error messages never reached the
             # debug log — only the count did — making root-cause impossible
-            # from logs alone. Always log the full introduced-error list.
+            # from logs alone. Always log the full introduced-error list, split
+            # into blocking (syntactic) vs advisory (semantic).
             _dlog("tsc_introduced_errors",
                   session_id=session_id, user_id=user_id,
                   phase=phase, filename=fname,
@@ -17674,10 +17696,17 @@ async def run_natural_pipeline_stream(
                   composed_symbols=[change_shells[i]["symbol"].name for i in applied_idxs],
                   skipped_indices=[i for i in idx_list if i not in applied_idxs],
                   introduced_count=len(_introduced),
+                  advisory_semantic_count=len(_advisory_semantic),
                   introduced=[{"code": e.get("code", ""),
+                               "kind": e.get("kind"),
                                "line": e.get("line"),
                                "message": (e.get("message", "") or "")[:300]}
-                              for e in _introduced])
+                              for e in _introduced],
+                  advisory_semantic=[{"code": e.get("code", ""),
+                                      "kind": e.get("kind"),
+                                      "line": e.get("line"),
+                                      "message": (e.get("message", "") or "")[:300]}
+                                     for e in _advisory_semantic])
             return _introduced
 
         def _force_block_on_tsc(_idx, _errs, _suffix):
