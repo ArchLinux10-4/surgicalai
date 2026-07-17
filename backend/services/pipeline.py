@@ -3325,7 +3325,48 @@ async def run_chat_stream(
                             pass
             if in_thinking:
                 yield sse({"type": "thinking_end", "content": ""})
+        elif _is_claude_model(chat_model):
+            # ── Claude/Anthropic native streaming with thinking blocks ──
+            anthropic_key = _get_anthropic_key(user_id)
+            aclient = AsyncAnthropic(api_key=anthropic_key)
+            # Anthropic API: system is a separate param, messages must not contain role=system
+            _sys_text = next((m["content"] for m in all_messages if m["role"] == "system"), "")
+            _claude_msgs = [m for m in all_messages if m["role"] != "system"]
+            _claude_kwargs = {
+                "model": chat_model,
+                "max_tokens": _max_output_tokens(chat_model),
+                "system": _sys_text or "You are a helpful assistant.",
+                "messages": _claude_msgs,
+            }
+            _claude_kwargs.update(_get_thinking_kwargs(chat_model, 8000))
+            _claude_kwargs.update(_get_effort_kwargs(chat_model))
+            _dlog("run_chat_stream_claude", model=chat_model, user_id=user_id)
+            in_thinking = False
+            async with aclient.messages.stream(**_claude_kwargs) as _cstream:
+                async for event in _cstream:
+                    event_type = getattr(event, "type", None)
+                    if event_type == "content_block_start":
+                        block = getattr(event, "content_block", None)
+                        if block and getattr(block, "type", "") == "thinking":
+                            in_thinking = True
+                            yield sse({"type": "thinking_start", "content": ""})
+                    elif event_type == "content_block_delta":
+                        delta = getattr(event, "delta", None)
+                        if delta:
+                            thinking_chunk = getattr(delta, "thinking", None)
+                            text_chunk = getattr(delta, "text", None)
+                            if thinking_chunk:
+                                yield sse({"type": "thinking", "content": thinking_chunk})
+                            elif text_chunk:
+                                yield sse({"type": "token", "content": text_chunk})
+                    elif event_type == "content_block_stop":
+                        if in_thinking:
+                            yield sse({"type": "thinking_end", "content": ""})
+                            in_thinking = False
+            if in_thinking:
+                yield sse({"type": "thinking_end", "content": ""})
         else:
+            # ── OpenAI / GPT streaming ──
             client = _get_client(user_id)
             stream = _chat_create(client,
                 model=chat_model,
