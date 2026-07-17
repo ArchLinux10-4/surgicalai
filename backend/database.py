@@ -415,6 +415,10 @@ def _init_sqlite():
         cur.execute("ALTER TABLE session_files ADD COLUMN origin TEXT DEFAULT 'uploaded'")
     if "edited" not in sf_cols:
         cur.execute("ALTER TABLE session_files ADD COLUMN edited INTEGER DEFAULT 0")
+    if "github_meta" not in sf_cols:
+        cur.execute("ALTER TABLE session_files ADD COLUMN github_meta TEXT")
+    if "github_pushed_at" not in sf_cols:
+        cur.execute("ALTER TABLE session_files ADD COLUMN github_pushed_at TIMESTAMP")
 
     # Migration: add QA log + compliance log tables
     cur.execute("""

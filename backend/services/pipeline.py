@@ -1341,9 +1341,7 @@ def _should_use_ollama(model: Optional[str] = None, user_id: str = "") -> bool:
     if model and model.startswith("ollama:"):
         return True
     if get_setting("ollama_enabled", "false") == "true":
-        has_openai = bool(_resolve_key(user_id, "openai"))
-        if not has_openai:
-            return True
+        return True
     return False
 
 
