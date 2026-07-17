@@ -5408,6 +5408,15 @@ async def analyze_and_plan_stream(
         # ------------------------------------------------------------------
         yield sse({"type": "progress", "content": "Running QA..."})
 
+        # ── GPT-reliability instrumentation (bug: GPT path hangs at QA with 0 changes) ──
+        # Cannot be proven from code alone — needs a live trace. Log QA entry so a
+        # single live run reveals whether QA is invoked with an empty change set.
+        _dlog("qa_entry_change_count",
+              session_id=session_id, user_id=user_id,
+              model=architect_model,
+              num_changes=(len(changes) if changes else 0),
+              file=(file_path or ""))
+
         qa = await run_qa_for_changes(changes, file_content, user_request, anthropic_key, architect_model, user_id=user_id)
         qa_risks = qa.get("risks", [])
 
@@ -5449,6 +5458,18 @@ async def analyze_and_plan_stream(
                 if _sq_blocking(_sq_issues):
                     _sq_has_errors = True
                     _sq_msgs = [si["message"] for si in _sq_issues if si["severity"] == "error"]
+                    # ── GPT-reliability instrumentation (bug: LLM QA false "safe" score) ──
+                    # Cannot be proven from code alone — needs a live trace. Record the
+                    # delta between what the LLM QA reported and what structural QA caught
+                    # BEFORE the score is capped below.
+                    _dlog("llm_qa_vs_structural_delta",
+                          session_id=session_id, user_id=user_id,
+                          model=architect_model,
+                          llm_verdict=qa.get("verdict"),
+                          llm_score=qa.get("qa_score"),
+                          structural_blocking_count=len(_sq_msgs),
+                          structural_messages=_sq_msgs[:5],
+                          file=_sq_fname)
                     qa["verdict"] = "blocked"
                     qa["qa_score"] = min(qa.get("qa_score", 10) or 10, 3)
                     qa_risks.extend([f"[STRUCTURAL] {m}" for m in _sq_msgs])
@@ -5462,6 +5483,15 @@ async def analyze_and_plan_stream(
         _aps_blocked = (_aps_verdict == "blocked") or (_aps_score <= 7)
 
         if _aps_blocked:
+            # ── GPT-reliability instrumentation (bug: correction loop timeout on large symbols) ──
+            # Cannot be proven from code alone — needs a live trace. Record change count and
+            # total edited-code size at correction entry so a timeout can be correlated to symbol size.
+            _dlog("aps_correction_loop_entry",
+                  session_id=session_id, user_id=user_id,
+                  model=architect_model,
+                  num_changes=(len(changes) if changes else 0),
+                  total_new_code_len=(sum(len(getattr(_c, "new_code", "") or "") for _c in changes) if changes else 0),
+                  qa_verdict=_aps_verdict, qa_score=_aps_score)
             for _aps_attempt in range(_APS_MAX_RETRIES):
                 yield sse({"type": "progress",
                            "content": f"🔁 Fixing blocked code — attempt {_aps_attempt + 1}/{_APS_MAX_RETRIES}..."})
