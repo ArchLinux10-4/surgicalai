@@ -17920,6 +17920,49 @@ async def run_natural_pipeline_stream(
                       retry_round=_qa_retry_round)
                 break
 
+            # ── Disconnect checkpoint (QA-correction loop parity) ──────────
+            # Evidence (trace 0b90bcde): a client disconnect 31.8s into a
+            # QA-correction round vaporized an already-QA-safe edit (score
+            # 9/10) alongside the blocked one — chat.py's safety net only
+            # saves visible chat tokens. Before entering the long, risky
+            # correction call, emit every change that already passed QA so
+            # the stream wrapper can persist it if the connection dies.
+            # Mirrors the symbol-resolution checkpoint (session e4e9d098);
+            # unknown SSE types are ignored by all frontend parsers.
+            _safe_indices = [
+                _si for _si in range(len(change_shells)) if _si not in blocked_indices
+            ]
+            if _safe_indices:
+                try:
+                    _qa_ckpt_payload = {
+                        "retry_round": _qa_retry_round,
+                        "blocked_count": len(blocked_indices),
+                        "resolved": [
+                            {
+                                "filename": change_shells[_si]["filename"],
+                                "symbol": getattr(
+                                    change_shells[_si]["symbol"], "name", "?"
+                                ),
+                                "description": change_shells[_si].get("description", ""),
+                                "new_code": change_shells[_si].get("new_code", ""),
+                            }
+                            for _si in _safe_indices
+                        ],
+                    }
+                    _dlog("qa_retry_checkpoint_emitted",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round,
+                          safe_count=len(_safe_indices),
+                          blocked_count=len(blocked_indices),
+                          payload_bytes=len(json.dumps(_qa_ckpt_payload)))
+                    yield sse({"type": "checkpoint",
+                               "content": json.dumps(_qa_ckpt_payload)})
+                except Exception as _qa_ckpt_err:
+                    _dlog("qa_retry_checkpoint_error",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round,
+                          error=str(_qa_ckpt_err)[:200])
+
             yield sse({"type": "progress",
                        "content": f"🔁 Fixing {len(blocked_indices)} blocked change(s) — "
                                   f"attempt {_qa_retry_round + 1}/{MAX_QA_RETRIES}..."})

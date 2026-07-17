@@ -22,9 +22,19 @@ export function isCreatedFile(f: SessionFile): boolean {
   return (f as any).origin === 'created'
 }
 
-/** File whose content was changed by the AI pipeline. */
+/**
+ * File whose content was changed by the AI pipeline (or the user) since
+ * upload/creation.
+ *
+ * Backed by the `edited` 0/1 column (set by update_session_file() whenever
+ * a diff is applied) — NOT `origin`. `origin` is only ever 'uploaded' or
+ * 'created' on the backend; the literal 'edited' origin value is never
+ * written, so checking `f.origin === 'edited'` could never be true for
+ * any file. That dead check is why the "Edited" filter/tag always showed
+ * zero results.
+ */
 export function isEditedFile(f: SessionFile): boolean {
-  return f.origin === 'edited'
+  return !!(f as any).edited
 }
 
 /** Spreadsheet/CSV file — eligible for the DataLab transform affordance. */
