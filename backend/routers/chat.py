@@ -64,6 +64,43 @@ async def _with_heartbeat(aiter, interval: int = 5):
             _dlog("heartbeat_swallow", exc_type=type(_hb_exc).__name__, exc_msg=str(_hb_exc))
 
 
+# ── Mode selector helpers (pure, unit-tested in test_mode_selector.py) ─────────
+# "edit" (default) and "agent" use the existing pipeline. "ask" and "plan"
+# short-circuit to a plain streamed answer with no edit pipeline.
+_VALID_MODES = ("edit", "ask", "plan", "agent")
+
+_ASK_DIRECTIVE = (
+    "You are in ASK mode. Answer the user's question thoroughly, using the "
+    "attached code and context. Explain, analyze, and research as needed. Do NOT "
+    "produce code edits, diffs, or <surgical_edit> tags — respond in clear "
+    "markdown prose only."
+)
+_PLAN_DIRECTIVE = (
+    "You are in PLAN mode. Produce a detailed, step-by-step implementation plan "
+    "for the user's request. Reference specific files, functions, and line "
+    "numbers from the provided code. Use this structure:\n"
+    "## Overview\nBrief summary of the approach.\n\n"
+    "## Steps\n1. **File: path** — what to change and why.\n2. ...\n\n"
+    "## Risks & Considerations\nEdge cases and things to watch for.\n\n"
+    "Do NOT produce code edits, diffs, or <surgical_edit> tags — plan only."
+)
+
+
+def _normalize_mode(raw) -> str:
+    """Coerce any client-supplied mode value to a known mode; default 'edit'."""
+    m = str(raw if raw is not None else "edit").lower().strip()
+    return m if m in _VALID_MODES else "edit"
+
+
+def _mode_directive(mode: str) -> str:
+    """Return the system directive for Ask/Plan modes; '' for edit/agent."""
+    if mode == "ask":
+        return _ASK_DIRECTIVE
+    if mode == "plan":
+        return _PLAN_DIRECTIVE
+    return ""
+
+
 def _load_effective_memory(conn, session_id):
     """Merge GLOBAL (team-wide) project memory with per-session memory.
 
@@ -573,6 +610,11 @@ async def smart_stream(req: dict, request: Request):
     # v1.5: explicit Agent Mode toggle from the UI. ORed with the phrase cue
     # below — never replaces it, so "create tasks" prompts keep working.
     force_tasks = bool(req.get("force_tasks", False))
+    # v1.6: explicit Mode selector from the UI — "edit" (default) | "ask" |
+    # "plan" | "agent". Ask/Plan short-circuit to a plain streamed answer and
+    # never touch the edit pipeline. "agent" is additive with force_tasks so the
+    # legacy toggle + "create tasks" phrase cue keep working unchanged.
+    mode = _normalize_mode(req.get("mode"))
     current_user_id = getattr(request.state, "user_id", "") or ""
 
     # Per-user keys only — no global/shared keys
@@ -643,7 +685,120 @@ async def smart_stream(req: dict, request: Request):
         _stream_t0 = time.time()
         _phase = "init"
         _dlog("sse_stream_start", session_id=session_id, user_id=current_user_id,
-              needs_compaction=needs_compaction, msg_len=len(message))
+              mode=mode, needs_compaction=needs_compaction, msg_len=len(message))
+
+        # ── Ask / Plan mode: plain streamed answer, NO edit pipeline ──────────
+        # Structural isolation: this branch returns from the generator before the
+        # pipeline is ever imported or dispatched. The model cannot emit an edit
+        # here because nothing downstream parses <surgical_edit> tags. This is the
+        # #1 lesson from Cursor/Copilot plan-mode failures — enforce by structure,
+        # not by prompt. Reuses run_chat_stream() (same helper plain chat uses),
+        # so memory + pinned context + all model backends come for free.
+        if mode in ("ask", "plan"):
+            # Effective mode for this branch. NOTE: never rebind `mode` itself —
+            # it is a closure variable read earlier (sse_stream_start); assigning
+            # to it here would make Python treat it as a generator-local and throw
+            # UnboundLocalError at that earlier read.
+            _eff_mode = mode
+            # Offline (Ollama/Qwen) degrade: Plan is hidden from the offline UI
+            # because a 7B local model produces weak multi-step plans that set a
+            # "now execute" expectation Agent can't honour offline. If a stale
+            # client still sends mode="plan" offline, degrade it to Ask (plain
+            # Q&A) rather than surface a capability we don't offer offline. Both
+            # are text-only — zero edit risk either way. Cloud path untouched.
+            if _eff_mode == "plan":
+                from database import get_setting as _gs_mode
+                from services.pipeline import _should_use_ollama as _use_offline_check
+                if _use_offline_check(_gs_mode("architect_model", "gpt-4.1"),
+                                      current_user_id):
+                    _dlog("sse_mode_offline_plan_to_ask", session_id=session_id,
+                          user_id=current_user_id)
+                    _eff_mode = "ask"
+
+            _dlog("sse_mode_dispatch", session_id=session_id, user_id=current_user_id,
+                  mode=_eff_mode)
+
+            _directive = _mode_directive(_eff_mode)
+
+            # Build the file context string from session files (same shape the
+            # single-pass path loads). run_chat_stream previews the first 300 lines.
+            _mode_file_ctx = None
+            if session_files:
+                _mode_file_ctx = "\n\n".join(
+                    f"### {f['filename']}\n{f.get('content', '')}"
+                    for f in session_files
+                )
+
+            # Prepend the mode directive to the current (last) user turn so every
+            # backend — Anthropic, OpenAI, Gemini, Ollama — sees it identically.
+            _mode_messages = [dict(m) for m in conversation_history]
+            if _mode_messages and _mode_messages[-1].get("role") == "user":
+                _mode_messages[-1]["content"] = (
+                    f"{_directive}\n\n{_mode_messages[-1]['content']}"
+                )
+            else:
+                _mode_messages.append({"role": "user", "content": _directive})
+
+            _mode_collected = []
+            _mode_error = False
+            _mode_model = None  # captured from run_chat_stream's `done` event
+            try:
+                # model omitted → run_chat_stream resolves architect_model itself.
+                async for _mchunk in run_chat_stream(
+                    _mode_messages,
+                    file_content=_mode_file_ctx,
+                    project_memory=project_memory,
+                    user_id=current_user_id,
+                ):
+                    # run_chat_stream emits token / thinking_* / done / error —
+                    # all already handled by the smart-stream frontend consumer.
+                    if _mchunk.startswith("data: "):
+                        try:
+                            _md = _json.loads(_mchunk[6:])
+                            _mt = _md.get("type")
+                            if _mt == "token":
+                                _mode_collected.append(_md.get("content", ""))
+                            elif _mt == "error":
+                                _mode_error = True
+                            elif _mt == "done" and _md.get("model"):
+                                # run_chat_stream doesn't log which backend it
+                                # resolved; capture it here so an empty/short
+                                # Ask/Plan answer isn't an untraceable ghost.
+                                _mode_model = _md.get("model")
+                        except Exception:
+                            pass
+                    yield _mchunk
+            except Exception as _me:
+                _mode_error = True
+                _dlog("sse_mode_error", session_id=session_id,
+                      user_id=current_user_id, mode=mode, error=str(_me))
+                yield "data: " + _json.dumps({"type": "error", "content":
+                    "Sorry — that request could not be completed. Please try again."}) + "\n\n"
+                yield "data: " + _json.dumps({"type": "done", "content": ""}) + "\n\n"
+
+            # Persist the assistant answer (tagged with the mode for later replay).
+            _mode_text = "".join(_mode_collected)
+            if _mode_text and not _mode_error:
+                try:
+                    with get_db_ctx() as _mdb:
+                        _mdb.execute(
+                            "INSERT INTO chat_messages (id, session_id, role, content) "
+                            "VALUES (?, ?, ?, ?)",
+                            (str(uuid.uuid4()), session_id, "assistant", _mode_text)
+                        )
+                        _mdb.execute(
+                            "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (session_id,)
+                        )
+                        _mdb.commit()
+                except Exception as _se:
+                    _dlog("sse_mode_save_error", session_id=session_id,
+                          user_id=current_user_id, mode=mode, error=str(_se))
+            _dlog("sse_mode_done", session_id=session_id, user_id=current_user_id,
+                  mode=mode, model=_mode_model, chars=len(_mode_text),
+                  error=_mode_error)
+            return
+        # ── End Ask/Plan mode ─────────────────────────────────────────────────
 
         # --- Rolling compaction (with keepalive) ---
         if needs_compaction:
@@ -693,9 +848,31 @@ async def smart_stream(req: dict, request: Request):
 
         _cue_match = wants_task_breakdown(message)
         _dlog("sse_task_gate", session_id=session_id, user_id=current_user_id,
-              force_tasks=force_tasks, cue_match=_cue_match, use_natural=_use_natural)
+              force_tasks=force_tasks, cue_match=_cue_match, mode=mode,
+              use_natural=_use_natural)
 
-        if (force_tasks or _cue_match) and not _is_claude:
+        # "agent" mode from the selector is additive with the legacy toggle and
+        # the "create tasks" phrase cue — any of the three triggers the branch.
+        _want_tasks = force_tasks or _cue_match or (mode == "agent")
+
+        # ── Offline (Ollama/Qwen) hard guard ──────────────────────────────
+        # Offline routing (_should_use_ollama) is INDEPENDENT of _is_claude:
+        # a user with ollama_enabled + no cloud key but a stale "claude-*"
+        # architect_model would be _is_claude=True yet actually run on Qwen.
+        # The multi-agent task pipeline is unsupported on 7B local models, so
+        # we structurally force Agent -> single-pass (whole-file Edit) here,
+        # before the task gate can fire. Also neutralises stray "create tasks"
+        # phrase cues while offline. Isolated to the offline path — the
+        # Claude/OpenAI cloud branches are untouched.
+        from services.pipeline import _should_use_ollama as _use_offline_check
+        _is_offline = _use_offline_check(_arch_model, current_user_id)
+        if _is_offline and _want_tasks:
+            _dlog("sse_mode_offline_no_agent", session_id=session_id,
+                  user_id=current_user_id, architect_model=_arch_model,
+                  mode=mode, force_tasks=force_tasks, cue_match=_cue_match)
+            _want_tasks = False
+
+        if _want_tasks and not _is_claude:
             # Tasks were explicitly requested (toggle or phrase) but the active
             # model is not Claude, so the agentic pipeline cannot run. Tell the
             # user instead of silently ignoring the request (fix #4).
@@ -706,7 +883,7 @@ async def smart_stream(req: dict, request: Request):
                 "Running this as a normal single-pass request instead.*\n\n"
             )})
 
-        if _is_claude and (force_tasks or _cue_match):
+        if _is_claude and _want_tasks:
             _phase = "planning"
             _plan_t0 = time.time()
             _plan_ka = 0

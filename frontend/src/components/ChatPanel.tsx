@@ -11,10 +11,22 @@ import { SessionFilesTray } from './SessionFilesTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
-import { AccountTree, Add, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
+import { AccountTree, Add, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Lock, Psychology, Security, Send, Warning } from '@mui/icons-material';
 import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
 
+
+// ── Chat mode selector ────────────────────────────────────────────────────────
+// Explicit user-selected intent (like Cursor/Copilot/Cline). Ask/Plan stream a
+// plain answer with no edit pipeline; Edit/Agent are the existing code paths.
+type ChatMode = 'edit' | 'ask' | 'plan' | 'agent'
+const MODE_META: Record<ChatMode, { icon: typeof AutoFixHigh; label: string; desc: string }> = {
+  edit:  { icon: AutoFixHigh,       label: 'Edit',  desc: 'Code edits with QA review' },
+  ask:   { icon: LightbulbOutlined, label: 'Ask',   desc: 'Questions & research — no edits' },
+  plan:  { icon: Description,       label: 'Plan',  desc: 'Implementation plan — no edits' },
+  agent: { icon: AccountTree,       label: 'Agent', desc: 'Multi-agent task breakdown (Claude)' },
+}
+const CHAT_MODES: ChatMode[] = ['edit', 'ask', 'plan', 'agent']
 
 // ── Cost indicator for model picker ───────────────────────────────────────────
 function ModelCostIndicator({ cost }: { cost?: number }) {
@@ -823,17 +835,44 @@ export function ChatPanel() {
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const userScrolledUpRef = useRef(false)
   // ── Agent Mode toggle (multi-agent task breakdown) ───────────────────────
-  // Read localStorage at send time (not from a closure) so doStream never
-  // sees a stale value. State exists only to drive the toggle UI.
-  const agentModeOn = () => {
-    try { return localStorage.getItem('sai_agent_mode') === '1' } catch { return false }
+  // Mode selector: Edit (default) | Ask | Plan | Agent.
+  // Read localStorage at send time (not from a closure) so doStream never sees
+  // a stale value. State exists only to drive the selector UI.
+  const readChatMode = (): ChatMode => {
+    try {
+      const v = localStorage.getItem('sai_chat_mode')
+      if (v === 'edit' || v === 'ask' || v === 'plan' || v === 'agent') return v
+      // One-time migration from the legacy Agent Mode toggle.
+      if (localStorage.getItem('sai_agent_mode') === '1') return 'agent'
+    } catch { /* storage blocked — default below */ }
+    return 'edit'
   }
-  const [agentMode, setAgentMode] = useState(agentModeOn)
-  const toggleAgentMode = () => setAgentMode(prev => {
-    const next = !prev
-    try { localStorage.setItem('sai_agent_mode', next ? '1' : '0') } catch { /* storage blocked — session-only toggle */ }
-    return next
-  })
+  const [chatMode, setChatMode] = useState<ChatMode>(readChatMode)
+  const [modeMenuOpen, setModeMenuOpen] = useState(false)
+  const selectChatMode = (m: ChatMode) => {
+    setChatMode(m)
+    try { localStorage.setItem('sai_chat_mode', m) } catch { /* storage blocked — session-only */ }
+  }
+
+  // ── Offline (Ollama/Qwen) mode gating ──────────────────────────────────
+  // Mirror of backend _should_use_ollama: a local "ollama:" model, OR
+  // ollama_enabled with no cloud OpenAI key. Offline runs on a 7B local
+  // model that can only do plain chat + whole-file rewrite, so we expose
+  // just Ask + Edit and hide Plan + Agent. The backend enforces the same
+  // guard structurally — this is the honest UI mirror. We never mutate the
+  // user's stored preference, so their cloud choice returns when a key is added.
+  const isOffline = !!(
+    settings?.architect_model?.startsWith('ollama:') ||
+    (settings?.ollama_enabled && !settings?.openai_api_key_set)
+  )
+  const availableModes: ChatMode[] = isOffline ? ['edit', 'ask'] : CHAT_MODES
+  const effectiveMode: ChatMode = isOffline
+    ? (chatMode === 'agent' ? 'edit' : chatMode === 'plan' ? 'ask' : chatMode)
+    : chatMode
+  // Ref so doStream (deps: [sessionFiles]) reads the live offline flag with no
+  // stale closure and without widening its dependency array.
+  const isOfflineRef = useRef(isOffline)
+  isOfflineRef.current = isOffline
 
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -1171,8 +1210,16 @@ export function ChatPanel() {
     let gotResult = false
     let streamModel = ''
 
+    // Resolve the outgoing mode fresh from storage, then degrade to the
+    // offline set (Edit/Ask) when on a local model so Qwen is never asked to
+    // Plan/Agent. Backend applies the same guard structurally as a backstop.
+    const _rawMode = readChatMode()
+    const _sendMode: ChatMode = isOfflineRef.current
+      ? (_rawMode === 'agent' ? 'edit' : _rawMode === 'plan' ? 'ask' : _rawMode)
+      : _rawMode
+
     const ctrl = api.stream.smart(
-      { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id), force_tasks: agentModeOn() },
+      { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id), mode: _sendMode, force_tasks: _sendMode === 'agent' },
       (progress) => {
         setSessionStreamProgress(sessionId, progress)
         if (useAppStore.getState().activeSessions !== sessionId) return
@@ -2019,35 +2066,90 @@ export function ChatPanel() {
                 lastResponse={messages.filter(m => m.role === 'assistant' && m.content).slice(-1)[0]?.content}
                 disabled={isStreaming || isCompacting}
               />
-              {/* Agent Mode toggle — forces multi-agent task breakdown */}
-              <div className="relative group">
+              {/* Mode selector — Edit (default) | Ask | Plan | Agent */}
+              <div className="relative">
                 <button
-                  onClick={toggleAgentMode}
+                  onClick={() => setModeMenuOpen(o => !o)}
                   disabled={isStreaming || isCompacting}
+                  title="Choose how the assistant responds"
                   className={`h-8 px-2.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors disabled:opacity-40 ${
-                    agentMode
+                    effectiveMode !== 'edit'
                       ? 'bg-accent/15 text-accent hover:bg-accent/25'
                       : 'text-muted/70 hover:text-ink/80 hover:bg-overlay/60'
                   }`}
                 >
-                  <AccountTree sx={{ fontSize: 14 }} />
-                  Agent Mode
-                  {agentMode && <span className="w-1.5 h-1.5 rounded-full bg-accent animate-pulse" />}
+                  {(() => { const I = MODE_META[effectiveMode].icon; return <I sx={{ fontSize: 14 }} /> })()}
+                  {MODE_META[effectiveMode].label}
+                  <span className="text-[9px] opacity-60 leading-none">▾</span>
                 </button>
-                <div className="absolute bottom-full left-0 mb-2 w-72 p-3 rounded-xl bg-surface border border-border/80 shadow-xl shadow-black/40 text-left hidden group-hover:block z-50 pointer-events-none">
-                  <div className="text-xs font-semibold text-ink mb-1 flex items-center gap-1.5">
-                    <AccountTree sx={{ fontSize: 13 }} className="text-accent" /> Agent Mode
-                  </div>
-                  <p className="text-[11px] text-muted leading-relaxed">
-                    Breaks your request into tasks and runs them with a team of AI agents —
-                    each with its own architect, surgeon, and QA — plus a final integration
-                    review across all changes. Best for large, multi-file requests.
-                  </p>
-                  <p className="text-[11px] text-faint leading-relaxed mt-1.5">
-                    When off, you can still trigger it by including “create tasks” in your
-                    prompt. Requires a Claude model.
-                  </p>
-                </div>
+                {modeMenuOpen && (
+                  <>
+                    {/* click-outside backdrop */}
+                    <div className="fixed inset-0 z-40" onClick={() => setModeMenuOpen(false)} />
+                    <div className="absolute bottom-full left-0 mb-2 w-64 p-1.5 rounded-xl bg-surface border border-border/80 shadow-xl shadow-black/40 z-50">
+                      {isOffline && (
+                        <div className="flex items-center gap-1.5 px-2.5 pt-1 pb-2 mb-1 border-b border-border/50">
+                          <Bolt sx={{ fontSize: 14 }} className="text-amber-400" />
+                          <span className="text-[11px] font-semibold text-ink">Offline · local model</span>
+                          <span className="ml-auto text-[10px] text-muted font-mono truncate max-w-[92px]">
+                            {(settings?.architect_model || 'qwen').replace('ollama:', '')}
+                          </span>
+                        </div>
+                      )}
+                      {availableModes.map(m => {
+                        const meta = MODE_META[m]
+                        const I = meta.icon
+                        const active = effectiveMode === m
+                        return (
+                          <button
+                            key={m}
+                            onClick={() => { selectChatMode(m); setModeMenuOpen(false) }}
+                            className={`w-full text-left px-2.5 py-2 rounded-lg flex items-start gap-2 transition-colors ${
+                              active ? 'bg-accent/15' : 'hover:bg-overlay/60'
+                            }`}
+                          >
+                            <I sx={{ fontSize: 15 }} className={active ? 'text-accent mt-0.5' : 'text-muted mt-0.5'} />
+                            <span className="flex-1 min-w-0">
+                              <span className={`block text-xs font-semibold ${active ? 'text-accent' : 'text-ink'}`}>{meta.label}</span>
+                              <span className="block text-[11px] text-muted leading-snug">{meta.desc}</span>
+                            </span>
+                            {active && <span className="w-1.5 h-1.5 rounded-full bg-accent mt-1.5 shrink-0" />}
+                          </button>
+                        )
+                      })}
+                      {isOffline && (
+                        <>
+                          <div className="mt-1 pt-1 border-t border-border/50">
+                            {(['plan', 'agent'] as ChatMode[]).map(m => {
+                              const meta = MODE_META[m]
+                              const I = meta.icon
+                              return (
+                                <div
+                                  key={m}
+                                  title="Requires a cloud model (Claude). Add an API key in Settings."
+                                  className="w-full text-left px-2.5 py-2 rounded-lg flex items-start gap-2 opacity-45 cursor-not-allowed select-none"
+                                >
+                                  <I sx={{ fontSize: 15 }} className="text-muted mt-0.5" />
+                                  <span className="flex-1 min-w-0">
+                                    <span className="block text-xs font-semibold text-ink">{meta.label}</span>
+                                    <span className="block text-[11px] text-muted leading-snug">{meta.desc}</span>
+                                  </span>
+                                  <span className="flex items-center gap-1 mt-0.5 shrink-0">
+                                    <Lock sx={{ fontSize: 12 }} className="text-muted" />
+                                    <span className="text-[9px] uppercase tracking-wide text-muted">Cloud</span>
+                                  </span>
+                                </div>
+                              )
+                            })}
+                          </div>
+                          <div className="px-2.5 pt-1.5 pb-1 text-[10px] text-faint leading-snug">
+                            Plan &amp; Agent need a cloud model. Add an API key in Settings to enable them.
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  </>
+                )}
               </div>
               <span className="text-[11px] text-faint ml-1 select-none">
                 {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} attached` : ''}
