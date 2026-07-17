@@ -3908,6 +3908,118 @@ def _locate_snippet_in_text(text: str, old_code: str):
 
 
 # ---------------------------------------------------------------------------
+# Helper: _locate_snippet_fuzzy  (Claude last-ditch content-anchor rescue)
+# ---------------------------------------------------------------------------
+# Purpose: a final, OPT-IN-ONLY safety net for the rare case where Claude's
+# old_code snippet has minor unintended drift (re-wrapped line, a dropped/added
+# trailing comment, a re-indent) and therefore fails BOTH exact match and the
+# whitespace-tolerant match in _locate_snippet_in_text. This is an ADD-ON tier
+# that runs only after those two have already failed — it never replaces them
+# and never runs for models other than Claude (call sites gate on
+# `_natural_use_claude`). It is intentionally conservative: it only ever
+# returns ok=True when the best-scoring window is both a strong match AND
+# unambiguously better than every other candidate window, so a low-confidence
+# or ambiguous case falls straight through to the existing correction loop
+# unchanged — exactly like today, with zero new failure modes.
+MAX_FUZZY_SCAN_LINES = 3000  # safety valve — skip fuzzy scan on huge texts
+
+
+def _locate_snippet_fuzzy(text: str, old_code: str,
+                           min_ratio: float = 0.85, min_margin: float = 0.08):
+    """
+    Find the contiguous line range in ``text`` most similar to ``old_code``
+    using difflib, for use ONLY after exact/whitespace-tolerant matching has
+    already failed.
+
+    Safety gates (both required to accept a match):
+      1. best_ratio >= min_ratio (default 0.85 — a high bar, not a loose
+         fuzzy match).
+      2. best_ratio beats the second-best candidate window by >= min_margin
+         (default 0.08) — refuses to guess between look-alike regions.
+
+    Returns:
+        (matched_text, start_idx, end_idx, ok, reason, diagnostics)
+        start_idx/end_idx are 0-based inclusive line indices into
+        text.splitlines(); diagnostics carries best_ratio/second_best_ratio/
+        windows_scanned for logging. On ok=False, matched_text/start_idx/
+        end_idx are None/-1/-1.
+    """
+    diagnostics = {"best_ratio": 0.0, "second_best_ratio": 0.0, "windows_scanned": 0}
+    if not old_code or not text:
+        return None, -1, -1, False, "no old_code or empty text", diagnostics
+
+    target_lines = old_code.splitlines()
+    n_t = len(target_lines)
+    if n_t == 0:
+        return None, -1, -1, False, "old_code is blank", diagnostics
+
+    text_lines = text.splitlines()
+    n_text = len(text_lines)
+    if n_text < n_t:
+        return None, -1, -1, False, "old_code has more lines than target text", diagnostics
+    if n_text > MAX_FUZZY_SCAN_LINES:
+        return None, -1, -1, False, (
+            f"text_too_large_for_fuzzy_scan: {n_text} lines exceeds cap "
+            f"of {MAX_FUZZY_SCAN_LINES}"
+        ), diagnostics
+
+    target_joined = "\n".join(_l.strip() for _l in target_lines)
+    best_ratio = -1.0
+    best_idx = -1
+    second_best_ratio = -1.0
+    windows_scanned = 0
+
+    for i in range(0, n_text - n_t + 1):
+        window_joined = "\n".join(_l.strip() for _l in text_lines[i:i + n_t])
+        ratio = difflib.SequenceMatcher(None, target_joined, window_joined).ratio()
+        windows_scanned += 1
+        if ratio > best_ratio:
+            second_best_ratio = best_ratio
+            best_ratio = ratio
+            best_idx = i
+        elif ratio > second_best_ratio:
+            second_best_ratio = ratio
+
+    diagnostics["best_ratio"] = round(best_ratio, 4)
+    diagnostics["second_best_ratio"] = round(second_best_ratio, 4) if second_best_ratio >= 0 else 0.0
+    diagnostics["windows_scanned"] = windows_scanned
+
+    if best_idx < 0:
+        return None, -1, -1, False, "no candidate windows", diagnostics
+    if best_ratio < min_ratio:
+        return None, -1, -1, False, (
+            f"best_ratio {best_ratio:.3f} below threshold {min_ratio}"
+        ), diagnostics
+
+    margin = best_ratio - max(second_best_ratio, 0.0)
+    if margin < min_margin:
+        return None, -1, -1, False, (
+            f"ambiguous: best {best_ratio:.3f} vs second-best "
+            f"{second_best_ratio:.3f} (margin {margin:.3f} < {min_margin})"
+        ), diagnostics
+
+    end_idx = best_idx + n_t - 1
+    matched_text = "\n".join(text_lines[best_idx:end_idx + 1])
+    return matched_text, best_idx, end_idx, True, f"fuzzy_match:ratio={best_ratio:.3f}", diagnostics
+
+
+def _apply_fuzzy_splice(text: str, start_idx: int, end_idx: int, new_code: str) -> str:
+    """
+    Replace 0-based inclusive line range [start_idx, end_idx] in ``text``
+    with ``new_code``. Companion splice function for _locate_snippet_fuzzy —
+    operates on the SAME line indices that function returns, so there is no
+    re-derivation of position (no second chance to get an off-by-one wrong).
+    """
+    lines = text.splitlines(keepends=True)
+    before = "".join(lines[:start_idx])
+    after = "".join(lines[end_idx + 1:])
+    replacement = new_code
+    if replacement and not replacement.endswith("\n"):
+        replacement += "\n"
+    return before + replacement + after
+
+
+# ---------------------------------------------------------------------------
 # Helper: _apply_snippet_by_lines  (Option B — line-number targeted edit)
 # ---------------------------------------------------------------------------
 
@@ -17011,6 +17123,51 @@ async def run_natural_pipeline_stream(
                                               old_code_preview=old_code[:200],
                                               user_id=user_id)
 
+                            # ── Claude last-ditch: fuzzy content-anchor rescue ──
+                            # ADD-ON safety net (approved feature request). Only
+                            # engages for Claude (`_natural_use_claude`), only
+                            # after Option B's line-splice AND the exact/ws-
+                            # tolerant file-level rescue above have BOTH already
+                            # failed, and only when old_code was supplied at all.
+                            # Existing behavior for every other model and every
+                            # other failure path is completely unchanged.
+                            if (not _optb_rescued and old_code
+                                    and _natural_use_claude):
+                                (_fz_text, _fz_start, _fz_end, _fz_ok,
+                                 _fz_reason, _fz_diag) = _locate_snippet_fuzzy(
+                                    _accum_base, old_code
+                                )
+                                _dlog("claude_fuzzy_rescue_attempt",
+                                      session_id=session_id,
+                                      filename=filename,
+                                      symbol=symbol_name,
+                                      site="option_b_line_splice_fail",
+                                      old_code_len=len(old_code),
+                                      symbol_code_len=len(_accum_base),
+                                      best_ratio=_fz_diag.get("best_ratio"),
+                                      second_best_ratio=_fz_diag.get("second_best_ratio"),
+                                      windows_scanned=_fz_diag.get("windows_scanned"),
+                                      ok=_fz_ok,
+                                      reason=_fz_reason,
+                                      user_id=user_id)
+                                if _fz_ok:
+                                    _fz_full = _apply_fuzzy_splice(
+                                        _accum_base, _fz_start, _fz_end, new_code
+                                    )
+                                    edit_data["new_code"] = _fz_full
+                                    edit_data.pop("old_code", None)
+                                    edit_data.pop("edit_start_line", None)
+                                    edit_data.pop("edit_end_line", None)
+                                    _optb_rescued = True
+                                    _dlog("claude_fuzzy_rescue_accepted",
+                                          session_id=session_id,
+                                          filename=filename,
+                                          symbol=symbol_name,
+                                          site="option_b_line_splice_fail",
+                                          matched_line_range=f"{_fz_start}-{_fz_end}",
+                                          matched_text_preview=_fz_text[:200] if _fz_text else None,
+                                          user_id=user_id)
+
                             if not _optb_rescued:
                                 _dlog("snippet_apply_failed",
                                       session_id=session_id,
@@ -17113,36 +17270,79 @@ async def run_natural_pipeline_stream(
                                       user_id=user_id)
                                 # fall through to the resolved path below
                             else:
-                                _dlog("snippet_apply_failed",
-                                      session_id=session_id,
-                                      filename=filename,
-                                      symbol=symbol_name,
-                                      reason=snip_reason,
-                                      file_level_reason=(
-                                          _rf_reason if not _rf_ok
-                                          else "match lies inside the target symbol"
-                                      ),
-                                      old_code_sent=old_code,
-                                      old_code_len=len(old_code),
-                                      symbol_code_actual=_accum_base,
-                                      symbol_code_len=len(_accum_base),
-                                      user_id=user_id)
-                                still_unresolved.append({
-                                    "filename": filename,
-                                    "symbol": symbol_name,
-                                    "new_code": new_code,
-                                    "description": description,
-                                    "_raw": edit_raw,
-                                    "_snippet_reason": snip_reason,
-                                    # CURRENT accumulated content — not symbol.code
-                                    # (the pristine original). Showing stale content
-                                    # made the correction model re-anchor against
-                                    # lines that no longer exist (the correction-drop
-                                    # bug).
-                                    "_symbol_code": _accum_base,
-                                    "_symbol_start": symbol.start_line,
-                                })
-                                continue
+                                # ── Claude last-ditch: fuzzy content-anchor rescue ──
+                                # ADD-ON safety net (approved feature request). Only
+                                # engages for Claude (`_natural_use_claude`), only
+                                # after the exact symbol splice AND the exact/ws-
+                                # tolerant file-level rescue above have BOTH already
+                                # failed. Existing behavior for every other model
+                                # and every other failure path is unchanged.
+                                _fz_rescued = False
+                                if _natural_use_claude:
+                                    (_fz_text, _fz_start, _fz_end, _fz_ok,
+                                     _fz_reason, _fz_diag) = _locate_snippet_fuzzy(
+                                        _accum_base, old_code
+                                    )
+                                    _dlog("claude_fuzzy_rescue_attempt",
+                                          session_id=session_id,
+                                          filename=filename,
+                                          symbol=symbol_name,
+                                          site="option_a_string_splice_fail",
+                                          old_code_len=len(old_code),
+                                          symbol_code_len=len(_accum_base),
+                                          best_ratio=_fz_diag.get("best_ratio"),
+                                          second_best_ratio=_fz_diag.get("second_best_ratio"),
+                                          windows_scanned=_fz_diag.get("windows_scanned"),
+                                          ok=_fz_ok,
+                                          reason=_fz_reason,
+                                          user_id=user_id)
+                                    if _fz_ok:
+                                        _fz_full = _apply_fuzzy_splice(
+                                            _accum_base, _fz_start, _fz_end, new_code
+                                        )
+                                        edit_data["new_code"] = _fz_full
+                                        edit_data.pop("old_code", None)
+                                        _fz_rescued = True
+                                        _dlog("claude_fuzzy_rescue_accepted",
+                                              session_id=session_id,
+                                              filename=filename,
+                                              symbol=symbol_name,
+                                              site="option_a_string_splice_fail",
+                                              matched_line_range=f"{_fz_start}-{_fz_end}",
+                                              matched_text_preview=_fz_text[:200] if _fz_text else None,
+                                              user_id=user_id)
+
+                                if not _fz_rescued:
+                                    _dlog("snippet_apply_failed",
+                                          session_id=session_id,
+                                          filename=filename,
+                                          symbol=symbol_name,
+                                          reason=snip_reason,
+                                          file_level_reason=(
+                                              _rf_reason if not _rf_ok
+                                              else "match lies inside the target symbol"
+                                          ),
+                                          old_code_sent=old_code,
+                                          old_code_len=len(old_code),
+                                          symbol_code_actual=_accum_base,
+                                          symbol_code_len=len(_accum_base),
+                                          user_id=user_id)
+                                    still_unresolved.append({
+                                        "filename": filename,
+                                        "symbol": symbol_name,
+                                        "new_code": new_code,
+                                        "description": description,
+                                        "_raw": edit_raw,
+                                        "_snippet_reason": snip_reason,
+                                        # CURRENT accumulated content — not symbol.code
+                                        # (the pristine original). Showing stale content
+                                        # made the correction model re-anchor against
+                                        # lines that no longer exist (the correction-drop
+                                        # bug).
+                                        "_symbol_code": _accum_base,
+                                        "_symbol_start": symbol.start_line,
+                                    })
+                                    continue
                     else:
                         # ── Degenerate-fragment guard ────────────────────────
                         # No old_code was supplied. If new_code is clearly only a
