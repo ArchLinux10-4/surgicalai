@@ -3,7 +3,7 @@ import { api } from '../api/client'
 import type { SessionFile } from '../types'
 import { GitHubCommitModal } from './GitHubCommitModal'
 import { useAppStore } from '../stores/appStore'
-import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile } from '../lib/fileClassify'
+import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile, DiffStatsBadge } from '../lib/fileClassify'
 import { GitHub } from '@mui/icons-material';
 import { DownloadSessionButton } from './DownloadSessionButton'
 
@@ -68,7 +68,7 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
 
 
   const isFileEdited = (file: SessionFile): boolean => {
-    return !!(file as any).edited
+    return isEditedFile(file)
   }
 
   // Sort: modified-since-push first, then synced, then never; AI-edited before unedited.
@@ -77,8 +77,8 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
     return [...sessionFiles].sort((a, b) => {
       const so = order[syncStatus(a)] - order[syncStatus(b)]
       if (so !== 0) return so
-      const aEdited = (a as any).edited ? 0 : 1
-      const bEdited = (b as any).edited ? 0 : 1
+      const aEdited = isFileEdited(a) ? 0 : 1
+      const bEdited = isFileEdited(b) ? 0 : 1
       return aEdited - bEdited
     })
   }, [sessionFiles])
@@ -271,6 +271,7 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
                             AI-Edited
                           </span>
                         )}
+                        {isModified && <DiffStatsBadge fileId={file.id} />}
                       </div>
                       <div className="flex items-center gap-2 mt-0.5">
                         <span className="text-[11px] text-muted/60">{file.lines?.toLocaleString()} lines</span>
