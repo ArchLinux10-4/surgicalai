@@ -249,7 +249,7 @@ export const api = {
     },
 
     smart: (
-      data: { session_id: string; message: string; file_ids?: string[]; force_tasks?: boolean },
+      data: { session_id: string; message: string; file_ids?: string[]; mode?: 'edit' | 'ask' | 'plan' | 'agent'; force_tasks?: boolean },
       onProgress: (msg: string) => void,
       onToken: (token: string) => void,
       onResult: (result: any) => void,
