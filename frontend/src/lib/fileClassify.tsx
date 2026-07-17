@@ -15,7 +15,7 @@ import React from 'react'
 import type { SessionFile } from '../types'
 import { useAppStore } from '../stores/appStore'
 
-export type FileFilter = 'all' | 'current' | 'new'
+export type FileFilter = 'all' | 'current' | 'new' | 'edited'
 
 /** AI-generated net-new file. */
 export function isCreatedFile(f: SessionFile): boolean {
