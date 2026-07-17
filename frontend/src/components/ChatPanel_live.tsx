@@ -71,9 +71,12 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
 
   if (pendingMessages.length === 0) return null
 
-  // Count only UNAPPLIED changes — exclude already-applied ones
-  let totalChanges = 0
-  let totalFiles   = 0
+  // Count only UNAPPLIED changes — exclude already-applied ones. QA-blocked
+  // changes are NOT bulk-applyable (same gate the per-row checkbox enforces),
+  // so track clean vs flagged separately.
+  let cleanChanges   = 0
+  let flaggedChanges = 0
+  let totalFiles     = 0
   for (const msg of pendingMessages) {
     try {
       const result: SmartResult = JSON.parse(msg.surgical_data)
@@ -81,15 +84,17 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       for (const f of files) {
         const changes = result.changes_by_file[f]?.changes || []
         const unapplied = changes.filter((c: any) => c?.id && !appliedIds.has(c.id))
-        if (unapplied.length > 0) totalFiles++
-        totalChanges += unapplied.length
+        const clean = unapplied.filter((c: any) => c.qa_result?.verdict !== 'blocked')
+        if (clean.length > 0) totalFiles++
+        cleanChanges   += clean.length
+        flaggedChanges += unapplied.length - clean.length
       }
       const newFiles = (result.new_files || []).filter((nf: any) => nf?.id && !appliedIds.has(nf.id))
-      totalChanges += newFiles.length
+      cleanChanges += newFiles.length
     } catch {}
   }
 
-  if (totalChanges === 0) return null
+  if (cleanChanges === 0) return null
 
   const handleApplyAll = async () => {
     setApplying(true)
@@ -106,18 +111,21 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
         for (const [, fileData] of Object.entries(result.changes_by_file || {})) {
           const fd = fileData as any
           if (!fd?.file_id || !fd?.changes?.length) continue
+          // Only bulk-apply QA-clean changes; blocked ones require individual review.
+          const applyChanges = fd.changes.filter((c: any) => c?.qa_result?.verdict !== 'blocked')
+          if (applyChanges.length === 0) continue
           try {
             const current = await api.sessionFiles.get(sessionId, fd.file_id)
             const applied = await api.surgical.applyAll({
               file_path: fd.filename,
-              changes: fd.changes,
+              changes: applyChanges,
               file_content: current.content,
             })
             if (applied.modified_content) {
               await api.sessionFiles.update(sessionId, fd.file_id, applied.modified_content)
               appliedFiles++
               // Track every applied change in DB so state survives refresh
-              for (const ch of fd.changes) {
+              for (const ch of applyChanges) {
                 if (ch?.id) markPromises.push(api.surgical.markApplied(sessionId, ch.id).catch(() => {}))
               }
             }
@@ -160,7 +168,10 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       <DoneAll sx={{ fontSize: 14 }} />
       {applying
         ? 'Applying…'
-        : `Apply All  ·  ${totalChanges} change${totalChanges !== 1 ? 's' : ''} across ${totalFiles} file${totalFiles !== 1 ? 's' : ''}`
+        : flaggedChanges > 0
+          ? `Apply All  ·  ${cleanChanges} clean change${cleanChanges !== 1 ? 's' : ''} ` +
+            `(${flaggedChanges} QA-flagged, apply individually)`
+          : `Apply All  ·  ${cleanChanges} change${cleanChanges !== 1 ? 's' : ''} across ${totalFiles} file${totalFiles !== 1 ? 's' : ''}`
       }
     </button>
   )

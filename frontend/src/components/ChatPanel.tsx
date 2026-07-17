@@ -79,26 +79,32 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
 
   if (pendingMessages.length === 0) return null
 
-  // Count only UNAPPLIED changes — diff cards' applied state is source of truth
-  let totalChanges = 0
-  const fileSet    = new Set<string>()
+  // Count only UNAPPLIED changes — diff cards' applied state is source of truth.
+  // QA-blocked changes are NOT bulk-applyable: the per-row checkbox disables them
+  // (see InlineDiffCard), so Apply All must respect the same gate. We track clean
+  // (applyable) vs flagged (QA-blocked) separately so the button can show the split.
+  let cleanChanges   = 0
+  let flaggedChanges = 0
+  const fileSet      = new Set<string>()
   for (const msg of pendingMessages) {
     try {
       const result: SmartResult = JSON.parse(msg.surgical_data)
       for (const [fname, fd] of Object.entries(result.changes_by_file || {})) {
         const changes = (fd as any)?.changes || []
         const unapplied = changes.filter((c: any) => c.id && !appliedIds.has(c.id))
-        if (unapplied.length > 0) {
-          totalChanges += unapplied.length
-          fileSet.add(fname)
-        }
+        const clean   = unapplied.filter((c: any) => c.qa_result?.verdict !== 'blocked')
+        cleanChanges   += clean.length
+        flaggedChanges += unapplied.length - clean.length
+        if (clean.length > 0) fileSet.add(fname)
       }
       // new_files are not edits — don't count them as changes to apply
     } catch {}
   }
   const totalFiles = fileSet.size
 
-  if (totalChanges === 0) return null
+  // Nothing clean to bulk-apply → hide the button (flagged changes stay visible
+  // on their individual cards for manual review).
+  if (cleanChanges === 0) return null
 
   const handleApplyAll = async () => {
     setApplying(true)
@@ -119,17 +125,21 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
         for (const [, fileData] of Object.entries(result.changes_by_file || {})) {
           const fd = fileData as any
           if (!fd?.file_id || !fd?.changes?.length) continue
+          // Only bulk-apply QA-clean changes. QA-blocked changes must be reviewed
+          // and applied individually — same gate the per-row checkbox enforces.
+          const applyChanges = fd.changes.filter((c: any) => c?.qa_result?.verdict !== 'blocked')
+          if (applyChanges.length === 0) continue
           try {
             const current = await api.sessionFiles.get(sessionId, fd.file_id)
             const applied = await api.surgical.applyAll({
               file_path: fd.filename,
-              changes: fd.changes,
+              changes: applyChanges,
               file_content: current.content,
             })
             if (applied.modified_content) {
               await api.sessionFiles.update(sessionId, fd.file_id, applied.modified_content)
               appliedFiles++
-              appliedChanges += applied.applied_count ?? fd.changes.length
+              appliedChanges += applied.applied_count ?? applyChanges.length
               rescuedChanges += applied.rescued_count ?? 0
               // Truthful accounting: the engine reports exactly which changes
               // failed — those stay UNAPPLIED so they remain visible/retryable.
@@ -140,7 +150,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
               if ((applied.failed_changes || []).length > 0 && !firstFailReason) {
                 firstFailReason = applied.failed_changes[0]?.reason || ''
               }
-              for (const ch of fd.changes) {
+              for (const ch of applyChanges) {
                 if (ch?.id && !failedIds.has(ch.id)) {
                   markPromises.push(api.surgical.markApplied(sessionId, ch.id).catch(() => {}))
                 }
@@ -196,7 +206,10 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       <DoneAll sx={{ fontSize: 14 }} />
       {applying
         ? 'Applying…'
-        : `Apply All  ·  ${totalChanges} change${totalChanges !== 1 ? 's' : ''} across ${totalFiles} file${totalFiles !== 1 ? 's' : ''}`
+        : flaggedChanges > 0
+          ? `Apply All  ·  ${cleanChanges} clean change${cleanChanges !== 1 ? 's' : ''} ` +
+            `(${flaggedChanges} QA-flagged, apply individually)`
+          : `Apply All  ·  ${cleanChanges} change${cleanChanges !== 1 ? 's' : ''} across ${totalFiles} file${totalFiles !== 1 ? 's' : ''}`
       }
     </button>
   )

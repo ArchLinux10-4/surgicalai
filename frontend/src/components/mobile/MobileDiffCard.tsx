@@ -109,20 +109,26 @@ function FileCard({
 
   const handleApply = async () => {
     if (applying || allApplied) return
+    // Only apply QA-clean changes; QA-blocked ones must be reviewed individually.
+    const applyChanges = changes.filter((c: any) => c?.qa_result?.verdict !== 'blocked')
+    if (applyChanges.length === 0) {
+      toast.error('All changes here are QA-flagged — review them individually before applying')
+      return
+    }
     setApplying(true)
     try {
       const current = await api.sessionFiles.get(sessionId, fileData.file_id)
       const result  = await api.surgical.applyAll({
         file_path: filename,
-        changes,
+        changes: applyChanges,
         file_content: current.content,
       })
       if (result.modified_content) {
         await api.sessionFiles.update(sessionId, fileData.file_id, result.modified_content)
       }
-      // Mark every change as applied in localStorage + backend DB
+      // Mark every applied change in localStorage + backend DB
       const newApplied: Record<string, boolean> = {}
-      for (const ch of changes) {
+      for (const ch of applyChanges) {
         if (ch?.id) {
           saveApplied(sessionId, ch.id)
           api.surgical.markApplied(sessionId, ch.id).catch(() => {})
@@ -130,7 +136,11 @@ function FileCard({
         }
       }
       setAppliedMap(prev => ({ ...prev, ...newApplied }))
-      toast.success(`Applied ${changes.length} change${changes.length !== 1 ? 's' : ''} to ${filename}`)
+      const flagged = changes.length - applyChanges.length
+      toast.success(
+        `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''} to ${filename}` +
+        (flagged > 0 ? ` (${flagged} QA-flagged, skipped)` : '')
+      )
       onApplied()
     } catch (e: any) {
       const msg = e?.message || 'Apply failed'
