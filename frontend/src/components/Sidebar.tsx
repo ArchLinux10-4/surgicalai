@@ -10,7 +10,7 @@ import { LinearPanel } from './LinearPanel'
 import { VercelPanel } from './VercelPanel'
 import { RailwayPanel } from './RailwayPanel'
 import { useThemeStore } from '../stores/themeStore'
-import { Add, Chat, CloudOff, Close, Code, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
+import { Add, Chat, CloudOff, Close, Code, CreateNewFolder, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile, DiffStatsBadge } from '../lib/fileClassify'
 import { DownloadSessionButton } from './DownloadSessionButton'
 
@@ -587,10 +587,48 @@ function getFileIcon(filename: string) {
 }
 
 function SessionFilesPanel() {
-  const { sessionFiles, removeSessionFile, addSessionFile, fileFilter, activeSessions } = useAppStore()
+  const { sessionFiles, setSessionFiles, removeSessionFile, addSessionFile, fileFilter, activeSessions, settings } = useAppStore()
   const fileInputRef = useRef<HTMLInputElement>(null)
+  const [importing, setImporting] = useState(false)
+  // Import Folder reads from a path on the *server's* disk (see
+  // routers/files.py:_get_workspace_root). On a local install the server IS
+  // the user's machine, so this is a real "open my project" action. On a
+  // hosted (Vercel/Railway) instance the server is a remote container, so
+  // this path can never reach the user's laptop — surfacing the button there
+  // would be actively misleading, so it's hidden entirely (server tells us
+  // via settings.is_hosted, same signal that gates workspace_path editing).
+  const canImportFolder = !settings?.is_hosted
   const counts = fileCounts(sessionFiles)
   const visibleFiles = sessionFiles.filter(f => matchesFileFilter(f, fileFilter))
+
+  const handleImportFolder = async () => {
+    if (!activeSessions || importing) return
+    setImporting(true)
+    try {
+      const result = await api.sessionFiles.importFolder(activeSessions)
+      await api.sessionFiles.list(activeSessions).then(setSessionFiles)
+
+      const skippedTotal = result.skipped_edited.length + result.skipped_too_large.length + result.skipped_session_cap.length + result.failed.length
+      if (result.imported_count === 0 && skippedTotal === 0) {
+        toast.info('No files found', `${result.folder} has no importable code files (or everything is already up to date).`)
+      } else {
+        const bits: string[] = []
+        if (result.skipped_edited.length) bits.push(`${result.skipped_edited.length} kept (already edited here)`)
+        if (result.skipped_too_large.length) bits.push(`${result.skipped_too_large.length} too large`)
+        if (result.skipped_session_cap.length) bits.push(`${result.skipped_session_cap.length} skipped (session limit reached)`)
+        if (result.failed.length) bits.push(`${result.failed.length} failed to read`)
+        if (result.truncated) bits.push(`stopped at 500 files — import a subfolder for the rest`)
+        toast.success(
+          `Imported ${result.imported_count} file${result.imported_count !== 1 ? 's' : ''}`,
+          bits.length ? bits.join(' · ') : `From ${result.folder}`
+        )
+      }
+    } catch (e: any) {
+      toast.error('Import folder failed', e.message)
+    } finally {
+      setImporting(false)
+    }
+  }
 
   const handleDownload = async (file: SessionFile) => {
     try {
@@ -642,6 +680,16 @@ function SessionFilesPanel() {
               sessionFiles={sessionFiles}
             />
           )}
+          {canImportFolder && (
+            <button
+              onClick={handleImportFolder}
+              disabled={importing || !activeSessions}
+              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-overlay text-muted text-[11px] font-semibold hover:bg-accent/10 hover:text-accent transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Import every code file from your configured workspace folder (skips node_modules, venv, .git, etc.)"
+            >
+              <CreateNewFolder sx={{ fontSize: 12 }} /> {importing ? 'Importing…' : 'Import Folder'}
+            </button>
+          )}
           <button
             onClick={() => fileInputRef.current?.click()}
             className="flex items-center gap-1 px-2 py-1 rounded-lg bg-accent/10 text-accent text-[11px] font-semibold hover:bg-accent/20 transition-colors"
@@ -673,15 +721,29 @@ function SessionFilesPanel() {
             <div>
               <p className="text-[13px] font-semibold text-muted">No files in this chat</p>
               <p className="text-[11px] text-faint mt-1 leading-relaxed">
-                Drop files into the chat or click <strong className="text-muted/70">Add</strong> above
+                {canImportFolder
+                  ? <>Drop files into the chat, click <strong className="text-muted/70">Add</strong>, or import
+                      your whole project folder at once</>
+                  : <>Drop files into the chat, or click <strong className="text-muted/70">Add</strong> to upload some</>}
               </p>
             </div>
-            <button
-              onClick={() => fileInputRef.current?.click()}
-              className="mt-1 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent/10 text-accent text-[12px] font-semibold hover:bg-accent/20 transition-colors border border-accent/20"
-            >
-              <FileUpload sx={{ fontSize: 12 }} /> Upload files
-            </button>
+            <div className="flex items-center gap-2">
+              {canImportFolder && (
+                <button
+                  onClick={handleImportFolder}
+                  disabled={importing || !activeSessions}
+                  className="mt-1 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent text-white text-[12px] font-semibold hover:bg-accent/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <CreateNewFolder sx={{ fontSize: 12 }} /> {importing ? 'Importing…' : 'Import Folder'}
+                </button>
+              )}
+              <button
+                onClick={() => fileInputRef.current?.click()}
+                className="mt-1 flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-accent/10 text-accent text-[12px] font-semibold hover:bg-accent/20 transition-colors border border-accent/20"
+              >
+                <FileUpload sx={{ fontSize: 12 }} /> Upload files
+              </button>
+            </div>
           </div>
         ) : visibleFiles.length === 0 ? (
           <div className="px-4 py-6 text-center text-[12px] text-muted/60">

@@ -1,6 +1,7 @@
 """Per-session file storage — files uploaded to a chat stay in that chat.
 Supports: code, images (vision), PDFs, CSV, Excel.
 """
+import os
 import uuid
 import base64
 import io
@@ -674,6 +675,153 @@ def delete_session_file(session_id: str, file_id: str):
         )
         conn.commit()
     return {"ok": True}
+
+
+@router.post("/{session_id}/files/import-folder")
+def import_folder(session_id: str, body: dict = None):
+    """Bulk-import every code file from a local folder into this session,
+    so Chat/Edit/Agent can see an entire project at once (like opening a
+    folder in Cursor), instead of uploading files one at a time.
+
+    Reuses the exact same sandboxing, ignore-lists, and size limits as the
+    existing single-file upload path and the local file browser — nothing
+    new is introduced, this only adds a bulk caller on top:
+      - Path must resolve inside the configured workspace_path (same
+        `_safe_path` boundary check as the file browser in files.py).
+      - Same IGNORED_DIRS as the file browser (node_modules, venv, .git,
+        dist, build, __pycache__, etc. are never imported).
+      - Only recognized code/text extensions (CODE_EXTENSIONS) are
+        imported — binaries/images/unknown types are skipped.
+      - Same per-file (1MB) and per-session (30MB) byte limits as the
+        single upload path (middleware/file_validator.py).
+      - Files with edited=1 (you or the AI already changed them in this
+        session) are never overwritten — in-session edits always win.
+      - Hard cap of MAX_IMPORT_FILES per call so a mistaken huge directory
+        can't hang the request.
+    """
+    from routers.files import IGNORED_DIRS, IGNORED_EXTS, _get_workspace_root, _safe_path
+
+    MAX_IMPORT_FILES = 500
+
+    body = body or {}
+    requested_path = (body.get("path") or "").strip()
+    workspace = _get_workspace_root()
+
+    target = _safe_path(requested_path) if requested_path else Path(workspace)
+    if not target.exists() or not target.is_dir():
+        raise HTTPException(status_code=404, detail=f"Folder not found: {target}")
+
+    # ── Walk & collect candidate files ────────────────────────────────────
+    candidates: list[Path] = []
+    truncated = False
+    for root, dirs, files in os.walk(target):
+        dirs[:] = sorted(d for d in dirs if d not in IGNORED_DIRS)
+        for fname in sorted(files):
+            ext = Path(fname).suffix.lower()
+            if ext in IGNORED_EXTS or ext not in CODE_EXTENSIONS:
+                continue
+            candidates.append(Path(root) / fname)
+            if len(candidates) >= MAX_IMPORT_FILES:
+                truncated = True
+                break
+        if truncated:
+            break
+
+    imported, skipped_edited, skipped_too_large, skipped_session_cap, failed = [], [], [], [], []
+
+    with get_db_ctx() as conn:
+        session_total = conn.execute(
+            "SELECT COALESCE(SUM(LENGTH(content)), 0) FROM session_files WHERE session_id = ?",
+            (session_id,)
+        ).fetchone()[0]
+        existing_rows = {}
+        for r in conn.execute(
+            "SELECT filename, id, edited FROM session_files WHERE session_id = ?", (session_id,)
+        ).fetchall():
+            fname = r["filename"] if hasattr(r, "__getitem__") else r[0]
+            fid = r["id"] if hasattr(r, "__getitem__") else r[1]
+            fedited = r["edited"] if hasattr(r, "__getitem__") else r[2]
+            existing_rows[fname] = (fid, fedited)
+
+        for path in candidates:
+            try:
+                rel_name = str(path.relative_to(workspace)).replace(os.sep, "/")
+            except ValueError:
+                rel_name = path.name
+
+            try:
+                raw_bytes = path.read_bytes()
+            except Exception as e:
+                failed.append({"filename": rel_name, "reason": str(e)})
+                continue
+
+            if rel_name in existing_rows and existing_rows[rel_name][1]:
+                skipped_edited.append(rel_name)
+                continue
+
+            try:
+                validate_file_size(rel_name, len(raw_bytes))
+            except HTTPException:
+                skipped_too_large.append(rel_name)
+                continue
+
+            try:
+                validate_session_total(session_total, len(raw_bytes))
+            except HTTPException:
+                skipped_session_cap.append(rel_name)
+                continue
+
+            try:
+                content = raw_bytes.decode("utf-8", errors="replace")
+            except Exception:
+                content = raw_bytes.decode("latin-1", errors="replace")
+            content = _sanitize_for_postgres(content)
+
+            lines = len(content.splitlines())
+            try:
+                smap = parser.parse(content, rel_name)
+                symbol_count = len(smap.symbols)
+            except Exception:
+                symbol_count = 0
+
+            language = _get_language(rel_name)
+            session_total += len(raw_bytes)
+
+            if rel_name in existing_rows:
+                file_id = existing_rows[rel_name][0]
+                conn.execute(
+                    "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, "
+                    "file_type = 'code', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (content, language, lines, symbol_count, file_id)
+                )
+            else:
+                file_id = str(uuid.uuid4())
+                conn.execute(
+                    "INSERT INTO session_files (id, session_id, filename, content, language, lines, "
+                    "symbol_count, file_type, origin, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'code', 'uploaded', CURRENT_TIMESTAMP)",
+                    (file_id, session_id, rel_name, content, language, lines, symbol_count)
+                )
+            imported.append(rel_name)
+
+        conn.commit()
+
+    logger.warning(
+        f"[import-folder] session={session_id[:8]} path={target} "
+        f"imported={len(imported)} skipped_edited={len(skipped_edited)} "
+        f"skipped_too_large={len(skipped_too_large)} skipped_session_cap={len(skipped_session_cap)} "
+        f"failed={len(failed)} candidates_seen={len(candidates)} truncated={truncated}"
+    )
+
+    return {
+        "imported_count": len(imported),
+        "imported": imported,
+        "skipped_edited": skipped_edited,
+        "skipped_too_large": skipped_too_large,
+        "skipped_session_cap": skipped_session_cap,
+        "failed": failed,
+        "truncated": truncated,
+        "folder": str(target),
+    }
 
 
 @router.get("/{session_id}/files/{file_id}/preview")

@@ -523,6 +523,24 @@ export const api = {
         return res.json()
       })
     },
+    /** Bulk-import every code file from a local folder into this session
+     *  (defaults to the configured workspace path when no path is given).
+     *  Same sandboxing/ignore-lists/size limits as single-file upload;
+     *  never overwrites files already edited in this session. */
+    importFolder: (sessionId: string, path?: string) =>
+      request<{
+        imported_count: number
+        imported: string[]
+        skipped_edited: string[]
+        skipped_too_large: string[]
+        skipped_session_cap: string[]
+        failed: { filename: string; reason: string }[]
+        truncated: boolean
+        folder: string
+      }>(`/chat/${sessionId}/files/import-folder`, {
+        method: 'POST',
+        body: JSON.stringify(path ? { path } : {}),
+      }),
     list: (sessionId: string) =>
       request<any[]>(`/chat/${sessionId}/files`),
     get: (sessionId: string, fileId: string) =>
