@@ -4694,6 +4694,77 @@ def _fragment_reason(symbol_code: str, new_code: str):
     )
 
 
+def compose_symbol_edits(orig_full: str, edits: list, apply_fn):
+    """
+    Apply a list of symbol edits SEQUENTIALLY onto one file's original content.
+
+    ``edits``: list of ``(idx, proxy)`` where proxy is the change object
+    ``apply_fn`` accepts. Returns ``(composed_content, applied_idx_list)``.
+    Edits that fail to apply (exception, empty result, or no-op) are skipped
+    so one bad anchor never voids its siblings.
+
+    WHY (session 6930f196): validating each symbol edit in isolation against
+    the original file manufactured phantom tsc errors whenever the model made
+    coordinated sibling edits (e.g. widen a union type + use the new member).
+    tsc must judge the composed set — the code that will actually ship.
+    """
+    composed = orig_full
+    applied = []
+    for idx, proxy in edits:
+        try:
+            nxt = apply_fn(composed, proxy)
+        except Exception:
+            continue
+        if nxt and nxt != composed:
+            composed = nxt
+            applied.append(idx)
+    return composed, applied
+
+
+def diff_introduced_errors(orig_errs: list, new_errs: list) -> list:
+    """
+    Return errors in ``new_errs`` not accounted for by ``orig_errs``,
+    matching on (code, message) with duplicate counting — so pre-existing
+    isolated-file noise (e.g. TS2307 unresolved imports) never causes a
+    false block, but a genuinely introduced duplicate of an existing error
+    is still caught.
+    """
+    sig = lambda e: (e.get("code", ""), (e.get("message", "") or "").strip())
+    counts: dict = {}
+    for e in orig_errs:
+        counts[sig(e)] = counts.get(sig(e), 0) + 1
+    introduced = []
+    for e in new_errs:
+        s = sig(e)
+        if counts.get(s, 0) > 0:
+            counts[s] -= 1
+        else:
+            introduced.append(e)
+    return introduced
+
+
+def wrong_symbol_reason(symbol_name: str, new_code: str):
+    """
+    Guard for correction full-replacements (session 6930f196): the corrector,
+    told to fix a type error rooted in a SIBLING symbol, returned the
+    sibling's fix (a 1-line type alias) as the full replacement for the
+    target function — deleting it. The fragment guard skips symbols under
+    40 lines, so small symbols had no protection.
+
+    A full replacement that never mentions the target symbol's name is never
+    a valid replacement for it. Returns a rejection reason, else ``None``.
+    """
+    if not symbol_name or not new_code:
+        return None
+    if symbol_name in new_code:
+        return None
+    return (
+        f"new_code does not mention the target symbol `{symbol_name}` anywhere — "
+        f"it looks like a fix for a DIFFERENT symbol. Applying it would delete "
+        f"`{symbol_name}`."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helper: _resolve_search_terms
 # ---------------------------------------------------------------------------
@@ -17544,52 +17615,69 @@ async def run_natural_pipeline_stream(
         # historically did not, so compile-only errors that LLM QA does not
         # mentally emulate (e.g. TS1487 octal escape inside a JS template
         # literal) could pass at a high score and break the production build.
-        # This helper runs real `tsc --noEmit` on the FULL file after a change
-        # and returns only the errors that change *introduced* — comparing
-        # against the original so pre-existing isolated-file noise (e.g. TS2307
-        # "cannot find module" for unresolved imports) never causes a false
-        # block. Introduced errors are fed into the SAME retry + 8/10-gate
-        # machinery used for QA/structural issues — no parallel loop.
-        async def _tsc_introduced_errors(cs, orig_cache):
-            fname = cs["filename"]
+        # This helper runs real `tsc --noEmit` on the FULL file after applying
+        # ALL of that file's edits COMPOSED TOGETHER, and returns only the
+        # errors the composed edit set *introduced* — comparing against the
+        # original so pre-existing isolated-file noise (e.g. TS2307 "cannot
+        # find module" for unresolved imports) never causes a false block.
+        #
+        # WHY composed, not per-change (session 6930f196): validating each
+        # symbol edit in isolation manufactured PHANTOM errors whenever the
+        # model produced coordinated sibling edits — e.g. widening the
+        # FileFilter union in one edit and using the new member in another.
+        # Each edit alone raised TS2367 ("no overlap"); together they compile
+        # clean. The isolated check blocked the using-edit at score 3 in every
+        # run, the correction loop's fix was re-broken by the same isolated
+        # check at the final gate, and auto-heal could never converge.
+        #
+        # Introduced errors are fed into the SAME retry + 8/10-gate machinery
+        # used for QA/structural issues — no parallel loop.
+        async def _tsc_file_introduced_errors(fname, idx_list, orig_cache, phase):
             if not fname.lower().endswith((".ts", ".tsx", ".js", ".jsx")):
                 return []
             try:
                 from services.linter_validator import validate_linters as _vl
             except Exception:
                 return []
-            orig_full = cs["file_content"]
-            try:
-                _proxy = type("_SC", (), {
+            orig_full = change_shells[idx_list[0]]["file_content"]
+            _edit_pairs = []
+            for _ci in idx_list:
+                cs = change_shells[_ci]
+                if not cs.get("new_code"):
+                    continue
+                _edit_pairs.append((_ci, type("_SC", (), {
                     "new_code": cs["new_code"],
                     "original_code": cs["symbol"].code,
                     "symbol": cs["symbol"],
                     "operations": [{"find": cs["symbol"].code, "replace": cs["new_code"]}],
                     "applied": False,
-                })()
-                new_full = await asyncio.to_thread(_apply_change_fn, orig_full, _proxy)
-            except Exception:
-                return []
-            if not new_full or new_full == orig_full:
+                })()))
+            composed, applied_idxs = await asyncio.to_thread(
+                compose_symbol_edits, orig_full, _edit_pairs, _apply_change_fn)
+            if not applied_idxs or composed == orig_full:
                 return []
             try:
                 if fname not in orig_cache:
                     orig_cache[fname] = await asyncio.to_thread(_vl, orig_full, fname)
                 _orig_errs = orig_cache[fname]
-                _new_errs = await asyncio.to_thread(_vl, new_full, fname)
+                _new_errs = await asyncio.to_thread(_vl, composed, fname)
             except Exception:
                 return []
-            _sig = lambda e: (e.get("code", ""), (e.get("message", "") or "").strip())
-            _counts: dict = {}
-            for _e in _orig_errs:
-                _counts[_sig(_e)] = _counts.get(_sig(_e), 0) + 1
-            _introduced = []
-            for _e in _new_errs:
-                _s = _sig(_e)
-                if _counts.get(_s, 0) > 0:
-                    _counts[_s] -= 1
-                else:
-                    _introduced.append(_e)
+            _introduced = diff_introduced_errors(_orig_errs, _new_errs)
+            # Session 6930f196: the actual TS error messages never reached the
+            # debug log — only the count did — making root-cause impossible
+            # from logs alone. Always log the full introduced-error list.
+            _dlog("tsc_introduced_errors",
+                  session_id=session_id, user_id=user_id,
+                  phase=phase, filename=fname,
+                  composed_indices=applied_idxs,
+                  composed_symbols=[change_shells[i]["symbol"].name for i in applied_idxs],
+                  skipped_indices=[i for i in idx_list if i not in applied_idxs],
+                  introduced_count=len(_introduced),
+                  introduced=[{"code": e.get("code", ""),
+                               "line": e.get("line"),
+                               "message": (e.get("message", "") or "")[:300]}
+                              for e in _introduced])
             return _introduced
 
         def _force_block_on_tsc(_idx, _errs, _suffix):
@@ -17609,16 +17697,24 @@ async def run_natural_pipeline_stream(
             return _msgs
 
         # ── tsc pre-check — feed introduced compile errors into the retry loop ─
+        # Grouped by file: all of a file's edits are composed before tsc runs,
+        # so coordinated sibling edits are judged as the set that will actually
+        # ship (see _tsc_file_introduced_errors for the phantom-error history).
         _tsc_orig_cache: dict = {}
+        _tsc_pre_groups: dict = {}
         for _ti, _tcs in enumerate(change_shells):
+            _tsc_pre_groups.setdefault(_tcs["filename"], []).append(_ti)
+        for _tfname, _tidxs in _tsc_pre_groups.items():
             if _qa_over_budget:
                 break
-            _t_introduced = await _tsc_introduced_errors(_tcs, _tsc_orig_cache)
+            _t_introduced = await _tsc_file_introduced_errors(
+                _tfname, _tidxs, _tsc_orig_cache, "pre_check")
             if _t_introduced:
-                _t_msgs = _force_block_on_tsc(_ti, _t_introduced, "")
+                for _ti in _tidxs:
+                    _force_block_on_tsc(_ti, _t_introduced, "")
                 yield sse({"type": "progress",
-                           "content": f"🔧 tsc found {len(_t_msgs)} compile error(s) in "
-                                      f"{_tcs['symbol'].name} — will auto-fix"})
+                           "content": f"🔧 tsc found {len(_t_introduced)} compile error(s) in "
+                                      f"{_tfname} ({len(_tidxs)} edit(s) composed) — will auto-fix"})
 
         # ── QA retry loop — fix blocked changes before showing to user ────────
         # Triggers on verdict=="blocked" OR score<=5 with hard issues.
@@ -18655,6 +18751,23 @@ async def run_natural_pipeline_stream(
                                   is_fragment=_frag_reason is not None,
                                   fragment_reason=_frag_reason)
 
+                            # ── Wrong-symbol guard (session 6930f196) ──────
+                            # See wrong_symbol_reason(): rejects a full
+                            # replacement that never mentions the target
+                            # symbol — the sibling-fix corruption that the
+                            # fragment guard (<40-line skip) let through.
+                            _sym_name_guard = change_shells[idx]["symbol"].name
+                            _wrong_sym = (wrong_symbol_reason(_sym_name_guard, corrected_code)
+                                          if _frag_reason is None else None)
+                            if _wrong_sym:
+                                _frag_reason = _wrong_sym
+                                _dlog("correction_wrong_symbol_rejected",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=_sym_name_guard,
+                                      corrected_len=len(corrected_code),
+                                      corrected_preview=corrected_code[:200])
+
                             if _frag_reason is None:
                                 accepted = corrected_code
                             else:
@@ -18973,45 +19086,115 @@ async def run_natural_pipeline_stream(
                         # Thinking-config: explicit config for adaptive models
                         _mw_think_kw = _get_thinking_kwargs(_mw_correction_model, 4000)
                         _mw_effort_kw = _get_effort_kwargs(_mw_correction_model)
-                        _mw_task = asyncio.create_task(_stream_and_collect(
-                            aclient, model=_mw_correction_model,
-                            max_tokens=_max_output_tokens(_mw_correction_model), system=system_prompt,
-                            messages=[{"role": "user", "content": _mw_prompt}],
-                            **_mw_think_kw,
-                            **_mw_effort_kw,
-                        ))
-                        while not _mw_task.done():
-                            try:
-                                await asyncio.wait_for(asyncio.shield(_mw_task), timeout=20.0)
-                            except asyncio.TimeoutError:
-                                # ── Pipeline deadline inside keepalive ─────
-                                if _pipeline_over_budget():
-                                    _mw_task.cancel()
-                                    _dlog("pipeline_deadline_skip",
-                                          session_id=session_id, user_id=user_id,
-                                          phase="multi_window_call_keepalive",
-                                          retry_round=_qa_retry_round,
-                                          mw_idx=_mw_idx, window_idx=_mw_wi,
-                                          elapsed_s=round(time.time() - _pipeline_t0, 1),
-                                          deadline_s=PIPELINE_DEADLINE_S)
-                                    raise TimeoutError(
-                                        "pipeline deadline exceeded during multi-window correction"
-                                    )
-                                yield sse({"type": "progress",
-                                           "content": f"Multi-window correction {_mw_sym.name} "
-                                                       f"window {_mw_wi + 1}/{len(_mw_windows)}…"})
+                        # ── One ReAct round for multi-window (session 6930f196) ──
+                        # All 9 multi-window "no_edit" responses in that session
+                        # were the model responsibly asking for context via
+                        # <search_request> ("I need to see how recordDiffStats is
+                        # implemented before I can build a correct fix"). The
+                        # single-window path executes those; this path silently
+                        # dropped them, starving the healer. Honor exactly one
+                        # search/file-request round per window, then require the
+                        # edit.
+                        _mw_msgs = [{"role": "user", "content": _mw_prompt}]
+                        _mw_text = ""
+                        for _mw_react in range(2):
+                            _mw_task = asyncio.create_task(_stream_and_collect(
+                                aclient, model=_mw_correction_model,
+                                max_tokens=_max_output_tokens(_mw_correction_model), system=system_prompt,
+                                messages=_mw_msgs,
+                                **_mw_think_kw,
+                                **_mw_effort_kw,
+                            ))
+                            while not _mw_task.done():
+                                try:
+                                    await asyncio.wait_for(asyncio.shield(_mw_task), timeout=20.0)
+                                except asyncio.TimeoutError:
+                                    # ── Pipeline deadline inside keepalive ─────
+                                    if _pipeline_over_budget():
+                                        _mw_task.cancel()
+                                        _dlog("pipeline_deadline_skip",
+                                              session_id=session_id, user_id=user_id,
+                                              phase="multi_window_call_keepalive",
+                                              retry_round=_qa_retry_round,
+                                              mw_idx=_mw_idx, window_idx=_mw_wi,
+                                              elapsed_s=round(time.time() - _pipeline_t0, 1),
+                                              deadline_s=PIPELINE_DEADLINE_S)
+                                        raise TimeoutError(
+                                            "pipeline deadline exceeded during multi-window correction"
+                                        )
+                                    yield sse({"type": "progress",
+                                               "content": f"Multi-window correction {_mw_sym.name} "
+                                                           f"window {_mw_wi + 1}/{len(_mw_windows)}…"})
 
-                        _mw_resp = _mw_task.result()
-                        _mw_text = "".join(
-                            b.text for b in _mw_resp.content if hasattr(b, "text")
-                        )
+                            _mw_resp = _mw_task.result()
+                            _mw_text = "".join(
+                                b.text for b in _mw_resp.content if hasattr(b, "text")
+                            )
 
-                        _dlog("correction_multi_window_response",
-                              session_id=session_id, user_id=user_id,
-                              retry_round=_qa_retry_round, idx=_mw_idx,
-                              symbol=_mw_sym.name, window_idx=_mw_wi,
-                              response_chars=len(_mw_text),
-                              has_edit=EDIT_OPEN in _mw_text)
+                            _dlog("correction_multi_window_response",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=_mw_idx,
+                                  symbol=_mw_sym.name, window_idx=_mw_wi,
+                                  react_round=_mw_react,
+                                  response_chars=len(_mw_text),
+                                  has_edit=EDIT_OPEN in _mw_text)
+
+                            if EDIT_OPEN in _mw_text or _mw_react > 0:
+                                break  # got an edit, or already used the one ReAct round
+
+                            _mw_sr = re.search(
+                                r'<search_request>\s*(.*?)\s*</search_request>',
+                                _mw_text, re.DOTALL)
+                            _mw_fr = re.search(
+                                r'<file_request>\s*(.*?)\s*</file_request>',
+                                _mw_text, re.DOTALL)
+                            _mw_react_parts = []
+                            if _mw_sr:
+                                _mw_sr_data = _parse_search_content(_mw_sr.group(1))
+                                _mw_sr_terms = (_mw_sr_data.get("terms", [])
+                                                if isinstance(_mw_sr_data, dict) else [])
+                                if _mw_sr_terms:
+                                    _mw_sr_result = _resolve_search_multifile(
+                                        _mw_sr_terms, symbol_maps_by_name,
+                                        file_content_lookup_stream)
+                                    _mw_react_parts.append(
+                                        f"Search results for {_mw_sr_terms}:\n{_mw_sr_result}")
+                            if _mw_fr:
+                                for _mw_fr_fn in _parse_filereq_content(_mw_fr.group(1))[:3]:
+                                    _mw_fr_content = file_content_lookup_stream.get(_mw_fr_fn, "")
+                                    if not _mw_fr_content:
+                                        _mw_fr_cands = [
+                                            k for k in file_content_lookup_stream
+                                            if _mw_fr_fn.lower() in k.lower()
+                                            or k.lower() in _mw_fr_fn.lower()]
+                                        if _mw_fr_cands:
+                                            _mw_fr_fn = _mw_fr_cands[0]
+                                            _mw_fr_content = file_content_lookup_stream.get(_mw_fr_fn, "")
+                                    if _mw_fr_content:
+                                        _mw_react_parts.append(
+                                            f"FILE: {_mw_fr_fn}\n```\n{_mw_fr_content}\n```")
+                                    else:
+                                        _mw_react_parts.append(f"FILE NOT FOUND: '{_mw_fr_fn}'")
+                            if not _mw_react_parts:
+                                break  # no edit and no context request — genuine decline
+
+                            _dlog("correction_mw_search_executed",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=_mw_idx,
+                                  symbol=_mw_sym.name, window_idx=_mw_wi,
+                                  had_search=_mw_sr is not None,
+                                  had_filereq=_mw_fr is not None,
+                                  context_chars=sum(len(p) for p in _mw_react_parts))
+                            _mw_msgs = _mw_msgs + [
+                                {"role": "assistant", "content": _mw_text},
+                                {"role": "user", "content": (
+                                    "\n\n".join(_mw_react_parts)
+                                    + "\n\nYou now have the context you asked for. "
+                                    "Write your corrected <surgical_edit> block for THIS "
+                                    "window exactly as instructed above — return ALL lines "
+                                    "of the window, no line-number prefixes."
+                                )},
+                            ]
 
                         # Parse edit block
                         _mw_ei = _mw_text.find(EDIT_OPEN)
@@ -19325,14 +19508,24 @@ async def run_natural_pipeline_stream(
         # _force_block_on_tsc. NOTE: with the advisory-only QA gate below, this
         # no longer withholds the change — it ships with a loud QA advisory
         # warning so the user can decide whether to apply it.
+        # Grouped by file — composed exactly like the pre-check, so a change
+        # set the correction loop fixed is never re-broken here by isolated
+        # re-validation (session 6930f196: safe/10 at 00:15:05, re-blocked at
+        # 00:15:12 by the old per-change final gate).
         _tsc_final_cache: dict = {}
+        _tsc_final_groups: dict = {}
         for _ti, _tcs in enumerate(change_shells):
-            _t_introduced = await _tsc_introduced_errors(_tcs, _tsc_final_cache)
+            _tsc_final_groups.setdefault(_tcs["filename"], []).append(_ti)
+        for _tfname, _tidxs in _tsc_final_groups.items():
+            _t_introduced = await _tsc_file_introduced_errors(
+                _tfname, _tidxs, _tsc_final_cache, "final_gate")
             if _t_introduced:
-                _t_msgs = _force_block_on_tsc(_ti, _t_introduced, " remain after auto-fix")
+                for _ti in _tidxs:
+                    _force_block_on_tsc(_ti, _t_introduced, " remain after auto-fix")
                 yield sse({"type": "progress",
-                           "content": f"🔴 tsc check: {_tcs['symbol'].name} still has "
-                                      f"{len(_t_msgs)} compile error(s) — shipping with a QA warning, review before applying"})
+                           "content": f"🔴 tsc check: {_tfname} still has "
+                                      f"{len(_t_introduced)} compile error(s) after composing "
+                                      f"{len(_tidxs)} edit(s) — shipping with a QA warning, review before applying"})
 
         # ── Assemble SurgicalChange objects from results
         # ADVISORY 8/10 GATE — NOT a hard block. Every change ships regardless
