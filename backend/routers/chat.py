@@ -380,6 +380,19 @@ def get_messages(session_id: str):
     msgs = []
     for r in rows:
         d = dict(r)
+        # Surface the persisted model tag (written at save time into the
+        # existing `metadata` column) so the badge survives a reload instead
+        # of only ever living in transient React state. Fail-safe: malformed
+        # or absent metadata never breaks the message list, just omits the tag.
+        _meta_raw = d.pop("metadata", None)
+        if _meta_raw:
+            try:
+                _meta = json.loads(_meta_raw)
+                _mdl = _meta.get("model")
+                if _mdl:
+                    d["_model"] = _mdl
+            except Exception:
+                pass
         content = d.get("content", "")
         if content.startswith("__SURGICAL_RESULT__:"):
             d["message_type"] = "surgical_result"
@@ -461,12 +474,15 @@ def send_message(req: ChatRequest, request: Request):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
 
-    # Save assistant message
+    # Save assistant message. Model tag persisted into the existing `metadata`
+    # column so the frontend badge survives a page reload / session reload
+    # instead of only ever living in transient React state.
     with get_db_ctx() as conn:
         resp_id = str(uuid.uuid4())
         conn.execute(
-            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-            (resp_id, req.session_id, "assistant", response)
+            "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
+            (resp_id, req.session_id, "assistant", response,
+             json.dumps({"model": req.model or get_setting("architect_model", "gpt-4.1")}))
         )
         conn.execute(
             "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -526,6 +542,7 @@ async def stream_message(req: ChatRequest, request: Request):
 
     async def stream_and_collect():
         collected = []
+        _stream_model = req.model or ""
         async for chunk in run_chat_stream(
             messages, req.file_content, req.symbol_context, req.model, pinned_context, project_memory, user_id=user_id
         ):
@@ -535,13 +552,18 @@ async def stream_message(req: ChatRequest, request: Request):
                     if data.get("type") == "token":
                         collected.append(data.get("content", ""))
                     elif data.get("type") == "done":
+                        # run_chat_stream resolves the actual model used (may
+                        # differ from req.model if that was blank); capture it
+                        # here so the persisted tag is never a guess.
+                        if data.get("model"):
+                            _stream_model = data.get("model")
                         # Save full response to DB
                         full_text = "".join(collected)
                         resp_id = str(uuid.uuid4())
                         with get_db_ctx() as db:
                             db.execute(
-                                "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                                (resp_id, session_id, "assistant", full_text)
+                                "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
+                                (resp_id, session_id, "assistant", full_text, json.dumps({"model": _stream_model}))
                             )
                             db.execute(
                                 "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -787,9 +809,10 @@ async def smart_stream(req: dict, request: Request):
                 try:
                     with get_db_ctx() as _mdb:
                         _mdb.execute(
-                            "INSERT INTO chat_messages (id, session_id, role, content) "
-                            "VALUES (?, ?, ?, ?)",
-                            (str(uuid.uuid4()), session_id, "assistant", _mode_text)
+                            "INSERT INTO chat_messages (id, session_id, role, content, metadata) "
+                            "VALUES (?, ?, ?, ?, ?)",
+                            (str(uuid.uuid4()), session_id, "assistant", _mode_text,
+                             json.dumps({"model": _mode_model or ""}))
                         )
                         _mdb.execute(
                             "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1002,6 +1025,10 @@ async def smart_stream(req: dict, request: Request):
         else:
             _pipeline = run_natural_pipeline_stream if _use_natural else run_smart_pipeline_stream
         _saved = False
+        # Model resolved by the pipeline's own done/error chunk (source of
+        # truth — never guessed here). Falls back to configured architect
+        # model if the pipeline never emits one (e.g. crash before first done).
+        _resolved_model = ""
 
         try:
             _pipe_kwargs = dict(
@@ -1032,6 +1059,11 @@ async def smart_stream(req: dict, request: Request):
                         elif chunk_type == "checkpoint":
                             checkpoint_content = data.get("content", "")
                         elif chunk_type in ("done", "error"):
+                            # Pipeline's own done/error chunk is the source of
+                            # truth for which model actually ran; only fall
+                            # back to the configured architect model if the
+                            # chunk (e.g. an early error) never carried one.
+                            _resolved_model = data.get("model") or _arch_model
                             # Save assistant message — store both natural text AND result
                             with get_db_ctx() as db:
                                 resp_id = str(uuid.uuid4())
@@ -1072,8 +1104,9 @@ async def smart_stream(req: dict, request: Request):
                                     saved_content = natural_text
 
                                 db.execute(
-                                    "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                                    (resp_id, session_id, "assistant", saved_content)
+                                    "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
+                                    (resp_id, session_id, "assistant", saved_content,
+                                     _json.dumps({"model": _resolved_model}))
                                 )
                                 db.execute(
                                     "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1141,8 +1174,9 @@ async def smart_stream(req: dict, request: Request):
                                 print(f"[STREAM] Checkpoint recovery failed: {_ckpt_parse_err}")
                         if fallback_text:
                             db.execute(
-                                "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                                (resp_id, session_id, "assistant", fallback_text)
+                                "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
+                                (resp_id, session_id, "assistant", fallback_text,
+                                 _json.dumps({"model": _resolved_model or _arch_model}))
                             )
                             db.execute(
                                 "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1237,7 +1271,7 @@ def _build_prior_work_context(session_id, run_id, current_seq):
     return ctx
 
 
-def _save_task_message(session_id, natural_text, parsed):
+def _save_task_message(session_id, natural_text, parsed, model=""):
     """Persist a task's assistant message (natural text + optional diff result)."""
     with get_db_ctx() as db:
         rid = str(uuid.uuid4())
@@ -1262,8 +1296,8 @@ def _save_task_message(session_id, natural_text, parsed):
         else:
             saved = natural_text
         db.execute(
-            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-            (rid, session_id, "assistant", saved),
+            "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
+            (rid, session_id, "assistant", saved, json.dumps({"model": model})),
         )
         db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
         db.commit()
@@ -1447,6 +1481,7 @@ async def execute_task(req: dict, request: Request):
 
         collected, result_content, poll, aborted = [], None, 0, False
         _think_parts: list = []  # accumulated extended-thinking text for this task
+        _task_model = ""  # captured from this task's own done chunk
         try:
             async for chunk in _with_heartbeat(run_natural_pipeline_stream(
                 session_files=session_files,
@@ -1486,6 +1521,8 @@ async def execute_task(req: dict, request: Request):
                                 yield _sse({"type": "task_thinking", "id": task_id, "content": _tc})
                         elif _ct == "error":
                             yield _sse({"type": "task_progress", "id": task_id, "content": "⚠️ " + _d.get("content", "")})
+                        elif _ct == "done" and _d.get("model"):
+                            _task_model = _d.get("model")
                     except Exception:
                         pass
         except Exception as _ee:
@@ -1526,7 +1563,7 @@ async def execute_task(req: dict, request: Request):
             except Exception:
                 parsed = None
         score, worst = _eval_task_result(parsed) if parsed else (None, "safe")
-        _save_task_message(session_id, natural_text, parsed)
+        _save_task_message(session_id, natural_text, parsed, model=_task_model)
 
         # Non-code ("answer") tasks edit nothing → skip the QA verdict gate.
         _is_answer = task.get("kind") == "answer"
