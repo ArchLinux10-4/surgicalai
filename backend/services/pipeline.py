@@ -4460,6 +4460,7 @@ def _extract_qa_reference_lines(
     qa_dict: dict,
     code: str,
     context_lines: int = 20,
+    known_symbols: "Optional[set]" = None,
 ) -> list:
     """Extract line ranges referenced in QA feedback but not in diff windows.
 
@@ -4537,6 +4538,67 @@ def _extract_qa_reference_lines(
         for g in groups:
             if g and len(g) >= 5:
                 identifiers.add(g)
+
+    # ── 2b. Ground identifiers against the AST symbol table (STRUCTURAL) ──
+    # Bug (sessions d59e51e5 -> ca544fc4 -> c0df52ac, all models): a regex
+    # over English QA prose cannot reliably tell a real code symbol from a
+    # generic token. CSS/style prop names ("overflowX", "maxWidth", "margin"),
+    # imported components ("Box", "Dialog", "Drawer") and plain English words
+    # are all syntactically valid camelCase/PascalCase, so every regex refine-
+    # ment just let the next generic token through. Proven: overflowX occurs
+    # only 5x in the proving file — BELOW any occurrence threshold — yet is
+    # still not a real symbol, so a frequency guard alone cannot fix this.
+    #
+    # The authoritative answer to "is this a real defined symbol in this file"
+    # is the tree-sitter AST symbol table the pipeline already builds
+    # (symbol_maps_by_name). When the caller provides that allow-list
+    # (known_symbols is not None — including an authoritative EMPTY set for a
+    # file that defines no symbols), keep ONLY prose tokens that resolve to a
+    # real defined symbol. This eliminates the entire bug class, in every
+    # future variant, with zero magic numbers.
+    #
+    # Backstop: when known_symbols is None (parser unavailable / parse error /
+    # a legacy caller that passes no allow-list), fall back to the occurrence-
+    # frequency heuristic so we never crash or regress on unparseable files.
+    if known_symbols is not None:
+        _grounded = {ident for ident in identifiers if ident in known_symbols}
+        _rejected = identifiers - _grounded
+        _dlog("extract_qa_reference_lines_ast_grounding",
+              mode="ast_symbol_allowlist",
+              known_symbol_count=len(known_symbols),
+              identifiers_before=len(identifiers),
+              kept_count=len(_grounded),
+              kept_sample=sorted(_grounded)[:20],
+              rejected_count=len(_rejected),
+              rejected_sample=sorted(_rejected)[:20])
+        identifiers = _grounded
+    else:
+        # Backstop: a genuine symbol reference appears a handful of times;
+        # a generic token tends to appear many times. Drop identifiers whose
+        # total occurrence count exceeds this threshold. This is a fallback
+        # ONLY — the AST allow-list above is the real fix.
+        _QA_REF_IDENT_MAX_OCCURRENCES = 10
+        _ident_occurrence_counts = {ident: 0 for ident in identifiers}
+        for line in code_lines:
+            for ident in identifiers:
+                if ident in line:
+                    _ident_occurrence_counts[ident] += line.count(ident)
+
+        _dropped_common_idents = {
+            ident: cnt for ident, cnt in _ident_occurrence_counts.items()
+            if cnt > _QA_REF_IDENT_MAX_OCCURRENCES
+        }
+        if _dropped_common_idents:
+            _dlog("extract_qa_reference_lines_common_ident_dropped",
+                  mode="frequency_backstop",
+                  dropped_count=len(_dropped_common_idents),
+                  dropped_sample={k: v for k, v in
+                                   sorted(_dropped_common_idents.items(),
+                                          key=lambda kv: -kv[1])[:20]},
+                  max_occurrences_threshold=_QA_REF_IDENT_MAX_OCCURRENCES,
+                  total_identifiers_before=len(identifiers))
+            identifiers = {ident for ident in identifiers
+                           if ident not in _dropped_common_idents}
 
     ident_line_indices = set()
     for i, line in enumerate(code_lines):
@@ -4638,15 +4700,24 @@ def _augment_windows_with_qa_refs(
     original_code: str,
     edited_code: str,
     context_lines: int = 20,
+    known_symbols: "Optional[set]" = None,
 ) -> list:
     """Add QA-referenced windows to diff-based windows.
 
     For each QA-referenced line range NOT already covered by a diff window,
     create a new correction window so the model can see and edit that code.
 
+    ``known_symbols`` is the authoritative AST symbol allow-list for the file
+    (from ``symbol_maps_by_name``). When provided, QA-referenced windows are
+    seeded ONLY by prose tokens that resolve to a real defined symbol — never
+    by generic camelCase prose tokens (overflowX, maxWidth, Box, Dialog). When
+    None, ``_extract_qa_reference_lines`` falls back to a frequency backstop.
+
     Returns the augmented window list (may be unchanged if all refs are covered).
     """
-    qa_ranges = _extract_qa_reference_lines(qa_dict, edited_code, context_lines)
+    qa_ranges = _extract_qa_reference_lines(
+        qa_dict, edited_code, context_lines, known_symbols=known_symbols
+    )
     if not qa_ranges:
         return diff_windows
 
@@ -18577,8 +18648,42 @@ async def run_natural_pipeline_stream(
                     # Evidence (session 82eb1056, line 542): correction
                     # emitted <search_request> because the target code at
                     # line ~1830 was outside all diff windows.
+                    # Build the authoritative symbol allow-list from the AST
+                    # symbol table (tree-sitter) for THIS file, so QA-referenced
+                    # windows are seeded ONLY by real defined symbols — never by
+                    # generic camelCase prose tokens (overflowX, maxWidth, Box,
+                    # Dialog). Structural, version-proof fix for the QA-reference
+                    # garbage-window bug (sessions ca544fc4 / c0df52ac).
+                    _qa_known_symbols = None
+                    try:
+                        _qa_fname = cs.get("filename")
+                        _qa_smap_entry = symbol_maps_by_name.get(_qa_fname) if _qa_fname else None
+                        if _qa_smap_entry and _qa_smap_entry[0] is not None:
+                            _qa_known_symbols = {
+                                s.name for s in _qa_smap_entry[0].symbols
+                                if getattr(s, "name", None)
+                            }
+                            _dlog("qa_ref_known_symbols_built",
+                                  session_id=session_id, user_id=user_id,
+                                  filename=_qa_fname,
+                                  symbol_count=len(_qa_known_symbols),
+                                  symbol_sample=sorted(_qa_known_symbols)[:25])
+                        else:
+                            _dlog("qa_ref_known_symbols_unavailable",
+                                  session_id=session_id, user_id=user_id,
+                                  filename=_qa_fname,
+                                  reason=("no_entry" if not _qa_smap_entry
+                                          else "null_symbol_map"),
+                                  fallback="frequency_backstop")
+                    except Exception as _e_ks:
+                        _dlog("qa_ref_known_symbols_error",
+                              session_id=session_id, user_id=user_id,
+                              error=str(_e_ks), fallback="frequency_backstop")
+                        _qa_known_symbols = None
+
                     _all_windows = _augment_windows_with_qa_refs(
-                        _all_windows, qa_d, symbol.code, cs["new_code"]
+                        _all_windows, qa_d, symbol.code, cs["new_code"],
+                        known_symbols=_qa_known_symbols,
                     )
 
                     if len(_all_windows) == 1:
@@ -19554,6 +19659,13 @@ async def run_natural_pipeline_stream(
                         _mw_fw["window_start"] <= el <= _mw_fw["window_end"]
                         for el in _mw_error_lines
                     )
+                    # Stash whether this window has a legitimate reason to be
+                    # edited (a real diff change or a QA-reported error line
+                    # actually inside it) — consulted later by the zero-diff
+                    # edit guard (Bug #3 fix) so a changed_line_count==0
+                    # window that was ONLY included via the qa_reference
+                    # exemption cannot silently accept a model edit.
+                    _mw_fw["_has_error_line"] = _fw_has_error_line
                     if _fw_has_changes or _fw_is_qa_ref or _fw_has_error_line:
                         _mw_relevant_windows.append(_mw_fw)
                     else:
@@ -19934,6 +20046,40 @@ async def run_natural_pipeline_stream(
                                       stripped=[l.rstrip() for l in _mw_corrected[-_mw_overlap:]],
                                       suffix_head=[l.rstrip() for l in _mw_suffix_after[:_mw_overlap]])
                                 _mw_corrected = _mw_corrected[:-_mw_overlap]
+
+                        # ── Zero-diff window edit guard (Bug #3 fix) ──
+                        # Proven (trace surgical_debug_c0df52ac (1).jsonl,
+                        # windows idx=3/idx=4): a window with
+                        # changed_line_count==0 and no QA-reported error line
+                        # inside it is context-only — the model was shown it
+                        # only so it has surrounding context, not because
+                        # anything there needs to change. Twice the
+                        # correction model silently emitted an edit anyway
+                        # (each deleting 1 line), and nothing rejected it —
+                        # one deletion introduced a brand-new missing
+                        # </Box> that required a second correction round to
+                        # catch. Reject (do not splice) any window where the
+                        # window had no legitimate edit reason AND the
+                        # returned content actually differs from the
+                        # original — same partial-success pattern as the
+                        # no_edit case above (this window's correction is
+                        # dropped, other windows still proceed).
+                        _mw_orig_window_lines = _mw_broken_lines_pre[_mw_ws0:_mw_we0 + 1]
+                        if (_mw_winfo.get("changed_line_count", 0) == 0
+                                and not _mw_winfo.get("_has_error_line", False)
+                                and _mw_corrected != _mw_orig_window_lines):
+                            _dlog("correction_zero_diff_window_edit_rejected",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=_mw_idx,
+                                  symbol=_mw_sym.name, window_idx=_mw_wi,
+                                  window_start=_mw_ws1, window_end=_mw_we1,
+                                  original_line_count=len(_mw_orig_window_lines),
+                                  corrected_line_count=len(_mw_corrected),
+                                  note=("window had changed_line_count=0 and no QA "
+                                        "error line inside it, but model returned "
+                                        "different content — rejected, not spliced"))
+                            _mw_all_ok = False
+                            continue  # skip this window only, others still proceed
 
                         # ── Splice into running code ──
                         # (_mw_ws0/_mw_we0 assigned above, before boundary dedup)
