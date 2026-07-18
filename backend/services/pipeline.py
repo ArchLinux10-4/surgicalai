@@ -3946,6 +3946,40 @@ def _filter_correction_edits(raw_edits: list, resolved_raw_keys: set,
 
 
 # ---------------------------------------------------------------------------
+# Helper: _mw_window_content_loss  (GPT multi-window correction size guard)
+# ---------------------------------------------------------------------------
+# Purpose: GPT's multi-window QA-correction path used to splice ANY returned
+# window into the running code unconditionally, with no check on whether the
+# returned window was drastically shorter than the window it was meant to
+# replace. Proven in trace surgical_debug_8773a043.jsonl (PublicHome, window
+# idx 3): GPT was asked for a corrected 41-line window and returned only 4
+# lines; the splice accepted it anyway (correction_multi_window_splice_done:
+# line_delta=-37), gutting JSX that QA then flagged as unrecoverable and that
+# a second correction round could never fully restore. This helper is the
+# pure decision function for whether a returned window's line count
+# represents unacceptable content loss and should be rejected (not spliced)
+# rather than silently accepted. Only used by the GPT multi-window path —
+# does not touch Claude's path or the single-pass path.
+def _mw_window_content_loss(expected_lines: int, corrected_lines: int,
+                             min_window_size: int = 8,
+                             max_loss_ratio: float = 0.40) -> bool:
+    """
+    Return True if a corrected window lost more than ``max_loss_ratio`` of its
+    expected line count and should be REJECTED (not spliced in).
+
+    Small windows (< ``min_window_size`` expected lines) are exempt — trivial
+    one/two-line edits legitimately shrink or grow without indicating
+    content loss, and the ratio math is noisy at that scale.
+    """
+    if expected_lines < min_window_size:
+        return False
+    if expected_lines <= 0:
+        return False
+    loss_ratio = (expected_lines - corrected_lines) / expected_lines
+    return loss_ratio > max_loss_ratio
+
+
+# ---------------------------------------------------------------------------
 # Helper: _locate_snippet_fuzzy  (Claude last-ditch content-anchor rescue)
 # ---------------------------------------------------------------------------
 # Purpose: a final, OPT-IN-ONLY safety net for the rare case where Claude's
@@ -19918,6 +19952,29 @@ async def run_natural_pipeline_stream(
 
                         _mw_expected = _mw_we0 - _mw_ws0 + 1
                         _mw_delta = len(_mw_corrected) - _mw_expected
+
+                        # ── Content-loss size guard (GPT multi-window only) ──
+                        # GPT sometimes returns a drastically truncated window
+                        # (e.g. 4 lines instead of an expected 41) that used to
+                        # be spliced in unconditionally, silently gutting JSX
+                        # and cascading into unrecoverable syntax errors on
+                        # later rounds. Reject windows that lost too much of
+                        # their expected content instead of shipping truncated
+                        # content (only applied to non-trivial windows — small
+                        # windows legitimately shrink via normal edits).
+                        if _mw_window_content_loss(_mw_expected, len(_mw_corrected)):
+                            _dlog("correction_multi_window_content_loss_rejected",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=_mw_idx,
+                                  symbol=_mw_sym.name, window_idx=_mw_wi,
+                                  corrected_lines=len(_mw_corrected),
+                                  expected_lines=_mw_expected,
+                                  line_delta=_mw_delta,
+                                  note="window rejected — not spliced, will retry next round instead of shipping truncated content")
+                            _mw_all_ok = False
+                            _mw_hard_fail = True  # treat as hard fail: abandon this round's splice for this symbol, do not corrupt change_shells
+                            break
+
                         _mw_broken_lines[_mw_ws0:_mw_we0 + 1] = _mw_corrected
                         _mw_running_code = "\n".join(_mw_broken_lines)
 
