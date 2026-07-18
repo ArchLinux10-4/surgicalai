@@ -8,7 +8,7 @@ from models.schemas import (
     SurgicalChange
 )
 from database import get_setting, get_db_ctx
-from services.pipeline import analyze_and_plan, analyze_and_plan_stream
+from services.pipeline import analyze_and_plan, analyze_and_plan_stream, _dlog
 from services.surgical_editor import apply_changes_to_file
 from services.edit_rescue import rescue_failed_changes
 
@@ -60,19 +60,64 @@ def _rescue_after_total_failure(req: SurgicalApplyRequest, request: Request,
         raise HTTPException(status_code=409, detail=str(error))
     wanted = [c for c in req.changes
               if change_ids is None or c.id in change_ids]
-    failed = [{"change_id": c.id,
-               "symbol": (getattr(c.symbol, "full_path", None)
-                          or getattr(c.symbol, "name", "?")) if c.symbol else "?",
-               "reason": str(error)} for c in wanted]
+    # Same idempotency check as the partial-failure path in
+    # surgical_editor.apply_changes_to_file: if this change's new_code is
+    # already present in the content we were given, it was almost certainly
+    # already applied by an earlier request (e.g. via a different diff card,
+    # or a stale change.id from a re-emitted message) — not a real failure
+    # that needs an AI rescue attempt. Split these out up front so we never
+    # burn a rescue call on something that's already done, and so the caller
+    # gets a structured response (not a raised error) whenever every change
+    # in this batch turns out to already be applied.
+    _content_for_check = req.file_content or ""
+    _to_rescue: list = []
+    _already_applied: list = []
+    for c in wanted:
+        _sym = (getattr(c.symbol, "full_path", None)
+                or getattr(c.symbol, "name", "?")) if c.symbol else "?"
+        _is_already = bool((c.new_code or "").strip()) and (c.new_code or "") in _content_for_check
+        _entry = {"change_id": c.id, "symbol": _sym, "reason": str(error),
+                  "already_applied": _is_already}
+        (_already_applied if _is_already else _to_rescue).append(_entry)
+
+    if not _to_rescue:
+        # Everything in this batch was already applied elsewhere — this is
+        # not a failure at all, just a stale/duplicate apply request.
+        return SurgicalApplyResponse(
+            file_path=req.file_path,
+            new_content=_content_for_check,
+            applied_count=0,
+            backup_path=None,
+            cloud_mode=True,
+            modified_content=_content_for_check,
+            failed_count=len(_already_applied),
+            failed_changes=_already_applied,
+        )
+
     user_id = getattr(request.state, "user_id", None) or ""
     new_content, rescued, still_failed = rescue_failed_changes(
         file_path=req.file_path,
         file_content=req.file_content,
         all_changes=req.changes,
-        failed_changes=failed,
+        failed_changes=_to_rescue,
         user_id=user_id,
     )
     if not rescued:
+        if _already_applied:
+            # Some changes in this batch really did fail and couldn't be
+            # rescued, but others were already applied — return a structured
+            # response so the frontend can still auto-clear the already-done
+            # ones instead of leaving the whole batch stuck on a hard error.
+            return SurgicalApplyResponse(
+                file_path=req.file_path,
+                new_content=_content_for_check,
+                applied_count=0,
+                backup_path=None,
+                cloud_mode=True,
+                modified_content=_content_for_check,
+                failed_count=len(_to_rescue) + len(_already_applied),
+                failed_changes=_to_rescue + _already_applied,
+            )
         raise HTTPException(status_code=409, detail=str(error))
     return SurgicalApplyResponse(
         file_path=req.file_path,
@@ -81,8 +126,8 @@ def _rescue_after_total_failure(req: SurgicalApplyRequest, request: Request,
         backup_path=None,
         cloud_mode=True,
         modified_content=new_content,
-        failed_count=len(still_failed),
-        failed_changes=still_failed,
+        failed_count=len(still_failed) + len(_already_applied),
+        failed_changes=still_failed + _already_applied,
         rescued_count=len(rescued),
         rescued_changes=rescued,
     )
@@ -145,6 +190,13 @@ async def analyze_stream(req: SurgicalAnalyzeRequest):
 @router.post("/apply", response_model=SurgicalApplyResponse)
 def apply(req: SurgicalApplyRequest, request: Request):
     """Apply approved changes to a file."""
+    # The Apply button click was structurally invisible in the debug trace
+    # before this _dlog call — see correction-round filter investigation.
+    # req.session_id is optional (older frontend builds / callers may omit
+    # it), so this degrades gracefully rather than erroring.
+    _dlog("change_apply_requested", endpoint="apply",
+          session_id=req.session_id, file_path=req.file_path,
+          change_id=req.change_id, change_count=len(req.changes))
     try:
         try:
             result = apply_changes_to_file(
@@ -172,20 +224,36 @@ def apply(req: SurgicalApplyRequest, request: Request):
                     )
             conn.commit()
 
+        _dlog("change_apply_result", endpoint="apply",
+              session_id=req.session_id, file_path=req.file_path,
+              applied_count=result.applied_count,
+              failed_count=result.failed_count,
+              rescued_count=result.rescued_count,
+              already_applied_count=sum(
+                  1 for f in (result.failed_changes or []) if f.get("already_applied")))
         return result
     except HTTPException:
         raise
     except FileNotFoundError as e:
+        _dlog("change_apply_result", endpoint="apply", session_id=req.session_id,
+              file_path=req.file_path, error="file_not_found", detail=str(e))
         raise HTTPException(status_code=404, detail=str(e))
     except ValueError as e:
+        _dlog("change_apply_result", endpoint="apply", session_id=req.session_id,
+              file_path=req.file_path, error="value_error", detail=str(e))
         raise HTTPException(status_code=409, detail=str(e))
     except Exception as e:
+        _dlog("change_apply_result", endpoint="apply", session_id=req.session_id,
+              file_path=req.file_path, error="unhandled", detail=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/apply-all", response_model=SurgicalApplyResponse)
 def apply_all(req: SurgicalApplyRequest, request: Request):
     """Apply all changes in a batch, with an AI rescue tier for failures."""
+    _dlog("change_apply_requested", endpoint="apply-all",
+          session_id=req.session_id, file_path=req.file_path,
+          change_count=len(req.changes))
     try:
         try:
             result = apply_changes_to_file(
@@ -199,12 +267,23 @@ def apply_all(req: SurgicalApplyRequest, request: Request):
         except ValueError as ve:
             # Total failure → AI rescue from the original content
             result = _rescue_after_total_failure(req, request, ve)
+        _dlog("change_apply_result", endpoint="apply-all",
+              session_id=req.session_id, file_path=req.file_path,
+              applied_count=result.applied_count,
+              failed_count=result.failed_count,
+              rescued_count=result.rescued_count,
+              already_applied_count=sum(
+                  1 for f in (result.failed_changes or []) if f.get("already_applied")))
         return result
     except HTTPException:
         raise
     except FileNotFoundError as e:
+        _dlog("change_apply_result", endpoint="apply-all", session_id=req.session_id,
+              file_path=req.file_path, error="file_not_found", detail=str(e))
         raise HTTPException(status_code=404, detail=str(e))
     except Exception as e:
+        _dlog("change_apply_result", endpoint="apply-all", session_id=req.session_id,
+              file_path=req.file_path, error="unhandled", detail=str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 

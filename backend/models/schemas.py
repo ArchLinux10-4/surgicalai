@@ -231,6 +231,11 @@ class SurgicalApplyRequest(BaseModel):
     change_id: Optional[str] = None
     changes: List[SurgicalChange]
     file_content: Optional[str] = None  # Required when file isn't on server disk (uploaded files)
+    # Optional: ties this Apply action back to the debug trace for the session
+    # it came from (surgical_debug_{session_id}.jsonl). Without this, the Apply
+    # button click is structurally invisible in the trace — see change_apply_*
+    # _dlog events in routers/surgical.py.
+    session_id: Optional[str] = None
 
 
 class SurgicalApplyResponse(BaseModel):

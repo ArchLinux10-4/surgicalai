@@ -675,13 +675,26 @@ def apply_changes_to_file(
             _dlog("apply_all_change_ok", symbol=_c_sym,
                   applied_count=applied_count)
         except ValueError as e:
+            # Structural idempotency check: if this change's new_code is
+            # already present in the current content, the "couldn't find"
+            # failure almost certainly means the change was already applied
+            # by an earlier request (e.g. a different diff card / a stale
+            # change.id from a re-emitted message — see routers/surgical.py
+            # change_apply_* _dlog events). Flag it so callers can treat it
+            # as "already done" instead of a real failure that needs retry.
+            # This is a content check, not a guess based on the error string,
+            # so it stays correct even if the error text changes later.
+            _new_code = getattr(change, "new_code", None) or ""
+            _already_applied = bool(_new_code.strip()) and _new_code in current_content
             _dlog("apply_all_change_failed", symbol=_c_sym,
                   change_id=getattr(change, "id", None),
-                  reason=str(e))
+                  reason=str(e),
+                  already_applied=_already_applied)
             failed_changes.append({
                 "change_id": getattr(change, "id", None),
                 "symbol": _c_sym,
                 "reason": str(e),
+                "already_applied": _already_applied,
             })
 
     _dlog("apply_all_batch_summary",

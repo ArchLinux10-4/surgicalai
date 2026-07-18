@@ -155,15 +155,24 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
               rescuedChanges += applied.rescued_count ?? 0
               // Truthful accounting: the engine reports exactly which changes
               // failed — those stay UNAPPLIED so they remain visible/retryable.
-              const failedIds = new Set(
-                (applied.failed_changes || []).map((f: any) => f.change_id).filter(Boolean)
+              // Exception: "already_applied" entries are a structural
+              // idempotency check (new_code already found in current file
+              // content, done server-side — see surgical_editor.py), not a
+              // real failure. Without this split, a change already applied
+              // via a different diff card / a stale change.id would fail
+              // every Apply All forever and keep showing as available.
+              const allFailed = applied.failed_changes || []
+              const alreadyAppliedIds = new Set(
+                allFailed.filter((f: any) => f.already_applied).map((f: any) => f.change_id).filter(Boolean)
               )
-              failedChanges += applied.failed_count ?? failedIds.size
-              if ((applied.failed_changes || []).length > 0 && !firstFailReason) {
-                firstFailReason = applied.failed_changes[0]?.reason || ''
+              const realFailed = allFailed.filter((f: any) => !f.already_applied)
+              const failedIds = new Set(realFailed.map((f: any) => f.change_id).filter(Boolean))
+              failedChanges += realFailed.length
+              if (realFailed.length > 0 && !firstFailReason) {
+                firstFailReason = realFailed[0]?.reason || ''
               }
               for (const ch of applyChanges) {
-                if (ch?.id && !failedIds.has(ch.id)) {
+                if (ch?.id && (alreadyAppliedIds.has(ch.id) || !failedIds.has(ch.id))) {
                   markPromises.push(api.surgical.markApplied(sessionId, ch.id).catch(() => {}))
                 }
               }

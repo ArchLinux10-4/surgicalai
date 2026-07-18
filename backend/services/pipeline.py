@@ -3908,6 +3908,44 @@ def _locate_snippet_in_text(text: str, old_code: str):
 
 
 # ---------------------------------------------------------------------------
+# Helper: _filter_correction_edits  (correction-round duplicate guard)
+# ---------------------------------------------------------------------------
+# Purpose: after a correction round, drop TRUE duplicate edits — ones whose
+# (filename, symbol) was ALREADY successfully resolved earlier in this
+# session — while keeping every legitimate retarget. The correction prompt
+# explicitly tells the model to re-anchor an unresolved edit to a DIFFERENT,
+# real symbol name; checking the new edit against the ORIGINAL unresolved
+# name (instead of against symbols already resolved) silently discarded every
+# correctly-retargeted edit. That was the "couldn't safely apply" bug traced
+# in session 9687de0e (PublicHome.jsx / MenuIcon import, confirmed via
+# surgical_debug_9687de0e.jsonl events 27-30). Fix: compare against
+# resolved_raw_keys (symbols already applied), not still-unresolved symbols.
+def _filter_correction_edits(raw_edits: list, resolved_raw_keys: set,
+                              session_id: str = "", user_id=None,
+                              skip_event: str = "correction_edit_skipped_already_resolved"):
+    """Return (kept_raw_edits, skipped_count). Logs a _dlog per dropped edit."""
+    kept = []
+    skipped = 0
+    for raw in (raw_edits or []):
+        try:
+            parsed = json.loads(raw)
+            key = (parsed.get("filename", ""), parsed.get("symbol", ""))
+            if key not in resolved_raw_keys:
+                kept.append(raw)
+            else:
+                skipped += 1
+                _dlog(skip_event,
+                      session_id=session_id,
+                      filename=parsed.get("filename", ""),
+                      symbol=parsed.get("symbol", ""),
+                      user_id=user_id)
+        except Exception:
+            # Unparseable edit — keep it; downstream parsing will handle/report it.
+            kept.append(raw)
+    return kept, skipped
+
+
+# ---------------------------------------------------------------------------
 # Helper: _locate_snippet_fuzzy  (Claude last-ditch content-anchor rescue)
 # ---------------------------------------------------------------------------
 # Purpose: a final, OPT-IN-ONLY safety net for the rare case where Claude's
@@ -16302,6 +16340,12 @@ async def run_natural_pipeline_stream(
         # failure mode). Keyed by (filename, symbol.full_path).
         _symbol_accum: dict = {}        # key -> latest merged symbol code
         _resolved_by_symbol: dict = {}  # key -> the single resolved_edit entry
+        # Raw (filename, symbol_name_as_submitted) pairs successfully resolved
+        # so far, across ALL rounds. Used by the correction-round dedup filter
+        # to detect true duplicate re-submissions (same symbol already fixed) —
+        # NOT to gatekeep symbol renames the correction prompt itself asked for.
+        # (correction-drop bug fix — session 9687de0e)
+        _resolved_raw_keys: set = set()
 
         # Tracks (abs_start, abs_end) ranges already applied per (filename, symbol)
         # key. Used by the overlap guard to reject conflicting line-number edits
@@ -17397,6 +17441,7 @@ async def run_natural_pipeline_stream(
                         }
                         _resolved_by_symbol[_akey] = _entry
                         resolved_edits.append(_entry)
+                    _resolved_raw_keys.add((filename, symbol_name))
                     _dlog("edit_resolved",
                           session_id=session_id,
                           filename=filename,
@@ -17589,17 +17634,22 @@ async def run_natural_pipeline_stream(
                         if _cb.endswith(EDIT_CLOSE):
                             new_pending.append(_cb[:-len(EDIT_CLOSE)])
                             _cb, _cs = "", "normal"
-                # Filter correction edits: only keep edits for symbols
-                # that were actually unresolved. The correction model may
-                # gratuitously re-emit edits for already-resolved symbols,
-                # which would double-splice and create duplicates.
-                _unresolved_keys = {(x["filename"], x["symbol"]) for x in still_unresolved}
+                # Filter correction edits: drop only TRUE duplicates — edits for
+                # symbols that were already successfully resolved in a prior
+                # round. The correction prompt explicitly instructs the model to
+                # retarget an unresolved edit to a DIFFERENT (real) symbol name,
+                # so gatekeeping against the original unresolved-symbol name here
+                # silently discarded every correctly-retargeted edit (the
+                # correction-drop bug — session 9687de0e). Checking against
+                # _resolved_raw_keys (symbols already successfully applied)
+                # instead preserves the original anti-duplicate intent without
+                # blocking legitimate retargeting.
                 _filtered_pending = []
                 for _np_raw in (new_pending or []):
                     try:
                         _np_parsed = json.loads(_np_raw)
                         _np_key = (_np_parsed.get("filename", ""), _np_parsed.get("symbol", ""))
-                        if _np_key in _unresolved_keys:
+                        if _np_key not in _resolved_raw_keys:
                             _filtered_pending.append(_np_raw)
                         else:
                             _dlog("correction_edit_skipped_already_resolved",
@@ -17708,13 +17758,16 @@ async def run_natural_pipeline_stream(
                                             _fup.append(_fcb[:-len(EDIT_CLOSE)])
                                             _fcb, _fcs = "", "normal"
                                 if _fup:
-                                    # Same filter — only keep unresolved symbols
+                                    # Same fix as the main correction filter above:
+                                    # drop only TRUE duplicates (already-resolved
+                                    # symbols), not legitimate retargets to a
+                                    # different (correct) symbol name.
                                     _fup_filtered = []
                                     for _fup_raw in _fup:
                                         try:
                                             _fup_parsed = json.loads(_fup_raw)
                                             _fup_key = (_fup_parsed.get("filename", ""), _fup_parsed.get("symbol", ""))
-                                            if _fup_key in _unresolved_keys:
+                                            if _fup_key not in _resolved_raw_keys:
                                                 _fup_filtered.append(_fup_raw)
                                             else:
                                                 _dlog("correction_followup_edit_skipped_already_resolved",

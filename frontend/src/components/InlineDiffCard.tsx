@@ -736,9 +736,16 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       // ── Per-change failure surfacing (v3.4) ──────────────────────────
       // The backend now applies what it can and reports what it couldn't.
       // Never silently mark a dropped change as applied.
-      const failedChanges: any[] = Array.isArray(result?.failed_changes) ? result.failed_changes : []
+      const allFailedChanges: any[] = Array.isArray(result?.failed_changes) ? result.failed_changes : []
+      // Split "already applied elsewhere" (structural idempotency check done
+      // server-side — not a real failure, see surgical_editor.py) from
+      // changes that genuinely could not be applied and still need action.
+      const alreadyAppliedIds = new Set(
+        allFailedChanges.filter((f: any) => f.already_applied).map((f: any) => f.change_id).filter(Boolean)
+      )
+      const failedChanges = allFailedChanges.filter((f: any) => !f.already_applied)
       const failedIds = new Set(failedChanges.map((f: any) => f.change_id).filter(Boolean))
-      const okCount = selectedChanges.length - failedChanges.length
+      const okCount = selectedChanges.length - failedChanges.length - alreadyAppliedIds.size
 
       if (failedChanges.length > 0) {
         console.warn('[InlineDiffCard] apply reported failed changes:', failedChanges)
@@ -755,6 +762,9 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
       onApplied?.(filename, newContent)
       for (const change of selectedChanges) {
+        // Already-applied changes are marked done too (no error, no retry
+        // prompt) — they just weren't reported as a fresh "applied_count"
+        // by the backend because there was nothing new to write.
         if (!failedIds.has(change.id)) markApplied(change.id, change.diff)
       }
       // Signal ApplyAllButton to re-check applied state (replicates refresh sync)
