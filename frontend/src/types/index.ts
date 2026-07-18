@@ -9,6 +9,7 @@ export interface ChatMessage {
   _thinking?: string
   _steps?: string[]
   _model?: string
+  _aborted?: boolean
 }
 
 export interface ChatSession {

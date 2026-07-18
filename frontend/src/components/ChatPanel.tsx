@@ -393,6 +393,7 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
         <div className="flex items-center gap-2 mb-2">
           <span className="text-[12px] font-semibold text-ink/80">SurgicalAI</span>
           {msg._model && <span className="text-[9px] font-mono text-muted/60 bg-overlay/50 px-1.5 py-0.5 rounded">{msg._model}</span>}
+          {msg._aborted && <span className="text-[9px] font-medium text-danger/80 bg-danger/10 px-1.5 py-0.5 rounded">Stopped</span>}
           <span className="text-[10px] text-faint opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
         </div>
 
@@ -898,6 +899,30 @@ export function ChatPanel() {
   const thinkingTextRef = useRef('')
   const progressHistoryRef = useRef<string[]>([])
 
+  // Manual abort (Escape / Stop button): preserve whatever was streamed so far
+  // — including any thinking text — as a real message instead of discarding it.
+  // Long-term fix: nothing streamed is ever silently dropped on user-initiated stop.
+  const saveAbortedMessage = (sid: string) => {
+    const state = useAppStore.getState()
+    const entry = state.streamingSessions[sid]
+    const accumulated = (entry?.streamingMessage ?? (state.activeSessions === sid ? state.streamingMessage : '')) || ''
+    const thinking = thinkingTextRef.current
+    const steps = [...progressHistoryRef.current]
+    if (accumulated.trim() || thinking.trim()) {
+      addMessage({
+        id: Date.now().toString() + '_ai_aborted',
+        session_id: sid,
+        role: 'assistant',
+        content: accumulated.trim(),
+        created_at: new Date().toISOString(),
+        _thinking: thinking || undefined,
+        _steps: steps,
+        _aborted: true,
+      })
+    }
+    clearSessionStream(sid)
+  }
+
   // Mid-thought injection state
   const [injectionInput, setInjectionInput] = useState('')
   const [injectionQueued, setInjectionQueued] = useState(false)
@@ -1010,8 +1035,7 @@ export function ChatPanel() {
       if ((e.ctrlKey || e.metaKey) && e.key === 'p') { e.preventDefault(); fileInputRef.current?.click() }
       if (e.key === 'Escape' && isStreaming) {
         const sid = useAppStore.getState().activeSessions
-        if (sid) { abortMapRef.current.get(sid)?.abort(); abortMapRef.current.delete(sid) }
-        if (sid) clearSessionStream(sid)
+        if (sid) { abortMapRef.current.get(sid)?.abort(); abortMapRef.current.delete(sid); saveAbortedMessage(sid) }
         else { setIsStreaming(false); setStreamingMessage(''); setStreamProgress('') }
       }
     }
@@ -1335,14 +1359,14 @@ export function ChatPanel() {
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
       (err) => {
-        if (accumulated.trim() && !gotResult) {
+        if ((accumulated.trim() || thinkingTextRef.current.trim()) && !gotResult) {
           addMessage({
             id: Date.now().toString() + '_ai_err',
             session_id: sessionId,
             role: 'assistant',
             content: accumulated.trim(),
             created_at: new Date().toISOString(),
-            _thinking: thinkingTextRef.current,
+            _thinking: thinkingTextRef.current || undefined,
             _steps: [...progressHistoryRef.current],
             _model: streamModel || 'N/A',
           })
@@ -1360,10 +1384,21 @@ export function ChatPanel() {
         }, 3000)
       },
       // onThinking — injection point: when thinking ends and injection is queued, restart
+      //
+      // NOTE: the backend fires thinking_start/thinking_end multiple times within a
+      // single operation (one pair per correction round / retry / phase). We must NOT
+      // wipe accumulated thinking on every 'start' — only a brand-new user message
+      // resets thinkingTextRef (see the three explicit resets at message-send time).
+      // Here we just append a separator so every round's thinking survives to the
+      // final saved message instead of only the last round's.
       (thinkToken, phase) => {
         if (useAppStore.getState().activeSessions !== sessionId) return
         if (phase === 'start') {
-          setIsThinking(true); setThinkingText(''); thinkingTextRef.current = ''
+          setIsThinking(true)
+          if (thinkingTextRef.current) {
+            const next = thinkingTextRef.current + '\n\n---\n\n'
+            setThinkingText(next); thinkingTextRef.current = next
+          }
         } else if (phase === 'delta') {
           setThinkingText(prev => { const next = prev + thinkToken; thinkingTextRef.current = next; return next })
         } else if (phase === 'end') {
@@ -2208,8 +2243,8 @@ export function ChatPanel() {
                 <button
                   onClick={() => {
                     const sid = useAppStore.getState().activeSessions
-                    if (sid) { abortMapRef.current.get(sid)?.abort(); abortMapRef.current.delete(sid) }
-                    stopStream(sid || undefined)
+                    if (sid) { abortMapRef.current.get(sid)?.abort(); abortMapRef.current.delete(sid); saveAbortedMessage(sid) }
+                    else stopStream(undefined)
                   }}
                   className="h-8 px-3 rounded-lg bg-danger/15 text-danger text-xs font-semibold flex items-center gap-1.5 hover:bg-danger/25 transition-colors"
                 >

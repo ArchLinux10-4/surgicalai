@@ -114,6 +114,9 @@ function MessageBubble({ msg, sessionId, sessionFiles, setSessionFiles }: {
         <span className="text-[#4ade80] text-[10px] font-bold">AI</span>
       </div>
       <div className="flex-1 min-w-0 overflow-hidden">
+        {msg._aborted && (
+          <span className="inline-block text-[9px] font-medium text-danger/80 bg-danger/10 px-1.5 py-0.5 rounded mb-1.5">Stopped</span>
+        )}
         {/* Steps trail */}
         {msg._steps && <ProgressSteps steps={msg._steps} />}
 
@@ -345,6 +348,12 @@ export function MobileChatPanel() {
 
   const progressHistoryRef = useRef<string[]>([])
   const ctrlRef            = useRef<AbortController | null>(null)
+  // Bridge refs so a manual Stop (outside the streaming closure) can still see
+  // what was accumulated and save it instead of discarding it. Long-term fix:
+  // nothing streamed is ever silently dropped on user-initiated stop.
+  const accumulatedRef      = useRef('')
+  const gotResultRef        = useRef(false)
+  const streamingSessionIdRef = useRef<string | null>(null)
   // v1.4: holds the planned run while the planning stream closes, so the
   // per-task execution queue can start once /smart-stream returns.
   const pendingRunRef      = useRef<{ runId: string; tasks: any[] } | null>(null)
@@ -410,6 +419,25 @@ export function MobileChatPanel() {
     progressHistoryRef.current = []
   }, [])
 
+  // Manual Stop tap: preserve whatever was streamed so far as a real message
+  // instead of discarding it. Long-term fix: nothing streamed is ever silently
+  // dropped on user-initiated stop.
+  const handleStopClick = useCallback(() => {
+    if (!gotResultRef.current && accumulatedRef.current.trim() && streamingSessionIdRef.current) {
+      addMessage({
+        id: Date.now().toString() + '_ai_aborted',
+        session_id: streamingSessionIdRef.current,
+        role: 'assistant',
+        content: accumulatedRef.current.trim(),
+        created_at: new Date().toISOString(),
+        _steps: [...progressHistoryRef.current],
+        _aborted: true,
+      })
+      gotResultRef.current = true
+    }
+    stopStream()
+  }, [addMessage, stopStream])
+
   const ensureSession = useCallback(async (): Promise<string> => {
     if (activeSessions) return activeSessions
     const s = await api.chat.createSession({ title: 'New Chat' })
@@ -454,6 +482,9 @@ export function MobileChatPanel() {
     setProgHist(['Thinking...'])
     setBuildEdit(false)
     progressHistoryRef.current = ['Thinking...']
+    streamingSessionIdRef.current = sessionId
+    accumulatedRef.current = ''
+    gotResultRef.current = false
 
     let accumulated  = ''
     let gotResult    = false
@@ -540,9 +571,10 @@ export function MobileChatPanel() {
           return prev
         })
       },
-      (token) => { accumulated += token; setStreamingMsg(accumulated) },
+      (token) => { accumulated += token; accumulatedRef.current = accumulated; setStreamingMsg(accumulated) },
       (result) => {
         gotResult = true
+        gotResultRef.current = true
         const _steps = [...progressHistoryRef.current]
         const naturalText = result.natural_text || accumulated
         stopStream()
@@ -571,6 +603,7 @@ export function MobileChatPanel() {
           return
         }
         if (gotResult) return
+        gotResultRef.current = true
         const _steps = [...progressHistoryRef.current]
         stopStream()
         if (fullText.trim()) {
@@ -587,7 +620,23 @@ export function MobileChatPanel() {
         else api.chat.getSessions().then(setSessions).catch(() => {})
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
-      (err) => { setError(err); stopStream(); setBuildEdit(false) },
+      (err) => {
+        // Preserve whatever was streamed before the connection error — same
+        // long-term fix as manual stop: nothing streamed is silently dropped.
+        if (accumulated.trim() && !gotResult) {
+          addMessage({
+            id: Date.now().toString() + '_ai_err',
+            session_id: sessionId,
+            role: 'assistant',
+            content: accumulated.trim(),
+            created_at: new Date().toISOString(),
+            _steps: [...progressHistoryRef.current],
+          })
+          gotResult = true
+          gotResultRef.current = true
+        }
+        setError(err); stopStream(); setBuildEdit(false)
+      },
       undefined, // onThinking — omitted on mobile for simplicity
       // onCompacting
       (phase) => {
@@ -839,7 +888,7 @@ export function MobileChatPanel() {
             {/* Right: send / stop */}
             {isStreaming ? (
               <button
-                onClick={stopStream}
+                onClick={handleStopClick}
                 className="w-9 h-9 flex items-center justify-center rounded-xl
                   bg-danger/15 text-danger hover:bg-danger/25 active:scale-95 transition-all"
               >
