@@ -914,6 +914,12 @@ export function ChatPanel() {
   const currentModelProvider = availableModels.find(m => m.id === settings?.architect_model)?.provider
   const searchToolsUnavailableForCurrentModel =
     (effectiveMode === 'ask' || effectiveMode === 'plan') && currentModelProvider === 'openai'
+  // Agent mode (multi-agent task pipeline) is Claude-only today (backend gate:
+  // `_is_claude = _arch_model.startswith("claude-")` in chat.py). Unlike
+  // Ask/Plan, GPT doesn't just lose a feature here — the whole run silently
+  // downgrades to a normal single-pass edit instead of multi-agent tasks.
+  const agentRequiresClaudeForCurrentModel =
+    effectiveMode === 'agent' && currentModelProvider === 'openai'
   // Ref so doStream (deps: [sessionFiles]) reads the live offline flag with no
   // stale closure and without widening its dependency array.
   const isOfflineRef = useRef(isOffline)
@@ -1917,12 +1923,14 @@ export function ChatPanel() {
               onClick={() => setModelPickerOpen(v => !v)}
               className="text-[11px] font-mono text-muted/70 hover:text-accent bg-overlay/40 hover:bg-overlay px-1.5 py-0.5 rounded transition-colors leading-none flex items-center gap-1"
               title={
-                searchToolsUnavailableForCurrentModel
-                  ? `${settings?.architect_model || 'claude-sonnet-4-6'} — file search/lookup tools are Claude-only in ${MODE_META[effectiveMode].label} mode. This model will use a basic file preview instead.`
-                  : 'Change model'
+                agentRequiresClaudeForCurrentModel
+                  ? `${settings?.architect_model || 'claude-sonnet-4-6'} — Agent Mode requires a Claude model. This will silently run as a normal single-pass edit instead of multi-agent tasks.`
+                  : searchToolsUnavailableForCurrentModel
+                    ? `${settings?.architect_model || 'claude-sonnet-4-6'} — file search/lookup tools are Claude-only in ${MODE_META[effectiveMode].label} mode. This model will use a basic file preview instead.`
+                    : 'Change model'
               }
             >
-              {searchToolsUnavailableForCurrentModel && (
+              {(searchToolsUnavailableForCurrentModel || agentRequiresClaudeForCurrentModel) && (
                 <Warning sx={{ fontSize: 11 }} className="text-warning" />
               )}
               {settings?.architect_model || 'claude-sonnet-4-6'}
@@ -1937,14 +1945,24 @@ export function ChatPanel() {
                       File search &amp; lookup tools work with Claude models only in {MODE_META[effectiveMode].label} mode.
                     </div>
                   )}
+                  {effectiveMode === 'agent' && (
+                    <div className="px-3 py-1.5 mb-1 border-b border-border/60 text-[10px] text-muted/80 leading-snug">
+                      Agent Mode (multi-agent task breakdown) works with Claude models only.
+                    </div>
+                  )}
                   {availableModels.filter(m => m.role === 'architect').map(m => {
-                    const locked = (effectiveMode === 'ask' || effectiveMode === 'plan') && m.provider === 'openai'
+                    const isGpt = m.provider === 'openai'
+                    const locked = isGpt && (effectiveMode === 'ask' || effectiveMode === 'plan' || effectiveMode === 'agent')
+                    const lockLabel = effectiveMode === 'agent' ? 'Needs Claude' : 'No search'
+                    const lockTitle = effectiveMode === 'agent'
+                      ? `Agent Mode requires a Claude model. Selecting ${m.id} would silently run as a normal single-pass edit instead of multi-agent tasks.`
+                      : `File search & lookup tools are Claude-only in ${MODE_META[effectiveMode].label} mode. ${m.id} would fall back to a basic file preview — not recommended.`
                     return (
                       <button
                         key={m.id}
                         onClick={() => { if (!locked) handleModelChange(m.id) }}
                         disabled={locked}
-                        title={locked ? `File search & lookup tools are Claude-only in ${MODE_META[effectiveMode].label} mode. ${m.id} would fall back to a basic file preview — not recommended.` : undefined}
+                        title={locked ? lockTitle : undefined}
                         className={`w-full text-left px-3 py-1.5 text-[12px] transition-colors ${
                           locked
                             ? 'opacity-45 cursor-not-allowed select-none'
@@ -1957,7 +1975,7 @@ export function ChatPanel() {
                           {locked && (
                             <span className="ml-auto flex items-center gap-0.5 text-[9px] uppercase tracking-wide text-muted shrink-0">
                               <Lock sx={{ fontSize: 11 }} className="text-muted" />
-                              No search
+                              {lockLabel}
                             </span>
                           )}
                         </div>
