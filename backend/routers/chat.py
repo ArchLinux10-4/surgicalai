@@ -737,8 +737,8 @@ async def smart_stream(req: dict, request: Request):
         # at the SQL source so it can't leak regardless of downstream pipeline path.
         history = conn.execute(
             "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
-            "AND content NOT LIKE '__COMPACTION_EVENT__:%' ORDER BY created_at ASC",
-            (session_id,)
+            "AND content NOT LIKE ? ORDER BY created_at ASC",
+            (session_id, "__COMPACTION_EVENT__:%")
         ).fetchall()
         conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
         _dlog("history_loaded_excludes_compaction_marker", session_id=session_id,
@@ -1464,8 +1464,8 @@ async def execute_task(req: dict, request: Request):
         session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
         history = conn.execute(
             "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
-            "AND content NOT LIKE '__COMPACTION_EVENT__:%' ORDER BY created_at ASC",
-            (session_id,)
+            "AND content NOT LIKE ? ORDER BY created_at ASC",
+            (session_id, "__COMPACTION_EVENT__:%")
         ).fetchall()
         conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
         _dlog("execute_task_history_excludes_compaction_marker", session_id=session_id,

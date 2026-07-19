@@ -201,8 +201,8 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
             # see matching fix + rationale in routers/chat.py.
             history = conn.execute(
                 "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
-                "AND content NOT LIKE '__COMPACTION_EVENT__:%' ORDER BY created_at ASC",
-                (session_id,),
+                "AND content NOT LIKE ? ORDER BY created_at ASC",
+                (session_id, "__COMPACTION_EVENT__:%"),
             ).fetchall()
             conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
             _dlog("runner_task_history_excludes_compaction_marker", session_id=session_id,
