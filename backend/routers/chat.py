@@ -207,11 +207,12 @@ import openai as _openai_mod
 HISTORY_TOKEN_BUDGET = 30_000  # Max estimated tokens before compaction triggers
 MIN_RECENT_KEEP = 6            # Always keep at least this many recent messages
 
-async def _compact_session(session_id: str, user_id: str) -> str:
+async def _compact_session(session_id: str, user_id: str) -> tuple[str, int]:
     """
     Token-aware compaction: compact oldest uncompacted messages, keeping
     MIN_RECENT_KEEP recent ones. Uses GPT-4.1-mini (fast + cheap).
-    Returns the new summary string.
+    Returns (new_summary, compacted_count). compacted_count is 0 when no
+    compaction actually ran (e.g. below threshold, or an error occurred).
     """
     with get_db_ctx() as db:
         try:
@@ -222,12 +223,12 @@ async def _compact_session(session_id: str, user_id: str) -> str:
                 (session_id,)
             ).fetchall()
             if not all_uncompacted or len(all_uncompacted) <= MIN_RECENT_KEEP:
-                return ""
+                return "", 0
 
             # Keep MIN_RECENT_KEEP most recent, compact everything else
             to_compact = all_uncompacted[:-MIN_RECENT_KEEP]
             if not to_compact:
-                return ""
+                return "", 0
             _dlog("compact_token_aware", session_id=session_id,
                   total_uncompacted=len(all_uncompacted),
                   compacting=len(to_compact), keeping=MIN_RECENT_KEEP)
@@ -277,6 +278,12 @@ async def _compact_session(session_id: str, user_id: str) -> str:
                         cleaned = "Made code changes."
                 elif raw.startswith("__SURGICAL_RESULT__:"):
                     cleaned = "Made code changes (surgical edit)."
+                elif raw.startswith("__COMPACTION_EVENT__:"):
+                    # A prior compaction marker aged past the recent window and is
+                    # itself being folded in. Never feed its raw JSON payload back
+                    # into the summarizer — its content is already captured in
+                    # `existing` (the running session_summary carried forward above).
+                    cleaned = "[Earlier history was already condensed into the summary above.]"
                 else:
                     cleaned = raw
 
@@ -288,11 +295,23 @@ async def _compact_session(session_id: str, user_id: str) -> str:
                 prompt_parts.append(f"Previous summary:\n{existing}\n")
             prompt_parts.append(f"New conversation turns to add:\n{turns_text}")
 
+            # Structured checklist prompt (not free-form prose). Modeled on how
+            # Anthropic's own compaction API and Claude Code scope a compaction
+            # summary: fixed categories so no category can be silently dropped,
+            # rather than one open-ended "summarize this" instruction.
             compact_prompt = (
-                "Summarize this coding assistant conversation history. "
-                "Focus on: what files were discussed, what code changes were made or planned, "
-                "key decisions, and any patterns or conventions established. "
-                "Be concise but complete. Under 400 words. Use bullet points."
+                "You are compacting a coding-assistant conversation so it can be carried "
+                "forward without the full transcript. Produce a summary using EXACTLY "
+                "these six headers, in this order, each followed by concise bullet points "
+                "(write \"- none\" under a header if it truly has nothing to report, but "
+                "always include all six headers):\n\n"
+                "**User intent** — what the user is overall trying to accomplish.\n"
+                "**Key decisions** — technical or design decisions made, and why.\n"
+                "**Files & changes** — which files/symbols were discussed or edited, and what changed.\n"
+                "**Errors & fixes** — problems hit and how they were resolved.\n"
+                "**Pending / open items** — anything started but not finished.\n"
+                "**Next step** — the single most immediate next action.\n\n"
+                "Be concise but complete. Under 400 words total."
             )
 
             openai_key = _resolve_chat_key(user_id, "openai")
@@ -321,7 +340,12 @@ async def _compact_session(session_id: str, user_id: str) -> str:
                 )
                 new_summary = resp.content[0].text if resp.content else ""
             else:
-                return existing
+                _dlog("compact_session_no_api_key", session_id=session_id, user_id=user_id)
+                return existing, 0
+
+            if not new_summary.strip():
+                _dlog("compact_session_empty_summary_from_model", session_id=session_id,
+                      used_openai=bool(openai_key), used_anthropic=bool(anthropic_key and not openai_key))
 
             ids = [dict(r)["id"] for r in to_compact]
             placeholders = ",".join(["?" for _ in ids])
@@ -333,15 +357,45 @@ async def _compact_session(session_id: str, user_id: str) -> str:
                 "UPDATE chat_sessions SET session_summary = ? WHERE id = ?",
                 (new_summary, session_id)
             )
+
+            # Persist a permanent, inspectable compaction-event record as a real
+            # chat message — same established convention as __NATURAL_AND_RESULT__
+            # / __SURGICAL_RESULT__ (a content-prefix marker on an ordinary
+            # chat_messages row). This survives page reloads and session
+            # switches because get_messages() loads every row unconditionally;
+            # it is never filtered out like the old client-only-state marker was.
+            # is_compacted stays 0 so it remains eligible for a *future* compaction
+            # round to fold in (via the __COMPACTION_EVENT__ branch above, which
+            # collapses it to one line rather than replaying its raw JSON). It is
+            # NEVER sent to the model as raw content in the meantime: every
+            # conversation_history query excludes `content LIKE '__COMPACTION_EVENT__:%'`
+            # at the SQL source (routers/chat.py history queries, task_runner.py),
+            # with _clean_history_content() as a second line of defense.
+            event_id = str(uuid.uuid4())
+            event_payload = {
+                "summary": new_summary,
+                "compacted_count": len(to_compact),
+                "kept_count": MIN_RECENT_KEEP,
+            }
+            db.execute(
+                "INSERT INTO chat_messages (id, session_id, role, content, is_compacted) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (event_id, session_id, "system",
+                 "__COMPACTION_EVENT__:" + json.dumps(event_payload), 0)
+            )
             db.commit()
-            return new_summary
+            _dlog("compact_event_persisted", session_id=session_id, event_id=event_id,
+                  compacted_count=len(to_compact), kept_count=MIN_RECENT_KEEP,
+                  summary_len=len(new_summary))
+            return new_summary, len(to_compact)
         except Exception as exc:
             try:
                 db.rollback()
             except Exception:
                 pass
+            _dlog("compact_session_error", session_id=session_id, error=str(exc))
             print(f"[compact] Error: {exc}")
-            return ""
+            return "", 0
 
 
 @router.get("/sessions")
@@ -410,6 +464,23 @@ def get_messages(session_id: str):
                 d["message_type"] = "surgical_result"
                 d["surgical_data"] = content[len("__NATURAL_AND_RESULT__:"):]
                 d["content"] = ""
+        elif content.startswith("__COMPACTION_EVENT__:"):
+            d["message_type"] = "compact_marker"
+            d["content"] = ""
+            try:
+                payload = json.loads(content[len("__COMPACTION_EVENT__:"):])
+                d["compact_summary"] = payload.get("summary", "")
+                d["compact_count"] = payload.get("compacted_count", 0)
+                d["compact_kept"] = payload.get("kept_count", 0)
+            except Exception as exc:
+                # Fail-safe: malformed payload still renders the chip, just
+                # without an expandable summary — never breaks the message list.
+                _dlog("get_messages_compaction_marker_parse_failed",
+                      session_id=d.get("session_id", ""), message_id=d.get("id", ""),
+                      error=str(exc))
+                d["compact_summary"] = ""
+                d["compact_count"] = 0
+                d["compact_kept"] = 0
         msgs.append(d)
     return msgs
 
@@ -660,12 +731,18 @@ async def smart_stream(req: dict, request: Request):
         ).fetchone()
         session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
 
-        # Get conversation history — only uncompacted messages
+        # Get conversation history — only uncompacted messages.
+        # Compaction-event marker rows (__COMPACTION_EVENT__:{json}) are a UI-only
+        # audit record and must never reach the model as raw JSON — excluded here
+        # at the SQL source so it can't leak regardless of downstream pipeline path.
         history = conn.execute(
-            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 ORDER BY created_at ASC",
+            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
+            "AND content NOT LIKE '__COMPACTION_EVENT__:%' ORDER BY created_at ASC",
             (session_id,)
         ).fetchall()
         conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
+        _dlog("history_loaded_excludes_compaction_marker", session_id=session_id,
+              msg_count=len(conversation_history))
 
         # Token-aware compaction trigger: estimate tokens from loaded history
         _history_tokens = sum(len(h.get("content") or "") for h in conversation_history) // 4
@@ -844,16 +921,26 @@ async def smart_stream(req: dict, request: Request):
                     if not done:
                         _compact_ka += 1
                         yield ": keepalive\n\n"
-                new_sum = _compact_task.result()
+                new_sum, _compacted_count = _compact_task.result()
                 if new_sum:
                     current_summary = new_sum
                 _dlog("sse_compaction_done", session_id=session_id, user_id=current_user_id,
-                      duration_s=round(time.time() - _compact_t0, 1), keepalives=_compact_ka)
+                      duration_s=round(time.time() - _compact_t0, 1), keepalives=_compact_ka,
+                      compacted_count=_compacted_count)
             except Exception as _ce:
+                new_sum, _compacted_count = "", 0
                 _dlog("sse_compaction_error", session_id=session_id, user_id=current_user_id,
                       duration_s=round(time.time() - _compact_t0, 1), error=str(_ce))
                 print(f"[compact] failed: {_ce}")
-            yield "data: " + _json.dumps({"type": "compacting_done", "content": "History compacted"}) + "\n\n"
+            # Forward the actual summary + count so the client can render the
+            # persisted compaction marker immediately, without waiting for a
+            # full session reload to see what get_messages() would return.
+            yield "data: " + _json.dumps({
+                "type": "compacting_done",
+                "content": "History compacted",
+                "summary": new_sum,
+                "compacted_count": _compacted_count,
+            }) + "\n\n"
 
         # Use natural pipeline (Claude talks naturally, embeds <surgical_edit> tags)
         # Fall back to legacy pipeline for non-Claude models
@@ -1376,10 +1463,13 @@ async def execute_task(req: dict, request: Request):
         ).fetchone()
         session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
         history = conn.execute(
-            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 ORDER BY created_at ASC",
+            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
+            "AND content NOT LIKE '__COMPACTION_EVENT__:%' ORDER BY created_at ASC",
             (session_id,)
         ).fetchall()
         conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
+        _dlog("execute_task_history_excludes_compaction_marker", session_id=session_id,
+              msg_count=len(conversation_history))
         file_rows = conn.execute(
             "SELECT id, filename, content, language, lines, symbol_count, file_type FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,)

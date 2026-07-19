@@ -13465,6 +13465,19 @@ def _clean_history_content(content: str) -> str:
     if not content:
         return content
 
+    if content.startswith("__COMPACTION_EVENT__:"):
+        # Defense-in-depth: this marker is normally excluded at the SQL source
+        # (see routers/chat.py, services/task_runner.py history queries) before
+        # it ever reaches here. This branch only fires if that filter is
+        # bypassed or a caller forgets it — never let raw JSON reach the model.
+        try:
+            data = json.loads(content[len("__COMPACTION_EVENT__:"):])
+            n = data.get("compacted_count", "some") if isinstance(data, dict) else "some"
+            return f"[Earlier {n} messages in this conversation were summarized to save space.]"
+        except Exception:
+            _dlog("clean_history_compaction_marker_parse_failed", content_len=len(content))
+            return "[Earlier messages in this conversation were summarized to save space.]"
+
     if content.startswith("__SURGICAL_RESULT__:"):
         try:
             data = json.loads(content[len("__SURGICAL_RESULT__:"):])

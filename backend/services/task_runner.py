@@ -196,11 +196,17 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
                 "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
             ).fetchone()
             session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
+            # Compaction-event marker rows are UI-only audit records; excluded here
+            # at the source so agent/task-mode context never receives raw JSON —
+            # see matching fix + rationale in routers/chat.py.
             history = conn.execute(
-                "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 ORDER BY created_at ASC",
+                "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
+                "AND content NOT LIKE '__COMPACTION_EVENT__:%' ORDER BY created_at ASC",
                 (session_id,),
             ).fetchall()
             conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
+            _dlog("runner_task_history_excludes_compaction_marker", session_id=session_id,
+                  msg_count=len(conversation_history))
             file_rows = conn.execute(
                 "SELECT id, filename, content, language, lines, symbol_count, file_type FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
                 (session_id,),

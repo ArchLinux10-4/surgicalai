@@ -336,6 +336,36 @@ class DiffCardBoundary extends Component<{ children: React.ReactNode }, { hasErr
 }
 
 // ── Message bubble ────────────────────────────────────────
+function CompactMarkerChip({ msg }: { msg: any }) {
+  const [open, setOpen] = useState(false)
+  const summary: string = msg.compact_summary || ''
+  const count: number = msg.compact_count || 0
+  const hasSummary = summary.trim().length > 0
+  return (
+    <div className="flex flex-col items-center py-2 px-4">
+      <button
+        type="button"
+        onClick={() => hasSummary && setOpen(o => !o)}
+        className={`flex items-center gap-1.5 px-3 py-1 bg-surface/60 border border-border/50 rounded-full ${hasSummary ? 'cursor-pointer hover:bg-surface/90' : 'cursor-default'}`}
+        title={hasSummary ? 'Click to see exactly what was kept vs. condensed' : undefined}
+      >
+        <span className="text-[11px] text-muted/70">
+          📦 Earlier conversation compacted{count ? ` (${count} messages)` : ''}
+        </span>
+        {hasSummary && <span className="text-[10px] text-muted/50">{open ? '▲ hide' : '▼ view summary'}</span>}
+      </button>
+      {open && hasSummary && (
+        <div className="mt-2 max-w-[90%] w-full sm:w-[520px] text-[12px] leading-relaxed bg-surface/40 border border-border/40 rounded-lg p-3 whitespace-pre-wrap text-fg/80">
+          <div className="text-[10px] uppercase tracking-wide text-muted/60 mb-1.5">
+            What the model retained from the condensed history:
+          </div>
+          {summary}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
   const isUser = msg.role === 'user'
   const isSurgical = msg.message_type === 'surgical_result'
@@ -352,15 +382,12 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
     })
   }
 
-  // Compact marker chip
+  // Compact marker chip — persisted (see backend __COMPACTION_EVENT__ rows),
+  // so it survives reload. Clickable to reveal exactly what was kept in the
+  // summary that replaced the older turns, instead of just a toast claiming
+  // "compaction happened" with no way to audit what it did.
   if (msg.message_type === 'compact_marker') {
-    return (
-      <div className="flex items-center justify-center py-2 px-4">
-        <div className="flex items-center gap-1.5 px-3 py-1 bg-surface/60 border border-border/50 rounded-full">
-          <span className="text-[11px] text-muted/70">📦 Earlier conversation compacted</span>
-        </div>
-      </div>
-    )
+    return <CompactMarkerChip msg={msg} />
   }
 
   let surgicalResult: SmartResult | null = null
@@ -1405,8 +1432,11 @@ export function ChatPanel() {
           setIsThinking(false)
         }
       },
-      // onCompacting
-      (phase) => {
+      // onCompacting — the persisted __COMPACTION_EVENT__ row (see backend
+      // _compact_session) is what will actually reload from the server on
+      // next getMessages() call; this optimistic insert just renders the
+      // same shape immediately so the user doesn't have to refresh to see it.
+      (phase, info) => {
         if (useAppStore.getState().activeSessions !== sessionId) return
         if (phase === 'start') {
           setIsCompacting(true)
@@ -1418,8 +1448,10 @@ export function ChatPanel() {
             role: 'system' as any,
             message_type: 'compact_marker',
             content: '',
+            compact_summary: info?.summary || '',
+            compact_count: info?.compacted_count || 0,
             created_at: new Date().toISOString(),
-          })
+          } as any)
         }
       },
       // onEditStart

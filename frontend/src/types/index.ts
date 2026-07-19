@@ -10,6 +10,9 @@ export interface ChatMessage {
   _steps?: string[]
   _model?: string
   _aborted?: boolean
+  compact_summary?: string
+  compact_count?: number
+  compact_kept?: number
 }
 
 export interface ChatSession {

@@ -75,6 +75,35 @@ function StreamingBubble({ text, progress, isBuildingEdit }: {
   )
 }
 
+// Compact marker chip — persisted (see backend __COMPACTION_EVENT__ rows), so
+// it survives reload. Tap to reveal exactly what was kept in the summary that
+// replaced the older turns, instead of a toast with no way to audit it.
+function CompactMarkerChip({ msg }: { msg: any }) {
+  const [open, setOpen] = useState(false)
+  const summary: string = msg.compact_summary || ''
+  const count: number = msg.compact_count || 0
+  const hasSummary = summary.trim().length > 0
+  return (
+    <div className="flex flex-col items-center py-2 px-3">
+      <button
+        type="button"
+        onClick={() => hasSummary && setOpen(o => !o)}
+        className="flex items-center gap-1.5 px-3 py-1 bg-surface/60 rounded-full border border-border/40"
+      >
+        <span className="text-[10px] text-muted/50">
+          📦 Earlier conversation compacted{count ? ` (${count})` : ''}
+        </span>
+        {hasSummary && <span className="text-[9px] text-muted/40">{open ? '▲' : '▼ view'}</span>}
+      </button>
+      {open && hasSummary && (
+        <div className="mt-2 w-full text-[11px] leading-relaxed bg-surface/40 border border-border/40 rounded-lg p-2.5 whitespace-pre-wrap text-fg/80">
+          {summary}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Message bubble ────────────────────────────────────────────────────────────
 function MessageBubble({ msg, sessionId, sessionFiles, setSessionFiles }: {
   msg: any; sessionId: string
@@ -84,13 +113,7 @@ function MessageBubble({ msg, sessionId, sessionFiles, setSessionFiles }: {
   const isResult = msg.message_type === 'natural_result' || msg.message_type === 'surgical_result'
 
   if (msg.message_type === 'compact_marker') {
-    return (
-      <div className="flex justify-center py-2">
-        <span className="text-[10px] text-muted/50 bg-surface/60 px-3 py-1 rounded-full border border-border/40">
-          📦 Earlier conversation compacted
-        </span>
-      </div>
-    )
+    return <CompactMarkerChip msg={msg} />
   }
 
   let result: SmartResult | null = null
@@ -639,7 +662,7 @@ export function MobileChatPanel() {
       },
       undefined, // onThinking — omitted on mobile for simplicity
       // onCompacting
-      (phase) => {
+      (phase, info) => {
         if (phase === 'start') {
           setIsCompacting(true)
           setProgress('Compacting conversation history...')
@@ -651,8 +674,10 @@ export function MobileChatPanel() {
             role: 'system' as any,
             message_type: 'compact_marker',
             content: '',
+            compact_summary: info?.summary || '',
+            compact_count: info?.compacted_count || 0,
             created_at: new Date().toISOString(),
-          })
+          } as any)
         }
       },
       () => setBuildEdit(true),

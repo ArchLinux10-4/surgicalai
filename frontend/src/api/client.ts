@@ -256,7 +256,7 @@ export const api = {
       onDone: (fullText: string, model?: string) => void,
       onError: (err: string) => void,
       onThinking?: (text: string, phase: 'start' | 'delta' | 'end') => void,
-      onCompacting?: (phase: 'start' | 'done') => void,
+      onCompacting?: (phase: 'start' | 'done', info?: { summary?: string; compacted_count?: number }) => void,
       onEditStart?: () => void,
       onEditEnd?: () => void,
       onTask?: (event: any) => void,
@@ -298,7 +298,7 @@ export const api = {
           else if (chunk.type === 'thinking') onThinking?.(chunk.content, 'delta')
           else if (chunk.type === 'thinking_end') onThinking?.('', 'end')
           else if (chunk.type === 'compacting') onCompacting?.('start')
-          else if (chunk.type === 'compacting_done') onCompacting?.('done')
+          else if (chunk.type === 'compacting_done') onCompacting?.('done', { summary: chunk.summary, compacted_count: chunk.compacted_count })
           else if (chunk.type === 'edit_start') onEditStart?.()
           else if (chunk.type === 'edit_end') onEditEnd?.()
           else if (chunk.type === 'file_needed') {
