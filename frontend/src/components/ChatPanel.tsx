@@ -27,6 +27,16 @@ const MODE_META: Record<ChatMode, { icon: typeof AutoFixHigh; label: string; des
   agent: { icon: AccountTree,       label: 'Agent', desc: 'Multi-agent task breakdown (Claude)' },
 }
 const CHAT_MODES: ChatMode[] = ['edit', 'ask', 'plan', 'agent']
+// Per-mode accent color — all existing theme tokens (tailwind.config.js), no new
+// colors introduced. Edit stays neutral (it's the baseline/default action).
+// `dot` is a separate literal (not derived via string replace) so Tailwind's
+// static content scanner can see every class name it needs to generate.
+const MODE_COLOR: Record<ChatMode, { text: string; bg: string; border: string; dot: string }> = {
+  edit:  { text: 'text-muted/70', bg: 'bg-overlay/60',  border: 'border-border/80', dot: 'bg-muted/70' },
+  ask:   { text: 'text-accent',   bg: 'bg-accent/15',   border: 'border-accent/50', dot: 'bg-accent' },
+  plan:  { text: 'text-purple',   bg: 'bg-purple/15',   border: 'border-purple/50', dot: 'bg-purple' },
+  agent: { text: 'text-orange',   bg: 'bg-orange/15',   border: 'border-orange/50', dot: 'bg-orange' },
+}
 
 // ── Cost indicator for model picker ───────────────────────────────────────────
 function ModelCostIndicator({ cost }: { cost?: number }) {
@@ -886,6 +896,10 @@ export function ChatPanel() {
   }
   const [chatMode, setChatMode] = useState<ChatMode>(readChatMode)
   const [modeMenuOpen, setModeMenuOpen] = useState(false)
+  // Dismissible Agent+non-Claude warning banner — resets whenever the mode or
+  // architect model changes, so it can't stay hidden after the condition that
+  // triggered it changes again.
+  const [agentClaudeNoticeDismissed, setAgentClaudeNoticeDismissed] = useState(false)
   const selectChatMode = (m: ChatMode) => {
     setChatMode(m)
     try { localStorage.setItem('sai_chat_mode', m) } catch { /* storage blocked — session-only */ }
@@ -920,6 +934,12 @@ export function ChatPanel() {
   // downgrades to a normal single-pass edit instead of multi-agent tasks.
   const agentRequiresClaudeForCurrentModel =
     effectiveMode === 'agent' && currentModelProvider === 'openai'
+  // Re-arm the dismissible banner whenever the condition it warns about
+  // changes — a dismissal only applies to the specific mode/model pairing
+  // the user saw it for, never silently suppressed going forward.
+  useEffect(() => {
+    setAgentClaudeNoticeDismissed(false)
+  }, [effectiveMode, settings?.architect_model])
   // Ref so doStream (deps: [sessionFiles]) reads the live offline flag with no
   // stale closure and without widening its dependency array.
   const isOfflineRef = useRef(isOffline)
@@ -2150,8 +2170,35 @@ export function ChatPanel() {
           </div>
         )}
 
+        {/* Persistent mode chip — always in direct line of sight before typing,
+            so the active mode is never buried in a toolbar dropdown. */}
+        <div className="mb-1.5 flex items-center gap-1.5">
+          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold ${MODE_COLOR[effectiveMode].bg} ${MODE_COLOR[effectiveMode].text}`}>
+            {(() => { const I = MODE_META[effectiveMode].icon; return <I sx={{ fontSize: 11 }} /> })()}
+            {MODE_META[effectiveMode].label} Mode
+          </span>
+        </div>
+
+        {agentRequiresClaudeForCurrentModel && !agentClaudeNoticeDismissed && (
+          <div className="mb-1.5 flex items-center gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-1.5 animate-slide-up">
+            <Warning sx={{ fontSize: 14 }} className="text-warning shrink-0" />
+            <span className="flex-1 text-[11px] text-ink/80 leading-snug">
+              Agent Mode needs a Claude model. With <strong>{settings?.architect_model || 'the current model'}</strong> selected, this will silently run as a normal single-pass edit instead of multi-agent tasks.
+            </span>
+            <button
+              onClick={() => setAgentClaudeNoticeDismissed(true)}
+              className="text-muted/60 hover:text-ink/80 transition-colors shrink-0"
+              title="Dismiss"
+            >
+              <Close sx={{ fontSize: 14 }} />
+            </button>
+          </div>
+        )}
+
         {/* Unified input pill — Claude/Tasklet style */}
-        <div className="relative flex flex-col bg-surface/80 border border-border/80 rounded-2xl shadow-lg shadow-black/20 focus-within:border-border focus-within:shadow-accent/5 transition-all">
+        <div className={`relative flex flex-col bg-surface/80 border rounded-2xl shadow-lg shadow-black/20 focus-within:shadow-accent/5 transition-all ${
+          effectiveMode !== 'edit' ? MODE_COLOR[effectiveMode].border : 'border-border/80 focus-within:border-border'
+        }`}>
           <button
             type="button"
             onClick={() => setIsComposerExpanded(prev => !prev)}
@@ -2206,7 +2253,7 @@ export function ChatPanel() {
                   title="Choose how the assistant responds"
                   className={`h-8 px-2.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors disabled:opacity-40 ${
                     effectiveMode !== 'edit'
-                      ? 'bg-accent/15 text-accent hover:bg-accent/25'
+                      ? `${MODE_COLOR[effectiveMode].bg} ${MODE_COLOR[effectiveMode].text} hover:brightness-110`
                       : 'text-muted/70 hover:text-ink/80 hover:bg-overlay/60'
                   }`}
                 >
@@ -2230,6 +2277,7 @@ export function ChatPanel() {
                       )}
                       {availableModes.map(m => {
                         const meta = MODE_META[m]
+                        const color = MODE_COLOR[m]
                         const I = meta.icon
                         const active = effectiveMode === m
                         return (
@@ -2237,15 +2285,15 @@ export function ChatPanel() {
                             key={m}
                             onClick={() => { selectChatMode(m); setModeMenuOpen(false) }}
                             className={`w-full text-left px-2.5 py-2 rounded-lg flex items-start gap-2 transition-colors ${
-                              active ? 'bg-accent/15' : 'hover:bg-overlay/60'
+                              active ? color.bg : 'hover:bg-overlay/60'
                             }`}
                           >
-                            <I sx={{ fontSize: 15 }} className={active ? 'text-accent mt-0.5' : 'text-muted mt-0.5'} />
+                            <I sx={{ fontSize: 15 }} className={active ? `${color.text} mt-0.5` : 'text-muted mt-0.5'} />
                             <span className="flex-1 min-w-0">
-                              <span className={`block text-xs font-semibold ${active ? 'text-accent' : 'text-ink'}`}>{meta.label}</span>
+                              <span className={`block text-xs font-semibold ${active ? color.text : 'text-ink'}`}>{meta.label}</span>
                               <span className="block text-[11px] text-muted leading-snug">{meta.desc}</span>
                             </span>
-                            {active && <span className="w-1.5 h-1.5 rounded-full bg-accent mt-1.5 shrink-0" />}
+                            {active && <span className={`w-1.5 h-1.5 rounded-full ${color.dot} mt-1.5 shrink-0`} />}
                           </button>
                         )
                       })}
