@@ -552,10 +552,17 @@ export const api = {
         method: 'POST',
         body: JSON.stringify(content != null ? { content } : {}),
       }),
-    update: (sessionId: string, fileId: string, content: string) =>
-      request<any>(`/chat/${sessionId}/files/${fileId}`, { method: 'PUT', body: JSON.stringify({ content }) }),
+    update: (sessionId: string, fileId: string, content: string, label?: string) =>
+      request<any>(`/chat/${sessionId}/files/${fileId}`, { method: 'PUT', body: JSON.stringify(label ? { content, label } : { content }) }),
     undo: (sessionId: string, fileId: string) =>
       request<any>(`/chat/${sessionId}/files/${fileId}/undo`, { method: 'POST' }),
+    /** Full, browsable edit history for a file — every past saved state, not just the last one. */
+    listVersions: (sessionId: string, fileId: string) =>
+      request<{ id: string; lines: number; symbol_count: number; label: string; created_at: string }[]>(
+        `/chat/${sessionId}/files/${fileId}/versions`
+      ),
+    restoreVersion: (sessionId: string, fileId: string, versionId: string) =>
+      request<any>(`/chat/${sessionId}/files/${fileId}/versions/${versionId}/restore`, { method: 'POST' }),
     delete: (sessionId: string, fileId: string) =>
       request(`/chat/${sessionId}/files/${fileId}`, { method: 'DELETE' }),
     download: async (sessionId: string, fileId: string, filename: string) => {

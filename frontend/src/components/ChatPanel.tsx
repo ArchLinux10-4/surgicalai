@@ -159,7 +159,8 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
               file_content: current.content,
             })
             if (applied.modified_content) {
-              await api.sessionFiles.update(sessionId, fd.file_id, applied.modified_content)
+              await api.sessionFiles.update(sessionId, fd.file_id, applied.modified_content,
+                `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''}`)
               appliedFiles++
               appliedChanges += applied.applied_count ?? applyChanges.length
               rescuedChanges += applied.rescued_count ?? 0

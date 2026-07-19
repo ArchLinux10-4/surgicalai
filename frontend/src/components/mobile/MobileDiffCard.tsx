@@ -124,7 +124,8 @@ function FileCard({
         file_content: current.content,
       })
       if (result.modified_content) {
-        await api.sessionFiles.update(sessionId, fileData.file_id, result.modified_content)
+        await api.sessionFiles.update(sessionId, fileData.file_id, result.modified_content,
+          `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''}`)
       }
       // Mark every applied change in localStorage + backend DB
       const newApplied: Record<string, boolean> = {}

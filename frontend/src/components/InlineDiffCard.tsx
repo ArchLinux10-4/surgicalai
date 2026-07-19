@@ -10,7 +10,7 @@ import type { SmartResult, QAResult } from '../types'
 import { LivePreview, isVisualFile } from './LivePreview'
 import { useAppStore } from '../stores/appStore'
 import { recordDiffStats, revertDiffStats } from '../lib/fileClassify'
-import { Cancel, CheckCircle, Description, FileDownload, KeyboardArrowDown, KeyboardArrowUp, Replay, SkipNext, Visibility, Warning } from '@mui/icons-material';
+import { Cancel, CheckCircle, Close, Description, FileDownload, History, KeyboardArrowDown, KeyboardArrowUp, Replay, SkipNext, Visibility, Warning } from '@mui/icons-material';
 interface Props {
   result: SmartResult
   sessionId: string
@@ -710,7 +710,10 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       const newContent = result.modified_content || ''
       if (newContent) {
         try {
-          await api.sessionFiles.update(sessionId, fileData.file_id, newContent)
+          const changeLabel = selectedChanges.length === 1
+            ? `Applied: ${selectedChanges[0]?.symbol?.full_path || selectedChanges[0]?.symbol?.name || 'change'}`
+            : `Applied ${selectedChanges.length} changes`
+          await api.sessionFiles.update(sessionId, fileData.file_id, newContent, changeLabel)
           console.debug('[InlineDiffCard] DB updated OK, re-syncing originalCode from DB')
           // Re-fetch originalCode from DB — replicates what page refresh does on mount.
           // This ensures the next round of edits starts from the true DB state.
@@ -802,21 +805,30 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     }
   }
 
-  const handleUndo = async (change: any) => {
-    setUndoing(p => ({ ...p, [change.id]: true }))
+  // Undo is file-level, not per-change: the backend reverts the file's most
+  // recent saved version regardless of how many changes were bundled into
+  // that save. So one click clears every change's applied/skipped state for
+  // this file, not just the row the click happened to be near.
+  const FILE_UNDO_KEY = '__file__'
+  const handleFileUndo = async () => {
+    setUndoing(p => ({ ...p, [FILE_UNDO_KEY]: true }))
     try {
       const result = await api.sessionFiles.undo(sessionId, fileData.file_id)
-      try { localStorage.removeItem(appliedKey(sessionId, change.id)) } catch {}
-      try { localStorage.removeItem(skippedKey(sessionId, change.id)) } catch {}
-      // Remove from backend DB too
-      if (sessionId) api.surgical.unmarkApplied(sessionId, change.id).catch(() => {})
-      // Reverse the diff-stats contribution this change made when it was applied
-      if (change.diff) {
-        const { added, removed } = diffLineCounts(change.diff)
-        revertDiffStats(fileData.file_id, added, removed)
+      let revertedAdded = 0, revertedRemoved = 0
+      for (const c of realChanges) {
+        if (!applied[c.id]) continue
+        try { localStorage.removeItem(appliedKey(sessionId, c.id)) } catch {}
+        try { localStorage.removeItem(skippedKey(sessionId, c.id)) } catch {}
+        if (sessionId) api.surgical.unmarkApplied(sessionId, c.id).catch(() => {})
+        if (c.diff) {
+          const { added, removed } = diffLineCounts(c.diff)
+          revertedAdded += added
+          revertedRemoved += removed
+        }
       }
-      setApplied(p => { const next = { ...p }; delete next[change.id]; return next })
-      setSkipped(p => { const next = { ...p }; delete next[change.id]; return next })
+      if (revertedAdded || revertedRemoved) revertDiffStats(fileData.file_id, revertedAdded, revertedRemoved)
+      setApplied({})
+      setSkipped({})
       setModifiedCode(undefined)
       // Sync originalCode to reverted content — replicates refresh behavior
       if (result.content) setOriginalCode(result.content)
@@ -826,8 +838,68 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     } catch (e: any) {
       toast.error(e.message || 'Undo failed')
     } finally {
-      setUndoing(p => ({ ...p, [change.id]: false }))
+      setUndoing(p => ({ ...p, [FILE_UNDO_KEY]: false }))
     }
+  }
+
+  // ── Version history (browse + restore any past saved state) ──────────────
+  const [showHistory, setShowHistory] = useState(false)
+  const [versions, setVersions] = useState<{ id: string; lines: number; symbol_count: number; label: string; created_at: string }[] | null>(null)
+  const [loadingVersions, setLoadingVersions] = useState(false)
+  const [restoringId, setRestoringId] = useState<string | null>(null)
+
+  const openHistory = async () => {
+    setShowHistory(true)
+    setLoadingVersions(true)
+    try {
+      const v = await api.sessionFiles.listVersions(sessionId, fileData.file_id)
+      setVersions(v)
+    } catch (e: any) {
+      toast.error(e.message || 'Failed to load history')
+      setVersions([])
+    } finally {
+      setLoadingVersions(false)
+    }
+  }
+
+  const handleRestoreVersion = async (versionId: string) => {
+    setRestoringId(versionId)
+    try {
+      const result = await api.sessionFiles.restoreVersion(sessionId, fileData.file_id, versionId)
+      // Restoring changes file content out from under the applied/skipped
+      // bookkeeping (same reasoning as file-level undo above) — clear it.
+      for (const c of realChanges) {
+        try { localStorage.removeItem(appliedKey(sessionId, c.id)) } catch {}
+        try { localStorage.removeItem(skippedKey(sessionId, c.id)) } catch {}
+      }
+      setApplied({})
+      setSkipped({})
+      setModifiedCode(undefined)
+      if (result.content) setOriginalCode(result.content)
+      onApplied?.(filename, result.content)
+      toast.success(`Restored ${filename} to selected version`)
+      onChangeApplied?.()
+      setShowHistory(false)
+      // Refresh the list so the freshly-created "Before restore" checkpoint shows up next time
+      setVersions(null)
+    } catch (e: any) {
+      toast.error(e.message || 'Restore failed')
+    } finally {
+      setRestoringId(null)
+    }
+  }
+
+  const formatVersionTime = (iso: string) => {
+    try {
+      const d = new Date(iso.endsWith('Z') ? iso : iso + 'Z')
+      const diffMs = Date.now() - d.getTime()
+      const mins = Math.round(diffMs / 60000)
+      if (mins < 1) return 'just now'
+      if (mins < 60) return `${mins}m ago`
+      const hrs = Math.round(mins / 60)
+      if (hrs < 24) return `${hrs}h ago`
+      return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
+    } catch { return iso }
   }
 
   const handleDownload = async () => {
@@ -885,35 +957,97 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         <span className="text-[11px] text-muted/70 ml-1">
           {realChanges.length} change{realChanges.length !== 1 ? 's' : ''}
         </span>
-        {/* File-level Live Preview button — on open, replicate browser refresh:
-             fetch fresh file from DB, clear stale state, force full remount */}
-        {isVisualFile(filename) && (
+        <div className="flex items-center gap-1.5 ml-auto relative">
+          {/* File-level Undo — reverts the file to its most recent saved
+               version. Backed by real version history (session_file_versions),
+               so this always works when any change has been applied — it is
+               no longer limited to "exactly one change applied this session". */}
+          {Object.values(applied).some(Boolean) && (
+            <button
+              onClick={handleFileUndo}
+              disabled={undoing[FILE_UNDO_KEY]}
+              className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Revert to the version before the most recent change"
+            >
+              <Replay sx={{ fontSize: 11 }} />
+              {undoing[FILE_UNDO_KEY] ? 'Reverting...' : 'Undo'}
+            </button>
+          )}
+
+          {/* Version History — browse & restore ANY past saved state of this
+               file, not just the last one. This is what makes "always
+               reversible" actually true. */}
           <button
-            onClick={async () => {
-              const opening = !showFilePreview
-              if (opening) {
-                // Replicate what browser refresh does on mount: fresh DB fetch
-                try {
-                  const freshFile = await api.sessionFiles.get(sessionId, fileData.file_id)
-                  if (freshFile?.content) setOriginalCode(freshFile.content)
-                } catch {}
-                setModifiedCode(undefined)
-                setPreviewKey(k => k + 1)
-              }
-              setShowFilePreview(opening)
-            }}
-            className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors ml-auto"
-            title={showFilePreview ? 'Hide live preview' : 'Show live preview of this file'}
+            onClick={() => (showHistory ? setShowHistory(false) : openHistory())}
+            className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
+            title="Browse and restore any previous version of this file"
           >
-            <Visibility sx={{ fontSize: 11 }} />
-            {showFilePreview ? 'Hide Preview' : 'Preview'}
+            <History sx={{ fontSize: 12 }} />
+            History
           </button>
-        )}
-        {allApplied && (
-          <span className={`${isVisualFile(filename) ? '' : 'ml-auto '}flex items-center gap-1.5 text-[12px] text-success font-semibold`}>
-            <CheckCircle sx={{ fontSize: 13 }} /> All applied
-          </span>
-        )}
+
+          {showHistory && (
+            <div className="absolute right-0 top-full mt-1.5 w-72 max-h-80 overflow-y-auto bg-surface border border-border rounded-lg shadow-lg z-20">
+              <div className="flex items-center justify-between px-3 py-2 border-b border-border/60 sticky top-0 bg-surface">
+                <span className="text-[11px] font-semibold uppercase tracking-wide text-muted/70">Version History</span>
+                <button onClick={() => setShowHistory(false)} className="text-muted hover:text-ink">
+                  <Close sx={{ fontSize: 14 }} />
+                </button>
+              </div>
+              {loadingVersions && (
+                <div className="px-3 py-3 text-[11px] text-muted">Loading…</div>
+              )}
+              {!loadingVersions && versions && versions.length === 0 && (
+                <div className="px-3 py-3 text-[11px] text-muted">No saved versions yet — this file hasn't been edited in this session.</div>
+              )}
+              {!loadingVersions && versions && versions.map(v => (
+                <div key={v.id} className="flex items-center justify-between gap-2 px-3 py-2 border-b border-border/40 last:border-0 hover:bg-overlay">
+                  <div className="min-w-0">
+                    <div className="text-[11px] font-medium text-ink truncate">{v.label || 'Edit'}</div>
+                    <div className="text-[10px] text-muted/70">{formatVersionTime(v.created_at)} · {v.lines} lines</div>
+                  </div>
+                  <button
+                    onClick={() => handleRestoreVersion(v.id)}
+                    disabled={restoringId === v.id}
+                    className="flex-shrink-0 flex items-center gap-1 px-2 py-1 bg-accent/10 text-accent border border-accent/30 rounded-md text-[10px] font-semibold hover:bg-accent/20 transition-colors disabled:opacity-50"
+                  >
+                    {restoringId === v.id ? 'Restoring…' : 'Restore'}
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* File-level Live Preview button — on open, replicate browser refresh:
+               fetch fresh file from DB, clear stale state, force full remount */}
+          {isVisualFile(filename) && (
+            <button
+              onClick={async () => {
+                const opening = !showFilePreview
+                if (opening) {
+                  // Replicate what browser refresh does on mount: fresh DB fetch
+                  try {
+                    const freshFile = await api.sessionFiles.get(sessionId, fileData.file_id)
+                    if (freshFile?.content) setOriginalCode(freshFile.content)
+                  } catch {}
+                  setModifiedCode(undefined)
+                  setPreviewKey(k => k + 1)
+                }
+                setShowFilePreview(opening)
+              }}
+              className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
+              title={showFilePreview ? 'Hide live preview' : 'Show live preview of this file'}
+            >
+              <Visibility sx={{ fontSize: 11 }} />
+              {showFilePreview ? 'Hide Preview' : 'Preview'}
+            </button>
+          )}
+          {allApplied && (
+            <span className="flex items-center gap-1.5 text-[12px] text-success font-semibold">
+              <CheckCircle sx={{ fontSize: 13 }} /> All applied
+            </span>
+          )}
+        </div>
       </div>
 
       {/* File-level Live Preview — one preview for the entire file */}
@@ -1010,25 +1144,10 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     <Cancel sx={{ fontSize: 9 }} /> Skipped
                   </span>
                 )}
-                {isApplied && (() => {
-                  const totalApplied = Object.values(applied).filter(Boolean).length
-                  const canUndo = totalApplied === 1
-                  return (
-                    <button
-                      onClick={() => canUndo && handleUndo(change)}
-                      disabled={!canUndo || undoing[change.id]}
-                      className={`flex items-center gap-1 px-2 py-1 bg-surface border border-border rounded-lg text-[11px] font-semibold transition-colors ${
-                        canUndo
-                          ? 'text-muted hover:bg-overlay hover:text-ink cursor-pointer'
-                          : 'text-muted/40 cursor-not-allowed'
-                      }`}
-                      title={canUndo ? 'Revert this change' : 'Undo is only available when one change is applied. Download the file to save your current version.'}
-                    >
-                      <Replay sx={{ fontSize: 11 }} />
-                      {undoing[change.id] ? 'Reverting...' : 'Undo'}
-                    </button>
-                  )
-                })()}
+                {/* Per-change Undo removed — Undo is file-level (see file header
+                     above) since the backend reverts the whole file's most
+                     recent saved state, not an individual row. Use the file
+                     header's Undo/History controls instead. */}
 
                 <button
                   onClick={() => toggleDiff(change.id)}

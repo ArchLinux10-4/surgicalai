@@ -6,11 +6,12 @@ import uuid
 import base64
 import io
 import logging
+import datetime as _dt
 from pathlib import Path
 import mimetypes
 from fastapi import APIRouter, HTTPException, File, UploadFile, Form
 from fastapi.responses import Response
-from database import get_db, get_db_ctx
+from database import get_db, get_db_ctx, _dlog
 from middleware.file_validator import validate_file_size, validate_session_total
 from services.ast_parser import ASTParser
 
@@ -18,6 +19,34 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 parser = ASTParser()
+
+
+def _snapshot_version(conn, session_id: str, file_id: str, content: str, lines: int,
+                       symbol_count: int, label: str = "Edit") -> None:
+    """Append the given content as a new row in the version history table.
+
+    Called with the CONTENT BEING REPLACED (i.e. the state right before an
+    edit is written), so the history reads as a list of "what the file used
+    to look like" checkpoints a user can always go back to. Never raises —
+    a history-write failure must not block the primary edit from saving.
+    """
+    try:
+        version_id = str(uuid.uuid4())
+        # Explicit microsecond-precision timestamp (not SQL CURRENT_TIMESTAMP,
+        # which is only second-resolution on sqlite) so versions from rapid
+        # successive edits still sort correctly newest-first.
+        created_at = _dt.datetime.utcnow().isoformat(sep=" ", timespec="microseconds")
+        conn.execute(
+            "INSERT INTO session_file_versions "
+            "(id, session_id, file_id, content, lines, symbol_count, label, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (version_id, session_id, file_id, content, lines, symbol_count, label, created_at)
+        )
+        _dlog("session_file_version_snapshot", session_id=session_id[:8] if session_id else None,
+              file_id=file_id, label=label, lines=lines, version_id=version_id)
+    except Exception as e:
+        _dlog("session_file_version_snapshot_failed", session_id=session_id[:8] if session_id else None,
+              file_id=file_id, error=str(e))
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif"}
 PDF_EXTENSIONS = {".pdf"}
@@ -585,14 +614,21 @@ def update_session_file(session_id: str, file_id: str, body: dict):
     Uses optimistic concurrency: the UPDATE includes AND updated_at = ?
     so a concurrent write between our SELECT and UPDATE is detected and
     returns 409 instead of silently overwriting the other change.
+
+    Before overwriting, the CURRENT content is snapshotted into
+    session_file_versions so it is never lost — the file can always be
+    restored to this exact point via the version history, not just the
+    single most-recent edit.
     """
     new_content = body.get("content", "")
+    label = body.get("label") or "Edit applied"
     with get_db_ctx() as conn:
         row = conn.execute(
             "SELECT content, filename, updated_at FROM session_files WHERE id = ? AND session_id = ?",
             (file_id, session_id)
         ).fetchone()
         if not row:
+            _dlog("session_file_update_not_found", session_id=session_id[:8] if session_id else None, file_id=file_id)
             raise HTTPException(status_code=404, detail="File not found")
 
         if hasattr(row, "__getitem__"):
@@ -612,57 +648,189 @@ def update_session_file(session_id: str, file_id: str, body: dict):
         new_content = _sanitize_for_postgres(new_content)
         prev_content = _sanitize_for_postgres(prev_content)
 
+        prev_lines = len(prev_content.splitlines()) if prev_content else 0
+        try:
+            prev_smap = parser.parse(prev_content or "", filename)
+            prev_symbol_count = len(prev_smap.symbols)
+        except Exception:
+            prev_symbol_count = 0
+
+        # Snapshot BEFORE the overwrite — this is what makes every edit
+        # reversible, not just the last one.
+        _snapshot_version(conn, session_id, file_id, prev_content, prev_lines, prev_symbol_count, label=label)
+
         result = conn.execute(
             "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, edited = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ? AND updated_at = ?",
             (new_content, prev_content, lines, symbol_count, file_id, session_id, row_updated_at)
         )
         if result.rowcount == 0:
+            _dlog("session_file_update_conflict", session_id=session_id[:8] if session_id else None, file_id=file_id)
             raise HTTPException(status_code=409, detail="File was modified concurrently — please retry with fresh content")
         conn.commit()
     return {"id": file_id, "lines": lines, "symbol_count": symbol_count, "ok": True}
 
 
-@router.post("/{session_id}/files/{file_id}/undo")
-def undo_session_file(session_id: str, file_id: str):
-    """Restore a file to its previous version (one-step undo).
+def _restore_content(conn, session_id: str, file_id: str, target_content: str,
+                      current_content: str, filename: str, row_updated_at, restore_label: str):
+    """Shared core: snapshot the current content, then overwrite with target_content.
 
-    Optimistic concurrency: AND updated_at = ? prevents undo from
-    silently overwriting a concurrent edit.
+    Used by both /undo (restores the most recent version) and
+    /versions/{version_id}/restore (restores an arbitrary past version).
+    Restoring is itself non-destructive — the content being replaced is
+    snapshotted first, so restoring is always reversible too.
+    """
+    lines = len(target_content.splitlines())
+    try:
+        smap = parser.parse(target_content, filename)
+        symbol_count = len(smap.symbols)
+    except Exception:
+        symbol_count = 0
+
+    current_lines = len(current_content.splitlines()) if current_content else 0
+    try:
+        cur_smap = parser.parse(current_content or "", filename)
+        current_symbol_count = len(cur_smap.symbols)
+    except Exception:
+        current_symbol_count = 0
+
+    _snapshot_version(conn, session_id, file_id, current_content, current_lines,
+                       current_symbol_count, label=restore_label)
+
+    result = conn.execute(
+        "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, edited = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ? AND updated_at = ?",
+        (target_content, current_content, lines, symbol_count, file_id, session_id, row_updated_at)
+    )
+    if result.rowcount == 0:
+        _dlog("session_file_restore_conflict", session_id=session_id[:8] if session_id else None, file_id=file_id)
+        raise HTTPException(status_code=409, detail="File was modified concurrently — restore cancelled")
+    return lines, symbol_count
+
+
+@router.get("/{session_id}/files/{file_id}/versions")
+def list_session_file_versions(session_id: str, file_id: str):
+    """List all saved versions of a file, newest first.
+
+    Backed by session_file_versions — a real, unbounded, append-only
+    history (not the old single-slot previous_content column), so every
+    past state of the file is browsable and restorable, not just the last.
     """
     with get_db_ctx() as conn:
-        row = conn.execute(
-            "SELECT content, previous_content, filename, updated_at FROM session_files WHERE id = ? AND session_id = ?",
+        file_row = conn.execute(
+            "SELECT updated_at FROM session_files WHERE id = ? AND session_id = ?",
             (file_id, session_id)
         ).fetchone()
-        if not row:
+        if not file_row:
             raise HTTPException(status_code=404, detail="File not found")
 
-        if hasattr(row, "__getitem__"):
-            current = row["content"]
-            prev = row["previous_content"]
-            filename = row["filename"]
-            row_updated_at = row["updated_at"]
-        else:
-            current, prev, filename, row_updated_at = row[0], row[1], row[2], row[3]
+        rows = conn.execute(
+            "SELECT id, lines, symbol_count, label, created_at FROM session_file_versions "
+            "WHERE file_id = ? AND session_id = ? ORDER BY created_at DESC",
+            (file_id, session_id)
+        ).fetchall()
 
-        if not prev:
+    versions = []
+    for r in rows:
+        if hasattr(r, "__getitem__") and not isinstance(r, tuple):
+            versions.append({
+                "id": r["id"], "lines": r["lines"], "symbol_count": r["symbol_count"],
+                "label": r["label"], "created_at": str(r["created_at"]),
+            })
+        else:
+            versions.append({
+                "id": r[0], "lines": r[1], "symbol_count": r[2],
+                "label": r[3], "created_at": str(r[4]),
+            })
+    _dlog("session_file_versions_listed", session_id=session_id[:8] if session_id else None,
+          file_id=file_id, count=len(versions))
+    return versions
+
+
+@router.post("/{session_id}/files/{file_id}/versions/{version_id}/restore")
+def restore_session_file_version(session_id: str, file_id: str, version_id: str):
+    """Restore a file to an arbitrary past version by id.
+
+    Optimistic concurrency: AND updated_at = ? prevents restore from
+    silently overwriting a concurrent edit made while the History panel
+    was open.
+    """
+    with get_db_ctx() as conn:
+        file_row = conn.execute(
+            "SELECT content, filename, updated_at FROM session_files WHERE id = ? AND session_id = ?",
+            (file_id, session_id)
+        ).fetchone()
+        if not file_row:
+            raise HTTPException(status_code=404, detail="File not found")
+        if hasattr(file_row, "__getitem__"):
+            current_content = file_row["content"]
+            filename = file_row["filename"]
+            row_updated_at = file_row["updated_at"]
+        else:
+            current_content, filename, row_updated_at = file_row[0], file_row[1], file_row[2]
+
+        version_row = conn.execute(
+            "SELECT content FROM session_file_versions WHERE id = ? AND file_id = ? AND session_id = ?",
+            (version_id, file_id, session_id)
+        ).fetchone()
+        if not version_row:
+            _dlog("session_file_version_not_found", session_id=session_id[:8] if session_id else None,
+                  file_id=file_id, version_id=version_id)
+            raise HTTPException(status_code=404, detail="Version not found")
+        target_content = version_row["content"] if hasattr(version_row, "__getitem__") else version_row[0]
+
+        lines, symbol_count = _restore_content(
+            conn, session_id, file_id, target_content, current_content, filename,
+            row_updated_at, restore_label="Before restore"
+        )
+        conn.commit()
+    _dlog("session_file_version_restored", session_id=session_id[:8] if session_id else None,
+          file_id=file_id, version_id=version_id, lines=lines)
+    return {"id": file_id, "content": target_content, "lines": lines, "symbol_count": symbol_count, "ok": True}
+
+
+@router.post("/{session_id}/files/{file_id}/undo")
+def undo_session_file(session_id: str, file_id: str):
+    """Undo — restore the file to its most recent saved version.
+
+    Now backed by session_file_versions instead of a single previous_content
+    slot, so this always targets the true last checkpoint even after many
+    edits. The undo itself is snapshotted too, so it can be reversed by
+    restoring a later version from the History panel if needed.
+    """
+    with get_db_ctx() as conn:
+        file_row = conn.execute(
+            "SELECT content, filename, updated_at FROM session_files WHERE id = ? AND session_id = ?",
+            (file_id, session_id)
+        ).fetchone()
+        if not file_row:
+            raise HTTPException(status_code=404, detail="File not found")
+        if hasattr(file_row, "__getitem__"):
+            current_content = file_row["content"]
+            filename = file_row["filename"]
+            row_updated_at = file_row["updated_at"]
+        else:
+            current_content, filename, row_updated_at = file_row[0], file_row[1], file_row[2]
+
+        latest_version = conn.execute(
+            "SELECT id, content FROM session_file_versions WHERE file_id = ? AND session_id = ? "
+            "ORDER BY created_at DESC LIMIT 1",
+            (file_id, session_id)
+        ).fetchone()
+        if not latest_version:
+            _dlog("session_file_undo_no_history", session_id=session_id[:8] if session_id else None, file_id=file_id)
             raise HTTPException(status_code=400, detail="No previous version to restore")
 
-        lines = len(prev.splitlines())
-        try:
-            smap = parser.parse(prev, filename)
-            symbol_count = len(smap.symbols)
-        except Exception:
-            symbol_count = 0
+        if hasattr(latest_version, "__getitem__"):
+            target_content = latest_version["content"]
+        else:
+            target_content = latest_version[1]
 
-        result = conn.execute(
-            "UPDATE session_files SET content = ?, previous_content = ?, lines = ?, symbol_count = ?, edited = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND session_id = ? AND updated_at = ?",
-            (prev, current, lines, symbol_count, file_id, session_id, row_updated_at)
+        lines, symbol_count = _restore_content(
+            conn, session_id, file_id, target_content, current_content, filename,
+            row_updated_at, restore_label="Before undo"
         )
-        if result.rowcount == 0:
-            raise HTTPException(status_code=409, detail="File was modified concurrently — undo cancelled")
         conn.commit()
-    return {"id": file_id, "content": prev, "lines": lines, "symbol_count": symbol_count, "ok": True}
+    _dlog("session_file_undo_ok", session_id=session_id[:8] if session_id else None, file_id=file_id, lines=lines)
+    return {"id": file_id, "content": target_content, "lines": lines, "symbol_count": symbol_count, "ok": True}
 
 
 @router.delete("/{session_id}/files/{file_id}")

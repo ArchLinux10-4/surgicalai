@@ -620,10 +620,17 @@ export function SettingsModal() {
                   <input type="checkbox" checked={form.auto_backup} onChange={(e) => upd('auto_backup')(e.target.checked)}
                     className="mt-0.5 accent-accent" />
                   <div>
-                    <div className="text-sm font-medium text-ink">Auto-backup before every surgical change</div>
-                    <div className="text-xs text-muted mt-0.5">Saves to <code className="font-mono text-[10px] bg-overlay px-1 rounded">.surgicalai_backups/</code> \u2014 always reversible</div>
+                    <div className="text-sm font-medium text-ink">Auto-backup before every surgical change (local files)</div>
+                    <div className="text-xs text-muted mt-0.5">When editing files directly on disk from the Surgical panel, saves a timestamped copy to <code className="font-mono text-[10px] bg-overlay px-1 rounded">.surgicalai_backups/</code> before every change</div>
                   </div>
                 </label>
+                <div className="flex items-start gap-3">
+                  <div className="mt-0.5 w-4 h-4 flex-shrink-0" />
+                  <div>
+                    <div className="text-sm font-medium text-ink">Version history — always on, everywhere</div>
+                    <div className="text-xs text-muted mt-0.5">Every applied change to a session file is saved as a restorable checkpoint — not just the last one. Click <span className="font-medium text-ink">History</span> next to any file's changes to browse and restore any previous version.</div>
+                  </div>
+                </div>
               </div>
             )}
 

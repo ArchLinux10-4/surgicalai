@@ -379,6 +379,26 @@ def _init_sqlite():
             last_login TIMESTAMP
         )
     """)
+    # session_file_versions — full, append-only edit history per file.
+    # Every time a file's content changes (apply, undo, restore) the PRIOR
+    # content is snapshotted here first, so a file is always reversible to
+    # any past state, not just the single most-recent one.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS session_file_versions (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            file_id TEXT NOT NULL,
+            content TEXT NOT NULL,
+            lines INTEGER DEFAULT 0,
+            symbol_count INTEGER DEFAULT 0,
+            label TEXT DEFAULT 'Edit',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_session_file_versions_file
+        ON session_file_versions(file_id, created_at)
+    """)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_api_keys (
             id TEXT PRIMARY KEY,
@@ -669,6 +689,24 @@ def _init_postgres():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 last_login TIMESTAMP
             )
+        """)
+        # session_file_versions — full, append-only edit history per file
+        # (mirrors the sqlite table above; see comment there for rationale)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS session_file_versions (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                file_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                lines INTEGER DEFAULT 0,
+                symbol_count INTEGER DEFAULT 0,
+                label TEXT DEFAULT 'Edit',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_file_versions_file
+            ON session_file_versions(file_id, created_at)
         """)
         # user_api_keys — encrypted API keys per user
         conn.execute("""
