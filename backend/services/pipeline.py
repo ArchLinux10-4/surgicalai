@@ -9029,6 +9029,89 @@ async def _run_gpt_direct_rewrite(
     raise RuntimeError("[GPT_DIRECT_REWRITE] GPT did not call submit_file_rewrite")
 
 
+def _compute_rewrite_drift(
+    original: str,
+    rewritten: str,
+    is_redesign: bool,
+) -> dict:
+    """
+    Post-hoc drift guard for the full-file direct-rewrite path (Cursor-inspired).
+
+    Cursor's "instant apply" observation: in a correct rewrite, the vast majority
+    of a file is copy-forward-identical text; only the true edit regions should
+    differ. We exploit the same invariant as a SAFETY CHECK (not a speed hack):
+    diff the original vs. the model's rewrite and measure how much of the file
+    actually changed. If the changed fraction is far larger than the request's
+    scope implies, the model likely "cleaned up" / rewrote code it was never
+    asked to touch — the exact failure mode full-file rewrites risk.
+
+    This is ADVISORY ONLY. It NEVER hard-blocks or mutates the rewrite. It returns
+    a structured verdict so the caller can surface a warning and feed the existing
+    (advisory) QA agent an extra risk to scrutinize — consistent with the
+    "QA gate is advisory-only by design" rule.
+
+    Model-agnostic: applies to whatever the direct-rewrite path produced
+    (Claude or GPT), because it measures the OUTPUT text, not model behavior.
+
+    Returns:
+      {
+        "changed_lines": int,
+        "unchanged_lines": int,
+        "total_lines": int,
+        "changed_ratio": float,      # 0.0 - 1.0
+        "expected_max_ratio": float, # scope-calibrated ceiling
+        "flagged": bool,             # True => changed more than scope implies
+        "reason": str,               # human-readable explanation
+      }
+    """
+    import difflib as _difflib
+
+    orig_lines = original.splitlines()
+    new_lines = rewritten.splitlines()
+    total = max(len(orig_lines), len(new_lines), 1)
+
+    # SequenceMatcher matching blocks give the count of lines that are identical
+    # and in-order between the two versions (the "copy-forward" spans).
+    sm = _difflib.SequenceMatcher(a=orig_lines, b=new_lines, autojunk=False)
+    unchanged = sum(block.size for block in sm.get_matching_blocks())
+    unchanged = min(unchanged, total)
+    changed = max(total - unchanged, 0)
+    changed_ratio = changed / total
+
+    # Scope-calibrated ceiling: a redesign legitimately rewrites most of the file,
+    # so we allow a very high ceiling there. A targeted (non-redesign) large-symbol
+    # edit that was routed to direct-rewrite should still leave most of the file
+    # untouched, so we hold it to a much tighter ceiling. These are deliberately
+    # generous to avoid false positives on legitimate large edits — the check only
+    # fires on egregious, unexpected whole-file churn.
+    expected_max_ratio = 0.95 if is_redesign else 0.60
+
+    flagged = changed_ratio > expected_max_ratio
+    if flagged:
+        reason = (
+            f"Rewrite changed {changed_ratio:.0%} of the file "
+            f"({changed}/{total} lines), exceeding the "
+            f"{expected_max_ratio:.0%} ceiling for a "
+            f"{'redesign' if is_redesign else 'targeted'} change. "
+            f"Possible unintended churn outside the requested scope."
+        )
+    else:
+        reason = (
+            f"Rewrite changed {changed_ratio:.0%} of the file "
+            f"({changed}/{total} lines) — within expected scope."
+        )
+
+    return {
+        "changed_lines": changed,
+        "unchanged_lines": unchanged,
+        "total_lines": total,
+        "changed_ratio": round(changed_ratio, 4),
+        "expected_max_ratio": expected_max_ratio,
+        "flagged": flagged,
+        "reason": reason,
+    }
+
+
 async def run_smart_pipeline_stream(
     session_files: list,
     user_request: str,
@@ -11712,6 +11795,60 @@ USER REQUEST:
                     _use_direct_rewrite = False
 
                 if _dr_ok:
+                    # ── Post-hoc drift guard (Cursor-inspired, advisory only) ──
+                    # Measure how much of the file the full-file rewrite actually
+                    # changed. If it churned far more than the request's scope
+                    # implies, the model may have rewritten code it wasn't asked
+                    # to touch. We NEVER hard-block here — we surface a warning and
+                    # feed the (advisory) QA agent an extra risk so it scrutinizes.
+                    # Applies to both Claude and GPT direct rewrites (measures the
+                    # output text, not model behavior).
+                    # NOTE: `plan.get("risks") or []` (not the .get default) —
+                    # a present-but-None "risks" value would make list(None) raise
+                    # TypeError on this unguarded line and crash the stream. The
+                    # `or []` collapses both missing-key and None to an empty list.
+                    _dr_qa_extra_risks = list(plan.get("risks") or [])
+                    try:
+                        _dr_drift = _compute_rewrite_drift(
+                            original=sf["content"],
+                            rewritten=_dr_new_code,
+                            is_redesign=_is_redesign,
+                        )
+                        _dlog(
+                            "direct_rewrite_drift_guard",
+                            session_id=session_id or "",
+                            user_id=user_id,
+                            filename=matched_name,
+                            symbol=matched_name,
+                            model=_surg_model_route,
+                            is_redesign=_is_redesign,
+                            changed_ratio=_dr_drift["changed_ratio"],
+                            expected_max_ratio=_dr_drift["expected_max_ratio"],
+                            changed_lines=_dr_drift["changed_lines"],
+                            total_lines=_dr_drift["total_lines"],
+                            flagged=_dr_drift["flagged"],
+                        )
+                        if _dr_drift["flagged"]:
+                            yield sse({"type": "progress", "content": f"⚠️ Drift guard: {_dr_drift['reason']}"})
+                            _dr_qa_extra_risks.append(
+                                "DRIFT GUARD: The full-file rewrite changed "
+                                f"{_dr_drift['changed_ratio']:.0%} of the file "
+                                f"({_dr_drift['changed_lines']}/{_dr_drift['total_lines']} lines), "
+                                "more than the requested scope implies. Verify NO code outside "
+                                "the requested change was altered, removed, or 'cleaned up'."
+                            )
+                        else:
+                            yield sse({"type": "progress", "content": f"✓ Drift guard: {_dr_drift['reason']}"})
+                    except Exception as _drift_exc:
+                        # Guard must never break the pipeline — advisory only.
+                        _dlog(
+                            "direct_rewrite_drift_guard_error",
+                            session_id=session_id or "",
+                            user_id=user_id,
+                            filename=matched_name,
+                            error=str(_drift_exc)[:200],
+                        )
+
                     _dr_qa_result = await run_qa_agent(
                         original_code=sf["content"],
                         new_code=_dr_new_code,
@@ -11722,7 +11859,7 @@ USER REQUEST:
                         other_files_context="",
                         session_id=session_id or "",
                         user_id=user_id,
-                        architect_risks=plan.get("risks", []),
+                        architect_risks=_dr_qa_extra_risks,
                         targeted_context="",
                     )
                     _dr_qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫", "skipped": "⏭"}.get(

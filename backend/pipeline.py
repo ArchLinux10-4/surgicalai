@@ -1,4 +1,34 @@
 """
+╔══════════════════════════════════════════════════════════════════════════════╗
+║  ⚠️  STALE / PRODUCTION-DEAD DUPLICATE — DO NOT EDIT FOR RUNTIME BEHAVIOR  ⚠️   ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║                                                                                ║
+║  THE LIVE PIPELINE IS:  backend/services/pipeline.py  (NOT this file).         ║
+║                                                                                ║
+║  Every production import resolves to `services.pipeline`. Verified:            ║
+║    • routers/chat.py imports run_smart_pipeline_stream / run_natural_pipeline  ║
+║      _stream FROM services.pipeline (grep `from services.pipeline import`).    ║
+║    • grep across the repo for `from pipeline` / `import pipeline` (excluding   ║
+║      services.pipeline) → ZERO runtime imports of THIS file.                   ║
+║    • This file has NO `__main__` entrypoint and is in NO Procfile/start script.║
+║    • services/pipeline.py is ~2x larger and is the actively maintained copy    ║
+║      (e.g. it has the GPT direct-rewrite path this file lacks).                ║
+║                                                                                ║
+║  TRAP HISTORY: An agent once implemented a full-file-rewrite "drift guard"     ║
+║  here, ran passing unit tests against it, and shipped DEAD CODE — nothing      ║
+║  loads this module at runtime. If you are adding/changing pipeline BEHAVIOR,   ║
+║  edit services/pipeline.py. Confirm your edit is live by grepping who imports  ║
+║  the symbol you changed BEFORE writing tests.                                  ║
+║                                                                                ║
+║  WHY THIS FILE STILL EXISTS (do not delete without a cleanup pass): one test   ║
+║  still reads it directly — tests/test_fragment_guard.py does                   ║
+║  `open("pipeline.py")` (relative) to extract `_fragment_reason` via AST.       ║
+║  (test_targeted_edit.py references it only as a FALLBACK after services/, and  ║
+║  test_lf2_fix.py / tests_qa_prose_fallback_salvage.py target services/ — the   ║
+║  live file.) Removing this file requires repointing test_fragment_guard.py     ║
+║  first. Tracked in backlog: "Stale duplicate pipeline files cleanup".          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
 Two-model AI pipeline.
 - Architect: GPT-5 (or configured model) — reads symbol map, reasons, produces plan
 - Surgeon: GPT-4.1 — receives plan + code chunk, writes minimal precise replacement
