@@ -137,6 +137,25 @@ if ! pip install --quiet -r requirements.txt; then
 fi
 
 echo "  ✅ Backend dependencies installed"
+
+# Local-install-only extras (e.g. Playwright for the Element Picker feature).
+# requirements-local.txt is never read by Railway/hosted builds (nixpacks only
+# reads requirements.txt) — this script only ever runs on a local machine, so
+# it's always safe to install these here, into the same venv the app runs from.
+if [ -f requirements-local.txt ]; then
+  _dlog "installing local-only extras from requirements-local.txt"
+  if pip install --quiet -r requirements-local.txt; then
+    _dlog "requirements-local.txt installed OK"
+    echo "  ✅ Local-only extras installed (Element Picker, etc.)"
+  else
+    _dlog "FAIL: pip install -r requirements-local.txt. Retrying verbosely to capture the real error..."
+    pip install -r requirements-local.txt >> "$LOGFILE" 2>&1 || true
+    echo -e "  ${YELLOW}⚠️  Local-only extras failed to install (non-fatal — core app still works).${NC}"
+    echo "     Affects: Element Picker. To retry manually:"
+    echo "       cd backend && source .venv/bin/activate && pip install -r requirements-local.txt"
+    echo "     Full pip error is in $LOGFILE"
+  fi
+fi
 echo ""
 
 # ── Frontend ─────────────────────────────────────────────────────────────────
