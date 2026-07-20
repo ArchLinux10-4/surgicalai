@@ -1,0 +1,10 @@
+# Local-install-only dependencies. Railway's nixpacks build never reads
+# this file (only requirements.txt), so anything here has zero hosted
+# footprint by construction — no is_hosted check needed at install time.
+#
+# playwright: powers the Element Picker feature (services/element_picker.py).
+# Used purely as a CDP *client* via connectOverCDP to attach to a Chrome the
+# user already has running — never downloads or launches its own Chromium
+# when used this way, so `playwright install` is not required for this
+# feature (only `pip install playwright`).
+playwright>=1.44
