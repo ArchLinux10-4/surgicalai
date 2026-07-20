@@ -126,13 +126,33 @@ class _PickerState:
                     # user to upgrade if they hit the CDP error downstream.
                     _dlog("connect_no_defaults_unsupported_old_playwright", error=str(te))
                     browser = pw.chromium.connect_over_cdp(cdp_url)
-                contexts = browser.contexts
-                if not contexts or not contexts[0].pages:
+                # Bounded retry (defense-in-depth): on a freshly-launched
+                # Chrome (fresh profile dir), the CDP port can accept a
+                # connection before the initial `about:blank` tab has
+                # finished registering as a page target. Give it up to 3s
+                # to appear rather than failing on the very first check —
+                # this mirrors the same race launch() now guards against
+                # (see _cdp_has_page_target), but connect() can also be
+                # called standalone (power-user manual-flag path) so it
+                # needs its own guard too.
+                page = None
+                retry_deadline = time.time() + 3.0
+                attempts = 0
+                while True:
+                    attempts += 1
+                    contexts = browser.contexts
+                    if contexts and contexts[0].pages:
+                        page = contexts[0].pages[0]
+                        break
+                    if time.time() >= retry_deadline:
+                        break
+                    time.sleep(0.25)
+                if page is None:
+                    _dlog("connect_no_tabs_after_retry", cdp_url=cdp_url, attempts=attempts)
                     raise ElementPickerError(
                         "Connected to Chrome, but no open tabs were found. "
                         "Open at least one tab in the target Chrome window."
                     )
-                page = contexts[0].pages[0]
             except Exception as e:
                 # IMPORTANT: always stop the Playwright driver instance we
                 # just started on ANY failure path (bad tabs, connect_over_cdp
@@ -461,6 +481,25 @@ def _port_open(port: int, host: str = "localhost") -> bool:
         return False
 
 
+def _cdp_has_page_target(port: int, host: str = "localhost") -> bool:
+    """True once Chrome's CDP endpoint actually lists a `page`-type target.
+
+    The debug port can start accepting TCP connections before the initial
+    tab (e.g. the `about:blank` opened by launch()) has finished registering
+    as a CDP-attachable target — especially on a brand-new profile dir,
+    where Chrome is still doing first-run profile setup. `_port_open()`
+    alone is not sufficient readiness evidence; this closes that gap.
+    """
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://{host}:{port}/json/list", timeout=0.5) as resp:
+            targets = json.loads(resp.read().decode("utf-8", "replace"))
+        return any(isinstance(t, dict) and t.get("type") == "page" for t in targets)
+    except Exception as e:
+        _dlog("cdp_has_page_target_check_failed", port=port, error=str(e))
+        return False
+
+
 def _parse_port(cdp_url: str) -> int:
     try:
         parsed = urlparse(cdp_url)
@@ -510,10 +549,13 @@ def launch(cdp_url: str = "http://localhost:9222") -> dict:
         raise ElementPickerError(f"Failed to launch Chrome: {e}") from e
 
     # First launch of a fresh profile can take a couple seconds — poll
-    # instead of assuming it's instantly ready.
+    # instead of assuming it's instantly ready. Readiness requires BOTH the
+    # TCP port accepting connections AND the CDP endpoint listing an actual
+    # page target; the port alone opens before the first tab is registered,
+    # which raced connect() into a false "no open tabs" failure.
     deadline = time.time() + 12
     while time.time() < deadline:
-        if _port_open(port):
+        if _port_open(port) and _cdp_has_page_target(port):
             _dlog("launch_ready", port=port, binary=binary)
             return {"launched": True, "already_running": False}
         time.sleep(0.3)
