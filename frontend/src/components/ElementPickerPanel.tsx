@@ -307,6 +307,23 @@ export function ElementPickerPanel() {
     wsRef.current?.send(JSON.stringify({ type: 'mouseReleased', x: coords.x, y: coords.y, button: 'left' }))
   }
 
+  // Relays live cursor position into the page so Chrome's own hover
+  // highlight (Overlay.setInspectMode, armed in Pick mode — see
+  // handleModeChange above) has motion to react to. Without this, our
+  // synthetic input never generates a mousemove, so Chrome's renderer never
+  // sees the cursor "enter" any element inside our docked view, and the
+  // Overlay agent has nothing to paint into the frames we stream back —
+  // confirmed root cause of "highlight shows in the real Chrome window but
+  // not in the app". Fires in both modes (not just Pick) so Browse mode
+  // also gets real hover feedback (e.g. link/button hover states), matching
+  // normal browser behavior. High-frequency by nature, so it goes through
+  // the same coalescing path as mouseWheel — see _queue_continuous.
+  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    const coords = toPageCoords(e)
+    if (!coords || !wsRef.current) return
+    wsRef.current.send(JSON.stringify({ type: 'mouseMoved', x: coords.x, y: coords.y }))
+  }
+
   const handleCanvasWheel = (e: React.WheelEvent<HTMLCanvasElement>) => {
     if (mode !== 'browse') return
     const coords = toPageCoords(e as unknown as React.MouseEvent<HTMLCanvasElement>)
@@ -474,6 +491,7 @@ export function ElementPickerPanel() {
               ref={canvasRef}
               tabIndex={0}
               onClick={handleCanvasClick}
+              onMouseMove={handleCanvasMouseMove}
               onWheel={handleCanvasWheel}
               onKeyDown={handleCanvasKeyDown}
               className={`max-w-full max-h-full outline-none transition-shadow duration-150 ${
