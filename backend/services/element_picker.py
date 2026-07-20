@@ -336,6 +336,24 @@ class _PickerState:
                             pass
 
                 session.on("Page.screencastFrame", _on_frame)
+                # Chrome only treats scroll/wheel input as "live" on a page it
+                # considers focused+active. Our real Chrome window is a
+                # background window on the user's desktop (the live view
+                # panel is what they actually interact with), so without
+                # this Chrome periodically stops honoring CDP-dispatched
+                # mouseWheel events until the user manually clicks the real
+                # window to give it OS focus — proven root cause of "scroll
+                # stops working, have to click the real Chrome tab and back".
+                # `Emulation.setFocusEmulationEnabled` (official CDP,
+                # Emulation domain) tells Chrome to simulate a permanently
+                # focused+active page regardless of real OS window focus, so
+                # every dispatched event keeps working continuously. Non-fatal
+                # if unsupported on an old Chrome — live view still works,
+                # just may re-exhibit the background-focus quirk.
+                try:
+                    session.send("Emulation.setFocusEmulationEnabled", {"enabled": True})
+                except Exception as focus_err:
+                    _dlog("focus_emulation_enable_failed", error=str(focus_err))
                 session.send(
                     "Page.startScreencast",
                     {
@@ -347,7 +365,7 @@ class _PickerState:
                     },
                 )
                 self._cdp_session = session
-                _dlog("screencast_started", max_width=max_width, max_height=max_height, quality=quality)
+                _dlog("screencast_started", max_width=max_width, max_height=max_height, quality=quality, focus_emulation=True)
             except Exception as e:
                 _dlog("screencast_start_failed", error=str(e))
                 raise ElementPickerError(f"Could not start live view: {e}") from e
@@ -360,6 +378,14 @@ class _PickerState:
                 self._cdp_session.send("Page.stopScreencast")
             except Exception as e:
                 _dlog("screencast_stop_error", error=str(e))
+            try:
+                # Best-effort: hand focus emulation back to the real OS
+                # window state now that the live view session is ending.
+                # Non-fatal — the CDP session detaching normally clears this
+                # anyway, this is just belt-and-suspenders cleanup.
+                self._cdp_session.send("Emulation.setFocusEmulationEnabled", {"enabled": False})
+            except Exception:
+                pass
             self._cdp_session = None
             # Drain any queued frames so a later restart doesn't hand back
             # a stale frame from the previous session.
