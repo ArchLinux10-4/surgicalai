@@ -509,7 +509,28 @@ class _PickerState:
                     },
                 )
             else:
-                session.send("Overlay.setInspectMode", {"mode": "none"})
+                # Chrome's real implementation (confirmed against Blink source,
+                # InspectorOverlayAgent::setInspectMode /
+                # HighlightConfigFromInspectorObject) requires
+                # `highlightConfig` on EVERY setInspectMode call, including the
+                # disable ("none") case — contradicting the public CDP docs,
+                # which claim it "may be omitted if enabled == false". Omitting
+                # it here throws: "Internal error: highlight configuration
+                # parameter is missing". The config content is inert when mode
+                # is "none" (nothing is drawn), so we just reuse the same
+                # accent-colored config for parity with the enable branch.
+                session.send(
+                    "Overlay.setInspectMode",
+                    {
+                        "mode": "none",
+                        "highlightConfig": {
+                            "showInfo": True,
+                            "showExtensionLines": False,
+                            "contentColor": {"r": 88, "g": 166, "b": 255, "a": 0.20},
+                            "borderColor": {"r": 88, "g": 166, "b": 255, "a": 0.9},
+                        },
+                    },
+                )
         except Exception as e:
             _dlog("inspect_mode_apply_failed", enabled=enabled, error=str(e))
             raise
