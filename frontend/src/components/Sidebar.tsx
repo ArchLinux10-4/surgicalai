@@ -10,7 +10,8 @@ import { LinearPanel } from './LinearPanel'
 import { VercelPanel } from './VercelPanel'
 import { RailwayPanel } from './RailwayPanel'
 import { useThemeStore } from '../stores/themeStore'
-import { Add, Chat, CloudOff, Close, Code, CreateNewFolder, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
+import { Add, AdsClick, Chat, CloudOff, Close, Code, CreateNewFolder, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
+import { ElementPickerPanel } from './ElementPickerPanel';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile, DiffStatsBadge } from '../lib/fileClassify'
 import { DownloadSessionButton } from './DownloadSessionButton'
 
@@ -792,7 +793,7 @@ function SessionFilesPanel() {
 }
 
 // ── Rail items config ─────────────────────────────────────────────────────────
-type TabId = 'sessions' | 'files' | 'github' | 'context' | 'linear' | 'vercel' | 'railway'
+type TabId = 'sessions' | 'files' | 'github' | 'context' | 'linear' | 'vercel' | 'railway' | 'element-picker'
 const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
   { id: 'sessions', icon: Chat, label: 'Chats',  tooltip: 'Chats' },
   { id: 'files',    icon: Code,      label: 'Files',  tooltip: 'Session Files' },
@@ -801,6 +802,11 @@ const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
   { id: 'vercel',   icon: VercelIcon,         label: 'Vercel', tooltip: 'Vercel Deployments' },
   { id: 'railway',  icon: RailwayIcon,        label: 'Railway', tooltip: 'Railway Services' },
   { id: 'context',  icon: Psychology,         label: 'Memory', tooltip: 'Global Memory' },
+  // Local-install only — a Chrome CDP connection can never reach the user's
+  // laptop from a hosted (Vercel/Railway) deploy, so this tile is filtered
+  // out entirely on hosted instances (see `visibleRailItems` below), same
+  // precedent as Import Folder's `canImportFolder` gate.
+  { id: 'element-picker', icon: AdsClick, label: 'Element Picker', tooltip: 'Pick Element' },
 ]
 
 // ── Vercel icon (inline SVG) ──────────────────────────────────────────────────
@@ -867,6 +873,10 @@ export function Sidebar() {
   // network that isn't there, disable them proactively with a clear message.
   const offlineModeActive = !!settings?.ollama_enabled
   const CLOUD_ONLY_TABS: TabId[] = ['vercel', 'railway']
+  // Same is_hosted signal that already gates Import Folder (session file
+  // panel) — a Chrome CDP connection can only ever reach localhost, so this
+  // tile would be actively misleading on a hosted Vercel/Railway deploy.
+  const visibleRailItems = RAIL_ITEMS.filter(r => r.id !== 'element-picker' || !settings?.is_hosted)
 
   // `pinned` = user has explicitly (manually) expanded the panel — persists
   // across reloads (sourced from the app store, which persists it to
@@ -962,7 +972,7 @@ export function Sidebar() {
   const fileCount = sessionFiles.length
   const initials = (user?.username ?? 'U').slice(0, 2).toUpperCase()
 
-  const panelLabel = RAIL_ITEMS.find(r => r.id === sidebarTab)?.label ?? ''
+  const panelLabel = visibleRailItems.find(r => r.id === sidebarTab)?.label ?? ''
 
   return (
     <div className="flex h-full relative" onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
@@ -987,7 +997,7 @@ export function Sidebar() {
         </button>
 
         {/* Nav icons */}
-        {RAIL_ITEMS.map(({ id, icon: Icon, tooltip }) => {
+        {visibleRailItems.map(({ id, icon: Icon, tooltip }) => {
           const isActive = sidebarTab === id && panelVisible
           const badge = id === 'files' && fileCount > 0 ? fileCount : null
           const disabledOffline = offlineModeActive && CLOUD_ONLY_TABS.includes(id)
@@ -1123,6 +1133,7 @@ export function Sidebar() {
           {sidebarTab === 'sessions' && <SessionList />}
           {sidebarTab === 'files'    && <SessionFilesPanel />}
           {sidebarTab === 'context'  && <ContextPanel />}
+          {sidebarTab === 'element-picker' && !settings?.is_hosted && <ElementPickerPanel />}
           {sidebarTab === 'github'   && (
             <GitHubPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
           )}
