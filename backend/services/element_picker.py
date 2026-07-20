@@ -29,8 +29,37 @@ import socket
 import subprocess
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 from urllib.parse import urlparse
+
+# Playwright's sync API is explicitly documented as NOT thread-safe: every
+# call touching a Playwright object (browser/page/cdp session) must happen
+# on the exact same OS thread that first called `sync_playwright().start()`,
+# or it raises `greenlet.error: Cannot switch to a different thread`.
+#
+# Our callers do not naturally share one thread: `POST /connect` lands on
+# whichever FastAPI/anyio threadpool worker services that request, while the
+# WebSocket handler drives `start_screencast`/`navigate`/mouse-dispatch via
+# `asyncio.to_thread`, which pulls from asyncio's own separate default
+# executor. Two different thread pools racing to touch the same Playwright
+# objects is exactly what production hit (see connect_ok immediately
+# followed by screencast_start_failed in the debug log).
+#
+# Fix: pin every Playwright-touching call onto one dedicated single-worker
+# executor, created once for the process lifetime. Because it has exactly
+# one worker thread, every job submitted to it — no matter which request
+# thread or asyncio task submitted it — always runs on that same OS thread.
+# This makes the failure mode structurally impossible rather than papering
+# over one call site.
+_PW_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="element-picker-pw")
+
+
+def _run_on_pw_thread(fn, *args, **kwargs):
+    """Submit fn to the single dedicated Playwright thread and block for the
+    result, re-raising any exception as-is so existing ElementPickerError /
+    HTTPException handling upstream is untouched."""
+    return _PW_EXECUTOR.submit(fn, *args, **kwargs).result()
 
 logger = logging.getLogger(__name__)
 
@@ -590,50 +619,59 @@ def launch(cdp_url: str = "http://localhost:9222") -> dict:
 
 
 def connect(cdp_url: str) -> dict:
-    return _state.connect(cdp_url)
+    # Touches Playwright (sync_playwright().start() on first call) — must
+    # run on the single dedicated Playwright thread. See _PW_EXECUTOR above.
+    return _run_on_pw_thread(_state.connect, cdp_url)
 
 
 def screenshot_b64() -> str:
-    raw = _state.screenshot()
+    raw = _run_on_pw_thread(_state.screenshot)
     return base64.b64encode(raw).decode("ascii")
 
 
 def pick(x: float, y: float) -> dict:
-    return _state.pick(x, y)
+    return _run_on_pw_thread(_state.pick, x, y)
 
 
 def disconnect() -> dict:
-    return _state.disconnect()
+    return _run_on_pw_thread(_state.disconnect)
 
 
 def status() -> dict:
-    return _state.status()
+    # NOTE: touches `self._page.url`, a real Playwright property getter, not
+    # a plain Python attribute — must go through the single dedicated
+    # Playwright thread like every other call here.
+    return _run_on_pw_thread(_state.status)
 
 
 def start_screencast() -> None:
-    _state.start_screencast()
+    _run_on_pw_thread(_state.start_screencast)
 
 
 def stop_screencast() -> None:
-    _state.stop_screencast()
+    _run_on_pw_thread(_state.stop_screencast)
 
 
 def get_next_frame(timeout: float = 1.0) -> Optional[dict]:
+    # Only reads from the bounded frame queue that Playwright's own event
+    # dispatcher fills — no direct Playwright object access, safe from any
+    # thread, no dispatch needed (and must stay off the single PW thread so
+    # a slow consumer never blocks screencast frame delivery).
     return _state.get_next_frame(timeout=timeout)
 
 
 def navigate(url: str) -> dict:
-    return _state.navigate(url)
+    return _run_on_pw_thread(_state.navigate, url)
 
 
 def dispatch_mouse(kind: str, x: float, y: float, button: str = "left",
                     delta_x: float = 0.0, delta_y: float = 0.0) -> None:
-    _state.dispatch_mouse(kind, x, y, button=button, delta_x=delta_x, delta_y=delta_y)
+    _run_on_pw_thread(_state.dispatch_mouse, kind, x, y, button=button, delta_x=delta_x, delta_y=delta_y)
 
 
 def dispatch_text(text: str) -> None:
-    _state.dispatch_text(text)
+    _run_on_pw_thread(_state.dispatch_text, text)
 
 
 def dispatch_key(key: str, code: str) -> None:
-    _state.dispatch_key(key, code)
+    _run_on_pw_thread(_state.dispatch_key, key, code)
