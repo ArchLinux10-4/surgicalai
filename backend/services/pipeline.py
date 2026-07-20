@@ -415,6 +415,35 @@ async def _stream_and_collect(aclient, **kwargs):
 
 # ── Phase 3: shared parse helpers (used by both mid-stream + EOS) ──────
 
+def _looks_like_filename(cand: str) -> bool:
+    """True when `cand` plausibly names a file the model wants pulled, rather
+    than a line of prose.
+
+    Proven bug (screenshot 2026-07-20): when <file_request> content is not
+    valid JSON, the plain-text fallback below split it on commas/newlines and
+    treated EVERY fragment as a filename — so a markdown bullet like
+    "- **Tell me the branch name** … (I can use `diff_branches`)" rendered as a
+    bogus "file needed" card. A real requested name is a short, path-safe token
+    that either ends in an extension (AuthGate.jsx) or is a single bare token
+    (Makefile, src/config). Prose — spaces + punctuation, markdown, no
+    extension — is rejected."""
+    cand = (cand or "").strip()
+    if not cand or len(cand) > 200 or "\n" in cand:
+        return False
+    # Reject obvious markdown / prose markers.
+    if any(tok in cand for tok in ("**", "`", "→", ": ", "?", "(", ")", "  ")):
+        return False
+    if cand[:2] in ("- ", "* ", "# ") or cand.startswith("#"):
+        return False
+    # (a) has a file extension and is path-safe, or
+    if re.search(r"\.[A-Za-z0-9]{1,8}$", cand) and re.fullmatch(r"[\w\-./@ ]{1,200}", cand):
+        return True
+    # (b) a single bare path-safe token (Makefile, Dockerfile, src/config)
+    if re.fullmatch(r"[\w\-./]{1,60}", cand):
+        return True
+    return False
+
+
 def _parse_filereq_content(raw: str) -> list:
     """Parse file_request tag content — JSON array/string with plain-text fallback."""
     raw = raw.strip()
@@ -428,7 +457,23 @@ def _parse_filereq_content(raw: str) -> list:
             return [parsed.strip()]
         return []
     except (json.JSONDecodeError, ValueError):
-        return [f.strip() for f in raw.replace(",", "\n").split("\n") if f.strip()]
+        # Non-JSON fallback: split on commas/newlines, but keep only fragments
+        # that actually look like filenames. Without this gate, prose the model
+        # wrote around a malformed tag becomes phantom "file needed" cards.
+        _cands = [f.strip() for f in raw.replace(",", "\n").split("\n") if f.strip()]
+        _kept = [c for c in _cands if _looks_like_filename(c)]
+        # Bug A probe (session f10e5b33): prove whether the filename gate is
+        # rescuing us from phantom "file needed" cards. When candidates exist
+        # but NONE survive the filename check, the tag content was prose — not
+        # a file request — and returning [] is the correct, bug-killing outcome.
+        _dlog("filereq_nonjson_fallback",
+              raw_preview=raw[:200],
+              raw_len=len(raw),
+              cand_count=len(_cands),
+              kept_count=len(_kept),
+              kept=_kept[:10],
+              rejected_as_prose=[c for c in _cands if not _looks_like_filename(c)][:10])
+        return _kept
 
 
 def _parse_search_content(raw: str):
@@ -566,28 +611,67 @@ def _parse_plan_content(raw: str):
         return None
 
 
+def _looks_like_edit_block(text: str) -> bool:
+    """True when `text` plausibly holds a JSON edit / new-file payload rather
+    than prose.
+
+    A real edit block always carries JSON structure with at least one
+    recognised edit field. Model prose that merely *mentions* a tag name — e.g.
+    a refusal written as "a `<surgical_edit>` against this file would mean
+    guessing" — never does.
+
+    Proven bug (session f10e5b33, AuthGate.jsx): the streaming tag scanner
+    opened `in_edit` on a `<surgical_edit>` marker the model typed inside
+    backticks in a `<blocked>` clarification; EOS recovery then kept the
+    trailing prose as a phantom edit block, which failed JSON parse and was
+    mislabelled "truncated — hit token limit" before a degenerate_drop. This
+    guard lets recovery reject such prose so the real clarification is surfaced
+    instead of a phantom edit. Real edits are always JSON, so they always pass."""
+    if not text or "{" not in text:
+        return False
+    return bool(re.search(
+        r'"(filename|new_code|old_code|symbol|edit_start_line|content)"\s*:',
+        text,
+    ))
+
+
 def _eos_recover_blocks(open_tag: str, close_tag: str, full_response: str,
                         tag_buf: str, blocks_list: list) -> tuple:
     """EOS recovery: findall complete blocks in full_response, dedup, keep partial.
-    Mutates blocks_list in place. Returns (new_count, partial_kept, had_matches)."""
+    Mutates blocks_list in place.
+    Returns (new_count, partial_kept, had_matches, rejected_prose).
+    rejected_prose is the leaked buffer text when it was NOT a plausible edit
+    block (so the caller can surface it as prose instead of shipping a phantom
+    edit); None otherwise."""
     pattern = re.escape(open_tag) + r"(.*?)" + re.escape(close_tag)
     all_matches = re.findall(pattern, full_response, re.DOTALL)
     new_count = 0
     partial_kept = False
+    rejected_prose = None
     if all_matches:
         for block in all_matches:
-            if block not in blocks_list:
+            if block in blocks_list:
+                continue
+            if _looks_like_edit_block(block):
                 blocks_list.append(block)
                 new_count += 1
+            elif rejected_prose is None:
+                rejected_prose = block
         if (tag_buf.strip()
                 and close_tag not in tag_buf
                 and tag_buf not in blocks_list):
-            blocks_list.append(tag_buf)
-            partial_kept = True
+            if _looks_like_edit_block(tag_buf):
+                blocks_list.append(tag_buf)
+                partial_kept = True
+            elif rejected_prose is None:
+                rejected_prose = tag_buf
     else:
         if tag_buf.strip():
-            blocks_list.append(tag_buf)
-    return new_count, partial_kept, bool(all_matches)
+            if _looks_like_edit_block(tag_buf):
+                blocks_list.append(tag_buf)
+            else:
+                rejected_prose = tag_buf
+    return new_count, partial_kept, bool(all_matches), rejected_prose
 
 
 def _is_claude_model(model: str) -> bool:
@@ -15748,7 +15832,7 @@ async def run_natural_pipeline_stream(
                   full_response_len=len(full_response))
 
             if state == "in_edit":
-                _new_count, _partial_kept, _had_matches = _eos_recover_blocks(
+                _new_count, _partial_kept, _had_matches, _rejected_prose = _eos_recover_blocks(
                     EDIT_OPEN, EDIT_CLOSE, full_response, tag_buf, edit_blocks_raw)
                 if _had_matches:
                     state = "normal"
@@ -15759,9 +15843,21 @@ async def run_natural_pipeline_stream(
                           partial_kept=_partial_kept,
                           total_edit_blocks=len(edit_blocks_raw))
                 yield sse({"type": "edit_end", "content": ""})
+                if _rejected_prose:
+                    # The buffer opened `in_edit` on a `<surgical_edit>` marker the
+                    # model typed inside prose (e.g. a `<blocked>` clarification),
+                    # not a real JSON edit. Surface it as visible text instead of
+                    # dropping it as a phantom edit block. Proven: session f10e5b33.
+                    state = "normal"
+                    tag_buf = ""
+                    _dlog("eos_edit_rejected_prose_surfaced",
+                          session_id=session_id, user_id=user_id,
+                          prose_len=len(_rejected_prose),
+                          edit_blocks_after=len(edit_blocks_raw))
+                    yield sse({"type": "token", "content": _rejected_prose})
 
             elif state == "in_file":
-                _new_count, _partial_kept, _had_matches = _eos_recover_blocks(
+                _new_count, _partial_kept, _had_matches, _rejected_prose = _eos_recover_blocks(
                     FILE_OPEN, FILE_CLOSE, full_response, tag_buf, new_file_blocks_raw)
                 if _had_matches:
                     state = "normal"
@@ -15772,6 +15868,14 @@ async def run_natural_pipeline_stream(
                           partial_kept=_partial_kept,
                           total_file_blocks=len(new_file_blocks_raw))
                 yield sse({"type": "edit_end", "content": ""})
+                if _rejected_prose:
+                    state = "normal"
+                    tag_buf = ""
+                    _dlog("eos_newfile_rejected_prose_surfaced",
+                          session_id=session_id, user_id=user_id,
+                          prose_len=len(_rejected_prose),
+                          new_file_blocks_after=len(new_file_blocks_raw))
+                    yield sse({"type": "token", "content": _rejected_prose})
 
             elif state == "in_plan":
                 _pl_match = re.search(
@@ -16524,21 +16628,42 @@ async def run_natural_pipeline_stream(
                             else:
                                 _fn_m = re.search(r'"filename"\s*:\s*"([^"]+)"', edit_raw)
                                 _sym_m = re.search(r'"symbol"\s*:\s*"([^"]+)"', edit_raw)
+                                # Bug B probe (session f10e5b33): distinguish a
+                                # genuinely truncated edit from PROSE that slipped
+                                # through the scanner (model typed <surgical_edit>
+                                # inside backticks). Prose has no JSON edit fields
+                                # -> _looks_like_edit_block is False. Mislabelling
+                                # prose as "hit token limit" is the original bug;
+                                # log the discriminator so the mislabel is provable.
+                                _is_editlike = _looks_like_edit_block(edit_raw)
                                 _dlog("edit_parse_failed",
                                       session_id=session_id,
                                       raw_preview=edit_raw[:300],
                                       raw_tail=edit_raw[-200:],
                                       raw_len=len(edit_raw),
+                                      looks_like_edit=_is_editlike,
+                                      likely_prose_not_truncation=not _is_editlike,
                                       err_direct=_parse_err_1,
                                       err_repair=_parse_err_2,
                                       err_extract=_parse_err_3,
                                       filename_hint=_fn_m.group(1) if _fn_m else None,
                                       symbol_hint=_sym_m.group(1) if _sym_m else None,
                                       user_id=user_id)
+                                # Only claim "truncated / token limit" when the raw
+                                # actually looks like a JSON edit. Otherwise it is
+                                # non-edit prose and saying "token limit" is the
+                                # very mislabel this fix eliminates.
+                                if _is_editlike:
+                                    _skip_reason = ("Edit block was truncated or malformed — "
+                                                    "Claude may have hit the output token limit")
+                                else:
+                                    _skip_reason = ("Content inside the edit tag was not a valid "
+                                                    "edit (looked like prose, not a JSON edit) — "
+                                                    "no change applied")
                                 skipped_changes_struct.append({
                                     "filename": _fn_m.group(1) if _fn_m else "(unknown)",
                                     "symbol": _sym_m.group(1) if _sym_m else "(truncated)",
-                                    "reason": "Edit block was truncated or malformed — Claude may have hit the output token limit",
+                                    "reason": _skip_reason,
                                 })
                                 continue
 
