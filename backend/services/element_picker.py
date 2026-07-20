@@ -148,10 +148,32 @@ class _PickerState:
                         break
                     time.sleep(0.25)
                 if page is None:
+                    # The Chrome process is alive (we got this far) but has
+                    # zero open tabs. This is a real, common state: on macOS,
+                    # closing a window's last tab does NOT quit Chrome — the
+                    # process (and the CDP port) stays up with no tabs at
+                    # all. Waiting longer never helps here, so create a tab
+                    # ourselves instead of failing outright.
+                    try:
+                        if browser.contexts:
+                            page = browser.contexts[0].new_page()
+                        else:
+                            page = browser.new_context().new_page()
+                        page.goto("about:blank")
+                        _dlog("connect_created_new_page", cdp_url=cdp_url, attempts=attempts)
+                    except Exception as create_err:
+                        _dlog(
+                            "connect_create_page_failed",
+                            cdp_url=cdp_url,
+                            attempts=attempts,
+                            error=str(create_err),
+                        )
+                if page is None:
                     _dlog("connect_no_tabs_after_retry", cdp_url=cdp_url, attempts=attempts)
                     raise ElementPickerError(
-                        "Connected to Chrome, but no open tabs were found. "
-                        "Open at least one tab in the target Chrome window."
+                        "Connected to Chrome, but no open tabs were found and "
+                        "a new tab could not be created automatically. Please "
+                        "quit Chrome completely and click Launch again."
                     )
             except Exception as e:
                 # IMPORTANT: always stop the Playwright driver instance we
