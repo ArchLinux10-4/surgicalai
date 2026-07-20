@@ -593,6 +593,25 @@ export const api = {
       }),
   },
 
+  // Element Picker — local-install only (server hides these behind is_hosted;
+  // see routers/element_picker.py). Attaches to the user's own already-running
+  // Chrome via CDP (playwright connectOverCDP), never launches/downloads one.
+  elementPicker: {
+    status: () => request<{ available: boolean; connected: boolean; cdp_url?: string | null; page_url?: string | null }>('/element-picker/status'),
+    connect: (cdpUrl: string) =>
+      request<{ connected: boolean; cdp_url: string | null; page_url: string | null }>('/element-picker/connect', {
+        method: 'POST',
+        body: JSON.stringify({ cdp_url: cdpUrl }),
+      }),
+    screenshot: () => request<{ image_base64: string; mime_type: string }>('/element-picker/screenshot'),
+    pick: (x: number, y: number) =>
+      request<{ tag: string; id: string | null; className: string | null; text: string; outerHTML: string; rect: { x: number; y: number; width: number; height: number } }>(
+        '/element-picker/pick',
+        { method: 'POST', body: JSON.stringify({ x, y }) }
+      ),
+    disconnect: () => request<{ connected: boolean }>('/element-picker/disconnect', { method: 'POST' }),
+  },
+
   context: {
     getMemory: (workspacePath: string) => request<ProjectMemory>(`/context/memory?workspace_path=${encodeURIComponent(workspacePath)}`),
     saveMemory: (data: any) => request<any>('/context/memory', { method: 'POST', body: JSON.stringify(data) }),
