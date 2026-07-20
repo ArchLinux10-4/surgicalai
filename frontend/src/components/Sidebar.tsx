@@ -802,12 +802,13 @@ const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
   { id: 'railway',  icon: RailwayIcon,        label: 'Railway', tooltip: 'Railway Services' },
   { id: 'context',  icon: Psychology,         label: 'Memory', tooltip: 'Global Memory' },
 ]
-// Element Picker opens its own full-screen live-view screen (see
-// ElementPickerModal), not a sliding sidebar panel — a tiny embedded strip
-// can't show a real, full-size, interactive browser feed. Local-install only:
-// a Chrome CDP connection can never reach the user's laptop from a hosted
-// (Vercel/Railway) deploy, so the button itself is hidden there (same
-// precedent as Import Folder's `canImportFolder` gate).
+// Element Picker docks into the third-pane slot beside chat (see
+// ElementPickerPanel / Layout.tsx) — same convention as opening a code file,
+// not a tiny sliding sidebar strip, since it needs to show a real, sizeable,
+// interactive browser feed. Local-install only: a Chrome CDP connection can
+// never reach the user's laptop from a hosted (Vercel/Railway) deploy, so
+// the button itself is hidden there (same precedent as Import Folder's
+// `canImportFolder` gate).
 
 // ── Vercel icon (inline SVG) ──────────────────────────────────────────────────
 function VercelIcon({ size = 16 }: { size?: number }) {
@@ -1038,8 +1039,8 @@ export function Sidebar() {
           <Palette sx={{ fontSize: 17 }} />
         </button>
 
-        {/* Element Picker — opens its own full-screen live-view screen, not
-            a sliding panel (see ElementPickerModal). Local-install only. */}
+        {/* Element Picker — docks beside chat like an open file (see
+            ElementPickerPanel / Layout.tsx). Local-install only. */}
         {!settings?.is_hosted && (
           <button
             onClick={() => setElementPickerModalOpen(true)}

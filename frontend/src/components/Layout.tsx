@@ -2,6 +2,7 @@ import React, { useState, useCallback, useRef } from 'react'
 import { Sidebar } from './Sidebar'
 import { ChatPanel } from './ChatPanel'
 import { CodePanel } from './CodePanel'
+import { ElementPickerPanel } from './ElementPickerPanel'
 import { useAppStore } from '../stores/appStore'
 import { useAuthStore } from '../stores/authStore'
 import { LoginPage } from '../pages/LoginPage'
@@ -14,6 +15,12 @@ const SIDEBAR_MAX_PX = Math.round(SIDEBAR_MIN_PX * 1.4)  // +40% = ~370px
 export function Layout() {
   const activeFile = useAppStore(s => s.activeFile)
   const sidebarPinned = useAppStore(s => s.sidebarPinned)
+  // Element Picker docks into the same third-pane slot CodePanel uses below
+  // — one main view beside chat at a time, same convention Cursor's own
+  // in-app Browser pane follows. It takes precedence over an open file
+  // rather than stacking a fourth column, matching the "keep it simple,
+  // one thing docked beside chat" decision from user feedback.
+  const elementPickerOpen = useAppStore(s => s.elementPickerModalOpen)
   const { isAuthenticated } = useAuthStore()
   // Default to max width — the panel was too cramped at the minimum.
   // Users can still drag it narrower via the resize handle.
@@ -83,21 +90,24 @@ export function Layout() {
         )}
       </aside>
 
-      {/* Chat — expands to fill all space when no file is open */}
+      {/* Chat — expands to fill all space when no file/picker pane is docked */}
       <section className={`flex flex-col bg-base overflow-hidden transition-all duration-200 ${
-        activeFile
+        (activeFile || elementPickerOpen)
           ? 'w-[460px] flex-shrink-0 border-r border-border'
           : 'flex-1'
       }`}>
         <ChatPanel />
       </section>
 
-      {/* Code editor — only rendered when a file is actively open */}
-      {activeFile && (
+      {/* Third pane — Element Picker takes priority over an open code file
+          (one main view beside chat at a time, not a stacked fourth column) */}
+      {elementPickerOpen ? (
+        <ElementPickerPanel />
+      ) : activeFile ? (
         <section className="flex-1 flex flex-col bg-base min-w-0">
           <CodePanel />
         </section>
-      )}
+      ) : null}
     </div>
   )
 }

@@ -8,8 +8,10 @@ playwright — that stays deferred inside services/element_picker.py so a
 host without the local-only dependency installed still boots cleanly.
 """
 import asyncio
+import base64
 import json
 import logging
+import struct
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -152,19 +154,51 @@ async def ws_stream(websocket: WebSocket):
         await websocket.close(code=1003)
         return
 
+    # Client tells us its actual panel size + devicePixelRatio so the
+    # screencast is captured at the real pixel resolution it'll be shown
+    # at — a fixed 1400x900 request stretched across a bigger, high-DPI
+    # panel is what produced the "blurry" complaint. Values are re-clamped
+    # server-side in start_screencast regardless of what's sent here.
     try:
-        await asyncio.to_thread(picker_service.start_screencast)
+        req_w = int(float(websocket.query_params.get("w", "1400")))
+        req_h = int(float(websocket.query_params.get("h", "900")))
+        req_dpr = float(websocket.query_params.get("dpr", "1"))
+    except (TypeError, ValueError):
+        req_w, req_h, req_dpr = 1400, 900, 1.0
+
+    try:
+        await asyncio.to_thread(
+            picker_service.start_screencast,
+            max_width=round(req_w * req_dpr),
+            max_height=round(req_h * req_dpr),
+            quality=85,
+        )
     except ElementPickerError as e:
         await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
         await websocket.close(code=1011)
         return
 
     async def _frame_sender():
+        # Binary framing instead of JSON+base64 text: CDP already hands us
+        # base64 JPEG bytes, so round-tripping that through JSON.stringify
+        # (another text-escaping pass) then having the browser JSON.parse +
+        # decode base64 again was two redundant encode/decode passes on
+        # every single frame — a real, measurable chunk of the reported
+        # slowness. Wire format: [4-byte big-endian metadata length][UTF-8
+        # JSON metadata][raw JPEG bytes]. Client reads it with a DataView
+        # and decodes the JPEG via createImageBitmap — no base64 involved
+        # at all after this point.
         while True:
             frame = await asyncio.to_thread(picker_service.get_next_frame, 1.0)
             if frame is None:
                 continue  # timeout — just poll again, keeps the loop cancellable
-            await websocket.send_text(json.dumps({"type": "frame", **frame}))
+            try:
+                jpeg_bytes = base64.b64decode(frame.get("data") or "")
+            except Exception:
+                continue
+            meta_bytes = json.dumps(frame.get("metadata") or {}).encode("utf-8")
+            header = struct.pack(">I", len(meta_bytes))
+            await websocket.send_bytes(header + meta_bytes + jpeg_bytes)
 
     async def _control_receiver():
         while True:

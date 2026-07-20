@@ -621,8 +621,19 @@ export const api = {
     /** WS URL for the live-view screencast (see routers/element_picker.py
      *  ws/stream). Carries the JWT as `?token=` — same convention as the
      *  chat WS transport, since the HTTP auth middleware doesn't run for
-     *  WebSocket scopes. */
-    wsStreamUrl: () => wsUrl('/element-picker/ws/stream'),
+     *  WebSocket scopes. `w`/`h`/`dpr` tell the backend the panel's real
+     *  pixel size so the screencast is captured sharp on HiDPI screens
+     *  instead of a fixed low-res frame stretched to fill a bigger box. */
+    wsStreamUrl: (opts?: { w?: number; h?: number; dpr?: number }) => {
+      const base = wsUrl('/element-picker/ws/stream')
+      if (!opts) return base
+      const qp = new URLSearchParams()
+      if (opts.w) qp.set('w', String(Math.round(opts.w)))
+      if (opts.h) qp.set('h', String(Math.round(opts.h)))
+      if (opts.dpr) qp.set('dpr', String(opts.dpr))
+      const extra = qp.toString()
+      return extra ? `${base}&${extra}` : base
+    },
   },
 
   context: {

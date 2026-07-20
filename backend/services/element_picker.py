@@ -285,7 +285,18 @@ class _PickerState:
     # send the next frame until we ack the current one via
     # `Page.screencastFrameAck`, so a slow consumer naturally throttles the
     # frame rate instead of the browser flooding us.
-    def start_screencast(self) -> None:
+    def start_screencast(self, max_width: int = 1400, max_height: int = 900, quality: int = 85) -> None:
+        # Resolution/quality are caller-supplied (see routers/element_picker.py
+        # ws_stream, which sizes these from the client's actual panel size ×
+        # devicePixelRatio) so a Retina/HiDPI screen gets a genuinely sharp
+        # frame instead of a fixed 1400×900 JPEG stretched to fill a much
+        # larger CSS box — that upscaling was the exact cause of the
+        # "blurry" complaint. Clamped server-side regardless of what the
+        # client sends, so a bad value can never request an unreasonably
+        # large/slow encode.
+        max_width = max(320, min(int(max_width), 2400))
+        max_height = max(240, min(int(max_height), 1600))
+        quality = max(40, min(int(quality), 95))
         with self._screencast_lock:
             if self._cdp_session is not None:
                 return  # already streaming — idempotent
@@ -325,14 +336,14 @@ class _PickerState:
                     "Page.startScreencast",
                     {
                         "format": "jpeg",
-                        "quality": 70,
-                        "maxWidth": 1400,
-                        "maxHeight": 900,
+                        "quality": quality,
+                        "maxWidth": max_width,
+                        "maxHeight": max_height,
                         "everyNthFrame": 1,
                     },
                 )
                 self._cdp_session = session
-                _dlog("screencast_started")
+                _dlog("screencast_started", max_width=max_width, max_height=max_height, quality=quality)
             except Exception as e:
                 _dlog("screencast_start_failed", error=str(e))
                 raise ElementPickerError(f"Could not start live view: {e}") from e
@@ -644,8 +655,8 @@ def status() -> dict:
     return _run_on_pw_thread(_state.status)
 
 
-def start_screencast() -> None:
-    _run_on_pw_thread(_state.start_screencast)
+def start_screencast(max_width: int = 1400, max_height: int = 900, quality: int = 85) -> None:
+    _run_on_pw_thread(_state.start_screencast, max_width=max_width, max_height=max_height, quality=quality)
 
 
 def stop_screencast() -> None:

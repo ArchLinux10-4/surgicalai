@@ -2,7 +2,6 @@ import React, { useEffect } from 'react'
 import { Layout } from './components/Layout'
 import { MobileLayout } from './components/mobile/MobileLayout'
 import { SettingsModal } from './components/SettingsModal'
-import { ElementPickerModal } from './components/ElementPickerModal'
 import { Toaster } from './components/Toast'
 import { useAppStore } from './stores/appStore'
 import { useAuthStore } from './stores/authStore'
@@ -72,7 +71,6 @@ export default function App() {
       {/* Mobile and desktop routes are fully isolated — no shared component tree */}
       {isMobile ? <MobileLayout /> : <Layout />}
       <SettingsModal />
-      <ElementPickerModal />
       <Toaster />
     </div>
   )
