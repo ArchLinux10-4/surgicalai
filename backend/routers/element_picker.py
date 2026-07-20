@@ -12,6 +12,8 @@ import base64
 import json
 import logging
 import struct
+import threading
+import time
 
 from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
@@ -188,17 +190,142 @@ async def ws_stream(websocket: WebSocket):
         # JSON metadata][raw JPEG bytes]. Client reads it with a DataView
         # and decodes the JPEG via createImageBitmap — no base64 involved
         # at all after this point.
-        while True:
-            frame = await asyncio.to_thread(picker_service.get_next_frame, 1.0)
-            if frame is None:
-                continue  # timeout — just poll again, keeps the loop cancellable
-            try:
-                jpeg_bytes = base64.b64decode(frame.get("data") or "")
-            except Exception:
-                continue
-            meta_bytes = json.dumps(frame.get("metadata") or {}).encode("utf-8")
-            header = struct.pack(">I", len(meta_bytes))
-            await websocket.send_bytes(header + meta_bytes + jpeg_bytes)
+        #
+        # Frame pump: one dedicated background thread blocks on
+        # get_next_frame() and hands frames to this coroutine via an
+        # asyncio.Queue, instead of the previous `await
+        # asyncio.to_thread(get_next_frame, ...)` called fresh for every
+        # single frame. The old approach paid threadpool task-scheduling
+        # overhead once per frame (i.e. at full frame rate) for no benefit —
+        # get_next_frame is a plain blocking queue.get, so one long-lived
+        # thread is strictly cheaper than one short-lived executor hop per
+        # frame.
+        loop = asyncio.get_event_loop()
+        out_queue: "asyncio.Queue[dict]" = asyncio.Queue(maxsize=2)
+        stop_event = threading.Event()
+
+        def _pump():
+            while not stop_event.is_set():
+                frame = picker_service.get_next_frame(1.0)
+                if frame is None:
+                    continue  # timeout — just poll again, keeps the loop cancellable
+                def _enqueue(f=frame):
+                    if out_queue.full():
+                        try:
+                            out_queue.get_nowait()  # drop oldest, never let stale frames pile up
+                        except asyncio.QueueEmpty:
+                            pass
+                    try:
+                        out_queue.put_nowait(f)
+                    except asyncio.QueueFull:
+                        pass
+                try:
+                    loop.call_soon_threadsafe(_enqueue)
+                except RuntimeError:
+                    break  # loop already closed (socket tearing down)
+
+        pump_thread = threading.Thread(target=_pump, daemon=True, name="element-picker-frame-pump")
+        pump_thread.start()
+
+        # Real timing data instead of guessing where "laggy" comes from:
+        # logs frame rate + average capture-to-wire latency every 5s while
+        # the panel is open, so the next reproduction gives concrete numbers.
+        frame_count = 0
+        latency_total = 0.0
+        window_start = time.monotonic()
+
+        try:
+            while True:
+                frame = await out_queue.get()
+                try:
+                    jpeg_bytes = base64.b64decode(frame.get("data") or "")
+                except Exception:
+                    continue
+                captured_at = frame.get("_captured_at")
+                if captured_at:
+                    latency_total += max(0.0, time.time() - captured_at)
+                    frame_count += 1
+                meta_bytes = json.dumps(frame.get("metadata") or {}).encode("utf-8")
+                header = struct.pack(">I", len(meta_bytes))
+                await websocket.send_bytes(header + meta_bytes + jpeg_bytes)
+
+                now = time.monotonic()
+                elapsed = now - window_start
+                if elapsed >= 5.0:
+                    if frame_count:
+                        picker_service._dlog(
+                            "screencast_perf",
+                            fps=round(frame_count / elapsed, 1),
+                            avg_capture_to_wire_ms=round((latency_total / frame_count) * 1000, 1),
+                            jpeg_bytes_last_frame=len(jpeg_bytes),
+                        )
+                    frame_count = 0
+                    latency_total = 0.0
+                    window_start = now
+        finally:
+            stop_event.set()
+            pump_thread.join(timeout=2)
+
+    # Continuous-event coalescing (mouseWheel / mouseMoved only) — the exact
+    # same "drop stale, keep latest" idea as the frame pipeline's
+    # drop-if-busy, just applied to the input direction instead of the
+    # output direction. Without this, a trackpad scroll gesture (which fires
+    # dozens of wheel events/sec) queues one `await asyncio.to_thread(...)`
+    # CDP round-trip per event, strictly in order — the receive loop can't
+    # even read the *next* queued message until the current one's Chrome
+    # round-trip finishes. A 2s scroll gesture then takes several real
+    # seconds to fully drain, so the page keeps visibly catching up to
+    # stale, already-superseded deltas long after the hand stops — this is
+    # the proven cause of the reported "1-2 seconds behind my mouse" lag.
+    # Fix: while a wheel/move dispatch is in flight, newer events of the
+    # same kind merge into a single pending slot (wheel deltas accumulate,
+    # x/y take the latest) instead of queuing individually. Discrete events
+    # (click/key/text/navigate) are untouched — already low-frequency and
+    # must stay strictly ordered.
+    _pending_continuous: dict[str, dict] = {}
+    _dispatching_continuous: set[str] = set()
+
+    async def _flush_continuous(kind: str):
+        try:
+            while True:
+                ev = _pending_continuous.pop(kind, None)
+                if ev is None:
+                    return
+                try:
+                    await asyncio.to_thread(
+                        picker_service.dispatch_mouse, kind,
+                        ev["x"], ev["y"], ev.get("button", "left"),
+                        ev.get("deltaX", 0.0), ev.get("deltaY", 0.0),
+                    )
+                except ElementPickerError as e:
+                    logger.info("[element_picker] ws control error: %s", e)
+                except Exception as e:
+                    logger.info("[element_picker] ws control unexpected error: %s", e)
+        finally:
+            _dispatching_continuous.discard(kind)
+
+    def _queue_continuous(kind: str, msg: dict):
+        x = float(msg.get("x", 0))
+        y = float(msg.get("y", 0))
+        existing = _pending_continuous.get(kind)
+        if kind == "mouseWheel" and existing is not None:
+            # Accumulate deltas so a burst of small scroll ticks still
+            # produces the correct total scroll distance, not just the
+            # latest tiny tick.
+            existing["x"] = x
+            existing["y"] = y
+            existing["deltaX"] = existing.get("deltaX", 0.0) + float(msg.get("deltaX", 0))
+            existing["deltaY"] = existing.get("deltaY", 0.0) + float(msg.get("deltaY", 0))
+        else:
+            _pending_continuous[kind] = {
+                "x": x, "y": y,
+                "button": msg.get("button", "left"),
+                "deltaX": float(msg.get("deltaX", 0)),
+                "deltaY": float(msg.get("deltaY", 0)),
+            }
+        if kind not in _dispatching_continuous:
+            _dispatching_continuous.add(kind)
+            asyncio.create_task(_flush_continuous(kind))
 
     async def _control_receiver():
         while True:
@@ -213,7 +340,9 @@ async def ws_stream(websocket: WebSocket):
             try:
                 if kind == "navigate":
                     await asyncio.to_thread(picker_service.navigate, msg.get("url", ""))
-                elif kind in ("mousePressed", "mouseReleased", "mouseMoved", "mouseWheel"):
+                elif kind in ("mouseMoved", "mouseWheel"):
+                    _queue_continuous(kind, msg)
+                elif kind in ("mousePressed", "mouseReleased"):
                     await asyncio.to_thread(
                         picker_service.dispatch_mouse, kind,
                         float(msg.get("x", 0)), float(msg.get("y", 0)),

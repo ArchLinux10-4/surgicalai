@@ -316,6 +316,10 @@ class _PickerState:
                     frame = {
                         "data": event.get("data", ""),
                         "metadata": event.get("metadata", {}),
+                        # Wall-clock capture time — lets the WS sender compute a
+                        # real capture-to-wire latency number instead of guessing
+                        # where time is going (encode vs. queue vs. network).
+                        "_captured_at": time.time(),
                     }
                     # Drop the oldest queued frame on overflow rather than
                     # blocking the CDP dispatch thread or growing unbounded.

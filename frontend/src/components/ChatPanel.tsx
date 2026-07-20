@@ -12,7 +12,7 @@ import { PickedElementsTray } from './PickedElementsTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
-import { AccountTree, Add, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Lock, Psychology, Security, Send, Warning } from '@mui/icons-material';
+import { AccountTree, Add, AdsClick, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Lock, Psychology, Security, Send, Warning } from '@mui/icons-material';
 import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
 
@@ -409,6 +409,7 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
 
   // ── User bubble (right-aligned) ──
   if (isUser) {
+    const { visibleText, elements: pickedCtx } = parsePickedElementsFromContent(msg.content || '')
     return (
       <div className="flex justify-end px-4 py-3 group">
         <div className="max-w-[78%]">
@@ -416,9 +417,12 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
             <span className="text-[10px] text-faint opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
             <span className="text-[11px] font-medium text-muted/70">You</span>
           </div>
-          <div className="bg-overlay/60 border border-border/40 rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm text-ink leading-relaxed whitespace-pre-wrap shadow-sm">
-            {msg.content}
-          </div>
+          {visibleText.trim() && (
+            <div className="bg-overlay/60 border border-border/40 rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm text-ink leading-relaxed whitespace-pre-wrap shadow-sm">
+              {visibleText}
+            </div>
+          )}
+          <PickedElementsInMessage elements={pickedCtx} />
         </div>
       </div>
     )
@@ -833,7 +837,18 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
 }
 
 /** Fold picked-element chips into the outgoing message text at send time
- *  only — the chips themselves never touch the textarea's visible value. */
+ *  only — the chips themselves never touch the textarea's visible value.
+ *
+ *  The appended context is still full text sent to the model (unchanged
+ *  behavior), but it's wrapped in an unambiguous marker pair so the chat
+ *  transcript can find it again — including after a page reload, since
+ *  parsing reads straight from the persisted `msg.content` string rather
+ *  than any client-only state. That lets the bubble show the same compact
+ *  pill the user saw in the composer instead of a wall of raw HTML,
+ *  with an explicit expand toggle to see the underlying snippet(s). */
+const PICKED_CTX_START = '\n\n<!--PICKED_ELEMENTS_CONTEXT-->\n'
+const PICKED_CTX_END = '\n<!--/PICKED_ELEMENTS_CONTEXT-->'
+
 function appendPickedElementsContext(text: string, elements: PickedElementRef[]): string {
   if (elements.length === 0) return text
   const blocks = elements.map((el, i) => {
@@ -847,7 +862,68 @@ function appendPickedElementsContext(text: string, elements: PickedElementRef[])
       el.text ? `Visible text: "${el.text.slice(0, 200)}"` : null,
     ].filter(Boolean).join('\n')
   })
-  return `${text}\n\n---\n${blocks.join('\n\n')}`
+  return `${text}${PICKED_CTX_START}${blocks.join('\n\n')}${PICKED_CTX_END}`
+}
+
+interface ParsedPickedElementCtx { tag: string; idLabel: string; text?: string; snippet: string }
+
+/** Splits a message's stored content back into the part the user actually
+ *  typed and the picked-element context blocks appended at send time.
+ *  Returns elements: [] (and the content untouched) for any message that
+ *  never had picked elements — including all pre-existing chat history. */
+function parsePickedElementsFromContent(content: string): { visibleText: string; elements: ParsedPickedElementCtx[] } {
+  const startIdx = content.indexOf(PICKED_CTX_START)
+  if (startIdx === -1) return { visibleText: content, elements: [] }
+  const endIdx = content.indexOf(PICKED_CTX_END, startIdx)
+  if (endIdx === -1) return { visibleText: content, elements: [] }
+  const visibleText = content.slice(0, startIdx)
+  const raw = content.slice(startIdx + PICKED_CTX_START.length, endIdx)
+  const elements = raw.split('\n\n').map((block) => {
+    const tagMatch = block.match(/^Element \d+(?: \(from [^)]*\))?: <([a-zA-Z0-9-]+)/)
+    const idMatch = block.match(/ id="([^"]*)"/)
+    const textMatch = block.match(/Visible text: "([^"]*)"/)
+    return {
+      tag: tagMatch?.[1] || 'div',
+      idLabel: idMatch ? `#${idMatch[1]}` : '',
+      text: textMatch?.[1],
+      snippet: block,
+    }
+  })
+  return { visibleText, elements }
+}
+
+/** Read-only version of the composer's picked-element pill, shown inside a
+ *  sent message. Stays exactly as compact as the composer chip by default;
+ *  clicking any pill expands a details panel with the full HTML snippet(s)
+ *  underneath, mirroring the existing compact-marker expand pattern. */
+function PickedElementsInMessage({ elements }: { elements: ParsedPickedElementCtx[] }) {
+  const [open, setOpen] = useState(false)
+  if (elements.length === 0) return null
+  return (
+    <div className="mt-1.5">
+      <div className="flex flex-wrap items-center gap-1.5 justify-end">
+        {elements.map((el, i) => (
+          <button
+            key={i}
+            onClick={() => setOpen((o) => !o)}
+            title={el.text ? `"${el.text.slice(0, 120)}"` : 'Click to view HTML'}
+            className="flex items-center gap-1.5 pl-2 pr-2 py-1 rounded-lg bg-accent/10 border border-accent/25 text-[11px] text-accent font-medium hover:bg-accent/15 transition-colors"
+          >
+            <AdsClick sx={{ fontSize: 13 }} className="shrink-0" />
+            <span className="font-mono">&lt;{el.tag}&gt;{el.idLabel}</span>
+          </button>
+        ))}
+        <span className="text-[10px] text-muted/50 cursor-pointer select-none" onClick={() => setOpen((o) => !o)}>
+          {open ? '▲ hide' : '▼ expand'}
+        </span>
+      </div>
+      {open && (
+        <div className="mt-2 max-w-full text-[11px] leading-relaxed bg-surface/40 border border-border/40 rounded-lg p-3 whitespace-pre-wrap text-fg/80 font-mono text-left">
+          {elements.map((e) => e.snippet).join('\n\n')}
+        </div>
+      )}
+    </div>
+  )
 }
 
 // ── Main Chat Panel ───────────────────────────────────────

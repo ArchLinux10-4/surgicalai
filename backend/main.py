@@ -186,6 +186,20 @@ if FRONTEND_DIST.exists():
 
     @app.get("/{full_path:path}")
     async def serve_frontend(full_path: str):
+        # Root-level build assets (otter.png, favicons, manifest.json, etc.)
+        # live at dist/<name>, not under dist/assets/ — only the latter is
+        # StaticFiles-mounted above. Without this check, every request for
+        # one of those files fell through to this catch-all and got back
+        # index.html's bytes instead (200 OK, wrong content — browsers then
+        # show a broken-image icon since it isn't valid image data). Serve
+        # the real file when it exists in the build output; only fall back
+        # to index.html for actual SPA client routes. `.resolve()` + parent
+        # check prevents a `../`-style full_path from escaping FRONTEND_DIST.
+        if full_path:
+            candidate = (FRONTEND_DIST / full_path).resolve()
+            dist_root = FRONTEND_DIST.resolve()
+            if candidate.is_file() and dist_root in candidate.parents:
+                return FileResponse(str(candidate))
         index = FRONTEND_DIST / "index.html"
         return FileResponse(str(index))
 

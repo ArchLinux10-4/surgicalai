@@ -32,6 +32,60 @@ echo -e "  Starting backend at ${BLUE}http://127.0.0.1:8000${NC}"
 
 cd "$BACKEND_DIR"
 source .venv/bin/activate
+
+# ── Full shutdown on Ctrl+C ──────────────────────────────────────────────────
+# Ctrl+C alone does NOT clean everything up:
+#  - The Element Picker's debug Chrome is launched with start_new_session=True
+#    (so it survives `uvicorn --reload` restarts), which detaches it from this
+#    script's process group. SIGINT never reaches it on its own.
+#  - Ollama (offline mode) is started independently by install.sh (nohup, or a
+#    systemd service on Linux) and isn't part of this script's process tree at
+#    all.
+# This trap stops the backend, the picker's debug Chrome, and Ollama so
+# nothing is left running after Ctrl+C.
+PICKER_PROFILE_DIR="$HOME/.surgicalai/picker-chrome-profile"
+
+cleanup() {
+  trap - INT TERM  # avoid re-entering cleanup if a second Ctrl+C arrives
+  echo ""
+  echo "Shutting down SurgicalAI (stopping all related processes)..."
+
+  # 1. Backend (and anything still bound to :8000 after a graceful TERM)
+  if [ -n "$BACKEND_PID" ] && kill -0 "$BACKEND_PID" 2>/dev/null; then
+    kill -TERM "$BACKEND_PID" 2>/dev/null
+  fi
+  sleep 0.3
+  if lsof -Pi :8000 -sTCP:LISTEN -t >/dev/null 2>&1; then
+    kill -9 $(lsof -Pi :8000 -sTCP:LISTEN -t) 2>/dev/null || true
+  fi
+
+  # 2. Element Picker debug Chrome — matched by its unique profile dir so we
+  #    never touch the user's real Chrome.
+  if pgrep -f -- "--user-data-dir=$PICKER_PROFILE_DIR" >/dev/null 2>&1; then
+    echo "  Stopping Element Picker debug Chrome..."
+    pkill -9 -f -- "--user-data-dir=$PICKER_PROFILE_DIR" 2>/dev/null || true
+  fi
+
+  # 3. Ollama (offline mode) — stop it too, even though install.sh started it
+  #    independently, so Ctrl+C leaves zero leftover processes.
+  #    Matched by exact process name (-x), not a free-text `pkill -f` pattern:
+  #    `-f` matches full command lines and can catch unrelated processes whose
+  #    argv merely contains the substring "ollama serve" (e.g. another
+  #    terminal running install.sh, or a log-tail command) — confirmed with a
+  #    live test where `pkill -f "ollama serve"` killed an unrelated process.
+  if command -v systemctl &>/dev/null && systemctl is-active --quiet ollama 2>/dev/null; then
+    echo "  Stopping Ollama (offline mode, systemd service)..."
+    sudo -n systemctl stop ollama 2>/dev/null || pkill -x ollama 2>/dev/null || true
+  elif pgrep -x ollama >/dev/null 2>&1; then
+    echo "  Stopping Ollama (offline mode)..."
+    pkill -x ollama 2>/dev/null || true
+  fi
+
+  echo "  ✅ All processes stopped."
+  exit 0
+}
+trap cleanup INT TERM
+
 uvicorn main:app --host 127.0.0.1 --port 8000 --reload &
 BACKEND_PID=$!
 
