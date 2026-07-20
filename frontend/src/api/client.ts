@@ -618,6 +618,14 @@ export const api = {
         { method: 'POST', body: JSON.stringify({ x, y }) }
       ),
     disconnect: () => request<{ connected: boolean }>('/element-picker/disconnect', { method: 'POST' }),
+    /** hard=true bypasses the browser cache (Ctrl/Cmd+Shift+R equivalent) —
+     *  the fix for frontend dev loops where a plain reload keeps showing
+     *  stale JS/CSS served with cache-friendly headers. */
+    reload: (hard: boolean) =>
+      request<{ connected: boolean; cdp_url: string | null; page_url: string | null }>('/element-picker/reload', {
+        method: 'POST',
+        body: JSON.stringify({ hard }),
+      }),
     /** WS URL for the live-view screencast (see routers/element_picker.py
      *  ws/stream). Carries the JWT as `?token=` — same convention as the
      *  chat WS transport, since the HTTP auth middleware doesn't run for

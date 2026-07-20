@@ -12,6 +12,24 @@ import { ImageStudio } from './ImageStudio'
 const SIDEBAR_MIN_PX = 264   // 44px rail + 220px panel — current default
 const SIDEBAR_MAX_PX = Math.round(SIDEBAR_MIN_PX * 1.4)  // +40% = ~370px
 
+// Chat panel width constants (used when a file or the Element Picker is
+// docked beside it) — same min/max-clamped drag convention as the sidebar
+// above, just on the opposite edge. Min keeps the composer/message bubbles
+// usable; max leaves at least ~30% of a typical 1280px window for the
+// docked pane so it's never squeezed to nothing.
+const CHAT_MIN_PX = 340
+const CHAT_MAX_PX = 900
+const CHAT_DEFAULT_PX = 460
+const CHAT_WIDTH_STORAGE_KEY = 'surgicalai:chatPanelWidth'
+
+function loadChatWidth(): number {
+  try {
+    const saved = Number(localStorage.getItem(CHAT_WIDTH_STORAGE_KEY))
+    if (Number.isFinite(saved) && saved >= CHAT_MIN_PX && saved <= CHAT_MAX_PX) return saved
+  } catch { /* localStorage unavailable — fall back to default */ }
+  return CHAT_DEFAULT_PX
+}
+
 export function Layout() {
   const activeFile = useAppStore(s => s.activeFile)
   const sidebarPinned = useAppStore(s => s.sidebarPinned)
@@ -49,6 +67,39 @@ export function Layout() {
     window.addEventListener('mousemove', onMove)
     window.addEventListener('mouseup', onUp)
   }, [sidebarWidth])
+
+  // Chat panel resize — same grab-and-drag convention as the sidebar handle
+  // above, mirrored onto the chat/docked-pane boundary. One width value
+  // drives both the CodePanel split and the Element Picker split since only
+  // one of those two ever occupies the third-pane slot at a time.
+  const [chatWidth, setChatWidth] = useState(loadChatWidth)
+  const chatWidthRef    = useRef(chatWidth)
+  const chatDragStartX  = useRef<number>(0)
+  const chatDragStartW  = useRef<number>(chatWidth)
+  const isChatDragging  = useRef(false)
+  chatWidthRef.current = chatWidth
+
+  const onChatDragStart = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    isChatDragging.current  = true
+    chatDragStartX.current  = e.clientX
+    chatDragStartW.current  = chatWidthRef.current
+
+    const onMove = (ev: MouseEvent) => {
+      if (!isChatDragging.current) return
+      const delta = ev.clientX - chatDragStartX.current
+      const next  = Math.min(CHAT_MAX_PX, Math.max(CHAT_MIN_PX, chatDragStartW.current + delta))
+      setChatWidth(next)
+    }
+    const onUp = () => {
+      isChatDragging.current = false
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      try { localStorage.setItem(CHAT_WIDTH_STORAGE_KEY, String(chatWidthRef.current)) } catch { /* best-effort */ }
+    }
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }, [])
 
   if (!isAuthenticated) {
     return <LoginPage />
@@ -90,14 +141,42 @@ export function Layout() {
         )}
       </aside>
 
-      {/* Chat — expands to fill all space when no file/picker pane is docked */}
-      <section className={`flex flex-col bg-base overflow-hidden transition-all duration-200 ${
-        (activeFile || elementPickerOpen)
-          ? 'w-[460px] flex-shrink-0 border-r border-border'
-          : 'flex-1'
-      }`}>
+      {/* Chat — expands to fill all space when no file/picker pane is docked.
+          Width comes from the drag-resizable `chatWidth` state (not a fixed
+          Tailwind width) whenever a third pane is docked, same idea as the
+          sidebar's own resizable width above; the `transition-all` is
+          suppressed mid-drag (via the dragging check below is unnecessary
+          here since width is only set on mouseup-free `next` per move —
+          keeping the transition off during active drags avoids the resize
+          feeling laggy/rubber-banded behind the mouse). */}
+      <section
+        className={`flex flex-col bg-base overflow-hidden ${
+          (activeFile || elementPickerOpen)
+            ? 'flex-shrink-0 border-r border-border'
+            : 'flex-1 transition-all duration-200'
+        }`}
+        style={(activeFile || elementPickerOpen) ? { width: chatWidth } : undefined}
+      >
         <ChatPanel />
       </section>
+
+      {/* Drag handle — boundary between chat and whichever third pane is
+          docked (CodePanel or Element Picker). Same visual language as the
+          sidebar's own handle for consistency. */}
+      {(activeFile || elementPickerOpen) && (
+        <div
+          onMouseDown={onChatDragStart}
+          className="w-1 flex-shrink-0 cursor-col-resize z-10 relative
+            hover:bg-accent/40 active:bg-accent/60 transition-colors group"
+          title="Drag to resize chat panel"
+        >
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex flex-col gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+            {[0, 1, 2].map(i => (
+              <div key={i} className="w-0.5 h-1 bg-muted/60 rounded-full" />
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Third pane — Element Picker takes priority over an open code file
           (one main view beside chat at a time, not a stacked fourth column) */}

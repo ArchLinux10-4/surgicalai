@@ -391,6 +391,34 @@ class _PickerState:
             _dlog("navigate_ok", url=url)
             return self._status_locked()
 
+    def reload(self, hard: bool = False) -> dict:
+        """Reload the live page. `hard=True` bypasses the browser cache
+        (the CDP equivalent of Ctrl/Cmd+Shift+R) — needed for frontend dev
+        loops where the page under test is served with cache-friendly
+        headers and a plain reload would keep showing stale JS/CSS. Uses
+        the same CDP session the screencast already holds (Playwright's
+        sync `Page.reload()` has no cache-bypass option), so this only
+        works while live view is active — same precondition as every other
+        `dispatch_*`/session-based call in this class."""
+        with self.lock:
+            if self._page is None:
+                raise ElementPickerError("Not connected. Call connect first.")
+            with self._screencast_lock:
+                session = self._cdp_session
+            if session is None:
+                raise ElementPickerError("Live view is not active — cannot reload.")
+            try:
+                # Page.enable is idempotent (safe to call repeatedly) and
+                # ensures the reload command is honored even if this CDP
+                # session hasn't had the Page domain explicitly enabled yet.
+                session.send("Page.enable")
+                session.send("Page.reload", {"ignoreCache": bool(hard)})
+            except Exception as e:
+                _dlog("reload_failed", hard=hard, error=str(e))
+                raise ElementPickerError(f"Could not reload page: {e}") from e
+            _dlog("reload_ok", hard=hard)
+            return self._status_locked()
+
     def dispatch_mouse(self, kind: str, x: float, y: float, button: str = "left",
                         delta_x: float = 0.0, delta_y: float = 0.0) -> None:
         """Relay a real mouse event (move/down/up/wheel) into the live page —
@@ -677,6 +705,10 @@ def get_next_frame(timeout: float = 1.0) -> Optional[dict]:
 
 def navigate(url: str) -> dict:
     return _run_on_pw_thread(_state.navigate, url)
+
+
+def reload(hard: bool = False) -> dict:
+    return _run_on_pw_thread(_state.reload, hard=hard)
 
 
 def dispatch_mouse(kind: str, x: float, y: float, button: str = "left",

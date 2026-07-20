@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AdsClick, Close, Language, Launch, PanTool, RestartAlt } from '@mui/icons-material'
+import { AdsClick, Close, Language, Launch, PanTool, Refresh, RestartAlt } from '@mui/icons-material'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/appStore'
 import { toast } from '../lib/toast'
@@ -47,6 +47,7 @@ export function ElementPickerPanel() {
   const [launching, setLaunching] = useState(false)
   const [mode, setMode] = useState<'browse' | 'pick'>('browse')
   const [picking, setPicking] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
   const [liveError, setLiveError] = useState<string | null>(null)
   // True from the moment `connected` flips on until the very first frame is
   // painted — without this the user sees a blank gray box with zero
@@ -217,6 +218,28 @@ export function ElementPickerPanel() {
     wsRef.current.send(JSON.stringify({ type: 'navigate', url }))
   }
 
+  // Hard refresh — bypasses the browser cache, the exact gap that made
+  // iterating on frontend changes painful: without this the only way to
+  // force the live view to pick up a fresh build was disconnect + relaunch.
+  // Goes over the REST endpoint (not the WS control channel) since it's a
+  // one-off action, not a continuous input stream like mouse/keyboard.
+  const handleHardRefresh = useCallback(async () => {
+    if (!connected || refreshing) return
+    setRefreshing(true)
+    try {
+      await api.elementPicker.reload(true)
+    } catch (e: any) {
+      toast.error('Refresh failed', e.message ?? String(e))
+    } finally {
+      // The reload itself is fire-and-forget from the backend's point of
+      // view (CDP doesn't wait for it) — the screencast just starts
+      // showing the reloading/reloaded page on its own. This delay is
+      // purely so the spinner reads as "did something" instead of
+      // flashing for a single frame.
+      setTimeout(() => setRefreshing(false), 400)
+    }
+  }, [connected, refreshing])
+
   // Map a canvas click into real page coordinates using the frame's own
   // pixel buffer size vs. the original page's device size (screencast
   // frames are scaled down to maxWidth/maxHeight — see start_screencast).
@@ -274,6 +297,15 @@ export function ElementPickerPanel() {
   }
 
   const handleCanvasKeyDown = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
+    // Ctrl/Cmd+Shift+R while the live view is focused — same shortcut as a
+    // real browser's hard refresh, intercepted here (preventDefault) so it
+    // triggers OUR reload endpoint instead of hard-refreshing the surgicalai
+    // app itself, which is what would happen if this fell through.
+    if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'R' || e.key === 'r')) {
+      e.preventDefault()
+      handleHardRefresh()
+      return
+    }
     if (mode !== 'browse' || !wsRef.current) return
     const specialKeys: Record<string, string> = {
       Enter: 'Enter', Backspace: 'Backspace', Tab: 'Tab', Escape: 'Escape',
@@ -309,15 +341,40 @@ export function ElementPickerPanel() {
               />
             </div>
             <button
-              onClick={() => setMode(m => m === 'browse' ? 'pick' : 'browse')}
-              className={`flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-[11.5px] font-semibold transition-colors shrink-0 ${
-                mode === 'pick' ? 'bg-accent text-white' : 'bg-overlay text-muted hover:text-ink'
-              }`}
-              title={mode === 'pick' ? 'Click any element on the page to add it as a chip' : 'Switch to picking mode'}
+              onClick={handleHardRefresh}
+              disabled={refreshing}
+              className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-overlay text-muted text-[11px] font-semibold hover:text-ink transition-colors shrink-0 disabled:opacity-50"
+              title="Hard refresh — reload the page bypassing cache (⌘/Ctrl+Shift+R while focused on the page)"
             >
-              {mode === 'pick' ? <AdsClick sx={{ fontSize: 14 }} /> : <PanTool sx={{ fontSize: 14 }} />}
-              {mode === 'pick' ? (picking ? 'Picking…' : 'Click to pick') : 'Browse'}
+              <Refresh sx={{ fontSize: 14 }} className={refreshing ? 'animate-spin' : ''} />
             </button>
+            {/* Browse/Pick segmented control — both states always visible side
+                by side (not a single button whose label silently swaps), so
+                the current mode is unambiguous at a glance, matching how
+                Chrome DevTools' own inspect-toggle stays visually distinct
+                from the rest of its toolbar. */}
+            <div className="flex items-center gap-0.5 p-0.5 rounded-lg bg-overlay shrink-0" role="group" aria-label="Interaction mode">
+              <button
+                onClick={() => setMode('browse')}
+                aria-pressed={mode === 'browse'}
+                className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11.5px] font-semibold transition-colors ${
+                  mode === 'browse' ? 'bg-surface text-ink shadow-soft' : 'text-muted hover:text-ink'
+                }`}
+                title="Browse mode — clicks, scroll, and typing go to the real page"
+              >
+                <PanTool sx={{ fontSize: 13 }} /> Browse
+              </button>
+              <button
+                onClick={() => setMode('pick')}
+                aria-pressed={mode === 'pick'}
+                className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11.5px] font-semibold transition-colors ${
+                  mode === 'pick' ? 'bg-accent text-white' : 'text-muted hover:text-ink'
+                }`}
+                title="Pick mode — the next click adds that element as a chip instead of clicking through"
+              >
+                <AdsClick sx={{ fontSize: 13 }} /> {picking ? 'Picking…' : 'Pick'}
+              </button>
+            </div>
             <button
               onClick={handleDisconnect}
               className="flex items-center gap-1 px-2 py-1.5 rounded-lg bg-overlay text-muted text-[11px] font-semibold hover:bg-red-500/10 hover:text-red-500 transition-colors shrink-0"
@@ -375,14 +432,34 @@ export function ElementPickerPanel() {
                 </div>
               </div>
             )}
+            {/* Persistent mode badge — unlike the toolbar toggle above (which
+                you have to glance up and to the side to read), this sits
+                right on the page you're looking at, so which mode you're in
+                is never ambiguous mid-workflow. Deliberately always visible,
+                not just on hover, since the whole point is a mistake here
+                (clicking through a form vs. picking it) matters. */}
+            {!awaitingFirstFrame && !liveError && (
+              <div
+                className={`absolute top-2 left-2 z-10 flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold pointer-events-none transition-colors ${
+                  mode === 'pick'
+                    ? 'bg-accent text-white shadow-glow-accent'
+                    : 'bg-surface/90 text-muted border border-border'
+                }`}
+              >
+                {mode === 'pick' ? <AdsClick sx={{ fontSize: 13 }} /> : <PanTool sx={{ fontSize: 13 }} />}
+                {mode === 'pick' ? 'Pick mode — click an element' : 'Browse mode'}
+              </div>
+            )}
             <canvas
               ref={canvasRef}
               tabIndex={0}
               onClick={handleCanvasClick}
               onWheel={handleCanvasWheel}
               onKeyDown={handleCanvasKeyDown}
-              className={`max-w-full max-h-full outline-none ${mode === 'pick' ? 'cursor-crosshair' : 'cursor-default'} ${picking ? 'opacity-70' : ''}`}
-              style={{ boxShadow: '0 0 0 1px rgba(255,255,255,0.06)' }}
+              className={`max-w-full max-h-full outline-none transition-shadow duration-150 ${
+                mode === 'pick' ? 'ring-2 ring-accent shadow-glow-accent' : ''
+              } ${mode === 'pick' ? 'cursor-crosshair' : 'cursor-default'} ${picking ? 'opacity-70' : ''}`}
+              style={mode === 'pick' ? undefined : { boxShadow: '0 0 0 1px rgba(255,255,255,0.06)' }}
             />
           </>
         )}

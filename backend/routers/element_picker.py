@@ -49,6 +49,10 @@ class PickRequest(BaseModel):
     y: float
 
 
+class ReloadRequest(BaseModel):
+    hard: bool = False
+
+
 @router.get("/status")
 def get_status():
     if USE_POSTGRES:
@@ -94,6 +98,19 @@ def pick(body: PickRequest):
     _guard_local_only()
     try:
         return picker_service.pick(body.x, body.y)
+    except ElementPickerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/reload")
+def reload(body: ReloadRequest):
+    """Reload the live page — `hard=true` bypasses the browser cache (the
+    CDP equivalent of Ctrl/Cmd+Shift+R). Needed for frontend dev loops:
+    without this the user has no way to force the picker's live view to
+    pick up freshly-built JS/CSS short of disconnecting and reconnecting."""
+    _guard_local_only()
+    try:
+        return picker_service.reload(body.hard)
     except ElementPickerError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
