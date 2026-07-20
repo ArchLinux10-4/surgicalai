@@ -21,8 +21,15 @@ import base64
 import datetime as _dt
 import json
 import logging
+import os
+import platform
+import shutil
+import socket
+import subprocess
 import threading
+import time
 from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +44,7 @@ def _dlog(event: str, **kwargs):
         logger.info("[element_picker] %s", json.dumps(record, default=str))
         try:
             with open(_DLOG_PATH, "a") as f:
-                f.write(json.dumps(record, default=str) + "
-")
+                f.write(json.dumps(record, default=str) + "\n")
         except Exception:
             pass
     except Exception:
@@ -208,6 +214,128 @@ class _PickerState:
 # Single process-wide instance — one Chrome connection at a time, matching
 # the one-user-one-machine local-install usage model.
 _state = _PickerState()
+
+
+# ─── Launch — one-click Chrome start, no Terminal required ──────────────────
+#
+# UX problem this solves: connect() only *attaches* to an already-running
+# debug-mode Chrome. Asking a non-technical user to open a terminal and type
+# `chrome --remote-debugging-port=9222` is a support-ticket generator.
+#
+# Design: launch a SEPARATE Chrome window with its own dedicated profile
+# directory (~/.surgicalai/picker-chrome-profile), not the user's everyday
+# Chrome profile. This means:
+#   - The user's normal Chrome window is never touched, quit, or restarted —
+#     no risk of losing their open tabs/session.
+#   - The picker window starts logged out the first time (fresh profile),
+#     but the profile directory persists across launches, so any logins the
+#     user does inside the picker window are remembered next time.
+#   - Only supported/target platforms: Debian Linux and macOS (M1/Intel).
+#
+# If port is already open (e.g. power user already started Chrome with the
+# flag themselves), launch() is a no-op and the caller proceeds straight to
+# connect() — the manual/advanced path still works unchanged.
+
+_CHROME_MAC_PATHS = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+]
+_CHROME_LINUX_BINARY_NAMES = [
+    "google-chrome",
+    "google-chrome-stable",
+    "chromium",
+    "chromium-browser",
+]
+
+_PICKER_PROFILE_DIR = os.path.expanduser("~/.surgicalai/picker-chrome-profile")
+
+
+def _find_chrome_binary() -> Optional[str]:
+    system = platform.system()
+    if system == "Darwin":
+        for path in _CHROME_MAC_PATHS:
+            if os.path.exists(path):
+                return path
+        return None
+    if system == "Linux":
+        for name in _CHROME_LINUX_BINARY_NAMES:
+            path = shutil.which(name)
+            if path:
+                return path
+        return None
+    # Unsupported platform (target machines are Debian Linux + macOS only).
+    return None
+
+
+def _port_open(port: int, host: str = "localhost") -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _parse_port(cdp_url: str) -> int:
+    try:
+        parsed = urlparse(cdp_url)
+        return parsed.port or 9222
+    except Exception:
+        return 9222
+
+
+def launch(cdp_url: str = "http://localhost:9222") -> dict:
+    """Ensure a debug-mode Chrome is reachable at cdp_url's port, launching a
+    dedicated picker-profile Chrome window if nothing is listening yet.
+    Never touches the user's regular Chrome process."""
+    port = _parse_port(cdp_url)
+
+    if _port_open(port):
+        _dlog("launch_already_running", port=port)
+        return {"launched": False, "already_running": True}
+
+    binary = _find_chrome_binary()
+    if not binary:
+        _dlog("launch_no_chrome_found", platform=platform.system())
+        raise ElementPickerError(
+            "Could not find a Chrome installation to launch automatically. "
+            "Install Google Chrome, or start it yourself with "
+            f"`--remote-debugging-port={port}` and click Connect."
+        )
+
+    os.makedirs(_PICKER_PROFILE_DIR, exist_ok=True)
+    args = [
+        binary,
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={_PICKER_PROFILE_DIR}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--new-window",
+        "about:blank",
+    ]
+    try:
+        subprocess.Popen(
+            args,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        _dlog("launch_popen_failed", error=str(e), binary=binary)
+        raise ElementPickerError(f"Failed to launch Chrome: {e}") from e
+
+    # First launch of a fresh profile can take a couple seconds — poll
+    # instead of assuming it's instantly ready.
+    deadline = time.time() + 12
+    while time.time() < deadline:
+        if _port_open(port):
+            _dlog("launch_ready", port=port, binary=binary)
+            return {"launched": True, "already_running": False}
+        time.sleep(0.3)
+
+    _dlog("launch_timeout", port=port, binary=binary)
+    raise ElementPickerError(
+        "Chrome was launched but didn't become reachable in time. "
+        "Try clicking Connect again in a moment."
+    )
 
 
 def connect(cdp_url: str) -> dict:

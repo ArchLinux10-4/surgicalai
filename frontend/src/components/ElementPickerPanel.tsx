@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
-import { AdsClick, Link as LinkIcon, RestartAlt, Send } from '@mui/icons-material'
+import { AdsClick, ExpandMore, Launch, Link as LinkIcon, RestartAlt, Send } from '@mui/icons-material'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/appStore'
 import { toast } from '../lib/toast'
@@ -38,6 +38,8 @@ export function ElementPickerPanel() {
   const [loadingShot, setLoadingShot] = useState(false)
   const [picked, setPicked] = useState<PickedElement | null>(null)
   const [picking, setPicking] = useState(false)
+  const [launching, setLaunching] = useState(false)
+  const [showAdvanced, setShowAdvanced] = useState(false)
   const imgRef = useRef<HTMLImageElement>(null)
 
   // Pick up any pre-existing connection (e.g. panel re-opened after a tab switch).
@@ -78,6 +80,30 @@ export function ElementPickerPanel() {
       toast.error('Connect failed', e.message ?? String(e))
     } finally {
       setConnecting(false)
+    }
+  }
+
+  /** One-click path for everyday users: opens a dedicated picker Chrome
+   *  window (own profile, your regular Chrome is untouched) and connects
+   *  automatically — no terminal, no flags to type. */
+  const handleLaunchAndConnect = async () => {
+    setLaunching(true)
+    try {
+      const launchRes = await api.elementPicker.launch(cdpUrl)
+      if (launchRes.launched) {
+        toast.success('Picker browser opened', 'A separate Chrome window just opened for picking — your regular Chrome is untouched.')
+      }
+      const res = await api.elementPicker.connect(cdpUrl)
+      setConnected(res.connected)
+      setPageUrl(res.page_url ?? null)
+      if (res.connected) {
+        toast.success('Connected', res.page_url ? `Attached to ${res.page_url}` : 'Attached to Chrome')
+        await refreshScreenshot()
+      }
+    } catch (e: any) {
+      toast.error('Could not open picker browser', e.message ?? String(e))
+    } finally {
+      setLaunching(false)
     }
   }
 
@@ -153,34 +179,56 @@ export function ElementPickerPanel() {
             <div>
               <p className="text-[13px] font-semibold text-muted">Pick an element from a live page</p>
               <p className="text-[11px] text-faint mt-1 leading-relaxed max-w-[220px]">
-                Start Chrome with remote debugging on, then connect below —
-                point at any element and describe your change without
-                copy-pasting HTML by hand.
+                Opens a separate picker browser window — point at any element
+                and describe your change without copy-pasting HTML by hand.
               </p>
             </div>
           </div>
-          <label className="block text-[11px] font-semibold text-muted mb-1">CDP URL</label>
-          <div className="flex gap-1.5">
-            <input
-              value={cdpUrl}
-              onChange={e => setCdpUrl(e.target.value)}
-              placeholder="http://localhost:9222"
-              className="flex-1 px-2 py-1.5 rounded-lg bg-overlay text-ink text-[12px] border border-border focus:outline-none focus:ring-1 focus:ring-accent"
-            />
-            <button
-              onClick={handleConnect}
-              disabled={connecting || !cdpUrl}
-              className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-accent text-white text-[12px] font-semibold hover:bg-accent/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <LinkIcon sx={{ fontSize: 13 }} /> {connecting ? 'Connecting…' : 'Connect'}
-            </button>
-          </div>
-          <p className="text-[10px] text-faint mt-3 leading-relaxed">
-            Launch Chrome once with, e.g.:<br />
-            <code className="text-[10px] bg-overlay px-1 py-0.5 rounded">
-              chrome --remote-debugging-port=9222
-            </code>
+
+          <button
+            onClick={handleLaunchAndConnect}
+            disabled={launching || connecting}
+            className="w-full flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-accent text-white text-[12.5px] font-semibold hover:bg-accent/90 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >
+            <Launch sx={{ fontSize: 15 }} /> {launching ? 'Opening picker browser…' : 'Open Picker Browser'}
+          </button>
+          <p className="text-[10px] text-faint mt-2 text-center leading-relaxed">
+            Your regular Chrome window stays exactly as it is.
           </p>
+
+          <button
+            onClick={() => setShowAdvanced(v => !v)}
+            className="w-full flex items-center justify-center gap-1 mt-4 py-1 text-[10.5px] font-semibold text-faint hover:text-muted transition-colors"
+          >
+            <ExpandMore sx={{ fontSize: 14, transform: showAdvanced ? 'rotate(180deg)' : 'none', transition: 'transform 0.15s' }} />
+            Advanced: connect to Chrome manually
+          </button>
+          {showAdvanced && (
+            <div className="mt-2 pt-3 border-t border-border">
+              <label className="block text-[11px] font-semibold text-muted mb-1">CDP URL</label>
+              <div className="flex gap-1.5">
+                <input
+                  value={cdpUrl}
+                  onChange={e => setCdpUrl(e.target.value)}
+                  placeholder="http://localhost:9222"
+                  className="flex-1 px-2 py-1.5 rounded-lg bg-overlay text-ink text-[12px] border border-border focus:outline-none focus:ring-1 focus:ring-accent"
+                />
+                <button
+                  onClick={handleConnect}
+                  disabled={connecting || !cdpUrl}
+                  className="flex items-center gap-1 px-3 py-1.5 rounded-lg bg-overlay text-muted text-[12px] font-semibold hover:bg-accent/10 hover:text-accent transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  <LinkIcon sx={{ fontSize: 13 }} /> {connecting ? 'Connecting…' : 'Connect'}
+                </button>
+              </div>
+              <p className="text-[10px] text-faint mt-2 leading-relaxed">
+                For a Chrome you already have running with remote debugging on:<br />
+                <code className="text-[10px] bg-overlay px-1 py-0.5 rounded">
+                  chrome --remote-debugging-port=9222
+                </code>
+              </p>
+            </div>
+          )}
         </div>
       ) : (
         <div className="flex-1 overflow-y-auto p-3 flex flex-col gap-3">

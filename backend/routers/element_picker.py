@@ -30,6 +30,10 @@ class ConnectRequest(BaseModel):
     cdp_url: str = "http://localhost:9222"
 
 
+class LaunchRequest(BaseModel):
+    cdp_url: str = "http://localhost:9222"
+
+
 class PickRequest(BaseModel):
     x: float
     y: float
@@ -40,6 +44,20 @@ def get_status():
     if USE_POSTGRES:
         return {"available": False, "connected": False}
     return {"available": True, **picker_service.status()}
+
+
+@router.post("/launch")
+def launch(body: LaunchRequest):
+    """One-click Chrome start for non-technical users — launches a dedicated
+    picker-profile Chrome window with the debug port open (or no-ops if a
+    debug-mode Chrome is already listening on that port). Never touches the
+    user's everyday Chrome window/profile. See services/element_picker.py
+    for the full rationale."""
+    _guard_local_only()
+    try:
+        return picker_service.launch(body.cdp_url)
+    except ElementPickerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @router.post("/connect")

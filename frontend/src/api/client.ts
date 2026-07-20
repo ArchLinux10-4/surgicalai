@@ -598,6 +598,14 @@ export const api = {
   // Chrome via CDP (playwright connectOverCDP), never launches/downloads one.
   elementPicker: {
     status: () => request<{ available: boolean; connected: boolean; cdp_url?: string | null; page_url?: string | null }>('/element-picker/status'),
+    /** One-click launch: starts a dedicated picker-profile Chrome window with
+     *  the debug port open (no-ops if one is already listening). Never
+     *  touches the user's everyday Chrome window/profile. */
+    launch: (cdpUrl: string) =>
+      request<{ launched: boolean; already_running: boolean }>('/element-picker/launch', {
+        method: 'POST',
+        body: JSON.stringify({ cdp_url: cdpUrl }),
+      }),
     connect: (cdpUrl: string) =>
       request<{ connected: boolean; cdp_url: string | null; page_url: string | null }>('/element-picker/connect', {
         method: 'POST',
