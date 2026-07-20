@@ -618,6 +618,11 @@ export const api = {
         { method: 'POST', body: JSON.stringify({ x, y }) }
       ),
     disconnect: () => request<{ connected: boolean }>('/element-picker/disconnect', { method: 'POST' }),
+    /** WS URL for the live-view screencast (see routers/element_picker.py
+     *  ws/stream). Carries the JWT as `?token=` — same convention as the
+     *  chat WS transport, since the HTTP auth middleware doesn't run for
+     *  WebSocket scopes. */
+    wsStreamUrl: () => wsUrl('/element-picker/ws/stream'),
   },
 
   context: {

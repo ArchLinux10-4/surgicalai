@@ -23,6 +23,7 @@ import json
 import logging
 import os
 import platform
+import queue
 import shutil
 import socket
 import subprocess
@@ -64,6 +65,18 @@ class _PickerState:
         self._browser = None      # playwright Browser (CDP-attached)
         self._page = None         # playwright Page (active tab)
         self.cdp_url: Optional[str] = None
+        # Live-view screencast (see start_screencast/stop_screencast below).
+        # Guarded by its own lock — separate from the connect/disconnect lock
+        # above — because frame delivery must not block on a long-held
+        # `self.lock` the way pick()/screenshot() legitimately do.
+        self._cdp_session = None       # playwright CDPSession, when streaming
+        self._screencast_lock = threading.Lock()
+        # Bounded to 2: a screencast frame handler runs on Playwright's own
+        # dispatch thread, not ours. Keeping only the newest 1-2 frames (and
+        # dropping older ones on overflow) means a slow consumer never builds
+        # an unbounded backlog / memory leak — we always show the latest
+        # frame, never a queue of stale ones.
+        self._frame_queue: "queue.Queue[dict]" = queue.Queue(maxsize=2)
 
     @property
     def connected(self) -> bool:
@@ -170,8 +183,162 @@ class _PickerState:
             _dlog("pick_ok", x=x, y=y, tag=result.get("tag"))
             return result
 
+    # ── Live view — CDP screencast ───────────────────────────────────────
+    #
+    # Real technique (not a custom hack): Chrome DevTools Protocol's
+    # `Page.startScreencast` streams a continuous sequence of JPEG frames
+    # over the same CDP connection Playwright already holds. This is the
+    # exact mechanism Chrome's own remote-debugging inspector and hosted
+    # "live view" browser tools use — no extra software, no VNC, no
+    # extension. Backpressure is built into the protocol: Chrome will not
+    # send the next frame until we ack the current one via
+    # `Page.screencastFrameAck`, so a slow consumer naturally throttles the
+    # frame rate instead of the browser flooding us.
+    def start_screencast(self) -> None:
+        with self._screencast_lock:
+            if self._cdp_session is not None:
+                return  # already streaming — idempotent
+            if self._page is None:
+                raise ElementPickerError("Not connected. Call connect first.")
+            try:
+                session = self._page.context.new_cdp_session(self._page)
+
+                def _on_frame(event: dict):
+                    try:
+                        session.send(
+                            "Page.screencastFrameAck",
+                            {"sessionId": event["sessionId"]},
+                        )
+                    except Exception as ack_err:
+                        _dlog("screencast_ack_failed", error=str(ack_err))
+                    frame = {
+                        "data": event.get("data", ""),
+                        "metadata": event.get("metadata", {}),
+                    }
+                    # Drop the oldest queued frame on overflow rather than
+                    # blocking the CDP dispatch thread or growing unbounded.
+                    try:
+                        self._frame_queue.put_nowait(frame)
+                    except queue.Full:
+                        try:
+                            self._frame_queue.get_nowait()
+                        except queue.Empty:
+                            pass
+                        try:
+                            self._frame_queue.put_nowait(frame)
+                        except queue.Full:
+                            pass
+
+                session.on("Page.screencastFrame", _on_frame)
+                session.send(
+                    "Page.startScreencast",
+                    {
+                        "format": "jpeg",
+                        "quality": 70,
+                        "maxWidth": 1400,
+                        "maxHeight": 900,
+                        "everyNthFrame": 1,
+                    },
+                )
+                self._cdp_session = session
+                _dlog("screencast_started")
+            except Exception as e:
+                _dlog("screencast_start_failed", error=str(e))
+                raise ElementPickerError(f"Could not start live view: {e}") from e
+
+    def stop_screencast(self) -> None:
+        with self._screencast_lock:
+            if self._cdp_session is None:
+                return
+            try:
+                self._cdp_session.send("Page.stopScreencast")
+            except Exception as e:
+                _dlog("screencast_stop_error", error=str(e))
+            self._cdp_session = None
+            # Drain any queued frames so a later restart doesn't hand back
+            # a stale frame from the previous session.
+            try:
+                while True:
+                    self._frame_queue.get_nowait()
+            except queue.Empty:
+                pass
+            _dlog("screencast_stopped")
+
+    def get_next_frame(self, timeout: float = 1.0) -> Optional[dict]:
+        """Blocking pop from the frame queue — call via a worker thread from
+        async code (e.g. `asyncio.to_thread`), never directly on the event
+        loop. Returns None on timeout (caller should just poll again)."""
+        try:
+            return self._frame_queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def navigate(self, url: str) -> dict:
+        with self.lock:
+            if self._page is None:
+                raise ElementPickerError("Not connected. Call connect first.")
+            try:
+                self._page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            except Exception as e:
+                _dlog("navigate_failed", url=url, error=str(e))
+                raise ElementPickerError(f"Could not navigate to {url}: {e}") from e
+            _dlog("navigate_ok", url=url)
+            return self._status_locked()
+
+    def dispatch_mouse(self, kind: str, x: float, y: float, button: str = "left",
+                        delta_x: float = 0.0, delta_y: float = 0.0) -> None:
+        """Relay a real mouse event (move/down/up/wheel) into the live page —
+        used for Browse-mode scrolling/clicking, never for Pick mode (which
+        stays non-mutating via pick()/elementFromPoint)."""
+        with self._screencast_lock:
+            session = self._cdp_session
+        if session is None:
+            raise ElementPickerError("Live view is not active.")
+        try:
+            params = {"type": kind, "x": x, "y": y, "button": button, "clickCount": 1}
+            if kind == "mouseWheel":
+                params = {"type": "mouseWheel", "x": x, "y": y,
+                          "deltaX": delta_x, "deltaY": delta_y}
+            session.send("Input.dispatchMouseEvent", params)
+        except Exception as e:
+            _dlog("dispatch_mouse_failed", kind=kind, error=str(e))
+            raise ElementPickerError(f"Mouse event failed: {e}") from e
+
+    def dispatch_text(self, text: str) -> None:
+        """Relay real typed characters into the focused field on the live
+        page (e.g. typing into a search box while browsing to the target)."""
+        with self._screencast_lock:
+            session = self._cdp_session
+        if session is None:
+            raise ElementPickerError("Live view is not active.")
+        try:
+            session.send("Input.insertText", {"text": text})
+        except Exception as e:
+            _dlog("dispatch_text_failed", error=str(e))
+            raise ElementPickerError(f"Type event failed: {e}") from e
+
+    def dispatch_key(self, key: str, code: str) -> None:
+        """Relay a special key (Enter/Backspace/Tab/Arrow*) into the live
+        page — insertText alone can't express these."""
+        with self._screencast_lock:
+            session = self._cdp_session
+        if session is None:
+            raise ElementPickerError("Live view is not active.")
+        try:
+            session.send("Input.dispatchKeyEvent", {"type": "keyDown", "key": key, "code": code})
+            session.send("Input.dispatchKeyEvent", {"type": "keyUp", "key": key, "code": code})
+        except Exception as e:
+            _dlog("dispatch_key_failed", key=key, error=str(e))
+            raise ElementPickerError(f"Key event failed: {e}") from e
+
     def disconnect(self) -> dict:
         with self.lock:
+            # Stop any live-view streaming before tearing down the CDP
+            # connection it depends on.
+            try:
+                self.stop_screencast()
+            except Exception as e:
+                _dlog("disconnect_stop_screencast_error", error=str(e))
             if self._browser is not None:
                 try:
                     self._browser.close()
@@ -357,3 +524,32 @@ def disconnect() -> dict:
 
 def status() -> dict:
     return _state.status()
+
+
+def start_screencast() -> None:
+    _state.start_screencast()
+
+
+def stop_screencast() -> None:
+    _state.stop_screencast()
+
+
+def get_next_frame(timeout: float = 1.0) -> Optional[dict]:
+    return _state.get_next_frame(timeout=timeout)
+
+
+def navigate(url: str) -> dict:
+    return _state.navigate(url)
+
+
+def dispatch_mouse(kind: str, x: float, y: float, button: str = "left",
+                    delta_x: float = 0.0, delta_y: float = 0.0) -> None:
+    _state.dispatch_mouse(kind, x, y, button=button, delta_x=delta_x, delta_y=delta_y)
+
+
+def dispatch_text(text: str) -> None:
+    _state.dispatch_text(text)
+
+
+def dispatch_key(key: str, code: str) -> None:
+    _state.dispatch_key(key, code)

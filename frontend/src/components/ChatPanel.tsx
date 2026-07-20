@@ -1,13 +1,14 @@
 import React, { useState, useRef, useEffect, useCallback, Component } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { useAppStore } from '../stores/appStore'
+import { useAppStore, type PickedElementRef } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import { InlineDiffCard } from './InlineDiffCard'
 import { NewFileCard } from './NewFileCard'
 import { MarkdownCode } from './CodeBlock'
 import { SessionFilesTray } from './SessionFilesTray'
+import { PickedElementsTray } from './PickedElementsTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
@@ -831,6 +832,24 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
   )
 }
 
+/** Fold picked-element chips into the outgoing message text at send time
+ *  only — the chips themselves never touch the textarea's visible value. */
+function appendPickedElementsContext(text: string, elements: PickedElementRef[]): string {
+  if (elements.length === 0) return text
+  const blocks = elements.map((el, i) => {
+    const snippet = el.outerHTML.length > 800 ? el.outerHTML.slice(0, 800) + '…' : el.outerHTML
+    const label = el.elId ? ` id="${el.elId}"` : ''
+    return [
+      `Element ${i + 1}${el.pageUrl ? ` (from ${el.pageUrl})` : ''}: <${el.tag}${label}>`,
+      '```html',
+      snippet,
+      '```',
+      el.text ? `Visible text: "${el.text.slice(0, 200)}"` : null,
+    ].filter(Boolean).join('\n')
+  })
+  return `${text}\n\n---\n${blocks.join('\n\n')}`
+}
+
 // ── Main Chat Panel ───────────────────────────────────────
 export function ChatPanel() {
   const {
@@ -841,6 +860,7 @@ export function ChatPanel() {
     sessionFiles, setSessionFiles, addSessionFile, removeSessionFile,
     agentTasks, setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble, setAgentPhase,
     pendingChatInput, setPendingChatInput,
+    pickedElements, clearPickedElements,
   } = useAppStore()
 
   // Keep the agentic task list in sync with Claude's DB-backed progress while a
@@ -1844,9 +1864,14 @@ export function ChatPanel() {
       return
     }
     setError(null)
-    const text = input.trim()
+    // Picked-element chips are additive context shown above the composer —
+    // never part of the visible draft — so they're folded into the outgoing
+    // text only at send time, then cleared (mirrors how sessionFiles attach
+    // without living inside the textarea).
+    const text = appendPickedElementsContext(input.trim(), pickedElements)
     sentMessageRef.current = text
     setInput('')
+    if (pickedElements.length > 0) clearPickedElements()
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
     userScrolledUpRef.current = false  // snap to bottom on user's own send
 
@@ -2147,6 +2172,8 @@ export function ChatPanel() {
             <span className="text-[11px] text-muted/70 animate-pulse">Uploading...</span>
           </div>
         )}
+
+        <PickedElementsTray />
 
         {/* Prompt templates — quick-start chips */}
         {!isStreaming && (

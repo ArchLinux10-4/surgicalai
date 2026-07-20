@@ -7,12 +7,18 @@ unconditionally at import time. Importing this module never imports
 playwright — that stays deferred inside services/element_picker.py so a
 host without the local-only dependency installed still boots cleanly.
 """
-from fastapi import APIRouter, HTTPException
+import asyncio
+import json
+import logging
+
+from fastapi import APIRouter, HTTPException, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
 from database import USE_POSTGRES
 from services import element_picker as picker_service
 from services.element_picker import ElementPickerError
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -95,3 +101,119 @@ def disconnect():
         return picker_service.disconnect()
     except ElementPickerError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# ─── Live view — WebSocket screencast ───────────────────────────────────────
+#
+# Why WebSocket, not another poll-and-refresh REST call: `Page.startScreencast`
+# is a push stream (Chrome sends a new JPEG the instant the page repaints,
+# throttled by our frame-ack), so a persistent socket is the natural fit — the
+# same reasoning already applied to the chat streaming endpoints elsewhere in
+# this router package (see routers/chat.py's WS transport docstring).
+#
+# Auth: the HTTP `auth_middleware` in main.py does not run for WebSocket
+# scopes (Starlette limitation), so we re-authenticate here exactly the same
+# way routers/chat.py's `_ws_pump` does: `?token=` query param → decode_token.
+# This mirrors an existing, already-reviewed pattern rather than inventing a
+# new one.
+async def _authenticate_ws(websocket: WebSocket) -> bool:
+    from auth_utils import decode_token
+
+    token = websocket.query_params.get("token", "") or ""
+    try:
+        decode_token(token)
+        return True
+    except Exception:
+        return False
+
+
+@router.websocket("/ws/stream")
+async def ws_stream(websocket: WebSocket):
+    """Live view of the connected page. On open: authenticates, starts the
+    CDP screencast, then runs two concurrent loops for the life of the
+    socket — one forwarding frames to the client, one receiving control
+    messages (navigate / mouse / key / scroll) from the client and relaying
+    them into the real page. Disconnect always stops the screencast but
+    never closes the underlying CDP connection (browser stays attached)."""
+    if USE_POSTGRES:
+        # Hosted deploy — reject the handshake before accept(), same 404-style
+        # "doesn't exist here" contract as the HTTP endpoints above.
+        await websocket.close(code=1008)
+        return
+
+    if not await _authenticate_ws(websocket):
+        await websocket.close(code=1008)
+        return
+
+    await websocket.accept()
+
+    if not picker_service.status().get("connected"):
+        await websocket.send_text(json.dumps({"type": "error", "message": "Not connected to a browser."}))
+        await websocket.close(code=1003)
+        return
+
+    try:
+        await asyncio.to_thread(picker_service.start_screencast)
+    except ElementPickerError as e:
+        await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+        await websocket.close(code=1011)
+        return
+
+    async def _frame_sender():
+        while True:
+            frame = await asyncio.to_thread(picker_service.get_next_frame, 1.0)
+            if frame is None:
+                continue  # timeout — just poll again, keeps the loop cancellable
+            await websocket.send_text(json.dumps({"type": "frame", **frame}))
+
+    async def _control_receiver():
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                msg = json.loads(raw)
+            except Exception:
+                continue
+            if not isinstance(msg, dict):
+                continue
+            kind = msg.get("type")
+            try:
+                if kind == "navigate":
+                    await asyncio.to_thread(picker_service.navigate, msg.get("url", ""))
+                elif kind in ("mousePressed", "mouseReleased", "mouseMoved", "mouseWheel"):
+                    await asyncio.to_thread(
+                        picker_service.dispatch_mouse, kind,
+                        float(msg.get("x", 0)), float(msg.get("y", 0)),
+                        msg.get("button", "left"),
+                        float(msg.get("deltaX", 0)), float(msg.get("deltaY", 0)),
+                    )
+                elif kind == "text":
+                    await asyncio.to_thread(picker_service.dispatch_text, msg.get("text", ""))
+                elif kind == "key":
+                    await asyncio.to_thread(picker_service.dispatch_key, msg.get("key", ""), msg.get("code", ""))
+            except ElementPickerError as e:
+                logger.info("[element_picker] ws control error: %s", e)
+            except Exception as e:
+                logger.info("[element_picker] ws control unexpected error: %s", e)
+
+    sender_task = asyncio.create_task(_frame_sender())
+    receiver_task = asyncio.create_task(_control_receiver())
+    try:
+        await asyncio.wait([sender_task, receiver_task], return_when=asyncio.FIRST_COMPLETED)
+    except WebSocketDisconnect:
+        pass
+    finally:
+        for t in (sender_task, receiver_task):
+            t.cancel()
+        for t in (sender_task, receiver_task):
+            try:
+                await t
+            except BaseException:
+                pass
+        try:
+            await asyncio.to_thread(picker_service.stop_screencast)
+        except Exception:
+            pass
+        try:
+            await websocket.close()
+        except Exception:
+            pass

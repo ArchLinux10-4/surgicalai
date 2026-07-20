@@ -32,8 +32,8 @@ interface AppState {
   setSurgicalPanelOpen: (v: boolean) => void
 
   // UI
-  sidebarTab: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'railway' | 'element-picker'
-  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'railway' | 'element-picker') => void
+  sidebarTab: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'railway'
+  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'railway') => void
   sidebarPanelOpen: boolean
   setSidebarPanelOpen: (open: boolean) => void
   sidebarPinned: boolean
@@ -111,6 +111,27 @@ interface AppState {
   // Pending chat input — set from sidebar components (e.g. deploy watcher)
   pendingChatInput: string | null
   setPendingChatInput: (msg: string | null) => void
+
+  // Element Picker — full-screen live-view modal + picked-element chips.
+  // Chips are additive context above the composer (mirrors SessionFilesTray),
+  // never injected into the visible draft text — kept separate so the
+  // textarea itself needs zero changes (see PickedElementsTray.tsx).
+  elementPickerModalOpen: boolean
+  setElementPickerModalOpen: (open: boolean) => void
+  pickedElements: PickedElementRef[]
+  addPickedElement: (el: PickedElementRef) => void
+  removePickedElement: (id: string) => void
+  clearPickedElements: () => void
+}
+
+export interface PickedElementRef {
+  id: string
+  tag: string
+  elId: string | null
+  className: string | null
+  text: string
+  outerHTML: string
+  pageUrl: string | null
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -262,4 +283,15 @@ export const useAppStore = create<AppState>((set) => ({
 
   pendingChatInput: null,
   setPendingChatInput: (pendingChatInput) => set({ pendingChatInput }),
+
+  elementPickerModalOpen: false,
+  setElementPickerModalOpen: (elementPickerModalOpen) => set({ elementPickerModalOpen }),
+  pickedElements: [],
+  addPickedElement: (el) => set((s) => (
+    s.pickedElements.some(p => p.id === el.id)
+      ? s
+      : { pickedElements: [...s.pickedElements, el] }
+  )),
+  removePickedElement: (id) => set((s) => ({ pickedElements: s.pickedElements.filter(p => p.id !== id) })),
+  clearPickedElements: () => set({ pickedElements: [] }),
 }))
