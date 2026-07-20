@@ -19606,7 +19606,10 @@ async def run_natural_pipeline_stream(
                                           symbol=change_shells[idx]["symbol"].name,
                                           reason=(_flv_reason if not _flv_ok
                                                   else "match lies inside the target symbol — symbol splice should have handled it"),
-                                          old_code_preview=corrected_old[:200])
+                                          old_code_preview=corrected_old[:200],
+                                          file_level_fixed=_file_level_fixed,
+                                          note="Path 2b did not fix this — _file_level_fixed stays False, "
+                                               "so the no-accepted-correction path below will fire normally")
 
                         # ── Path 3: Full new_code replacement (fragment-checked) ──
                         # SKIP if windowed correction was used — the corrected_code
@@ -19651,7 +19654,7 @@ async def run_natural_pipeline_stream(
                                       fragment_reason=_frag_reason,
                                       sym_len=len(_sym_code), corrected_len=len(corrected_code))
 
-                        if accepted is None:
+                        if accepted is None and not _file_level_fixed:
                             _dlog("qa_retry_correction_not_accepted", session_id=session_id, user_id=user_id,
                                   retry_round=_qa_retry_round, idx=idx,
                                   symbol=change_shells[idx]["symbol"].name,
@@ -19663,6 +19666,18 @@ async def run_natural_pipeline_stream(
                                   had_fixes_array=isinstance(corrected_fixes, list),
                                   corrected_code_len=len(corrected_code) if corrected_code else 0,
                                   sym_code_len=len(_sym_code))
+                        elif accepted is None and _file_level_fixed:
+                            # Bug fix (session f10e5b33): symbol-level `accepted` stayed
+                            # None because Path 2b's fix lands via _extra_ops, not
+                            # `accepted` — but the file DID change. Without this branch
+                            # the log above would fire and falsely claim nothing happened.
+                            _dlog("qa_retry_correction_accepted_via_file_level_only",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=idx,
+                                  symbol=change_shells[idx]["symbol"].name,
+                                  note="symbol-level accepted is None but a file-level "
+                                       "companion edit (_extra_ops) was queued and will ship",
+                                  extra_ops_count=len(change_shells[idx].get("_extra_ops") or []))
                         elif accepted == change_shells[idx]["new_code"]:
                             _dlog("qa_retry_correction_not_accepted", session_id=session_id, user_id=user_id,
                                   retry_round=_qa_retry_round, idx=idx,
@@ -19680,7 +19695,10 @@ async def run_natural_pipeline_stream(
                                 _qa_d_for_hist.get("issues", [])[:3]
                             ) if _qa_d_for_hist.get("issues") else _qa_d_for_hist.get("verdict", "no details"),
                             "code_preview": (corrected_code or "")[:200],
-                            "accepted": accepted is not None and accepted != change_shells[idx]["new_code"],
+                            "accepted": (
+                                (accepted is not None and accepted != change_shells[idx]["new_code"])
+                                or _file_level_fixed
+                            ),
                         }
                         _correction_history.setdefault(idx, []).append(_hist_entry)
                         _dlog("correction_history_recorded",
@@ -19688,7 +19706,9 @@ async def run_natural_pipeline_stream(
                               retry_round=_qa_retry_round, idx=idx,
                               symbol=change_shells[idx]["symbol"].name,
                               total_attempts=len(_correction_history[idx]),
-                              accepted=_hist_entry["accepted"])
+                              accepted=_hist_entry["accepted"],
+                              file_level_fixed=_file_level_fixed,
+                              via_symbol_accepted=(accepted is not None and accepted != change_shells[idx]["new_code"]))
                         if accepted is not None and accepted != change_shells[idx]["new_code"]:
                             change_shells[idx]["new_code"] = accepted
                             # Keep target_element/replacement consistent with the new full
@@ -20427,6 +20447,7 @@ async def run_natural_pipeline_stream(
             for idx in fixed_indices:
                 if idx in _correction_history and _correction_history[idx]:
                     _latest = _correction_history[idx][-1]
+                    _accepted_before_reconcile = _latest.get("accepted")
                     _reqa_d = qa_results[idx] if idx < len(qa_results) else {}
                     _reqa_verdict = _reqa_d.get("verdict", "?")
                     _reqa_score = _reqa_d.get("qa_score", "?")
@@ -20438,7 +20459,9 @@ async def run_natural_pipeline_stream(
                           retry_round=_qa_retry_round, idx=idx,
                           symbol=change_shells[idx]["symbol"].name,
                           reqa_score=_reqa_score, reqa_verdict=_reqa_verdict,
-                          accepted=_latest["accepted"])
+                          accepted=_latest["accepted"],
+                          accepted_before_reconcile=_accepted_before_reconcile,
+                          flipped_by_reconcile=(_accepted_before_reconcile != _latest["accepted"]))
 
         # ── tsc compile check — final verification after all retries ──────────
         # Re-run tsc on the FINAL content of every change. Anything that still
