@@ -37,7 +37,8 @@ def _dlog(event: str, **kwargs):
         logger.info("[element_picker] %s", json.dumps(record, default=str))
         try:
             with open(_DLOG_PATH, "a") as f:
-                f.write(json.dumps(record, default=str) + "\n")
+                f.write(json.dumps(record, default=str) + "
+")
         except Exception:
             pass
     except Exception:
@@ -82,20 +83,35 @@ class _PickerState:
                     "only — run `pip install -r backend/requirements-local.txt`."
                 ) from e
 
+            pw = None
             try:
                 pw = sync_playwright().start()
                 browser = pw.chromium.connect_over_cdp(cdp_url)
                 contexts = browser.contexts
                 if not contexts or not contexts[0].pages:
-                    pw.stop()
                     raise ElementPickerError(
                         "Connected to Chrome, but no open tabs were found. "
                         "Open at least one tab in the target Chrome window."
                     )
                 page = contexts[0].pages[0]
-            except ElementPickerError:
-                raise
             except Exception as e:
+                # IMPORTANT: always stop the Playwright driver instance we
+                # just started on ANY failure path (bad tabs, connect_over_cdp
+                # raising on a bad URL/cert, etc). Leaving it running is what
+                # causes the *next* connect attempt to fail with "It looks
+                # like you are using Playwright Sync API inside the asyncio
+                # loop" — that error is Playwright's own guard against a
+                # second sync_playwright().start() while a prior one is
+                # still alive, not an asyncio/FastAPI issue. See
+                # https://github.com/microsoft/playwright-python/issues/462
+                if pw is not None:
+                    try:
+                        pw.stop()
+                    except Exception as stop_err:
+                        _dlog("connect_pw_stop_after_failure_error", error=str(stop_err))
+                if isinstance(e, ElementPickerError):
+                    _dlog("connect_failed_no_tabs", cdp_url=cdp_url)
+                    raise
                 _dlog("connect_failed", cdp_url=cdp_url, error=str(e))
                 raise ElementPickerError(
                     f"Could not connect to Chrome at {cdp_url}: {e}"
