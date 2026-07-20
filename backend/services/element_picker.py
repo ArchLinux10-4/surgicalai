@@ -105,7 +105,27 @@ class _PickerState:
             pw = None
             try:
                 pw = sync_playwright().start()
-                browser = pw.chromium.connect_over_cdp(cdp_url)
+                # `no_defaults=True` (Playwright >=1.60) tells Playwright not
+                # to issue its own overrides (Browser.setDownloadBehavior,
+                # focus emulation, media emulation) on the pre-existing
+                # default context when attaching over CDP. Without it, real
+                # Chrome (the user's daily-driver browser, not a Playwright-
+                # launched one) rejects Browser.setDownloadBehavior with
+                # "Browser context management is not supported" and the
+                # connection fails outright. This is exactly the documented
+                # use case for the flag: "attaching to a user's daily-driver
+                # browser where these overrides would interfere with
+                # existing browser state."
+                # https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp-option-no-defaults
+                try:
+                    browser = pw.chromium.connect_over_cdp(cdp_url, no_defaults=True)
+                except TypeError as te:
+                    # Older Playwright (<1.60) installed locally doesn't know
+                    # this kwarg yet. Fail soft: retry without it rather than
+                    # crashing connect() outright, and log so we can tell the
+                    # user to upgrade if they hit the CDP error downstream.
+                    _dlog("connect_no_defaults_unsupported_old_playwright", error=str(te))
+                    browser = pw.chromium.connect_over_cdp(cdp_url)
                 contexts = browser.contexts
                 if not contexts or not contexts[0].pages:
                     raise ElementPickerError(

@@ -7,4 +7,19 @@
 # user already has running — never downloads or launches its own Chromium
 # when used this way, so `playwright install` is not required for this
 # feature (only `pip install playwright`).
-playwright>=1.44
+#
+# Floor is 1.60, NOT 1.44: connect_over_cdp()'s `no_defaults` option — which
+# element_picker.py now always requests — was added in Playwright 1.60
+# (https://playwright.dev/python/docs/api/class-browsertype#browser-type-connect-over-cdp-option-no-defaults).
+# Without it, real Chrome (the user's actual daily-driver browser, not a
+# Playwright-launched one) rejects the CDP `Browser.setDownloadBehavior`
+# call Playwright issues by default, and connect() fails with:
+#   "Protocol error (Browser.setDownloadBehavior): Browser context
+#    management is not supported."
+# (Confirmed via official Playwright docs + microsoft/playwright issues
+# #15370, #30383, #41661 — same root cause reported against every non-
+# Playwright-launched CDP target.) element_picker.py also falls back
+# gracefully with a `_dlog` if an older Playwright is already installed,
+# but this pin is the actual fix — reinstall via
+# `pip install -r backend/requirements-local.txt` to pick it up.
+playwright>=1.60
