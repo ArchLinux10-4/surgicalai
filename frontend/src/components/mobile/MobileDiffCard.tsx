@@ -149,7 +149,15 @@ function FileCard({
       if (msg.includes("Couldn't find") || msg.includes("could not find") || msg.includes("exact code")) {
         const newApplied: Record<string, boolean> = {}
         for (const ch of changes) {
-          if (ch?.id) { saveApplied(sessionId, ch.id); newApplied[ch.id] = true }
+          if (ch?.id) {
+            saveApplied(sessionId, ch.id)
+            newApplied[ch.id] = true
+            // Persist to backend DB too — without this, any Apply All bar
+            // reading applied state from api.surgical.getApplied() never
+            // learns this change is done, even though this card now shows
+            // it as applied (same gap as desktop InlineDiffCard).
+            api.surgical.markApplied(sessionId, ch.id).catch(() => {})
+          }
         }
         setAppliedMap(prev => ({ ...prev, ...newApplied }))
         toast.success('Changes appear to already be applied ✓')

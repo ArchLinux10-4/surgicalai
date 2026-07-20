@@ -674,14 +674,20 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     saveApplied(sessionId, changeId)
     setApplied(p => ({ ...p, [changeId]: true }))
     setSkipped(p => { const n = { ...p }; delete n[changeId]; return n })
-    // Persist to backend DB so applied state survives page refresh
-    if (sessionId) api.surgical.markApplied(sessionId, changeId).catch(() => {})
+    // Persist to backend DB so applied state survives page refresh. Returns the
+    // promise so callers can await it before telling ApplyAllButton to re-check —
+    // otherwise the re-check GET can race ahead of this POST and read stale
+    // (unapplied) state, leaving "Apply All" stuck visible forever.
+    const persisted = sessionId
+      ? api.surgical.markApplied(sessionId, changeId).catch(() => {})
+      : Promise.resolve()
     // Track lines added/removed for this file — powers the diff-stats badge in the file drawer
     if (diff) {
       const { added, removed } = diffLineCounts(diff)
       recordDiffStats(fileData.file_id, added, removed)
     }
     onChangeApplied?.()
+    return persisted
   }
 
   // Apply all selected changes in one call
@@ -764,18 +770,22 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       setModifiedCode(undefined)  // clear so LivePreview falls back to originalCode (fresh from DB)
       setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
       onApplied?.(filename, newContent)
+      const markPromises: Promise<any>[] = []
       for (const change of selectedChanges) {
         // Already-applied changes are marked done too (no error, no retry
         // prompt) — they just weren't reported as a fresh "applied_count"
         // by the backend because there was nothing new to write.
-        if (!failedIds.has(change.id)) markApplied(change.id, change.diff)
+        if (!failedIds.has(change.id)) markPromises.push(Promise.resolve(markApplied(change.id, change.diff)))
       }
-      // Signal ApplyAllButton to re-check applied state (replicates refresh sync)
+      // Wait for the backend DB writes to land before telling ApplyAllButton
+      // (and other cards) to re-check applied state.
+      await Promise.all(markPromises)
       window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
     } catch (e: any) {
       const errMsg: string = e?.message || 'Apply failed'
       // If code couldn't be found, it was likely already applied — auto-mark it
       if (errMsg.includes("Couldn't find the exact code") || errMsg.includes("could not find") || errMsg.includes("exact code")) {
+        const markPromises: Promise<any>[] = []
         for (const change of selectedChanges) {
           saveApplied(sessionId, change.id)
           setApplied(p => ({ ...p, [change.id]: true }))
@@ -783,7 +793,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             const { added, removed } = diffLineCounts(change.diff)
             recordDiffStats(fileData.file_id, added, removed)
           }
+          // Persist to backend DB too — without this, ApplyAllButton (which
+          // reads applied state ONLY from the DB via api.surgical.getApplied)
+          // never learns this change is done, even though this card now
+          // correctly shows "All applied". That left the sticky "Apply All"
+          // bar visible forever for changes that hit this fallback path.
+          if (sessionId) markPromises.push(api.surgical.markApplied(sessionId, change.id).catch(() => {}))
         }
+        await Promise.all(markPromises)
         // Re-sync originalCode from DB — the file is already modified,
         // so our in-memory originalCode is stale. Replicate refresh.
         try {
