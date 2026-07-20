@@ -209,6 +209,11 @@ export function ElementPickerPanel() {
     try { await api.elementPicker.disconnect() } catch { /* best-effort */ }
     setConnected(false)
     setPageUrl(null)
+    // disconnect() tears down the CDP session (and its inspect-mode state)
+    // server-side already — reset local UI state to match so a future
+    // reconnect starts clean in Browse mode rather than showing "Pick" as
+    // selected with no highlight actually armed.
+    setMode('browse')
   }
 
   const handleNavigate = () => {
@@ -239,6 +244,21 @@ export function ElementPickerPanel() {
       setTimeout(() => setRefreshing(false), 400)
     }
   }, [connected, refreshing])
+
+  // Switching modes toggles the live CDP hover-highlight (Overlay.setInspectMode
+  // — see backend/services/element_picker.py). Only ever armed while Pick mode
+  // is on: while it's on, Chrome intercepts clicks for node-selection instead
+  // of letting them reach the page, which is correct for Pick mode but would
+  // silently break normal navigation/clicking if left on during Browse mode.
+  // Best-effort — if it fails the picker still works exactly as before, the
+  // user just loses the live highlight box.
+  const handleModeChange = useCallback((next: 'browse' | 'pick') => {
+    setMode(next)
+    if (!connected) return
+    api.elementPicker.setInspectMode(next === 'pick').catch((e: any) => {
+      toast.error('Live highlight unavailable', e.message ?? String(e))
+    })
+  }, [connected])
 
   // Map a canvas click into real page coordinates using the frame's own
   // pixel buffer size vs. the original page's device size (screencast
@@ -355,7 +375,7 @@ export function ElementPickerPanel() {
                 from the rest of its toolbar. */}
             <div className="flex items-center gap-0.5 p-0.5 rounded-lg bg-overlay shrink-0" role="group" aria-label="Interaction mode">
               <button
-                onClick={() => setMode('browse')}
+                onClick={() => handleModeChange('browse')}
                 aria-pressed={mode === 'browse'}
                 className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11.5px] font-semibold transition-colors ${
                   mode === 'browse' ? 'bg-surface text-ink shadow-soft' : 'text-muted hover:text-ink'
@@ -365,12 +385,12 @@ export function ElementPickerPanel() {
                 <PanTool sx={{ fontSize: 13 }} /> Browse
               </button>
               <button
-                onClick={() => setMode('pick')}
+                onClick={() => handleModeChange('pick')}
                 aria-pressed={mode === 'pick'}
                 className={`flex items-center gap-1 px-2 py-1 rounded-md text-[11.5px] font-semibold transition-colors ${
                   mode === 'pick' ? 'bg-accent text-white' : 'text-muted hover:text-ink'
                 }`}
-                title="Pick mode — the next click adds that element as a chip instead of clicking through"
+                title="Pick mode — hover to highlight, click an element to add it as a chip"
               >
                 <AdsClick sx={{ fontSize: 13 }} /> {picking ? 'Picking…' : 'Pick'}
               </button>

@@ -53,6 +53,10 @@ class ReloadRequest(BaseModel):
     hard: bool = False
 
 
+class InspectModeRequest(BaseModel):
+    enabled: bool
+
+
 @router.get("/status")
 def get_status():
     if USE_POSTGRES:
@@ -111,6 +115,24 @@ def reload(body: ReloadRequest):
     _guard_local_only()
     try:
         return picker_service.reload(body.hard)
+    except ElementPickerError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.post("/inspect-mode")
+def inspect_mode(body: InspectModeRequest):
+    """Toggle the live hover-highlight (the box that tracks whatever
+    element is under the mouse, like Cursor/DevTools "inspect element").
+    Uses the official CDP `Overlay.setInspectMode` — Chrome paints the
+    highlight itself as part of its normal rendering, so it appears for
+    free in the existing screencast frames the frontend already displays.
+    Must be enabled only while the client's Pick mode is active: while on,
+    Chrome intercepts clicks for node-selection instead of letting them
+    reach the page, which matches Pick-mode semantics but would break
+    Browse mode if left on."""
+    _guard_local_only()
+    try:
+        return picker_service.set_inspect_mode(body.enabled)
     except ElementPickerError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

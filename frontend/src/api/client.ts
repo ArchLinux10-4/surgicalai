@@ -626,6 +626,16 @@ export const api = {
         method: 'POST',
         body: JSON.stringify({ hard }),
       }),
+    /** Live hover-highlight (official CDP `Overlay.setInspectMode` — the
+     *  same mechanism Chrome DevTools' own "inspect element" uses). Chrome
+     *  paints the highlight itself, so it shows up for free in the
+     *  existing screencast frames — no extra rendering here. Must only be
+     *  enabled while Pick mode is active (see ElementPickerPanel.tsx). */
+    setInspectMode: (enabled: boolean) =>
+      request<{ connected: boolean }>('/element-picker/inspect-mode', {
+        method: 'POST',
+        body: JSON.stringify({ enabled }),
+      }),
     /** WS URL for the live-view screencast (see routers/element_picker.py
      *  ws/stream). Carries the JWT as `?token=` — same convention as the
      *  chat WS transport, since the HTTP auth middleware doesn't run for

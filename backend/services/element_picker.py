@@ -100,6 +100,12 @@ class _PickerState:
         # `self.lock` the way pick()/screenshot() legitimately do.
         self._cdp_session = None       # playwright CDPSession, when streaming
         self._screencast_lock = threading.Lock()
+        # Live hover-highlight (Pick mode). Tracked so we can re-assert it
+        # after navigate()/reload() — `Overlay.setInspectMode` is UI state
+        # tied to the current document and is not guaranteed to survive a
+        # full navigation, so we defensively re-send it every time rather
+        # than assume persistence.
+        self._inspect_mode_enabled = False
         # Bounded to 2: a screencast frame handler runs on Playwright's own
         # dispatch thread, not ours. Keeping only the newest 1-2 frames (and
         # dropping older ones on overflow) means a slow consumer never builds
@@ -415,6 +421,14 @@ class _PickerState:
                 _dlog("navigate_failed", url=url, error=str(e))
                 raise ElementPickerError(f"Could not navigate to {url}: {e}") from e
             _dlog("navigate_ok", url=url)
+            if self._inspect_mode_enabled:
+                with self._screencast_lock:
+                    session = self._cdp_session
+                if session is not None:
+                    try:
+                        self._apply_inspect_mode_locked(session, True)
+                    except Exception:
+                        pass  # already _dlog'd inside; navigation itself still succeeded
             return self._status_locked()
 
     def reload(self, hard: bool = False) -> dict:
@@ -443,6 +457,80 @@ class _PickerState:
                 _dlog("reload_failed", hard=hard, error=str(e))
                 raise ElementPickerError(f"Could not reload page: {e}") from e
             _dlog("reload_ok", hard=hard)
+            if self._inspect_mode_enabled:
+                self._apply_inspect_mode_locked(session, True)
+            return self._status_locked()
+
+    def _apply_inspect_mode_locked(self, session, enabled: bool) -> None:
+        """Real technique (not a custom hack): this is the exact mechanism
+        Chrome's own DevTools "inspect element" tool uses — confirmed
+        against the official CDP Overlay domain docs
+        (chromedevtools.github.io/devtools-protocol/tot/Overlay/) and a
+        working reference implementation (Stack Overflow #59710285).
+
+        `Overlay.setInspectMode(mode='searchForNode')` makes Chrome itself
+        track whatever DOM node is under the mouse (driven by the
+        `Input.dispatchMouseEvent(mouseMoved)` calls `dispatch_mouse()`
+        already sends) and paint a highlight box as part of its own
+        rendering — i.e. it shows up for free in the existing
+        `Page.startScreencast` JPEG frames. No new rendering pipeline, no
+        frontend canvas-drawing code, no extra wire format.
+
+        Requires `DOM.enable` + `Overlay.enable` first (both idempotent —
+        official docs: "Enables domain notifications", safe to call every
+        time). Must be explicitly turned back off with mode='none' — it
+        does NOT auto-exit after a pick (documented gap, confirmed by
+        real-world reports), and while it's on Chrome intercepts clicks
+        for node-selection instead of letting them reach the page — which
+        is exactly Pick-mode's desired semantics, but wrong for Browse
+        mode, so callers must only enable this while in Pick mode and
+        must disable it the instant the user switches back to Browse.
+        """
+        try:
+            session.send("DOM.enable")
+            session.send("Overlay.enable")
+            if enabled:
+                session.send(
+                    "Overlay.setInspectMode",
+                    {
+                        "mode": "searchForNode",
+                        "highlightConfig": {
+                            "showInfo": True,
+                            "showExtensionLines": False,
+                            # Matches the app's existing accent color
+                            # (--c-accent: 88 166 255 / #58a6ff) used for
+                            # the Pick-mode ring/badge elsewhere in
+                            # ElementPickerPanel.tsx, so the live highlight
+                            # visually matches the rest of the picker UI
+                            # instead of introducing an unrelated color.
+                            "contentColor": {"r": 88, "g": 166, "b": 255, "a": 0.20},
+                            "borderColor": {"r": 88, "g": 166, "b": 255, "a": 0.9},
+                        },
+                    },
+                )
+            else:
+                session.send("Overlay.setInspectMode", {"mode": "none"})
+        except Exception as e:
+            _dlog("inspect_mode_apply_failed", enabled=enabled, error=str(e))
+            raise
+
+    def set_inspect_mode(self, enabled: bool) -> dict:
+        """Turn the live hover-highlight on/off. Requires an active
+        screencast session (same precondition as reload()) since the
+        highlight is only visible through the live-view frames."""
+        with self.lock:
+            if self._page is None:
+                raise ElementPickerError("Not connected. Call connect first.")
+            with self._screencast_lock:
+                session = self._cdp_session
+            if session is None:
+                raise ElementPickerError("Live view is not active — cannot set inspect mode.")
+            try:
+                self._apply_inspect_mode_locked(session, enabled)
+            except Exception as e:
+                raise ElementPickerError(f"Could not set inspect mode: {e}") from e
+            self._inspect_mode_enabled = bool(enabled)
+            _dlog("inspect_mode_set", enabled=enabled)
             return self._status_locked()
 
     def dispatch_mouse(self, kind: str, x: float, y: float, button: str = "left",
@@ -517,6 +605,9 @@ class _PickerState:
             self._page = None
             self._playwright = None
             self.cdp_url = None
+            # Reset so a future connect()+navigate() doesn't silently try to
+            # re-assert inspect mode from a stale prior session's state.
+            self._inspect_mode_enabled = False
             _dlog("disconnect_ok", cdp_url=prev_url)
             return self._status_locked()
 
@@ -735,6 +826,10 @@ def navigate(url: str) -> dict:
 
 def reload(hard: bool = False) -> dict:
     return _run_on_pw_thread(_state.reload, hard=hard)
+
+
+def set_inspect_mode(enabled: bool) -> dict:
+    return _run_on_pw_thread(_state.set_inspect_mode, enabled)
 
 
 def dispatch_mouse(kind: str, x: float, y: float, button: str = "left",
