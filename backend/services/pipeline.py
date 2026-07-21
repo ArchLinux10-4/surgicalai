@@ -19730,7 +19730,18 @@ async def run_natural_pipeline_stream(
             # When scattered changes produced N>1 clusters, each window gets
             # its own API call.  Process bottom-to-top so line numbers stay
             # stable across splices.
-            for _mw_idx in _multi_window_pending:
+            # ── Progress visibility (multi-window is sequential and can take
+            #    several minutes across many API calls with nothing else to
+            #    show) — announce the batch up front so the user isn't left
+            #    guessing whether the run is stuck.
+            if len(_multi_window_pending) > 1:
+                _dlog("mw_progress_batch_start",
+                      session_id=session_id, user_id=user_id,
+                      pending_count=len(_multi_window_pending))
+                yield sse({"type": "progress",
+                           "content": f"🔁 Fixing {len(_multi_window_pending)} flagged section(s) "
+                                      f"one at a time — this can take a few minutes…"})
+            for _mw_pos, _mw_idx in enumerate(_multi_window_pending):
                 # ── Pipeline deadline gate (multi-window) ──────────────────
                 if _pipeline_over_budget():
                     _dlog("pipeline_deadline_skip",
@@ -19871,6 +19882,17 @@ async def run_natural_pipeline_stream(
                       } for w in _mw_windows],
                       error_lines_extracted=len(_mw_error_lines))
 
+                _dlog("mw_progress_symbol_start",
+                      session_id=session_id, user_id=user_id,
+                      symbol=_mw_sym.name,
+                      symbol_pos=_mw_pos + 1,
+                      symbol_total=len(_multi_window_pending),
+                      window_count=len(_mw_windows))
+                yield sse({"type": "progress",
+                           "content": f"🔁 Correcting {_mw_sym.name} "
+                                      f"({_mw_pos + 1}/{len(_multi_window_pending)} sections, "
+                                      f"{len(_mw_windows)} window(s))…"})
+
                 # Process windows BOTTOM-TO-TOP — splicing later windows first
                 # keeps earlier window line numbers valid.
                 for _mw_wi in range(len(_mw_windows) - 1, -1, -1):
@@ -19982,6 +20004,22 @@ async def run_natural_pipeline_stream(
                           window_lines=_mw_wl,
                           prompt_chars=len(_mw_prompt),
                           prompt_est_tokens=len(_mw_prompt) // 4)
+
+                    # Fire immediately (not gated behind the 20s keepalive
+                    # below) — most window calls finish in 5-25s, so without
+                    # this the user would see nothing at all for them.
+                    _dlog("mw_progress_window_start",
+                          session_id=session_id, user_id=user_id,
+                          symbol=_mw_sym.name,
+                          window_index=_mw_wi + 1,
+                          window_total=len(_mw_windows),
+                          window_start_line=_mw_ws1,
+                          window_end_line=_mw_we1,
+                          model=_mw_correction_model)
+                    yield sse({"type": "progress",
+                               "content": f"🔁 {_mw_sym.name}: window {_mw_wi + 1}/"
+                                          f"{len(_mw_windows)} (lines {_mw_ws1}\u2013{_mw_we1}) "
+                                          f"\u2192 {_mw_correction_model}…"})
 
                     try:
                         # Thinking-config: explicit config for adaptive models
@@ -20355,6 +20393,17 @@ async def run_natural_pipeline_stream(
                           any_spliced=_mw_any_spliced,
                           hard_fail=_mw_hard_fail,
                           note="no windows spliced or hard failure — no changes applied")
+
+                _dlog("mw_progress_symbol_done",
+                      session_id=session_id, user_id=user_id,
+                      symbol=_mw_sym.name,
+                      applied=bool(_mw_should_apply and _mw_frag is None))
+                yield sse({"type": "progress",
+                           "content": (
+                               f"✅ {_mw_sym.name} corrected"
+                               if _mw_should_apply and _mw_frag is None
+                               else f"⚠️ {_mw_sym.name} correction did not apply — will retry next round"
+                           )})
 
                 # ── Record multi-window attempt in correction history (Bug 2 fix) ──
                 _mw_qa_for_hist = qa_results[_mw_idx] if _mw_idx < len(qa_results) else {}
