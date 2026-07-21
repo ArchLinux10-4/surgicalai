@@ -10,6 +10,7 @@ import type { SmartResult, QAResult } from '../types'
 import { LivePreview, isVisualFile } from './LivePreview'
 import { useAppStore } from '../stores/appStore'
 import { recordDiffStats, revertDiffStats } from '../lib/fileClassify'
+import { acquireApplyLock, releaseApplyLock } from '../lib/fileApplyLock'
 import { Cancel, CheckCircle, Close, Description, FileDownload, History, KeyboardArrowDown, KeyboardArrowUp, Replay, SkipNext, Visibility, Warning } from '@mui/icons-material';
 interface Props {
   result: SmartResult
@@ -693,6 +694,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   // Apply all selected changes in one call
   const handleApplySelected = async () => {
     if (selectedChanges.length === 0) return
+    // Mutual exclusion with the global "Apply All" bar (and other diff cards
+    // for the same file) — see fileApplyLock.ts for the proven race this
+    // closes. When nothing else is applying this file (the normal case),
+    // this acquires instantly and every line below runs exactly as before.
+    if (!acquireApplyLock(fileData.file_id)) {
+      toast.error('This file is being applied elsewhere right now — please wait a moment and try again')
+      return
+    }
     setApplying(true)
     try {
       const fileData2 = await api.sessionFiles.get(sessionId, fileData.file_id)
@@ -819,6 +828,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       }
     } finally {
       setApplying(false)
+      releaseApplyLock(fileData.file_id)
     }
   }
 

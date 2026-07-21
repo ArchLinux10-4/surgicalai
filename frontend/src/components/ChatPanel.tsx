@@ -15,6 +15,7 @@ import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AdsClick, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Lock, Psychology, Security, Send, Warning } from '@mui/icons-material';
 import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
+import { acquireApplyLock, releaseApplyLock } from '../lib/fileApplyLock'
 
 
 // ── Chat mode selector ────────────────────────────────────────────────────────
@@ -136,6 +137,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
     let appliedChanges = 0
     let rescuedChanges = 0
     let failedChanges  = 0
+    let skippedLocked  = 0
     let firstFailReason = ''
 
     const markPromises: Promise<any>[] = []
@@ -152,6 +154,12 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
           // and applied individually — same gate the per-row checkbox enforces.
           const applyChanges = fd.changes.filter((c: any) => c?.qa_result?.verdict !== 'blocked')
           if (applyChanges.length === 0) continue
+          // Mutual exclusion with individual diff-card Apply buttons — see
+          // fileApplyLock.ts for the proven race this closes. If a diff card
+          // is already applying this exact file right now, skip it this
+          // round rather than racing on a stale content snapshot; it will
+          // simply no longer need Apply All once the other apply finishes.
+          if (!acquireApplyLock(fd.file_id)) { skippedLocked++; continue }
           try {
             const current = await api.sessionFiles.get(sessionId, fd.file_id)
             const applied = await api.surgical.applyAll({
@@ -189,7 +197,12 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
                 }
               }
             }
-          } catch { failed++ }
+          } catch (e: any) {
+            failed++
+            if (!firstFailReason) firstFailReason = e?.message || ''
+          } finally {
+            releaseApplyLock(fd.file_id)
+          }
         }
       }
 
@@ -201,22 +214,32 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       await Promise.all(markPromises)
 
       const rescuedNote = rescuedChanges > 0 ? ` (${rescuedChanges} AI-rescued)` : ''
+      const lockedNote = skippedLocked > 0
+        ? ` (${skippedLocked} file${skippedLocked !== 1 ? 's' : ''} skipped — already being applied elsewhere, try Apply All again in a moment)`
+        : ''
       if (failed === 0 && failedChanges === 0) {
-        toast.success(
-          `Applied ${appliedChanges} change${appliedChanges !== 1 ? 's' : ''} across ` +
-          `${appliedFiles} file${appliedFiles !== 1 ? 's' : ''}${rescuedNote}`
-        )
-        window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
-        setDone(true)
+        if (appliedFiles === 0 && skippedLocked > 0) {
+          toast.error(`Nothing applied — every clean file is currently being applied elsewhere. Try again in a moment.`)
+        } else {
+          toast.success(
+            `Applied ${appliedChanges} change${appliedChanges !== 1 ? 's' : ''} across ` +
+            `${appliedFiles} file${appliedFiles !== 1 ? 's' : ''}${rescuedNote}${lockedNote}`
+          )
+          window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
+          if (skippedLocked === 0) setDone(true)
+        }
       } else if (failedChanges > 0) {
         toast.error(
           `Applied ${appliedChanges}${rescuedNote}, but ${failedChanges} ` +
-          `change${failedChanges !== 1 ? 's' : ''} could not be applied`,
+          `change${failedChanges !== 1 ? 's' : ''} could not be applied${lockedNote}`,
           firstFailReason ? firstFailReason.slice(0, 200) : undefined
         )
         window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
       } else {
-        toast.error(`Applied ${appliedFiles} file(s) — ${failed} file(s) failed entirely`)
+        toast.error(
+          `Applied ${appliedFiles} file(s) — ${failed} file(s) failed entirely${lockedNote}`,
+          firstFailReason ? firstFailReason.slice(0, 200) : undefined
+        )
       }
     } catch (e: any) {
       toast.error(e.message || 'Apply all failed')
