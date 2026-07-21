@@ -123,6 +123,50 @@ _FILE_MODIFIED = "modified"  # File existed before but content changed
 _FILE_UNCHANGED = "unchanged" # File existed before with same content
 
 
+def _humanize_elapsed(timestamp_val) -> str:
+    """
+    Convert a DB timestamp (str or datetime, any format SQLite/Postgres
+    hands back) into a short human string like "6h ago", "3d ago", "just now".
+    Never raises — returns "" on any parse failure so callers can safely
+    fall back to the old turn-count-only wording.
+    """
+    if not timestamp_val:
+        return ""
+    try:
+        from datetime import datetime, timezone
+        if isinstance(timestamp_val, datetime):
+            dt = timestamp_val
+        else:
+            s = str(timestamp_val).strip()
+            # Normalize common formats: "YYYY-MM-DD HH:MM:SS[.ffffff]" (SQLite)
+            # and ISO-8601 with/without "Z"/offset (Postgres / asyncpg).
+            s = s.replace("Z", "+00:00")
+            if "T" not in s and " " in s:
+                s = s.replace(" ", "T", 1)
+            dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        delta_s = (now - dt).total_seconds()
+        if delta_s < 0:
+            delta_s = 0
+        if delta_s < 60:
+            return "just now"
+        if delta_s < 3600:
+            return f"{int(delta_s // 60)}m ago"
+        if delta_s < 86400:
+            return f"{int(delta_s // 3600)}h ago"
+        days = int(delta_s // 86400)
+        if days < 30:
+            return f"{days}d ago"
+        months = int(days // 30)
+        if months < 12:
+            return f"{months}mo ago"
+        return f"{int(months // 12)}y ago"
+    except Exception:
+        return ""
+
+
 def _classify_session_files(session_id: str, session_files: list,
                             conversation_history: list) -> dict:
     """
@@ -168,6 +212,10 @@ def _classify_session_files(session_id: str, session_files: list,
         fname = sf["filename"]
         content = sf.get("content", "")
         c_hash = _file_content_hash(content)
+        # Wall-clock timestamp for this file's row, straight from the DB —
+        # used so Claude sees real elapsed time ("6h ago"), not just a turn
+        # number, when a file/screenshot is old but still attached.
+        _elapsed = _humanize_elapsed(sf.get("updated_at") or sf.get("created_at"))
 
         if fname in existing:
             old_hash, first_turn, _ = existing[fname]
@@ -178,12 +226,12 @@ def _classify_session_files(session_id: str, session_files: list,
                 status = _FILE_MODIFIED
                 detail = f"first seen turn {first_turn}, content changed this turn"
             upserts.append((session_id, fname, c_hash, first_turn, current_turn))
-            result[fname] = {"status": status, "first_seen_turn": first_turn, "detail": detail}
+            result[fname] = {"status": status, "first_seen_turn": first_turn, "detail": detail, "elapsed": _elapsed}
         else:
             status = _FILE_NEW
             detail = "added this turn"
             upserts.append((session_id, fname, c_hash, current_turn, current_turn))
-            result[fname] = {"status": status, "first_seen_turn": current_turn, "detail": detail}
+            result[fname] = {"status": status, "first_seen_turn": current_turn, "detail": detail, "elapsed": _elapsed}
 
     # ── Persist updated manifest ──
     try:
@@ -223,14 +271,24 @@ def _classify_session_files(session_id: str, session_files: list,
     return result
 
 
-def _file_status_badge(status: str) -> str:
-    """Human-readable badge for file status in context."""
+def _file_status_badge(status: str, elapsed: str = "") -> str:
+    """
+    Human-readable badge for file status in context.
+
+    `elapsed` (e.g. "6h ago", "3d ago") is the real wall-clock age of the
+    file's DB row — optional so existing/dead call sites that don't pass it
+    keep working unchanged (backward-compatible default "").
+    """
     if status == _FILE_NEW:
         return "🆕 NEW"
     elif status == _FILE_MODIFIED:
-        return "✏️ MODIFIED since last turn"
+        # elapsed is already a full phrase, e.g. "6h ago" / "just now"
+        return f"✏️ MODIFIED {elapsed}" if elapsed else "✏️ MODIFIED since last turn"
     elif status == _FILE_UNCHANGED:
-        return "📎 UNCHANGED from previous turn"
+        return (
+            f"📎 UNCHANGED — first seen {elapsed}, already reviewed"
+            if elapsed else "📎 UNCHANGED from previous turn"
+        )
     return ""
 from models.schemas import (
     SurgicalOperation,
@@ -13402,6 +13460,25 @@ def _build_natural_file_context(
     # ── Render Tier 1: full context ───────────────────────────────────────
     parts.append("━━━ UPLOADED FILES ━━━\n")
 
+    # One-time steering line — only appears when at least one file/image is
+    # not brand-new this turn (MODIFIED or UNCHANGED badge present below).
+    # Fixes: Claude treating hours/days-old screenshots or files as if just
+    # uploaded. Badges alone are a label with no behavioral instruction;
+    # this tells Claude explicitly how to act on them. Matches Anthropic's
+    # own guidance (timestamps as a relevance proxy) and the fix requested
+    # in Claude Code issue #55063 for stale-attachment re-narration.
+    if file_statuses and any(
+        fs.get("status") in (_FILE_UNCHANGED, _FILE_MODIFIED) for fs in file_statuses.values()
+    ):
+        parts.append(
+            "📌 Some files/images below are marked UNCHANGED or MODIFIED — you have already "
+            "seen them in this conversation (elapsed time shown in each badge). Treat them as "
+            "already-reviewed prior context, NOT as new uploads: do not re-describe or "
+            "re-analyze unchanged content from scratch, and do not reference them as if the "
+            "user just attached them this turn unless the current message says otherwise. "
+            "Only NEW-badged files are actually new this turn.\n"
+        )
+
     if tier2:
         parts.append(
             f"ℹ️  {len(session_files)} files total. Showing full context for the "
@@ -13423,9 +13500,9 @@ def _build_natural_file_context(
         file_type  = sf.get("file_type", "code")
         lines_count = sf.get("lines", len(content.splitlines()))
 
-        # File status badge (new / modified / unchanged)
+        # File status badge (new / modified / unchanged) + real elapsed time
         _fs = file_statuses.get(fname, {}) if file_statuses else {}
-        _badge = _file_status_badge(_fs.get("status", "")) if _fs else ""
+        _badge = _file_status_badge(_fs.get("status", ""), _fs.get("elapsed", "")) if _fs else ""
         _badge_suffix = f"  {_badge}" if _badge else ""
 
         if file_type == "image":
@@ -13505,9 +13582,9 @@ def _build_natural_file_context(
         file_type   = sf.get("file_type", "code")
         lines_count = sf.get("lines", sf.get("content", "") and len(sf["content"].splitlines()) or 0)
 
-        # File status badge
+        # File status badge + real elapsed time
         _fs = file_statuses.get(fname, {}) if file_statuses else {}
-        _badge = _file_status_badge(_fs.get("status", "")) if _fs else ""
+        _badge = _file_status_badge(_fs.get("status", ""), _fs.get("elapsed", "")) if _fs else ""
         _badge_suffix = f"  {_badge}" if _badge else ""
 
         if file_type in ("image", "pdf", "csv", "excel", "text"):
@@ -14607,7 +14684,7 @@ async def run_natural_pipeline_stream(
 
                 # Annotate image with new/unchanged/modified status
                 _img_fs = _file_statuses.get(fname, {})
-                _img_badge = _file_status_badge(_img_fs.get("status", "")) if _img_fs else ""
+                _img_badge = _file_status_badge(_img_fs.get("status", ""), _img_fs.get("elapsed", "")) if _img_fs else ""
                 if _img_badge:
                     user_content.append({
                         "type": "text",

@@ -753,7 +753,7 @@ async def smart_stream(req: dict, request: Request):
 
         # Load session files
         file_rows = conn.execute(
-            "SELECT id, filename, content, language, lines, symbol_count, file_type FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
+            "SELECT id, filename, content, language, lines, symbol_count, file_type, created_at, updated_at FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,)
         ).fetchall()
         session_files = [dict(r) for r in file_rows]
@@ -1471,7 +1471,7 @@ async def execute_task(req: dict, request: Request):
         _dlog("execute_task_history_excludes_compaction_marker", session_id=session_id,
               msg_count=len(conversation_history))
         file_rows = conn.execute(
-            "SELECT id, filename, content, language, lines, symbol_count, file_type FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
+            "SELECT id, filename, content, language, lines, symbol_count, file_type, created_at, updated_at FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
             (session_id,)
         ).fetchall()
         session_files = [dict(r) for r in file_rows]
