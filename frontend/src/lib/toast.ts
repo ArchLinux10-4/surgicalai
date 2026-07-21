@@ -1,5 +1,11 @@
 import { create } from 'zustand'
 
+// Global kill-switch: flip to true to re-enable toast popups app-wide.
+// All ~140 call sites (toast.success/error/info/warning) and the store
+// itself are left fully intact — this single flag just stops `add()`
+// from ever pushing a toast into the render queue, so nothing renders.
+const TOASTS_ENABLED = false
+
 export type ToastType = 'success' | 'error' | 'info' | 'warning'
 
 export interface Toast {
@@ -19,6 +25,7 @@ interface ToastStore {
 export const useToastStore = create<ToastStore>((set) => ({
   toasts: [],
   add: (toast) => {
+    if (!TOASTS_ENABLED) return
     const id = Math.random().toString(36).slice(2)
     set((s) => ({ toasts: [...s.toasts, { ...toast, id }] }))
     const dur = toast.duration ?? 4000
