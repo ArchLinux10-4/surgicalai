@@ -13720,6 +13720,16 @@ def _resolve_search_multifile(
         found_anything = False
 
         for fname, (smap, _sf) in symbol_maps_by_name.items():
+            # Images are stored as a raw base64 data-URL, not source text
+            # (see routers/session_files.py _normalize_image_for_claude).
+            # That URL has no newlines, so it collapses into one giant
+            # "line" and a rare-but-legal substring match dumps the entire
+            # multi-MB blob as a "snippet" (proven: 2.27M-char blowup from
+            # matching "FAQ" inside base64 noise). Grep is meaningless
+            # against binary data — skip it here. Images remain fully
+            # available via <file_request> for direct fetch by name.
+            if (_sf or {}).get("file_type") == "image":
+                continue
             file_content = file_content_lookup.get(fname, "")
             if not file_content:
                 continue
@@ -13818,15 +13828,47 @@ def _resolve_search_multifile(
                 found_anything = True
                 break
 
+            # BUG FIX: this `break` above only exits the inner per-line loop.
+            # Without exiting the outer per-file loop too, a generic term
+            # (e.g. a common UI string) matches in file after file with no
+            # cap, producing an unbounded result (proven: 2,271,172 chars in
+            # one real trace). Mirror the step-1 guard so a term stops
+            # searching further files the moment ANY match is found.
+            if found_anything:
+                break
+
         if not found_anything:
             result_parts.append(f"NOT FOUND: '{term}' — not in any uploaded file.")
 
     if not result_parts:
         return ""
 
+    # Defense-in-depth: even with the break-fix above, a single term could
+    # still return one very large symbol/snippet. Structurally cap the total
+    # returned size so a search can never blow the model's context budget,
+    # regardless of upload size or content — this must hold true no matter
+    # how large future uploads get.
+    _MAX_SEARCH_RESULT_CHARS = 50_000
+    kept_parts: list = []
+    total_chars = 0
+    omitted = 0
+    for part in result_parts:
+        if kept_parts and total_chars + len(part) > _MAX_SEARCH_RESULT_CHARS:
+            omitted += 1
+            continue
+        kept_parts.append(part)
+        total_chars += len(part)
+
+    body = "\n\n".join(kept_parts)
+    if omitted:
+        body += (
+            f"\n\n... [search results truncated, {omitted} more match(es) omitted — "
+            f"narrow your search terms or use <file_request> for the exact file]"
+        )
+
     return (
         "\n\n=== SEARCH RESULTS ===\n"
-        + "\n\n".join(result_parts)
+        + body
         + "\n=== END SEARCH RESULTS ===\n"
     )
 
