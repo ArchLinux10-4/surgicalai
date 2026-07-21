@@ -875,6 +875,48 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   const [loadingVersions, setLoadingVersions] = useState(false)
   const [restoringId, setRestoringId] = useState<string | null>(null)
 
+  // ── Restore confirm countdown (purely frontend) ───────────────────────
+  // Restore is destructive-feeling (silently overwrites current content), so
+  // clicking it "arms" a 3s countdown with a visible Cancel button instead
+  // of restoring immediately. Only fires the real restore if the user does
+  // not cancel and the countdown reaches 0. Never touches the backend API
+  // until the countdown completes.
+  const [armedVersionId, setArmedVersionId] = useState<string | null>(null)
+  const [armCountdown, setArmCountdown] = useState(0)
+  const armIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const armTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const clearArmTimers = () => {
+    if (armIntervalRef.current) { clearInterval(armIntervalRef.current); armIntervalRef.current = null }
+    if (armTimeoutRef.current) { clearTimeout(armTimeoutRef.current); armTimeoutRef.current = null }
+  }
+
+  const cancelArmedRestore = () => {
+    clearArmTimers()
+    setArmedVersionId(null)
+    setArmCountdown(0)
+  }
+
+  const armRestore = (versionId: string) => {
+    clearArmTimers()
+    setArmedVersionId(versionId)
+    setArmCountdown(3)
+    armIntervalRef.current = setInterval(() => {
+      setArmCountdown(c => (c > 1 ? c - 1 : 0))
+    }, 1000)
+    armTimeoutRef.current = setTimeout(() => {
+      clearArmTimers()
+      setArmedVersionId(null)
+      setArmCountdown(0)
+      handleRestoreVersion(versionId)
+    }, 3000)
+  }
+
+  // Clean up timers on unmount so a pending restore never fires after the
+  // card is gone, and cancel any armed restore if the history panel closes.
+  useEffect(() => () => clearArmTimers(), [])
+  useEffect(() => { if (!showHistory) cancelArmedRestore() }, [showHistory])
+
   const openHistory = async () => {
     setShowHistory(true)
     setLoadingVersions(true)
@@ -1033,13 +1075,31 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     <div className="text-[11px] font-medium text-ink truncate">{v.label || 'Edit'}</div>
                     <div className="text-[10px] text-muted/70">{formatVersionTime(v.created_at)} · {v.lines} lines</div>
                   </div>
-                  <button
-                    onClick={() => handleRestoreVersion(v.id)}
-                    disabled={restoringId === v.id}
-                    className="flex-shrink-0 flex items-center gap-1 px-2 py-1 bg-accent/10 text-accent border border-accent/30 rounded-md text-[10px] font-semibold hover:bg-accent/20 transition-colors disabled:opacity-50"
-                  >
-                    {restoringId === v.id ? 'Restoring…' : 'Restore'}
-                  </button>
+                  {armedVersionId === v.id ? (
+                    <div className="flex-shrink-0 flex items-center gap-1">
+                      <span className="text-[10px] font-semibold text-accent tabular-nums" title="Restoring — click Cancel to stop">
+                        Restoring in {armCountdown}s…
+                      </span>
+                      <button
+                        onClick={cancelArmedRestore}
+                        className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-md text-[10px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
+                        title="Cancel restore"
+                        autoFocus
+                      >
+                        <Cancel sx={{ fontSize: 11 }} />
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      onClick={() => armRestore(v.id)}
+                      disabled={restoringId === v.id || (armedVersionId !== null && armedVersionId !== v.id)}
+                      className="flex-shrink-0 flex items-center gap-1 px-2 py-1 bg-accent/10 text-accent border border-accent/30 rounded-md text-[10px] font-semibold hover:bg-accent/20 transition-colors disabled:opacity-50"
+                      title="Restores after a 3-second countdown — you'll get a chance to cancel"
+                    >
+                      {restoringId === v.id ? 'Restoring…' : 'Restore'}
+                    </button>
+                  )}
                 </div>
               ))}
             </div>
