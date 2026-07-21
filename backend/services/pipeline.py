@@ -3350,8 +3350,33 @@ Use to view the full contents of specific file(s) by exact name.
 
 Emit ONLY ONE tag at a time, then STOP your response immediately — the
 results will be returned to you and you may continue. You may use these
-tags across multiple turns of this exchange (up to 3 rounds) before giving
-your final answer in plain prose (no tags in your final answer).
+tags across multiple turns of this exchange (up to {max_rounds} rounds)
+before giving your final answer in plain prose (no tags in your final
+answer).
+"""
+
+# Ask/Plan is READ-ONLY by design — it can look at the connected GitHub
+# repo the same way Edit mode can, but it must never write. push_files and
+# push_session_file are deliberately left OFF this list; even if the model
+# ignores that and emits one anyway, run_chat_stream blocks it in code
+# before execute_github_request is ever called (belt-and-suspenders, not
+# just a prompt request).
+_ASK_PLAN_GITHUB_INSTRUCTIONS_TEMPLATE = """
+You may also use a third tag to read the connected GitHub repository
+(read-only in this mode — you cannot push, commit, or edit files here):
+
+<github_request>{{"tool": "list_prs", "args": {{"owner": "...", "repo": "..."}}, "reason": "why you need this"}}</github_request>
+
+Available tools: list_repos {{}}, list_prs {{owner, repo, state?}},
+get_pr_diff {{owner, repo, pr_number}}, get_pr_comments {{owner, repo, pr_number}},
+list_issues {{owner, repo, state?}}, get_issue_comments {{owner, repo, issue_number}},
+diff_branches {{owner, repo, base, head}}, list_files {{owner, repo, ref?, path_prefix?}},
+read_file {{owner, repo, path, ref?, start_line?}}, search_code {{owner, repo, query}},
+check_deploy {{provider?}}.
+{known_line}
+If the user wants an actual code change made or pushed, tell them to switch
+to Agent/Edit mode — this mode can only look, not write.
+One github_request per response, same one-tag-then-stop rule as above.
 """
 
 
@@ -3381,6 +3406,30 @@ async def run_chat_stream(
     chat_model = model or get_setting("architect_model", _DEFAULT_ARCH_MODEL)
     _model_used = chat_model
     _ask_plan_tools_enabled = bool(session_files) and _is_claude_model(chat_model)
+    _ASK_PLAN_MAX_ROUNDS = 8  # was 3 — search/file/github rounds share this budget
+
+    # ── GitHub read access for Ask/Plan (additive, flag-gated) ──────────
+    # Reuses the exact same natural_github_availability/get_known_repos/
+    # execute_github_request helpers the Edit pipeline already relies on —
+    # no new GitHub logic. Read-only in this mode: push_files and
+    # push_session_file are blocked in code below even if requested.
+    _gh_nat_enabled = False
+    _gh_nat_installs: list = []
+    _gh_known_repos: list = []
+    if _ask_plan_tools_enabled:
+        try:
+            from services.github_natural_tag import (
+                natural_github_availability, parse_github_request,
+                execute_github_request, get_known_repos,
+            )
+            _gh_nat_enabled, _gh_nat_installs = natural_github_availability(
+                user_id, dlog=_dlog)
+            if _gh_nat_enabled:
+                _gh_known_repos = get_known_repos(user_id, session_id, dlog=_dlog)
+        except Exception as _gh_nat_err:
+            _gh_nat_enabled = False
+            _dlog("ask_plan_github_setup_error", session_id=session_id,
+                  user_id=user_id, error=str(_gh_nat_err))
 
     system_parts = [CHAT_PERSONA]
 
@@ -3413,9 +3462,20 @@ async def run_chat_stream(
         system_parts.append(
             "\n## Session Files (index only)\n" + "\n".join(_idx_lines)
         )
-        system_parts.append(_ASK_PLAN_TOOL_INSTRUCTIONS)
+        system_parts.append(
+            _ASK_PLAN_TOOL_INSTRUCTIONS.replace(
+                "{max_rounds}", str(_ASK_PLAN_MAX_ROUNDS)))
+        if _gh_nat_enabled:
+            _known_line = (
+                f"\nKNOWN REPOS (most recent first): {', '.join(_gh_known_repos)}\n"
+                "Use these owner/repo values directly instead of calling list_repos.\n"
+                if _gh_known_repos else ""
+            )
+            system_parts.append(
+                _ASK_PLAN_GITHUB_INSTRUCTIONS_TEMPLATE.format(known_line=_known_line))
         _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
-              model=chat_model, num_files=len(file_content_lookup))
+              model=chat_model, num_files=len(file_content_lookup),
+              github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
     elif file_content:
         # Legacy path — unchanged for non-Claude models / callers with no
         # session_files (e.g. the plain /api/chat/stream simple-chat page).
@@ -3531,9 +3591,10 @@ async def run_chat_stream(
             def _strip_tool_tags(text: str) -> str:
                 text = re.sub(r'<search_request>.*?</search_request>', '', text, flags=re.DOTALL)
                 text = re.sub(r'<file_request>.*?</file_request>', '', text, flags=re.DOTALL)
+                text = re.sub(r'<github_request>.*?</github_request>', '', text, flags=re.DOTALL)
                 return text.strip()
 
-            _ASK_PLAN_MAX_ROUNDS = 3
+            _ASK_PLAN_GH_WRITE_TOOLS = frozenset({"push_files", "push_session_file"})
             _tool_round = 0
             while True:
                 _claude_kwargs = {
@@ -3579,12 +3640,16 @@ async def run_chat_stream(
                 if not _ask_plan_tools_enabled:
                     break  # legacy path already streamed live above — done.
 
-                # ── Tool round: did Claude ask for search/file context? ──
+                # ── Tool round: did Claude ask for search/file/github context? ──
                 _sr_match = re.search(r'<search_request>\s*(.*?)\s*</search_request>', _round_text, re.DOTALL)
                 _fr_match = re.search(r'<file_request>\s*(.*?)\s*</file_request>', _round_text, re.DOTALL)
+                _gr_match = (
+                    re.search(r'<github_request>\s*(.*?)\s*</github_request>', _round_text, re.DOTALL)
+                    if _gh_nat_enabled else None
+                )
 
-                if (not _sr_match and not _fr_match) or _tool_round >= _ASK_PLAN_MAX_ROUNDS:
-                    _clean_text = _strip_tool_tags(_round_text) if (_sr_match or _fr_match) else _round_text
+                if (not _sr_match and not _fr_match and not _gr_match) or _tool_round >= _ASK_PLAN_MAX_ROUNDS:
+                    _clean_text = _strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -3619,6 +3684,29 @@ async def run_chat_stream(
                             _tool_parts.append(f"FILE NOT FOUND: '{_fr_fn}'")
                     _dlog("ask_plan_file_fetched", session_id=session_id, user_id=user_id,
                           tool_round=_tool_round, requested=_fr_names[:5])
+                if _gr_match:
+                    _gr_parsed = parse_github_request(_gr_match.group(1), dlog=_dlog)
+                    if not _gr_parsed:
+                        _tool_parts.append(
+                            "Your <github_request> was not valid JSON. Emit a corrected "
+                            "<github_request>, or answer with what you already know.")
+                    elif _gr_parsed.get("tool") in _ASK_PLAN_GH_WRITE_TOOLS:
+                        # Structural guard, not just a prompt request — Ask/Plan can
+                        # never write, no matter what the model emits.
+                        _dlog("ask_plan_github_write_blocked", session_id=session_id,
+                              user_id=user_id, tool_round=_tool_round,
+                              tool=_gr_parsed.get("tool"))
+                        _tool_parts.append(
+                            f"'{_gr_parsed.get('tool')}' is not available in this mode — "
+                            "Ask/Plan is read-only. Tell the user to switch to Agent/Edit "
+                            "mode to make and push that change.")
+                    else:
+                        _gr_result = execute_github_request(_gr_parsed, user_id, dlog=_dlog)
+                        _tool_parts.append(
+                            f"GitHub {_gr_parsed.get('tool')} result:\n{_gr_result}")
+                        _dlog("ask_plan_github_executed", session_id=session_id, user_id=user_id,
+                              tool_round=_tool_round, tool=_gr_parsed.get("tool"),
+                              result_chars=len(_gr_result))
 
                 if not _tool_parts:
                     yield sse({"type": "token", "content": _round_text})
