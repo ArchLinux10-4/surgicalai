@@ -264,9 +264,12 @@ export const api = {
       // in the session. `respond` sends the file (or a skip) back over the same
       // WebSocket. `onFileCleared` fires when the prompt should be dismissed
       // (provided / skipped / timed out).
+      // `respond` returns false when the back-channel is dead (WS already
+      // closed) so the caller can surface that instead of hanging forever
+      // on a request that will never be delivered.
       onFileNeeded?: (
         info: { filename: string; message: string; retry?: boolean },
-        respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => void,
+        respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => boolean,
       ) => void,
       onFileCleared?: (filename: string) => void,
     ): AbortController => {
@@ -304,7 +307,11 @@ export const api = {
           else if (chunk.type === 'file_needed') {
             onFileNeeded?.(
               { filename: chunk.filename, message: chunk.content, retry: chunk.retry },
-              (resp) => sendToServer?.({ type: 'file_response', ...resp }),
+              (resp) => {
+                if (!sendToServer) return false   // back-channel is gone — never silently no-op
+                sendToServer({ type: 'file_response', ...resp })
+                return true
+              },
             )
           }
           else if (chunk.type === 'file_needed_cleared') onFileCleared?.(chunk.filename)

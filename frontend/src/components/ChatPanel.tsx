@@ -1115,10 +1115,26 @@ export function ChatPanel() {
     filename: string
     message: string
     retry?: boolean
-    respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => void
+    respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => boolean
   } | null>(null)
   const fileRequestInputRef = useRef<HTMLInputElement>(null)
   const [fileRequestBusy, setFileRequestBusy] = useState(false)
+
+  // If the stream that owns a pending file-request ends for ANY reason
+  // (result / done / error) before the backend ever sends file_needed_cleared
+  // — e.g. the WebSocket dropped while paused — the prompt can no longer be
+  // answered. Clear it here so the banner never gets stuck forever, and tell
+  // the user what happened instead of leaving a dead "Sending…" spinner.
+  const clearStaleFileRequest = useCallback((sessionId: string) => {
+    setFileRequest(prev => {
+      if (!prev || prev.sessionId !== sessionId) return prev
+      setFileRequestBusy(false)
+      if (useAppStore.getState().activeSessions === sessionId) {
+        setError('Connection to the agent was lost while it was waiting for your file. Please resend your message.')
+      }
+      return null
+    })
+  }, [])
 
   // Smart auto-scroll: only scroll to bottom when user is already at the bottom.
   // If user scrolls up to read, don't yank them back down.
@@ -1448,6 +1464,7 @@ export function ChatPanel() {
       },
       (token) => { accumulated += token; setSessionStreamingMessage(sessionId, accumulated) },
       (result) => {
+        clearStaleFileRequest(sessionId)
         gotResult = true
         if (result._model) streamModel = result._model
         const _thinking = thinkingTextRef.current
@@ -1492,6 +1509,7 @@ export function ChatPanel() {
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
       (fullText: string, model?: string) => {
+        clearStaleFileRequest(sessionId)
         if (model) streamModel = model
         // Planning stream closed — if a task run was planned, start executing
         // tasks one at a time (each in its own SSE stream) instead of the
@@ -1532,6 +1550,7 @@ export function ChatPanel() {
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
       (err) => {
+        clearStaleFileRequest(sessionId)
         if ((accumulated.trim() || thinkingTextRef.current.trim()) && !gotResult) {
           addMessage({
             id: Date.now().toString() + '_ai_err',
@@ -1661,7 +1680,7 @@ export function ChatPanel() {
       },
     )
     abortMapRef.current.set(sessionId, ctrl)
-  }, [sessionFiles]) // all setters are stable; only sessionFiles can change
+  }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change
 
   // Restart stream when an injection was queued — fires once isStreaming settles to false
   useEffect(() => {
@@ -1694,7 +1713,14 @@ export function ChatPanel() {
     setFileRequestBusy(true)
     try {
       const content = await file.text()
-      req.respond({ filename: file.name, content })
+      const sent = req.respond({ filename: file.name, content })
+      if (!sent) {
+        // Back-channel is dead — clicking again would never help, so clear
+        // the banner immediately instead of leaving a "Sending…" spinner.
+        setFileRequestBusy(false)
+        setFileRequest(null)
+        setError('Connection to the agent was lost — please resend your message.')
+      }
     } catch {
       setFileRequestBusy(false)
       setError('Could not read that file — please try again or skip.')
@@ -1704,7 +1730,12 @@ export function ChatPanel() {
   const handleFileRequestSkip = () => {
     if (!fileRequest) return
     setFileRequestBusy(true)
-    fileRequest.respond({ action: 'skip' })
+    const sent = fileRequest.respond({ action: 'skip' })
+    if (!sent) {
+      setFileRequestBusy(false)
+      setFileRequest(null)
+      setError('Connection to the agent was lost — please resend your message.')
+    }
   }
 
   const handleModelChange = async (modelId: string) => {
@@ -1931,6 +1962,15 @@ export function ChatPanel() {
     if (isStreaming && input.trim()) {
       const sid = activeSessions
       if (!sid) return                       // no session — nothing to inject into
+      // The agent is paused waiting on a file-request back-channel for this
+      // session. Steering here would abort that WebSocket and permanently
+      // strand the pause (no file_response can ever be delivered afterwards)
+      // — that was the root cause of the "File needed" banner getting stuck.
+      // Force resolution via the banner's own Upload/Skip buttons instead.
+      if (fileRequest && fileRequest.sessionId === sid) {
+        setError('The agent is waiting for a file — use Upload file or Skip above before sending a new message.')
+        return
+      }
       const inj = input.trim()
       setInput('')
       if (textareaRef.current) textareaRef.current.style.height = 'auto'
@@ -2008,7 +2048,7 @@ export function ChatPanel() {
     progressHistoryRef.current = ['Thinking...']
 
     doStream(sessionId, text, isFirstMessage, autoNameSession)
-  }, [input, isStreaming, isThinking, settings, activeSessions, sessionFiles, doStream])
+  }, [input, isStreaming, isThinking, settings, activeSessions, sessionFiles, doStream, fileRequest])
 
   const handleKey = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); handleSend() }

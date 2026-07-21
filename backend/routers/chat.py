@@ -1877,9 +1877,15 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
         while True:
             try:
                 raw_in = await websocket.receive_text()
-            except BaseException:
+            except BaseException as _recv_e:
                 # BaseException catches CancelledError (Python 3.8+) in addition
                 # to regular exceptions — ensures clean exit on task cancellation.
+                # Logged (not silent) so a disconnect that happens while the
+                # pipeline is mid-`_await_user_file` pause is diagnosable —
+                # this task's exit is otherwise invisible to the main pump's
+                # own except blocks below, since it runs as a separate task.
+                _dlog("ws_receiver_ended", endpoint=endpoint_name, user_id=user_id,
+                      reason=type(_recv_e).__name__)
                 break
             try:
                 msg_in = json.loads(raw_in)
