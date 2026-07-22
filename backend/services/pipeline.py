@@ -4229,6 +4229,91 @@ def _mw_window_content_loss(expected_lines: int, corrected_lines: int,
 
 
 # ---------------------------------------------------------------------------
+# Helper: _mw_window_content_duplication  (multi-window duplicate-block guard)
+# ---------------------------------------------------------------------------
+# Purpose: _mw_window_content_loss (above) only rejects windows that came
+# back TOO SHORT. It has no symmetric check for a window that comes back
+# too LONG because the model duplicated a chunk of its own output — proven
+# live in session 29fba21b (Dashboard.jsx, window_idx=3): window 2222-2281
+# expected 60 lines, the model returned 83 (+23, +38%), and the splice
+# accepted it unconditionally because no guard existed for "too long."  The
+# very next QA retry round flagged that exact region: "severely corrupted
+# ... duplicated and scrambled content blocks" (qa_retry_blocked_indices,
+# retry_round=1, idx=0). This helper detects that failure mode directly —
+# a repeated contiguous block of lines inside the SAME corrected window —
+# rather than guessing from a line-count ratio alone, so it catches the
+# actual duplication QA reports without needing to tune a threshold against
+# legitimate large (non-duplicated) expansions such as the real (44, 48)
+# and (114, 115) grows already covered by the loss-guard's own test suite.
+def _mw_window_content_duplication(corrected_lines: list, min_repeat_len: int = 4,
+                                    min_repeat_char_len: int = 8):
+    """
+    Return a short description string if ``corrected_lines`` contains a
+    contiguous run of >= ``min_repeat_len`` non-blank lines that appears
+    more than once, else ``None``.
+
+    Blank lines are ignored when building each candidate block (so an
+    inserted blank line between two identical-looking sections can't hide
+    a duplicate), but at least one line in the repeated block must have
+    >= ``min_repeat_char_len`` stripped characters — this filters out
+    trivial repeats like chains of closing brackets (`)`, `}`, `};`) that
+    legitimately recur in normal code and are not the corruption signature
+    reported by QA.
+    """
+    norm = [l.strip() for l in corrected_lines]
+    nonblank_idx = [i for i, l in enumerate(norm) if l]
+    if len(nonblank_idx) < min_repeat_len * 2:
+        return None  # window too small for a meaningful duplicate block
+
+    seen = {}
+    for start in range(len(nonblank_idx) - min_repeat_len + 1):
+        idxs = nonblank_idx[start:start + min_repeat_len]
+        block = tuple(norm[i] for i in idxs)
+        if block in seen:
+            if any(len(b) >= min_repeat_char_len for b in block):
+                prev_start = seen[block]
+                return (
+                    f"corrected window contains a repeated {min_repeat_len}-line "
+                    f"block (first at window line {prev_start + 1}, repeated at "
+                    f"window line {idxs[0] + 1})"
+                )
+        else:
+            seen[block] = idxs[0]
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Helper: _mw_window_content_gain  (multi-window content-gain size guard)
+# ---------------------------------------------------------------------------
+# Purpose: coarse backstop alongside _mw_window_content_duplication above.
+# Duplication detection catches the *specific* corruption signature QA
+# reported; this ratio check catches any other degenerate over-length
+# window (e.g. hallucinated extra content that isn't a literal repeated
+# block) without being tripped by legitimate larger rewrites. Threshold is
+# deliberately generous (75%) — real legitimate grows observed in
+# production traces top out around +9% (44->48) and +2% (41->42); the
+# real bug case was +38% (60->83). 75% gives wide margin above both.
+def _mw_window_content_gain(expected_lines: int, corrected_lines: int,
+                             min_window_size: int = 8,
+                             max_gain_ratio: float = 0.75) -> bool:
+    """
+    Return True if a corrected window grew by more than ``max_gain_ratio``
+    of its expected line count and should be REJECTED (not spliced in).
+
+    Small windows (< ``min_window_size`` expected lines) are exempt for the
+    same reason as ``_mw_window_content_loss`` — trivial edits legitimately
+    grow without indicating a problem, and the ratio math is noisy at that
+    scale.
+    """
+    if expected_lines < min_window_size:
+        return False
+    if expected_lines <= 0:
+        return False
+    gain_ratio = (corrected_lines - expected_lines) / expected_lines
+    return gain_ratio > max_gain_ratio
+
+
+# ---------------------------------------------------------------------------
 # Helper: _locate_snippet_fuzzy  (Claude last-ditch content-anchor rescue)
 # ---------------------------------------------------------------------------
 # Purpose: a final, OPT-IN-ONLY safety net for the rare case where Claude's
@@ -20541,6 +20626,48 @@ async def run_natural_pipeline_stream(
                                   note="window rejected — not spliced, will retry next round instead of shipping truncated content")
                             _mw_all_ok = False
                             _mw_hard_fail = True  # treat as hard fail: abandon this round's splice for this symbol, do not corrupt change_shells
+                            break
+
+                        # ── Content-duplication guard (proven live: session ──
+                        # 29fba21b, Dashboard.jsx, window_idx=3, window
+                        # 2222-2281 expected 60 lines, model returned 83
+                        # (+23, +38%), spliced unconditionally — no guard
+                        # existed for "too long". Next QA round: "severely
+                        # corrupted ... duplicated and scrambled content
+                        # blocks". Detects the actual repeated-block
+                        # signature directly rather than guessing from a
+                        # ratio alone.
+                        _mw_dup_reason = _mw_window_content_duplication(_mw_corrected)
+                        if _mw_dup_reason:
+                            _dlog("correction_multi_window_duplication_rejected",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=_mw_idx,
+                                  symbol=_mw_sym.name, window_idx=_mw_wi,
+                                  corrected_lines=len(_mw_corrected),
+                                  expected_lines=_mw_expected,
+                                  line_delta=_mw_delta,
+                                  reason=_mw_dup_reason,
+                                  note="window rejected — not spliced, will retry next round instead of shipping duplicated content")
+                            _mw_all_ok = False
+                            _mw_hard_fail = True
+                            break
+
+                        # ── Content-gain size guard (symmetric backstop) ──
+                        # Coarse ratio backstop alongside the duplication
+                        # check above, for degenerate over-length windows
+                        # that aren't a literal repeated block (e.g.
+                        # hallucinated extra content).
+                        if _mw_window_content_gain(_mw_expected, len(_mw_corrected)):
+                            _dlog("correction_multi_window_content_gain_rejected",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=_mw_idx,
+                                  symbol=_mw_sym.name, window_idx=_mw_wi,
+                                  corrected_lines=len(_mw_corrected),
+                                  expected_lines=_mw_expected,
+                                  line_delta=_mw_delta,
+                                  note="window rejected — not spliced, will retry next round instead of shipping over-length content")
+                            _mw_all_ok = False
+                            _mw_hard_fail = True
                             break
 
                         _mw_broken_lines[_mw_ws0:_mw_we0 + 1] = _mw_corrected
