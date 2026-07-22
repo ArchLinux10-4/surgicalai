@@ -3406,7 +3406,16 @@ async def run_chat_stream(
     chat_model = model or get_setting("architect_model", _DEFAULT_ARCH_MODEL)
     _model_used = chat_model
     _ask_plan_tools_enabled = bool(session_files) and _is_claude_model(chat_model)
-    _ASK_PLAN_MAX_ROUNDS = 8  # was 3 — search/file/github rounds share this budget
+    # Same knob Edit mode's agent_loop reads (services/pipeline.py ~14904),
+    # so Ask/Plan and Edit share one source of truth instead of two
+    # independently-hardcoded budgets. Default 24 matches Edit mode exactly.
+    _ASK_PLAN_MAX_ROUNDS = int(_os.getenv("AGENT_MAX_TURNS", "24"))
+    # Wall-clock backstop, same purpose/value as Edit mode's
+    # STREAMING_PHASE_DEADLINE_S (services/pipeline.py ~14430/14898). Separate
+    # local constant — does NOT touch or share state with Edit mode's
+    # PIPELINE_DEADLINE_S / STREAMING_PHASE_DEADLINE_S governors.
+    _ASK_PLAN_DEADLINE_S = 480  # 8 min max for the whole search/file/github loop
+    _ask_plan_t0 = time.time()
 
     # ── GitHub read access for Ask/Plan (additive, flag-gated) ──────────
     # Reuses the exact same natural_github_availability/get_known_repos/
@@ -3648,14 +3657,24 @@ async def run_chat_stream(
                     if _gh_nat_enabled else None
                 )
 
-                if (not _sr_match and not _fr_match and not _gr_match) or _tool_round >= _ASK_PLAN_MAX_ROUNDS:
+                _ask_plan_elapsed = time.time() - _ask_plan_t0
+                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match
+                _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
+                _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
+                if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
                     _clean_text = _strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
                     yield sse({"type": "token", "content": _clean_text})
+                    _ask_plan_reason = (
+                        "model_finished" if _ask_plan_no_more_tools
+                        else "budget_exhausted_deadline" if _ask_plan_deadline_hit
+                        else "budget_exhausted_rounds"
+                    )
                     _dlog("ask_plan_tool_final_answer", session_id=session_id, user_id=user_id,
-                          tool_round=_tool_round, chars=len(_clean_text))
+                          tool_round=_tool_round, chars=len(_clean_text), reason=_ask_plan_reason,
+                          elapsed_s=round(_ask_plan_elapsed, 1))
                     break
 
                 yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
