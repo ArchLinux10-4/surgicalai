@@ -3,7 +3,32 @@ Compile-time syntax validation for JSX/TSX/TS/JS files.
 Uses tree-sitter for fast, accurate parsing without Node.js dependency.
 Falls back gracefully if tree-sitter is not installed.
 """
+import datetime as _dt
+import json
+import logging
 from typing import List, Dict
+
+logger = logging.getLogger(__name__)
+
+_DLOG_PATH = "/tmp/syntax_validator_dlog.jsonl"
+
+
+def _dlog(event: str, **kwargs):
+    """Same pattern as element_picker.py's _dlog: logger + flat-file,
+    never raises. Added so any future false-positive/false-negative in
+    this module (session ff34af1d class of bug) leaves a trace instead
+    of silently altering QA scores with no evidence."""
+    try:
+        ts = _dt.datetime.utcnow().isoformat() + "Z"
+        record = {"ts": ts, "event": event, **kwargs}
+        logger.info("[syntax_validator] %s", json.dumps(record, default=str))
+        try:
+            with open(_DLOG_PATH, "a") as f:
+                f.write(json.dumps(record, default=str) + "\n")
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 def validate_syntax(code: str, filename: str) -> List[Dict]:
@@ -27,24 +52,43 @@ def validate_syntax(code: str, filename: str) -> List[Dict]:
             lang = Language(ts_typescript.language_typescript())
 
         parser = Parser(lang)
-        tree = parser.parse(code.encode('utf-8'))
+        code_bytes = code.encode('utf-8')
+        tree = parser.parse(code_bytes)
 
         if not tree.root_node.has_error:
             return []
 
         raw_errors = []
-        _find_error_nodes(tree.root_node, raw_errors, code, max_errors=8)
+        _dlog("syntax_validator_parse_has_error", filename=filename, ext=ext, code_len=len(code))
+        # Pass the BYTE-encoded buffer, not the str — node.start_byte/end_byte
+        # are byte offsets from tree-sitter. Slicing a Python str with byte
+        # offsets desyncs as soon as any multi-byte UTF-8 character (curly
+        # quotes, em dashes, emoji, etc.) appears earlier in the file,
+        # producing garbled error text (session ff34af1d: "Spacing: '-"
+        # instead of the real offending text).
+        _find_error_nodes(tree.root_node, raw_errors, code_bytes, max_errors=8)
 
         if not raw_errors:
+            _dlog("syntax_validator_all_errors_suppressed_as_benign", filename=filename)
             return []
 
         # Deduplicate cascading errors — keep meaningful ones
-        return _deduplicate_errors(raw_errors)
+        final_errors = _deduplicate_errors(raw_errors)
+        _dlog(
+            "syntax_validator_reporting_errors",
+            filename=filename,
+            raw_count=len(raw_errors),
+            final_count=len(final_errors),
+            messages=[e.get("message") for e in final_errors],
+        )
+        return final_errors
 
     except ImportError:
+        _dlog("syntax_validator_tree_sitter_not_installed", filename=filename)
         print("[SYNTAX_VALIDATOR] tree-sitter not installed, skipping validation")
         return []
     except Exception as e:
+        _dlog("syntax_validator_unexpected_exception", filename=filename, error=str(e))
         print(f"[SYNTAX_VALIDATOR] Unexpected error: {e}")
         return []
 
@@ -155,36 +199,129 @@ def detect_redeclarations(code: str, filename: str) -> List[Dict]:
         return []
 
 
-def _find_error_nodes(node, errors: list, code: str, max_errors: int = 8):
-    """Walk tree-sitter parse tree and collect ERROR nodes."""
+def _find_error_nodes(node, errors: list, code_bytes: bytes, max_errors: int = 8):
+    """Walk tree-sitter parse tree and collect ERROR nodes.
+
+    `code_bytes` MUST be the UTF-8 encoded buffer that was actually parsed —
+    node.start_byte/end_byte are byte offsets, not character offsets.
+    """
     if len(errors) >= max_errors:
         return
 
     if node.type == 'ERROR':
+        error_text_preview = (
+            code_bytes[node.start_byte:node.end_byte][:80].decode('utf-8', 'replace')
+        )
+        if _is_benign_jsx_text_punctuation(node):
+            _dlog(
+                "syntax_validator_benign_jsx_text_suppressed",
+                line=node.start_point[0] + 1,
+                col=node.start_point[1],
+                text_preview=error_text_preview,
+            )
+            # Session ff34af1d proved (byte-for-byte, reproduced from
+            # production log) that tree-sitter-typescript's TSX grammar
+            # raises a false ERROR node for perfectly valid, unescaped
+            # JSX text content containing '&', '&&', '<' or '>' used as
+            # plain prose (e.g. "& many more", "5 > 3 items", "Terms &
+            # Conditions"). Real browsers/Babel accept this without any
+            # escaping. Confirmed via minimal repro: adjacent-JSX-element,
+            # unclosed-tag, and bad-expression-block bugs are NOT affected
+            # by this filter — they still get flagged (see
+            # test_syntax_validator_jsx_text_false_positive.py).
+            return
+
         line = node.start_point[0] + 1
         col = node.start_point[1]
-        text = code[node.start_byte:node.end_byte][:120]
+        text = code_bytes[node.start_byte:node.end_byte][:120].decode('utf-8', 'replace')
+        message = _classify_error(node, code_bytes)
+
+        # Any ERROR node whose text begins with JSX-text-like punctuation
+        # ('&', '<', '>') but that the guard did NOT suppress is exactly
+        # the boundary case worth watching for regressions or missed
+        # false positives — log it so any recurrence has a trace instead
+        # of silently reappearing as an unexplained QA block.
+        if text.lstrip()[:1] in ('&', '<', '>'):
+            _dlog(
+                "syntax_validator_punctuation_error_not_suppressed",
+                line=line,
+                col=col,
+                text_preview=text[:80],
+                message=message,
+            )
 
         errors.append({
             "line": line,
             "column": col,
             "text": text,
-            "message": _classify_error(node, code),
+            "message": message,
             "detail": f"Line {line}, col {col}: {text[:60]}"
         })
     elif node.has_error:
         for child in node.children:
-            _find_error_nodes(child, errors, code, max_errors)
+            _find_error_nodes(child, errors, code_bytes, max_errors)
 
 
-def _classify_error(error_node, code: str) -> str:
-    """Classify the error type for user-friendly messaging."""
-    text = code[error_node.start_byte:error_node.end_byte][:200]
-    line_start = code.rfind('\n', 0, error_node.start_byte) + 1
-    line_end = code.find('\n', error_node.end_byte)
+def _is_benign_jsx_text_punctuation(error_node) -> bool:
+    """True if an ERROR node is just plain JSX text content containing raw
+    '&', '&&', '<', or '>' punctuation — a known tree-sitter-typescript TSX
+    grammar false positive, not an actual code defect.
+
+    Only fires when:
+      1. The ERROR node sits directly inside a jsx_element/jsx_fragment's
+         children (i.e. it IS the text between open/close tags), and
+      2. None of its descendants are actual JSX/expression nodes — real
+         bugs (adjacent elements, unclosed tags, broken expression blocks)
+         always have jsx_element/jsx_fragment/jsx_expression descendants
+         under the ERROR node, so this never masks them.
+    """
+    parent = error_node.parent
+    if parent is None or parent.type not in ('jsx_element', 'jsx_fragment'):
+        return False
+    if _has_jsx_descendant(error_node):
+        return False
+
+    # CONTENT check, not just structure. Verified against real Babel
+    # (@babel/core + @babel/preset-react — ground truth for what actually
+    # ships/compiles, not a guess):
+    #   - bare '&' / '&&' followed by prose in JSX text -> Babel ACCEPTS
+    #     (confirmed: `<div>salt & pepper && more</div>` compiles clean)
+    #   - bare '>' in JSX text -> Babel REJECTS: "Unexpected token `>`.
+    #     Did you mean `&gt;` or `{'>'}`?" — a REAL compile error
+    #   - bare '<' in JSX text -> Babel REJECTS: "Unexpected token"
+    # An earlier draft of this guard suppressed all three based on tree
+    # shape alone (no jsx descendant under the ERROR node), which silently
+    # hid a real `>` bug (over-suppression) — caught here by re-testing
+    # against actual Babel before shipping. Only text that STARTS with
+    # '&' is proven safe to suppress; '<' / '>' must stay flagged.
+    error_text = error_node.text.decode('utf-8', 'replace') if error_node.text else ''
+    return error_text.lstrip().startswith('&')
+
+
+def _has_jsx_descendant(node) -> bool:
+    for child in node.children:
+        if child.type in (
+            'jsx_element', 'jsx_fragment',
+            'jsx_self_closing_element', 'jsx_expression',
+        ):
+            return True
+        if _has_jsx_descendant(child):
+            return True
+    return False
+
+
+def _classify_error(error_node, code_bytes: bytes) -> str:
+    """Classify the error type for user-friendly messaging.
+
+    `code_bytes` MUST be the UTF-8 encoded buffer that was parsed — all
+    offsets here are byte offsets, not character offsets.
+    """
+    text = code_bytes[error_node.start_byte:error_node.end_byte][:200].decode('utf-8', 'replace')
+    line_start = code_bytes.rfind(b'\n', 0, error_node.start_byte) + 1
+    line_end = code_bytes.find(b'\n', error_node.end_byte)
     if line_end == -1:
-        line_end = len(code)
-    context = code[line_start:line_end].strip()
+        line_end = len(code_bytes)
+    context = code_bytes[line_start:line_end].decode('utf-8', 'replace').strip()
 
     # Adjacent JSX elements pattern
     if '<>' in text or '</>' in text or (text.strip().startswith('<') and error_node.parent):
