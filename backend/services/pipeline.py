@@ -20783,9 +20783,26 @@ async def run_natural_pipeline_stream(
                   fixed_indices=fixed_indices,
                   fixed_symbols=[change_shells[i]["symbol"].name for i in fixed_indices] if fixed_indices else [])
             if not fixed_indices:
-                _dlog("qa_retry_no_fixes_breaking", session_id=session_id, user_id=user_id,
-                      retry_round=_qa_retry_round)
-                break  # No code actually changed — stop retrying
+                # ── Evidence (trace 29fba21b (3)): a correction attempt can
+                # legitimately produce ZERO fixed_indices in a round — e.g. our
+                # multi-window content-gain/duplication guard correctly
+                # rejects a bad window, which rolls back the WHOLE symbol
+                # (hard_fail) even though other windows spliced clean. That is
+                # NOT the same as "nothing left to try": qa_results for the
+                # still-blocked symbol is untouched (only fixed_indices get
+                # re-QA'd below), so blocked_indices will recompute the same
+                # symbol as blocked next round and retry it fresh — this is
+                # exactly what a manual resubmission does (and it worked,
+                # 2 -> 9/10). Only stop early if we're out of retry budget;
+                # otherwise let the loop use every round it's allowed.
+                _dlog("qa_retry_no_fixes_this_round", session_id=session_id, user_id=user_id,
+                      retry_round=_qa_retry_round,
+                      rounds_remaining=MAX_QA_RETRIES - _qa_retry_round - 1)
+                if _qa_retry_round >= MAX_QA_RETRIES - 1:
+                    _dlog("qa_retry_no_fixes_breaking", session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round)
+                    break  # No code changed AND out of rounds — stop retrying
+                continue  # rounds remain — recompute blocked_indices and retry fresh
 
             # Re-run QA on all fixed changes in parallel
             # ── Pipeline deadline gate (re-QA) ─────────────────────────
