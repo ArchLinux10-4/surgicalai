@@ -19644,6 +19644,8 @@ async def run_natural_pipeline_stream(
                         corrected_fixes = edit_data.get("fixes")
                         corrected_code = edit_data.get("new_code", "")
                         corrected_old  = edit_data.get("old_code", "")
+                        corrected_edit_start_line = edit_data.get("edit_start_line")
+                        corrected_edit_end_line   = edit_data.get("edit_end_line")
                         _sym_code = change_shells[idx]["symbol"].code
 
                         _dlog("qa_retry_correction_parsed", session_id=session_id, user_id=user_id,
@@ -19821,6 +19823,85 @@ async def run_natural_pipeline_stream(
                                   old_code_len=len(corrected_old),
                                   new_code_len=len(corrected_code),
                                   note="windowed prompt sent but model used old_code/new_code format — trying Path 2")
+
+                        # ── Path L: edit_start_line/edit_end_line splice (un-windowed) ──
+                        # Claude is explicitly told it MAY answer a correction with
+                        # edit_start_line/edit_end_line + new_code instead of a full
+                        # symbol or an old_code/new_code snippet (this is the SAME
+                        # format the main resolution path already supports via
+                        # _apply_snippet_by_lines — see line ~4432 and its call site
+                        # at ~17674). Before this fix, this branch of the correction
+                        # applier never read edit_start_line/edit_end_line at all, so
+                        # a correction using this format fell straight through to
+                        # Path 3 (full-symbol replacement), which fragment-rejected
+                        # the small snippet and the correction was silently dropped
+                        # even though it was a perfectly valid targeted edit.
+                        # Only applies when NOT windowed — Path W already owns the
+                        # windowed-splice case above.
+                        if (accepted is None and not _winfo and not _windowed_path_attempted
+                                and corrected_code and not corrected_old
+                                and corrected_edit_start_line and corrected_edit_end_line):
+                            _sym_abs_start = getattr(change_shells[idx]["symbol"], "start_line", 1) or 1
+                            try:
+                                _isl_corr = int(corrected_edit_start_line)
+                                _iel_corr = int(corrected_edit_end_line)
+                            except (TypeError, ValueError) as _ls_conv_err:
+                                _isl_corr = _iel_corr = None
+                                _dlog("correction_linesplice_non_numeric_bounds",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      raw_start=repr(corrected_edit_start_line),
+                                      raw_end=repr(corrected_edit_end_line),
+                                      error=str(_ls_conv_err),
+                                      note="edit_start_line/edit_end_line were not valid ints — "
+                                           "falling through to Path 2/3")
+
+                            if _isl_corr is not None and _iel_corr is not None:
+                                _ls_full, _ls_ok, _ls_reason = _apply_snippet_by_lines(
+                                    _sym_code, _sym_abs_start, _isl_corr, _iel_corr, corrected_code
+                                )
+
+                                _dlog("correction_linesplice_attempt",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      edit_start_line=_isl_corr, edit_end_line=_iel_corr,
+                                      sym_abs_start=_sym_abs_start,
+                                      ok=_ls_ok, reason=_ls_reason,
+                                      new_code_len=len(corrected_code),
+                                      sym_code_len=len(_sym_code))
+
+                                if _ls_ok:
+                                    _frag_ls = _fragment_reason(_sym_code, _ls_full)
+                                    if _frag_ls is None:
+                                        accepted = _ls_full
+                                        _dlog("correction_linesplice_accepted",
+                                              session_id=session_id, user_id=user_id,
+                                              retry_round=_qa_retry_round, idx=idx,
+                                              symbol=change_shells[idx]["symbol"].name,
+                                              edit_start_line=_isl_corr, edit_end_line=_iel_corr,
+                                              result_lines=len(_ls_full.splitlines()))
+                                    else:
+                                        _dlog("correction_linesplice_fragment_rejected",
+                                              session_id=session_id, user_id=user_id,
+                                              retry_round=_qa_retry_round, idx=idx,
+                                              symbol=change_shells[idx]["symbol"].name,
+                                              edit_start_line=_isl_corr, edit_end_line=_iel_corr,
+                                              fragment_reason=_frag_ls,
+                                              note="line-splice bounds were valid but result "
+                                                   "still failed fragment check — falling through "
+                                                   "to Path 2/3")
+                                else:
+                                    _dlog("correction_linesplice_bounds_failed",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          edit_start_line=_isl_corr, edit_end_line=_iel_corr,
+                                          sym_abs_start=_sym_abs_start,
+                                          reason=_ls_reason,
+                                          note="edit_start_line/edit_end_line out of bounds for "
+                                               "this symbol — falling through to Path 2/3")
 
                         # ── Path 2: old_code/new_code snippet splice (fallback) ──
                         _file_level_fixed = False
