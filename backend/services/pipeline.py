@@ -18439,7 +18439,37 @@ async def run_natural_pipeline_stream(
                 _intermediate_contents[filename] = file_content
 
             # QA sees the file state AFTER all previous changes to this file
-            qa_original_content = _intermediate_contents[filename]
+            # (Fix 1: cross-change ordering — needed so change #2 can see
+            # a helper added by change #1 in the same run).
+            #
+            # v3.14.0 — Path Q fix: when the symbol's OWN original text is
+            # still present verbatim in the intermediate file (i.e. no prior
+            # change in this run touched this exact span), scope QA's
+            # "before" snapshot down to just that symbol instead of the
+            # whole file. Passing the whole file as `original_code` while
+            # `new_code` is a small scoped edit (e.g. a ~40-line import-only
+            # `_preamble` edit against an 878-line file) makes QA compare
+            # apples to oranges and misfire "catastrophic truncation" on
+            # every correctly-scoped small edit — proven in
+            # surgical_debug_c557dd1b.jsonl (AddJobModal.jsx, RegionBatchGenerator.jsx).
+            # Fall back to the whole intermediate file only when the
+            # symbol's original text can no longer be found verbatim —
+            # exactly the cross-change case Fix 1 was built for.
+            _qa_intermediate = _intermediate_contents[filename]
+            if symbol.code and symbol.code in _qa_intermediate:
+                qa_original_content = symbol.code
+                _dlog("qa_original_content_scoped_to_symbol",
+                      session_id=session_id, filename=filename,
+                      symbol=symbol.name,
+                      symbol_lines=len(symbol.code.splitlines()),
+                      whole_file_lines=len(_qa_intermediate.splitlines()))
+            else:
+                qa_original_content = _qa_intermediate
+                _dlog("qa_original_content_fallback_whole_file",
+                      session_id=session_id, filename=filename,
+                      symbol=symbol.name,
+                      reason="symbol_code_not_found_verbatim_prior_change_in_run",
+                      whole_file_lines=len(_qa_intermediate.splitlines()))
 
             diff = _make_diff(symbol.code, new_code, symbol.name)
             _tgt, _repl = _compute_target_element(symbol.code, new_code)
