@@ -204,13 +204,36 @@ def search_chats(request: Request, q: str):
 import openai as _openai_mod
 
 # Token-aware compaction settings
-HISTORY_TOKEN_BUDGET = 30_000  # Max estimated tokens before compaction triggers
-MIN_RECENT_KEEP = 6            # Always keep at least this many recent messages
+#
+# Long-session structural fix (see _dlog "compact_*" events for live evidence):
+# the previous constants (30K budget / keep-6 / 500-char truncate / 500-token
+# summary / 400-word cap) caused compaction to fire many times over a 3+ hour
+# session, and each round re-compressed the ALREADY-compressed prior summary
+# together with new turns into another <=400-word blob — compounding loss on
+# every round. Raised thresholds below reduce how often compaction fires and
+# how much detail each round is allowed to discard. The compounding-loss
+# mechanism itself is fixed further down: each round now summarizes ONLY the
+# new turns and appends that to the existing summary (instead of asking the
+# model to re-shrink old + new together every time). A separate, rare
+# "meta-compaction" pass (SUMMARY_META_COMPACT_CHARS) is the only place old
+# summary text is ever re-compressed, and that only happens after many rounds
+# of appending, not on every round.
+HISTORY_TOKEN_BUDGET = 60_000       # Max estimated tokens before compaction triggers (was 30_000)
+MIN_RECENT_KEEP = 20                # Always keep at least this many recent messages raw (was 6)
+PER_MESSAGE_TRUNCATE_CHARS = 3000   # Max chars kept per message before summarization (was 500)
+SUMMARY_MAX_TOKENS = 1500           # Max output tokens for a per-round compaction summary (was 500)
+SUMMARY_WORD_CAP = 1200             # Word ceiling stated in the per-round compaction prompt (was 400)
+SUMMARY_META_COMPACT_CHARS = 12_000  # If the appended running summary grows past this many
+                                     # characters, run one extra consolidation pass over the
+                                     # summary alone (rare — only in very long sessions).
+SUMMARY_META_MAX_TOKENS = 2200       # Output budget for that rare meta-consolidation pass.
+SUMMARY_META_WORD_CAP = 1800
 
 async def _compact_session(session_id: str, user_id: str) -> tuple[str, int]:
     """
     Token-aware compaction: compact oldest uncompacted messages, keeping
-    MIN_RECENT_KEEP recent ones. Uses GPT-4.1-mini (fast + cheap).
+    MIN_RECENT_KEEP recent ones. Prefers Claude Sonnet 5; falls back to
+    GPT-4.1-mini only when the user has no Anthropic key.
     Returns (new_summary, compacted_count). compacted_count is 0 when no
     compaction actually ran (e.g. below threshold, or an error occurred).
     """
@@ -287,65 +310,139 @@ async def _compact_session(session_id: str, user_id: str) -> tuple[str, int]:
                 else:
                     cleaned = raw
 
-                turns_text_parts.append(f"{role}: {cleaned[:500]}")
+                turns_text_parts.append(f"{role}: {cleaned[:PER_MESSAGE_TRUNCATE_CHARS]}")
 
             turns_text = "\n".join(turns_text_parts)
-            prompt_parts = []
-            if existing:
-                prompt_parts.append(f"Previous summary:\n{existing}\n")
-            prompt_parts.append(f"New conversation turns to add:\n{turns_text}")
 
             # Structured checklist prompt (not free-form prose). Modeled on how
             # Anthropic's own compaction API and Claude Code scope a compaction
             # summary: fixed categories so no category can be silently dropped,
             # rather than one open-ended "summarize this" instruction.
+            #
+            # NOTE: this prompt summarizes ONLY the new turns below — it is
+            # deliberately NOT asked to also re-compress `existing`. The prior
+            # summary is appended (not replaced) after this call returns, so
+            # a normal compaction round never re-shrinks detail that a previous
+            # round already captured. See SUMMARY_META_COMPACT_CHARS below for
+            # the one place old summary text can be re-compressed.
             compact_prompt = (
                 "You are compacting a coding-assistant conversation so it can be carried "
-                "forward without the full transcript. Produce a summary using EXACTLY "
-                "these six headers, in this order, each followed by concise bullet points "
-                "(write \"- none\" under a header if it truly has nothing to report, but "
-                "always include all six headers):\n\n"
+                "forward without the full transcript. Summarize ONLY the NEW conversation "
+                "turns given below (do not restate or re-summarize any earlier summary — "
+                "there is none in this prompt). Produce a summary using EXACTLY these six "
+                "headers, in this order, each followed by concise bullet points (write "
+                "\"- none\" under a header if it truly has nothing to report, but always "
+                "include all six headers):\n\n"
                 "**User intent** — what the user is overall trying to accomplish.\n"
                 "**Key decisions** — technical or design decisions made, and why.\n"
                 "**Files & changes** — which files/symbols were discussed or edited, and what changed.\n"
                 "**Errors & fixes** — problems hit and how they were resolved.\n"
                 "**Pending / open items** — anything started but not finished.\n"
                 "**Next step** — the single most immediate next action.\n\n"
-                "Be concise but complete. Under 400 words total."
+                f"Be concise but complete. Under {SUMMARY_WORD_CAP} words total."
             )
 
             openai_key = _resolve_chat_key(user_id, "openai")
             anthropic_key = _resolve_chat_key(user_id, "anthropic")
 
-            new_summary = ""
-            if openai_key:
+            # Claude Sonnet 5 is the preferred compaction model everywhere in this
+            # codebase — GPT-4.1-mini is only a fallback when the user has no
+            # Anthropic key configured (per-user keys only, never shared).
+            new_chunk_summary = ""
+            used_model = ""
+            if anthropic_key:
+                from anthropic import AsyncAnthropic as _AsyncAnthropic
+                aclient = _AsyncAnthropic(api_key=anthropic_key)
+                resp = await aclient.messages.create(
+                    model="claude-sonnet-5",
+                    max_tokens=SUMMARY_MAX_TOKENS,
+                    system=compact_prompt,
+                    messages=[{"role": "user", "content": turns_text}],
+                )
+                new_chunk_summary = resp.content[0].text if resp.content else ""
+                used_model = "claude-sonnet-5"
+            elif openai_key:
                 client = _openai_mod.AsyncOpenAI(api_key=openai_key)
                 resp = await client.chat.completions.create(
                     model="gpt-4.1-mini",
                     messages=[
                         {"role": "system", "content": compact_prompt},
-                        {"role": "user", "content": "\n".join(prompt_parts)}
+                        {"role": "user", "content": turns_text}
                     ],
-                    max_tokens=500,
+                    max_tokens=SUMMARY_MAX_TOKENS,
                 )
-                new_summary = resp.choices[0].message.content or ""
-            elif anthropic_key:
-                from anthropic import AsyncAnthropic as _AsyncAnthropic
-                aclient = _AsyncAnthropic(api_key=anthropic_key)
-                resp = await aclient.messages.create(
-                    model="claude-haiku-4-5-20251001",
-                    max_tokens=500,
-                    system=compact_prompt,
-                    messages=[{"role": "user", "content": "\n".join(prompt_parts)}],
-                )
-                new_summary = resp.content[0].text if resp.content else ""
+                new_chunk_summary = resp.choices[0].message.content or ""
+                used_model = "gpt-4.1-mini"
             else:
                 _dlog("compact_session_no_api_key", session_id=session_id, user_id=user_id)
                 return existing, 0
 
-            if not new_summary.strip():
+            if not new_chunk_summary.strip():
                 _dlog("compact_session_empty_summary_from_model", session_id=session_id,
-                      used_openai=bool(openai_key), used_anthropic=bool(anthropic_key and not openai_key))
+                      used_model=used_model)
+
+            # Append (do not replace): the running summary accumulates each
+            # round's chunk as its own dated section, so information from
+            # earlier rounds is never silently re-compressed on a normal round.
+            _dlog("compact_chunk_summarized", session_id=session_id, used_model=used_model,
+                  turns_summarized=len(to_compact), chunk_chars=len(new_chunk_summary))
+            if existing.strip():
+                new_summary = (
+                    f"{existing.rstrip()}\n\n---\n\n"
+                    f"### Additional session activity\n{new_chunk_summary.strip()}"
+                )
+            else:
+                new_summary = new_chunk_summary.strip()
+
+            # Rare meta-compaction: only when the accumulated (appended) summary
+            # itself has grown past SUMMARY_META_COMPACT_CHARS across many rounds
+            # in a very long session. This is the one deliberate place where
+            # older summary text is re-compressed — it happens far less often
+            # than a normal round, and only on the summary itself (never on raw
+            # turn content, which is long gone by then).
+            if len(new_summary) > SUMMARY_META_COMPACT_CHARS:
+                meta_prompt = (
+                    "The text below is an accumulated running summary of a long coding-assistant "
+                    "session, made of multiple appended sections. Consolidate it into ONE coherent "
+                    "summary using the same six headers (User intent, Key decisions, Files & changes, "
+                    "Errors & fixes, Pending / open items, Next step), preserving every distinct file, "
+                    "decision, and open item mentioned anywhere in the sections — do not drop items "
+                    "just to shorten; only merge duplicates and tighten wording. "
+                    f"Under {SUMMARY_META_WORD_CAP} words total."
+                )
+                try:
+                    if anthropic_key:
+                        from anthropic import AsyncAnthropic as _AsyncAnthropic2
+                        aclient2 = _AsyncAnthropic2(api_key=anthropic_key)
+                        meta_resp = await aclient2.messages.create(
+                            model="claude-sonnet-5",
+                            max_tokens=SUMMARY_META_MAX_TOKENS,
+                            system=meta_prompt,
+                            messages=[{"role": "user", "content": new_summary}],
+                        )
+                        meta_summary = meta_resp.content[0].text if meta_resp.content else ""
+                    else:
+                        client2 = _openai_mod.AsyncOpenAI(api_key=openai_key)
+                        meta_resp = await client2.chat.completions.create(
+                            model="gpt-4.1-mini",
+                            messages=[
+                                {"role": "system", "content": meta_prompt},
+                                {"role": "user", "content": new_summary}
+                            ],
+                            max_tokens=SUMMARY_META_MAX_TOKENS,
+                        )
+                        meta_summary = meta_resp.choices[0].message.content or ""
+                    if meta_summary.strip():
+                        _dlog("compact_meta_consolidation_applied", session_id=session_id,
+                              before_chars=len(new_summary), after_chars=len(meta_summary))
+                        new_summary = meta_summary.strip()
+                    else:
+                        _dlog("compact_meta_consolidation_empty_kept_appended", session_id=session_id,
+                              summary_chars=len(new_summary))
+                except Exception as meta_exc:
+                    # Degrade safely: keep the (larger but complete) appended
+                    # summary rather than lose it if the meta pass fails.
+                    _dlog("compact_meta_consolidation_error", session_id=session_id, error=str(meta_exc))
 
             ids = [dict(r)["id"] for r in to_compact]
             placeholders = ",".join(["?" for _ in ids])
