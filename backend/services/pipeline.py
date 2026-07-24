@@ -513,6 +513,29 @@ def _parse_filereq_content(raw: str) -> list:
             return [str(f).strip() for f in parsed if str(f).strip()]
         elif isinstance(parsed, str):
             return [parsed.strip()]
+        elif isinstance(parsed, dict):
+            # Proven bug (session d8f0ed39, 2026-07-23): Claude sometimes emits
+            # a JSON object shape here — matching the dict convention used by
+            # <search_request>/<history_request> in the same instruction block
+            # — instead of the documented array/string. Before this branch,
+            # a dict was valid JSON but matched neither `list` nor `str`, so
+            # it silently fell through to `return []` with NO log trace,
+            # dropping a legitimate file request and starving the model mid-task.
+            # Accept both {"filename": "x"} and {"filenames": [...]} so the
+            # request is recovered instead of silently discarded.
+            _names = []
+            if isinstance(parsed.get("filenames"), list):
+                _names = [str(f).strip() for f in parsed["filenames"] if str(f).strip()]
+            elif parsed.get("filename"):
+                _names = [str(parsed["filename"]).strip()]
+            _dlog("filereq_dict_shape_recovered",
+                  raw_preview=raw[:200],
+                  recovered=_names[:10],
+                  recovered_count=len(_names))
+            return _names
+        _dlog("filereq_unrecognized_json_shape",
+              raw_preview=raw[:200],
+              parsed_type=type(parsed).__name__)
         return []
     except (json.JSONDecodeError, ValueError):
         # Non-JSON fallback: split on commas/newlines, but keep only fragments
@@ -15120,7 +15143,9 @@ async def run_natural_pipeline_stream(
             "CONTEXT TOOLS — use any of these, as many times as you need, in any\n"
             "order, and interleave them freely with your edits:\n"
             "• <search_request> — grep the codebase for symbols or text you need to see.\n"
-            "• <file_request> — pull the FULL contents of specific file(s).\n"
+            "• <file_request> — pull the FULL contents of specific file(s). Body is a "
+            "JSON array of exact filenames, e.g. "
+            "<file_request>[\"file1.py\", \"file2.tsx\"]</file_request>.\n"
             + ("• <github_request> — read from the connected GitHub repository.\n" if _gh_nat_enabled else "")
             + ("• <history_request>{\"filename\": \"...\", \"query\": \"optional keyword\"} — "
                "look up an OLDER/original version of a file from THIS session's edit "
