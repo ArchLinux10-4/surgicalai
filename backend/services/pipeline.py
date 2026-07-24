@@ -1324,6 +1324,12 @@ def _friendly_error(e: Exception) -> str:
             return "You've hit the API rate limit. Wait a few seconds and try again."
         if "invalid" in low and "key" in low:
             return "Your Anthropic API key appears to be invalid. Check **Settings → API Keys**."
+        if "content filtering" in low or "content_filter" in low:
+            _dlog("friendly_error_anthropic_content_filter", raw_error=msg[:500])
+            return ("Claude's content filter blocked this response. This can happen on certain "
+                    "code patterns (e.g. security- or scraping-related logic) even when the code "
+                    "itself is legitimate. Try rephrasing your request or breaking the change into "
+                    "a smaller step.")
 
     # Gemini-specific errors
     if "google" in cls or "gemini" in low or "generativelanguage" in low:
@@ -15505,6 +15511,12 @@ async def run_natural_pipeline_stream(
                             _dlog("tag_stop_sequences_rejected_disabled",
                                   session_id=session_id, user_id=user_id, error=err_str[:300])
                             continue
+                        _dlog("stream_error_not_retried",
+                              session_id=session_id, user_id=user_id, turn=_turn,
+                              error_type=type(stream_err).__name__,
+                              is_content_filter=("content filtering" in err_str.lower()
+                                                  or "content_filter" in err_str.lower()),
+                              error=err_str[:500])
                         raise
 
             else:
