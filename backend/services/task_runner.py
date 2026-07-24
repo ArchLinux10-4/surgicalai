@@ -258,6 +258,7 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
                 project_memory=project_memory,
                 session_summary=session_summary,
                 user_id=user_id,
+                is_agent_task=True,
             ):
                 poll += 1
                 if poll % 20 == 0 and cancel_requested_for_run(session_id, run_id):

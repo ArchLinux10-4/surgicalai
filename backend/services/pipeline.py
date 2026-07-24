@@ -542,6 +542,27 @@ def _parse_search_content(raw: str):
         return None
 
 
+def _parse_history_content(raw: str):
+    """Parse history_request tag content — JSON dict {"filename": ..., "query": ...
+    (optional)}. Returns a dict with at least "filename", or None if the tag
+    body was not valid JSON / had no usable filename (mirrors
+    _parse_search_content's fail-quiet-to-None style; the caller wraps a
+    None return into an {"_invalid": ...} recovery message, same as search/
+    filereq/github)."""
+    try:
+        parsed = json.loads(raw.strip())
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    filename = str(parsed.get("filename", "")).strip()
+    if not filename:
+        return None
+    query = parsed.get("query")
+    query = str(query).strip() if query else None
+    return {"filename": filename, "query": query}
+
+
 def pick_no_edits_notice(
     hit_agent_max_turns: bool,
     has_skipped_changes: bool,
@@ -14479,9 +14500,20 @@ async def run_natural_pipeline_stream(
     session_summary: str = "",
     user_id: str = "",
     client_inbox=None,
+    is_agent_task: bool = False,
 ):
     """
     Natural conversation pipeline — Claude talks like Claude.
+
+    is_agent_task : True only when this call is one task of a Claude Agent
+        Mode run (task_runner.py's server-side runner, or chat.py's
+        /execute-task SSE stream). Defaults False, which is what every
+        direct single-pass chat/edit call (any model, incl. GPT and the
+        offline pipeline's own separate code path) passes — i.e. never
+        passes this kwarg at all. Gates the <history_request> tool (see
+        below): registered into TAG_DEFS only when True, so on the
+        single-pass path TAG_DEFS, the system prompt, and the stop-sequence
+        list are byte-identical to before this feature existed.
 
     client_inbox : optional asyncio.Queue back-channel to the client. Present
         only on the WebSocket transport (bidirectional). When the agent loop
@@ -14799,6 +14831,22 @@ async def run_natural_pipeline_stream(
                   session_id=session_id, user_id=user_id,
                   error=str(_gh_nat_err))
 
+        # ── History-search tag (Agent Mode only) ───────────────────────────
+        # Lets the agent pull an OLDER/original version of a session file
+        # from session_file_versions (already-existing, per-session-scoped
+        # storage — see routers/session_files.py). Registered into TAG_DEFS
+        # only when is_agent_task=True, mirroring the _gh_nat_enabled
+        # pattern above: when False (every single-pass chat/edit call),
+        # TAG_DEFS never gets this key, so the tag-open scanner and
+        # _stop_tag_order filter (`if t in TAG_DEFS`) silently skip it —
+        # zero footprint on the single-pass path, not a special-case branch.
+        HISTORY_TAG_OPEN = "<history_request>"
+        HISTORY_TAG_CLOSE = "</history_request>"
+        if is_agent_task:
+            TAG_DEFS["history"] = {"open": HISTORY_TAG_OPEN, "close": HISTORY_TAG_CLOSE}
+            _dlog("natural_history_tag_registered",
+                  session_id=session_id, user_id=user_id)
+
         # ── Debug: confirm quality rules and project memory reached the prompt ──
         _total_sys_chars = sum(b.get("text", "") if isinstance(b, dict) else b for b in system_prompt if isinstance(b, dict)) if False else sum(len(b["text"]) for b in system_prompt if isinstance(b, dict) and "text" in b)
         _has_quality = "CODE QUALITY RULES" in NATURAL_SYSTEM
@@ -15034,9 +15082,18 @@ async def run_natural_pipeline_stream(
         # what makes "think → act → observe → continue" real rather than guessed.
         # Edit / new_file closes are NOT stop sequences: the model may emit several
         # edits in one turn and only stops when it is finished.
-        _stop_tag_order = ["search", "filereq", "github", "plan"]
+        # NOTE: no blanket [:4] slice here. That cap exists because OpenAI's
+        # `stop` param is hard-limited to 4 sequences (confirmed via OpenAI's
+        # own API docs/community — NOT guessed) — it is applied independently
+        # at the GPT call site below (`_gpt_stop = _agent_stop_seqs[:4]`).
+        # Anthropic's direct Messages API (what the Claude branch actually
+        # calls) has no such cap — the 4-limit only exists on Bedrock's
+        # wrapper (confirmed via an official botocore issue), and Agent Mode
+        # is Claude-only already (`_is_claude` gate, chat.py), so Claude may
+        # freely use all 5 stop tags (incl. "history") without affecting GPT.
+        _stop_tag_order = ["search", "filereq", "github", "plan", "history"]
         _agent_stop_seqs = (
-            [TAG_DEFS[t]["close"] for t in _stop_tag_order if t in TAG_DEFS][:4]
+            [TAG_DEFS[t]["close"] for t in _stop_tag_order if t in TAG_DEFS]
             if _tag_stop_enabled else []
         )
 
@@ -15051,6 +15108,9 @@ async def run_natural_pipeline_stream(
             if _kind == "github":
                 _gd = parse_github_request(_block, dlog=_dlog)
                 return ("github", _gd if _gd is not None else {"_invalid": _block[:500]})
+            if _kind == "history":
+                _hd = _parse_history_content(_block)
+                return ("history", _hd if _hd is not None else {"_invalid": _block[:500]})
             return None
 
         # ---- Unified instruction: every tool is legal on every turn, no phase wall ----
@@ -15062,6 +15122,12 @@ async def run_natural_pipeline_stream(
             "• <search_request> — grep the codebase for symbols or text you need to see.\n"
             "• <file_request> — pull the FULL contents of specific file(s).\n"
             + ("• <github_request> — read from the connected GitHub repository.\n" if _gh_nat_enabled else "")
+            + ("• <history_request>{\"filename\": \"...\", \"query\": \"optional keyword\"} — "
+               "look up an OLDER/original version of a file from THIS session's edit "
+               "history. Omit query for the very first (pre-edit) version; include a "
+               "query to search across all saved versions. Returned content is clearly "
+               "marked HISTORICAL — it is NOT the current file, never use it as ground "
+               "truth for what exists now.\n" if is_agent_task else "")
             + "\nWhen you request context the stream pauses, the results are handed\n"
             "back to you, and you continue from there.\n\n"
             "OUTPUT — emit when (and only when) you have the context to be correct:\n"
@@ -15273,7 +15339,7 @@ async def run_natural_pipeline_stream(
                                                 if _pd is not None:
                                                     edit_plan_data = _pd
                                                 _break_stream = True
-                                            elif _tag_name in ("search", "filereq", "github"):
+                                            elif _tag_name in ("search", "filereq", "github", "history"):
                                                 pending_tool = _capture_request(_tag_name, _content)
                                                 _break_stream = True
 
@@ -15501,7 +15567,7 @@ async def run_natural_pipeline_stream(
                                             if _pd is not None:
                                                 edit_plan_data = _pd
                                             _break_stream = True
-                                        elif _tag_name in ("search", "filereq", "github"):
+                                        elif _tag_name in ("search", "filereq", "github", "history"):
                                             pending_tool = _capture_request(_tag_name, _content)
                                             _break_stream = True
                                         state = "normal"
@@ -15537,7 +15603,7 @@ async def run_natural_pipeline_stream(
             # ── Recover a context-request tag the stop_sequence halted before closing ──
             if pending_tool is None and state.startswith("in_"):
                 _uc = state[3:]
-                if _uc in ("search", "filereq", "github"):
+                if _uc in ("search", "filereq", "github", "history"):
                     _ucm = re.search(
                         re.escape(TAG_DEFS[_uc]["open"]) + r"(.*)",
                         full_response, re.DOTALL)
@@ -16046,6 +16112,58 @@ async def run_natural_pipeline_stream(
                                 f"GitHub request failed: {str(_gh_err)[:200]}. Write your edits "
                                 "with the context you have, or explain what's blocking you with "
                                 "<blocked>…</blocked>."},
+                        ]
+                    continue
+
+                if _kind == "history":
+                    _hist_req = _data if isinstance(_data, dict) else {"_invalid": str(_data)[:500]}
+                    if "_invalid" in _hist_req:
+                        _dlog("agent_history_parse_failed",
+                              session_id=session_id, user_id=user_id,
+                              raw_preview=_hist_req.get("_invalid", "")[:200])
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content":
+                                "Your <history_request> was not valid JSON (needs at least "
+                                "{\"filename\": \"...\"}). Emit a corrected <history_request>, "
+                                "or write your edits."},
+                        ]
+                        continue
+                    _hist_fn = _hist_req.get("filename", "")
+                    _hist_query = _hist_req.get("query")
+                    _dlog("agent_history_requested",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          filename=_hist_fn, query=_hist_query)
+                    yield sse({"type": "progress",
+                               "content": f"Checking history: {_hist_fn}..."})
+                    try:
+                        from routers.session_files import search_file_version_history
+                        _hist_result = search_file_version_history(
+                            session_id, _hist_fn, query=_hist_query, dlog=_dlog)
+                        if _hist_result.get("found"):
+                            if "matches" in _hist_result:
+                                _hist_body = "\n\n".join(_hist_result["matches"])
+                            else:
+                                _hist_body = _hist_result.get("content", "")
+                        else:
+                            _hist_body = _hist_result.get("message", "No history found.")
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content":
+                                f"{_hist_body}\n\nRequest more history if you need it, or "
+                                "write your edits now using the CURRENT file content shown "
+                                "earlier in this conversation — not this historical content."},
+                        ]
+                    except Exception as _hist_err:
+                        _dlog("agent_history_error",
+                              session_id=session_id, user_id=user_id,
+                              filename=_hist_fn, error=str(_hist_err)[:300])
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content":
+                                f"History lookup failed: {str(_hist_err)[:200]}. Write your "
+                                "edits with the context you have, or explain what's blocking "
+                                "you with <blocked>…</blocked>."},
                         ]
                     continue
 

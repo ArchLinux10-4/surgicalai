@@ -1679,6 +1679,7 @@ async def execute_task(req: dict, request: Request):
                 session_summary=session_summary,
                 user_id=current_user_id,
                 client_inbox=getattr(request.state, "client_inbox", None),
+                is_agent_task=True,
             )):
                 poll += 1
                 if poll % 20 == 0 and cancel_requested_for_run(session_id, run_id):

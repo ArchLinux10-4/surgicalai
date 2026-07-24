@@ -706,6 +706,148 @@ def _restore_content(conn, session_id: str, file_id: str, target_content: str,
     return lines, symbol_count
 
 
+def search_file_version_history(session_id: str, filename: str, query: str = None,
+                                 dlog=None) -> dict:
+    """Read-only lookup into session_file_versions for the agent's
+    <history_request> tool (Agent Mode only — see pipeline.py).
+
+    Strictly scoped to (session_id, filename) — same isolation boundary as
+    every other session_file_versions query in this file. Never raises: any
+    failure degrades to a clear {"found": False, "message": ...} dict so a
+    history-lookup bug can never crash the agent loop it's called from.
+
+    query is None  -> returns the OLDEST version in full (i.e. "the
+                       original file", before any edit in this session),
+                       capped at 800 lines.
+    query is given -> case-insensitive plain-text search across every
+                       stored version's content, +/-40 lines of context per
+                       match, capped at 5 matches / ~6000 chars total (same
+                       cap philosophy as _resolve_search_multifile in
+                       pipeline.py, which had a real proven 2.27M-char
+                       blowup bug from an ungapped grep — these caps are
+                       non-negotiable).
+
+    Every result the agent will see is prefixed with an unmissable banner
+    marking it as historical, non-current content — the agent must never
+    mistake an old version for the current file.
+    """
+    _d = dlog or (lambda *a, **k: None)
+
+    def _get(row, key, idx):
+        return row[key] if hasattr(row, "__getitem__") and not isinstance(row, tuple) else row[idx]
+
+    try:
+        with get_db_ctx() as conn:
+            rows = conn.execute(
+                "SELECT id, filename FROM session_files WHERE session_id = ?",
+                (session_id,)
+            ).fetchall()
+            file_map = {_get(r, "filename", 1): _get(r, "id", 0) for r in rows}
+
+            file_id = file_map.get(filename)
+            if file_id is None:
+                _ci = {k.lower(): v for k, v in file_map.items()}
+                file_id = _ci.get(filename.lower())
+            if file_id is None:
+                # Substring fuzzy match — same tolerance rule the live
+                # <file_request> resolver uses (pipeline.py _fr_cands).
+                _cands = [k for k in file_map
+                          if filename.lower() in k.lower() or k.lower() in filename.lower()]
+                if len(_cands) == 1:
+                    file_id = file_map[_cands[0]]
+                elif len(_cands) > 1:
+                    _d("agent_history_ambiguous", session_id=session_id,
+                       filename=filename, candidates=_cands[:5])
+                    return {"found": False, "message":
+                            f"'{filename}' is ambiguous — did you mean one of: "
+                            f"{', '.join(_cands[:5])}? Use the exact filename."}
+            if file_id is None:
+                _d("agent_history_not_found", session_id=session_id, filename=filename)
+                return {"found": False, "message":
+                        f"No file named '{filename}' exists in this session "
+                        f"(current or historical). Check the filename."}
+
+            vrows = conn.execute(
+                "SELECT id, content, lines, label, created_at FROM session_file_versions "
+                "WHERE file_id = ? AND session_id = ? ORDER BY created_at ASC",
+                (file_id, session_id)
+            ).fetchall()
+
+        if not vrows:
+            _d("agent_history_no_versions", session_id=session_id,
+               filename=filename, file_id=file_id)
+            return {"found": False, "message":
+                    f"'{filename}' has never been edited in this session — "
+                    f"the CURRENT file IS the original, unchanged version."}
+
+        if query:
+            ql = query.lower()
+            matches = []
+            total_chars = 0
+            MAX_MATCHES = 5
+            MAX_TOTAL_CHARS = 6000
+            CONTEXT_LINES = 40
+            for r in vrows:
+                if len(matches) >= MAX_MATCHES or total_chars >= MAX_TOTAL_CHARS:
+                    break
+                content = _get(r, "content", 1)
+                label = _get(r, "label", 3)
+                created_at = _get(r, "created_at", 4)
+                lines = content.splitlines()
+                for i, line in enumerate(lines):
+                    if ql in line.lower():
+                        lo = max(0, i - CONTEXT_LINES)
+                        hi = min(len(lines), i + CONTEXT_LINES + 1)
+                        snippet = "\n".join(lines[lo:hi])
+                        banner = (
+                            f"\u26a0\ufe0f HISTORICAL CONTENT \u2014 version from "
+                            f"{created_at}, label \"{label}\". This is NOT the "
+                            f"current file. Do not use as ground truth for what "
+                            f"exists now.")
+                        matches.append(
+                            f"{banner}\n(lines {lo + 1}-{hi} of that version)\n"
+                            f"```\n{snippet}\n```")
+                        total_chars += len(matches[-1])
+                        break  # one match per version keeps results small
+            if not matches:
+                _d("agent_history_query_no_match", session_id=session_id,
+                   filename=filename, query=query, versions_checked=len(vrows))
+                return {"found": False, "message":
+                        f"Searched {len(vrows)} historical version(s) of "
+                        f"'{filename}' for \"{query}\" \u2014 no match found."}
+            _d("agent_history_results", session_id=session_id, filename=filename,
+               query=query, matches=len(matches),
+               result_chars=sum(len(m) for m in matches))
+            return {"found": True, "matches": matches}
+
+        # No query: the OLDEST version in full = "the original file".
+        oldest = vrows[0]
+        content = _get(oldest, "content", 1)
+        label = _get(oldest, "label", 3)
+        created_at = _get(oldest, "created_at", 4)
+        MAX_LINES = 800
+        lines = content.splitlines()
+        truncated = len(lines) > MAX_LINES
+        content_out = (
+            "\n".join(lines[:MAX_LINES])
+            + f"\n... [TRUNCATED \u2014 {len(lines) - MAX_LINES} more lines. "
+              f"Use query= to search for a specific part instead.]"
+        ) if truncated else content
+        banner = (
+            f"\u26a0\ufe0f HISTORICAL CONTENT \u2014 ORIGINAL version from "
+            f"{created_at}, label \"{label}\". This is NOT the current file "
+            f"\u2014 it is the state before ALL edits made in this session. "
+            f"Do not use as ground truth for what exists now.")
+        _d("agent_history_results", session_id=session_id, filename=filename,
+           query=None, lines=len(lines), truncated=truncated)
+        return {"found": True, "content": f"{banner}\n```\n{content_out}\n```"}
+    except Exception as e:
+        _d("agent_history_error", session_id=session_id, filename=filename,
+           error=str(e)[:300])
+        return {"found": False, "message":
+                f"Could not search file history for '{filename}': {str(e)[:150]}"}
+
+
 @router.get("/{session_id}/files/{file_id}/versions")
 def list_session_file_versions(session_id: str, file_id: str):
     """List all saved versions of a file, newest first.
