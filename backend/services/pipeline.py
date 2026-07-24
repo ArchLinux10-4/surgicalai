@@ -8986,6 +8986,48 @@ class ComplianceTracker:
             pass  # Never let compliance logging kill the pipeline
 
 
+def _json_unescape_string(s: str) -> str:
+    """
+    Unescape JSON string escape sequences (\\n, \\t, \\r, \\", \\\\, \\/, \\b,
+    \\f, \\uXXXX) in text extracted via regex from a JSON-style field value.
+
+    Root cause this fixes: _regex_extract_edit_block's JSON-style branch grabs
+    raw text between quotes without ever unescaping it. When a model (any
+    model, not just GPT) emits a well-formed JSON string containing "\\n" for
+    a real newline, that literal 2-character sequence was being written
+    verbatim into the target file instead of a real newline byte, producing
+    invalid/corrupted code that QA correctly flagged (proven byte-for-byte
+    against a real production payload, session d8f0ed39, 2026-07-24).
+    """
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if ch == '\\' and i + 1 < n:
+            nxt = s[i + 1]
+            mapping = {'n': '\n', 't': '\t', 'r': '\r', '"': '"',
+                       '\\': '\\', '/': '/', 'b': '\b', 'f': '\f'}
+            if nxt in mapping:
+                out.append(mapping[nxt])
+                i += 2
+                continue
+            if nxt == 'u' and i + 5 < n:
+                hexs = s[i + 2:i + 6]
+                try:
+                    out.append(chr(int(hexs, 16)))
+                    i += 6
+                    continue
+                except ValueError:
+                    pass
+            out.append(ch)
+            i += 1
+        else:
+            out.append(ch)
+            i += 1
+    return ''.join(out)
+
+
 def _regex_extract_edit_block(raw: str) -> dict | None:
     """
     Regex-based fallback for extracting edit block fields when JSON parsing
@@ -8999,6 +9041,7 @@ def _regex_extract_edit_block(raw: str) -> dict | None:
     Returns a dict with at least 'filename' and 'new_code', or None if
     extraction fails.
     """
+    _dlog("regex_extract_invoked", raw_len=len(raw))
     result = {}
     KNOWN_KEYS = ("filename", "symbol", "description", "old_code", "new_code",
                   "edit_start_line", "edit_end_line")
@@ -9072,7 +9115,7 @@ def _regex_extract_edit_block(raw: str) -> dict | None:
         # Phase 1
         while lines:
             s = lines[-1].strip()
-            if s in ('', '}', ']', '},', '],'):
+            if s in ('', '}', ']', '},', '],', ',', ';'):
                 lines.pop()
             else:
                 break
@@ -9083,16 +9126,26 @@ def _regex_extract_edit_block(raw: str) -> dict | None:
             if s in ('"', '",'):
                 lines.pop()
             else:
-                # Single-line case: closing "} or ", stuck to code
+                # Single-line case: closing "} or ", or "; stuck to code
+                # (";  observed from malformed model output that appends a
+                #  stray semicolon after the closing quote — see
+                #  regex_extract_invoked _dlog trace, session d8f0ed39)
                 last = lines[-1]
-                if last.endswith('"}') or last.endswith('",'):
+                if last.endswith('";'):
+                    lines[-1] = last[:-2]
+                elif last.endswith('"}') or last.endswith('",'):
                     lines[-1] = last[:-2]
                 elif last.endswith('"'):
                     lines[-1] = last[:-1]
 
         code = '\n'.join(lines).strip('\n')
         if code:
-            result[field] = code
+            unescaped = _json_unescape_string(code)
+            if unescaped != code:
+                _dlog("regex_extract_json_unescaped", field=field,
+                      before_len=len(code), after_len=len(unescaped),
+                      had_literal_backslash_n=('\\n' in code))
+            result[field] = unescaped
 
     if result.get("filename") and result.get("new_code"):
         # Tag which extraction formats were used for debugging
@@ -9106,7 +9159,14 @@ def _regex_extract_edit_block(raw: str) -> dict | None:
             else "hybrid" if _xml_tags_used
             else "json_regex"
         )
+        _dlog("regex_extract_success", filename=result.get("filename"),
+              extraction_format=result["_extraction_format"],
+              has_old_code=bool(result.get("old_code")),
+              new_code_len=len(result.get("new_code", "")))
         return result
+    _dlog("regex_extract_failed", raw_len=len(raw),
+          has_filename=bool(result.get("filename")),
+          has_new_code=bool(result.get("new_code")))
     return None
 
 
