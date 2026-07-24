@@ -1308,9 +1308,14 @@ def _friendly_error(e: Exception) -> str:
     msg = str(e)
     low = msg.lower()
     cls = type(e).__name__.lower()
+    mod = (type(e).__module__ or "").lower()
 
     # Anthropic-specific errors
-    if "anthropic" in cls or (("500" in msg or "529" in msg or "overload" in low) and "anthropic" in (cls + low)):
+    # NOTE: the real anthropic SDK exception class is named e.g. "APIStatusError" -
+    # the vendor name only appears in __module__ (e.g. "anthropic._exceptions" /
+    # "anthropic"), never in __name__. Checking __name__ alone silently failed to
+    # match any real SDK exception; kept as a fallback for wrapped/custom errors.
+    if "anthropic" in cls or "anthropic" in mod or (("500" in msg or "529" in msg or "overload" in low) and "anthropic" in (cls + low)):
         if "overloaded" in low or "529" in msg:
             return ("The AI service is temporarily overloaded. "
                     "Please wait a moment and try again — it usually clears in a few seconds.")
@@ -1364,6 +1369,12 @@ def _friendly_error(e: Exception) -> str:
         return msg
 
     # Generic fallback — never show raw Python dict/object representations
+    _dlog(
+        "friendly_error_fallback_unmatched",
+        error_type=cls,
+        error_module=mod,
+        message_snippet=msg[:300],
+    )
     short = msg[:150].replace("{", "(").replace("}", ")").replace("'type'", "type")
     return f"Something went wrong. Please try again in a moment. *(Detail: {short})*"
 
