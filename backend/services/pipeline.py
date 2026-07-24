@@ -713,6 +713,28 @@ def _parse_plan_content(raw: str):
         return None
 
 
+def _recover_stopped_plan_tag(full_response: str, tag_buf: str,
+                               plan_open: str = "<edit_plan>"):
+    """Recover an ``<edit_plan>`` whose closing tag was swallowed by the
+    Anthropic ``stop_sequence`` mechanism instead of appearing in the
+    stream text.
+
+    Proven root cause (session d8f0ed39, turn 4): the model finished a
+    complete, valid plan, the API halted the stream exactly at
+    ``</edit_plan>`` (``state_at_halt: "in_plan"``), and the per-turn
+    recovery step only handled ``search``/``filereq``/``github``/``history``
+    tags — "plan" was missing. The finished plan was thrown away and the
+    model was falsely told it "did not produce any code changes", wasting
+    an entire extra turn of thinking before the phase deadline fired.
+
+    Returns the parsed plan (a list) if the content between ``plan_open``
+    and end-of-response parses as valid JSON, else ``None``. Never raises.
+    """
+    match = re.search(re.escape(plan_open) + r"(.*)", full_response, re.DOTALL)
+    body = match.group(1) if match else tag_buf
+    return _parse_plan_content(body)
+
+
 def _looks_like_edit_block(text: str) -> bool:
     """True when `text` plausibly holds a JSON edit / new-file payload rather
     than prose.
@@ -15639,6 +15661,25 @@ async def run_natural_pipeline_stream(
                         tag_buf = ""
                         _dlog("agent_request_tag_recovered",
                               session_id=session_id, user_id=user_id, turn=_turn, kind=_uc)
+                elif _uc == "plan" and edit_plan_data is None:
+                    # Same stop_sequence truncation as above, but for <edit_plan>.
+                    # Proven root cause (session d8f0ed39): a fully-formed plan
+                    # was silently discarded here because "plan" was missing
+                    # from the recovery tuple, triggering a false "you produced
+                    # no output" nudge that burned an entire extra turn of
+                    # thinking before the phase deadline killed the request.
+                    _pd = _recover_stopped_plan_tag(
+                        full_response, tag_buf, TAG_DEFS["plan"]["open"])
+                    _dlog("agent_plan_tag_recover_attempt",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          tag_buf_len=len(tag_buf), parsed=_pd is not None)
+                    if _pd is not None:
+                        edit_plan_data = _pd
+                        state = "normal"
+                        tag_buf = ""
+                        _dlog("agent_plan_tag_recovered",
+                              session_id=session_id, user_id=user_id, turn=_turn,
+                              plan_items=len(_pd))
 
             _new_edits = (len(edit_blocks_raw) + len(new_file_blocks_raw)) - _edits_before
 
