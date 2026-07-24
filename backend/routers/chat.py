@@ -8,7 +8,9 @@ from fastapi.responses import StreamingResponse
 from models.schemas import ChatRequest, NewSessionRequest, ChatSession
 from database import get_db, get_db_ctx, get_setting, get_user_api_key, GLOBAL_MEMORY_KEY
 from crypto_utils import decrypt_api_key
-from services.pipeline import run_chat, run_chat_stream, _dlog
+from services.pipeline import (
+    run_chat, run_chat_stream, _dlog, _clean_history_content, HISTORY_WINDOW,
+)
 
 
 def _resolve_chat_key(user_id: str, key_type: str) -> str:
@@ -99,6 +101,61 @@ def _mode_directive(mode: str) -> str:
     if mode == "plan":
         return _PLAN_DIRECTIVE
     return ""
+
+
+def _estimate_history_tokens(conversation_history: list) -> int:
+    """
+    Estimate tokens for the compaction trigger using the SAME cleaning +
+    per-message cap the real Claude calls apply (pipeline.py's clean_history
+    build, ~line 14963) — not the raw uncleaned DB content.
+
+    Bug fixed: the raw DB `content` column can include full uncapped
+    __SURGICAL_RESULT__ JSON blobs (original_code + new_code + find/replace
+    duplicates). Estimating tokens from that inflates the count and can
+    trigger false `needs_compaction` even on small (e.g. 8-message) sessions,
+    while the model itself is never actually starved because the real Claude
+    call path already cleans + caps before sending.
+    """
+    total_chars = 0
+    for h in conversation_history:
+        content = str(h.get("content") or "")
+        if h.get("role") == "assistant":
+            content = _clean_history_content(content)
+        total_chars += len(content[:4000])
+    return total_chars // 4
+
+
+def _build_mode_history(conversation_history: list) -> list:
+    """
+    Build the windowed, cleaned message list sent to run_chat_stream() for
+    Ask/Plan mode.
+
+    Bug fixed: this branch previously sent the FULL raw, uncleaned
+    conversation_history with no HISTORY_WINDOW slice, no
+    _clean_history_content(), and no per-message cap -- the same defenses
+    the Edit-mode path already applies (pipeline.py's clean_history build,
+    ~line 14963). Proven root cause of a live failure (session
+    d8f0ed39): 29 raw messages including uncleaned __SURGICAL_RESULT__ JSON
+    blobs reached 1,353,079 tokens and Anthropic hard-rejected the request
+    (400: "prompt is too long ... > 1000000 maximum"), surfaced to the user
+    as the generic "file may be too large" error.
+
+    Reuses the exact same helper + constant the Edit-mode path already uses
+    -- single source of truth for both paths, nothing reinvented.
+    """
+    messages = []
+    for h in conversation_history[-HISTORY_WINDOW:]:
+        role = h.get("role", "user")
+        if role not in ("user", "assistant"):
+            continue
+        content = str(h.get("content", "")).strip()
+        if not content:
+            continue
+        if role == "assistant":
+            content = _clean_history_content(content)
+        if content:
+            messages.append({"role": role, "content": content[:4000]})
+    return messages
 
 
 def _load_effective_memory(conn, session_id):
@@ -841,8 +898,9 @@ async def smart_stream(req: dict, request: Request):
         _dlog("history_loaded_excludes_compaction_marker", session_id=session_id,
               msg_count=len(conversation_history))
 
-        # Token-aware compaction trigger: estimate tokens from loaded history
-        _history_tokens = sum(len(h.get("content") or "") for h in conversation_history) // 4
+        # Token-aware compaction trigger: estimate tokens from loaded history.
+        # See _estimate_history_tokens() for why this must use cleaned content.
+        _history_tokens = _estimate_history_tokens(conversation_history)
         needs_compaction = _history_tokens > HISTORY_TOKEN_BUDGET
         _dlog("compaction_check", session_id=session_id,
               history_tokens=_history_tokens, budget=HISTORY_TOKEN_BUDGET,
@@ -928,9 +986,16 @@ async def smart_stream(req: dict, request: Request):
                     for f in session_files
                 )
 
+            # Window + clean history before sending to any backend.
+            # See _build_mode_history() for the proven bug this fixes.
+            _mode_messages = _build_mode_history(conversation_history)
+            _dlog("sse_mode_history_windowed", session_id=session_id,
+                  user_id=current_user_id, mode=_eff_mode,
+                  raw_msg_count=len(conversation_history),
+                  cleaned_msg_count=len(_mode_messages))
+
             # Prepend the mode directive to the current (last) user turn so every
             # backend — Anthropic, OpenAI, Gemini, Ollama — sees it identically.
-            _mode_messages = [dict(m) for m in conversation_history]
             if _mode_messages and _mode_messages[-1].get("role") == "user":
                 _mode_messages[-1]["content"] = (
                     f"{_directive}\n\n{_mode_messages[-1]['content']}"
