@@ -17,6 +17,7 @@ import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
 import { acquireApplyLock, releaseApplyLock } from '../lib/fileApplyLock'
 import { runWithConcurrency, retryRateLimited, UPLOAD_CONCURRENCY } from '../lib/uploadQueue'
+import { clientLog } from '../lib/clientLog'
 
 
 // ── Chat mode selector ────────────────────────────────────────────────────────
@@ -1899,8 +1900,13 @@ export function ChatPanel() {
         try {
           const result = await retryRateLimited(
             () => api.sessionFiles.uploadMultipart(sessionId, formData),
-            { onRetry: (attempt, delay) => console.warn(
-                `[upload] ${file.name} rate-limited — retry ${attempt} in ${delay}ms`) },
+            { onRetry: (attempt, delay, err) => {
+                console.warn(`[upload] ${file.name} rate-limited — retry ${attempt} in ${delay}ms`)
+                clientLog('upload_retry', {
+                  filename: file.name, route: 'multipart', attempt, delay_ms: delay,
+                  status: (err as { status?: number })?.status,
+                }, sessionId)
+              } },
           )
           addSessionFile(result)
           return result
@@ -1921,7 +1927,13 @@ export function ChatPanel() {
       } else {
         // ── DIAGNOSTIC: should never reach here for images ────────────────────
         console.log(`[upload] text path for "${file.name}" (ext="${ext}" type="${file.type}")`)
-        // Text / code — existing behavior
+        // Text / code — existing behavior. Report that this file went down the
+        // TEXT path (the branch the old red "⚠️ TEXT path" toast flagged): an
+        // image mis-routed here is exactly the kind of browser-side failure
+        // that was previously unprovable.
+        clientLog('upload_text_path', {
+          filename: file.name, ext, type: file.type || '',
+        }, sessionId)
         const content = await file.text()
         uploadBody = { filename: file.name, content, language }
       }
@@ -1931,8 +1943,13 @@ export function ChatPanel() {
         console.log(`[upload] Sending ${file.name} (${(payloadSize / 1024).toFixed(0)}KB)`)
         const result = await retryRateLimited(
           () => api.sessionFiles.upload(sessionId, uploadBody),
-          { onRetry: (attempt, delay) => console.warn(
-              `[upload] ${file.name} rate-limited — retry ${attempt} in ${delay}ms`) },
+          { onRetry: (attempt, delay, err) => {
+              console.warn(`[upload] ${file.name} rate-limited — retry ${attempt} in ${delay}ms`)
+              clientLog('upload_retry', {
+                filename: file.name, route: 'json', attempt, delay_ms: delay,
+                status: (err as { status?: number })?.status,
+              }, sessionId)
+            } },
         )
         addSessionFile(result)
         return result
@@ -1953,6 +1970,20 @@ export function ChatPanel() {
       UPLOAD_CONCURRENCY,
     )
     setUploadingFiles(false)
+
+    // Report each file that did NOT land, so a retry storm / silent loss is
+    // reconstructable from the exportable log (filename + status + message
+    // only — never file contents).
+    outcomes.forEach((o, i) => {
+      if (!o.ok) {
+        const err = (o as { ok: false; error: any }).error
+        clientLog('upload_failed', {
+          filename: files[i]?.name ?? 'unknown',
+          status: err?.status,
+          message: String(err?.message ?? err ?? 'upload failed').slice(0, 300),
+        }, activeSessions ?? undefined)
+      }
+    })
 
     const accepted = outcomes.filter(o => o.ok && o.value).length
     const rejected = files.length - accepted

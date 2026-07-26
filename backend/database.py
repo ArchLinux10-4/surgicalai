@@ -49,6 +49,23 @@ def _dlog(event: str, **kwargs):
                 f.write(json.dumps(record, default=str) + "\n")
         except Exception:
             pass  # /tmp write is best-effort only; logger line above already fired
+
+        # ── Forward into the EXPORTABLE stream (debug_events table) ──────────
+        # Historically this _dlog never reached debug_events, so every DB
+        # connection-lifecycle event (and every session_files.py dlog that
+        # imports this function) was invisible in the log the user downloads.
+        # Forward to the canonical emitter so these become exportable.
+        #
+        # Fully guarded: lazy import (no import-time cost / cycle), never
+        # raises. The emitter itself carries a threading.local reentrancy
+        # guard — emit() writes via get_db_ctx(), whose open/close fires THIS
+        # _dlog again; that inner call is detected as reentrant and degrades
+        # to the /tmp line only, so we never recurse into a second DB write.
+        try:
+            import debug_events as _debug_events
+            _debug_events.emit(event, **kwargs)
+        except Exception:
+            pass  # forwarding must NEVER affect a real DB operation
     except Exception:
         pass  # logging must never break a DB call
 

@@ -2,9 +2,14 @@ import type { StreamChunk, ProjectMemory, PromptTemplate, ImpactAnalysis, MultiF
 
 const BASE = (import.meta.env.VITE_API_URL ?? '') + '/api'
 
+/** API base (`{VITE_API_URL||''}/api`) — exported so ancillary helpers
+ *  (e.g. clientLog) hit the same origin/prefix as every other API call. */
+export const API_BASE = BASE
+
 /** Read JWT from persisted auth store without importing zustand (avoids circular deps).
- *  Auth is stored under `surgicalai-auth-{username}` (namespaced) or legacy `surgicalai-auth`. */
-function getAuthToken(): string | null {
+ *  Auth is stored under `surgicalai-auth-{username}` (namespaced) or legacy `surgicalai-auth`.
+ *  Exported so ancillary helpers authenticate exactly like the main client. */
+export function getAuthToken(): string | null {
   try {
     // Search for namespaced key first (surgicalai-auth-{username})
     for (let i = 0; i < localStorage.length; i++) {

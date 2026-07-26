@@ -17,12 +17,102 @@ from auth_utils import decode_token
 
 router = APIRouter(prefix="/api/debug", tags=["debug"])
 
+# ── Client-event ingest limits (enforced server-side) ─────────────────────────
+_CLIENT_EVENT_MAX_BODY_BYTES = 4 * 1024   # cap serialized body at 4 KB
+_CLIENT_EVENT_MAX_KEYS = 30               # cap number of keys in `data`
+_CLIENT_EVENT_MAX_STR = 500               # truncate any string value/key to this
+_CLIENT_EVENT_PREFIX = "client_"          # make browser events unmistakable
+
+
+def _sanitize_client_data(data) -> dict:
+    """Bound a client-supplied `data` object: keep only a dict, cap key count,
+    truncate long string keys/values, and coerce non-primitive values to a
+    truncated string. Never trusts client size claims."""
+    if not isinstance(data, dict):
+        return {"_nonobject": str(data)[:_CLIENT_EVENT_MAX_STR]}
+    out = {}
+    for i, (k, v) in enumerate(data.items()):
+        if i >= _CLIENT_EVENT_MAX_KEYS:
+            out["_truncated_keys"] = True
+            break
+        key = str(k)[:_CLIENT_EVENT_MAX_STR]
+        if isinstance(v, str):
+            out[key] = v[:_CLIENT_EVENT_MAX_STR]
+        elif isinstance(v, (int, float, bool)) or v is None:
+            out[key] = v
+        else:
+            out[key] = str(v)[:_CLIENT_EVENT_MAX_STR]
+    return out
+
 
 def _require_admin(request: Request):
     """Require actual admin role — not just 'any logged-in user'."""
     if not getattr(request.state, "is_admin", False):
         _dlog("debug_admin_check_failed", user_id=getattr(request.state, "user_id", ""))
         raise HTTPException(status_code=403, detail="Admin access required")
+
+
+@router.post("/client-event")
+async def client_event(request: Request):
+    """Ingest a single browser-side event into the EXPORTABLE debug log.
+
+    Lets normal (non-admin) authenticated users report their own front-end
+    failures — upload retries, paste/TEXT-path errors — so browser-side
+    problems finally reach the log the user can download. This closes the gap
+    where client failures were unprovable.
+
+    Security / abuse controls:
+      • Requires an authenticated user (the global auth middleware populates
+        request.state.user_id). NOT admin — reading/clearing still is.
+      • user_id is stamped from request.state, NEVER from the client body.
+      • Serialized body capped at a few KB → 413 (logged). Key count capped,
+        long strings truncated.
+      • No exemption from the general rate limit (applied in middleware) so it
+        can't become an amplification vector.
+    """
+    user_id = getattr(request.state, "user_id", "") or ""
+
+    # Enforce a hard body-size cap server-side (don't trust any client claim).
+    try:
+        raw = await request.body()
+    except Exception:
+        raw = b""
+    if len(raw) > _CLIENT_EVENT_MAX_BODY_BYTES:
+        try:
+            from debug_events import emit as _emit
+            _emit(
+                "client_event_rejected_too_large",
+                user_id=user_id,
+                body_bytes=len(raw),
+                limit=_CLIENT_EVENT_MAX_BODY_BYTES,
+            )
+        except Exception:
+            pass
+        raise HTTPException(status_code=413, detail="Client event body too large")
+
+    try:
+        body = json.loads(raw.decode("utf-8")) if raw else {}
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    event_name = str(body.get("event", "unknown"))[:_CLIENT_EVENT_MAX_STR]
+    data = _sanitize_client_data(body.get("data", {}))
+
+    # Prefix so client events are unmistakable; stamp the SERVER-known user_id.
+    try:
+        from debug_events import emit as _emit
+        _emit(
+            f"{_CLIENT_EVENT_PREFIX}{event_name}",
+            user_id=user_id,
+            session_id=str(body.get("session_id", ""))[:_CLIENT_EVENT_MAX_STR],
+            data=data,
+        )
+    except Exception:
+        pass  # ingest is best-effort; never fail the client's report call
+
+    return JSONResponse({"ok": True})
 
 
 @router.get("/pipeline-log")

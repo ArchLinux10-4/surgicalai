@@ -21,6 +21,53 @@ router = APIRouter()
 parser = ASTParser()
 
 
+def _emit_upload_ok(session_id: str, file_id: str, filename: str, file_type: str,
+                    lines: int, size_bytes: int, replaced: bool, route: str) -> None:
+    """Record a decisive per-attempt upload success in the exportable log.
+
+    Never raises — an observability write must never affect the upload result.
+    session_id is truncated like the rest of this module; filenames/sizes only,
+    never file contents.
+    """
+    try:
+        from debug_events import emit as _emit
+        _emit(
+            "session_file_upload_ok",
+            session_id=(session_id[:8] if session_id else None),
+            file_id=file_id,
+            filename=filename,
+            file_type=file_type,
+            lines=lines,
+            size_bytes=size_bytes,
+            replaced=replaced,
+            route=route,
+        )
+    except Exception:
+        pass
+
+
+def _emit_upload_rejected(session_id: str, filename: str, status: int,
+                          reason: str, route: str) -> None:
+    """Record a decisive per-attempt upload rejection/exception in the log.
+
+    `reason` must be the real reason from the failing code path (validation,
+    size cap, session cap, unsupported type, concurrent-modification, DB
+    error, …) — never a generic placeholder. Never raises.
+    """
+    try:
+        from debug_events import emit as _emit
+        _emit(
+            "session_file_upload_rejected",
+            session_id=(session_id[:8] if session_id else None),
+            filename=filename,
+            status=status,
+            reason=reason,
+            route=route,
+        )
+    except Exception:
+        pass
+
+
 def _snapshot_version(conn, session_id: str, file_id: str, content: str, lines: int,
                        symbol_count: int, label: str = "Edit") -> None:
     """Append the given content as a new row in the version history table.
@@ -332,7 +379,26 @@ def _parse_excel_to_markdown(base64_data: str, filename: str) -> str:
 
 @router.post("/{session_id}/files")
 def upload_session_file(session_id: str, body: dict):
-    """Upload a file to a chat session (legacy JSON path)."""
+    """Upload a file to a chat session (legacy JSON path).
+
+    Thin observability wrapper: emits a decisive per-attempt outcome
+    (`session_file_upload_ok` / `session_file_upload_rejected`) so a retry
+    storm is reconstructable from the exportable log. Behaviour, status codes
+    and response body are unchanged — every path still returns/raises exactly
+    as before.
+    """
+    filename = body.get("filename", "untitled") if isinstance(body, dict) else "untitled"
+    try:
+        return _upload_session_file_impl(session_id, body)
+    except HTTPException as he:
+        _emit_upload_rejected(session_id, filename, he.status_code, str(he.detail), "json")
+        raise
+    except Exception as e:
+        _emit_upload_rejected(session_id, filename, 500, f"{type(e).__name__}: {e}", "json")
+        raise
+
+
+def _upload_session_file_impl(session_id: str, body: dict):
     filename = body.get("filename", "untitled")
     raw_content = body.get("content", "")
     base64_data = body.get("base64_data", "")
@@ -416,6 +482,7 @@ def upload_session_file(session_id: str, body: dict):
             "SELECT id, updated_at FROM session_files WHERE session_id = ? AND filename = ?",
             (session_id, filename)
         ).fetchone()
+        replaced = existing is not None
 
         if existing:
             file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
@@ -447,6 +514,9 @@ def upload_session_file(session_id: str, body: dict):
         except Exception as _e:  # noqa: BLE001
             logger.warning(f"[datalab] json upload byte capture skipped: {_e}")
 
+    _emit_upload_ok(session_id, file_id, filename, file_type, lines,
+                    _payload_bytes, replaced, "json")
+
     return {
         "id": file_id,
         "session_id": session_id,
@@ -466,7 +536,29 @@ async def upload_session_file_multipart(
     file: UploadFile = File(...),
     filename: str = Form(None),
 ):
-    """Multipart file upload — correct approach for iOS / Android / WKWebView."""
+    """Multipart file upload — correct approach for iOS / Android / WKWebView.
+
+    Thin observability wrapper: emits a decisive per-attempt outcome
+    (`session_file_upload_ok` / `session_file_upload_rejected`) so a retry
+    storm is reconstructable. Behaviour, status codes and response body are
+    unchanged.
+    """
+    _wrapper_filename = filename or (file.filename if file is not None else None) or "upload"
+    try:
+        return await _upload_session_file_multipart_impl(session_id, file, filename)
+    except HTTPException as he:
+        _emit_upload_rejected(session_id, _wrapper_filename, he.status_code, str(he.detail), "multipart")
+        raise
+    except Exception as e:
+        _emit_upload_rejected(session_id, _wrapper_filename, 500, f"{type(e).__name__}: {e}", "multipart")
+        raise
+
+
+async def _upload_session_file_multipart_impl(
+    session_id: str,
+    file: UploadFile,
+    filename: str = None,
+):
     actual_filename = filename or file.filename or "upload"
     raw_bytes = await file.read()
 
@@ -544,6 +636,7 @@ async def upload_session_file_multipart(
             "SELECT id, updated_at FROM session_files WHERE session_id = ? AND filename = ?",
             (session_id, actual_filename)
         ).fetchone()
+        replaced = existing is not None
 
         if existing:
             file_id = existing["id"] if hasattr(existing, "__getitem__") else existing[0]
@@ -568,6 +661,9 @@ async def upload_session_file_multipart(
         session_id, file_id, actual_filename, file_type, raw_bytes,
         mime=(file.content_type or ""),
     )
+
+    _emit_upload_ok(session_id, file_id, actual_filename, file_type, lines,
+                    len(raw_bytes), replaced, "multipart")
 
     return {
         "id": file_id,

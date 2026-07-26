@@ -17,6 +17,7 @@ Two tiers:
 """
 import time
 import threading
+from typing import NamedTuple
 from fastapi.responses import JSONResponse
 
 
@@ -33,6 +34,21 @@ _PIPELINE_PATHS = frozenset({
 # Limits: (max_requests, window_seconds)
 _PIPELINE_LIMIT = (10, 60)     # 10 Claude calls per minute per user
 _GENERAL_LIMIT  = (120, 60)    # 120 requests per minute per user
+
+
+class RateLimitDecision(NamedTuple):
+    """Result of a rate-limit check.
+
+    Carries the tier/cap/window that were actually applied so the rejection
+    log line records real data rather than re-deriving which tier fired.
+    Backward-compatible-ish: `allowed, retry_after` still unpack as the first
+    two fields, but the single caller reads fields by name.
+    """
+    allowed: bool
+    retry_after: int
+    tier: str
+    cap: int
+    window: int
 
 
 # ── Token bucket ──────────────────────────────────────────────────────────────
@@ -77,8 +93,12 @@ class _RateLimiter:
                 self._buckets[key] = _Bucket(max_t, window)
             return self._buckets[key]
 
-    def check(self, user_id: str, path: str) -> tuple[bool, int]:
-        """Returns (allowed, retry_after_seconds)."""
+    def check(self, user_id: str, path: str) -> "RateLimitDecision":
+        """Return the full decision (allowed, retry_after, tier, cap, window).
+
+        Returns the tier/cap/window that were actually applied so a rejection
+        log line is real data, not a re-guess of which tier fired.
+        """
         if path in _PIPELINE_PATHS:
             cap, window = _PIPELINE_LIMIT
             tier = "pipeline"
@@ -88,8 +108,8 @@ class _RateLimiter:
 
         bucket = self._bucket(f"{user_id}:{tier}", cap, window)
         if bucket.consume():
-            return True, 0
-        return False, bucket.retry_after
+            return RateLimitDecision(True, 0, tier, cap, window)
+        return RateLimitDecision(False, bucket.retry_after, tier, cap, window)
 
     def cleanup(self, max_idle: int = 3600):
         """Remove buckets idle longer than max_idle seconds."""
@@ -114,9 +134,30 @@ def check_rate_limit(
     Returns None if allowed, or a 429 JSONResponse if rate-limited.
     Called from auth_middleware in main.py after JWT is validated.
     """
-    allowed, retry_after = _limiter.check(user_id, path)
-    if allowed:
+    decision = _limiter.check(user_id, path)
+    if decision.allowed:
+        # ALLOW path is per-request hot code — deliberately NO logging here.
         return None
+
+    retry_after = decision.retry_after
+
+    # ── Record every rejection into the exportable log ────────────────────
+    # This is the rejection path only (never the allow path above), so it adds
+    # no per-request overhead to normal traffic. Lazy import + fully guarded:
+    # a logging failure must never stop the 429 from being returned.
+    try:
+        import debug_events as _debug_events
+        _debug_events.emit(
+            "rate_limit_rejected",
+            user_id=user_id,
+            path=path,
+            tier=decision.tier,
+            retry_after=retry_after,
+            cap=decision.cap,
+            window=decision.window,
+        )
+    except Exception:
+        pass  # never let a logging failure suppress the 429
 
     headers = {"Retry-After": str(retry_after)}
     if cors_headers:
