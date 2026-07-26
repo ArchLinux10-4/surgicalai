@@ -9,6 +9,7 @@ import React, { useState, useEffect } from 'react'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import type { SmartResult, SessionFile } from '../../types'
+import { useAppStore } from '../../stores/appStore'
 
 interface Props {
   result: SmartResult
@@ -81,6 +82,14 @@ function FileCard({
   const [appliedMap, setAppliedMap] = useState<Record<string, boolean>>({})
 
   const changes    = fileData.changes || []
+  // file_id recovery net — see InlineDiffCard for the proven failure this
+  // closes (empty file_id => `/chat/{sid}/files/` => 307 to the list route =>
+  // apply silently does nothing).
+  const sessionFilesForId = useAppStore(st => st.sessionFiles)
+  const effectiveFileId =
+    fileData.file_id ||
+    sessionFilesForId.find((f: any) => f.filename === (fileData.filename || filename))?.id ||
+    ''
   const changeIds  = changes.map((c: any) => c.id).filter(Boolean)
   const allApplied = changeIds.length > 0 && changeIds.every((id: string) => appliedMap[id])
 
@@ -117,14 +126,14 @@ function FileCard({
     }
     setApplying(true)
     try {
-      const current = await api.sessionFiles.get(sessionId, fileData.file_id)
+      const current = await api.sessionFiles.get(sessionId, effectiveFileId)
       const result  = await api.surgical.applyAll({
         file_path: filename,
         changes: applyChanges,
         file_content: current.content,
       })
       if (result.modified_content) {
-        await api.sessionFiles.update(sessionId, fileData.file_id, result.modified_content,
+        await api.sessionFiles.update(sessionId, effectiveFileId, result.modified_content,
           `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''}`)
       }
       // Mark every applied change in localStorage + backend DB
@@ -173,7 +182,7 @@ function FileCard({
     if (undoing) return
     setUndoing(true)
     try {
-      await api.sessionFiles.undo(sessionId, fileData.file_id)
+      await api.sessionFiles.undo(sessionId, effectiveFileId)
       // Unmark all changes for this file
       for (const ch of changes) {
         if (ch?.id) {

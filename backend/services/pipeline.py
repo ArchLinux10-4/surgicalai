@@ -16097,13 +16097,42 @@ async def run_natural_pipeline_stream(
                                 content = _fr_outcome["content"]
                                 file_content_lookup_stream[fn] = content
                                 user_supplied_files.add(fn)
+                                # ── Persist as a REAL session_files row ──
+                                # A user-pasted file MUST become a real row.
+                                # Without an `id` here the smart result carries
+                                # file_id="" and the apply path is dead: the
+                                # frontend requests /chat/{sid}/files/ which
+                                # 307-redirects to the list route, so a
+                                # QA-clean edit can never be applied and the
+                                # user sees no error. Proven in session
+                                # d021ff07 (GET /files/ 307, never a PUT).
+                                _fr_entry = None
+                                try:
+                                    from services.session_file_store import (
+                                        register_session_file,
+                                    )
+                                    _fr_entry = register_session_file(
+                                        session_id, fn, content,
+                                        origin="uploaded", dlog=_dlog)
+                                except Exception as _fr_reg_err:
+                                    _dlog("agent_filereq_register_failed",
+                                          session_id=session_id,
+                                          user_id=user_id, filename=fn,
+                                          error=str(_fr_reg_err)[:200])
+                                if not _fr_entry:
+                                    # Degraded fallback: the model can still
+                                    # read the content this turn, and
+                                    # changes_by_file recovers the id by name.
+                                    _fr_entry = {"filename": fn,
+                                                 "content": content}
+                                    _dlog("agent_filereq_register_degraded",
+                                          session_id=session_id,
+                                          user_id=user_id, filename=fn)
                                 try:
                                     _fr_smap = parser.parse(content, fn)
-                                    symbol_maps_by_name[fn] = (
-                                        _fr_smap,
-                                        {"filename": fn, "content": content})
                                 except Exception:
-                                    pass
+                                    _fr_smap = None
+                                symbol_maps_by_name[fn] = (_fr_smap, _fr_entry)
                             else:
                                 _fr_msg = _fr_outcome.get("message") or (
                                     f"FILE NOT FOUND: '{fn}' — not in uploaded files.")
@@ -21431,9 +21460,31 @@ async def run_natural_pipeline_stream(
             )
 
             if filename not in changes_by_file:
+                # ── file_id is load-bearing ──────────────────────────────
+                # The frontend applies an edit via
+                # GET/PUT /chat/{sid}/files/{file_id}. An empty file_id makes
+                # that URL collapse to /chat/{sid}/files/, which FastAPI
+                # 307-redirects to the list route — the edit silently becomes
+                # un-appliable. If the entry has no id (a producer that did
+                # not persist its content), recover it by filename before
+                # emitting, and log loudly if we still cannot.
+                _fid = (sf_entry.get("id") or "") if sf_entry else ""
+                if not _fid:
+                    try:
+                        from services.session_file_store import (
+                            resolve_session_file_id,
+                        )
+                        _fid = resolve_session_file_id(session_id, filename) or ""
+                    except Exception:
+                        _fid = ""
+                    _dlog("changes_file_id_recovered" if _fid
+                          else "changes_file_id_missing",
+                          session_id=session_id, user_id=user_id,
+                          filename=filename, file_id=_fid,
+                          had_entry=bool(sf_entry))
                 changes_by_file[filename] = {
                     "filename": filename,
-                    "file_id": sf_entry.get("id", "") if sf_entry else "",
+                    "file_id": _fid,
                     "changes": [],
                 }
             changes_by_file[filename]["changes"].append(change.model_dump())

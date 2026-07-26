@@ -267,6 +267,66 @@ def get_db_ctx():
         _note_conn_closed(reason="get_db_ctx", exc=exc_seen)
 
 
+def _ensure_session_files_indexes(executor):
+    """Index `session_files` on session_id and enforce one row per filename.
+
+    Works for both the sqlite cursor and the Postgres connection — both expose
+    `.execute(sql)`.
+
+    WHY
+    ---
+    1. `session_id` was unindexed, yet EVERY upload runs
+       `SELECT SUM(LENGTH(content)) ... WHERE session_id = ?` to enforce the
+       30 MB session cap. With no index that is a full-table scan per upload,
+       so a burst of N uploads costs O(N * table_size).
+    2. There was no uniqueness on `(session_id, filename)` even though every
+       write path does a read-then-insert upsert keyed on exactly that pair.
+       Concurrent uploads of the same filename can both miss the SELECT and
+       both INSERT, leaving duplicate rows — after which "the" file id for a
+       filename is ambiguous and edits can land on the stale row.
+
+    SAFETY: the unique index is only created when the table currently holds no
+    duplicates. If duplicates already exist we log and skip rather than
+    deleting user data; the plain index (the performance fix) still lands.
+    """
+    try:
+        executor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_files_session "
+            "ON session_files(session_id)"
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] idx_session_files_session skipped: {e}")
+
+    try:
+        dupes = executor.execute(
+            "SELECT COUNT(*) FROM ("
+            "  SELECT session_id, filename FROM session_files"
+            "  GROUP BY session_id, filename HAVING COUNT(*) > 1"
+            ") d"
+        ).fetchone()
+        dupe_count = int((dupes[0] if dupes else 0) or 0)
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] session_files duplicate check failed: {e}")
+        return
+
+    if dupe_count:
+        print(
+            f"[db] WARNING: {dupe_count} duplicate (session_id, filename) "
+            f"group(s) in session_files — UNIQUE index NOT created. "
+            f"Resolve the duplicates, then restart to enforce uniqueness."
+        )
+        return
+
+    try:
+        executor.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS "
+            "idx_session_files_session_filename "
+            "ON session_files(session_id, filename)"
+        )
+    except Exception as e:  # noqa: BLE001
+        print(f"[db] idx_session_files_session_filename skipped: {e}")
+
+
 def init_db():
     if USE_POSTGRES:
         _init_postgres()
@@ -399,6 +459,7 @@ def _init_sqlite():
         CREATE INDEX IF NOT EXISTS idx_session_file_versions_file
         ON session_file_versions(file_id, created_at)
     """)
+    _ensure_session_files_indexes(cur)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS user_api_keys (
             id TEXT PRIMARY KEY,
@@ -708,6 +769,7 @@ def _init_postgres():
             CREATE INDEX IF NOT EXISTS idx_session_file_versions_file
             ON session_file_versions(file_id, created_at)
         """)
+        _ensure_session_files_indexes(conn)
         # user_api_keys — encrypted API keys per user
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_api_keys (

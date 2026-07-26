@@ -584,6 +584,18 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   const [showFilePreview, setShowFilePreview] = useState(false)
 
   const { setSessionFiles } = useAppStore()
+  // ── file_id recovery net ────────────────────────────────────────────────
+  // Every apply/undo/version call is keyed on this id. If the pipeline emitted
+  // an empty file_id (a producer that never persisted its content to
+  // session_files), recover it by filename from the live session file list.
+  // Without this, the request URL collapses to `/chat/{sid}/files/` and the
+  // apply silently does nothing — proven in session d021ff07, where two
+  // QA-clean edits were lost to `GET /files/ 307` with no PUT ever sent.
+  const sessionFilesForId = useAppStore(s => s.sessionFiles)
+  const effectiveFileId: string =
+    fileData.file_id ||
+    sessionFilesForId.find(f => f.filename === (fileData.filename || filename))?.id ||
+    ''
   const [applying, setApplying] = useState(false)
   const [undoing, setUndoing] = useState<Record<string, boolean>>({})
   const [applied, setApplied] = useState<Record<string, boolean>>(() =>
@@ -599,10 +611,10 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   // Pre-fetch original file content so Preview works before Apply
   useEffect(() => {
     if (!isVisualFile(filename)) return
-    api.sessionFiles.get(sessionId, fileData.file_id)
+    api.sessionFiles.get(sessionId, effectiveFileId)
       .then(f => setOriginalCode(f.content))
       .catch(() => {})
-  }, [sessionId, fileData.file_id, filename])
+  }, [sessionId, effectiveFileId, filename])
 
   // Load applied state from backend DB on mount (survives page refresh, cross-browser)
   useEffect(() => {
@@ -685,7 +697,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     // Track lines added/removed for this file — powers the diff-stats badge in the file drawer
     if (diff) {
       const { added, removed } = diffLineCounts(diff)
-      recordDiffStats(fileData.file_id, added, removed)
+      recordDiffStats(effectiveFileId, added, removed)
     }
     onChangeApplied?.()
     return persisted
@@ -698,13 +710,13 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     // for the same file) — see fileApplyLock.ts for the proven race this
     // closes. When nothing else is applying this file (the normal case),
     // this acquires instantly and every line below runs exactly as before.
-    if (!acquireApplyLock(fileData.file_id)) {
+    if (!acquireApplyLock(effectiveFileId)) {
       toast.error('This file is being applied elsewhere right now — please wait a moment and try again')
       return
     }
     setApplying(true)
     try {
-      const fileData2 = await api.sessionFiles.get(sessionId, fileData.file_id)
+      const fileData2 = await api.sessionFiles.get(sessionId, effectiveFileId)
       if (!originalCode) setOriginalCode(fileData2.content)
 
       let result: any
@@ -728,12 +740,12 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           const changeLabel = selectedChanges.length === 1
             ? `Applied: ${selectedChanges[0]?.symbol?.full_path || selectedChanges[0]?.symbol?.name || 'change'}`
             : `Applied ${selectedChanges.length} changes`
-          await api.sessionFiles.update(sessionId, fileData.file_id, newContent, changeLabel)
+          await api.sessionFiles.update(sessionId, effectiveFileId, newContent, changeLabel)
           console.debug('[InlineDiffCard] DB updated OK, re-syncing originalCode from DB')
           // Re-fetch originalCode from DB — replicates what page refresh does on mount.
           // This ensures the next round of edits starts from the true DB state.
           try {
-            const freshFile = await api.sessionFiles.get(sessionId, fileData.file_id)
+            const freshFile = await api.sessionFiles.get(sessionId, effectiveFileId)
             if (freshFile?.content) {
               setOriginalCode(freshFile.content)
               console.debug('[InlineDiffCard] originalCode re-synced, len=', freshFile.content.length)
@@ -800,7 +812,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           setApplied(p => ({ ...p, [change.id]: true }))
           if (change.diff) {
             const { added, removed } = diffLineCounts(change.diff)
-            recordDiffStats(fileData.file_id, added, removed)
+            recordDiffStats(effectiveFileId, added, removed)
           }
           // Persist to backend DB too — without this, ApplyAllButton (which
           // reads applied state ONLY from the DB via api.surgical.getApplied)
@@ -813,7 +825,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         // Re-sync originalCode from DB — the file is already modified,
         // so our in-memory originalCode is stale. Replicate refresh.
         try {
-          const freshFile = await api.sessionFiles.get(sessionId, fileData.file_id)
+          const freshFile = await api.sessionFiles.get(sessionId, effectiveFileId)
           if (freshFile?.content) {
             setOriginalCode(freshFile.content)
             console.debug('[InlineDiffCard] originalCode re-synced after auto-mark, len=', freshFile.content.length)
@@ -828,7 +840,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       }
     } finally {
       setApplying(false)
-      releaseApplyLock(fileData.file_id)
+      releaseApplyLock(effectiveFileId)
     }
   }
 
@@ -840,7 +852,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   const handleFileUndo = async () => {
     setUndoing(p => ({ ...p, [FILE_UNDO_KEY]: true }))
     try {
-      const result = await api.sessionFiles.undo(sessionId, fileData.file_id)
+      const result = await api.sessionFiles.undo(sessionId, effectiveFileId)
       let revertedAdded = 0, revertedRemoved = 0
       for (const c of realChanges) {
         if (!applied[c.id]) continue
@@ -853,7 +865,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           revertedRemoved += removed
         }
       }
-      if (revertedAdded || revertedRemoved) revertDiffStats(fileData.file_id, revertedAdded, revertedRemoved)
+      if (revertedAdded || revertedRemoved) revertDiffStats(effectiveFileId, revertedAdded, revertedRemoved)
       setApplied({})
       setSkipped({})
       setModifiedCode(undefined)
@@ -921,7 +933,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     setShowHistory(true)
     setLoadingVersions(true)
     try {
-      const v = await api.sessionFiles.listVersions(sessionId, fileData.file_id)
+      const v = await api.sessionFiles.listVersions(sessionId, effectiveFileId)
       setVersions(v)
     } catch (e: any) {
       toast.error(e.message || 'Failed to load history')
@@ -934,7 +946,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   const handleRestoreVersion = async (versionId: string) => {
     setRestoringId(versionId)
     try {
-      const result = await api.sessionFiles.restoreVersion(sessionId, fileData.file_id, versionId)
+      const result = await api.sessionFiles.restoreVersion(sessionId, effectiveFileId, versionId)
       // Restoring changes file content out from under the applied/skipped
       // bookkeeping (same reasoning as file-level undo above) — clear it.
       for (const c of realChanges) {
@@ -973,7 +985,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 
   const handleDownload = async () => {
     try {
-      const fileData2 = await api.sessionFiles.get(sessionId, fileData.file_id)
+      const fileData2 = await api.sessionFiles.get(sessionId, effectiveFileId)
       const changesToApply = selectedChanges.length > 0
         ? selectedChanges
         : pendingChanges
@@ -1114,7 +1126,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 if (opening) {
                   // Replicate what browser refresh does on mount: fresh DB fetch
                   try {
-                    const freshFile = await api.sessionFiles.get(sessionId, fileData.file_id)
+                    const freshFile = await api.sessionFiles.get(sessionId, effectiveFileId)
                     if (freshFile?.content) setOriginalCode(freshFile.content)
                   } catch {}
                   setModifiedCode(undefined)
@@ -1146,7 +1158,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             filename={filename}
             modifiedCode={modifiedCode}
             sessionId={sessionId}
-            fileId={fileData.file_id}
+            fileId={effectiveFileId}
           />
         </div>
       )}

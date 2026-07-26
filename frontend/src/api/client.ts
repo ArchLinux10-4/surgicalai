@@ -109,6 +109,44 @@ function streamViaWS(
   }
 }
 
+/** Error that carries the HTTP status through to callers.
+ *
+ *  `request()` used to throw a bare `Error(detail)`, so the status code was
+ *  destroyed at the throw site. Callers written as `e?.response?.status` were
+ *  therefore ALWAYS reading `undefined`, which is why a burst of uploads that
+ *  the server rejected with 429 could not be distinguished from any other
+ *  failure — and so could never be retried. */
+export class ApiError extends Error {
+  status: number
+  /** Seconds the server asked us to wait (429 responses carry both a
+   *  `Retry-After` header and a `retry_after` body field — see
+   *  backend/middleware/rate_limiter.py). */
+  retryAfter?: number
+  constructor(message: string, status: number, retryAfter?: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+    this.retryAfter = retryAfter
+  }
+}
+
+/** Guard against building a URL from an empty file id.
+ *
+ *  `/chat/{sid}/files/${fileId}` with an empty id collapses to
+ *  `/chat/{sid}/files/`, which the server used to answer with a 307 redirect
+ *  to the *list* route. The caller then received a JSON array where it
+ *  expected a file, and the apply silently did nothing (proven in session
+ *  d021ff07). Fail fast and loudly instead. */
+function requireFileId(fileId: string, op: string): string {
+  if (!fileId) {
+    throw new ApiError(
+      `Cannot ${op}: this file has no session id yet. Re-upload the file and try again.`,
+      400,
+    )
+  }
+  return fileId
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...authHeaders(), ...options?.headers },
@@ -127,7 +165,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       }
     }
     const err = await res.json().catch(() => ({ detail: res.statusText }))
-    throw new Error(err.detail || `HTTP ${res.status}`)
+    const hdr = Number(res.headers.get('Retry-After'))
+    const retryAfter = Number(err?.retry_after) || (Number.isFinite(hdr) && hdr > 0 ? hdr : undefined)
+    throw new ApiError(err.detail || `HTTP ${res.status}`, res.status, retryAfter)
   }
   return res.json()
 }
@@ -525,7 +565,9 @@ export const api = {
       }).then(async res => {
         if (!res.ok) {
           const err = await res.json().catch(() => ({ detail: res.statusText }))
-          throw new Error(err.detail || `HTTP ${res.status}`)
+          const hdr = Number(res.headers.get('Retry-After'))
+          const retryAfter = Number(err?.retry_after) || (Number.isFinite(hdr) && hdr > 0 ? hdr : undefined)
+          throw new ApiError(err.detail || `HTTP ${res.status}`, res.status, retryAfter)
         }
         return res.json()
       })
@@ -551,27 +593,27 @@ export const api = {
     list: (sessionId: string) =>
       request<any[]>(`/chat/${sessionId}/files`),
     get: (sessionId: string, fileId: string) =>
-      request<any>(`/chat/${sessionId}/files/${fileId}`),
+      request<any>(`/chat/${sessionId}/files/${requireFileId(fileId, 'load this file')}`),
     /** Resolve the full import graph (components + CSS + npm deps) for a live
      *  preview. Pass `content` to preview an unsaved/modified version. */
     previewBundle: (sessionId: string, fileId: string, content?: string) =>
-      request<any>(`/chat/${sessionId}/files/${fileId}/preview-bundle`, {
+      request<any>(`/chat/${sessionId}/files/${requireFileId(fileId, 'preview this file')}/preview-bundle`, {
         method: 'POST',
         body: JSON.stringify(content != null ? { content } : {}),
       }),
     update: (sessionId: string, fileId: string, content: string, label?: string) =>
-      request<any>(`/chat/${sessionId}/files/${fileId}`, { method: 'PUT', body: JSON.stringify(label ? { content, label } : { content }) }),
+      request<any>(`/chat/${sessionId}/files/${requireFileId(fileId, 'save this file')}`, { method: 'PUT', body: JSON.stringify(label ? { content, label } : { content }) }),
     undo: (sessionId: string, fileId: string) =>
-      request<any>(`/chat/${sessionId}/files/${fileId}/undo`, { method: 'POST' }),
+      request<any>(`/chat/${sessionId}/files/${requireFileId(fileId, 'undo this file')}/undo`, { method: 'POST' }),
     /** Full, browsable edit history for a file — every past saved state, not just the last one. */
     listVersions: (sessionId: string, fileId: string) =>
       request<{ id: string; lines: number; symbol_count: number; label: string; created_at: string }[]>(
-        `/chat/${sessionId}/files/${fileId}/versions`
+        `/chat/${sessionId}/files/${requireFileId(fileId, 'list versions')}/versions`
       ),
     restoreVersion: (sessionId: string, fileId: string, versionId: string) =>
-      request<any>(`/chat/${sessionId}/files/${fileId}/versions/${versionId}/restore`, { method: 'POST' }),
+      request<any>(`/chat/${sessionId}/files/${requireFileId(fileId, 'restore this version')}/versions/${versionId}/restore`, { method: 'POST' }),
     delete: (sessionId: string, fileId: string) =>
-      request(`/chat/${sessionId}/files/${fileId}`, { method: 'DELETE' }),
+      request(`/chat/${sessionId}/files/${requireFileId(fileId, 'delete this file')}`, { method: 'DELETE' }),
     download: async (sessionId: string, fileId: string, filename: string) => {
       const file = await request<any>(`/chat/${sessionId}/files/${fileId}`)
       const blob = new Blob([file.content ?? ''], { type: 'text/plain' })

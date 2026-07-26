@@ -594,6 +594,33 @@ def list_session_files(session_id: str):
     return [dict(r) for r in rows]
 
 
+@router.get("/{session_id}/files/")
+@router.put("/{session_id}/files/")
+@router.delete("/{session_id}/files/")
+def _reject_empty_file_id(session_id: str):
+    """Fail loudly when a client sends an EMPTY file id.
+
+    `/chat/{sid}/files/{file_id}` with an empty `file_id` collapses to
+    `/chat/{sid}/files/`. Without this route FastAPI's `redirect_slashes`
+    answers with `307 -> /chat/{sid}/files`, i.e. the *list* endpoint, so a
+    broken apply looks like a success and returns a JSON array instead of a
+    file. That is exactly how session d021ff07 lost two QA-clean edits: the
+    request log shows `GET /api/chat/<sid>/files/ 307` and never a PUT.
+
+    Returning 400 here turns that silent misroute into a visible error.
+    """
+    logger.warning(
+        f"[session_files] Rejected request with EMPTY file id "
+        f"(session={session_id[:8]}) — client bug: the caller built a URL from "
+        f"an empty file_id."
+    )
+    raise HTTPException(
+        status_code=400,
+        detail="Missing file id — this file has no session_files row yet. "
+               "Re-upload the file and try again.",
+    )
+
+
 @router.get("/{session_id}/files/{file_id}")
 def get_session_file(session_id: str, file_id: str):
     """Get a specific file's full content."""

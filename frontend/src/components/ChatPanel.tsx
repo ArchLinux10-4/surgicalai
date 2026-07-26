@@ -16,6 +16,7 @@ import { AccountTree, Add, AdsClick, AttachFile, AttachMoney, AutoFixHigh, Biote
 import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
 import { acquireApplyLock, releaseApplyLock } from '../lib/fileApplyLock'
+import { runWithConcurrency, retryRateLimited, UPLOAD_CONCURRENCY } from '../lib/uploadQueue'
 
 
 // ── Chat mode selector ────────────────────────────────────────────────────────
@@ -149,7 +150,27 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
         // Apply edits per file
         for (const [, fileData] of Object.entries(result.changes_by_file || {})) {
           const fd = fileData as any
-          if (!fd?.file_id || !fd?.changes?.length) continue
+          if (!fd?.changes?.length) continue
+          // ── file_id recovery net ──────────────────────────────────────
+          // Apply is keyed on the session_files row id. A pipeline producer
+          // that never persisted its content emits file_id: "" — this used to
+          // `continue` here, so Apply All skipped the file in total silence
+          // and the user was told "Applied 0 changes" or nothing at all.
+          // Recover the id by filename; only if that also fails do we count
+          // it as a real, reported failure. Proven in session d021ff07.
+          const fdFileId: string =
+            fd.file_id ||
+            sessionFiles.find(f => f.filename === fd.filename)?.id ||
+            ''
+          if (!fdFileId) {
+            failed++
+            if (!firstFailReason) {
+              firstFailReason =
+                `${fd.filename || 'file'} is not attached to this session ` +
+                `(no file id) — re-upload it and apply again`
+            }
+            continue
+          }
           // Only bulk-apply QA-clean changes. QA-blocked changes must be reviewed
           // and applied individually — same gate the per-row checkbox enforces.
           const applyChanges = fd.changes.filter((c: any) => c?.qa_result?.verdict !== 'blocked')
@@ -159,16 +180,16 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
           // is already applying this exact file right now, skip it this
           // round rather than racing on a stale content snapshot; it will
           // simply no longer need Apply All once the other apply finishes.
-          if (!acquireApplyLock(fd.file_id)) { skippedLocked++; continue }
+          if (!acquireApplyLock(fdFileId)) { skippedLocked++; continue }
           try {
-            const current = await api.sessionFiles.get(sessionId, fd.file_id)
+            const current = await api.sessionFiles.get(sessionId, fdFileId)
             const applied = await api.surgical.applyAll({
               file_path: fd.filename,
               changes: applyChanges,
               file_content: current.content,
             })
             if (applied.modified_content) {
-              await api.sessionFiles.update(sessionId, fd.file_id, applied.modified_content,
+              await api.sessionFiles.update(sessionId, fdFileId, applied.modified_content,
                 `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''}`)
               appliedFiles++
               appliedChanges += applied.applied_count ?? applyChanges.length
@@ -201,7 +222,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
             failed++
             if (!firstFailReason) firstFailReason = e?.message || ''
           } finally {
-            releaseApplyLock(fd.file_id)
+            releaseApplyLock(fdFileId)
           }
         }
       }
@@ -1823,7 +1844,7 @@ export function ChatPanel() {
 
     const sessionId = await ensureSession()
     setUploadingFiles(true)
-    const promises = files.map(async (file) => {
+    const uploadOne = async (file: File) => {
       // ── File size validation ─────────────────────────────────────────
       const sizeErr = validateFileSize(file.name, file.size)
       if (sizeErr) { toast.error(sizeErr); return null }
@@ -1839,7 +1860,7 @@ export function ChatPanel() {
       // ── DIAGNOSTIC TOAST — visible on device screen ─────────────────────────
       // Shows raw file properties so we can see exactly what iOS Chrome sends.
       // Remove after the iOS upload bug is fixed.
-      toast.info(`📁 ${file.name}`, `type="${file.type}" ext="${ext}" img=${isImage}`)
+      console.log(`[upload] ${file.name} type="${file.type}" ext="${ext}" img=${isImage}`)
 
       // ── Magic byte fallback ────────────────────────────────────────────────
       if (!isImage && !isBinary) {
@@ -1870,21 +1891,22 @@ export function ChatPanel() {
 
       if (isImage) {
         // ── Multipart upload ──────────────────────────────────────────────────
-        toast.info(`🚀 → MULTIPART path`)
+        console.log(`[upload] multipart path for "${file.name}"`)
         console.log(`[IMG-UPLOAD] Multipart: ${file.name} ${(file.size / 1024 / 1024).toFixed(1)}MB type=${file.type}`)
         const formData = new FormData()
         formData.append('file', file)
         formData.append('filename', file.name)
         try {
-          const result = await api.sessionFiles.uploadMultipart(sessionId, formData)
+          const result = await retryRateLimited(
+            () => api.sessionFiles.uploadMultipart(sessionId, formData),
+            { onRetry: (attempt, delay) => console.warn(
+                `[upload] ${file.name} rate-limited — retry ${attempt} in ${delay}ms`) },
+          )
           addSessionFile(result)
-          toast.success(`${file.name} uploaded OK`)
           return result
         } catch (e: any) {
-          const detail = (e as any)?.response?.status ? `HTTP ${(e as any).response.status}` : (e as Error).message
-          toast.error(`MULTIPART FAILED: ${detail}`)
-          console.error('[IMG-UPLOAD] multipart error:', e)
-          return null
+          console.error('[upload] multipart error:', file.name, e?.status, e)
+          throw e
         }
       } else if (isBinary) {
         // PDF or Excel — read as base64, let backend extract text
@@ -1898,7 +1920,7 @@ export function ChatPanel() {
         uploadBody = { filename: file.name, content: '', base64_data: base64Data, language, file_type: fileType }
       } else {
         // ── DIAGNOSTIC: should never reach here for images ────────────────────
-        toast.error(`⚠️ TEXT path for "${file.name}" (ext="${ext}" type="${file.type}")`)
+        console.log(`[upload] text path for "${file.name}" (ext="${ext}" type="${file.type}")`)
         // Text / code — existing behavior
         const content = await file.text()
         uploadBody = { filename: file.name, content, language }
@@ -1906,22 +1928,45 @@ export function ChatPanel() {
 
       try {
         const payloadSize = JSON.stringify(uploadBody).length
-        console.log(`[IMG-UPLOAD] Sending ${file.name} (${(payloadSize / 1024).toFixed(0)}KB)`)
-        const result = await api.sessionFiles.upload(sessionId, uploadBody)
+        console.log(`[upload] Sending ${file.name} (${(payloadSize / 1024).toFixed(0)}KB)`)
+        const result = await retryRateLimited(
+          () => api.sessionFiles.upload(sessionId, uploadBody),
+          { onRetry: (attempt, delay) => console.warn(
+              `[upload] ${file.name} rate-limited — retry ${attempt} in ${delay}ms`) },
+        )
         addSessionFile(result)
-        toast.success(`${file.name} uploaded OK`)
         return result
       } catch (e: any) {
-        const detail = e?.response?.status ? `HTTP ${e.response.status}` : e.message
-        toast.error(`UPLOAD FAILED ${file.name}: ${detail}`)
-        console.error('[IMG-UPLOAD] fetch error:', e)
-        return null
+        console.error('[upload] fetch error:', file.name, e?.status, e)
+        throw e
       }
-    })
+    }
 
-    await Promise.all(promises)
+    // ── Bounded concurrency + truthful reporting ────────────────────────────
+    // `Promise.all` over every file at once overran the 120-req/60s limiter and
+    // silently lost 17 of 165 files to 429s in session c72c446e, while the UI
+    // still claimed "165 files ready" (it counted SELECTED files, not ACCEPTED
+    // ones). Now: at most UPLOAD_CONCURRENCY in flight, 429s are retried with
+    // the server's own Retry-After, and the toast reports what actually landed.
+    const outcomes = await runWithConcurrency(
+      files.map(file => () => uploadOne(file)),
+      UPLOAD_CONCURRENCY,
+    )
     setUploadingFiles(false)
-    toast.success(`${files.length} file${files.length > 1 ? 's' : ''} ready`)
+
+    const accepted = outcomes.filter(o => o.ok && o.value).length
+    const rejected = files.length - accepted
+    if (rejected === 0) {
+      toast.success(`${accepted} file${accepted !== 1 ? 's' : ''} ready`)
+    } else {
+      const firstErr = outcomes.find(o => !o.ok) as { ok: false; error: any } | undefined
+      const reason = firstErr?.error?.message || 'upload failed'
+      toast.error(
+        `${accepted} of ${files.length} file${files.length !== 1 ? 's' : ''} attached — ` +
+        `${rejected} failed (${reason}). The failed files are NOT in this session; ` +
+        `re-attach them before asking for edits.`,
+      )
+    }
     textareaRef.current?.focus()
   }, [activeSessions])
 
