@@ -5598,6 +5598,76 @@ def wrong_symbol_reason(symbol_name: str, new_code: str):
     )
 
 
+def _apply_file_level_insertion(change_shells, idx, anchor, insert):
+    """
+    Path 2c companion-op: queue a pure INSERTION of new line(s) immediately
+    after a verbatim, UNIQUE anchor line in the full file (e.g. a new
+    ``lazy(() => import(...))`` declaration or import that belongs in the
+    file's import/preamble section — OUTSIDE the target symbol).
+
+    This is the INSERTION analogue of Path 2b (``correction_file_level_op_*``,
+    session 0183c92e), which only handled REPLACEMENTS of text already present
+    verbatim. Proven needed by session e1ee32f5: a QA-blocked ``RouteFallback``
+    edit needed two new lazy imports added to the file preamble; the correction
+    model had no schema channel to express "this fix must touch code outside
+    the symbol", so ``wrong_symbol_reason()`` (correctly) rejected the
+    import-only ``new_code`` on every retry and a score-1 card shipped. The
+    later manual paste to Sonnet 5 worked only because a separate run re-scoped
+    the fix to a synthetic ``_preamble`` symbol wide enough to contain both
+    edits. This gives the automated loop that same reach — without weakening
+    the ``wrong_symbol_reason`` sibling-corruption guard.
+
+    The insertion is expressed with the EXISTING ``_extra_ops`` plumbing as
+    ``{"find": anchor, "replace": anchor + "\\n" + insert}`` — no new op type.
+
+    Safety: the anchor MUST appear exactly once verbatim in the file. Zero or
+    more-than-one occurrences → reject and never guess a position.
+
+    Returns ``(fixed: bool, reason: str)``. On success the op is appended to
+    ``change_shells[idx]["_extra_ops"]`` and the change diff / same_run note are
+    surfaced; ``new_code`` (the symbol body) is left completely untouched.
+    """
+    if not anchor or not insert:
+        return (False, "missing_fields")
+    _file_content = change_shells[idx].get("file_content") or ""
+    _count = _file_content.count(anchor)
+    if _count == 0:
+        return (False, "anchor_not_found")
+    if _count > 1:
+        return (False, f"anchor_ambiguous_{_count}_occurrences")
+
+    _op = {"find": anchor, "replace": anchor + "\n" + insert}
+    change_shells[idx].setdefault("_extra_ops", []).append(_op)
+
+    # Surface the companion insertion in the change diff (mirror Path 2b).
+    try:
+        change_shells[idx]["diff"] = (
+            (change_shells[idx].get("diff") or "")
+            + "\n"
+            + _make_diff(
+                anchor, anchor + "\n" + insert,
+                f"{change_shells[idx]['symbol'].name} (file-level insertion companion)"
+            )
+        )
+    except Exception:
+        pass
+
+    # Make re-QA aware the companion insertion ships with this change (so it
+    # does not re-block on the same missing import it just added).
+    try:
+        change_shells[idx]["same_run"] = (
+            (change_shells[idx].get("same_run") or "")
+            + "\n  \u2022 [file-level insertion companion in "
+            + f"{change_shells[idx]['filename']}] applied together with this change:\n"
+            + "    AFTER ANCHOR: " + anchor[:300].replace("\n", "\n    ") + "\n"
+            + "    INSERT:       " + insert[:300].replace("\n", "\n    ")
+        )
+    except Exception:
+        pass
+
+    return (True, "ok")
+
+
 # ---------------------------------------------------------------------------
 # Helper: _resolve_search_terms
 # ---------------------------------------------------------------------------
@@ -19637,6 +19707,22 @@ async def run_natural_pipeline_stream(
                     f"2. Still implement the original request: {cs['description']}\n"
                     f"3. Preserve everything you are not explicitly changing\n"
                     f"4. Use the exact symbol name: `{symbol.name}`\n\n"
+                    f"If part of the fix requires code OUTSIDE `{symbol.name}` "
+                    f"(for example, a new import statement, a new lazy() "
+                    f"declaration, or a new constant that must live near the top "
+                    f"of the file) — do NOT put that code inside \"new_code\". Keep "
+                    f"\"new_code\" scoped strictly to a correct, complete version of "
+                    f"`{symbol.name}` itself (if `{symbol.name}` itself needs no "
+                    f"change, return it unchanged). Instead, add two extra fields "
+                    f"to your JSON:\n"
+                    f"  \"file_level_anchor\": the EXACT existing line of code "
+                    f"(copied verbatim, unmodified) that the new code should be "
+                    f"inserted immediately after (e.g. the last existing import "
+                    f"line),\n"
+                    f"  \"file_level_insert\":  the new line(s) to insert after that "
+                    f"anchor.\n"
+                    f"Only use these fields for insertions outside the symbol. Omit "
+                    f"them entirely if no such change is needed.\n\n"
                     f"{_format_instructions}\n\n"
                     f"For JSX/TSX/HTML: first verify your corrected code has balanced tags — "
                     f"count every opening tag and confirm it has a matching closing tag at "
@@ -19972,6 +20058,14 @@ async def run_natural_pipeline_stream(
                         corrected_old  = edit_data.get("old_code", "")
                         corrected_edit_start_line = edit_data.get("edit_start_line")
                         corrected_edit_end_line   = edit_data.get("edit_end_line")
+                        # File-level INSERTION channel (session e1ee32f5): lets the
+                        # correction express a change that must land OUTSIDE the
+                        # target symbol (e.g. a new lazy() import in the preamble)
+                        # without stuffing it into new_code — which would trip the
+                        # wrong_symbol_reason guard. See _apply_file_level_insertion
+                        # and Path 2c below.
+                        corrected_file_anchor = edit_data.get("file_level_anchor", "") or ""
+                        corrected_file_insert = edit_data.get("file_level_insert", "") or ""
                         _sym_code = change_shells[idx]["symbol"].code
 
                         _dlog("qa_retry_correction_parsed", session_id=session_id, user_id=user_id,
@@ -19984,6 +20078,9 @@ async def run_natural_pipeline_stream(
                               has_old_code=bool(corrected_old),
                               old_code_len=len(corrected_old),
                               sym_code_len=len(_sym_code),
+                              has_file_level_anchor=bool(corrected_file_anchor),
+                              anchor_len=len(corrected_file_anchor),
+                              insert_len=len(corrected_file_insert),
                               edit_data_keys=list(edit_data.keys()) if isinstance(edit_data, dict) else [])
 
                         # Reconstruct a FULL symbol from the correction before it
@@ -20329,12 +20426,71 @@ async def run_natural_pipeline_stream(
                                           note="Path 2b did not fix this — _file_level_fixed stays False, "
                                                "so the no-accepted-correction path below will fire normally")
 
+                        # ── Path 2c: FILE-LEVEL INSERTION fallback (session e1ee32f5) ──
+                        # Parallel, additive path to Path 2b — but for a pure
+                        # INSERTION (new import / lazy() decl that does NOT yet
+                        # exist verbatim in the file). The correction model
+                        # expresses it via file_level_anchor/file_level_insert
+                        # (see the shared correction prompt). This MUST run before
+                        # Path 3 so a correction that legitimately leaves the
+                        # symbol unchanged (new_code == the symbol, or new_code
+                        # scoped only to the insertion) is never mis-rejected by
+                        # wrong_symbol_reason as sibling-corruption. The guard
+                        # itself (wrong_symbol_reason) is left completely
+                        # unchanged — it still fires full-force for any correction
+                        # that has NO valid file_level_anchor (see Path 3 + the
+                        # rejected branch below, which leaves _file_level_fixed
+                        # False so Path 3 runs normally).
+                        if (corrected_file_anchor and corrected_file_insert
+                                and accepted is None and not _file_level_fixed):
+                            _fli_fixed, _fli_reason = _apply_file_level_insertion(
+                                change_shells, idx, corrected_file_anchor, corrected_file_insert
+                            )
+                            if _fli_fixed:
+                                _file_level_fixed = True
+                                if idx not in fixed_indices:
+                                    fixed_indices.append(idx)
+                                _dlog("correction_file_level_insert_accepted",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      anchor_preview=corrected_file_anchor[:150],
+                                      insert_preview=corrected_file_insert[:200],
+                                      extra_ops_count=len(change_shells[idx].get("_extra_ops") or []))
+                                # If the symbol-scoped new_code is itself a real,
+                                # correctly-scoped edit (mentions the symbol), accept
+                                # it too — it ships alongside the insertion. If it
+                                # does NOT mention the symbol (the model left the
+                                # symbol unchanged as instructed), leave accepted None
+                                # and ship via _extra_ops only. Do NOT run
+                                # wrong_symbol_reason on a deliberately-unchanged
+                                # symbol (that is the whole point of this path).
+                                if corrected_code and change_shells[idx]["symbol"].name in corrected_code:
+                                    accepted = corrected_code
+                            else:
+                                # anchor missing / ambiguous — never guess a position.
+                                # _file_level_fixed stays False so Path 3 (and its
+                                # wrong_symbol_reason guard) runs normally below.
+                                _dlog("correction_file_level_insert_rejected",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      reason=_fli_reason,
+                                      anchor_preview=corrected_file_anchor[:150],
+                                      note="file-level insertion not applied — _extra_ops untouched, "
+                                           "Path 3 + wrong_symbol_reason guard fire normally")
+
                         # ── Path 3: Full new_code replacement (fragment-checked) ──
                         # SKIP if windowed correction was used — the corrected_code
                         # is a WINDOW, not a full symbol. Trying full-replacement
                         # would always fail the fragment check and produce
                         # misleading logs.
-                        if accepted is None and corrected_code and not corrected_old and not _windowed_path_attempted:
+                        # SKIP if Path 2c already handled this via a file-level
+                        # insertion and deliberately left the symbol unchanged —
+                        # running wrong_symbol_reason here would falsely reject a
+                        # correction that was told to keep the symbol as-is.
+                        if (accepted is None and corrected_code and not corrected_old
+                                and not _windowed_path_attempted and not _file_level_fixed):
                             _frag_reason = _fragment_reason(_sym_code, corrected_code)
 
                             _dlog("correction_full_replacement_attempt",
