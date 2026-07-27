@@ -14104,6 +14104,37 @@ def _clean_history_content(content: str) -> str:
     return content
 
 
+def _verify_cannot_anchor_claim(reason_text: str, qa_summary_text: str, file_text: str) -> list:
+    """
+    Proves or disproves a <cannot_anchor> claim that code the plan/QA asked
+    for "already exists" in the file.
+
+    Session e58cdb54 proved this matters: given an accurate search result
+    showing the file's real import list, the correction model still
+    concluded "the imports already exist" for names that are provably
+    absent — and the pipeline trusted that claim with zero verification,
+    permanently abandoning the fix. This function performs the verification
+    the pipeline was skipping: it extracts identifier-like tokens that
+    appear in BOTH the model's stated reason and the QA issue text that
+    triggered the correction (so we only check things QA actually asked
+    for), then grep-counts each against the file's ACTUAL current text.
+    Tokens the model implied already exist but which have zero real
+    occurrences are returned — a proven hallucination, not a guess.
+    """
+    if not reason_text or not file_text:
+        return []
+    _token_re = re.compile(r'\b[A-Z][A-Za-z0-9]{2,}\b')
+    reason_tokens = set(_token_re.findall(reason_text))
+    qa_tokens = set(_token_re.findall(qa_summary_text or ""))
+    shared = reason_tokens & qa_tokens
+    hallucinated = []
+    for tok in sorted(shared):
+        count = len(re.findall(r'\b' + re.escape(tok) + r'\b', file_text))
+        if count == 0:
+            hallucinated.append(tok)
+    return hallucinated
+
+
 def _resolve_search_multifile(
     terms: list,
     symbol_maps_by_name: dict,
@@ -19791,6 +19822,7 @@ async def run_natural_pipeline_stream(
                     _MAX_CORR_REACT = 3
                     _react_msgs = list(_corr_msgs_by_idx.get(idx, []))
                     _got_edit = False
+                    _last_hallucinated: list = []
                     _corr_react_round = 0
                     # ── Progress-based round extension ──
                     # Follow-ups that fetch never-before-seen context are
@@ -19807,14 +19839,136 @@ async def run_natural_pipeline_stream(
                             break
 
                         if "<cannot_anchor" in corr_text:
-                            # Model honestly can't locate an anchor — clean
-                            # abort routes to the existing keep-original path.
+                            # ── Verify the claim before trusting it (proven
+                            # gap: session e58cdb54) ──
+                            # A <cannot_anchor> is supposed to mean "I looked
+                            # and truly cannot find where this goes." But the
+                            # model can also use it to wrongly claim the
+                            # requested code "already exists" — and until now
+                            # the pipeline accepted that at face value with no
+                            # check against the real file, silently abandoning
+                            # a fix QA had correctly flagged as missing.
+                            _ca_reason_m = re.search(
+                                r'<cannot_anchor\s+reason=["\'](.*?)["\']\s*/?>',
+                                corr_text, re.DOTALL
+                            )
+                            _ca_reason = (
+                                _ca_reason_m.group(1) if _ca_reason_m
+                                else corr_text[:300]
+                            )
+                            _qa_d_now = (
+                                qa_results[idx] if idx < len(qa_results) else {}
+                            )
+                            _cur_filename = change_shells[idx]["filename"]
+                            _cur_file_text = file_content_lookup_stream.get(
+                                _cur_filename, ""
+                            )
+                            _hallucinated = _verify_cannot_anchor_claim(
+                                _ca_reason, _qa_d_now.get("summary", ""),
+                                _cur_file_text
+                            )
+                            if _hallucinated:
+                                _last_hallucinated = _hallucinated
+
+                            if _hallucinated and _corr_react_round < _MAX_CORR_REACT:
+                                # Proven false: grepped the CURRENT actual file
+                                # and found zero occurrences of something the
+                                # model claims already exists. Don't give up —
+                                # hand back hard proof and make it try again.
+                                _dlog("correction_cannot_anchor_hallucination_rejected",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      react_round=_corr_react_round,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      claimed_reason=_ca_reason[:300],
+                                      hallucinated_tokens=_hallucinated)
+                                _proof_lines = "\n".join(
+                                    f"  - '{t}': 0 occurrences (grepped the CURRENT "
+                                    f"actual file just now — not asking your memory)"
+                                    for t in _hallucinated
+                                )
+                                _react_msgs.extend([
+                                    {"role": "assistant", "content": corr_text},
+                                    {"role": "user", "content": (
+                                        "VERIFICATION FAILED. You claimed the "
+                                        "following already exist in the file, but "
+                                        f"they do NOT:\n{_proof_lines}\n\n"
+                                        "This was checked by grepping the file's "
+                                        "real, current content just now. You must "
+                                        "actually add them. If they belong outside "
+                                        "the target symbol (e.g. an import line), "
+                                        "use the file_level_anchor/file_level_insert "
+                                        "fields as instructed earlier. Do not reply "
+                                        "<cannot_anchor> again for these same items."
+                                    )},
+                                ])
+                                _corr_react_round += 1  # bounded — counts against budget
+                                _dlog("qa_retry_correction_react_followup",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      react_round=_corr_react_round,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      context_chars=len(_proof_lines),
+                                      msg_count=len(_react_msgs))
+                                try:
+                                    _dlog("qa_retry_correction_react_call",
+                                          model=_correction_model,
+                                          wrapper="safe_claude_call",
+                                          session_id=session_id, user_id=user_id)
+                                    _fu_task = asyncio.create_task(
+                                        _safe_claude_call(
+                                            aclient,
+                                            model=_correction_model,
+                                            desired_text_tokens=12000,
+                                            thinking_budget=4000,
+                                            retry_on_starve=True,
+                                            system=system_prompt,
+                                            messages=_react_msgs,
+                                        )
+                                    )
+                                    while not _fu_task.done():
+                                        try:
+                                            await asyncio.wait_for(
+                                                asyncio.shield(_fu_task),
+                                                timeout=20.0,
+                                            )
+                                        except asyncio.TimeoutError:
+                                            yield sse({"type": "progress",
+                                                       "content": f"QA correction round {_qa_retry_round + 1}… "
+                                                                   f"still working"})
+                                    _fu_resp = _fu_task.result()
+                                    corr_text = "".join(
+                                        b.text for b in _fu_resp.content
+                                        if hasattr(b, "text")
+                                    )
+                                    _dlog("qa_retry_correction_react_response",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          react_round=_corr_react_round,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          response_chars=len(corr_text),
+                                          has_edit=EDIT_OPEN in corr_text)
+                                except Exception as _react_exc:
+                                    _dlog("qa_retry_correction_react_error",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          react_round=_corr_react_round,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          error=str(_react_exc),
+                                          error_type=type(_react_exc).__name__)
+                                    break  # API error — stop ReAct for this correction
+                                continue  # re-evaluate the new corr_text at loop top
+
+                            # Genuine cannot_anchor (or hallucination-proof
+                            # budget exhausted) — clean abort routes to the
+                            # existing keep-original path.
                             _dlog("qa_retry_correction_clean_abort",
                                   session_id=session_id, user_id=user_id,
                                   retry_round=_qa_retry_round, idx=idx,
                                   react_round=_corr_react_round,
                                   symbol=change_shells[idx]["symbol"].name,
-                                  response_preview=corr_text[:300])
+                                  response_preview=corr_text[:300],
+                                  hallucinated_tokens=_hallucinated)
                             break
 
                         if _corr_react_round >= _MAX_CORR_REACT:
@@ -20022,6 +20176,41 @@ async def run_natural_pipeline_stream(
                               react_rounds_tried=_corr_react_round,
                               response_len=len(corr_text),
                               response_preview=corr_text[:500])
+                        # ── Record this non-attempt in correction history too ──
+                        # Previously a clean_abort/no_edit_block round vanished
+                        # with NO trace in _correction_history, so the next
+                        # retry round had zero memory it was already tried.
+                        # Proven in session e58cdb54: round 0 falsely claimed
+                        # required imports "already exist" (disproved above);
+                        # round 1 had no idea and jumped to a different dead
+                        # end (re-submitting identical code) instead of
+                        # correcting course with that knowledge.
+                        _hist_note = "Model produced no usable edit this round."
+                        if _last_hallucinated:
+                            _hist_note = (
+                                "Model claimed the following already exist, but "
+                                "a grep of the real file proved they do NOT: "
+                                + ", ".join(_last_hallucinated)
+                            )
+                        _correction_history.setdefault(idx, []).append({
+                            "round": _qa_retry_round,
+                            "qa_score": (
+                                qa_results[idx].get("qa_score", "?")
+                                if idx < len(qa_results) else "?"
+                            ),
+                            "qa_summary": _hist_note,
+                            "code_preview": corr_text[:200],
+                            "accepted": False,
+                        })
+                        _dlog("correction_history_recorded",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=idx,
+                              symbol=change_shells[idx]["symbol"].name,
+                              total_attempts=len(_correction_history[idx]),
+                              accepted=False,
+                              file_level_fixed=False,
+                              via_symbol_accepted=False,
+                              note="no_edit_or_clean_abort")
                         continue
                     if ei != -1 and ec != -1:
                         raw_edit = corr_text[ei + len(EDIT_OPEN):ec]
