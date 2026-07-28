@@ -685,6 +685,40 @@ def resolve_file_request_batch(
     return new_fnames, rerequestable, hit_total_limit
 
 
+def check_filereq_hard_limit(fnames_req, file_req_hard_counts, max_hard_retries: int = 4):
+    """Hard circuit-breaker for `<file_request>` filenames, independent of
+    `resolve_file_request_batch`'s requested-files bookkeeping.
+
+    Increments a per-filename lifetime request counter and returns the
+    filenames that have now been requested MORE than `max_hard_retries`
+    times in this run, regardless of whether `requested_files` /
+    `same_name_retries` believe the file was already resolved.
+
+    This exists as defense-in-depth for the class of bug proven in session
+    e3f0e267 (see `resolve_file_request_batch`'s docstring): if any future
+    code path ever adds a filename to `fnames_req` without going through
+    `resolve_file_request_batch`'s tracking correctly (a new branch, a
+    renamed variable, an early `continue` before `requested_files.add`),
+    this counter still trips and forces the loop to stop re-asking — it
+    counts raw appearances of a filename in the model's `<file_request>`
+    tag directly, rather than relying on any OTHER function's bookkeeping
+    to have run correctly first. Two independent guards must both fail for
+    an infinite re-ask loop to recur.
+
+    Mutates `file_req_hard_counts` in place (caller owns the dict so it
+    persists across turns). Returns the filenames that just crossed the
+    limit on THIS call, order-preserving, de-duped.
+    """
+    tripped = []
+    seen = set()
+    for fn in fnames_req:
+        file_req_hard_counts[fn] = file_req_hard_counts.get(fn, 0) + 1
+        if file_req_hard_counts[fn] > max_hard_retries and fn not in seen:
+            tripped.append(fn)
+            seen.add(fn)
+    return tripped
+
+
 _FILEREQ_EXT_SWAP = {"ts": "tsx", "tsx": "ts", "js": "jsx", "jsx": "js"}
 _FILEREQ_BARREL_NAMES = ("index.ts", "index.tsx", "index.js", "index.jsx")
 
@@ -15429,6 +15463,10 @@ async def run_natural_pipeline_stream(
         # Runaway backstop only — real termination is the deadline/budget above.
         AGENT_MAX_TURNS = int(_os.getenv("AGENT_MAX_TURNS", "24"))
         MAX_FILE_REQ_TOTAL = 15
+        # Hard, independent circuit breaker for `<file_request>` — see
+        # `check_filereq_hard_limit` docstring for why this exists as a
+        # SECOND guard on top of `resolve_file_request_batch`.
+        MAX_HARD_FILE_REQ_RETRIES = 4
         MAX_GITHUB_READ_ROUNDS = 30
         MAX_GITHUB_WRITE_ROUNDS = 30
         MAX_GITHUB_ATTEMPTS = 60
@@ -15443,6 +15481,10 @@ async def run_natural_pipeline_stream(
         user_supplied_files: set = set()
         # Count of honored same-name correction re-requests, keyed by filename.
         same_name_retries: dict = {}
+        # Lifetime count of how many times each raw filename has appeared in
+        # any `<file_request>`, independent of whether it was ever resolved.
+        # Backs the hard circuit breaker (`check_filereq_hard_limit`).
+        file_req_hard_counts: dict = {}
         _github_reads_used = 0
         _github_writes_used = 0
         _github_attempts = 0
@@ -16070,6 +16112,32 @@ async def run_natural_pipeline_stream(
 
                 if _kind == "file":
                     fnames_req = _data if isinstance(_data, list) else []
+                    # ── Hard circuit breaker (defense-in-depth) ──
+                    # Independent of every guard below: trips purely on raw
+                    # request count for a filename, so it still stops an
+                    # infinite re-ask loop even if `resolve_file_request_batch`
+                    # or `requested_files` bookkeeping is ever bypassed by a
+                    # future change. See `check_filereq_hard_limit` docstring.
+                    _cb_tripped = check_filereq_hard_limit(
+                        fnames_req, file_req_hard_counts,
+                        max_hard_retries=MAX_HARD_FILE_REQ_RETRIES)
+                    if _cb_tripped:
+                        _dlog("agent_filereq_hard_circuit_breaker_tripped",
+                              session_id=session_id, user_id=user_id, turn=_turn,
+                              filenames=_cb_tripped,
+                              counts={fn: file_req_hard_counts[fn] for fn in _cb_tripped},
+                              max_hard_retries=MAX_HARD_FILE_REQ_RETRIES)
+                        requested_files.update(_cb_tripped)
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content":
+                                (f"You've requested {', '.join(_cb_tripped)} more than "
+                                 f"{MAX_HARD_FILE_REQ_RETRIES} times this session. Stop "
+                                 "re-asking for it — write your edits with the context you "
+                                 "already have, or explain what's blocking you with "
+                                 "<blocked>…</blocked>.")},
+                        ]
+                        continue
                     # A file is genuinely "fully loaded" only if it is tier-1
                     # AND was not rendered as an excerpt (large grep window or
                     # truncated preview).  Excerpt-only files must fall through
@@ -16126,7 +16194,17 @@ async def run_natural_pipeline_stream(
                             max_file_req_total=MAX_FILE_REQ_TOTAL,
                         )
                     )
+                    _dlog("agent_filereq_batch_resolved",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          requested=fnames_req, new_fnames=new_fnames,
+                          rerequestable=sorted(_rerequestable),
+                          hit_total_limit=_hit_total_limit,
+                          requested_files_count=len(requested_files))
                     if not new_fnames or _hit_total_limit:
+                        _dlog("agent_filereq_batch_blocked",
+                              session_id=session_id, user_id=user_id, turn=_turn,
+                              requested=fnames_req, hit_total_limit=_hit_total_limit,
+                              requested_files_count=len(requested_files))
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
                             {"role": "user", "content":
@@ -16418,6 +16496,10 @@ async def run_natural_pipeline_stream(
                                 # HITL — one pause per genuinely-missing file,
                                 # ever, per turn loop.
                                 requested_files.add(fn)
+                                _dlog("agent_filereq_marked_not_found",
+                                      session_id=session_id, user_id=user_id,
+                                      turn=_turn, filename=fn,
+                                      message=_fr_msg[:200])
                                 continue
                         requested_files.add(fn)
                         file_lines = content.splitlines()
