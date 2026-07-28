@@ -1549,16 +1549,55 @@ def _compute_target_element(original: str, new_code: str):
 
 
 def _make_diff(original: str, new_code: str, symbol_path: str) -> str:
-    """Generate unified diff string between original and new code."""
-    orig_lines = original.splitlines(keepends=True)
-    new_lines = new_code.splitlines(keepends=True)
+    """Generate unified diff string between original and new code.
+
+    BUG FIX (missing-diff-card): difflib.unified_diff() is called with
+    lineterm="" so the ---/+++/@@ header lines come back with NO trailing
+    newline. The old code fed it keepends=True content lines (which DO keep
+    their own trailing "\n", except for a line that is genuinely the last
+    line of the string) and then joined everything with "".join(diff).
+
+    That combination glues the three header lines directly onto the first
+    body line with zero separators between them. It's invisible for
+    ordinary multi-line diffs, because the first body line is a "-"/"+"
+    line that still gets its own real content on the same physical line —
+    but for a SINGLE-LINE symbol (very common: one-line arrow functions,
+    one-line const/type declarations, etc.), the original/new text has no
+    embedded newline at all, so the ENTIRE diff — headers plus the sole
+    "-old" and "+new" lines — collapses onto one single line of text with
+    no "\n" anywhere in it:
+
+        "--- x (original)+++ x (modified)@@ -1 +1 @@-old line+new line"
+
+    Every consumer of this string (frontend InlineDiffCard's ghost-diff
+    filter, diffLineCounts, parseDiffRows, and the server-side
+    `_has_real_diff` ghost-diff filter) does `diff.split("\n")` and then
+    checks each resulting line for a "+"/"-" prefix that isn't "+++"/"---".
+    Collapsed onto one line, that combined string starts with "---", so it
+    is misclassified as a header-only/no-op diff and the whole change gets
+    silently dropped as a "ghost diff" — the pipeline reports success
+    (smart_result_emitted fires) but no diff card ever renders, and in the
+    legacy pipeline path the change is deleted from changes_by_file before
+    it is even emitted. Proven against real session logs
+    (surgical_debug_35a98c4c.jsonl, surgical_debug_e3f0e267.jsonl):
+    every dropped edit was a `symbol_lines: 1` single-line symbol.
+
+    Fix: use splitlines() (no keepends) for the input, so every yielded
+    diff line — headers and content alike — comes back with no embedded
+    terminator, then join them ourselves with a single "\n". This
+    guarantees exactly one newline between every line regardless of
+    whether the source strings end in a newline, for both single-line and
+    multi-line diffs.
+    """
+    orig_lines = original.splitlines()
+    new_lines = new_code.splitlines()
     diff = difflib.unified_diff(
         orig_lines, new_lines,
         fromfile=f"{symbol_path} (original)",
         tofile=f"{symbol_path} (modified)",
         lineterm=""
     )
-    return "".join(diff)
+    return "\n".join(diff)
 
 
 def _should_use_ollama(model: Optional[str] = None, user_id: str = "") -> bool:
