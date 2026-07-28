@@ -14104,6 +14104,70 @@ def _clean_history_content(content: str) -> str:
     return content
 
 
+def _extract_edit_blocks(text: str) -> list:
+    """Extract raw <surgical_edit> block bodies from `text`.
+
+    Small shared helper — the symbol-correction round previously
+    reimplemented this scan-loop three separate times inline (initial
+    correction response, first follow-up, and now the second follow-up
+    added below). Factored out so the second-follow-up fix (session
+    e3f0e267 audit) doesn't add a fourth copy.
+    """
+    _EO, _EC = "<surgical_edit>", "</surgical_edit>"
+    blocks, state, buf = [], "normal", ""
+    for ch in text:
+        if state == "normal":
+            buf += ch
+            if buf.endswith(_EO):
+                buf, state = "", "in_edit"
+        else:
+            buf += ch
+            if buf.endswith(_EC):
+                blocks.append(buf[:-len(_EC)])
+                buf, state = "", "normal"
+    return blocks
+
+
+def _fetch_requested_files_context(text: str, file_content_lookup_stream: dict) -> str:
+    """Parse a <file_request> tag in `text` and build a context block with the
+    actual file contents (fuzzy filename fallback included) — mirrors the
+    established file_request handling already used in the QA-retry ReAct
+    loop (see the `_fr_match`/`_fr_names` handling around
+    ``qa_retry_correction_search_executed``).
+
+    Proven bug (session e3f0e267): the symbol-correction round's
+    <search_request> follow-up had no handler at all for a model reply of
+    <file_request> instead of an edit block. The request was silently
+    ignored, `pending_edits` stayed empty, and both unresolved edits
+    vanished with resolved_count=0 AND skipped_count=0 — no skip message,
+    no error, no trace. This helper lets the correction round actually
+    fulfill the request instead of giving up.
+    """
+    m = re.search(r'<file_request>\s*(.*?)\s*</file_request>', text, re.DOTALL)
+    if not m:
+        return ""
+    names = _parse_filereq_content(m.group(1))
+    parts = []
+    for fn in names[:5]:
+        content = file_content_lookup_stream.get(fn, "")
+        if not content:
+            cands = [
+                k for k in file_content_lookup_stream
+                if fn.lower() in k.lower() or k.lower() in fn.lower()
+            ]
+            if cands:
+                fn = cands[0]
+                content = file_content_lookup_stream.get(fn, "")
+        if content:
+            parts.append(
+                f"FILE: {fn} ({len(content.splitlines())} lines)\n"
+                f"```\n{content}\n```"
+            )
+        else:
+            parts.append(f"FILE NOT FOUND: '{fn}'")
+    return "\n\n".join(parts)
+
+
 def _verify_cannot_anchor_claim(reason_text: str, qa_summary_text: str, file_text: str) -> list:
     """
     Proves or disproves a <cannot_anchor> claim that code the plan/QA asked
@@ -18697,17 +18761,82 @@ async def run_natural_pipeline_stream(
                                       response_preview=_fu_text,
                                       user_id=user_id)
                                 # Extract edit blocks from follow-up response
-                                _fup, _fcs, _fcb = [], "normal", ""
-                                for _fc in _fu_text:
-                                    if _fcs == "normal":
-                                        _fcb += _fc
-                                        if _fcb.endswith(EDIT_OPEN):
-                                            _fcb, _fcs = "", "in_edit"
-                                    else:
-                                        _fcb += _fc
-                                        if _fcb.endswith(EDIT_CLOSE):
-                                            _fup.append(_fcb[:-len(EDIT_CLOSE)])
-                                            _fcb, _fcs = "", "normal"
+                                _fup = _extract_edit_blocks(_fu_text)
+
+                                # ── Second follow-up: honor a <file_request> ──
+                                # Proven bug (session e3f0e267): when this
+                                # first follow-up asked for a file instead of
+                                # emitting an edit, nothing fetched it — the
+                                # request was silently dropped and both
+                                # unresolved edits vanished (resolved_count=0,
+                                # skipped_count=0, no trace). Give it the file
+                                # it asked for and one more real chance.
+                                if not _fup and "<file_request>" in _fu_text:
+                                    _fr_ctx = _fetch_requested_files_context(
+                                        _fu_text, file_content_lookup_stream
+                                    )
+                                    _dlog("correction_followup_file_request_fulfilled",
+                                          session_id=session_id,
+                                          resolve_round=resolve_round,
+                                          context_chars=len(_fr_ctx),
+                                          user_id=user_id)
+                                    if _fr_ctx:
+                                        _fu2_msgs = _fu_msgs + [
+                                            {"role": "assistant", "content": _fu_text},
+                                            {"role": "user", "content": (
+                                                "Here is the file you requested:\n\n"
+                                                + _fr_ctx
+                                                + "\n\nNow write your corrected "
+                                                "<surgical_edit> block(s). Use the "
+                                                "EXACT verbatim lines shown above as "
+                                                "your old_code anchor — copy them "
+                                                "character-for-character. If you "
+                                                "truly cannot locate the code to "
+                                                "anchor on, reply "
+                                                "<cannot_anchor reason='...'/> "
+                                                "instead of guessing."
+                                            )},
+                                        ]
+                                        _dlog("correction_followup2_call_config",
+                                              session_id=session_id,
+                                              model="claude-sonnet-5",
+                                              wrapper="safe_claude_call",
+                                              resolve_round=resolve_round)
+                                        _fu2_task = asyncio.create_task(
+                                            _safe_claude_call(
+                                                aclient,
+                                                model="claude-sonnet-5",
+                                                desired_text_tokens=12000,
+                                                thinking_budget=4000,
+                                                retry_on_starve=True,
+                                                system=system_prompt,
+                                                messages=_fu2_msgs,
+                                            )
+                                        )
+                                        _fu2_t0 = time.time()
+                                        while not _fu2_task.done():
+                                            try:
+                                                await asyncio.wait_for(
+                                                    asyncio.shield(_fu2_task), timeout=20.0
+                                                )
+                                            except asyncio.TimeoutError:
+                                                _fu2_el = int(time.time() - _fu2_t0)
+                                                yield sse({"type": "progress",
+                                                           "content": f"Correction follow-up… ({_fu2_el}s)"})
+                                        _fu2_resp = _fu2_task.result()
+                                        _fu2_text = "".join(
+                                            b.text for b in _fu2_resp.content
+                                            if hasattr(b, "text")
+                                        )
+                                        _dlog("correction_followup2_response",
+                                              session_id=session_id,
+                                              resolve_round=resolve_round,
+                                              duration_s=round(time.time() - _fu2_t0, 1),
+                                              response_chars=len(_fu2_text),
+                                              response_preview=_fu2_text,
+                                              user_id=user_id)
+                                        _fup = _extract_edit_blocks(_fu2_text)
+
                                 if _fup:
                                     # Same fix as the main correction filter above:
                                     # drop only TRUE duplicates (already-resolved
@@ -18734,6 +18863,100 @@ async def run_natural_pipeline_stream(
                                   session_id=session_id,
                                   error=str(_cse),
                                   user_id=user_id)
+                    elif "<file_request>" in corr_text:
+                        # Model asked to see a whole file up front instead of
+                        # searching first. Same fulfillment path as the
+                        # second follow-up below — proven bug (session
+                        # e3f0e267): this branch didn't exist at all, so the
+                        # request was silently dropped and both edits
+                        # vanished with resolved_count=0, skipped_count=0.
+                        try:
+                            _fr0_ctx = _fetch_requested_files_context(
+                                corr_text, file_content_lookup_stream
+                            )
+                            _dlog("correction_file_request_fulfilled",
+                                  session_id=session_id,
+                                  resolve_round=resolve_round,
+                                  context_chars=len(_fr0_ctx),
+                                  user_id=user_id)
+                            if _fr0_ctx:
+                                _fu0_msgs = correction_msgs + [
+                                    {"role": "assistant", "content": corr_text},
+                                    {"role": "user", "content": (
+                                        "Here is the file you requested:\n\n"
+                                        + _fr0_ctx
+                                        + "\n\nNow write your corrected "
+                                        "<surgical_edit> block(s). Use the "
+                                        "EXACT verbatim lines shown above as "
+                                        "your old_code anchor — copy them "
+                                        "character-for-character. If you "
+                                        "truly cannot locate the code to "
+                                        "anchor on, reply "
+                                        "<cannot_anchor reason='...'/> "
+                                        "instead of guessing."
+                                    )},
+                                ]
+                                _dlog("correction_followup_call_config",
+                                      session_id=session_id,
+                                      model="claude-sonnet-5",
+                                      wrapper="safe_claude_call",
+                                      resolve_round=resolve_round)
+                                _fu0_task = asyncio.create_task(
+                                    _safe_claude_call(
+                                        aclient,
+                                        model="claude-sonnet-5",
+                                        desired_text_tokens=12000,
+                                        thinking_budget=4000,
+                                        retry_on_starve=True,
+                                        system=system_prompt,
+                                        messages=_fu0_msgs,
+                                    )
+                                )
+                                _fu0_t0 = time.time()
+                                while not _fu0_task.done():
+                                    try:
+                                        await asyncio.wait_for(
+                                            asyncio.shield(_fu0_task), timeout=20.0
+                                        )
+                                    except asyncio.TimeoutError:
+                                        _fu0_el = int(time.time() - _fu0_t0)
+                                        yield sse({"type": "progress",
+                                                   "content": f"Correction follow-up… ({_fu0_el}s)"})
+                                _fu0_resp = _fu0_task.result()
+                                _fu0_text = "".join(
+                                    b.text for b in _fu0_resp.content
+                                    if hasattr(b, "text")
+                                )
+                                _dlog("correction_followup_response",
+                                      session_id=session_id,
+                                      resolve_round=resolve_round,
+                                      duration_s=round(time.time() - _fu0_t0, 1),
+                                      response_chars=len(_fu0_text),
+                                      response_preview=_fu0_text,
+                                      user_id=user_id)
+                                _fu0up = _extract_edit_blocks(_fu0_text)
+                                if _fu0up:
+                                    _fu0up_filtered = []
+                                    for _fu0_raw in _fu0up:
+                                        try:
+                                            _fu0_parsed = json.loads(_fu0_raw)
+                                            _fu0_key = (_fu0_parsed.get("filename", ""), _fu0_parsed.get("symbol", ""))
+                                            if _fu0_key not in _resolved_raw_keys:
+                                                _fu0up_filtered.append(_fu0_raw)
+                                            else:
+                                                _dlog("correction_followup_edit_skipped_already_resolved",
+                                                      session_id=session_id,
+                                                      filename=_fu0_parsed.get("filename", ""),
+                                                      symbol=_fu0_parsed.get("symbol", ""),
+                                                      user_id=user_id)
+                                        except Exception:
+                                            _fu0up_filtered.append(_fu0_raw)
+                                    pending_edits = _fu0up_filtered or _fu0up
+                        except Exception as _cfe:
+                            _dlog("correction_file_request_failed",
+                                  session_id=session_id,
+                                  error=str(_cfe),
+                                  user_id=user_id)
 
             except Exception as _corr_fail:
                 # Log the actual failure — this bare handler previously
@@ -18750,6 +18973,41 @@ async def run_natural_pipeline_stream(
                         "filename": item.get("filename", ""),
                         "symbol": item.get("symbol", ""),
                         "reason": "correction_failed",
+                    })
+                break
+
+            # ── Silent-evaporation guard ──────────────────────────────────
+            # Proven bug (session e3f0e267): a correction round can complete
+            # WITHOUT raising (so the except-handler above never runs) yet
+            # still fail to produce any usable edit — e.g. the model's final
+            # word was a <file_request>/<search_request> that led nowhere,
+            # or any other non-cooperative reply. In that case `pending_edits`
+            # is empty going into the next round, whose edit-processing loop
+            # then trivially computes `still_unresolved == []` and treats
+            # that as "everything resolved" — silently discarding items that
+            # went in unresolved. Two independent real sessions hit exactly
+            # this: resolved_count=0, skipped_count=0, no skip message, no
+            # error surfaced to the user, edits just gone. If this round
+            # still has unresolved items and produced no new candidate edits
+            # to try, finalize them as skipped HERE instead of laundering
+            # them into a false "nothing left to do."
+            if still_unresolved and not pending_edits:
+                _dlog("correction_round_produced_no_edit",
+                      session_id=session_id,
+                      resolve_round=resolve_round,
+                      unresolved_count=len(still_unresolved),
+                      unresolved=[{"f": x.get("filename"), "s": x.get("symbol")}
+                                  for x in still_unresolved],
+                      user_id=user_id)
+                for item in still_unresolved:
+                    skipped_messages.append(
+                        f"Symbol '{item['symbol']}' not found in {item['filename']} — "
+                        "correction round produced no usable edit or context request"
+                    )
+                    skipped_changes_struct.append({
+                        "filename": item.get("filename", ""),
+                        "symbol": item.get("symbol", ""),
+                        "reason": "correction_no_edit_produced",
                     })
                 break
 
