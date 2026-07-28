@@ -637,6 +637,54 @@ def pick_no_edits_notice(
     return "no_edits_silent", None
 
 
+def resolve_file_request_batch(
+    fnames_req,
+    requested_files,
+    user_supplied_files,
+    same_name_retries,
+    max_same_file_retries: int = 1,
+    max_file_req_total: int = 15,
+):
+    """Decide which of the model's `<filereq>` filenames actually need a
+    fresh fetch this turn, vs. which are already resolved (successfully OR
+    definitively not-found) and must not trigger another search/HITL pause.
+
+    Returns (new_fnames, rerequestable, hit_total_limit):
+      new_fnames      -- filenames to actually go fetch this turn.
+      rerequestable   -- subset of new_fnames that are a same-name
+                         correction retry (earlier copy came from a user
+                         upload and may be the WRONG file).
+      hit_total_limit -- True when the distinct-file request budget is
+                         exhausted and at least one of fnames_req is new.
+
+    Proven bug this guards against (session e3f0e267, useRateCardHooks.js):
+    a filename that could never be resolved (GitHub search exhausted, then
+    the human-in-the-loop pause timed out with no upload) must still count
+    as "requested" -- i.e. the CALLER must add it to `requested_files` even
+    on failure. If the caller only records successes, the same never-found
+    filename slips back through this filter on every later turn and pays a
+    full new search + up to a 240s blocking pause EACH time, burning the
+    whole streaming-phase time budget on a file that will never arrive and
+    aborting before any edit is attempted. This function only enforces the
+    filtering side of the contract; `requested_files.add(fn)` must be
+    called for every outcome (found, not-found, skipped, timed out).
+    """
+    rerequestable = {
+        fn for fn in fnames_req
+        if fn in requested_files
+        and fn in user_supplied_files
+        and same_name_retries.get(fn, 0) < max_same_file_retries
+    }
+    new_fnames = [
+        fn for fn in fnames_req
+        if fn not in requested_files or fn in rerequestable
+    ]
+    new_distinct = [fn for fn in fnames_req if fn not in requested_files]
+    hit_total_limit = (
+        len(requested_files) >= max_file_req_total and bool(new_distinct))
+    return new_fnames, rerequestable, hit_total_limit
+
+
 _FILEREQ_EXT_SWAP = {"ts": "tsx", "tsx": "ts", "js": "jsx", "jsx": "js"}
 _FILEREQ_BARREL_NAMES = ("index.ts", "index.tsx", "index.js", "index.jsx")
 
@@ -16064,22 +16112,20 @@ async def run_natural_pipeline_stream(
                     # per-file correction budget is not yet spent. This lets the
                     # model self-correct when the user uploads the wrong file, while
                     # the total-file and turn backstops still bound the whole run.
-                    MAX_SAME_FILE_RETRIES = 1  # was referenced but never defined — guaranteed NameError
-                    _rerequestable = {
-                        fn for fn in fnames_req
-                        if fn in requested_files
-                        and fn in user_supplied_files
-                        and same_name_retries.get(fn, 0) < MAX_SAME_FILE_RETRIES
-                    }
-                    new_fnames = [
-                        fn for fn in fnames_req
-                        if fn not in requested_files or fn in _rerequestable
-                    ]
-                    # The total-file cap only blocks pulling NEW distinct files; a
-                    # re-request of an already-loaded user file does not count.
-                    _new_distinct = [fn for fn in fnames_req if fn not in requested_files]
-                    _hit_total_limit = (
-                        len(requested_files) >= MAX_FILE_REQ_TOTAL and bool(_new_distinct))
+                    # See `resolve_file_request_batch` for the filtering contract:
+                    # it relies on `requested_files` recording EVERY outcome
+                    # (found or not-found) so a file that can never be resolved
+                    # doesn't pay a fresh search + HITL-pause cost on every turn
+                    # (proven bug, session e3f0e267 / useRateCardHooks.js).
+                    MAX_SAME_FILE_RETRIES = 1
+                    new_fnames, _rerequestable, _hit_total_limit = (
+                        resolve_file_request_batch(
+                            fnames_req, requested_files, user_supplied_files,
+                            same_name_retries,
+                            max_same_file_retries=MAX_SAME_FILE_RETRIES,
+                            max_file_req_total=MAX_FILE_REQ_TOTAL,
+                        )
+                    )
                     if not new_fnames or _hit_total_limit:
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
@@ -16347,6 +16393,31 @@ async def run_natural_pipeline_stream(
                                     _fr_msg += (f" (Similar files available: "
                                                 f"{', '.join(_fr_cands[:3])}.)")
                                 file_result_parts.append(_fr_msg)
+                                # ── Proven bug (session e3f0e267) ──────────────
+                                # `requested_files.add(fn)` used to live ONLY
+                                # after this whole if/else block, so a file that
+                                # was never found (GitHub search exhausted +
+                                # HITL pause timed out/skipped) was silently
+                                # never recorded as "already requested". The
+                                # model, told "proceed without it", instead
+                                # asked for the SAME missing file again in a
+                                # later turn — `new_fnames` didn't filter it out
+                                # (fn not in requested_files), so it paid the
+                                # full GitHub-search + 240s HITL pause cost a
+                                # SECOND time. Two full 240s pauses for one
+                                # never-found file (useRateCardHooks.js, turns
+                                # 3 and 5) burned ~480s and blew the 480s
+                                # streaming-phase deadline before any edit was
+                                # ever attempted -> agent_loop_deadline_abort ->
+                                # the unhelpful "ran out of time before
+                                # finishing my search" notice with ZERO edits.
+                                # Recording the failure here means a repeat
+                                # request for the same still-missing file is
+                                # caught by the `new_fnames`/`_hit_total_limit`
+                                # guards below instead of re-entering search+
+                                # HITL — one pause per genuinely-missing file,
+                                # ever, per turn loop.
+                                requested_files.add(fn)
                                 continue
                         requested_files.add(fn)
                         file_lines = content.splitlines()
