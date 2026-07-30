@@ -9393,6 +9393,57 @@ def _repair_json(text: str) -> str:
     return ''.join(result)
 
 
+def _build_architect_checkpoint_resolved(edit_blocks_raw: list, new_file_blocks_raw: list) -> list:
+    """
+    Parse raw <edit>/<new_file> tag bodies collected so far in the architect
+    turn loop into the same {filename, symbol, description, new_code} shape
+    the resolution-phase disconnect checkpoint (session e4e9d098) already
+    uses — so chat.py's existing recovery path in the SSE stream's finally
+    block can reconstruct them with zero changes on that side.
+
+    Pure and defensive by design: called every turn a disconnect could hit,
+    on data that may include an in-flight, not-yet-closed block or LLM JSON
+    with minor formatting slips. A block that can't be parsed (even after
+    _repair_json) is silently skipped — recovering the OTHER, valid blocks
+    is strictly better than losing the checkpoint attempt to one bad block,
+    and this must never raise into the caller's streaming loop.
+    """
+    resolved: list = []
+    for _raw in edit_blocks_raw:
+        try:
+            _rd = json.loads(_raw.strip())
+        except Exception:
+            try:
+                _rd = json.loads(_repair_json(_raw.strip()))
+            except Exception:
+                continue
+        if not isinstance(_rd, dict):
+            continue
+        resolved.append({
+            "filename": _rd.get("filename", "?"),
+            "symbol": _rd.get("symbol", "?"),
+            "description": _rd.get("description", ""),
+            "new_code": _rd.get("new_code", ""),
+        })
+    for _raw in new_file_blocks_raw:
+        try:
+            _rd = json.loads(_raw.strip())
+        except Exception:
+            try:
+                _rd = json.loads(_repair_json(_raw.strip()))
+            except Exception:
+                continue
+        if not isinstance(_rd, dict):
+            continue
+        resolved.append({
+            "filename": _rd.get("filename", "?"),
+            "symbol": "(new file)",
+            "description": _rd.get("description", ""),
+            "new_code": _rd.get("content", ""),
+        })
+    return resolved
+
+
 def _infer_new_file_from_raw(raw_content: str, user_request: str) -> dict | None:
     """
     Fallback for GPT models that write raw file content inside <new_file>
@@ -16059,6 +16110,39 @@ async def run_natural_pipeline_stream(
                               plan_items=len(_pd))
 
             _new_edits = (len(edit_blocks_raw) + len(new_file_blocks_raw)) - _edits_before
+
+            # ── Architect-phase disconnect checkpoint (session 414dfaef) ──
+            # Evidence: two client disconnects (page reload mid-stream) hit
+            # DURING this turn loop — one after 4 edit blocks had already
+            # closed cleanly in edit_blocks_raw. agent_loop_done never fired,
+            # so resolution_phase_start (and its own checkpoint, added for
+            # session e4e9d098) never ran. Those 4 completed edits vanished;
+            # the user saw "no code changes" despite Opus having written them.
+            # The existing checkpoint only covers the LATER resolution/
+            # correction phase. Mirror it here so any edit/file block that
+            # finished this turn survives a disconnect on a *later* turn,
+            # even though nothing has been symbol-resolved yet — chat.py's
+            # existing recovery path already understands this exact shape.
+            if _new_edits > 0:
+                _ckpt_resolved = _build_architect_checkpoint_resolved(
+                    edit_blocks_raw, new_file_blocks_raw)
+                if _ckpt_resolved:
+                    try:
+                        _dlog("architect_checkpoint_emitted",
+                              session_id=session_id, user_id=user_id, turn=_turn,
+                              edit_blocks=len(edit_blocks_raw),
+                              new_file_blocks=len(new_file_blocks_raw),
+                              parsed_count=len(_ckpt_resolved))
+                        yield sse({"type": "checkpoint",
+                                   "content": json.dumps({
+                                       "phase": "architect",
+                                       "turn": _turn,
+                                       "resolved": _ckpt_resolved,
+                                   })})
+                    except Exception as _arch_ckpt_err:
+                        _dlog("architect_checkpoint_error",
+                              session_id=session_id, user_id=user_id, turn=_turn,
+                              error=str(_arch_ckpt_err)[:200])
 
             # ── Dispatch: run the requested tool, feed results back, continue ──
             if pending_tool is not None:
