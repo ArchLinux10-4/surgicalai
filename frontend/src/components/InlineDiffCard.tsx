@@ -16,6 +16,34 @@ interface Props {
   result: SmartResult
   sessionId: string
   onApplied?: (filename: string, modifiedContent: string) => void
+  // onRetryWithQA: automates what the user was previously doing by hand —
+  // copying a failed QA report and pasting it back into chat to trigger a
+  // fresh correction attempt (proven in trace 414dfaef to reliably yield a
+  // better fix — that session went 2/10 -> 9/10 this way). Wired by
+  // ChatPanel to its real send pathway so this is a genuine resend, not a
+  // cosmetic mock.
+  onRetryWithQA?: (reportText: string) => void
+}
+
+// Builds the same information a user would have copy/pasted back into chat
+// after seeing a failed QA report — filename, symbol, verdict/score, and
+// every concrete issue QA found — formatted as plain text so it reads
+// naturally as a chat message asking for a fix.
+function buildQARetryReportText(filename: string, change: any): string {
+  const qa = change.qa_result || {}
+  const symbol = change.symbol?.full_path || change.symbol?.name || 'this change'
+  const lines: string[] = []
+  lines.push(`QA failed for ${symbol} in ${filename} (verdict: ${qa.verdict || 'blocked'}, score: ${qa.qa_score ?? 'n/a'}/10). Please fix it.`)
+  if (qa.summary) lines.push(`Summary: ${qa.summary}`)
+  const bucket = (label: string, items?: string[]) => {
+    if (items && items.length) lines.push(`${label}:\n` + items.map(i => `- ${i}`).join('\n'))
+  }
+  bucket('Type/compile errors', qa.type_errors)
+  bucket('Import issues', qa.import_issues)
+  bucket('Logic errors', qa.logic_errors)
+  bucket('Downstream risks', qa.downstream_risks)
+  if (qa.plan_deviation) lines.push(`Plan deviation: ${qa.plan_deviation}`)
+  return lines.join('\n\n')
 }
 
 // --- localStorage helpers for persisting applied/skipped state across refresh ---
@@ -73,13 +101,18 @@ function QABadge({ qa }: { qa: QAResult }) {
     skipped: 'text-muted bg-muted/10 border-muted/30',
   }
   const icons: Record<string, string> = { safe: '✅', warning: '⚠️', blocked: '🚫', skipped: '⏭' }
-  const color = styles[qa.verdict] || styles.skipped
-  const icon = icons[qa.verdict] || '⏭'
+  // hard_blocked (trace 414dfaef): a real blocked verdict that survived
+  // every auto-retry gets a visually distinct badge from a routine
+  // warning/skipped/borderline advisory, so it doesn't blend in as "just
+  // another small yellow badge" the way the 2/10 case did.
+  const color = qa.hard_blocked ? 'text-danger bg-danger/25 border-danger/50 font-bold' : (styles[qa.verdict] || styles.skipped)
+  const icon = qa.hard_blocked ? '⛔' : (icons[qa.verdict] || '⏭')
   const score = qa.qa_score !== null ? ` ${qa.qa_score}/10` : ''
   const issues = [
     ...qa.import_issues,
     ...qa.downstream_risks,
     ...qa.type_errors,
+    ...(qa.logic_errors || []),
     ...(qa.plan_deviation ? [qa.plan_deviation] : []),
   ].filter(Boolean)
 
@@ -130,6 +163,12 @@ function QABadge({ qa }: { qa: QAResult }) {
             <button onClick={() => setExpanded(false)} className="text-muted hover:text-ink">✕</button>
           </div>
           <p className="text-muted mb-2">{qa.summary || 'No summary'}</p>
+          {qa.hard_blocked && (
+            <p className="text-danger font-semibold mb-2">
+              ⛔ Still blocked after every auto-fix attempt — this diff was NOT applied.
+              {qa.regression_detected && ' An earlier attempt made it worse and was reverted automatically.'}
+            </p>
+          )}
           {issues.length > 0 && (
             <ul className="space-y-1">
               {issues.map((issue, i) => (
@@ -552,12 +591,13 @@ function DiffBlock({ diff, language: _language }: { diff: string; language: stri
   )
 }
 
-function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeApplied }: {
+function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeApplied, onRetryWithQA }: {
   filename: string
   fileData: { filename: string; file_id: string; changes: any[] }
   sessionId: string
   onApplied?: (filename: string, content: string) => void
   onChangeApplied?: (delta?: number) => void
+  onRetryWithQA?: (reportText: string) => void
 }) {
   // Filter ghost diffs first — do this before any state so IDs are stable
   const realChanges = fileData.changes.filter((c: any) => {
@@ -1248,6 +1288,27 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                      recent saved state, not an individual row. Use the file
                      header's Undo/History controls instead. */}
 
+                {/* Retry with QA (trace 414dfaef): automates the manual
+                    copy-paste-the-QA-report workflow that reliably fixed a
+                    2/10 -> 9/10 case. Only shown once every automatic retry
+                    round is exhausted and the change is still genuinely
+                    blocked — routine warnings/borderline scores don't need
+                    it. Disabled mid-stream so it can't double-fire. */}
+                {change.qa_result?.hard_blocked && onRetryWithQA && (
+                  <button
+                    onClick={() => {
+                      const reportText = buildQARetryReportText(fileData.filename || filename, change)
+                      onRetryWithQA(reportText)
+                      toast.success('Sent the QA report back — asking for another fix...')
+                    }}
+                    className="flex items-center gap-1 px-2.5 py-1 bg-danger/10 text-danger border border-danger/40 rounded-lg text-[11px] font-semibold hover:bg-danger/20 transition-colors animate-pulse"
+                    title="Send this failed QA report back to the agent for another fix — the same thing as pasting it into chat yourself"
+                  >
+                    <Replay sx={{ fontSize: 12 }} />
+                    <span>Retry with QA</span>
+                  </button>
+                )}
+
                 <button
                   onClick={() => toggleDiff(change.id)}
                   className="flex items-center gap-1 px-2.5 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
@@ -1334,7 +1395,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   )
 }
 
-export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
+export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA }: Props) {
   const [showTestRunner, setShowTestRunner] = useState(false)
   const fileEntries = Object.entries(result.changes_by_file)
   const totalChanges = fileEntries.reduce((sum, [, v]) => sum + v.changes.length, 0)
@@ -1363,6 +1424,7 @@ export function InlineDiffCard({ result, sessionId, onApplied }: Props) {
           sessionId={sessionId}
           onApplied={onApplied}
           onChangeApplied={(delta = 1) => { setAppliedCount(n => Math.max(0, n + delta)); setShowTestRunner(true) }}
+          onRetryWithQA={onRetryWithQA}
         />
       ))}
 

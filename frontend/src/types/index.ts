@@ -67,9 +67,24 @@ export interface QAResult {
   import_issues: string[]
   downstream_risks: string[]
   type_errors: string[]
+  // logic_errors: mental-tracing issues found by the QA reviewer. Backend has
+  // always computed this (models/schemas.py) but it was missing from this
+  // type and silently dropped by every UI surface that reads QAResult
+  // fields — fixed alongside the retry-gate hardening (trace 414dfaef).
+  logic_errors?: string[]
   plan_deviation: string
   skipped_reason?: string | null
   risk_verdicts?: RiskVerdict[]
+  // hard_blocked: true when the FINAL QA/tsc gate — after every auto-retry —
+  // still shows a real `blocked` verdict (confirmed compile errors, or a
+  // genuine blocked semantic verdict the retry loop couldn't resolve).
+  // Distinct from a routine soft/borderline advisory. Drives the louder
+  // warning + "Retry with QA" button on the diff card.
+  hard_blocked?: boolean
+  // regression_detected: true when an auto-correction round made things
+  // worse (more real compile errors) than the version before it, and the
+  // pipeline reverted that round's attempt rather than keeping it.
+  regression_detected?: boolean
 }
 
 export interface SurgicalChange {

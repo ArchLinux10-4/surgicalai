@@ -423,7 +423,7 @@ function CompactMarkerChip({ msg }: { msg: any }) {
   )
 }
 
-function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
+function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: string; onRetryWithQA?: (reportText: string) => void }) {
   const isUser = msg.role === 'user'
   const isSurgical = msg.message_type === 'surgical_result'
   const isNaturalResult = msg.message_type === 'natural_result'
@@ -502,7 +502,7 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
             {surgicalResult.intent === 'create' ? (
               <NewFileCard result={surgicalResult} sessionId={sessionId} />
             ) : (
-              <InlineDiffCard result={surgicalResult} sessionId={sessionId} />
+              <InlineDiffCard result={surgicalResult} sessionId={sessionId} onRetryWithQA={onRetryWithQA} />
             )}
           </DiffCardBoundary>
         ) : isNaturalResult ? (
@@ -520,7 +520,7 @@ function Message({ msg, sessionId }: { msg: any; sessionId: string }) {
                 {surgicalResult.intent === 'create' ? (
                   <NewFileCard result={surgicalResult} sessionId={sessionId} />
                 ) : (
-                  <InlineDiffCard result={surgicalResult} sessionId={sessionId} />
+                  <InlineDiffCard result={surgicalResult} sessionId={sessionId} onRetryWithQA={onRetryWithQA} />
                 )}
               </DiffCardBoundary>
             )}
@@ -2030,12 +2030,21 @@ export function ChatPanel() {
   }
 
   // ── Send message ──────────────────────────────────────
-  const handleSend = useCallback(async () => {
-    if (!input.trim()) return
+  // Retry-with-QA (trace 414dfaef): `overrideText`, when provided, is sent
+  // through the EXACT same real pathway as a normal typed message (steer
+  // injection while streaming, or a fresh send) instead of a parallel
+  // one-off implementation — this is deliberately the same mechanism the
+  // user was already using by hand (copy/paste a QA report into the box),
+  // just automated behind a button. `input` is only read/cleared when no
+  // override is given, so it never clobbers whatever the user was mid-typing.
+  const handleSend = useCallback(async (overrideText?: string) => {
+    const sourceText = overrideText !== undefined ? overrideText : input
+    if (!sourceText.trim()) return
+    clientLog('chat_handle_send_invoked', { isOverride: overrideText !== undefined, isStreaming, length: sourceText.length }, activeSessions || '')
     // Steer: if Claude is streaming (thinking or generating), inject the user's
     // context immediately — abort current stream and restart with combined message.
     // User sees their message bubble + Claude reacting, just like Tasklet.
-    if (isStreaming && input.trim()) {
+    if (isStreaming && sourceText.trim()) {
       const sid = activeSessions
       if (!sid) return                       // no session — nothing to inject into
       // The agent is paused waiting on a file-request back-channel for this
@@ -2047,9 +2056,11 @@ export function ChatPanel() {
         setError('The agent is waiting for a file — use Upload file or Skip above before sending a new message.')
         return
       }
-      const inj = input.trim()
-      setInput('')
-      if (textareaRef.current) textareaRef.current.style.height = 'auto'
+      const inj = sourceText.trim()
+      if (overrideText === undefined) {
+        setInput('')
+        if (textareaRef.current) textareaRef.current.style.height = 'auto'
+      }
       // Show user bubble so the injected message is visible in chat
       addMessage({
         id: Date.now().toString() + '_inj',
@@ -2083,11 +2094,15 @@ export function ChatPanel() {
     // never part of the visible draft — so they're folded into the outgoing
     // text only at send time, then cleared (mirrors how sessionFiles attach
     // without living inside the textarea).
-    const text = appendPickedElementsContext(input.trim(), pickedElements)
+    const text = overrideText !== undefined
+      ? overrideText.trim()
+      : appendPickedElementsContext(input.trim(), pickedElements)
     sentMessageRef.current = text
-    setInput('')
-    if (pickedElements.length > 0) clearPickedElements()
-    if (textareaRef.current) textareaRef.current.style.height = 'auto'
+    if (overrideText === undefined) {
+      setInput('')
+      if (pickedElements.length > 0) clearPickedElements()
+      if (textareaRef.current) textareaRef.current.style.height = 'auto'
+    }
     userScrolledUpRef.current = false  // snap to bottom on user's own send
 
     const sessionId = await ensureSession()
@@ -2272,7 +2287,7 @@ export function ChatPanel() {
         ) : (
           <div className="py-2">
             {messages.map((msg, i) => (
-              <Message key={msg.id || i} msg={msg} sessionId={msg.session_id || activeSessions || ''} />
+              <Message key={msg.id || i} msg={msg} sessionId={msg.session_id || activeSessions || ''} onRetryWithQA={handleSend} />
             ))}
             {resumableRun && resumableRun.sid === activeSessions && !isStreaming && (
               <div className="mx-3 mb-2 flex items-center justify-between gap-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5 animate-slide-up">
@@ -2595,7 +2610,7 @@ export function ChatPanel() {
               {/* Send button: always visible. During thinking, acts as Steer (queues context). */}
               {(!isStreaming || isThinking) && (
                 <button
-                  onClick={handleSend}
+                  onClick={() => handleSend()}
                   disabled={!input.trim() || isCompacting}
                   className={`h-8 w-8 rounded-lg flex items-center justify-center transition-all ${
                     !input.trim() || isCompacting

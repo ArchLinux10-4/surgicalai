@@ -8,6 +8,7 @@ Best Practice #2: Minimal footprint (surgeon only touches requested symbol)
 Best Practice #3: Verify before commit (confidence scoring + diff)
 """
 import ast
+import copy
 import json
 import re
 import uuid
@@ -19759,6 +19760,15 @@ async def run_natural_pipeline_stream(
             )
             qa_results[_idx]["verdict"] = "blocked"
             qa_results[_idx]["qa_score"] = min(qa_results[_idx].get("qa_score", 10) or 10, 3)
+            # hard_blocked (trace 414dfaef): _suffix is only non-empty when
+            # this fires from the FINAL gate (" remain after auto-fix") — i.e.
+            # the retry budget is exhausted and real, confirmed compiler
+            # errors are STILL present. That's the case the frontend needs to
+            # surface distinctly (louder banner + one-click "Retry with QA"),
+            # as opposed to pre_check catching an error the loop then fixes,
+            # which is normal and never reaches the user this way.
+            if _suffix:
+                qa_results[_idx]["hard_blocked"] = True
             qa_results[_idx]["summary"] = (
                 f"tsc: {len(_msgs)} compile error(s){_suffix}. "
                 + (qa_results[_idx].get("summary", "") or "")
@@ -19773,11 +19783,27 @@ async def run_natural_pipeline_stream(
         _tsc_pre_groups: dict = {}
         for _ti, _tcs in enumerate(change_shells):
             _tsc_pre_groups.setdefault(_tcs["filename"], []).append(_ti)
+        # ── Per-round regression baseline (trace 414dfaef) ────────────────────
+        # `_tsc_round_best[fname]` tracks the LOWEST tsc-introduced-error count
+        # ever observed for that file across pre_check + every retry round.
+        # Evidence: pre_check found 2 introduced errors in this file; round 0's
+        # auto-correction was never re-measured by tsc (only re-QA'd
+        # semantically); round 1's "fix" silently pushed the real compiler
+        # error count to 8 and nothing caught it until the final gate, after
+        # the retry budget was already spent. Seeding this here — and
+        # re-checking it after every round below — makes a regressing
+        # correction attempt visible and reversible on the spot instead of
+        # discovered for free at the very end.
+        _tsc_round_best: dict = {}
+        _tsc_round_cache: dict = {}
         for _tfname, _tidxs in _tsc_pre_groups.items():
             if _qa_over_budget:
                 break
             _t_introduced = await _tsc_file_introduced_errors(
                 _tfname, _tidxs, _tsc_orig_cache, "pre_check")
+            _tsc_round_best[_tfname] = len(_t_introduced)
+            _dlog("tsc_round_baseline_seeded", session_id=session_id, user_id=user_id,
+                  filename=_tfname, baseline_introduced_count=len(_t_introduced))
             if _t_introduced:
                 for _ti in _tidxs:
                     _force_block_on_tsc(_ti, _t_introduced, "")
@@ -19890,6 +19916,22 @@ async def run_natural_pipeline_stream(
                 _dlog("qa_retry_no_blocked_breaking", session_id=session_id, user_id=user_id,
                       retry_round=_qa_retry_round)
                 break
+
+            # ── Pre-round snapshot (regression rollback target) ────────────
+            # Captured BEFORE this round's correction attempt touches anything,
+            # so a regressing fix (tsc errors go UP, not down) can be reverted
+            # to the exact last-known-safe state below, instead of shipping a
+            # worse edit or silently burning the retry budget on it.
+            _pre_round_snapshot = {
+                _bi: {
+                    "new_code": change_shells[_bi]["new_code"],
+                    "diff": change_shells[_bi]["diff"],
+                    "qa_result": copy.deepcopy(qa_results[_bi]),
+                }
+                for _bi in blocked_indices
+            }
+            _dlog("qa_retry_pre_round_snapshot_captured", session_id=session_id, user_id=user_id,
+                  retry_round=_qa_retry_round, snapshot_indices=list(_pre_round_snapshot.keys()))
 
             # ── Disconnect checkpoint (QA-correction loop parity) ──────────
             # Evidence (trace 0b90bcde): a client disconnect 31.8s into a
@@ -22168,6 +22210,62 @@ async def run_natural_pipeline_stream(
                           accepted_before_reconcile=_accepted_before_reconcile,
                           flipped_by_reconcile=(_accepted_before_reconcile != _latest["accepted"]))
 
+            # ── Per-round tsc regression check + rollback (trace 414dfaef) ──
+            # Re-measure the REAL compiler error count for every file this
+            # round touched, using the exact same isolated-compile helper as
+            # pre_check/final_gate. If a file's introduced-error count went UP
+            # relative to the best count ever seen for it, this round's fix is
+            # strictly worse than what we already had — revert every changed
+            # idx in that file to its pre-round snapshot instead of keeping
+            # the regression or spending the next retry round trying to dig
+            # out of a hole this round dug. If it held steady or improved,
+            # record the new baseline so a future round is judged against it.
+            _round_touched_files = {change_shells[_fi]["filename"] for _fi in fixed_indices}
+            for _rfname in _round_touched_files:
+                _ridxs = _tsc_pre_groups.get(_rfname, [])
+                if not _ridxs:
+                    continue
+                _r_introduced = await _tsc_file_introduced_errors(
+                    _rfname, _ridxs, _tsc_round_cache, f"round_{_qa_retry_round}_check")
+                _prev_best = _tsc_round_best.get(_rfname, 0)
+                _new_count = len(_r_introduced)
+                _dlog("qa_retry_round_tsc_check", session_id=session_id, user_id=user_id,
+                      retry_round=_qa_retry_round, filename=_rfname,
+                      prev_best_introduced=_prev_best, this_round_introduced=_new_count,
+                      regressed=(_new_count > _prev_best))
+                if _new_count > _prev_best:
+                    _rolled_back = []
+                    for _ri in _ridxs:
+                        if _ri in fixed_indices and _ri in _pre_round_snapshot:
+                            _snap = _pre_round_snapshot[_ri]
+                            change_shells[_ri]["new_code"] = _snap["new_code"]
+                            change_shells[_ri]["diff"] = _snap["diff"]
+                            qa_results[_ri] = _snap["qa_result"]
+                            qa_results[_ri]["regression_detected"] = True
+                            _rolled_back.append(_ri)
+                            if _ri in _correction_history and _correction_history[_ri]:
+                                _correction_history[_ri][-1]["accepted"] = False
+                                _correction_history[_ri][-1]["qa_summary"] = (
+                                    f"[auto-reverted: this attempt raised real compile errors "
+                                    f"{_prev_best}\u2192{_new_count} in {_rfname}] "
+                                    + _correction_history[_ri][-1].get("qa_summary", "")
+                                )
+                    _dlog("qa_retry_regression_detected", session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round, filename=_rfname,
+                          prev_best_introduced=_prev_best, new_introduced=_new_count,
+                          rolled_back_indices=_rolled_back,
+                          introduced_detail=[{"code": e.get("code", ""), "line": e.get("line"),
+                                               "message": (e.get("message", "") or "")[:300]}
+                                              for e in _r_introduced])
+                    if _rolled_back:
+                        yield sse({"type": "progress",
+                                   "content": f"⛔ {_rfname}: that correction attempt introduced MORE "
+                                              f"compile errors ({_prev_best}\u2192{_new_count}) than we "
+                                              f"already had — reverted to the last safe version "
+                                              f"(attempt {_qa_retry_round + 1}/{MAX_QA_RETRIES})."})
+                else:
+                    _tsc_round_best[_rfname] = _new_count
+
         # ── tsc compile check — final verification after all retries ──────────
         # Re-run tsc on the FINAL content of every change. Anything that still
         # introduces a compile error is marked verdict="blocked" / score<=3 via
@@ -22265,11 +22363,28 @@ async def run_natural_pipeline_stream(
                     or qa_dict.get("skipped_reason")
                     or "QA did not produce a score"
                 )
-                _qa_advisory_icon = "⚠️" if _gv == "skipped" else "🔶"
+                # ── hard_blocked distinction (trace 414dfaef) ───────────────
+                # A genuine "blocked" verdict — real, confirmed problems the
+                # retry loop could not resolve within its budget — is a
+                # materially different situation from a borderline
+                # warning/unscored edit, and was previously given the exact
+                # same small 🔶 badge and folded into the same generic
+                # "advisory" log line. That's how a 2/10 blocked edit with
+                # compiler-confirmed errors shipped indistinguishable from a
+                # routine unscored re-check. Mark it explicitly so the
+                # frontend can show a louder, distinct warning + the
+                # one-click "Retry with QA" action instead.
+                if _gv == "blocked":
+                    qa_dict["hard_blocked"] = True
+                _qa_advisory_icon = "⚠️" if _gv == "skipped" else ("🔴" if qa_dict.get("hard_blocked") else "🔶")
+                _qa_advisory_suffix = (
+                    " Shipping as a visible, unapplied diff — use \u201cRetry with QA\u201d to try again."
+                    if qa_dict.get("hard_blocked") else " Shipping anyway."
+                )
                 yield sse({"type": "progress",
                            "content": f"{_qa_advisory_icon} QA advisory — {symbol.name} "
                                       f"(verdict: {_gv}, score: {_gscore_txt}/10): "
-                                      f"{_greason[:120]}. Shipping anyway."})
+                                      f"{_greason[:120]}.{_qa_advisory_suffix}"})
                 _dlog("qa_advisory_warning",
                       session_id=session_id,
                       filename=filename,
@@ -22278,6 +22393,8 @@ async def run_natural_pipeline_stream(
                       score=_gs,
                       reason=_greason[:300],
                       advisory=True,
+                      hard_blocked=qa_dict.get("hard_blocked", False),
+                      regression_detected=qa_dict.get("regression_detected", False),
                       user_id=user_id)
                 try:
                     _log_qa_result(session_id, filename, symbol.name, qa_dict)
@@ -22297,6 +22414,8 @@ async def run_natural_pipeline_stream(
                 logic_errors=qa_dict.get("logic_errors", []),
                 plan_deviation=qa_dict.get("plan_deviation", ""),
                 risk_verdicts=qa_dict.get("risk_verdicts", []),
+                hard_blocked=qa_dict.get("hard_blocked", False),
+                regression_detected=qa_dict.get("regression_detected", False),
             )
 
             verdict_icon = (

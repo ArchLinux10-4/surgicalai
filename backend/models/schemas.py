@@ -184,6 +184,18 @@ class QAResult(BaseModel):
     plan_deviation: str = ""
     skipped_reason: Optional[str] = None
     risk_verdicts: List[dict] = []     # v3.7.1: per-risk verdicts from QA
+    # ── Regression-aware retry loop (trace 414dfaef) ─────────────────────
+    # hard_blocked: True when the FINAL gate still shows a real `blocked`
+    # verdict with concrete compiler/type errors present after the retry
+    # budget is exhausted — distinct from a soft "advisory" (borderline
+    # score, no confirmed compile errors). Drives the frontend's
+    # "Retry with QA" button and a louder warning, instead of the same
+    # small badge used for genuinely borderline edits.
+    hard_blocked: bool = False
+    # regression_detected: True when at least one auto-correction round
+    # made tsc-introduced errors WORSE than the prior round (or than the
+    # pre-correction baseline) and was rolled back rather than kept.
+    regression_detected: bool = False
 
 
 class SurgicalOperation(BaseModel):
