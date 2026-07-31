@@ -6837,8 +6837,26 @@ async def analyze_and_plan_stream(
                                         _cotc_name = _cotc.function.name
                                         try:
                                             _cotc_input = json.loads(_cotc.function.arguments) if _cotc.function.arguments else {}
-                                        except json.JSONDecodeError:
-                                            _cotc_input = {}
+                                        except json.JSONDecodeError as _cotc_pe:
+                                            # Bug class (verified via OpenAI community + industry reports):
+                                            # malformed/truncated tool-call arguments JSON must NOT be
+                                            # silently treated as an empty dict — that produces misleading
+                                            # "not found"/"empty" tool results and the model never learns
+                                            # its own JSON was invalid, so it repeats the same broken call.
+                                            # Tell the model explicitly so it can resend valid JSON.
+                                            _dlog("agent_mode_gpt_correction_args_json_error",
+                                                  session_id=session_id, turn=_corr_turn + 1,
+                                                  tool=_cotc_name, error=str(_cotc_pe)[:200],
+                                                  raw=(_cotc.function.arguments or "")[:200])
+                                            _corr_oai_tool_results.append({
+                                                "role": "tool",
+                                                "tool_call_id": _cotc.id,
+                                                "content": json.dumps({
+                                                    "error": f"Arguments for '{_cotc_name}' were not valid JSON: {_cotc_pe}",
+                                                    "hint": "Re-call this tool with correctly escaped JSON arguments. This call did not run.",
+                                                }),
+                                            })
+                                            continue
 
                                         if _cotc_name == "done_fixing":
                                             _corr_done = True
@@ -11755,16 +11773,34 @@ USER REQUEST:
 
                 for _otc in _oai_tool_calls:
                     _otc_name = _otc.function.name
+                    _otc_parse_failed = False
+                    _otc_parse_err_msg = ""
                     try:
                         _otc_input = json.loads(_otc.function.arguments) if _otc.function.arguments else {}
-                    except json.JSONDecodeError:
+                    except json.JSONDecodeError as _otc_pe:
+                        # Bug class (verified via OpenAI community + industry reports on
+                        # tool-call argument failures): silently substituting {} here let
+                        # branches below run on empty input and return misleading success-ish
+                        # text (e.g. search_codebase's "already searched" message) even though
+                        # nothing was actually searched — the model never learns its JSON was
+                        # bad and can wander for rounds believing it already has data it
+                        # doesn't. Skip dispatch entirely and tell the model explicitly.
                         _otc_input = {}
+                        _otc_parse_failed = True
+                        _otc_parse_err_msg = str(_otc_pe)[:200]
                         _dlog("oai_tool_use_args_json_error", tool=_otc_name,
-                              raw=_otc.function.arguments[:200], session_id=session_id)
+                              raw=_otc.function.arguments[:200], session_id=session_id,
+                              round=_oai_round, error=_otc_parse_err_msg)
 
                     _otc_result = ""
 
-                    if _otc_name == "search_codebase":
+                    if _otc_parse_failed:
+                        _otc_result = (
+                            f"[ERROR] Arguments for '{_otc_name}' were not valid JSON: {_otc_parse_err_msg}"
+                            f" Re-call '{_otc_name}' with correctly escaped JSON arguments — this call did not run."
+                        )
+
+                    elif _otc_name == "search_codebase":
                         _s_terms = _otc_input.get("terms", [])
                         _s_new = [t for t in _s_terms if t.lower() not in {s.lower() for s in _oai_searched_terms}]
                         if not _s_new:
