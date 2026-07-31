@@ -6406,15 +6406,25 @@ async def analyze_and_plan_stream(
                               session_id=session_id, user_id=user_id)
                 # -- End starvation recovery -------------------------------
             else:
-                # GPT path — blocking call, same prompt
+                # GPT path — blocking call, same prompt.
+                # NOTE: _chat_create() already applies its own internal
+                # truncation/empty-output retry for reasoning models (gpt5_hardening,
+                # default ON — see services/gpt_reasoning.py:create_with_truncation_retry).
+                # That inner retry is silent (no SSE progress, no agent_* dlog events),
+                # so it does not give the user the same visible recovery Claude's
+                # Agent-Mode branch gets. The block below adds a SECOND, user-visible
+                # retry tier that only fires if full_text is STILL empty after the
+                # inner retry already ran — same trigger condition and dlog naming as
+                # the Claude branch above, so both providers are symmetric end-to-end.
+                _agent_gpt_messages = [
+                    {"role": "system", "content": CLAUDE_EDITOR_SYSTEM},
+                    {"role": "user", "content": user_message},
+                ]
                 yield sse({"type": "progress", "content": f"Architect ({architect_model}) analyzing..."})
                 _agent_oai_resp = await asyncio.to_thread(
                     lambda: _chat_create(
                         _agent_oai_client, architect_model,
-                        messages=[
-                            {"role": "system", "content": CLAUDE_EDITOR_SYSTEM},
-                            {"role": "user", "content": user_message},
-                        ],
+                        messages=_agent_gpt_messages,
                         response_format={"type": "json_object"},
                     )
                 )
@@ -6423,15 +6433,62 @@ async def analyze_and_plan_stream(
                       round=round_num, response_len=len(full_text),
                       session_id=session_id, user_id=user_id)
 
+                # -- Agent Mode starvation detection + auto-retry (GPT) --------
+                if not full_text.strip():
+                    from services.gpt_reasoning import RETRY_MAX_COMPLETION_TOKENS as _GPT_RETRY_BUDGET
+                    _gpt_base_model = architect_model.split(":")[0].lower()
+                    _dlog("agent_thinking_starvation_detected",
+                          model=architect_model, original_budget=None,
+                          retry_budget=_GPT_RETRY_BUDGET, retry_max=_GPT_RETRY_BUDGET,
+                          round=round_num, session_id=session_id,
+                          user_id=user_id)
+                    yield sse({"type": "progress",
+                               "content": "Re-analyzing with expanded capacity..."})
+
+                    _gpt_retry_kwargs = {
+                        "response_format": {"type": "json_object"},
+                        "max_completion_tokens": _GPT_RETRY_BUDGET,
+                    }
+                    if _gpt_base_model in REASONING_EFFORT_MODELS:
+                        _gpt_retry_kwargs["reasoning_effort"] = "high"
+
+                    _agent_oai_retry_resp = await asyncio.to_thread(
+                        lambda: _chat_create(
+                            _agent_oai_client, architect_model,
+                            messages=_agent_gpt_messages,
+                            **_gpt_retry_kwargs,
+                        )
+                    )
+                    full_text = _agent_oai_retry_resp.choices[0].message.content or ""
+
+                    _dlog("agent_starvation_retry_done",
+                          model=architect_model, retry_text_len=len(full_text),
+                          round=round_num, session_id=session_id,
+                          user_id=user_id)
+
+                    if not full_text.strip():
+                        _dlog("agent_starvation_final_fail",
+                              model=architect_model, round=round_num,
+                              session_id=session_id, user_id=user_id)
+                # -- End starvation recovery (GPT) ------------------------------
+
             # Parse JSON from response
             try:
                 _raw_plan = _extract_json_from_text(full_text)
                 plan_data = json.loads(_raw_plan) if isinstance(_raw_plan, str) else _raw_plan
             except (ValueError, json.JSONDecodeError) as parse_err:
+                # NOTE: this used to hardcode "Claude" even when architect_model was
+                # GPT — pre-existing bug found 2026-07-31 while adding the GPT
+                # starvation-retry tier above, which makes this path reachable for
+                # GPT users too (empty/unparseable response that survives the retry).
+                _dlog("agent_mode_plan_parse_error", model=architect_model,
+                      round=round_num, response_len=len(full_text),
+                      error=str(parse_err)[:200], session_id=session_id,
+                      user_id=user_id)
                 yield sse({
                     "type": "error",
                     "content": (
-                        f"Claude returned unexpected output. Please try again.\n\n"
+                        f"{architect_model} returned unexpected output. Please try again.\n\n"
                         f"Detail: {str(parse_err)[:200]}"
                     ),
                 })
