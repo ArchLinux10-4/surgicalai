@@ -138,15 +138,18 @@ async def test_ask_plan_search_request_round_trip(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_ask_plan_no_tools_for_non_claude_unchanged(monkeypatch):
-    """Non-Claude models must behave exactly as before — no tool loop, no
-    index/instructions injected, single pass, even when session_files is
-    supplied (backward-compat / no-regression guarantee)."""
-    monkeypatch.setattr(pipeline, "_is_claude_model", lambda m: False)
-    monkeypatch.setattr(pipeline, "_is_gemini_model", lambda m: False)
-    monkeypatch.setattr(pipeline, "_should_use_ollama", lambda m: False)
+async def test_ask_plan_gpt_search_request_round_trip(monkeypatch):
+    """Proves the fix: GPT (and, by the same code path, Gemini) now gets
+    the exact same search_request tool loop as Claude — this is the bug
+    this patch closes. Before this fix, GPT/Gemini fell straight into the
+    bare legacy branch below with zero tool access."""
+    session_files = [
+        {"filename": "utils.py", "content": "def compute_total(items):\n    return sum(items)\n"},
+        {"filename": "main.py", "content": "from utils import compute_total\n\ndef run():\n    return compute_total([1, 2, 3])\n"},
+    ]
 
-    captured = {}
+    round1_text = '<search_request>{"terms": ["compute_total"]}</search_request>'
+    round2_text = "compute_total sums a list of items. No tags here."
 
     class _FakeChoice:
         def __init__(self, content):
@@ -156,24 +159,85 @@ async def test_ask_plan_no_tools_for_non_claude_unchanged(monkeypatch):
         def __init__(self, content):
             self.choices = [_FakeChoice(content)]
 
-    def _fake_chat_create(client, **kwargs):
-        captured["messages"] = kwargs["messages"]
-        return iter([_FakeChunk("plain answer, no tools")])
+    calls = []
 
-    monkeypatch.setattr(pipeline, "_get_client", lambda user_id: object())
+    def _fake_chat_create(client, **kwargs):
+        calls.append(kwargs)
+        text = round1_text if len(calls) == 1 else round2_text
+        return iter([_FakeChunk(text)])
+
+    monkeypatch.setattr(pipeline, "_is_claude_model", lambda m: False)
+    monkeypatch.setattr(pipeline, "_is_gemini_model", lambda m: False)
+    monkeypatch.setattr(pipeline, "_should_use_ollama", lambda m: False)
+    monkeypatch.setattr(pipeline, "_get_client_for_model", lambda model, user_id="": object())
     monkeypatch.setattr(pipeline, "_chat_create", _fake_chat_create)
+
+    events = await _collect(pipeline.run_chat_stream(
+        messages=[{"role": "user", "content": "What does compute_total do?"}],
+        model="gpt-4.1",
+        user_id="",
+        session_id="test-session-gpt",
+        session_files=session_files,
+    ))
+
+    # Two model calls happened: initial + one tool round — same shape as
+    # the Claude test above, proving GPT gets the identical tool loop.
+    assert len(calls) == 2
+    second_call_msgs = calls[1]["messages"]
+    joined = json.dumps(second_call_msgs)
+    assert "Search results for" in joined
+    assert "compute_total" in joined
+
+    token_events = [e for e in events if e.get("type") == "token"]
+    assert token_events, "expected at least one token event"
+    final_text = "".join(e["content"] for e in token_events)
+    assert "<search_request>" not in final_text
+    assert "compute_total sums a list" in final_text
+    assert any(e.get("type") == "progress" for e in events)
+    assert events[-1]["type"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_ask_plan_ollama_unchanged(monkeypatch):
+    """Ollama is the one deliberate exclusion (it runs a fully separate
+    offline streaming path that never reaches the tag protocol either
+    way). This proves the exclusion and the legacy behavior are both
+    still exactly what they were before this patch, even when
+    session_files is supplied."""
+    monkeypatch.setattr(pipeline, "_is_claude_model", lambda m: False)
+    monkeypatch.setattr(pipeline, "_is_gemini_model", lambda m: False)
+    monkeypatch.setattr(pipeline, "_should_use_ollama", lambda m: True)
+
+    captured = {}
+
+    class _FakeResp:
+        def iter_lines(self):
+            return iter([json.dumps({"message": {"content": "plain ollama answer, no tools"}})])
+
+    class _FakeStreamCtx:
+        def __enter__(self):
+            return _FakeResp()
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_httpx_stream(method, url, json=None, timeout=None):
+        captured["messages"] = json["messages"]
+        return _FakeStreamCtx()
+
+    monkeypatch.setattr(pipeline.httpx, "stream", _fake_httpx_stream)
 
     session_files = [{"filename": "a.py", "content": "x = 1\n"}]
 
     events = await _collect(pipeline.run_chat_stream(
         messages=[{"role": "user", "content": "hi"}],
-        model="gpt-4.1",
+        model="ollama:qwen2.5-coder:7b",
         user_id="",
-        session_id="s1",
+        session_id="s-ollama",
         session_files=session_files,
     ))
 
     system_msg = next(m["content"] for m in captured["messages"] if m["role"] == "system")
     assert "search_request" not in system_msg
     assert "Session Files (index only)" not in system_msg
-    assert any(e.get("type") == "token" and "plain answer" in e.get("content", "") for e in events)
+    assert any(e.get("type") == "token" and "plain ollama answer" in e.get("content", "") for e in events)

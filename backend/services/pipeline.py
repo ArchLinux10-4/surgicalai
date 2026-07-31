@@ -3584,6 +3584,83 @@ to Agent/Edit mode — this mode can only look, not write.
 One github_request per response, same one-tag-then-stop rule as above.
 """
 
+# Ask/Plan is read-only — these GitHub tools can mutate the repo, so they
+# are blocked in code regardless of what the model emits (belt-and-
+# suspenders on top of the prompt instruction above).
+_ASK_PLAN_GH_WRITE_TOOLS = frozenset({"push_files", "push_session_file"})
+
+
+def _ask_plan_strip_tool_tags(text: str) -> str:
+    """Scrub raw <search_request>/<file_request>/<github_request> markup
+    before it can ever reach the user — shared by every model backend."""
+    text = re.sub(r'<search_request>.*?</search_request>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<file_request>.*?</file_request>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<github_request>.*?</github_request>', '', text, flags=re.DOTALL)
+    return text.strip()
+
+
+def _ask_plan_execute_tool_round(
+    *, sr_match, fr_match, gr_match, symbol_maps_by_name, file_content_lookup,
+    user_id, session_id, tool_round,
+):
+    """
+    Executes whichever tag(s) the model emitted this round, reusing the
+    exact same _resolve_search_multifile / _parse_filereq_content /
+    _parse_search_content / execute_github_request helpers Edit mode's
+    agent loop already relies on. Shared by the Claude native loop and the
+    OpenAI-compatible (GPT/Gemini) loop so a future fix to search/file/
+    GitHub tool behavior only has to be made once.
+    Returns the list of result strings to feed back to the model.
+    """
+    from services.github_natural_tag import parse_github_request, execute_github_request
+
+    tool_parts = []
+    if sr_match:
+        sr_data = _parse_search_content(sr_match.group(1))
+        sr_terms = sr_data.get("terms", []) if isinstance(sr_data, dict) else []
+        if sr_terms:
+            sr_result = _resolve_search_multifile(sr_terms, symbol_maps_by_name, file_content_lookup)
+            tool_parts.append(f"Search results for {sr_terms}:\n{sr_result}")
+            _dlog("ask_plan_search_executed", session_id=session_id, user_id=user_id,
+                  tool_round=tool_round, terms=sr_terms, result_chars=len(sr_result))
+    if fr_match:
+        fr_names = _parse_filereq_content(fr_match.group(1))
+        for fr_fn in fr_names[:5]:
+            fr_content = file_content_lookup.get(fr_fn, "")
+            if not fr_content:
+                fr_cands = [k for k in file_content_lookup
+                            if fr_fn.lower() in k.lower() or k.lower() in fr_fn.lower()]
+                if fr_cands:
+                    fr_fn = fr_cands[0]
+                    fr_content = file_content_lookup.get(fr_fn, "")
+            if fr_content:
+                tool_parts.append(f"FILE: {fr_fn} ({len(fr_content.splitlines())} lines)\n```\n{fr_content}\n```")
+            else:
+                tool_parts.append(f"FILE NOT FOUND: '{fr_fn}'")
+        _dlog("ask_plan_file_fetched", session_id=session_id, user_id=user_id,
+              tool_round=tool_round, requested=fr_names[:5])
+    if gr_match:
+        gr_parsed = parse_github_request(gr_match.group(1), dlog=_dlog)
+        if not gr_parsed:
+            tool_parts.append(
+                "Your <github_request> was not valid JSON. Emit a corrected "
+                "<github_request>, or answer with what you already know.")
+        elif gr_parsed.get("tool") in _ASK_PLAN_GH_WRITE_TOOLS:
+            _dlog("ask_plan_github_write_blocked", session_id=session_id,
+                  user_id=user_id, tool_round=tool_round,
+                  tool=gr_parsed.get("tool"))
+            tool_parts.append(
+                f"'{gr_parsed.get('tool')}' is not available in this mode — "
+                "Ask/Plan is read-only. Tell the user to switch to Agent/Edit "
+                "mode to make and push that change.")
+        else:
+            gr_result = execute_github_request(gr_parsed, user_id, dlog=_dlog)
+            tool_parts.append(f"GitHub {gr_parsed.get('tool')} result:\n{gr_result}")
+            _dlog("ask_plan_github_executed", session_id=session_id, user_id=user_id,
+                  tool_round=tool_round, tool=gr_parsed.get("tool"),
+                  result_chars=len(gr_result))
+    return tool_parts
+
 
 async def run_chat_stream(
     messages: list,
@@ -3610,7 +3687,12 @@ async def run_chat_stream(
     """
     chat_model = model or get_setting("architect_model", _DEFAULT_ARCH_MODEL)
     _model_used = chat_model
-    _ask_plan_tools_enabled = bool(session_files) and _is_claude_model(chat_model)
+    # Tools are enabled for every cloud backend (Claude native tool-round
+    # loop below, GPT/Gemini share one OpenAI-compatible tool-round loop).
+    # Ollama is the only exclusion — it runs a fully separate offline
+    # streaming path (see _should_use_ollama branch below) that never
+    # reaches this tag protocol either way, in Edit mode or here.
+    _ask_plan_tools_enabled = bool(session_files) and not _should_use_ollama(chat_model)
     # Same knob Edit mode's agent_loop reads (services/pipeline.py ~14904),
     # so Ask/Plan and Edit share one source of truth instead of two
     # independently-hardcoded budgets. Default 24 matches Edit mode exactly.
@@ -3709,7 +3791,75 @@ async def run_chat_stream(
         def sse(obj):
             return f"data: {json.dumps(obj)}\n\n"
 
-        if _is_gemini_model(chat_model) and HAS_GOOGLE_GENAI:
+        if _ask_plan_tools_enabled and not _is_claude_model(chat_model):
+            # ── GPT / Gemini shared tool loop ──
+            # Same <search_request>/<file_request>/<github_request> tag
+            # protocol as the Claude branch below, routed through the one
+            # OpenAI-compatible client Edit mode already uses for both
+            # GPT and Gemini (_get_client_for_model). Buffered per round
+            # (never streamed live) because a tag can split across
+            # chunks and must never leak raw markup to the user.
+            _oai_client = _get_client_for_model(chat_model, user_id)
+            _oai_msgs = list(all_messages)
+            _tool_round = 0
+            while True:
+                _dlog("run_chat_stream_openai_compat", model=chat_model, user_id=user_id,
+                      session_id=session_id, tool_round=_tool_round,
+                      tools_enabled=_ask_plan_tools_enabled)
+                _oai_stream = _chat_create(
+                    _oai_client, model=chat_model, messages=_oai_msgs,
+                    temperature=float(get_setting("temperature_architect", "0.0")),
+                    stream=True,
+                )
+                _round_text = ""
+                for _chunk in _oai_stream:
+                    _delta = _chunk.choices[0].delta
+                    if _delta.content:
+                        _round_text += _delta.content
+
+                _sr_match = re.search(r'<search_request>\s*(.*?)\s*</search_request>', _round_text, re.DOTALL)
+                _fr_match = re.search(r'<file_request>\s*(.*?)\s*</file_request>', _round_text, re.DOTALL)
+                _gr_match = (
+                    re.search(r'<github_request>\s*(.*?)\s*</github_request>', _round_text, re.DOTALL)
+                    if _gh_nat_enabled else None
+                )
+
+                _ask_plan_elapsed = time.time() - _ask_plan_t0
+                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match
+                _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
+                _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
+                if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match) else _round_text
+                    if not _clean_text.strip():
+                        _clean_text = ("I looked at the available code but couldn't fully answer within "
+                                       "my lookup budget — try asking about a more specific file or function.")
+                    yield sse({"type": "token", "content": _clean_text})
+                    _ask_plan_reason = (
+                        "model_finished" if _ask_plan_no_more_tools
+                        else "budget_exhausted_deadline" if _ask_plan_deadline_hit
+                        else "budget_exhausted_rounds"
+                    )
+                    _dlog("ask_plan_tool_final_answer", session_id=session_id, user_id=user_id,
+                          tool_round=_tool_round, chars=len(_clean_text), reason=_ask_plan_reason,
+                          elapsed_s=round(_ask_plan_elapsed, 1))
+                    break
+
+                yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
+                _tool_parts = _ask_plan_execute_tool_round(
+                    sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
+                    symbol_maps_by_name=symbol_maps_by_name,
+                    file_content_lookup=file_content_lookup,
+                    user_id=user_id, session_id=session_id, tool_round=_tool_round,
+                )
+
+                if not _tool_parts:
+                    yield sse({"type": "token", "content": _round_text})
+                    break
+
+                _oai_msgs.append({"role": "assistant", "content": _round_text})
+                _oai_msgs.append({"role": "user", "content": "\n\n".join(_tool_parts)})
+                _tool_round += 1
+        elif _is_gemini_model(chat_model) and HAS_GOOGLE_GENAI:
             # ── Gemini streaming with native thinking blocks ──
             gemini_key = _get_gemini_key(user_id)
             gclient = _google_genai.Client(api_key=gemini_key)
@@ -3802,13 +3952,6 @@ async def run_chat_stream(
             _sys_text = next((m["content"] for m in all_messages if m["role"] == "system"), "")
             _claude_msgs = [m for m in all_messages if m["role"] != "system"]
 
-            def _strip_tool_tags(text: str) -> str:
-                text = re.sub(r'<search_request>.*?</search_request>', '', text, flags=re.DOTALL)
-                text = re.sub(r'<file_request>.*?</file_request>', '', text, flags=re.DOTALL)
-                text = re.sub(r'<github_request>.*?</github_request>', '', text, flags=re.DOTALL)
-                return text.strip()
-
-            _ASK_PLAN_GH_WRITE_TOOLS = frozenset({"push_files", "push_session_file"})
             _tool_round = 0
             while True:
                 _claude_kwargs = {
@@ -3867,7 +4010,7 @@ async def run_chat_stream(
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -3883,54 +4026,12 @@ async def run_chat_stream(
                     break
 
                 yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
-                _tool_parts = []
-                if _sr_match:
-                    _sr_data = _parse_search_content(_sr_match.group(1))
-                    _sr_terms = _sr_data.get("terms", []) if isinstance(_sr_data, dict) else []
-                    if _sr_terms:
-                        _sr_result = _resolve_search_multifile(_sr_terms, symbol_maps_by_name, file_content_lookup)
-                        _tool_parts.append(f"Search results for {_sr_terms}:\n{_sr_result}")
-                        _dlog("ask_plan_search_executed", session_id=session_id, user_id=user_id,
-                              tool_round=_tool_round, terms=_sr_terms, result_chars=len(_sr_result))
-                if _fr_match:
-                    _fr_names = _parse_filereq_content(_fr_match.group(1))
-                    for _fr_fn in _fr_names[:5]:
-                        _fr_content = file_content_lookup.get(_fr_fn, "")
-                        if not _fr_content:
-                            _fr_cands = [k for k in file_content_lookup
-                                         if _fr_fn.lower() in k.lower() or k.lower() in _fr_fn.lower()]
-                            if _fr_cands:
-                                _fr_fn = _fr_cands[0]
-                                _fr_content = file_content_lookup.get(_fr_fn, "")
-                        if _fr_content:
-                            _tool_parts.append(f"FILE: {_fr_fn} ({len(_fr_content.splitlines())} lines)\n```\n{_fr_content}\n```")
-                        else:
-                            _tool_parts.append(f"FILE NOT FOUND: '{_fr_fn}'")
-                    _dlog("ask_plan_file_fetched", session_id=session_id, user_id=user_id,
-                          tool_round=_tool_round, requested=_fr_names[:5])
-                if _gr_match:
-                    _gr_parsed = parse_github_request(_gr_match.group(1), dlog=_dlog)
-                    if not _gr_parsed:
-                        _tool_parts.append(
-                            "Your <github_request> was not valid JSON. Emit a corrected "
-                            "<github_request>, or answer with what you already know.")
-                    elif _gr_parsed.get("tool") in _ASK_PLAN_GH_WRITE_TOOLS:
-                        # Structural guard, not just a prompt request — Ask/Plan can
-                        # never write, no matter what the model emits.
-                        _dlog("ask_plan_github_write_blocked", session_id=session_id,
-                              user_id=user_id, tool_round=_tool_round,
-                              tool=_gr_parsed.get("tool"))
-                        _tool_parts.append(
-                            f"'{_gr_parsed.get('tool')}' is not available in this mode — "
-                            "Ask/Plan is read-only. Tell the user to switch to Agent/Edit "
-                            "mode to make and push that change.")
-                    else:
-                        _gr_result = execute_github_request(_gr_parsed, user_id, dlog=_dlog)
-                        _tool_parts.append(
-                            f"GitHub {_gr_parsed.get('tool')} result:\n{_gr_result}")
-                        _dlog("ask_plan_github_executed", session_id=session_id, user_id=user_id,
-                              tool_round=_tool_round, tool=_gr_parsed.get("tool"),
-                              result_chars=len(_gr_result))
+                _tool_parts = _ask_plan_execute_tool_round(
+                    sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
+                    symbol_maps_by_name=symbol_maps_by_name,
+                    file_content_lookup=file_content_lookup,
+                    user_id=user_id, session_id=session_id, tool_round=_tool_round,
+                )
 
                 if not _tool_parts:
                     yield sse({"type": "token", "content": _round_text})
