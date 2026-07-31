@@ -17155,12 +17155,31 @@ async def run_natural_pipeline_stream(
                         if _retry_content:
                             yield sse({"type": "progress",
                                        "content": f"Retrying {_retry_sym} in {_retry_fname}..."})
-                            _redit_task = asyncio.create_task(_retry_truncated_edit(
-                                aclient, "claude-sonnet-5",  # R25: corrections always Claude
-                                _retry_fname, _retry_sym, _retry_content,
-                                _retry_smap, user_request,
-                                session_id, user_id
-                            ))
+                            if aclient is not None:
+                                _redit_coro = _retry_truncated_edit(
+                                    aclient, "claude-sonnet-5",  # R25: corrections always Claude
+                                    _retry_fname, _retry_sym, _retry_content,
+                                    _retry_smap, user_request,
+                                    session_id, user_id
+                                )
+                            else:
+                                # No Anthropic key configured (GPT-only user) —
+                                # fall back to GPT 5.6 Terra instead of silently
+                                # skipping the truncation retry. See
+                                # services/gpt_correction.py for full rationale.
+                                from services.gpt_correction import retry_truncated_edit_gpt
+                                _dlog("retry_truncated_edit_gpt_fallback",
+                                      session_id=session_id, user_id=user_id,
+                                      filename=_retry_fname, symbol=_retry_sym)
+                                _redit_coro = retry_truncated_edit_gpt(
+                                    _get_client(user_id), "gpt-5.6-terra",
+                                    _retry_fname, _retry_sym, _retry_content,
+                                    _retry_smap, user_request,
+                                    _chat_create, _dlog,
+                                    get_setting=get_setting,
+                                    session_id=session_id, user_id=user_id,
+                                )
+                            _redit_task = asyncio.create_task(_redit_coro)
                             _redit_t0 = time.time()
                             while not _redit_task.done():
                                 _done_r, _ = await asyncio.wait({_redit_task}, timeout=15.0)
@@ -17211,11 +17230,29 @@ async def run_natural_pipeline_stream(
                         _retry_fname = _fname_match.group(1)
                         yield sse({"type": "progress",
                                    "content": f"Retrying {_retry_fname}..."})
-                        _rnf_task = asyncio.create_task(_retry_truncated_newfile(
-                            aclient, "claude-sonnet-5",  # R25: corrections always Claude
-                            _retry_fname, user_request,
-                            session_id, user_id
-                        ))
+                        if aclient is not None:
+                            _rnf_coro = _retry_truncated_newfile(
+                                aclient, "claude-sonnet-5",  # R25: corrections always Claude
+                                _retry_fname, user_request,
+                                session_id, user_id
+                            )
+                        else:
+                            # No Anthropic key configured (GPT-only user) —
+                            # fall back to GPT 5.6 Terra instead of silently
+                            # skipping the truncation retry. See
+                            # services/gpt_correction.py for full rationale.
+                            from services.gpt_correction import retry_truncated_newfile_gpt
+                            _dlog("retry_truncated_newfile_gpt_fallback",
+                                  session_id=session_id, user_id=user_id,
+                                  filename=_retry_fname)
+                            _rnf_coro = retry_truncated_newfile_gpt(
+                                _get_client(user_id), "gpt-5.6-terra",
+                                _retry_fname, user_request,
+                                _chat_create, _dlog,
+                                get_setting=get_setting,
+                                session_id=session_id, user_id=user_id,
+                            )
+                        _rnf_task = asyncio.create_task(_rnf_coro)
                         _rnf_t0 = time.time()
                         while not _rnf_task.done():
                             _done_nf, _ = await asyncio.wait({_rnf_task}, timeout=15.0)
@@ -17408,13 +17445,33 @@ async def run_natural_pipeline_stream(
                     # budget so a hung call near the deadline cannot push past
                     # Railway's 900s SSE wall (session aaade983).
                     _budget_left = PIPELINE_DEADLINE_S - (time.time() - _pipeline_t0)
-                    _edit_task = asyncio.ensure_future(_execute_single_edit(
-                        aclient, "claude-sonnet-5",  # R25: corrections always Claude
-                        p_filename, p_symbol, p_description,
-                        p_content, p_smap, user_request,
-                        session_id, user_id,
-                        max_wait_s=max(5.0, min(120.0, _budget_left)),
-                    ))
+                    if aclient is not None:
+                        _edit_coro = _execute_single_edit(
+                            aclient, "claude-sonnet-5",  # R25: corrections always Claude
+                            p_filename, p_symbol, p_description,
+                            p_content, p_smap, user_request,
+                            session_id, user_id,
+                            max_wait_s=max(5.0, min(120.0, _budget_left)),
+                        )
+                    else:
+                        # No Anthropic key configured (GPT-only user) — fall
+                        # back to GPT 5.6 Terra instead of silently skipping
+                        # this plan-execute step. See services/gpt_correction.py
+                        # for full rationale.
+                        from services.gpt_correction import execute_single_edit_gpt
+                        _dlog("execute_single_edit_gpt_fallback",
+                              session_id=session_id, user_id=user_id,
+                              filename=p_filename, symbol=p_symbol)
+                        _edit_coro = execute_single_edit_gpt(
+                            _get_client(user_id), "gpt-5.6-terra",
+                            p_filename, p_symbol, p_description,
+                            p_content, p_smap, user_request,
+                            _chat_create, _dlog,
+                            get_setting=get_setting,
+                            session_id=session_id, user_id=user_id,
+                            max_wait_s=max(5.0, min(120.0, _budget_left)),
+                        )
+                    _edit_task = asyncio.ensure_future(_edit_coro)
                     _edit_start = time.monotonic()
                     while not _edit_task.done():
                         _done_set, _ = await asyncio.wait(
@@ -18940,20 +18997,43 @@ async def run_natural_pipeline_stream(
 
             try:
                 # Run non-streaming call with keepalive pings so proxy stays alive
-                _corr_correction_model = "claude-sonnet-5"  # R25: corrections always use Claude
-                _dlog("correction_call_config", session_id=session_id,
-                      model=_corr_correction_model,
-                      wrapper="safe_claude_call",
-                      resolve_round=resolve_round)
-                _corr_task = asyncio.create_task(_safe_claude_call(
-                    aclient,
-                    model=_corr_correction_model,
-                    desired_text_tokens=12000,
-                    thinking_budget=4000,
-                    retry_on_starve=True,
-                    system=system_prompt,
-                    messages=correction_msgs,
-                ))
+                if aclient is not None:
+                    _corr_correction_model = "claude-sonnet-5"  # R25: corrections always use Claude
+                    _dlog("correction_call_config", session_id=session_id,
+                          model=_corr_correction_model,
+                          wrapper="safe_claude_call",
+                          resolve_round=resolve_round)
+                    _corr_coro = _safe_claude_call(
+                        aclient,
+                        model=_corr_correction_model,
+                        desired_text_tokens=12000,
+                        thinking_budget=4000,
+                        retry_on_starve=True,
+                        system=system_prompt,
+                        messages=correction_msgs,
+                    )
+                else:
+                    # No Anthropic key configured (GPT-only user) — fall back
+                    # to GPT 5.6 Terra instead of silently skipping symbol
+                    # correction. See services/gpt_correction.py for rationale.
+                    from services.gpt_correction import safe_gpt_correction_call
+                    _corr_correction_model = "gpt-5.6-terra"
+                    _dlog("correction_call_config", session_id=session_id,
+                          model=_corr_correction_model,
+                          wrapper="safe_gpt_correction_call",
+                          resolve_round=resolve_round)
+                    _corr_coro = safe_gpt_correction_call(
+                        _get_client(user_id),
+                        model=_corr_correction_model,
+                        desired_text_tokens=12000,
+                        system=system_prompt,
+                        messages=correction_msgs,
+                        chat_create=_chat_create,
+                        dlog=_dlog,
+                        get_setting=get_setting,
+                        session_id=session_id, user_id=user_id,
+                    )
+                _corr_task = asyncio.create_task(_corr_coro)
                 # ── Deadline + visible heartbeat (session e4e9d098 fix 3) ──
                 # Evidence: this loop kept a run alive with invisible
                 # keepalives while the UI showed a frozen "Correcting symbol
@@ -19105,8 +19185,8 @@ async def run_natural_pipeline_stream(
                                       session_id=session_id,
                                       model="claude-sonnet-5",
                                       wrapper="safe_claude_call")
-                                _fu_task = asyncio.create_task(
-                                    _safe_claude_call(
+                                if aclient is not None:
+                                    _fu_coro = _safe_claude_call(
                                         aclient,
                                         model="claude-sonnet-5",
                                         desired_text_tokens=12000,
@@ -19115,7 +19195,24 @@ async def run_natural_pipeline_stream(
                                         system=system_prompt,
                                         messages=_fu_msgs,
                                     )
-                                )
+                                else:
+                                    # No Anthropic key (GPT-only user) — GPT 5.6
+                                    # Terra fallback. See services/gpt_correction.py.
+                                    from services.gpt_correction import safe_gpt_correction_call
+                                    _dlog("correction_followup_gpt_fallback",
+                                          session_id=session_id, user_id=user_id)
+                                    _fu_coro = safe_gpt_correction_call(
+                                        _get_client(user_id),
+                                        model="gpt-5.6-terra",
+                                        desired_text_tokens=12000,
+                                        system=system_prompt,
+                                        messages=_fu_msgs,
+                                        chat_create=_chat_create,
+                                        dlog=_dlog,
+                                        get_setting=get_setting,
+                                        session_id=session_id, user_id=user_id,
+                                    )
+                                _fu_task = asyncio.create_task(_fu_coro)
                                 _fu_t0 = time.time()
                                 while not _fu_task.done():
                                     try:
@@ -19180,8 +19277,8 @@ async def run_natural_pipeline_stream(
                                               model="claude-sonnet-5",
                                               wrapper="safe_claude_call",
                                               resolve_round=resolve_round)
-                                        _fu2_task = asyncio.create_task(
-                                            _safe_claude_call(
+                                        if aclient is not None:
+                                            _fu2_coro = _safe_claude_call(
                                                 aclient,
                                                 model="claude-sonnet-5",
                                                 desired_text_tokens=12000,
@@ -19190,7 +19287,25 @@ async def run_natural_pipeline_stream(
                                                 system=system_prompt,
                                                 messages=_fu2_msgs,
                                             )
-                                        )
+                                        else:
+                                            # No Anthropic key (GPT-only user) —
+                                            # GPT 5.6 Terra fallback. See
+                                            # services/gpt_correction.py.
+                                            from services.gpt_correction import safe_gpt_correction_call
+                                            _dlog("correction_followup2_gpt_fallback",
+                                                  session_id=session_id, user_id=user_id)
+                                            _fu2_coro = safe_gpt_correction_call(
+                                                _get_client(user_id),
+                                                model="gpt-5.6-terra",
+                                                desired_text_tokens=12000,
+                                                system=system_prompt,
+                                                messages=_fu2_msgs,
+                                                chat_create=_chat_create,
+                                                dlog=_dlog,
+                                                get_setting=get_setting,
+                                                session_id=session_id, user_id=user_id,
+                                            )
+                                        _fu2_task = asyncio.create_task(_fu2_coro)
                                         _fu2_t0 = time.time()
                                         while not _fu2_task.done():
                                             try:
@@ -19279,8 +19394,8 @@ async def run_natural_pipeline_stream(
                                       model="claude-sonnet-5",
                                       wrapper="safe_claude_call",
                                       resolve_round=resolve_round)
-                                _fu0_task = asyncio.create_task(
-                                    _safe_claude_call(
+                                if aclient is not None:
+                                    _fu0_coro = _safe_claude_call(
                                         aclient,
                                         model="claude-sonnet-5",
                                         desired_text_tokens=12000,
@@ -19289,7 +19404,24 @@ async def run_natural_pipeline_stream(
                                         system=system_prompt,
                                         messages=_fu0_msgs,
                                     )
-                                )
+                                else:
+                                    # No Anthropic key (GPT-only user) — GPT 5.6
+                                    # Terra fallback. See services/gpt_correction.py.
+                                    from services.gpt_correction import safe_gpt_correction_call
+                                    _dlog("correction_followup0_gpt_fallback",
+                                          session_id=session_id, user_id=user_id)
+                                    _fu0_coro = safe_gpt_correction_call(
+                                        _get_client(user_id),
+                                        model="gpt-5.6-terra",
+                                        desired_text_tokens=12000,
+                                        system=system_prompt,
+                                        messages=_fu0_msgs,
+                                        chat_create=_chat_create,
+                                        dlog=_dlog,
+                                        get_setting=get_setting,
+                                        session_id=session_id, user_id=user_id,
+                                    )
+                                _fu0_task = asyncio.create_task(_fu0_coro)
                                 _fu0_t0 = time.time()
                                 while not _fu0_task.done():
                                     try:
@@ -20592,8 +20724,8 @@ async def run_natural_pipeline_stream(
                                           model=_correction_model,
                                           wrapper="safe_claude_call",
                                           session_id=session_id, user_id=user_id)
-                                    _fu_task = asyncio.create_task(
-                                        _safe_claude_call(
+                                    if aclient is not None:
+                                        _fu_coro = _safe_claude_call(
                                             aclient,
                                             model=_correction_model,
                                             desired_text_tokens=12000,
@@ -20602,7 +20734,26 @@ async def run_natural_pipeline_stream(
                                             system=system_prompt,
                                             messages=_react_msgs,
                                         )
-                                    )
+                                    else:
+                                        # No Anthropic key (GPT-only user) — GPT
+                                        # 5.6 Terra fallback. See
+                                        # services/gpt_correction.py.
+                                        from services.gpt_correction import safe_gpt_correction_call
+                                        _dlog("qa_retry_correction_react_gpt_fallback",
+                                              session_id=session_id, user_id=user_id,
+                                              retry_round=_qa_retry_round, idx=idx)
+                                        _fu_coro = safe_gpt_correction_call(
+                                            _get_client(user_id),
+                                            model="gpt-5.6-terra",
+                                            desired_text_tokens=12000,
+                                            system=system_prompt,
+                                            messages=_react_msgs,
+                                            chat_create=_chat_create,
+                                            dlog=_dlog,
+                                            get_setting=get_setting,
+                                            session_id=session_id, user_id=user_id,
+                                        )
+                                    _fu_task = asyncio.create_task(_fu_coro)
                                     while not _fu_task.done():
                                         try:
                                             await asyncio.wait_for(
@@ -20770,8 +20921,8 @@ async def run_natural_pipeline_stream(
                                   model=_correction_model,
                                   wrapper="safe_claude_call",
                                   session_id=session_id, user_id=user_id)
-                            _fu_task = asyncio.create_task(
-                                _safe_claude_call(
+                            if aclient is not None:
+                                _fu_coro = _safe_claude_call(
                                     aclient,
                                     model=_correction_model,
                                     desired_text_tokens=12000,
@@ -20780,7 +20931,24 @@ async def run_natural_pipeline_stream(
                                     system=system_prompt,
                                     messages=_react_msgs,
                                 )
-                            )
+                            else:
+                                # No Anthropic key (GPT-only user) — GPT 5.6
+                                # Terra fallback. See services/gpt_correction.py.
+                                from services.gpt_correction import safe_gpt_correction_call
+                                _dlog("qa_retry_correction_react_gpt_fallback",
+                                      session_id=session_id, user_id=user_id)
+                                _fu_coro = safe_gpt_correction_call(
+                                    _get_client(user_id),
+                                    model="gpt-5.6-terra",
+                                    desired_text_tokens=12000,
+                                    system=system_prompt,
+                                    messages=_react_msgs,
+                                    chat_create=_chat_create,
+                                    dlog=_dlog,
+                                    get_setting=get_setting,
+                                    session_id=session_id, user_id=user_id,
+                                )
+                            _fu_task = asyncio.create_task(_fu_coro)
                             while not _fu_task.done():
                                 try:
                                     await asyncio.wait_for(
