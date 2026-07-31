@@ -2901,9 +2901,15 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
 
         _use_multi_turn = get_setting("multi_turn_surgeon", "false") == "true"
 
-        if _use_multi_turn and not _is_claude_model(surg_model):
-            _dlog("multi_turn_surgeon_gpt_fallback", model=surg_model, user_id=user_id,
-                  note="GPT multi-turn not yet implemented — using single-turn tool_use")
+        _gpt_multi_turn_requested = _use_multi_turn and not _is_claude_model(surg_model)
+        _gpt_multi_turn_surgeon_active = False
+        if _gpt_multi_turn_requested:
+            from services.gpt_correction import gpt_multi_turn_surgeon_enabled as _gpt_mt_enabled
+            _gpt_multi_turn_surgeon_active = _gpt_mt_enabled(get_setting)
+            if not _gpt_multi_turn_surgeon_active:
+                _dlog("multi_turn_surgeon_gpt_disabled_by_flag", model=surg_model, user_id=user_id,
+                      note="GPT multi-turn implemented but disabled by flag — using single-turn tool_use")
+
         if _is_claude_model(surg_model) and _use_multi_turn:
             # ── MULTI-TURN VERIFICATION PATH (Phase 3) ─────────────────────────
             # Claude makes edits one at a time, sees verification after each.
@@ -3181,6 +3187,31 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
                 confidence = 0
             elif _mt_failed_edits > 0:
                 surgeon_notes.append(f"Multi-turn: {_mt_failed_edits} edit(s) failed, {len(operations)} succeeded")
+
+        elif _gpt_multi_turn_surgeon_active:
+            # ── MULTI-TURN VERIFICATION PATH — GPT (Phase 4, new) ───────────────
+            # GPT equivalent of the Claude multi-turn branch above. Same
+            # per-edit verification-context / failed-edit-hint loop, using
+            # OpenAI tool-calling instead of Anthropic tool_use. See
+            # services/gpt_correction.py:run_gpt_multi_turn_surgeon for the
+            # full implementation and rationale.
+            from services.gpt_correction import run_gpt_multi_turn_surgeon
+            _dlog("surgeon_multi_turn_gpt_dispatch", model=surg_model, user_id=user_id,
+                  session_id=getattr(target, '_session_id', ''), forbid_noop=forbid_noop)
+            _gpt_mt_result = run_gpt_multi_turn_surgeon(
+                client, model=surg_model, user_msg=_tu_user_msg,
+                symbol_code=symbol.code, forbid_noop=forbid_noop,
+                chat_create=_chat_create, dlog=_dlog,
+                surgeon_tool_use_system=SURGEON_TOOL_USE_SYSTEM,
+                surgeon_tools_openai=SURGEON_TOOLS_OPENAI,
+                session_id=getattr(target, '_session_id', ''), user_id=user_id,
+            )
+            if _gpt_mt_result.get("early_return") is not None:
+                return _gpt_mt_result["early_return"]
+            operations = _gpt_mt_result.get("operations", [])
+            if _gpt_mt_result.get("confidence") is not None:
+                confidence = _gpt_mt_result["confidence"]
+            surgeon_notes.extend(_gpt_mt_result.get("notes", []))
 
         elif _is_claude_model(surg_model):
             # ── SINGLE-TURN TOOL USE (Phase 1 — unchanged) ──────────────────────
