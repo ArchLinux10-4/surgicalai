@@ -899,6 +899,16 @@ def _is_gemini_model(model: str) -> bool:
 # gains no duplicated provider logic. Same call shape as the two matchers
 # above: _is_grok_model("grok-4.5") -> True.
 from services.grok_provider import _is_grok_model, get_grok_client, strip_unsupported_params  # noqa: E402
+# Grok native tool-calling adapter (new file). Only reached from
+# `if _is_grok_model(...)` branches; nothing here touches Claude/GPT paths.
+from services.grok_agent_tools import (  # noqa: E402
+    build_grok_agent_tools as _grok_build_tools,
+    StreamedToolCallAccumulator as _GrokToolCallAccumulator,
+    translate_tool_calls as _grok_translate_tool_calls,
+    normalize_dispatch_pair as _grok_normalize_dispatch_pair,
+    build_grok_system_suffix as _grok_build_system_suffix,
+    build_grok_agent_instruction as _grok_build_agent_instruction,
+)
 
 
 # Models confirmed to support extended thinking (budget_tokens).
@@ -15767,6 +15777,22 @@ async def run_natural_pipeline_stream(
                   session_id=session_id, model=arch_model,
                   override_chars=len(_gpt_system_text), user_id=user_id)
 
+            # ── Grok-only: append a NATIVE-TOOL projection ────────────────
+            # Grok is driven by real function tools (passed as `tools=` at
+            # the call site below), not the XML-tag contract the shared
+            # prompt describes. Appended to `_gpt_system_text`, which the
+            # Claude branch never uses, so Claude/GPT prompts are unchanged.
+            if _is_grok_model(arch_model):
+                _grok_sys_suffix = _grok_build_system_suffix(
+                    mode=("agent" if is_agent_task else "edit"),
+                    github_enabled=_gh_nat_enabled,
+                    history_enabled=is_agent_task,
+                    dlog=_dlog, session_id=session_id, user_id=user_id)
+                _gpt_system_text += _grok_sys_suffix
+                _dlog("natural_grok_system_suffix_appended",
+                      session_id=session_id, user_id=user_id,
+                      model=arch_model, suffix_chars=len(_grok_sys_suffix))
+
         # ── Clean conversation history — strip JSON artifacts ─────────────
         clean_history = []
         for msg in conversation_history[-HISTORY_WINDOW:]:
@@ -16023,17 +16049,26 @@ async def run_natural_pipeline_stream(
             "4. When your edits are complete, simply stop.\n"
         )
 
+        # ── Grok-only: native-tool agent instruction (Claude/GPT keep the
+        #    XML _AGENT_INSTRUCTION above unchanged). ──
+        _active_agent_instruction = _AGENT_INSTRUCTION
+        if _is_grok_model(arch_model):
+            _active_agent_instruction = _grok_build_agent_instruction(
+                mode=("agent" if is_agent_task else "edit"),
+                github_enabled=_gh_nat_enabled, history_enabled=is_agent_task,
+                dlog=_dlog, session_id=session_id, user_id=user_id)
+
         current_messages = list(messages)
         _last_cm = current_messages[-1] if current_messages else None
         if _last_cm and isinstance(_last_cm.get("content"), str):
-            current_messages[-1] = {**_last_cm, "content": _last_cm["content"] + _AGENT_INSTRUCTION}
+            current_messages[-1] = {**_last_cm, "content": _last_cm["content"] + _active_agent_instruction}
         elif _last_cm and isinstance(_last_cm.get("content"), list):
             current_messages[-1] = {
                 **_last_cm,
-                "content": list(_last_cm["content"]) + [{"type": "text", "text": _AGENT_INSTRUCTION}],
+                "content": list(_last_cm["content"]) + [{"type": "text", "text": _active_agent_instruction}],
             }
         else:
-            current_messages = current_messages + [{"role": "user", "content": _AGENT_INSTRUCTION}]
+            current_messages = current_messages + [{"role": "user", "content": _active_agent_instruction}]
 
         yield sse({"type": "progress", "content": "Working..."})
         _dlog("agent_loop_start",
@@ -16044,12 +16079,21 @@ async def run_natural_pipeline_stream(
               stop_seqs=len(_agent_stop_seqs),
               github_enabled=_gh_nat_enabled)
 
+        _grok_native_turn = None  # cross-turn: set after a Grok native tool turn,
+                                  # consumed at the top of the next turn
         _turn = 0
         _consecutive_empty_turns = 0
         _consecutive_text_only_turns = 0
 
         while True:
             _turn += 1
+
+            # grok: rewrite prior dispatch echo into native tool messages
+            if _is_grok_model(arch_model) and _grok_native_turn is not None:
+                current_messages = _grok_normalize_dispatch_pair(
+                    current_messages, _grok_native_turn, dlog=_dlog,
+                    session_id=session_id, user_id=user_id)
+                _grok_native_turn = None
 
             # ── Governor: total wall-clock / pipeline budget (honest termination) ──
             _loop_elapsed = time.time() - _streaming_t0
@@ -16073,6 +16117,8 @@ async def run_natural_pipeline_stream(
 
             # ── Per-turn state ─────────────────────────────────────────────
             pending_tool = None            # (kind, data) — set by the parser on a request
+            _grok_blocked = False           # grok report_blocked terminal signal this turn
+            _grok_tc_acc = None             # grok streamed tool-call accumulator this turn
             state = "normal"
             normal_buf = ""
             tag_buf = ""
@@ -16377,6 +16423,18 @@ async def run_natural_pipeline_stream(
                     _gpt_call_kwargs = strip_unsupported_params(
                         _gpt_call_kwargs, dlog=_dlog,
                         session_id=session_id, user_id=user_id)
+                    _grok_tools = _grok_build_tools(
+                        mode=("agent" if is_agent_task else "edit"),
+                        github_enabled=_gh_nat_enabled,
+                        history_enabled=is_agent_task,
+                        dlog=_dlog, session_id=session_id, user_id=user_id)
+                    _gpt_call_kwargs["tools"] = _grok_tools
+                    _gpt_call_kwargs["tool_choice"] = "auto"
+                    _grok_tc_acc = _GrokToolCallAccumulator(
+                        dlog=_dlog, session_id=session_id, user_id=user_id)
+                    _dlog("natural_grok_native_tools_attached",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          tool_count=len(_grok_tools))
 
                 for _attempt in range(3):
                     try:
@@ -16492,6 +16550,11 @@ async def run_natural_pipeline_stream(
                                         if not _remainder:
                                             break
 
+                            if _grok_tc_acc is not None and _gpt_delta is not None:
+                                _tcd = getattr(_gpt_delta, "tool_calls", None)
+                                if _tcd:
+                                    _grok_tc_acc.add_delta(_tcd)
+
                             if pending_tool is not None or edit_plan_data is not None:
                                 break
                         break  # success
@@ -16543,6 +16606,37 @@ async def run_natural_pipeline_stream(
                         _dlog("agent_plan_tag_recovered",
                               session_id=session_id, user_id=user_id, turn=_turn,
                               plan_items=len(_pd))
+
+            # ── Grok native tool-calls → existing producer variables ──────
+            if _is_grok_model(arch_model) and _grok_tc_acc is not None and _grok_tc_acc.has_calls():
+                _grok_calls = _grok_tc_acc.finalize()
+                _grok_tr = _grok_translate_tool_calls(
+                    _grok_calls, dlog=_dlog, session_id=session_id, user_id=user_id)
+                if _grok_tr.edit_json_strings:
+                    edit_blocks_raw.extend(_grok_tr.edit_json_strings)
+                if _grok_tr.new_file_json_strings:
+                    new_file_blocks_raw.extend(_grok_tr.new_file_json_strings)
+                if _grok_tr.edit_plan is not None and edit_plan_data is None:
+                    edit_plan_data = _grok_tr.edit_plan
+                if _grok_tr.context_request is not None and pending_tool is None:
+                    _gk, _gb = _grok_tr.context_request
+                    pending_tool = _capture_request(_gk, _gb)
+                if _grok_tr.blocked_reason:
+                    _grok_blocked = True
+                    full_response += f"<blocked>{_grok_tr.blocked_reason}</blocked>"
+                _grok_native_turn = {
+                    "calls": _grok_calls,
+                    "results_by_id": _grok_tr.results_by_id,
+                    "context_call_id": _grok_tr.context_call_id,
+                    "assistant_text": full_response,
+                }
+                _dlog("natural_grok_tools_translated",
+                      session_id=session_id, user_id=user_id, turn=_turn,
+                      edits=len(_grok_tr.edit_json_strings),
+                      new_files=len(_grok_tr.new_file_json_strings),
+                      has_plan=_grok_tr.edit_plan is not None,
+                      has_context=_grok_tr.context_request is not None,
+                      blocked=_grok_blocked, errors=len(_grok_tr.errors))
 
             _new_edits = (len(edit_blocks_raw) + len(new_file_blocks_raw)) - _edits_before
 
@@ -17220,6 +17314,15 @@ async def run_natural_pipeline_stream(
                                 "you with <blocked>…</blocked>."},
                         ]
                     continue
+
+            # ── Grok report_blocked: terminate cleanly (native equivalent of
+            #    the <blocked> prose path; full_response already carries the
+            #    <blocked>…</blocked> text so downstream renders it). ──
+            if _is_grok_model(arch_model) and _grok_blocked:
+                _dlog("agent_loop_grok_blocked_exit",
+                      session_id=session_id, user_id=user_id, turn=_turn,
+                      response_len=len(full_response))
+                break
 
             # ── No tool requested — the turn either produced edits or is terminal ──
             _has_edits_or_plan = (_new_edits > 0 or edit_plan_data is not None)
