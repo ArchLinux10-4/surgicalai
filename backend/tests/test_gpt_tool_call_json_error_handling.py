@@ -115,6 +115,13 @@ def test_site1_malformed_json_yields_explicit_error_not_misleading_success():
         "malformed JSON must NOT fall through to the misleading "
         "'already searched' success-shaped message"
     )
+    # Per repair-prompt best practice (OpenAI community + industry write-ups),
+    # the model's own broken output must be echoed back so it can spot its
+    # specific mistake, not just be told "it was bad" in the abstract.
+    assert bad_call.function.arguments in result, (
+        "error message must include the model's own malformed JSON snippet "
+        "so it can self-correct the specific mistake"
+    )
 
     assert events, "parse failure must be logged via _dlog"
     event_name, kw = events[0]
@@ -189,6 +196,9 @@ def test_site2_malformed_json_appends_explicit_tool_error_and_skips_dispatch():
     assert "did not run" in payload["hint"]
     # Must NOT look like the old misleading "Symbol '' not found" degradation.
     assert "not found" not in payload["error"]
+    # Per repair-prompt best practice, the model's own broken output must be
+    # echoed back so it can spot its specific mistake next turn.
+    assert payload["your_call_was"] == bad_call.function.arguments
 
     assert events, "parse failure must be logged"
     event_name, kw = events[0]

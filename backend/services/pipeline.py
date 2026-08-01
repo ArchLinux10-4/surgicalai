@@ -6853,7 +6853,12 @@ async def analyze_and_plan_stream(
                                                 "tool_call_id": _cotc.id,
                                                 "content": json.dumps({
                                                     "error": f"Arguments for '{_cotc_name}' were not valid JSON: {_cotc_pe}",
-                                                    "hint": "Re-call this tool with correctly escaped JSON arguments. This call did not run.",
+                                                    # Include the model's own broken output (truncated), not just
+                                                    # the parser error — per best-practice repair-prompt design,
+                                                    # showing the exact malformed snippet lets the model spot its
+                                                    # own specific mistake instead of blindly retrying the same way.
+                                                    "your_call_was": (_cotc.function.arguments or "")[:300],
+                                                    "hint": "Re-call this tool with corrected, properly escaped JSON arguments. This call did not run.",
                                                 }),
                                             })
                                             continue
@@ -11795,9 +11800,17 @@ USER REQUEST:
                     _otc_result = ""
 
                     if _otc_parse_failed:
+                        # Include the model's own broken output (truncated) rather than just
+                        # the parser's error text. Per OpenAI community reports and structured-
+                        # output best-practice write-ups, showing the exact malformed snippet
+                        # (not a schema restatement — the model already has the tool schema
+                        # from the tools array) is what lets the model spot its own specific
+                        # escaping/truncation mistake instead of blindly repeating it.
+                        _otc_raw_snippet = (_otc.function.arguments or "")[:300]
                         _otc_result = (
-                            f"[ERROR] Arguments for '{_otc_name}' were not valid JSON: {_otc_parse_err_msg}"
-                            f" Re-call '{_otc_name}' with correctly escaped JSON arguments — this call did not run."
+                            f"[ERROR] Arguments for '{_otc_name}' were not valid JSON: {_otc_parse_err_msg}\n"
+                            f"Your call was: {_otc_raw_snippet}\n"
+                            f"Re-call '{_otc_name}' with corrected, properly escaped JSON arguments — this call did not run."
                         )
 
                     elif _otc_name == "search_codebase":
