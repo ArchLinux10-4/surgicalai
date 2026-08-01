@@ -898,7 +898,7 @@ def _is_gemini_model(model: str) -> bool:
 # prompt-cache key, 429 rate-limit-vs-billing classification), so pipeline.py
 # gains no duplicated provider logic. Same call shape as the two matchers
 # above: _is_grok_model("grok-4.5") -> True.
-from services.grok_provider import _is_grok_model, get_grok_client  # noqa: E402
+from services.grok_provider import _is_grok_model, get_grok_client, strip_unsupported_params  # noqa: E402
 
 
 # Models confirmed to support extended thinking (budget_tokens).
@@ -16213,18 +16213,43 @@ async def run_natural_pipeline_stream(
                         raise
 
             else:
-                # ── GPT turn (parity with the Claude branch; no client-side thinking) ──
-                _gpt_client = _get_client(user_id)
+                # ── GPT/Grok turn (parity with the Claude branch; no client-side thinking) ──
+                # NOTE (Grok): this branch fires for ANY non-Claude architect model
+                # (`_natural_use_claude = _is_claude_model(arch_model)`), so it is the
+                # main-chat (Ask/Plan) equivalent of the Agent Mode client fix at the
+                # `_agent_use_claude` branch above. Proven live against api.x.ai
+                # (2026-08-01): (1) an unguarded `_get_client(user_id)` here would send
+                # every Grok turn to OpenAI's endpoint with the wrong model id and key —
+                # confirmed via source read, not assumed; (2) xAI hard-400s
+                # "Model grok-4.5 does not support parameter stop." the instant `stop`
+                # carries a real sequence list (a bare `stop: null` is tolerated, but
+                # `_agent_stop_seqs` is non-empty whenever tag-stop is enabled, which is
+                # the normal case) — confirmed via a live 400 response, not the docs
+                # alone. GPT's behavior below is unchanged byte-for-byte: same client,
+                # same kwargs, same call.
+                if _is_grok_model(arch_model):
+                    _dlog("natural_pipeline_grok_client", session_id=session_id,
+                          user_id=user_id, turn=_turn, model=arch_model)
+                    _gpt_client = get_grok_client(user_id, dlog=_dlog)
+                else:
+                    _gpt_client = _get_client(user_id)
                 _gpt_msgs = [{"role": "system", "content": _gpt_system_text}] + list(current_messages)
                 _gpt_stop = _agent_stop_seqs[:4] if _agent_stop_seqs else None
+                _gpt_call_kwargs = {
+                    "messages": _gpt_msgs, "stream": True,
+                    "max_tokens": _max_output_tokens(arch_model),
+                    "stop": _gpt_stop,
+                }
+                if _is_grok_model(arch_model):
+                    _gpt_call_kwargs = strip_unsupported_params(
+                        _gpt_call_kwargs, dlog=_dlog,
+                        session_id=session_id, user_id=user_id)
 
                 for _attempt in range(3):
                     try:
                         _gpt_stream = _chat_create(
                             _gpt_client, model=arch_model,
-                            messages=_gpt_msgs, stream=True,
-                            max_tokens=_max_output_tokens(arch_model),
-                            stop=_gpt_stop,
+                            **_gpt_call_kwargs,
                         )
                         for _gpt_chunk in _gpt_stream:
                             _gpt_choice = _gpt_chunk.choices[0]

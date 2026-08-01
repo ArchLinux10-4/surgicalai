@@ -252,3 +252,79 @@ def test_pipeline_openai_and_gemini_key_helpers_untouched():
     assert "def _get_gemini_key" in src
     assert "def _get_client(user_id" in src or "def _get_client(" in src
     assert "def _get_grok_key" not in src
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# `run_natural_pipeline_stream`'s "GPT turn" branch — proven live against
+# api.x.ai on 2026-08-01 (not the docs alone) to have two real bugs before
+# this fix: (1) it built a raw OpenAI client for ANY non-Claude architect
+# model, including Grok, misrouting every Grok chat turn to api.openai.com;
+# (2) it passed `stop=<real sequence list>` unconditionally, which xAI
+# hard-400s with "Model grok-4.5 does not support parameter stop." (a bare
+# `stop: null` is tolerated — only a populated list 400s — confirmed live).
+# `_chat_create`'s own `stop`-stripping only fires for
+# `base_model in NO_TEMPERATURE_MODELS` (OpenAI reasoning ids), which never
+# contains a `grok-*` id, so it does not cover this call site.
+# ─────────────────────────────────────────────────────────────────────────
+
+def _natural_pipeline_gpt_turn_src() -> str:
+    src = _pipeline_src()
+    start = src.index("GPT/Grok turn (parity with the Claude branch")
+    # Slice to the first `for _attempt in range(3):` after the marker, which
+    # is the top of the retry loop this branch feeds into.
+    end = src.index("for _attempt in range(3):", start)
+    return src[start:end]
+
+
+def test_natural_pipeline_gpt_turn_routes_grok_to_xai_client():
+    """The main-chat (non-Agent-Mode) turn loop must route a Grok architect
+    model to `get_grok_client`, not the raw OpenAI client, before ever
+    building the request kwargs."""
+    block = _natural_pipeline_gpt_turn_src()
+    assert "if _is_grok_model(arch_model):" in block
+    assert "_gpt_client = get_grok_client(user_id, dlog=_dlog)" in block
+    assert "_gpt_client = _get_client(user_id)" in block  # GPT path retained
+
+
+def test_natural_pipeline_gpt_turn_strips_stop_for_grok_only():
+    """`strip_unsupported_params` must be applied to the outgoing kwargs only
+    when the architect model is Grok — GPT's `stop` handling must be
+    untouched (still flows straight into `_chat_create`, which does its own
+    o-series-specific stripping for OpenAI models)."""
+    block = _natural_pipeline_gpt_turn_src()
+    assert "strip_unsupported_params(" in block
+    # The strip call itself must be guarded by the same _is_grok_model check,
+    # not applied unconditionally (that would be harmless for GPT today, but
+    # would silently start being a functional change if GPT ever needed a
+    # disallowed param this set doesn't know about).
+    guard_idx = block.index("if _is_grok_model(arch_model):", block.index("_gpt_call_kwargs ="))
+    strip_idx = block.index("strip_unsupported_params(")
+    assert guard_idx < strip_idx
+
+
+def test_natural_pipeline_gpt_turn_gpt_call_kwargs_unchanged_shape():
+    """For a non-Grok model, the effective kwargs passed to `_chat_create`
+    must still be exactly `messages`, `stream=True`, `max_tokens`, `stop` —
+    same four keys as before this fix, just built via a dict instead of
+    inline call-site literals (functionally identical for GPT)."""
+    block = _natural_pipeline_gpt_turn_src()
+    assert '"messages": _gpt_msgs' in block
+    assert '"stream": True' in block
+    assert '"max_tokens": _max_output_tokens(arch_model)' in block
+    assert '"stop": _gpt_stop' in block
+
+
+def test_natural_pipeline_gpt_turn_dlogs_grok_client_route():
+    block = _natural_pipeline_gpt_turn_src()
+    assert '_dlog("natural_pipeline_grok_client"' in block
+
+
+def test_natural_pipeline_claude_branch_above_is_unmodified():
+    """The `if _natural_use_claude:` branch that this `else:` pairs with must
+    not be touched by this fix — only the `else:` (non-Claude) side changed."""
+    src = _pipeline_src()
+    assert "_natural_use_claude = _is_claude_model(arch_model)" in src
+    # The Claude streaming call must still be the Anthropic client, untouched.
+    idx = src.index("_natural_use_claude = _is_claude_model(arch_model)")
+    claude_block = src[idx:idx + 4000]
+    assert "aclient" in claude_block or "anthropic" in claude_block.lower()
