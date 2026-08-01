@@ -3585,7 +3585,16 @@ def run_chat(
     if _should_use_ollama(chat_model):
         return _ollama_chat(all_messages, chat_model)
 
-    client = _get_client(user_id)
+    # NOTE (Grok): `chat_model` is user-selectable (`model or
+    # get_setting("architect_model", ...)`), so an unguarded
+    # `_get_client(user_id)` here would send a `grok-*` selection to
+    # api.openai.com with the wrong key/model. Route Grok to xAI's endpoint;
+    # GPT behaviour is byte-identical (same client, same call, same kwargs).
+    if _is_grok_model(chat_model):
+        _dlog("run_chat_grok_client", model=chat_model, user_id=user_id)
+        client = get_grok_client(user_id, dlog=_dlog)
+    else:
+        client = _get_client(user_id)
     response = _chat_create(client,
         model=chat_model,
         messages=all_messages,
@@ -4096,8 +4105,17 @@ async def run_chat_stream(
                 _claude_msgs.append({"role": "user", "content": "\n\n".join(_tool_parts)})
                 _tool_round += 1
         else:
-            # ── OpenAI / GPT streaming ──
-            client = _get_client(user_id)
+            # ── OpenAI / GPT / Grok streaming ──
+            # NOTE (Grok): this non-Claude branch fires for any GPT- or Grok-
+            # selected `chat_model`; an unguarded `_get_client(user_id)` would
+            # misroute Grok to api.openai.com. Route Grok to xAI; GPT path is
+            # byte-identical.
+            if _is_grok_model(chat_model):
+                _dlog("run_chat_stream_grok_client", session_id=session_id,
+                      model=chat_model, user_id=user_id)
+                client = get_grok_client(user_id, dlog=_dlog)
+            else:
+                client = _get_client(user_id)
             stream = _chat_create(client,
                 model=chat_model,
                 messages=all_messages,
@@ -7423,8 +7441,16 @@ def analyze_multi_file(file_paths: list, file_contents: dict, user_request: str,
             combined_summary.append(entry)
 
     # Single architect call for ALL files
-    client = _get_client(user_id)
     arch_model = get_setting("architect_model", _DEFAULT_ARCH_MODEL)
+    # NOTE (Grok): `arch_model` is user-selectable, so an unguarded
+    # `_get_client(user_id)` here would misroute a `grok-*` selection to
+    # api.openai.com. Route Grok to xAI; GPT path is byte-identical.
+    if _is_grok_model(arch_model):
+        _dlog("multi_file_architect_grok_client", session_id=session_id,
+              model=arch_model, user_id=user_id)
+        client = get_grok_client(user_id, dlog=_dlog)
+    else:
+        client = _get_client(user_id)
 
     multi_user_msg = f"""MULTI-FILE ANALYSIS REQUEST
 
@@ -8400,8 +8426,14 @@ async def run_file_creator(
 
     # Route based on user's model — respect GPT selection instead of overriding
     if not _is_claude_model(creator_model):
-        # GPT / OpenAI path — use the user's chosen model
-        client = _get_client(user_id)
+        # GPT / OpenAI / Grok path — use the user's chosen model.
+        # NOTE (Grok): this non-Claude branch fires for a `grok-*` selection
+        # too, so route Grok to xAI's endpoint; GPT path is byte-identical.
+        if _is_grok_model(creator_model):
+            _dlog("file_creator_grok_client", model=creator_model, user_id=user_id)
+            client = get_grok_client(user_id, dlog=_dlog)
+        else:
+            client = _get_client(user_id)
         user_msg = _build_creator_user_msg(file_spec, codebase_context)
         _dlog("file_creator_gpt_path", model=creator_model, user_id=user_id)
         response = _chat_create(
@@ -9906,7 +9938,16 @@ async def _run_gpt_direct_rewrite(
     output the COMPLETE new file — mirrors the Claude path for feature parity.
     Returns {"new_file_content": str, "confidence": int, "notes": list}
     """
-    client = _get_client(user_id)
+    # NOTE (Grok): `model` here is the caller's surgeon-model route
+    # (`_surg_model_route = get_setting("surgeon_model", ...)`), reached via the
+    # non-Claude `else` branch at the call site — so it can be a `grok-*` id.
+    # An unguarded `_get_client(user_id)` would misroute it to api.openai.com.
+    # Route Grok to xAI; GPT path is byte-identical.
+    if _is_grok_model(model):
+        _dlog("gpt_direct_rewrite_grok_client", model=model, user_id=user_id)
+        client = get_grok_client(user_id, dlog=_dlog)
+    else:
+        client = _get_client(user_id)
 
     _dr_tools_oai = [{
         "type": "function",
@@ -10184,7 +10225,15 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 yield sse({"type": "done", "content": "", "model": _model_used})
                 return
 
-            client = _get_client(user_id)
+            # NOTE (Grok): fall-through non-Claude/Gemini/Ollama branch — a
+            # `grok-*` `chat_model` reaches here, so route Grok to xAI's
+            # endpoint; GPT path is byte-identical.
+            if _is_grok_model(chat_model):
+                _dlog("smart_pipeline_chat_grok_client", session_id=session_id,
+                      model=chat_model, user_id=user_id)
+                client = get_grok_client(user_id, dlog=_dlog)
+            else:
+                client = _get_client(user_id)
             stream = _chat_create(client, model=chat_model, messages=msgs, temperature=0.3, stream=True)
             for chunk in stream:
                 delta = chunk.choices[0].delta
@@ -11564,12 +11613,20 @@ USER REQUEST:
                       session_id=session_id, user_id=user_id)
                 plan = json.loads(resp_oai.choices[0].message.content)
         else:
-            # ── OpenAI Architect with Tool-Use ReAct Loop ──────────────────
+            # ── OpenAI / Grok Architect with Tool-Use ReAct Loop ───────────
             # Mirrors Claude's structured tool-use loop: GPT calls
             # search_codebase/request_file tools for context gathering
             # and submit_plan for the final plan.
             # Uses AGENTIC_TOOLS_V2_OPENAI for structured tool calls.
-            client = _get_client(user_id)
+            # NOTE (Grok): this final else (non-Claude, non-Gemini) fires for a
+            # `grok-*` `arch_model`, so route Grok to xAI's endpoint; GPT path
+            # is byte-identical.
+            if _is_grok_model(arch_model):
+                _dlog("smart_architect_grok_client", session_id=session_id,
+                      model=arch_model, user_id=user_id)
+                client = get_grok_client(user_id, dlog=_dlog)
+            else:
+                client = _get_client(user_id)
 
             _oai_architect_system = _architect_system
 
@@ -12987,7 +13044,16 @@ USER REQUEST:
                         if _lint_use_claude:
                             _lint_fix_client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
                         else:
-                            _lint_fix_oai_client = _get_client(user_id)
+                            # NOTE (Grok): `_lint_surg_model` is user-selectable
+                            # (`get_setting("surgeon_model", ...)`); this non-Claude
+                            # branch fires for a `grok-*` id, so route Grok to xAI's
+                            # endpoint; GPT path is byte-identical.
+                            if _is_grok_model(_lint_surg_model):
+                                _dlog("lint_fix_grok_client", session_id=session_id,
+                                      model=_lint_surg_model, user_id=user_id)
+                                _lint_fix_oai_client = get_grok_client(user_id, dlog=_dlog)
+                            else:
+                                _lint_fix_oai_client = _get_client(user_id)
                         _dlog("lint_fix_model_route", model=_lint_surg_model,
                               use_claude=_lint_use_claude, user_id=user_id)
                         _lint_working = _full_after_lint          # updated each attempt
