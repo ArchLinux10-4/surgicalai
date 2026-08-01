@@ -255,6 +255,23 @@ def get_available_models(request: Request):
              "description": "Fast reasoning — 5× cheaper than Sol, 1M context", "provider": "openai", "cost": 1},
         ]
 
+    # xAI Grok models — only shown when a Grok key is configured (same
+    # key-gating pattern as the OpenAI block above; Claude is ungated).
+    # `provider` is "grok", NOT "openai", so the frontend mode-lock check in
+    # ChatPanel.tsx (`const isGpt = m.provider === 'openai'`) does not catch
+    # these — Grok intentionally gets the same access GPT has today, no new
+    # restriction. Only the confirmed shipping model id is listed.
+    grok_models = []
+    has_grok = bool(_resolve_api_key(user_id, "grok"))
+    if has_grok:
+        grok_models = [
+            {"id": "grok-4.5", "name": "Grok 4.5", "role": "architect",
+             "description": "xAI reasoning model — 500K context, strong at agentic coding",
+             "provider": "grok", "cost": 2},
+        ]
+    _dlog("settings_models_grok_gate", user_id=user_id, has_grok=has_grok,
+          grok_model_count=len(grok_models))
+
     # Offline mode — return ONLY Ollama models, hide cloud models entirely
     s = get_all_settings()
     if s.get("ollama_enabled", "false").lower() == "true":
@@ -287,7 +304,7 @@ def get_available_models(request: Request):
         }
 
     return {
-        "models": claude_models + openai_models,
+        "models": claude_models + openai_models + grok_models,
         "pipeline_modes": [
             {"id": "auto", "name": "Auto", "description": "SurgicalAI natural pipeline (recommended)"},
         ]
@@ -380,6 +397,61 @@ def verify_gemini_key(body: dict, request: Request):
         if "401" in str(e) or "invalid" in err or "api_key" in err:
             raise HTTPException(status_code=401, detail="Invalid Gemini API key")
         raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)[:200]}")
+
+
+@router.post("/verify-grok-key")
+def verify_grok_key(body: dict, request: Request):
+    """Test xAI Grok API key, encrypt + store per-user.
+
+    Mirrors verify_gemini_key above: xAI's API is OpenAI-compatible, so the key
+    is probed with the standard OpenAI SDK pointed at xAI's base_url
+    (https://api.x.ai/v1) via `models.list()`. Stored under the new
+    key_type="grok" value in the existing per-user `user_api_keys` table — no
+    schema migration needed, since key_type is already a free-form string
+    discriminator.
+    """
+    from services.grok_provider import GROK_BASE_URL
+    key = body.get("key", "")
+    if not key:
+        _dlog("verify_grok_key_missing_key")
+        raise HTTPException(status_code=400, detail="No key provided")
+    try:
+        from openai import OpenAI
+        xclient = OpenAI(api_key=key, base_url=GROK_BASE_URL)
+        xclient.models.list()
+        user_id = _get_user_id(request)
+        if user_id:
+            encrypted = encrypt_api_key(key)
+            set_user_api_key(user_id, "grok", encrypted)
+            _dlog("verify_grok_key_stored", user_id=user_id, key_type="grok")
+        else:
+            _dlog("verify_grok_key_verified_unauthenticated")
+        # Per-user only — no global write
+        return {"ok": True, "message": "xAI Grok API key verified and saved"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        err = str(e).lower()
+        _dlog("verify_grok_key_failed", error_type=type(e).__name__, error=str(e)[:300])
+        if "401" in str(e) or "invalid" in err or "api_key" in err or "authentication" in err:
+            raise HTTPException(status_code=401, detail="Invalid xAI Grok API key")
+        raise HTTPException(status_code=500, detail=f"Verification failed: {str(e)[:200]}")
+
+
+@router.get("/grok-status")
+def grok_status(request: Request):
+    """Check if an xAI Grok API key is configured for this user.
+
+    Returns BOTH `configured` and `connected` with the same value on purpose:
+    /settings/gemini-status returns only `configured` while
+    frontend/src/components/SettingsModal.tsx reads `s?.connected` from it, so
+    the Gemini indicator can never light up. Returning both keys avoids
+    reproducing that pre-existing mismatch for Grok.
+    """
+    user_id = _get_user_id(request)
+    key = _resolve_api_key(user_id, "grok")
+    _dlog("grok_status_checked", user_id=user_id, configured=bool(key))
+    return {"configured": bool(key), "connected": bool(key)}
 
 
 @router.get("/gemini-status")
