@@ -65,7 +65,10 @@ export function SettingsModal() {
   const [githubConnecting, setGithubConnecting] = useState(false)
   const [githubStatus, setGithubStatus] = useState<any>(null)
   const [githubStatusMsg, setGithubStatusMsg] = useState('')
-  const [models, setModels] = useState<{id: string; name: string; role: string; description?: string; cost?: number}[]>([])
+  // models now comes from the shared appStore (see stores/appStore.ts) so
+  // that verifying a key here also updates ChatPanel's inline model picker
+  // immediately, without needing a page reload.
+  const { availableModels: models, refreshModels } = useAppStore()
   const [browsingDir, setBrowsingDir] = useState(false)
 
   // Security tab — change password
@@ -109,7 +112,7 @@ export function SettingsModal() {
         ollama_model: (settings as any).ollama_model || 'qwen2.5-coder:7b',
       })
     }
-    api.settings.getModels().then((d) => setModels(d.models || [])).catch(() => {})
+    refreshModels()
     try { (api as any).github.status().then((s: any) => setGithubStatus(s)).catch(() => {}) } catch(_) {}
     try { (api as any).vercel.status().then((s: any) => setVercelStatus(s)).catch(() => {}) } catch(_) {}
     try { (api as any).railway.status().then((s: any) => setRailwayStatus(s)).catch(() => {}) } catch(_) {}
@@ -146,6 +149,7 @@ export function SettingsModal() {
       setGrokConnected(true)
       setGrokKey('')
       clientLog('grok_key_verify_ok', {})
+      refreshModels()
       toast.success('Grok key saved', 'Grok 4.5 is now available in the model picker')
     } catch (e: any) {
       setGrokStatus('error')
@@ -169,6 +173,8 @@ export function SettingsModal() {
       setGeminiMessage(res.message || 'Gemini API key verified!')
       setGeminiConnected(true)
       setGeminiKey('')
+      clientLog('gemini_key_verify_ok', {})
+      refreshModels()
     } catch (e: any) {
       setGeminiStatus('error')
       setGeminiMessage(e.message || 'Invalid Gemini API key')
@@ -276,6 +282,8 @@ export function SettingsModal() {
       setKeyStatus('ok'); setKeyMessage('API key verified and saved!')
       const updated = await api.settings.get()
       setSettings(updated)
+      clientLog('openai_key_verify_ok', {})
+      refreshModels()
       toast.success('API key saved', 'OpenAI key verified successfully')
     } catch (e: any) {
       setKeyStatus('error'); setKeyMessage(e.message)
@@ -292,6 +300,8 @@ export function SettingsModal() {
       setAnthropicStatus('ok'); setAnthropicMessage('Anthropic key verified and saved!')
       const updated = await api.settings.get()
       setSettings(updated)
+      clientLog('anthropic_key_verify_ok', {})
+      refreshModels()
       toast.success('Anthropic key saved', 'Claude models now available')
     } catch (e: any) {
       setAnthropicStatus('error'); setAnthropicMessage(e.message)
@@ -331,6 +341,10 @@ export function SettingsModal() {
       await api.settings.update(form)
       const updated = await api.settings.get()
       setSettings(updated)
+      if (apiKey.trim() || anthropicKey.trim()) {
+        clientLog('settings_save_key_verified_refreshing_models', {})
+        refreshModels()
+      }
       setSettingsOpen(false)
       toast.success('Settings saved')
     } catch (e: any) {
