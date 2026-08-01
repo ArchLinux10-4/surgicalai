@@ -3605,53 +3605,83 @@ def run_chat(
     return response.choices[0].message.content
 
 
-_ASK_PLAN_TOOL_INSTRUCTIONS = """
-## Tools available in this conversation
-The file index above is names/sizes only — you have NOT been shown file contents.
-Do NOT guess about code you have not seen. You have two tags to inspect the
-real codebase before answering:
-
-<search_request>{"terms": ["exact_symbol_or_keyword", "another_term"]}</search_request>
-Use to find a specific function/class/keyword across all session files.
-
-<file_request>["filename1.py", "filename2.tsx"]</file_request>
-Use to view the full contents of specific file(s) by exact name.
-
-Emit ONLY ONE tag at a time, then STOP your response immediately — the
-results will be returned to you and you may continue. You may use these
-tags across multiple turns of this exchange (up to {max_rounds} rounds)
-before giving your final answer in plain prose (no tags in your final
-answer).
-"""
-
 # Ask/Plan is READ-ONLY by design — it can look at the connected GitHub
 # repo the same way Edit mode can, but it must never write. push_files and
-# push_session_file are deliberately left OFF this list; even if the model
-# ignores that and emits one anyway, run_chat_stream blocks it in code
-# before execute_github_request is ever called (belt-and-suspenders, not
-# just a prompt request).
-_ASK_PLAN_GITHUB_INSTRUCTIONS_TEMPLATE = """
-You may also use a third tag to read the connected GitHub repository
-(read-only in this mode — you cannot push, commit, or edit files here):
-
-<github_request>{{"tool": "list_prs", "args": {{"owner": "...", "repo": "..."}}, "reason": "why you need this"}}</github_request>
-
-Available tools: list_repos {{}}, list_prs {{owner, repo, state?}},
-get_pr_diff {{owner, repo, pr_number}}, get_pr_comments {{owner, repo, pr_number}},
-list_issues {{owner, repo, state?}}, get_issue_comments {{owner, repo, issue_number}},
-diff_branches {{owner, repo, base, head}}, list_files {{owner, repo, ref?, path_prefix?}},
-read_file {{owner, repo, path, ref?, start_line?}}, search_code {{owner, repo, query}},
-check_deploy {{provider?}}.
-{known_line}
-If the user wants an actual code change made or pushed, tell them to switch
-to Agent/Edit mode — this mode can only look, not write.
-One github_request per response, same one-tag-then-stop rule as above.
-"""
-
-# Ask/Plan is read-only — these GitHub tools can mutate the repo, so they
-# are blocked in code regardless of what the model emits (belt-and-
-# suspenders on top of the prompt instruction above).
+# push_session_file are deliberately left OFF the tool list; even if the
+# model ignores that and emits one anyway, run_chat_stream blocks it in
+# code before execute_github_request is ever called (belt-and-suspenders,
+# not just a prompt request).
 _ASK_PLAN_GH_WRITE_TOOLS = frozenset({"push_files", "push_session_file"})
+
+
+def _ask_plan_build_tool_instructions(
+    *, has_files: bool, gh_enabled: bool, gh_known_repos: list, max_rounds: int,
+) -> str:
+    """
+    Composes the Ask/Plan tool-instructions system-prompt block from
+    whichever tags are actually usable this turn: <search_request>/
+    <file_request> require attached session_files, <github_request>
+    requires a connected + verified GitHub installation. Built dynamically
+    (rather than one fixed string covering both) so the model is only ever
+    told about tags it can actually use — including the has_files=False,
+    gh_enabled=True combination (GitHub connected, no file attached) that
+    the previous fixed-string version could never describe correctly,
+    since it was only ever reached when has_files was True.
+    Only called when at least one of has_files/gh_enabled is True (see
+    _ask_plan_tools_enabled gate in run_chat_stream) — never emits an
+    empty/no-op tools block.
+    """
+    parts = ["## Tools available in this conversation"]
+    tag_blocks: list = []
+
+    if has_files:
+        parts.append(
+            "The file index above is names/sizes only — you have NOT been "
+            "shown file contents. Do NOT guess about code you have not seen."
+        )
+        tag_blocks.append(
+            '<search_request>{"terms": ["exact_symbol_or_keyword", "another_term"]}'
+            "</search_request>\nUse to find a specific function/class/keyword "
+            "across all session files."
+        )
+        tag_blocks.append(
+            '<file_request>["filename1.py", "filename2.tsx"]</file_request>\n'
+            "Use to view the full contents of specific file(s) by exact name."
+        )
+
+    if gh_enabled:
+        known_line = (
+            f"\nKNOWN REPOS (most recent first): {', '.join(gh_known_repos)}\n"
+            "Use these owner/repo values directly instead of calling list_repos.\n"
+            if gh_known_repos else ""
+        )
+        tag_blocks.append(
+            "You can read the connected GitHub repository (read-only in "
+            "this mode — you cannot push, commit, or edit files here):\n\n"
+            '<github_request>{"tool": "list_prs", "args": {"owner": "...", '
+            '"repo": "..."}, "reason": "why you need this"}</github_request>\n\n'
+            "Available tools: list_repos {}, list_prs {owner, repo, state?}, "
+            "get_pr_diff {owner, repo, pr_number}, get_pr_comments {owner, "
+            "repo, pr_number}, list_issues {owner, repo, state?}, "
+            "get_issue_comments {owner, repo, issue_number}, diff_branches "
+            "{owner, repo, base, head}, list_files {owner, repo, ref?, "
+            "path_prefix?}, read_file {owner, repo, path, ref?, start_line?}, "
+            "search_code {owner, repo, query}, check_deploy {provider?}."
+            f"{known_line}\n"
+            "If the user wants an actual code change made or pushed, tell "
+            "them to switch to Agent/Edit mode — this mode can only look, "
+            "not write."
+        )
+
+    parts.append("\n\n".join(tag_blocks))
+    parts.append(
+        "Emit ONLY ONE tag at a time, then STOP your response immediately — "
+        "the results will be returned to you and you may continue. You may "
+        f"use these tags across multiple turns of this exchange (up to "
+        f"{max_rounds} rounds) before giving your final answer in plain "
+        "prose (no tags in your final answer)."
+    )
+    return "\n" + "\n\n".join(parts) + "\n"
 
 
 def _ask_plan_strip_tool_tags(text: str) -> str:
@@ -3741,42 +3771,44 @@ async def run_chat_stream(
     Streaming version of run_chat. Yields SSE chunks.
     Used by the /api/chat/stream endpoint and by the Ask/Plan mode branch.
 
-    `session_files` (optional): when provided AND the resolved model is
-    Claude, this enables the same <search_request>/<file_request> tag tools
-    the Edit pipeline already has (proven pattern, reused verbatim) so
-    Ask/Plan can inspect real code instead of only seeing a 300-line
-    preview of one file. When omitted (legacy callers) or the model isn't
-    Claude, behavior is byte-identical to before — zero regression risk to
-    existing working paths.
+    `session_files` (optional): when provided, this enables the
+    <search_request>/<file_request> tag tools the Edit pipeline already has
+    (proven pattern, reused verbatim) so Ask/Plan can inspect real code
+    instead of only seeing a 300-line preview of one file.
+
+    GitHub read access (<github_request>, same as Edit mode) is enabled
+    independently of `session_files` — a user asking "what's in my repo?"
+    in Ask/Plan mode should not need to attach a file first. This mirrors
+    Edit mode, where GitHub access never depended on file attachments.
+    FIX (2026-08-01): previously the entire tool loop — including GitHub —
+    was gated on `bool(session_files)`, so Ask/Plan got zero search/GitHub
+    tools whenever no file was attached, for every model (Grok, GPT,
+    Claude alike). Confirmed via production debug log
+    surgical_debug_05b9699e.jsonl: `ask_plan_tools_enabled` never fired for
+    mode=ask/mode=plan turns with no attached files, while mode=edit turns
+    in the same session showed full `gh_known_repos` /
+    `natural_github_tag_registered` / `agent_loop_start(github_enabled=True)`
+    activity. When neither files nor GitHub are available, the loop stays
+    off so legacy live-token streaming (byte-identical to before) is kept —
+    zero regression risk to existing working paths.
     """
     chat_model = model or get_setting("architect_model", _DEFAULT_ARCH_MODEL)
     _model_used = chat_model
-    # Tools are enabled for every cloud backend (Claude native tool-round
-    # loop below, GPT/Gemini share one OpenAI-compatible tool-round loop).
-    # Ollama is the only exclusion — it runs a fully separate offline
-    # streaming path (see _should_use_ollama branch below) that never
-    # reaches this tag protocol either way, in Edit mode or here.
-    _ask_plan_tools_enabled = bool(session_files) and not _should_use_ollama(chat_model)
-    # Same knob Edit mode's agent_loop reads (services/pipeline.py ~14904),
-    # so Ask/Plan and Edit share one source of truth instead of two
-    # independently-hardcoded budgets. Default 24 matches Edit mode exactly.
-    _ASK_PLAN_MAX_ROUNDS = int(_os.getenv("AGENT_MAX_TURNS", "24"))
-    # Wall-clock backstop, same purpose/value as Edit mode's
-    # STREAMING_PHASE_DEADLINE_S (services/pipeline.py ~14430/14898). Separate
-    # local constant — does NOT touch or share state with Edit mode's
-    # PIPELINE_DEADLINE_S / STREAMING_PHASE_DEADLINE_S governors.
-    _ASK_PLAN_DEADLINE_S = 480  # 8 min max for the whole search/file/github loop
-    _ask_plan_t0 = time.time()
+    _ask_plan_has_files = bool(session_files)
+    _ask_plan_is_ollama = _should_use_ollama(chat_model)
 
     # ── GitHub read access for Ask/Plan (additive, flag-gated) ──────────
-    # Reuses the exact same natural_github_availability/get_known_repos/
-    # execute_github_request helpers the Edit pipeline already relies on —
-    # no new GitHub logic. Read-only in this mode: push_files and
-    # push_session_file are blocked in code below even if requested.
+    # Checked BEFORE _ask_plan_tools_enabled is decided (not nested inside
+    # it) so GitHub availability alone can turn the tool loop on, even with
+    # zero session_files attached. Reuses the exact same
+    # natural_github_availability/get_known_repos/execute_github_request
+    # helpers the Edit pipeline already relies on — no new GitHub logic.
+    # Read-only in this mode: push_files and push_session_file are blocked
+    # in code below even if requested.
     _gh_nat_enabled = False
     _gh_nat_installs: list = []
     _gh_known_repos: list = []
-    if _ask_plan_tools_enabled:
+    if not _ask_plan_is_ollama:
         try:
             from services.github_natural_tag import (
                 natural_github_availability, parse_github_request,
@@ -3791,6 +3823,34 @@ async def run_chat_stream(
             _dlog("ask_plan_github_setup_error", session_id=session_id,
                   user_id=user_id, error=str(_gh_nat_err))
 
+    # Tools (search/file tag loop) are enabled for every cloud backend
+    # (Claude native tool-round loop below, GPT/Gemini share one
+    # OpenAI-compatible tool-round loop) as soon as EITHER attached files
+    # OR a connected GitHub repo give the model something real to look at.
+    # Ollama is the only hard exclusion — it runs a fully separate offline
+    # streaming path (see _should_use_ollama branch below) that never
+    # reaches this tag protocol either way, in Edit mode or here. If
+    # neither files nor GitHub are available, the loop stays off so the
+    # legacy live-token streaming path (byte-identical to before this fix)
+    # still runs for plain chat with nothing to search.
+    _ask_plan_tools_enabled = (
+        (_ask_plan_has_files or _gh_nat_enabled) and not _ask_plan_is_ollama
+    )
+    _dlog("ask_plan_tools_gate_evaluated", session_id=session_id, user_id=user_id,
+          model=chat_model, has_files=_ask_plan_has_files,
+          github_enabled=_gh_nat_enabled, is_ollama=_ask_plan_is_ollama,
+          tools_enabled=_ask_plan_tools_enabled)
+    # Same knob Edit mode's agent_loop reads (services/pipeline.py ~14904),
+    # so Ask/Plan and Edit share one source of truth instead of two
+    # independently-hardcoded budgets. Default 24 matches Edit mode exactly.
+    _ASK_PLAN_MAX_ROUNDS = int(_os.getenv("AGENT_MAX_TURNS", "24"))
+    # Wall-clock backstop, same purpose/value as Edit mode's
+    # STREAMING_PHASE_DEADLINE_S (services/pipeline.py ~14430/14898). Separate
+    # local constant — does NOT touch or share state with Edit mode's
+    # PIPELINE_DEADLINE_S / STREAMING_PHASE_DEADLINE_S governors.
+    _ASK_PLAN_DEADLINE_S = 480  # 8 min max for the whole search/file/github loop
+    _ask_plan_t0 = time.time()
+
     system_parts = [CHAT_PERSONA]
 
     # Inject project memory
@@ -3804,7 +3864,13 @@ async def run_chat_stream(
 
     symbol_maps_by_name: dict = {}
     file_content_lookup: dict = {}
-    if _ask_plan_tools_enabled:
+    if _ask_plan_has_files and _ask_plan_tools_enabled:
+        # Note: _ask_plan_tools_enabled is always True here when
+        # _ask_plan_has_files is True, UNLESS Ollama is the resolved model
+        # (Ollama has its own fully separate offline path below that never
+        # reaches this tag protocol) — so this guard exists purely to keep
+        # the Ollama exclusion airtight even if that invariant ever
+        # changes upstream.
         for sf in session_files:
             fname = sf.get("filename", "") or ""
             content = sf.get("content", "") or ""
@@ -3822,28 +3888,29 @@ async def run_chat_stream(
         system_parts.append(
             "\n## Session Files (index only)\n" + "\n".join(_idx_lines)
         )
-        system_parts.append(
-            _ASK_PLAN_TOOL_INSTRUCTIONS.replace(
-                "{max_rounds}", str(_ASK_PLAN_MAX_ROUNDS)))
-        if _gh_nat_enabled:
-            _known_line = (
-                f"\nKNOWN REPOS (most recent first): {', '.join(_gh_known_repos)}\n"
-                "Use these owner/repo values directly instead of calling list_repos.\n"
-                if _gh_known_repos else ""
-            )
-            system_parts.append(
-                _ASK_PLAN_GITHUB_INSTRUCTIONS_TEMPLATE.format(known_line=_known_line))
-        _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
-              model=chat_model, num_files=len(file_content_lookup),
-              github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
-    elif file_content:
-        # Legacy path — unchanged for non-Claude models / callers with no
-        # session_files (e.g. the plain /api/chat/stream simple-chat page).
+    elif not _ask_plan_tools_enabled and file_content:
+        # Legacy single-file preview — only used when the tool loop is off
+        # entirely (no session_files AND no GitHub access), so plain
+        # /api/chat/stream callers with a lone active file keep seeing the
+        # exact byte-identical behavior they had before this fix.
         lines = file_content.splitlines()
         preview = "\n".join(lines[:300])
         if len(lines) > 300:
             preview += f"\n... [{len(lines) - 300} more lines not shown]"
         system_parts.append(f"\nActive file content (first 300 lines):\n```\n{preview}\n```")
+
+    if _ask_plan_tools_enabled:
+        # Reached whenever session_files were attached OR GitHub is
+        # connected (see gate above) — describes only the tags that are
+        # actually usable this turn (see _ask_plan_build_tool_instructions
+        # docstring for why this must be composed dynamically rather than
+        # a single fixed string).
+        system_parts.append(_ask_plan_build_tool_instructions(
+            has_files=_ask_plan_has_files, gh_enabled=_gh_nat_enabled,
+            gh_known_repos=_gh_known_repos, max_rounds=_ASK_PLAN_MAX_ROUNDS))
+        _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
+              model=chat_model, num_files=len(file_content_lookup),
+              github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
 
     if symbol_context:
         system_parts.append(f"\nFocused symbol context:\n```\n{symbol_context}\n```")
