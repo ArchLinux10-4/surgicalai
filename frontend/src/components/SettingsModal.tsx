@@ -6,6 +6,7 @@ import { AdminUsersPanel } from './AdminUsersPanel'
 import { GitHubAppPanel } from './GitHubAppPanel'
 import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
+import { clientLog } from '../lib/clientLog'
 import { AttachMoney, BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
 type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'railway' | 'security' | 'debug'
@@ -43,6 +44,14 @@ export function SettingsModal() {
   const [geminiStatus, setGeminiStatus] = useState<'idle' | 'ok' | 'error'>('idle')
   const [geminiMessage, setGeminiMessage] = useState('')
   const [geminiConnected, setGeminiConnected] = useState(false)
+  // xAI Grok key state — same per-provider hook set the OpenAI/Anthropic
+  // sections use (there is no shared key-input abstraction in this file).
+  const [grokKey, setGrokKey] = useState('')
+  const [showGrokKey, setShowGrokKey] = useState(false)
+  const [grokVerifying, setGrokVerifying] = useState(false)
+  const [grokStatus, setGrokStatus] = useState<'idle' | 'ok' | 'error'>('idle')
+  const [grokMessage, setGrokMessage] = useState('')
+  const [grokConnected, setGrokConnected] = useState(false)
   const [githubPat, setGithubPat] = useState('')
   const [vercelToken, setVercelToken] = useState('')
   const [vercelConnecting, setVercelConnecting] = useState(false)
@@ -105,7 +114,49 @@ export function SettingsModal() {
     try { (api as any).vercel.status().then((s: any) => setVercelStatus(s)).catch(() => {}) } catch(_) {}
     try { (api as any).railway.status().then((s: any) => setRailwayStatus(s)).catch(() => {}) } catch(_) {}
     try { api.settings.geminiStatus().then((s: any) => setGeminiConnected(s?.connected || false)).catch(() => {}) } catch(_) {}
+    // /settings/grok-status returns both `configured` and `connected` (the
+    // Gemini endpoint only returns `configured`, which is why the line above
+    // can never light up) — read either so the indicator actually works.
+    try {
+      api.settings.grokStatus()
+        .then((s: any) => {
+          const on = !!(s?.configured || s?.connected)
+          setGrokConnected(on)
+          clientLog('grok_status_loaded', { configured: on })
+        })
+        .catch((e: any) => { clientLog('grok_status_failed', { error: String(e?.message || e).slice(0, 200) }) })
+    } catch (_) {
+      clientLog('grok_status_threw', {})
+    }
   }, [settings, settingsOpen])
+
+  const handleVerifyGrokKey = async () => {
+    if (!grokKey.trim()) {
+      clientLog('grok_key_verify_skipped_empty', {})
+      return
+    }
+    setGrokVerifying(true)
+    setGrokStatus('idle')
+    setGrokMessage('')
+    clientLog('grok_key_verify_started', { keyLength: grokKey.trim().length })
+    try {
+      const res: any = await api.settings.verifyGrokKey(grokKey.trim())
+      setGrokStatus('ok')
+      setGrokMessage(res?.message || 'xAI Grok API key verified!')
+      setGrokConnected(true)
+      setGrokKey('')
+      clientLog('grok_key_verify_ok', {})
+      toast.success('Grok key saved', 'Grok 4.5 is now available in the model picker')
+    } catch (e: any) {
+      setGrokStatus('error')
+      setGrokMessage(e?.message || 'Invalid xAI Grok API key')
+      clientLog('grok_key_verify_failed', { error: String(e?.message || e).slice(0, 200) })
+      toast.error('Grok key failed', e?.message || 'Invalid xAI Grok API key')
+    } finally {
+      setGrokVerifying(false)
+      clientLog('grok_key_verify_finished', {})
+    }
+  }
 
   const handleVerifyGeminiKey = async () => {
     if (!geminiKey.trim()) return
@@ -469,6 +520,60 @@ export function SettingsModal() {
                         platform.openai.com
                       </a>
                       {' '}\u2014 enables GPT models
+                    </div>
+                  </div>
+                </div>
+
+                {/* xAI Grok Key */}
+                <div className="mt-6 pt-5 border-t border-border">
+                  <SectionHeader title="xAI Grok API Key" subtitle="Optional — enables Grok 4.5" />
+                  <div className="mt-3">
+                    <div className="flex gap-2">
+                      <div className="relative flex-1">
+                        <input
+                          type={showGrokKey ? 'text' : 'password'}
+                          value={grokKey}
+                          onChange={(e) => { setGrokKey(e.target.value); setGrokStatus('idle') }}
+                          onPaste={(e) => {
+                            e.preventDefault()
+                            const pasted = e.clipboardData.getData('text').trim()
+                            if (pasted) { setGrokKey(pasted); setGrokStatus('idle'); clientLog('grok_key_pasted', { keyLength: pasted.length }) }
+                          }}
+                          placeholder={grokConnected ? '\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022' : 'xai-\u2026'}
+                          className={`input pr-10 ${grokStatus === 'ok' ? 'border-success focus:border-success' : grokStatus === 'error' ? 'border-danger' : ''}`}
+                          onKeyDown={(e) => e.key === 'Enter' && handleVerifyGrokKey()}
+                          autoComplete="off"
+                          spellCheck={false}
+                        />
+                        <button
+                          onClick={() => { setShowGrokKey(!showGrokKey); clientLog('grok_key_visibility_toggled', { visible: !showGrokKey }) }}
+                          className="absolute right-3 top-1/2 -translate-y-1/2 text-faint hover:text-muted"
+                        >
+                          {showGrokKey ? <VisibilityOff sx={{ fontSize: 14 }} /> : <Visibility sx={{ fontSize: 14 }} />}
+                        </button>
+                      </div>
+                      <button
+                        onClick={handleVerifyGrokKey}
+                        disabled={grokVerifying || !grokKey.trim()}
+                        className="btn-primary px-5 disabled:opacity-40 disabled:cursor-not-allowed"
+                      >
+                        {grokVerifying ? '\u2026' : 'Verify'}
+                      </button>
+                    </div>
+                    {grokConnected && grokStatus === 'idle' && (
+                      <div className="flex items-center gap-1.5 mt-2 text-success text-xs">
+                        <CheckCircle sx={{ fontSize: 12 }} /> xAI Grok API key configured
+                      </div>
+                    )}
+                    {grokStatus === 'ok' && <div className="text-success text-xs mt-2">{grokMessage}</div>}
+                    {grokStatus === 'error' && <div className="text-danger text-xs mt-2">{grokMessage}</div>}
+                    <div className="text-[11px] text-faint mt-2">
+                      Get your key at{' '}
+                      <a href="https://console.x.ai/team/default/api-keys" target="_blank" rel="noopener" className="text-accent hover:underline"
+                         onClick={() => clientLog('grok_console_link_clicked', {})}>
+                        console.x.ai
+                      </a>
+                      {' '}{'\u2014'} enables Grok 4.5 (500K context, reasoning-only)
                     </div>
                   </div>
                 </div>

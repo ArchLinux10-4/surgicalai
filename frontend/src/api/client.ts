@@ -6,6 +6,20 @@ const BASE = (import.meta.env.VITE_API_URL ?? '') + '/api'
  *  (e.g. clientLog) hit the same origin/prefix as every other API call. */
 export const API_BASE = BASE
 
+/** Fire-and-forget clientLog bridge for wrappers defined in this file.
+ *  lib/clientLog.ts imports API_BASE/getAuthToken from here, so clientLog must
+ *  be pulled in lazily (dynamic import) to avoid a circular module dependency.
+ *  Never throws, never blocks the caller. */
+function _log(event: string, data: Record<string, unknown> = {}): void {
+  try {
+    void import('../lib/clientLog')
+      .then((m) => m.clientLog(event, data))
+      .catch(() => { /* silent no-op */ })
+  } catch {
+    /* never throw from a logging call */
+  }
+}
+
 /** Read JWT from persisted auth store without importing zustand (avoids circular deps).
  *  Auth is stored under `surgicalai-auth-{username}` (namespaced) or legacy `surgicalai-auth`.
  *  Exported so ancillary helpers authenticate exactly like the main client. */
@@ -209,6 +223,19 @@ export const api = {
     getModels: () => request<any>('/settings/models'),
     geminiStatus: () => request<any>('/settings/gemini-status'),
     verifyGeminiKey: (key: string) => request('/settings/verify-gemini-key', { method: 'POST', body: JSON.stringify({ key }) }),
+    // xAI Grok — mirrors the Gemini/Anthropic wrappers above. Each new wrapper
+    // emits a clientLog event so the browser side of the Grok flow lands in the
+    // downloadable debug log, exactly like the upload paths in ChatPanel.tsx.
+    // NOTE: clientLog is loaded via a lazy dynamic import, not a top-level
+    // one — lib/clientLog.ts imports API_BASE/getAuthToken from THIS file, so a
+    // static import here would create a circular module dependency (this file's
+    // own header comment calls out avoiding exactly that). _log() never throws
+    // and never blocks the request.
+    grokStatus: () => { _log('grok_status_fetch'); return request<any>('/settings/grok-status') },
+    verifyGrokKey: (key: string) => {
+      _log('grok_key_verify_submitted', { keyLength: key.length })
+      return request('/settings/verify-grok-key', { method: 'POST', body: JSON.stringify({ key }) })
+    },
     browseDirectory: () => request<any>('/settings/browse-directory', { method: 'POST' }),
   },
   chat: {

@@ -891,6 +891,16 @@ def _is_gemini_model(model: str) -> bool:
     return bool(model and (model.startswith("gemini-") or model.startswith("models/gemini")))
 
 
+# Grok/xAI model matcher. Deliberately NOT redefined here: it lives in
+# services/grok_provider.py alongside every xAI-specific request-shaping
+# mitigation (strict message-content rule, disallowed penalty/stop params,
+# HTML-entity-decoded tool args, finish_reason handling, per-chunk usage,
+# prompt-cache key, 429 rate-limit-vs-billing classification), so pipeline.py
+# gains no duplicated provider logic. Same call shape as the two matchers
+# above: _is_grok_model("grok-4.5") -> True.
+from services.grok_provider import _is_grok_model, get_grok_client  # noqa: E402
+
+
 # Models confirmed to support extended thinking (budget_tokens).
 # Extended-thinking support. All Claude 4.x families (Opus/Sonnet/Haiku 4.5+)
 # emit thinking blocks; 3.7 also supports it. 3.5 does NOT and is excluded.
@@ -1513,6 +1523,14 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
             _gh_responses_create = None
         if not _gpt_hardened:
             # Legacy defaults — byte-for-byte the pre-hardening behavior.
+            # NOTE (Grok): this injection is an exact-string membership test
+            # against OpenAI o-series ids in REASONING_EFFORT_MODELS, so it can
+            # never fire for a "grok-*" model id — xAI would reject/ignore the
+            # o-series-shaped kwarg. No functional change is needed here; the
+            # guarantee is asserted by
+            # backend/tests/test_grok_tool_call_handling.py via
+            # grok_provider.o_series_injection_can_misfire(), which fails if a
+            # Grok-shaped id is ever added to that set.
             if base_model in REASONING_EFFORT_MODELS and "reasoning_effort" not in kwargs:
                 _re = get_setting("reasoning_effort", "")
                 if _re and _re.lower() in ("none", "low", "medium", "high", "xhigh"):
@@ -1569,8 +1587,14 @@ def _get_gemini_key(user_id: str = "") -> str:
 def _get_client_for_model(model: str, user_id: str = "") -> OpenAI:
     """Return an OpenAI-compatible client for the given model.
     Gemini models use Google's OpenAI-compat endpoint.
+    Grok models use xAI's OpenAI-compat endpoint (https://api.x.ai/v1).
     All other models use the standard OpenAI endpoint.
     """
+    if _is_grok_model(model):
+        # xAI's Chat Completions API is OpenAI-SDK-compatible, so this is the
+        # same base_url-swap pattern already proven for Gemini below — purely
+        # additive, the Gemini and OpenAI branches are unchanged.
+        return get_grok_client(user_id, dlog=_dlog)
     if _is_gemini_model(model):
         key = _get_gemini_key(user_id)
         return OpenAI(
@@ -6269,7 +6293,21 @@ async def analyze_and_plan_stream(
             anthropic_key = _get_anthropic_key(user_id)
             aclient = AsyncAnthropic(api_key=anthropic_key)
         else:
-            _agent_oai_client = _get_client(user_id)
+            # Agent Mode's non-Claude branch built a raw OpenAI client here, so a
+            # non-OpenAI OpenAI-compatible architect model (Grok — and, already
+            # today, Gemini) would have been sent to api.openai.com with the
+            # user's OpenAI key and an unknown model id. Grok is routed to xAI's
+            # endpoint so Agent Mode actually works for it (rule: Grok gets the
+            # same access GPT has). GPT behaviour is byte-identical — the
+            # _get_client(user_id) call below is unchanged for every non-Grok
+            # model. The equivalent Gemini mis-route is pre-existing and left
+            # untouched (out of scope for this change).
+            if _is_grok_model(architect_model):
+                _dlog("agent_mode_grok_client", session_id=session_id,
+                      user_id=user_id, model=architect_model)
+                _agent_oai_client = get_grok_client(user_id, dlog=_dlog)
+            else:
+                _agent_oai_client = _get_client(user_id)
             anthropic_key = None  # may not have one
             try:
                 anthropic_key = _get_anthropic_key(user_id)
@@ -17299,6 +17337,26 @@ async def run_natural_pipeline_stream(
                                     _retry_smap, user_request,
                                     session_id, user_id
                                 )
+                            elif _is_grok_model(arch_model):
+                                # No Anthropic key AND the architect model is
+                                # Grok — use the Grok correction fallback
+                                # (services/grok_correction.py) instead of the
+                                # GPT fallback below, which would require an
+                                # OpenAI key this user may not have. Additive
+                                # third branch only: the Claude branch above and
+                                # the GPT branch below are both unchanged.
+                                from services.grok_correction import retry_truncated_edit_grok
+                                _dlog("retry_truncated_edit_grok_fallback",
+                                      session_id=session_id, user_id=user_id,
+                                      filename=_retry_fname, symbol=_retry_sym)
+                                _redit_coro = retry_truncated_edit_grok(
+                                    _get_client_for_model(arch_model, user_id), "grok-4.5",
+                                    _retry_fname, _retry_sym, _retry_content,
+                                    _retry_smap, user_request,
+                                    _chat_create, _dlog,
+                                    get_setting=get_setting,
+                                    session_id=session_id, user_id=user_id,
+                                )
                             else:
                                 # No Anthropic key configured (GPT-only user) —
                                 # fall back to GPT 5.6 Terra instead of silently
@@ -17372,6 +17430,22 @@ async def run_natural_pipeline_stream(
                                 aclient, "claude-sonnet-5",  # R25: corrections always Claude
                                 _retry_fname, user_request,
                                 session_id, user_id
+                            )
+                        elif _is_grok_model(arch_model):
+                            # No Anthropic key AND the architect model is Grok —
+                            # Grok correction fallback. Additive third branch:
+                            # the Claude branch above and the GPT branch below
+                            # are unchanged. See services/grok_correction.py.
+                            from services.grok_correction import retry_truncated_newfile_grok
+                            _dlog("retry_truncated_newfile_grok_fallback",
+                                  session_id=session_id, user_id=user_id,
+                                  filename=_retry_fname)
+                            _rnf_coro = retry_truncated_newfile_grok(
+                                _get_client_for_model(arch_model, user_id), "grok-4.5",
+                                _retry_fname, user_request,
+                                _chat_create, _dlog,
+                                get_setting=get_setting,
+                                session_id=session_id, user_id=user_id,
                             )
                         else:
                             # No Anthropic key configured (GPT-only user) —
@@ -17588,6 +17662,25 @@ async def run_natural_pipeline_stream(
                             p_filename, p_symbol, p_description,
                             p_content, p_smap, user_request,
                             session_id, user_id,
+                            max_wait_s=max(5.0, min(120.0, _budget_left)),
+                        )
+                    elif _is_grok_model(arch_model):
+                        # No Anthropic key AND the architect model is Grok —
+                        # Grok correction fallback for this plan-execute step.
+                        # Additive third branch: the Claude branch above and the
+                        # GPT branch below are unchanged. See
+                        # services/grok_correction.py.
+                        from services.grok_correction import execute_single_edit_grok
+                        _dlog("execute_single_edit_grok_fallback",
+                              session_id=session_id, user_id=user_id,
+                              filename=p_filename, symbol=p_symbol)
+                        _edit_coro = execute_single_edit_grok(
+                            _get_client_for_model(arch_model, user_id), "grok-4.5",
+                            p_filename, p_symbol, p_description,
+                            p_content, p_smap, user_request,
+                            _chat_create, _dlog,
+                            get_setting=get_setting,
+                            session_id=session_id, user_id=user_id,
                             max_wait_s=max(5.0, min(120.0, _budget_left)),
                         )
                     else:
@@ -19149,6 +19242,29 @@ async def run_natural_pipeline_stream(
                         system=system_prompt,
                         messages=correction_msgs,
                     )
+                elif _is_grok_model(arch_model):
+                    # No Anthropic key AND the architect model is Grok — Grok
+                    # correction fallback instead of silently skipping symbol
+                    # correction. Additive third branch: the Claude branch above
+                    # and the GPT branch below are unchanged. See
+                    # services/grok_correction.py.
+                    from services.grok_correction import safe_grok_correction_call
+                    _corr_correction_model = "grok-4.5"
+                    _dlog("correction_call_config", session_id=session_id,
+                          model=_corr_correction_model,
+                          wrapper="safe_grok_correction_call",
+                          resolve_round=resolve_round)
+                    _corr_coro = safe_grok_correction_call(
+                        _get_client_for_model(arch_model, user_id),
+                        model=_corr_correction_model,
+                        desired_text_tokens=12000,
+                        system=system_prompt,
+                        messages=correction_msgs,
+                        chat_create=_chat_create,
+                        dlog=_dlog,
+                        get_setting=get_setting,
+                        session_id=session_id, user_id=user_id,
+                    )
                 else:
                     # No Anthropic key configured (GPT-only user) — fall back
                     # to GPT 5.6 Terra instead of silently skipping symbol
@@ -19332,6 +19448,25 @@ async def run_natural_pipeline_stream(
                                         system=system_prompt,
                                         messages=_fu_msgs,
                                     )
+                                elif _is_grok_model(arch_model):
+                                    # No Anthropic key + Grok architect — Grok
+                                    # correction fallback. Additive third
+                                    # branch; Claude above / GPT below
+                                    # unchanged. See services/grok_correction.py.
+                                    from services.grok_correction import safe_grok_correction_call
+                                    _dlog("correction_followup_grok_fallback",
+                                          session_id=session_id, user_id=user_id)
+                                    _fu_coro = safe_grok_correction_call(
+                                        _get_client_for_model(arch_model, user_id),
+                                        model="grok-4.5",
+                                        desired_text_tokens=12000,
+                                        system=system_prompt,
+                                        messages=_fu_msgs,
+                                        chat_create=_chat_create,
+                                        dlog=_dlog,
+                                        get_setting=get_setting,
+                                        session_id=session_id, user_id=user_id,
+                                    )
                                 else:
                                     # No Anthropic key (GPT-only user) — GPT 5.6
                                     # Terra fallback. See services/gpt_correction.py.
@@ -19423,6 +19558,26 @@ async def run_natural_pipeline_stream(
                                                 retry_on_starve=True,
                                                 system=system_prompt,
                                                 messages=_fu2_msgs,
+                                            )
+                                        elif _is_grok_model(arch_model):
+                                            # No Anthropic key + Grok architect —
+                                            # Grok correction fallback. Additive
+                                            # third branch; Claude above / GPT
+                                            # below unchanged. See
+                                            # services/grok_correction.py.
+                                            from services.grok_correction import safe_grok_correction_call
+                                            _dlog("correction_followup2_grok_fallback",
+                                                  session_id=session_id, user_id=user_id)
+                                            _fu2_coro = safe_grok_correction_call(
+                                                _get_client_for_model(arch_model, user_id),
+                                                model="grok-4.5",
+                                                desired_text_tokens=12000,
+                                                system=system_prompt,
+                                                messages=_fu2_msgs,
+                                                chat_create=_chat_create,
+                                                dlog=_dlog,
+                                                get_setting=get_setting,
+                                                session_id=session_id, user_id=user_id,
                                             )
                                         else:
                                             # No Anthropic key (GPT-only user) —
@@ -19540,6 +19695,25 @@ async def run_natural_pipeline_stream(
                                         retry_on_starve=True,
                                         system=system_prompt,
                                         messages=_fu0_msgs,
+                                    )
+                                elif _is_grok_model(arch_model):
+                                    # No Anthropic key + Grok architect — Grok
+                                    # correction fallback. Additive third
+                                    # branch; Claude above / GPT below
+                                    # unchanged. See services/grok_correction.py.
+                                    from services.grok_correction import safe_grok_correction_call
+                                    _dlog("correction_followup0_grok_fallback",
+                                          session_id=session_id, user_id=user_id)
+                                    _fu0_coro = safe_grok_correction_call(
+                                        _get_client_for_model(arch_model, user_id),
+                                        model="grok-4.5",
+                                        desired_text_tokens=12000,
+                                        system=system_prompt,
+                                        messages=_fu0_msgs,
+                                        chat_create=_chat_create,
+                                        dlog=_dlog,
+                                        get_setting=get_setting,
+                                        session_id=session_id, user_id=user_id,
                                     )
                                 else:
                                     # No Anthropic key (GPT-only user) — GPT 5.6
@@ -20871,6 +21045,27 @@ async def run_natural_pipeline_stream(
                                             system=system_prompt,
                                             messages=_react_msgs,
                                         )
+                                    elif _is_grok_model(arch_model):
+                                        # No Anthropic key + Grok architect —
+                                        # Grok correction fallback. Additive
+                                        # third branch; Claude above / GPT below
+                                        # unchanged. See
+                                        # services/grok_correction.py.
+                                        from services.grok_correction import safe_grok_correction_call
+                                        _dlog("qa_retry_correction_react_grok_fallback",
+                                              session_id=session_id, user_id=user_id,
+                                              retry_round=_qa_retry_round, idx=idx)
+                                        _fu_coro = safe_grok_correction_call(
+                                            _get_client_for_model(arch_model, user_id),
+                                            model="grok-4.5",
+                                            desired_text_tokens=12000,
+                                            system=system_prompt,
+                                            messages=_react_msgs,
+                                            chat_create=_chat_create,
+                                            dlog=_dlog,
+                                            get_setting=get_setting,
+                                            session_id=session_id, user_id=user_id,
+                                        )
                                     else:
                                         # No Anthropic key (GPT-only user) — GPT
                                         # 5.6 Terra fallback. See
@@ -21067,6 +21262,25 @@ async def run_natural_pipeline_stream(
                                     retry_on_starve=True,
                                     system=system_prompt,
                                     messages=_react_msgs,
+                                )
+                            elif _is_grok_model(arch_model):
+                                # No Anthropic key + Grok architect — Grok
+                                # correction fallback. Additive third branch;
+                                # Claude above / GPT below unchanged. See
+                                # services/grok_correction.py.
+                                from services.grok_correction import safe_grok_correction_call
+                                _dlog("qa_retry_correction_react_grok_fallback",
+                                      session_id=session_id, user_id=user_id)
+                                _fu_coro = safe_grok_correction_call(
+                                    _get_client_for_model(arch_model, user_id),
+                                    model="grok-4.5",
+                                    desired_text_tokens=12000,
+                                    system=system_prompt,
+                                    messages=_react_msgs,
+                                    chat_create=_chat_create,
+                                    dlog=_dlog,
+                                    get_setting=get_setting,
+                                    session_id=session_id, user_id=user_id,
                                 )
                             else:
                                 # No Anthropic key (GPT-only user) — GPT 5.6
