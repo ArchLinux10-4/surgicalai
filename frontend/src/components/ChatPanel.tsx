@@ -982,6 +982,7 @@ export function ChatPanel() {
     agentTasks, setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble, setAgentPhase,
     pendingChatInput, setPendingChatInput,
     pickedElements, clearPickedElements,
+    availableModels, refreshModels,
   } = useAppStore()
 
   // Keep the agentic task list in sync with Claude's DB-backed progress while a
@@ -1018,7 +1019,9 @@ export function ChatPanel() {
   const [thinkingText, setThinkingText] = useState('')
   const [isThinking, setIsThinking] = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
-  const [availableModels, setAvailableModels] = useState<{id: string; name: string; role: string; description?: string; cost?: number; provider?: string}[]>([])
+  // availableModels/refreshModels now come from the shared appStore (see
+  // note there) so verifying a provider key in SettingsModal updates this
+  // picker immediately, without needing a page reload.
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
@@ -1254,9 +1257,11 @@ export function ChatPanel() {
     return () => window.removeEventListener('keydown', handler)
   }, [isStreaming])
 
-  // Load available models for inline model picker
+  // Load available models for inline model picker (shared store — see
+  // stores/appStore.ts refreshModels)
   useEffect(() => {
-    api.settings.getModels().then((d: any) => setAvailableModels(d.models || [])).catch(() => {})
+    clientLog('chat_panel_models_load_started', {})
+    refreshModels()
   }, [])
 
   const stopStream = (sessionId?: string) => {

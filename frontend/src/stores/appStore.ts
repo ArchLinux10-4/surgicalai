@@ -1,5 +1,21 @@
 import { create } from 'zustand'
 import type { ChatSession, ChatMessage, FileContent, SurgicalAnalysis, AppSettings, FileNode, PromptTemplate, ImpactAnalysis } from '../types'
+import { api } from '../api/client'
+import { clientLog } from '../lib/clientLog'
+
+// Shared across ChatPanel (model picker) and SettingsModal (models tab) so
+// that verifying a new provider key (e.g. Grok) — which happens in
+// SettingsModal — is reflected immediately in ChatPanel's picker without a
+// page reload. Both previously kept their own independent local
+// `useState`/`useEffect(fetch, [])` copies with no way to notify each other.
+export interface AvailableModel {
+  id: string
+  name: string
+  role: string
+  description?: string
+  cost?: number
+  provider?: string
+}
 
 interface AppState {
   // Settings
@@ -7,6 +23,13 @@ interface AppState {
   settingsOpen: boolean
   setSettings: (s: AppSettings) => void
   setSettingsOpen: (v: boolean) => void
+
+  // Model picker list — shared so any component that adds/verifies a
+  // provider key can call refreshModels() and have every consumer
+  // (ChatPanel's inline picker, SettingsModal's Models tab) update in sync.
+  availableModels: AvailableModel[]
+  setAvailableModels: (m: AvailableModel[]) => void
+  refreshModels: () => Promise<void>
 
   // Active file
   activeFile: FileContent | null
@@ -139,6 +162,19 @@ export const useAppStore = create<AppState>((set) => ({
   settingsOpen: false,
   setSettings: (settings) => set({ settings }),
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
+
+  availableModels: [],
+  setAvailableModels: (availableModels) => set({ availableModels }),
+  refreshModels: async () => {
+    try {
+      const d: any = await api.settings.getModels()
+      const models = d?.models || []
+      set({ availableModels: models })
+      clientLog('models_refreshed', { count: models.length, ids: models.map((m: any) => m.id) })
+    } catch (e: any) {
+      clientLog('models_refresh_failed', { error: String(e?.message || e).slice(0, 200) })
+    }
+  },
 
   activeFile: null,
   setActiveFile: (activeFile) => set({ activeFile }),
