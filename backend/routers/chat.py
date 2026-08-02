@@ -275,8 +275,25 @@ import openai as _openai_mod
 # "meta-compaction" pass (SUMMARY_META_COMPACT_CHARS) is the only place old
 # summary text is ever re-compressed, and that only happens after many rounds
 # of appending, not on every round.
-HISTORY_TOKEN_BUDGET = 60_000       # Max estimated tokens before compaction triggers (was 30_000)
-MIN_RECENT_KEEP = 20                # Always keep at least this many recent messages raw (was 6)
+#
+# Threshold re-tune (lowered again from 60_000 / 20):
+# raising the budget to 60K / keep-20 was a defensive reaction to the
+# compounding-loss bug, but that bug's real cause was the overwrite-style
+# summarization described above, and it is already fixed by the append-only
+# logic in _compact_session (summarize ONLY the new turns, append to the
+# existing summary; old summary text is re-compressed only in the rare
+# meta-compaction pass). With the real bug fixed elsewhere, the high threshold
+# bought nothing and instead made compaction effectively unreachable:
+# analysis of real user session logs shows ~289-323 tokens per message
+# (avg ~308), so a 60_000-token budget required roughly 195 messages in one
+# continuous session before compaction could fire — while real full-day
+# sessions ran 47-89 messages and therefore never compacted once. A 20_000
+# budget trips at roughly the 65-message mark, which matches observed real
+# long-session lengths, so compaction actually runs when it should. Only these
+# two values change; the per-message truncation, summary token/word budgets,
+# meta-compaction gate and the append-not-overwrite logic are unchanged.
+HISTORY_TOKEN_BUDGET = 20_000       # Max estimated tokens before compaction triggers (was 60_000)
+MIN_RECENT_KEEP = 12                # Always keep at least this many recent messages raw (was 20)
 PER_MESSAGE_TRUNCATE_CHARS = 3000   # Max chars kept per message before summarization (was 500)
 SUMMARY_MAX_TOKENS = 1500           # Max output tokens for a per-round compaction summary (was 500)
 SUMMARY_WORD_CAP = 1200             # Word ceiling stated in the per-round compaction prompt (was 400)
