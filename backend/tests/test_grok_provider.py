@@ -137,16 +137,21 @@ def test_get_grok_client_uses_xai_base_url(monkeypatch):
     captured = {}
 
     class FakeOpenAI:
-        def __init__(self, api_key=None, base_url=None):
+        def __init__(self, api_key=None, base_url=None, default_headers=None):
             captured["api_key"] = api_key
             captured["base_url"] = base_url
+            captured["default_headers"] = default_headers
 
     import openai as openai_mod
     monkeypatch.setattr(openai_mod, "OpenAI", FakeOpenAI)
 
     client = gp.get_grok_client("user-1")
     assert isinstance(client, FakeOpenAI)
-    assert captured == {"api_key": "xai-test-key", "base_url": "https://api.x.ai/v1"}
+    assert captured["api_key"] == "xai-test-key"
+    assert captured["base_url"] == "https://api.x.ai/v1"
+    # Additive: the client now always carries the x-grok-conv-id cache header
+    # (see test_grok_cache_headers.py for the dedicated coverage of this).
+    assert captured["default_headers"] == {"x-grok-conv-id": "surgicalai-user-1"}
 
 
 def test_get_grok_client_logs_creation(monkeypatch):
@@ -154,7 +159,7 @@ def test_get_grok_client_logs_creation(monkeypatch):
     monkeypatch.setattr(gp, "decrypt_api_key", lambda v: "xai-test-key")
 
     class FakeOpenAI:
-        def __init__(self, api_key=None, base_url=None):
+        def __init__(self, api_key=None, base_url=None, default_headers=None):
             pass
 
     import openai as openai_mod
@@ -163,6 +168,7 @@ def test_get_grok_client_logs_creation(monkeypatch):
     events = []
     gp.get_grok_client("user-1", dlog=lambda e, **kw: events.append(e))
     assert "grok_client_created" in events
+    assert "grok_client_created_with_cache_headers" in events
 
 
 def test_get_grok_client_propagates_missing_key_error(monkeypatch):
@@ -188,7 +194,10 @@ def test_get_client_for_model_has_additive_grok_branch():
     start = src.index("def _get_client_for_model")
     body = src[start:start + 1800]
     assert "if _is_grok_model(model):" in body
-    assert "get_grok_client(user_id, dlog=_dlog)" in body
+    # Additive session_id passthrough (grok-cache-header fix): the call now
+    # forwards session_id so the returned client carries a stable
+    # per-conversation prompt-cache header.
+    assert "get_grok_client(user_id, dlog=_dlog, session_id=session_id)" in body
     # The pre-existing Gemini branch and the OpenAI fall-through are unchanged.
     assert "if _is_gemini_model(model):" in body
     assert 'base_url="https://generativelanguage.googleapis.com/v1beta/openai/"' in body
@@ -282,7 +291,8 @@ def test_natural_pipeline_gpt_turn_routes_grok_to_xai_client():
     building the request kwargs."""
     block = _natural_pipeline_gpt_turn_src()
     assert "if _is_grok_model(arch_model):" in block
-    assert "_gpt_client = get_grok_client(user_id, dlog=_dlog)" in block
+    # Additive session_id passthrough (grok-cache-header fix).
+    assert "_gpt_client = get_grok_client(user_id, dlog=_dlog, session_id=session_id)" in block
     assert "_gpt_client = _get_client(user_id)" in block  # GPT path retained
 
 
@@ -358,6 +368,20 @@ def _grok_route_block(dlog_event: str) -> str:
     return src[start - 200:start + 400]
 
 
+# call sites where a `session_id` local was already in scope (grok-cache-header
+# fix): these now forward it explicitly to get_grok_client. The three call
+# sites whose enclosing function has no `session_id` param
+# (run_chat_grok_client / file_creator_grok_client / gpt_direct_rewrite_grok_client)
+# are deliberately left on the plain two-arg call.
+_SITES_WITH_SESSION_ID = {
+    "run_chat_stream_grok_client",
+    "multi_file_architect_grok_client",
+    "smart_pipeline_chat_grok_client",
+    "smart_architect_grok_client",
+    "lint_fix_grok_client",
+}
+
+
 @pytest.mark.parametrize("dlog_event,model_var", [
     ("run_chat_grok_client", "chat_model"),
     ("run_chat_stream_grok_client", "chat_model"),
@@ -370,11 +394,17 @@ def _grok_route_block(dlog_event: str) -> str:
 ])
 def test_round3_site_routes_grok_to_xai_client(dlog_event, model_var):
     """Every round-3 fixed call site must guard on `_is_grok_model(<var>)`,
-    build the client via `get_grok_client(user_id, dlog=_dlog)` for Grok, and
-    still fall back to the raw `_get_client(user_id)` for non-Grok models."""
+    build the client via `get_grok_client(user_id, dlog=_dlog[, session_id=session_id])`
+    for Grok, and still fall back to the raw `_get_client(user_id)` for
+    non-Grok models."""
     block = _grok_route_block(dlog_event)
     assert f"if _is_grok_model({model_var}):" in block
-    assert "get_grok_client(user_id, dlog=_dlog)" in block
+    expected_call = (
+        "get_grok_client(user_id, dlog=_dlog, session_id=session_id)"
+        if dlog_event in _SITES_WITH_SESSION_ID
+        else "get_grok_client(user_id, dlog=_dlog)"
+    )
+    assert expected_call in block
     assert "_get_client(user_id)" in block  # GPT path retained
 
 
@@ -410,7 +440,12 @@ def test_round3_site_grok_guard_precedes_get_grok_client(dlog_event):
     unconditional (which would break the GPT path)."""
     block = _grok_route_block(dlog_event)
     guard_idx = block.index("if _is_grok_model(")
-    grok_client_idx = block.index("get_grok_client(user_id, dlog=_dlog)")
+    expected_call = (
+        "get_grok_client(user_id, dlog=_dlog, session_id=session_id)"
+        if dlog_event in _SITES_WITH_SESSION_ID
+        else "get_grok_client(user_id, dlog=_dlog)"
+    )
+    grok_client_idx = block.index(expected_call)
     assert guard_idx < grok_client_idx
 
 
