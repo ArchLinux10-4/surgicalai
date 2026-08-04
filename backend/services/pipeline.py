@@ -946,6 +946,14 @@ from services.grok_retry import (  # noqa: E402
     grok_chat_create_with_billing_guard as _grok_chat_create_with_billing_guard,
     GrokBillingCapError as _GrokBillingCapError,
 )
+# Ask/Plan native tool-calling for Grok (new file, Grok-only). Fixes the same
+# "narrates instead of emitting tags" failure PR #116 fixed for Edit/Agent
+# mode, plus a Grok-only sandwich reinforcement against jumping to code in
+# Ask/Plan. Only reached from `if _is_grok_model(chat_model):` branches in
+# run_chat_stream; does not touch the Claude-native or GPT/Gemini tag loops.
+from services.grok_ask_plan_native import (  # noqa: E402
+    run_grok_ask_plan_native_stream as _grok_run_ask_plan_native_stream,
+)
 # Gap #3 (no circuit breaker for a Grok no-op tool-call loop) — new file,
 # Grok-only. Only reached from `if _is_grok_model(...)` branches.
 from services.grok_loop_guard import (  # noqa: E402
@@ -3832,9 +3840,17 @@ async def run_chat_stream(
     user_id: str = "",
     session_id: Optional[str] = None,
     session_files: Optional[list] = None,
+    mode: Optional[str] = None,
 ):
     """
     Streaming version of run_chat. Yields SSE chunks.
+
+    ``mode`` (optional, additive): "ask" or "plan" when this call originates
+    from the chat.py Ask/Plan branch; None for plain /api/chat/stream calls.
+    Purely a label — every existing caller that omits it keeps working
+    unchanged. Only consumed by the Grok-native Ask/Plan tool loop below (to
+    pick the right ASK/PLAN wording in its reinforcement text); Claude/GPT/
+    Gemini behavior does not depend on it at all.
     Used by the /api/chat/stream endpoint and by the Ask/Plan mode branch.
 
     `session_files` (optional): when provided, this enables the
@@ -3988,7 +4004,39 @@ async def run_chat_stream(
         def sse(obj):
             return f"data: {json.dumps(obj)}\n\n"
 
-        if _ask_plan_tools_enabled and not _is_claude_model(chat_model):
+        if _ask_plan_tools_enabled and _is_grok_model(chat_model):
+            # ── Grok native tool-calling loop (new file: grok_ask_plan_native.py) ──
+            # Same root cause PR #116 fixed for Edit/Agent mode: Grok narrates
+            # instead of emitting the <search_request>/<file_request>/
+            # <github_request> tags the GPT/Gemini branch below relies on, so
+            # it gets diverted here to the proven native tools=[...] path
+            # instead of falling into that shared tag loop. Does not touch the
+            # Claude-native branch above or the GPT/Gemini branch below.
+            _grok_ask_plan_effective_mode = (mode or "ask").strip().lower()
+            if _grok_ask_plan_effective_mode not in ("ask", "plan"):
+                _grok_ask_plan_effective_mode = "ask"
+            _dlog("run_chat_stream_grok_ask_plan_native", session_id=session_id,
+                  model=chat_model, user_id=user_id,
+                  mode=_grok_ask_plan_effective_mode)
+            _grok_client = _get_client_for_model(chat_model, user_id, session_id=session_id)
+            async for _gchunk in _grok_run_ask_plan_native_stream(
+                client=_grok_client,
+                chat_model=chat_model,
+                all_messages=all_messages,
+                mode=_grok_ask_plan_effective_mode,
+                gh_nat_enabled=_gh_nat_enabled,
+                gh_known_repos=_gh_known_repos,
+                symbol_maps_by_name=symbol_maps_by_name,
+                file_content_lookup=file_content_lookup,
+                execute_tool_round_fn=_ask_plan_execute_tool_round,
+                chat_create_fn=_chat_create,
+                iter_chunks_fn=_iter_openai_stream_chunks,
+                max_rounds=_ASK_PLAN_MAX_ROUNDS,
+                deadline_s=_ASK_PLAN_DEADLINE_S,
+                session_id=session_id, user_id=user_id, dlog=_dlog,
+            ):
+                yield _gchunk
+        elif _ask_plan_tools_enabled and not _is_claude_model(chat_model):
             # ── GPT / Gemini shared tool loop ──
             # Same <search_request>/<file_request>/<github_request> tag
             # protocol as the Claude branch below, routed through the one
