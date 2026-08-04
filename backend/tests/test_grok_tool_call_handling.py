@@ -473,7 +473,9 @@ def test_agent_mode_non_claude_branch_routes_grok_to_xai_client():
     idx = src.index("_agent_use_claude = _is_claude_model(architect_model)")
     block = src[idx:idx + 1600]
     assert "if _is_grok_model(architect_model):" in block
-    assert "get_grok_client(user_id, dlog=_dlog)" in block
+    # Additive session_id passthrough (grok-cache-header fix): session_id is
+    # in scope here (used in the adjacent _dlog call), so it is now forwarded.
+    assert "get_grok_client(user_id, dlog=_dlog, session_id=session_id)" in block
     assert 'agent_mode_grok_client' in block
     # GPT/other-model behaviour untouched.
     assert "_agent_oai_client = _get_client(user_id)" in block

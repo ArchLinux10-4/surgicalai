@@ -169,7 +169,7 @@ async def test_ask_plan_gpt_search_request_round_trip(monkeypatch):
     monkeypatch.setattr(pipeline, "_is_claude_model", lambda m: False)
     monkeypatch.setattr(pipeline, "_is_gemini_model", lambda m: False)
     monkeypatch.setattr(pipeline, "_should_use_ollama", lambda m: False)
-    monkeypatch.setattr(pipeline, "_get_client_for_model", lambda model, user_id="": object())
+    monkeypatch.setattr(pipeline, "_get_client_for_model", lambda model, user_id="", session_id="": object())
     monkeypatch.setattr(pipeline, "_chat_create", _fake_chat_create)
 
     events = await _collect(pipeline.run_chat_stream(

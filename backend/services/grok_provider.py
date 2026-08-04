@@ -170,13 +170,20 @@ def _get_grok_key(user_id: str = "", dlog=None) -> str:
     raise ValueError("xAI Grok API key not configured. Go to Settings → API Keys to add it.")
 
 
-def get_grok_client(user_id: str = "", dlog=None):
+def get_grok_client(user_id: str = "", dlog=None, session_id: str = ""):
     """Return an OpenAI-SDK client pointed at xAI's OpenAI-compatible endpoint.
 
     This is the function ``pipeline._get_client_for_model`` calls from its new
     ``elif _is_grok_model(model)`` branch. Importing ``OpenAI`` locally keeps
     this module import-safe (and mockable in tests) without touching
     pipeline.py's module-level ``from openai import OpenAI``.
+
+    Every request made through the returned client carries the
+    ``x-grok-conv-id`` prompt-cache-routing header (see ``prompt_cache_headers``
+    / docs.x.ai/developers/grok-4-5) via the OpenAI SDK's ``default_headers``
+    constructor kwarg, so callers do not need to pass ``extra_headers`` at
+    every individual ``.chat.completions.create(...)`` call site. Never
+    raises on header construction failure — falls back to no extra headers.
     """
     key = _get_grok_key(user_id, dlog=dlog)
     try:
@@ -185,8 +192,21 @@ def get_grok_client(user_id: str = "", dlog=None):
         _dlog("grok_client_openai_import_failed", dlog=dlog,
               user_id=user_id, error_type=type(e).__name__, error=str(e)[:300])
         raise
+
+    headers = {}
+    try:
+        headers = prompt_cache_headers(session_id, user_id, dlog=dlog)
+        _dlog("grok_client_created_with_cache_headers", dlog=dlog,
+              user_id=user_id, session_id=session_id or "<none>",
+              base_url=GROK_BASE_URL, headers=headers)
+    except Exception as e:
+        headers = {}
+        _dlog("grok_cache_headers_build_failed", dlog=dlog,
+              user_id=user_id, session_id=session_id or "<none>",
+              error_type=type(e).__name__, error=str(e)[:300])
+
     _dlog("grok_client_created", dlog=dlog, user_id=user_id, base_url=GROK_BASE_URL)
-    return OpenAI(api_key=key, base_url=GROK_BASE_URL)
+    return OpenAI(api_key=key, base_url=GROK_BASE_URL, default_headers=headers)
 
 
 # ── Gotcha 1: assistant tool_calls messages must carry a content element ─────

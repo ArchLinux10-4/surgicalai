@@ -899,6 +899,32 @@ def _is_gemini_model(model: str) -> bool:
 # gains no duplicated provider logic. Same call shape as the two matchers
 # above: _is_grok_model("grok-4.5") -> True.
 from services.grok_provider import _is_grok_model, get_grok_client, strip_unsupported_params  # noqa: E402
+
+
+def _iter_openai_stream_chunks(stream, model: str = "", session_id: str = "", user_id: str = ""):
+    """Yield only well-formed chunks from an OpenAI-SDK-shaped streaming
+    iterator, skipping any chunk with an empty ``choices`` array.
+
+    Real-world Grok-reachable streaming loops in this file used to do
+    ``chunk.choices[0]`` unconditionally. xAI's own streaming docs
+    (docs.x.ai/developers/model-capabilities/text/streaming) show a full
+    ``usage`` object on every SSE chunk, and OpenRouter's documented
+    error/debug streaming chunk format (openrouter.ai/docs/api_reference/
+    errors-and-debugging) shows real chunks with ``"choices": []`` (mid-stream
+    provider errors / debug-echo chunks). An empty ``choices`` array on an
+    unconditional ``chunk.choices[0]`` access raises an unhandled
+    ``IndexError`` and kills the whole response stream with no graceful
+    fallback. This generator is a pure pass-through no-op for every normal
+    chunk (GPT, Grok, or otherwise) that has a non-empty ``choices`` list —
+    it only ever skips the previously-crashing empty-choices case.
+    """
+    for chunk in stream:
+        if not chunk.choices:
+            _dlog("grok_stream_chunk_empty_choices", session_id=session_id,
+                  user_id=user_id, model=model,
+                  has_usage=bool(getattr(chunk, "usage", None)))
+            continue
+        yield chunk
 # Grok native tool-calling adapter (new file). Only reached from
 # `if _is_grok_model(...)` branches; nothing here touches Claude/GPT paths.
 from services.grok_agent_tools import (  # noqa: E402
@@ -1594,17 +1620,23 @@ def _get_gemini_key(user_id: str = "") -> str:
     raise ValueError("Google Gemini API key not configured. Go to Settings → API Keys to add it.")
 
 
-def _get_client_for_model(model: str, user_id: str = "") -> OpenAI:
+def _get_client_for_model(model: str, user_id: str = "", session_id: str = "") -> OpenAI:
     """Return an OpenAI-compatible client for the given model.
     Gemini models use Google's OpenAI-compat endpoint.
     Grok models use xAI's OpenAI-compat endpoint (https://api.x.ai/v1).
     All other models use the standard OpenAI endpoint.
+
+    ``session_id`` is optional and purely additive: when a Grok model is
+    routed, it is forwarded to ``get_grok_client`` so the returned client
+    carries a stable ``x-grok-conv-id`` prompt-cache header for this
+    conversation. Existing callers that omit it keep working unchanged
+    (falls back to a user_id-only cache key).
     """
     if _is_grok_model(model):
         # xAI's Chat Completions API is OpenAI-SDK-compatible, so this is the
         # same base_url-swap pattern already proven for Gemini below — purely
         # additive, the Gemini and OpenAI branches are unchanged.
-        return get_grok_client(user_id, dlog=_dlog)
+        return get_grok_client(user_id, dlog=_dlog, session_id=session_id)
     if _is_gemini_model(model):
         key = _get_gemini_key(user_id)
         return OpenAI(
@@ -3940,7 +3972,7 @@ async def run_chat_stream(
             # GPT and Gemini (_get_client_for_model). Buffered per round
             # (never streamed live) because a tag can split across
             # chunks and must never leak raw markup to the user.
-            _oai_client = _get_client_for_model(chat_model, user_id)
+            _oai_client = _get_client_for_model(chat_model, user_id, session_id=session_id)
             _oai_msgs = list(all_messages)
             _tool_round = 0
             while True:
@@ -3953,7 +3985,8 @@ async def run_chat_stream(
                     stream=True,
                 )
                 _round_text = ""
-                for _chunk in _oai_stream:
+                for _chunk in _iter_openai_stream_chunks(_oai_stream, model=chat_model,
+                                                          session_id=session_id, user_id=user_id):
                     _delta = _chunk.choices[0].delta
                     if _delta.content:
                         _round_text += _delta.content
@@ -4038,7 +4071,7 @@ async def run_chat_stream(
                 yield sse({"type": "thinking_end", "content": ""})
         elif _is_gemini_model(chat_model):
             # Fallback: Gemini via OpenAI-compat (no native thinking)
-            gclient_oai = _get_client_for_model(chat_model, user_id)
+            gclient_oai = _get_client_for_model(chat_model, user_id, session_id=session_id)
             stream = _chat_create(gclient_oai, model=chat_model, messages=all_messages,
                                   temperature=float(get_setting("temperature_architect", "0.0")), stream=True)
             for chunk in stream:
@@ -4190,7 +4223,7 @@ async def run_chat_stream(
             if _is_grok_model(chat_model):
                 _dlog("run_chat_stream_grok_client", session_id=session_id,
                       model=chat_model, user_id=user_id)
-                client = get_grok_client(user_id, dlog=_dlog)
+                client = get_grok_client(user_id, dlog=_dlog, session_id=session_id)
             else:
                 client = _get_client(user_id)
             stream = _chat_create(client,
@@ -4199,7 +4232,8 @@ async def run_chat_stream(
                 temperature=float(get_setting("temperature_architect", "0.0")),
                 stream=True
             )
-            for chunk in stream:
+            for chunk in _iter_openai_stream_chunks(stream, model=chat_model,
+                                                     session_id=session_id, user_id=user_id):
                 delta = chunk.choices[0].delta
                 if delta.content:
                     yield f"data: {json.dumps({'type': 'token', 'content': delta.content})}\n\n"
@@ -6400,7 +6434,7 @@ async def analyze_and_plan_stream(
             if _is_grok_model(architect_model):
                 _dlog("agent_mode_grok_client", session_id=session_id,
                       user_id=user_id, model=architect_model)
-                _agent_oai_client = get_grok_client(user_id, dlog=_dlog)
+                _agent_oai_client = get_grok_client(user_id, dlog=_dlog, session_id=session_id)
             else:
                 _agent_oai_client = _get_client(user_id)
             anthropic_key = None  # may not have one
@@ -7525,7 +7559,7 @@ def analyze_multi_file(file_paths: list, file_contents: dict, user_request: str,
     if _is_grok_model(arch_model):
         _dlog("multi_file_architect_grok_client", session_id=session_id,
               model=arch_model, user_id=user_id)
-        client = get_grok_client(user_id, dlog=_dlog)
+        client = get_grok_client(user_id, dlog=_dlog, session_id=session_id)
     else:
         client = _get_client(user_id)
 
@@ -10308,11 +10342,12 @@ Be warm, friendly, and encouraging. You're helping a person build something real
             if _is_grok_model(chat_model):
                 _dlog("smart_pipeline_chat_grok_client", session_id=session_id,
                       model=chat_model, user_id=user_id)
-                client = get_grok_client(user_id, dlog=_dlog)
+                client = get_grok_client(user_id, dlog=_dlog, session_id=session_id)
             else:
                 client = _get_client(user_id)
             stream = _chat_create(client, model=chat_model, messages=msgs, temperature=0.3, stream=True)
-            for chunk in stream:
+            for chunk in _iter_openai_stream_chunks(stream, model=chat_model,
+                                                     session_id=session_id, user_id=user_id):
                 delta = chunk.choices[0].delta
                 if delta.content:
                     yield sse({"type": "token", "content": delta.content})
@@ -11655,7 +11690,7 @@ USER REQUEST:
                 plan = json.loads(raw_gemini)
             else:
                 # Fallback: OpenAI-compat endpoint
-                gclient_oai = _get_client_for_model(arch_model, user_id)
+                gclient_oai = _get_client_for_model(arch_model, user_id, session_id=session_id)
                 arch_msgs_oai = [
                     {"role": "system", "content": _architect_system},
                     {"role": "user", "content": context_msg},
@@ -11701,7 +11736,7 @@ USER REQUEST:
             if _is_grok_model(arch_model):
                 _dlog("smart_architect_grok_client", session_id=session_id,
                       model=arch_model, user_id=user_id)
-                client = get_grok_client(user_id, dlog=_dlog)
+                client = get_grok_client(user_id, dlog=_dlog, session_id=session_id)
             else:
                 client = _get_client(user_id)
 
@@ -13128,7 +13163,7 @@ USER REQUEST:
                             if _is_grok_model(_lint_surg_model):
                                 _dlog("lint_fix_grok_client", session_id=session_id,
                                       model=_lint_surg_model, user_id=user_id)
-                                _lint_fix_oai_client = get_grok_client(user_id, dlog=_dlog)
+                                _lint_fix_oai_client = get_grok_client(user_id, dlog=_dlog, session_id=session_id)
                             else:
                                 _lint_fix_oai_client = _get_client(user_id)
                         _dlog("lint_fix_model_route", model=_lint_surg_model,
@@ -16409,7 +16444,7 @@ async def run_natural_pipeline_stream(
                 if _is_grok_model(arch_model):
                     _dlog("natural_pipeline_grok_client", session_id=session_id,
                           user_id=user_id, turn=_turn, model=arch_model)
-                    _gpt_client = get_grok_client(user_id, dlog=_dlog)
+                    _gpt_client = get_grok_client(user_id, dlog=_dlog, session_id=session_id)
                 else:
                     _gpt_client = _get_client(user_id)
                 _gpt_msgs = [{"role": "system", "content": _gpt_system_text}] + list(current_messages)
@@ -16442,7 +16477,8 @@ async def run_natural_pipeline_stream(
                             _gpt_client, model=arch_model,
                             **_gpt_call_kwargs,
                         )
-                        for _gpt_chunk in _gpt_stream:
+                        for _gpt_chunk in _iter_openai_stream_chunks(_gpt_stream, model=arch_model,
+                                                                      session_id=session_id, user_id=user_id):
                             _gpt_choice = _gpt_chunk.choices[0]
                             if _gpt_choice.finish_reason:
                                 _last_stop_reason = _gpt_choice.finish_reason
@@ -17611,7 +17647,7 @@ async def run_natural_pipeline_stream(
                                       session_id=session_id, user_id=user_id,
                                       filename=_retry_fname, symbol=_retry_sym)
                                 _redit_coro = retry_truncated_edit_grok(
-                                    _get_client_for_model(arch_model, user_id), "grok-4.5",
+                                    _get_client_for_model(arch_model, user_id, session_id=session_id), "grok-4.5",
                                     _retry_fname, _retry_sym, _retry_content,
                                     _retry_smap, user_request,
                                     _chat_create, _dlog,
@@ -17702,7 +17738,7 @@ async def run_natural_pipeline_stream(
                                   session_id=session_id, user_id=user_id,
                                   filename=_retry_fname)
                             _rnf_coro = retry_truncated_newfile_grok(
-                                _get_client_for_model(arch_model, user_id), "grok-4.5",
+                                _get_client_for_model(arch_model, user_id, session_id=session_id), "grok-4.5",
                                 _retry_fname, user_request,
                                 _chat_create, _dlog,
                                 get_setting=get_setting,
@@ -17936,7 +17972,7 @@ async def run_natural_pipeline_stream(
                               session_id=session_id, user_id=user_id,
                               filename=p_filename, symbol=p_symbol)
                         _edit_coro = execute_single_edit_grok(
-                            _get_client_for_model(arch_model, user_id), "grok-4.5",
+                            _get_client_for_model(arch_model, user_id, session_id=session_id), "grok-4.5",
                             p_filename, p_symbol, p_description,
                             p_content, p_smap, user_request,
                             _chat_create, _dlog,
@@ -19516,7 +19552,7 @@ async def run_natural_pipeline_stream(
                           wrapper="safe_grok_correction_call",
                           resolve_round=resolve_round)
                     _corr_coro = safe_grok_correction_call(
-                        _get_client_for_model(arch_model, user_id),
+                        _get_client_for_model(arch_model, user_id, session_id=session_id),
                         model=_corr_correction_model,
                         desired_text_tokens=12000,
                         system=system_prompt,
@@ -19718,7 +19754,7 @@ async def run_natural_pipeline_stream(
                                     _dlog("correction_followup_grok_fallback",
                                           session_id=session_id, user_id=user_id)
                                     _fu_coro = safe_grok_correction_call(
-                                        _get_client_for_model(arch_model, user_id),
+                                        _get_client_for_model(arch_model, user_id, session_id=session_id),
                                         model="grok-4.5",
                                         desired_text_tokens=12000,
                                         system=system_prompt,
@@ -19830,7 +19866,7 @@ async def run_natural_pipeline_stream(
                                             _dlog("correction_followup2_grok_fallback",
                                                   session_id=session_id, user_id=user_id)
                                             _fu2_coro = safe_grok_correction_call(
-                                                _get_client_for_model(arch_model, user_id),
+                                                _get_client_for_model(arch_model, user_id, session_id=session_id),
                                                 model="grok-4.5",
                                                 desired_text_tokens=12000,
                                                 system=system_prompt,
@@ -19966,7 +20002,7 @@ async def run_natural_pipeline_stream(
                                     _dlog("correction_followup0_grok_fallback",
                                           session_id=session_id, user_id=user_id)
                                     _fu0_coro = safe_grok_correction_call(
-                                        _get_client_for_model(arch_model, user_id),
+                                        _get_client_for_model(arch_model, user_id, session_id=session_id),
                                         model="grok-4.5",
                                         desired_text_tokens=12000,
                                         system=system_prompt,
@@ -21317,7 +21353,7 @@ async def run_natural_pipeline_stream(
                                               session_id=session_id, user_id=user_id,
                                               retry_round=_qa_retry_round, idx=idx)
                                         _fu_coro = safe_grok_correction_call(
-                                            _get_client_for_model(arch_model, user_id),
+                                            _get_client_for_model(arch_model, user_id, session_id=session_id),
                                             model="grok-4.5",
                                             desired_text_tokens=12000,
                                             system=system_prompt,
@@ -21533,7 +21569,7 @@ async def run_natural_pipeline_stream(
                                 _dlog("qa_retry_correction_react_grok_fallback",
                                       session_id=session_id, user_id=user_id)
                                 _fu_coro = safe_grok_correction_call(
-                                    _get_client_for_model(arch_model, user_id),
+                                    _get_client_for_model(arch_model, user_id, session_id=session_id),
                                     model="grok-4.5",
                                     desired_text_tokens=12000,
                                     system=system_prompt,
