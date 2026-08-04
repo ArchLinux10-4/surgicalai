@@ -1,0 +1,23 @@
+11 failed, 593 passed, 4 skipped, 5 errors in 162.78s (0:02:42)
+(2 pre-existing collection errors ignored: services/tests/test_pr72.py missing pipeline_pr72.py fixture,
+services/test_preview_bundle.py — both unrelated to backend/tests/ suite and pre-existing before this task)
+
+Failed:
+tests/test_chat_compaction_structural_fix.py::test_thresholds_raised
+tests/test_chat_compaction_structural_fix.py::test_per_message_truncation_uses_new_constant_not_hardcoded_500
+tests/test_chat_compaction_structural_fix.py::test_summary_is_appended_not_replaced
+tests/test_chat_compaction_structural_fix.py::test_prompt_does_not_ask_model_to_resummarize_existing
+tests/test_chat_compaction_structural_fix.py::test_meta_compaction_gate_present_and_rare
+tests/test_chat_compaction_structural_fix.py::test_meta_compaction_failure_keeps_appended_summary_not_lost
+tests/test_chat_compaction_structural_fix.py::test_claude_sonnet_5_preferred_over_gpt41mini
+tests/test_chat_compaction_structural_fix.py::test_meta_pass_also_uses_claude_sonnet_5
+tests/test_qa_symbol_granularity.py::test_natural_pipeline_qa_calls_are_symbol_level
+tests/test_qa_symbol_granularity.py::test_dead_intermediate_machinery_removed
+tests/test_value_const_indexing.py::test_small_scalars_are_skipped
+
+Errors:
+tests/test_element_picker_local_only.py::TestElementPickerServiceReal::test_connect_reports_connected
+tests/test_element_picker_local_only.py::TestElementPickerServiceReal::test_reconnect_same_url_is_noop
+tests/test_element_picker_local_only.py::TestElementPickerServiceReal::test_screenshot_returns_nonempty_jpeg_bytes
+tests/test_element_picker_local_only.py::TestElementPickerServiceReal::test_pick_returns_element_at_heading
+tests/test_element_picker_local_only.py::TestElementPickerServiceReal::test_disconnect_clears_state_but_chrome_survives

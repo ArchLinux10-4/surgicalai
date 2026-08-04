@@ -899,6 +899,10 @@ def _is_gemini_model(model: str) -> bool:
 # gains no duplicated provider logic. Same call shape as the two matchers
 # above: _is_grok_model("grok-4.5") -> True.
 from services.grok_provider import _is_grok_model, get_grok_client, strip_unsupported_params  # noqa: E402
+# Gap #2: pull in the already-built (previously orphaned) 429 classification
+# helpers so _friendly_error can surface the exact billing-cap copy. Additive
+# only — the import line above is untouched.
+from services.grok_provider import grok_429_user_message, GROK_429_BILLING  # noqa: E402
 
 
 def _iter_openai_stream_chunks(stream, model: str = "", session_id: str = "", user_id: str = ""):
@@ -934,6 +938,18 @@ from services.grok_agent_tools import (  # noqa: E402
     normalize_dispatch_pair as _grok_normalize_dispatch_pair,
     build_grok_system_suffix as _grok_build_system_suffix,
     build_grok_agent_instruction as _grok_build_agent_instruction,
+)
+# Gap #2 (billing-429 pointlessly retried) — new file, Grok-only, does NOT
+# touch api_retry.py or _chat_create's shared body. Only reached from
+# `if _is_grok_model(...)` branches; nothing here touches Claude/GPT paths.
+from services.grok_retry import (  # noqa: E402
+    grok_chat_create_with_billing_guard as _grok_chat_create_with_billing_guard,
+    GrokBillingCapError as _GrokBillingCapError,
+)
+# Gap #3 (no circuit breaker for a Grok no-op tool-call loop) — new file,
+# Grok-only. Only reached from `if _is_grok_model(...)` branches.
+from services.grok_loop_guard import (  # noqa: E402
+    check_repeated_calls as _grok_check_repeated_calls,
 )
 
 
@@ -1464,6 +1480,14 @@ def _friendly_error(e: Exception) -> str:
                     "code patterns (e.g. security- or scraping-related logic) even when the code "
                     "itself is legitimate. Try rephrasing your request or breaking the change into "
                     "a smaller step.")
+
+    # Grok (xAI)-specific errors — additive only, never touches any branch
+    # above. Reuses the classified-billing-429 marker exception raised by
+    # services/grok_retry.py's grok_chat_create_with_billing_guard (gap #2):
+    # a hard spend-cap 429 gets its own specific "add credits" copy instead
+    # of falling through to the generic fallback message below.
+    if isinstance(e, _GrokBillingCapError):
+        return grok_429_user_message(GROK_429_BILLING, dlog=None)
 
     # Gemini-specific errors
     if "google" in cls or "gemini" in low or "generativelanguage" in low:
@@ -16116,6 +16140,10 @@ async def run_natural_pipeline_stream(
 
         _grok_native_turn = None  # cross-turn: set after a Grok native tool turn,
                                   # consumed at the top of the next turn
+        _grok_loop_history: list = []  # cross-turn: no-op tool-call repeat
+                                  # signatures for the circuit breaker (gap #3)
+                                  # — NOT reset per-turn like _grok_blocked/
+                                  # _grok_tc_acc; persists across the whole loop.
         _turn = 0
         _consecutive_empty_turns = 0
         _consecutive_text_only_turns = 0
@@ -16473,10 +16501,21 @@ async def run_natural_pipeline_stream(
 
                 for _attempt in range(3):
                     try:
-                        _gpt_stream = _chat_create(
-                            _gpt_client, model=arch_model,
-                            **_gpt_call_kwargs,
-                        )
+                        # ── Gap #2: Grok billing-cap 429 must not be pointlessly
+                        #    retried by the shared api_call_with_retry path inside
+                        #    _chat_create — classify and raise immediately instead.
+                        #    GPT/Claude/Gemini keep calling _chat_create unchanged. ──
+                        if _is_grok_model(arch_model):
+                            _gpt_stream = _grok_chat_create_with_billing_guard(
+                                _gpt_client, model=arch_model,
+                                dlog=_dlog, session_id=session_id, user_id=user_id,
+                                **_gpt_call_kwargs,
+                            )
+                        else:
+                            _gpt_stream = _chat_create(
+                                _gpt_client, model=arch_model,
+                                **_gpt_call_kwargs,
+                            )
                         for _gpt_chunk in _iter_openai_stream_chunks(_gpt_stream, model=arch_model,
                                                                       session_id=session_id, user_id=user_id):
                             _gpt_choice = _gpt_chunk.choices[0]
@@ -16646,33 +16685,51 @@ async def run_natural_pipeline_stream(
             # ── Grok native tool-calls → existing producer variables ──────
             if _is_grok_model(arch_model) and _grok_tc_acc is not None and _grok_tc_acc.has_calls():
                 _grok_calls = _grok_tc_acc.finalize()
-                _grok_tr = _grok_translate_tool_calls(
-                    _grok_calls, dlog=_dlog, session_id=session_id, user_id=user_id)
-                if _grok_tr.edit_json_strings:
-                    edit_blocks_raw.extend(_grok_tr.edit_json_strings)
-                if _grok_tr.new_file_json_strings:
-                    new_file_blocks_raw.extend(_grok_tr.new_file_json_strings)
-                if _grok_tr.edit_plan is not None and edit_plan_data is None:
-                    edit_plan_data = _grok_tr.edit_plan
-                if _grok_tr.context_request is not None and pending_tool is None:
-                    _gk, _gb = _grok_tr.context_request
-                    pending_tool = _capture_request(_gk, _gb)
-                if _grok_tr.blocked_reason:
+
+                # ── Gap #3: circuit breaker for a repeated identical no-op
+                #    tool call. Reuses the existing report_blocked exit path
+                #    (_grok_blocked + <blocked>...</blocked>) instead of
+                #    inventing a new termination mechanism. Skips dispatch
+                #    entirely for this turn when tripped — that's the whole
+                #    point, we refuse to execute the Nth identical no-op call. ──
+                _grok_loop_reason = _grok_check_repeated_calls(
+                    _grok_loop_history, _grok_calls, dlog=_dlog,
+                    session_id=session_id, user_id=user_id)
+                if _grok_loop_reason:
                     _grok_blocked = True
-                    full_response += f"<blocked>{_grok_tr.blocked_reason}</blocked>"
-                _grok_native_turn = {
-                    "calls": _grok_calls,
-                    "results_by_id": _grok_tr.results_by_id,
-                    "context_call_id": _grok_tr.context_call_id,
-                    "assistant_text": full_response,
-                }
-                _dlog("natural_grok_tools_translated",
-                      session_id=session_id, user_id=user_id, turn=_turn,
-                      edits=len(_grok_tr.edit_json_strings),
-                      new_files=len(_grok_tr.new_file_json_strings),
-                      has_plan=_grok_tr.edit_plan is not None,
-                      has_context=_grok_tr.context_request is not None,
-                      blocked=_grok_blocked, errors=len(_grok_tr.errors))
+                    full_response += f"<blocked>{_grok_loop_reason}</blocked>"
+                    _dlog("grok_loop_guard_tripped",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          repeat_count=len(_grok_loop_history),
+                          tool_names=[c.get("name") for c in _grok_calls])
+                else:
+                    _grok_tr = _grok_translate_tool_calls(
+                        _grok_calls, dlog=_dlog, session_id=session_id, user_id=user_id)
+                    if _grok_tr.edit_json_strings:
+                        edit_blocks_raw.extend(_grok_tr.edit_json_strings)
+                    if _grok_tr.new_file_json_strings:
+                        new_file_blocks_raw.extend(_grok_tr.new_file_json_strings)
+                    if _grok_tr.edit_plan is not None and edit_plan_data is None:
+                        edit_plan_data = _grok_tr.edit_plan
+                    if _grok_tr.context_request is not None and pending_tool is None:
+                        _gk, _gb = _grok_tr.context_request
+                        pending_tool = _capture_request(_gk, _gb)
+                    if _grok_tr.blocked_reason:
+                        _grok_blocked = True
+                        full_response += f"<blocked>{_grok_tr.blocked_reason}</blocked>"
+                    _grok_native_turn = {
+                        "calls": _grok_calls,
+                        "results_by_id": _grok_tr.results_by_id,
+                        "context_call_id": _grok_tr.context_call_id,
+                        "assistant_text": full_response,
+                    }
+                    _dlog("natural_grok_tools_translated",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          edits=len(_grok_tr.edit_json_strings),
+                          new_files=len(_grok_tr.new_file_json_strings),
+                          has_plan=_grok_tr.edit_plan is not None,
+                          has_context=_grok_tr.context_request is not None,
+                          blocked=_grok_blocked, errors=len(_grok_tr.errors))
 
             _new_edits = (len(edit_blocks_raw) + len(new_file_blocks_raw)) - _edits_before
 
