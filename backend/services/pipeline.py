@@ -23093,6 +23093,44 @@ async def run_natural_pipeline_stream(
                                         file_content_lookup_stream)
                                     _mw_react_parts.append(
                                         f"Search results for {_mw_sr_terms}:\n{_mw_sr_result}")
+                                    # Gap B fix, multi-window path (same class of
+                                    # bug fixed for the single-window ReAct
+                                    # search at qa_retry_correction_search_scope_mismatch
+                                    # above): the correction model can request
+                                    # search terms belonging to a NEIGHBORING
+                                    # function instead of the blocked symbol
+                                    # (`_mw_sym`) itself, wasting the whole
+                                    # window's correction round on a wrong-symbol
+                                    # answer. Steer it back before that happens.
+                                    _mw_sr_sym_code = _mw_sym.code or ""
+                                    _mw_sr_terms_in_symbol = [
+                                        t for t in _mw_sr_terms
+                                        if isinstance(t, str) and t
+                                        and re.search(r'\b' + re.escape(t) + r'\b', _mw_sr_sym_code)
+                                    ]
+                                    _mw_sr_scope_mismatch = len(_mw_sr_terms_in_symbol) == 0
+                                    _dlog("correction_mw_search_scope_check",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=_mw_idx,
+                                          symbol=_mw_sym.name, window_idx=_mw_wi,
+                                          terms=_mw_sr_terms,
+                                          terms_found_in_target_symbol=_mw_sr_terms_in_symbol,
+                                          scope_mismatch=_mw_sr_scope_mismatch)
+                                    if _mw_sr_scope_mismatch:
+                                        _mw_react_parts.append(
+                                            f"\u26a0\ufe0f NONE of the search terms {_mw_sr_terms} appear "
+                                            f"anywhere in the symbol you are supposed to be fixing "
+                                            f"(`{_mw_sym.name}`). Those identifiers belong to a "
+                                            f"DIFFERENT function. Re-check the symbol you were asked "
+                                            f"to fix — its own code was already shown to you above — "
+                                            f"and base your correction on THAT code, not on the search "
+                                            f"results above."
+                                        )
+                                        _dlog("correction_mw_search_scope_mismatch",
+                                              session_id=session_id, user_id=user_id,
+                                              retry_round=_qa_retry_round, idx=_mw_idx,
+                                              symbol=_mw_sym.name, window_idx=_mw_wi,
+                                              terms=_mw_sr_terms)
                             if _mw_fr:
                                 for _mw_fr_fn in _parse_filereq_content(_mw_fr.group(1))[:3]:
                                     _mw_fr_content = file_content_lookup_stream.get(_mw_fr_fn, "")
@@ -23394,7 +23432,21 @@ async def run_natural_pipeline_stream(
                 )
                 if _mw_should_apply:
                     _mw_frag = _fragment_reason(_mw_sym.code, _mw_running_code)
-                    if _mw_frag is None:
+                    # Gap A fix, multi-window path (same class of bug fixed for
+                    # the single-window splice at _bracket_balance_reason's
+                    # call site above — proven live on the exact same
+                    # windowed-splice mechanism, just reached via the
+                    # multi-window branch instead. A multi-window symbol
+                    # accumulates several window splices into
+                    # `_mw_running_code`; without this check a
+                    # brace/paren-unbalanced result from any one window
+                    # ships straight to tsc unchecked, same as the
+                    # single-window gap this mirrors.
+                    _mw_brace = (
+                        _bracket_balance_reason(_mw_running_code)
+                        if _mw_frag is None else None
+                    )
+                    if _mw_frag is None and _mw_brace is None:
                         change_shells[_mw_idx]["new_code"] = _mw_running_code
                         _new_tgt, _new_repl = _compute_target_element(
                             _mw_sym.code, _mw_running_code
@@ -23420,6 +23472,8 @@ async def run_natural_pipeline_stream(
                               retry_round=_qa_retry_round, idx=_mw_idx,
                               symbol=_mw_sym.name,
                               fragment_reason=_mw_frag,
+                              is_brace_unbalanced=_mw_brace is not None,
+                              brace_balance_reason=_mw_brace,
                               running_len=len(_mw_running_code),
                               sym_len=len(_mw_sym.code))
                 else:
