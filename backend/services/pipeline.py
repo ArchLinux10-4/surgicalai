@@ -946,6 +946,19 @@ from services.grok_retry import (  # noqa: E402
     grok_chat_create_with_billing_guard as _grok_chat_create_with_billing_guard,
     GrokBillingCapError as _GrokBillingCapError,
 )
+# Gap D (OpenAI billing/quota-cap 429 pointlessly retried) — new file,
+# GPT-scoped, does NOT touch api_retry.py. Wired into _chat_create's shared
+# body only via a local name-shadow (see _chat_create below) so every one of
+# the ~24 _chat_create call sites is protected from a single choke point,
+# without duplicating retry logic at each call site. Grok/Gemini/Claude
+# behavior through _chat_create is unchanged (guard falls back to plain
+# api_call_with_retry for those models).
+from services.gpt_retry import (  # noqa: E402
+    api_call_with_billing_guard as _gpt_api_call_with_billing_guard,
+    GPTBillingCapError as _GPTBillingCapError,
+    gpt_429_user_message as _gpt_429_user_message,
+    GPT_429_BILLING as _GPT_429_BILLING,
+)
 # Ask/Plan native tool-calling for Grok (new file, Grok-only). Fixes the same
 # "narrates instead of emitting tags" failure PR #116 fixed for Edit/Agent
 # mode, plus a Grok-only sandwich reinforcement against jumping to code in
@@ -1505,6 +1518,18 @@ def _friendly_error(e: Exception) -> str:
     if isinstance(e, _GrokBillingCapError):
         return grok_429_user_message(GROK_429_BILLING, dlog=None)
 
+    # OpenAI (GPT)-specific billing/quota-cap errors — additive only, never
+    # touches any branch above or below. Reuses the classified-billing-429
+    # marker exception raised by services/gpt_retry.py's
+    # api_call_with_billing_guard (Gap D): a hard billing/quota/spend-limit
+    # 429 gets its own specific "add credits / raise the limit" copy instead
+    # of falling through to the generic "You've hit the OpenAI rate limit"
+    # message in the OpenAI branch below, which would be actively misleading
+    # for this case (retrying will never help).
+    if isinstance(e, _GPTBillingCapError):
+        _dlog("friendly_error_gpt_billing_cap", raw_error=str(e)[:300])
+        return _gpt_429_user_message(_GPT_429_BILLING, dlog=None)
+
     # Gemini-specific errors
     if "google" in cls or "gemini" in low or "generativelanguage" in low:
         if "api_key" in low or "invalid" in low or "401" in msg:
@@ -1553,8 +1578,28 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
     for reasoning models and injects reasoning_effort when configured.
     Also injects max_completion_tokens for reasoning models that require it.
     Retries automatically on transient API errors (429, 500, 503, overloaded)."""
-    from services.api_retry import api_call_with_retry
+    from services.api_retry import api_call_with_retry as _base_api_call_with_retry
     base_model = model.split(":")[0].lower()
+    # Gap D: _chat_create is the single shared choke point (~24 call sites:
+    # architect turns, corrections, QA, Surgeon, lint-fix, etc.) for every
+    # provider that uses the OpenAI SDK shape. Plain api_call_with_retry
+    # treats ANY 429 as transient and retries it — wrong for OpenAI billing/
+    # quota/spend-limit 429s, which can never succeed on retry (see
+    # services/gpt_retry.py docstring for the OpenAI-docs + community-report
+    # citations backing this). Scope the new guard to models that are NOT
+    # Grok/Gemini/Claude — Grok already has its own dedicated guard at its
+    # primary call site (services/grok_retry.py, Gap #2) and Claude never
+    # reaches this function (different SDK) — so this is additive-only and
+    # cannot regress existing Grok/Gemini/Claude behavior through here.
+    if _is_grok_model(model) or _is_gemini_model(model) or _is_claude_model(model):
+        api_call_with_retry = _base_api_call_with_retry
+        _dlog("chat_create_billing_guard_skipped_non_gpt", model=model)
+    else:
+        def api_call_with_retry(fn, max_retries=2, backoff=(1, 3)):
+            return _gpt_api_call_with_billing_guard(
+                fn, max_retries=max_retries, backoff=backoff,
+                dlog=_dlog, model=model)
+        _dlog("chat_create_billing_guard_active", model=model)
     # OpenAI deprecated max_tokens; newer models (GPT-4.1+, o-series, GPT-5.x)
     # require max_completion_tokens instead.  _chat_create is ONLY used with the
     # OpenAI SDK, so this conversion is always safe.
