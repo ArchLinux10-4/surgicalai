@@ -6055,6 +6055,124 @@ def _fragment_reason(symbol_code: str, new_code: str):
     )
 
 
+def _bracket_balance_reason(code: str) -> Optional[str]:
+    """
+    Cheap, deterministic brace/paren/bracket balance scan — string/comment
+    aware — used to catch a corrupted splice BEFORE it burns a whole tsc
+    round-trip + retry round finding out the hard way.
+
+    Proven gap (Gap A, session deb639d1): the windowed-correction splice path
+    (``correction_windowed_splice_attempt`` / ``_accepted``) only rejects a
+    splice when ``_fragment_reason`` calls it a degenerate fragment (much
+    shorter than the symbol AND missing the declaration line). A splice that
+    is a DIFFERENT size than the window it replaced (e.g. 109 lines swapped
+    in for an expected 47, or 12 lines swapped in for an expected 47) sails
+    right through that check — it's neither tiny-relative-to-the-WHOLE-symbol
+    nor missing the declaration — and can still leave braces/parens/try-catch
+    unbalanced. In the logged trace this happened on BOTH retry rounds of the
+    same symbol (``fetchMarketJSearch.js`` / ``route_post_api_market_reprocess_no_match``,
+    331 lines): round 0 spliced in 109 lines for a 47-line window
+    (``line_delta: 62``) and introduced ``TS1005``/``TS1472``; round 1 spliced
+    in 12 lines for the same window (``line_delta: -35``) and introduced
+    ``TS1005``/``TS1128`` — both rounds only discovered the corruption via the
+    LATER ``tsc_introduced_errors`` check, by which point the retry budget was
+    already spent on a doomed splice.
+
+    This scan is a proxy for that same class of failure, checked at splice
+    time instead of after a full tsc round-trip. It is intentionally simple
+    (bracket-depth + string/comment skipping) — it is not a parser and never
+    claims to be; it exists to reject an obviously-corrupted splice earlier and
+    for less cost than a full tsc invocation, not to replace tsc.
+
+    Returns a guidance string when unbalanced, else ``None``.
+    """
+    if not code:
+        return None
+
+    PAIRS = {")": "(", "]": "[", "}": "{"}
+    OPENERS = set(PAIRS.values())
+    CLOSERS = set(PAIRS.keys())
+
+    stack: list = []
+    i = 0
+    n = len(code)
+    in_line_comment = False
+    in_block_comment = False
+    str_char = None  # active string delimiter, or None
+
+    while i < n:
+        ch = code[i]
+        nxt = code[i + 1] if i + 1 < n else ""
+
+        if in_line_comment:
+            if ch == "\n":
+                in_line_comment = False
+            i += 1
+            continue
+
+        if in_block_comment:
+            if ch == "*" and nxt == "/":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+
+        if str_char is not None:
+            if ch == "\\":
+                i += 2  # skip escaped char
+                continue
+            if ch == str_char:
+                str_char = None
+            i += 1
+            continue
+
+        # Not inside a string/comment — decide what to enter/act on.
+        if ch == "/" and nxt == "/":
+            in_line_comment = True
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "#":
+            in_line_comment = True  # Python/shell-style line comment
+            i += 1
+            continue
+        if ch in ("'", '"', "`"):
+            str_char = ch
+            i += 1
+            continue
+        if ch in OPENERS:
+            stack.append(ch)
+            i += 1
+            continue
+        if ch in CLOSERS:
+            expected = PAIRS[ch]
+            if not stack:
+                return (
+                    f"unmatched closing '{ch}' with no open bracket on the stack — "
+                    f"the spliced result is structurally unbalanced."
+                )
+            top = stack.pop()
+            if top != expected:
+                return (
+                    f"mismatched bracket: found closing '{ch}' but the innermost open "
+                    f"bracket was '{top}' — the spliced result is structurally unbalanced."
+                )
+            i += 1
+            continue
+        i += 1
+
+    if stack:
+        return (
+            f"{len(stack)} unclosed bracket(s) at end of spliced result "
+            f"({''.join(stack)}) — the spliced result is structurally unbalanced."
+        )
+    return None
+
+
 def compose_symbol_edits(orig_full: str, edits: list, apply_fn):
     """
     Apply a list of symbol edits SEQUENTIALLY onto one file's original content.
@@ -20881,6 +20999,16 @@ async def run_natural_pipeline_stream(
         # ── Correction history: track what each idx tried + why it was rejected ──
         # Key = change index, value = list of {round, code_preview, qa_summary}
         _correction_history: dict[int, list[dict]] = {}
+        # ── Gap A fix (session deb639d1): windowed-correction context widening ──
+        # When a windowed splice is rejected for a brace/paren balance failure
+        # (see ``_bracket_balance_reason``), the SAME fixed-size window handed
+        # to the model next round is very likely to fail the same way again —
+        # that is exactly what happened twice in the logged trace (a 47-line
+        # window, rejected round 0, re-sent unchanged, rejected round 1 too).
+        # Track a per-idx context widening so the NEXT round's window request
+        # (see ``_find_changed_windows`` call below) gives the model more
+        # surrounding code instead of repeating the same losing window size.
+        _window_widen_hint: dict[int, int] = {}
 
         for _qa_retry_round in range(MAX_QA_RETRIES):
             # ── Pipeline deadline gate ─────────────────────────────────────
@@ -21027,6 +21155,7 @@ async def run_natural_pipeline_stream(
                     _dlog("qa_retry_checkpoint_emitted",
                           session_id=session_id, user_id=user_id,
                           retry_round=_qa_retry_round,
+                          phase="round_start",
                           safe_count=len(_safe_indices),
                           blocked_count=len(blocked_indices),
                           payload_bytes=len(json.dumps(_qa_ckpt_payload)))
@@ -21036,6 +21165,7 @@ async def run_natural_pipeline_stream(
                     _dlog("qa_retry_checkpoint_error",
                           session_id=session_id, user_id=user_id,
                           retry_round=_qa_retry_round,
+                          phase="round_start",
                           error=str(_qa_ckpt_err)[:200])
 
             yield sse({"type": "progress",
@@ -21151,7 +21281,19 @@ async def run_natural_pipeline_stream(
                     #   2. Show only that region ± 20 lines of context
                     #   3. Model returns corrected window (standard format)
                     #   4. Server splices window back (deterministic, no matching)
-                    _all_windows = _find_changed_windows(symbol.code, cs["new_code"])
+                    # Gap A fix: widen context on a prior brace-balance rejection
+                    # instead of re-sending the exact window that already failed.
+                    _ctx_lines_for_window = _window_widen_hint.get(idx, 20)
+                    _all_windows = _find_changed_windows(
+                        symbol.code, cs["new_code"], context_lines=_ctx_lines_for_window
+                    )
+                    if idx in _window_widen_hint:
+                        _dlog("correction_windowed_context_widened",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=idx,
+                              symbol=symbol.name,
+                              context_lines=_ctx_lines_for_window,
+                              reason="prior_round_brace_balance_rejection")
 
                     # ── Fix 2: Augment with QA-referenced locations ───────
                     # When QA identifies issues at locations NOT covered by
@@ -21689,13 +21831,57 @@ async def run_natural_pipeline_stream(
                                 _react_parts.append(
                                     f"Search results for {_sr_terms}:\n{_sr_result}"
                                 )
+                                # Gap B fix (session deb639d1): the correction
+                                # model can issue a <search_request> for terms
+                                # that all belong to a NEIGHBORING function
+                                # rather than the blocked symbol itself — proven
+                                # in the logged trace, where a search for
+                                # ["spawnEngine", "NO_MATCH_RAW_PATH",
+                                # "ENGINE_SCRIPT_PATH"] (all identifiers of the
+                                # sibling function `spawnEngine`) was used to
+                                # "fix" `route_post_api_market_auto_match_start`,
+                                # and the resulting new_code never mentioned the
+                                # target symbol at all — correctly caught by
+                                # `qa_retry_correction_fragment_rejected` downstream,
+                                # but only AFTER a full round was spent producing
+                                # a wrong-symbol answer. Catch the scope mismatch
+                                # here, before that round is wasted, by steering
+                                # the model back to the symbol it's actually
+                                # supposed to be fixing.
+                                _sr_sym_code = change_shells[idx]["symbol"].code or ""
+                                _sr_terms_in_symbol = [
+                                    t for t in _sr_terms
+                                    if isinstance(t, str) and t
+                                    and re.search(r'\b' + re.escape(t) + r'\b', _sr_sym_code)
+                                ]
+                                _sr_scope_mismatch = len(_sr_terms_in_symbol) == 0
                                 _dlog("qa_retry_correction_search_executed",
                                       session_id=session_id, user_id=user_id,
                                       retry_round=_qa_retry_round, idx=idx,
                                       react_round=_corr_react_round,
                                       symbol=change_shells[idx]["symbol"].name,
                                       terms=_sr_terms,
-                                      result_chars=len(_sr_result))
+                                      result_chars=len(_sr_result),
+                                      terms_found_in_target_symbol=_sr_terms_in_symbol,
+                                      scope_mismatch=_sr_scope_mismatch)
+                                if _sr_scope_mismatch:
+                                    _react_parts.append(
+                                        f"\u26a0\ufe0f NONE of the search terms {_sr_terms} appear "
+                                        f"anywhere in the symbol you are supposed to be fixing "
+                                        f"(`{change_shells[idx]['symbol'].name}`). Those identifiers "
+                                        f"belong to a DIFFERENT function. Re-check the symbol you were "
+                                        f"asked to fix — its own code was already shown to you above — "
+                                        f"and base your correction on THAT code, not on the search "
+                                        f"results above."
+                                    )
+                                    _dlog("qa_retry_correction_search_scope_mismatch",
+                                          session_id=session_id, user_id=user_id,
+                                          retry_round=_qa_retry_round, idx=idx,
+                                          react_round=_corr_react_round,
+                                          symbol=change_shells[idx]["symbol"].name,
+                                          terms=_sr_terms,
+                                          note="all search terms belong to a different function than "
+                                               "the target symbol — appended corrective reminder")
 
                         if _fr_match:
                             _fr_names = _parse_filereq_content(_fr_match.group(1))
@@ -22094,6 +22280,14 @@ async def run_natural_pipeline_stream(
                                 _result_lines[_ws_0 : _we_0 + 1] = _corrected_lines
                                 _spliced = "\n".join(_result_lines)
                                 _frag_w = _fragment_reason(_sym_code, _spliced)
+                                # Gap A fix: reject a structurally-corrupted splice
+                                # (unbalanced braces/parens/brackets) BEFORE it ships
+                                # to tsc — see _bracket_balance_reason docstring for
+                                # the exact logged failure this closes.
+                                _brace_w = (
+                                    _bracket_balance_reason(_spliced)
+                                    if _frag_w is None else None
+                                )
 
                                 _dlog("correction_windowed_splice_attempt",
                                       session_id=session_id, user_id=user_id,
@@ -22110,9 +22304,11 @@ async def run_natural_pipeline_stream(
                                       spliced_len=len(_spliced),
                                       sym_code_len=len(_sym_code),
                                       is_fragment=_frag_w is not None,
-                                      fragment_reason=_frag_w)
+                                      fragment_reason=_frag_w,
+                                      is_brace_unbalanced=_brace_w is not None,
+                                      brace_balance_reason=_brace_w)
 
-                                if _frag_w is None:
+                                if _frag_w is None and _brace_w is None:
                                     accepted = _spliced
                                     _dlog("correction_windowed_splice_accepted",
                                           session_id=session_id, user_id=user_id,
@@ -22121,14 +22317,36 @@ async def run_natural_pipeline_stream(
                                           original_lines=len(_sym_code.splitlines()),
                                           result_lines=len(_spliced.splitlines()),
                                           line_delta=_line_delta)
+                                    # A previously-widened window that finally
+                                    # produced a balanced splice — clear the hint
+                                    # so a future correction round starts fresh.
+                                    _window_widen_hint.pop(idx, None)
                                 else:
                                     _dlog("correction_windowed_splice_rejected",
                                           session_id=session_id, user_id=user_id,
                                           retry_round=_qa_retry_round, idx=idx,
                                           symbol=change_shells[idx]["symbol"].name,
                                           fragment_reason=_frag_w,
+                                          brace_balance_reason=_brace_w,
                                           spliced_len=len(_spliced),
                                           sym_code_len=len(_sym_code))
+                                    if _brace_w is not None:
+                                        # Gap A fix: widen the window for the NEXT
+                                        # correction round instead of re-sending the
+                                        # same fixed-size window that just produced
+                                        # a structurally broken splice — proven to
+                                        # repeat verbatim in the logged trace
+                                        # (round 0 AND round 1 both failed the same
+                                        # way on the same 47-line window).
+                                        _prev_widen = _window_widen_hint.get(idx, 20)
+                                        _window_widen_hint[idx] = min(_prev_widen + 40, 200)
+                                        _dlog("correction_windowed_widen_scheduled",
+                                              session_id=session_id, user_id=user_id,
+                                              retry_round=_qa_retry_round, idx=idx,
+                                              symbol=change_shells[idx]["symbol"].name,
+                                              prev_context_lines=_prev_widen,
+                                              next_context_lines=_window_widen_hint[idx],
+                                              reason=_brace_w)
                         elif _winfo and not corrected_code:
                             # Windowed correction was set up but model returned
                             # no new_code — log so we can diagnose.
@@ -23403,6 +23621,65 @@ async def run_natural_pipeline_stream(
                                               f"(attempt {_qa_retry_round + 1}/{MAX_QA_RETRIES})."})
                 else:
                     _tsc_round_best[_rfname] = _new_count
+
+            # ── Gap C fix (session deb639d1): end-of-round disconnect checkpoint ──
+            # The existing checkpoint above only fires at the START of each
+            # retry round, built from blocked_indices as they stood BEFORE this
+            # round's corrections ran. Proven gap: a 6-symbol turn had one
+            # symbol (`AutoMatchModal`) fixed AND re-QA'd safe (score 9) during
+            # round 0, but round 1 started immediately after (`qa_retry_loop_start`
+            # at 05:11:50.78) and the SSE stream disconnected 2.36s later
+            # (`sse_stream_disconnect`, total_duration_s=530.3) — before chat.py's
+            # safety net ever received a checkpoint reflecting the round-0 fix.
+            # It fell back to the STALE round-0-start checkpoint and recovered
+            # only the 3 symbols that were safe before round 0 even began,
+            # silently dropping the newly-approved fix along with the still-
+            # blocked ones. Emitting a checkpoint again HERE — right after this
+            # round's corrections are re-QA'd and regression-checked, using the
+            # freshest qa_results — means a disconnect at ANY point afterward
+            # (including seconds into the next round) still finds an up-to-date
+            # checkpoint already delivered, not one frozen at round-start.
+            _post_round_blocked = []
+            for _pbi, _pbqd in enumerate(qa_results):
+                _pbv = _pbqd.get("verdict", "safe")
+                _pbs = _pbqd.get("qa_score") or 10
+                if _pbv == "blocked" or _pbs <= 7:
+                    _post_round_blocked.append(_pbi)
+            _post_round_safe = [
+                _psi for _psi in range(len(change_shells)) if _psi not in _post_round_blocked
+            ]
+            if _post_round_safe:
+                try:
+                    _qa_post_ckpt_payload = {
+                        "retry_round": _qa_retry_round,
+                        "blocked_count": len(_post_round_blocked),
+                        "resolved": [
+                            {
+                                "filename": change_shells[_psi]["filename"],
+                                "symbol": getattr(
+                                    change_shells[_psi]["symbol"], "name", "?"
+                                ),
+                                "description": change_shells[_psi].get("description", ""),
+                                "new_code": change_shells[_psi].get("new_code", ""),
+                            }
+                            for _psi in _post_round_safe
+                        ],
+                    }
+                    _dlog("qa_retry_checkpoint_emitted",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round,
+                          phase="round_end",
+                          safe_count=len(_post_round_safe),
+                          blocked_count=len(_post_round_blocked),
+                          payload_bytes=len(json.dumps(_qa_post_ckpt_payload)))
+                    yield sse({"type": "checkpoint",
+                               "content": json.dumps(_qa_post_ckpt_payload)})
+                except Exception as _qa_post_ckpt_err:
+                    _dlog("qa_retry_checkpoint_error",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round,
+                          phase="round_end",
+                          error=str(_qa_post_ckpt_err)[:200])
 
         # ── tsc compile check — final verification after all retries ──────────
         # Re-run tsc on the FINAL content of every change. Anything that still
