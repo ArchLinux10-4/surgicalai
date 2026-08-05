@@ -959,6 +959,14 @@ from services.grok_ask_plan_native import (  # noqa: E402
 from services.grok_loop_guard import (  # noqa: E402
     check_repeated_calls as _grok_check_repeated_calls,
 )
+# Claude-only web research (Ask/Plan mode) — new file, additive. Only
+# reached from the `elif _is_claude_model(...)` branch below, and only
+# when the user has the setting on. Untouched by GPT/Grok/Gemini paths and
+# by the already-working Claude Edit/Agent surgical pipeline.
+from services.claude_web_search import (  # noqa: E402
+    build_web_search_tool as _build_claude_web_search_tool,
+    ClaudeWebSearchStreamTracker as _ClaudeWebSearchStreamTracker,
+)
 
 
 # Models confirmed to support extended thinking (budget_tokens).
@@ -3876,6 +3884,11 @@ async def run_chat_stream(
     """
     chat_model = model or get_setting("architect_model", _DEFAULT_ARCH_MODEL)
     _model_used = chat_model
+    # Claude-only web research sources for this turn (empty for every other
+    # provider/path — see the `_is_claude_model` branch below). Surfaced on
+    # the final `done` event so chat.py can persist a Sources list next to
+    # the message, the same way it already persists the `model` tag.
+    _web_search_sources_final: list = []
     _ask_plan_has_files = bool(session_files)
     _ask_plan_is_ollama = _should_use_ollama(chat_model)
 
@@ -4198,6 +4211,25 @@ async def run_chat_stream(
             _sys_text = next((m["content"] for m in all_messages if m["role"] == "system"), "")
             _claude_msgs = [m for m in all_messages if m["role"] != "system"]
 
+            # ── Claude-only web research (Ask/Plan mode) ──────────────────
+            # New, additive, opt-in via the `web_search_enabled` setting.
+            # Anthropic's web_search tool is server-executed: Claude decides
+            # when to search, Anthropic runs it, and results/citations stream
+            # back as ordinary content blocks in this same `messages.stream()`
+            # call — no extra round trip needed from us. See
+            # services/claude_web_search.py for the full rationale.
+            _web_search_enabled = (
+                mode in ("ask", "plan")
+                and get_setting("web_search_enabled", "false").lower() == "true"
+            )
+            _ws_tracker = (
+                _ClaudeWebSearchStreamTracker(session_id=session_id, user_id=user_id)
+                if _web_search_enabled else None
+            )
+            if _web_search_enabled:
+                _dlog("claude_web_search_enabled_for_turn", session_id=session_id,
+                      user_id=user_id, model=chat_model, mode=mode)
+
             _tool_round = 0
             while True:
                 _claude_kwargs = {
@@ -4208,13 +4240,19 @@ async def run_chat_stream(
                 }
                 _claude_kwargs.update(_get_thinking_kwargs(chat_model, 8000))
                 _claude_kwargs.update(_get_effort_kwargs(chat_model))
+                if _web_search_enabled:
+                    _claude_kwargs["tools"] = [_build_claude_web_search_tool()]
                 _dlog("run_chat_stream_claude", model=chat_model, user_id=user_id,
                       session_id=session_id, tool_round=_tool_round,
-                      tools_enabled=_ask_plan_tools_enabled)
+                      tools_enabled=_ask_plan_tools_enabled,
+                      web_search_enabled=_web_search_enabled)
                 in_thinking = False
                 _round_text = ""
                 async with aclient.messages.stream(**_claude_kwargs) as _cstream:
                     async for event in _cstream:
+                        if _ws_tracker is not None:
+                            for _ws_sse_event in _ws_tracker.on_event(event):
+                                yield sse(_ws_sse_event)
                         event_type = getattr(event, "type", None)
                         if event_type == "content_block_start":
                             block = getattr(event, "content_block", None)
@@ -4239,6 +4277,9 @@ async def run_chat_stream(
                                 in_thinking = False
                 if in_thinking:
                     yield sse({"type": "thinking_end", "content": ""})
+
+                if _ws_tracker is not None:
+                    _web_search_sources_final = _ws_tracker.get_sources()
 
                 if not _ask_plan_tools_enabled:
                     break  # legacy path already streamed live above — done.
@@ -4315,7 +4356,15 @@ async def run_chat_stream(
               error=str(e)[:300], user_id=user_id, session_id=session_id)
         yield sse({"type": "error", "content": _friendly_error(e)})
 
-    yield f"data: {json.dumps({'type': 'done', 'content': '', 'model': _model_used})}\n\n"
+    _done_payload = {"type": "done", "content": "", "model": _model_used}
+    if _web_search_sources_final:
+        # Claude-only (Ask/Plan mode with the setting on) — empty list for
+        # every other provider/path, so this key is simply absent-in-effect
+        # elsewhere. See services/claude_web_search.py.
+        _done_payload["web_search_sources"] = _web_search_sources_final
+        _dlog("claude_web_search_done", session_id=session_id, user_id=user_id,
+              source_count=len(_web_search_sources_final))
+    yield f"data: {json.dumps(_done_payload)}\n\n"
 
 
 
@@ -15487,9 +15536,25 @@ async def run_natural_pipeline_stream(
     user_id: str = "",
     client_inbox=None,
     is_agent_task: bool = False,
+    web_search_enabled: bool = False,
 ):
     """
     Natural conversation pipeline — Claude talks like Claude.
+
+    web_search_enabled : per-request, per-session opt-in for Claude's native
+        web-search tool during Edit/Agent-mode turns (Ask/Plan mode has its
+        own separate, global `web_search_enabled` Settings toggle — see
+        run_chat_stream). This one is a one-shot "research before editing"
+        checkbox: routers/chat.py's /smart-stream reads it fresh off each
+        request body and stores it per-session (services/claude_web_search.py
+        has the full rationale), so it defaults False and never changes
+        behaviour unless the user explicitly checks the box for a message.
+        Threaded into services/task_runner.py and the /execute-task branch
+        of chat.py too, so tasks spawned from a "research-enabled" message
+        keep the capability across the whole task run. No-op on non-Claude
+        architect models (_natural_use_claude gates it below) and adds
+        nothing to the request unless True — byte-identical behaviour
+        otherwise.
 
     is_agent_task : True only when this call is one task of a Claude Agent
         Mode run (task_runner.py's server-side runner, or chat.py's
@@ -15679,6 +15744,42 @@ async def run_natural_pipeline_stream(
         arch_model = _user_arch_model
         _model_used = arch_model
         _natural_use_claude = _is_claude_model(arch_model)
+
+        # ── Claude-only web research (Edit/Agent mode, per-request opt-in) ──
+        # New, additive. See the `web_search_enabled` docstring above and
+        # services/claude_web_search.py for the full rationale. Mirrors the
+        # Ask/Plan wiring in run_chat_stream exactly (same tool, same tracker
+        # class), just gated on the per-request flag instead of the global
+        # Settings toggle, and injected into the Edit/Agent turn loop below
+        # instead of the single-shot Ask/Plan loop.
+        _natural_web_search_enabled = web_search_enabled and _natural_use_claude
+        _natural_ws_tracker = None
+        _natural_ws_sources: list = []
+        if _natural_web_search_enabled:
+            from services.claude_web_search import (
+                build_web_search_tool as _build_natural_web_search_tool,
+                ClaudeWebSearchStreamTracker as _NaturalClaudeWebSearchStreamTracker,
+            )
+            _natural_ws_tracker = _NaturalClaudeWebSearchStreamTracker(
+                session_id=session_id, user_id=user_id)
+        _dlog("natural_pipeline_web_search_gate",
+              session_id=session_id, user_id=user_id,
+              requested=web_search_enabled, is_claude=_natural_use_claude,
+              enabled=_natural_web_search_enabled, is_agent_task=is_agent_task)
+
+        def _natural_done_payload(_dp_model_used):
+            """Shared `done` payload builder for every exit point below — the
+            single-shot Edit path and all Agent-mode loop exits alike. Keeps
+            the web_search_sources merge in exactly one place instead of
+            duplicated at each of the 4 `done` yield sites."""
+            _dp = {"type": "done", "content": "", "model": _dp_model_used}
+            if _natural_ws_sources:
+                _dp["web_search_sources"] = _natural_ws_sources
+                _dlog("natural_pipeline_web_search_done",
+                      session_id=session_id, user_id=user_id,
+                      source_count=len(_natural_ws_sources))
+            return _dp
+
         if _natural_use_claude:
             anthropic_key = _get_anthropic_key(user_id)
             aclient = AsyncAnthropic(api_key=anthropic_key)
@@ -16266,6 +16367,11 @@ async def run_natural_pipeline_stream(
                 stream_kwargs.update(_get_effort_kwargs(arch_model))
                 if _agent_stop_seqs:
                     stream_kwargs["stop_sequences"] = _agent_stop_seqs
+                if _natural_web_search_enabled:
+                    stream_kwargs["tools"] = [_build_natural_web_search_tool()]
+                _dlog("agent_turn_web_search",
+                      session_id=session_id, user_id=user_id, turn=_turn,
+                      enabled=_natural_web_search_enabled)
 
                 for _attempt in range(3):
                     try:
@@ -16273,6 +16379,10 @@ async def run_natural_pipeline_stream(
                             current_block_type = None
                             async for event in astream:
                                 etype = getattr(event, "type", None)
+
+                                if _natural_ws_tracker is not None:
+                                    for _natural_ws_sse_event in _natural_ws_tracker.on_event(event):
+                                        yield sse(_natural_ws_sse_event)
 
                                 if etype == "content_block_start":
                                     current_block_type = getattr(
@@ -16459,6 +16569,12 @@ async def run_natural_pipeline_stream(
                                     break
                                 if pending_tool is not None or edit_plan_data is not None:
                                     break
+
+                        if _natural_ws_tracker is not None:
+                            _natural_ws_sources = _natural_ws_tracker.get_sources()
+                            _dlog("agent_turn_web_search_sources",
+                                  session_id=session_id, user_id=user_id, turn=_turn,
+                                  source_count=len(_natural_ws_sources))
 
                         # Capture stop_reason
                         try:
@@ -17671,7 +17787,7 @@ async def run_natural_pipeline_stream(
                                "available. Attaching the specific file(s) involved — or "
                                "naming the exact symbol I should focus on — will let me "
                                "complete it on the next run."})
-            yield sse({"type": "done", "content": "", "model": _model_used})
+            yield sse(_natural_done_payload(_model_used))
             return
 
         _dlog("phase2_complete",
@@ -18292,7 +18408,7 @@ async def run_natural_pipeline_stream(
                       was_starvation_recovery=bool(_streaming_starvation_abort))
                 if _noedit_msg:
                     yield sse({"type": "token", "content": _noedit_msg})
-            yield sse({"type": "done", "content": "", "model": _model_used})
+            yield sse(_natural_done_payload(_model_used))
             return
 
         _resolution_t0 = time.time()
@@ -23683,7 +23799,7 @@ async def run_natural_pipeline_stream(
                     "natural_text": _msg,
                 }
                 yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(_fail_result)})
-            yield sse({"type": "done", "content": "", "model": _model_used})
+            yield sse(_natural_done_payload(_model_used))
             return
 
         # Determine intent: create if any new files, edit otherwise, mixed if both
@@ -23723,7 +23839,7 @@ async def run_natural_pipeline_stream(
         _dlog("pipeline_complete",
               session_id=session_id, user_id=user_id,
               pipeline_total_s=round(time.time() - _pipeline_t0, 1))
-        yield sse({"type": "done", "content": "", "model": _model_used})
+        yield sse(_natural_done_payload(_model_used))
 
     except Exception as e:
         import traceback as _tb

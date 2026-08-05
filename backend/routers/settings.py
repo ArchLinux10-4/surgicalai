@@ -63,6 +63,7 @@ def get_settings(request: Request):
         ollama_enabled=s.get("ollama_enabled", "false").lower() == "true",
         ollama_base_url=s.get("ollama_base_url", "http://localhost:11434"),
         ollama_model=s.get("ollama_model", "qwen2.5-coder:7b"),
+        web_search_enabled=s.get("web_search_enabled", "false").lower() == "true",
         is_hosted=USE_POSTGRES,
     )
 

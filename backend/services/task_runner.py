@@ -249,6 +249,17 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
         think_parts: list = []  # accumulated extended-thinking text for this task
         last_progress_write = 0.0
         last_thinking_write = 0.0
+        # v1.7 research checkbox — mirrors routers/chat.py's execute_task
+        # branch exactly: the flag lives per-session (set by smart_stream when
+        # the user checked the box), not per-task, and is read fresh on every
+        # task so a mid-run toggle-off takes effect on the next task.
+        from database import get_setting as _rt_get_setting
+        _runner_web_search_enabled = (
+            _rt_get_setting(f"web_search_research_session_{session_id}", "false") == "true"
+        )
+        _dlog("runner_task_web_research_flag", session_id=session_id,
+              task_id=task_id, web_search_enabled=_runner_web_search_enabled)
+        _runner_ws_sources: list = []  # v1.7 research checkbox — this task's web-search sources, if any
         try:
             async for chunk in run_natural_pipeline_stream(
                 session_files=session_files,
@@ -259,6 +270,7 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
                 session_summary=session_summary,
                 user_id=user_id,
                 is_agent_task=True,
+                web_search_enabled=_runner_web_search_enabled,
             ):
                 poll += 1
                 if poll % 20 == 0 and cancel_requested_for_run(session_id, run_id):
@@ -297,6 +309,10 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
                             except Exception as pwx:
                                 _dlog("runner_progress_write_error", task_id=task_id,
                                       error=str(pwx)[:120])
+                    elif ct == "done" and d.get("web_search_sources"):
+                        _runner_ws_sources = d.get("web_search_sources")
+                        _dlog("runner_task_web_search_captured", session_id=session_id,
+                              task_id=task_id, source_count=len(_runner_ws_sources))
                 except Exception:
                     pass
         except Exception as ee:
@@ -327,7 +343,8 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
                 parsed = None
         score, worst = _eval_task_result(parsed) if parsed else (None, "safe")
         try:
-            _save_task_message(session_id, natural_text, parsed)
+            _save_task_message(session_id, natural_text, parsed,
+                                web_search_sources=_runner_ws_sources)
         except Exception as smx:
             _dlog("runner_save_message_error", session_id=session_id,
                   task_id=task_id, error=str(smx)[:200])

@@ -21,6 +21,9 @@ class SettingsUpdate(BaseModel):
     ollama_enabled: Optional[bool] = None
     ollama_base_url: Optional[str] = None
     ollama_model: Optional[str] = None
+    # Claude-only web research toggle (Ask/Plan mode). See
+    # services/claude_web_search.py for the tool this enables.
+    web_search_enabled: Optional[bool] = None
 
 
 class SettingsResponse(BaseModel):
@@ -38,6 +41,7 @@ class SettingsResponse(BaseModel):
     ollama_enabled: bool = False
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5-coder:7b"
+    web_search_enabled: bool = False
     is_hosted: bool = False
 
 
