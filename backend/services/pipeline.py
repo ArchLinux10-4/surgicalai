@@ -3894,6 +3894,7 @@ async def run_chat_stream(
     session_id: Optional[str] = None,
     session_files: Optional[list] = None,
     mode: Optional[str] = None,
+    web_search_enabled: bool = False,
 ):
     """
     Streaming version of run_chat. Yields SSE chunks.
@@ -3905,6 +3906,18 @@ async def run_chat_stream(
     pick the right ASK/PLAN wording in its reinforcement text); Claude/GPT/
     Gemini behavior does not depend on it at all.
     Used by the /api/chat/stream endpoint and by the Ask/Plan mode branch.
+
+    ``web_search_enabled`` (optional, additive): per-message opt-in for
+    Claude's native web-search tool, mirroring the Edit/Agent "Research"
+    checkbox (`run_natural_pipeline_stream`'s ``web_search_enabled`` param —
+    see chat.py's `web_search_research_session_{session_id}` setting, read
+    fresh per turn). Only consumed when ``mode in ("ask", "plan")`` — see the
+    Claude branch below. Kept OR'd with the legacy global `web_search_enabled`
+    Settings toggle (not replaced) so any user who already turned that on
+    keeps working exactly as before; this param only ADDS a second, per-
+    message way to opt in, matching the nicer Edit/Agent UX. Defaults to
+    False so every existing caller that omits it (the plain /api/chat/stream
+    endpoint, and any test that doesn't pass it) is byte-for-byte unaffected.
 
     `session_files` (optional): when provided, this enables the
     <search_request>/<file_request> tag tools the Edit pipeline already has
@@ -4263,9 +4276,20 @@ async def run_chat_stream(
             # back as ordinary content blocks in this same `messages.stream()`
             # call — no extra round trip needed from us. See
             # services/claude_web_search.py for the full rationale.
+            # FIX (Research checkbox parity): Ask/Plan previously could ONLY
+            # get web search via the global, always-on `web_search_enabled`
+            # Settings toggle -- there was no per-message way to turn it on
+            # for a single turn, unlike Edit/Agent's "Research" checkbox
+            # (run_natural_pipeline_stream's web_search_enabled param). OR'd
+            # (not replaced) with the legacy global toggle so nobody who
+            # already relies on that loses it -- this only adds the second,
+            # per-message path the caller (chat.py) now also offers.
             _web_search_enabled = (
                 mode in ("ask", "plan")
-                and get_setting("web_search_enabled", "false").lower() == "true"
+                and (
+                    web_search_enabled
+                    or get_setting("web_search_enabled", "false").lower() == "true"
+                )
             )
             _ws_tracker = (
                 _ClaudeWebSearchStreamTracker(session_id=session_id, user_id=user_id)
@@ -4273,7 +4297,8 @@ async def run_chat_stream(
             )
             if _web_search_enabled:
                 _dlog("claude_web_search_enabled_for_turn", session_id=session_id,
-                      user_id=user_id, model=chat_model, mode=mode)
+                      user_id=user_id, model=chat_model, mode=mode,
+                      via_per_message_checkbox=bool(web_search_enabled))
 
             _tool_round = 0
             while True:

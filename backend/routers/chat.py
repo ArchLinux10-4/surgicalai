@@ -1045,6 +1045,20 @@ async def smart_stream(req: dict, request: Request):
             _mode_error = False
             _mode_model = None  # captured from run_chat_stream's `done` event
             _mode_web_search_sources: list = []  # Claude-only (Ask/Plan) — see claude_web_search.py
+            # Research-checkbox parity fix: the SAME per-session flag the
+            # Edit/Agent "Research" checkbox writes above (top of this
+            # function, unconditional on mode) now also drives Ask/Plan's web
+            # search for this turn — read fresh per-turn (not cached) so
+            # toggling the checkbox off mid-session takes effect on the very
+            # next message, exactly like the Edit/Agent path already does.
+            # run_chat_stream OR's this with the legacy global Settings
+            # toggle, so nobody relying on that loses it.
+            _ask_plan_web_search_enabled = (
+                get_setting(f"web_search_research_session_{session_id}", "false") == "true"
+            )
+            _dlog("ask_plan_web_research_flag", session_id=session_id,
+                  user_id=current_user_id, mode=_eff_mode,
+                  web_search_enabled=_ask_plan_web_search_enabled)
             try:
                 # model omitted → run_chat_stream resolves architect_model itself.
                 async for _mchunk in run_chat_stream(
@@ -1055,6 +1069,7 @@ async def smart_stream(req: dict, request: Request):
                     session_id=session_id,
                     session_files=session_files,
                     mode=_eff_mode,
+                    web_search_enabled=_ask_plan_web_search_enabled,
                 ):
                     # run_chat_stream emits token / thinking_* / done / error —
                     # all already handled by the smart-stream frontend consumer.
