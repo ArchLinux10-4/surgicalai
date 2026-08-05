@@ -92,6 +92,11 @@ export function SettingsModal() {
     ollama_enabled: false,
     ollama_base_url: 'http://localhost:11434',
     ollama_model: 'qwen2.5-coder:7b',
+    // Claude native web-search — global default for Ask/Plan (see
+    // services/claude_web_search.py). Edit/Agent mode has its own separate,
+    // per-message "Research" checkbox in the chat composer, so this toggle
+    // is scoped to "on by default for Ask/Plan" only.
+    web_search_enabled: false,
   })
 
   const { theme, setTheme } = useThemeStore()
@@ -110,6 +115,7 @@ export function SettingsModal() {
         ollama_enabled: (settings as any).ollama_enabled || false,
         ollama_base_url: (settings as any).ollama_base_url || 'http://localhost:11434',
         ollama_model: (settings as any).ollama_model || 'qwen2.5-coder:7b',
+        web_search_enabled: (settings as any).web_search_enabled || false,
       })
     }
     refreshModels()
@@ -617,6 +623,31 @@ export function SettingsModal() {
                 )}
 
                 {/* Confidence Threshold slider hidden — not wired to pipeline (uses hardcoded 8/10 gate) */}
+
+                <div className="mt-6 pt-5 border-t border-border">
+                  <SectionHeader title="Web Search" subtitle="Claude looks things up live before answering — real-time facts, cited sources" />
+                  <label className="flex items-start gap-3 cursor-pointer group mt-3">
+                    <input
+                      type="checkbox"
+                      checked={form.web_search_enabled}
+                      onChange={(e) => {
+                        const next = e.target.checked
+                        upd('web_search_enabled')(next)
+                        clientLog('settings_web_search_enabled_toggled', { enabled: next })
+                      }}
+                      className="mt-0.5 accent-accent"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-ink">Enable web search in Ask &amp; Plan mode</div>
+                      <div className="text-xs text-muted mt-0.5">
+                        Claude-only. When on, Claude can search the web and cite sources while answering
+                        questions or planning — before any code changes are made. Editing (Edit/Agent mode)
+                        has its own separate "Research" checkbox in the message box, since edits are riskier
+                        to base on unreviewed live results by default.
+                      </div>
+                    </div>
+                  </label>
+                </div>
 
                 <div className="mt-6 pt-5 border-t border-border">
                   <SectionHeader title="Offline Mode" subtitle="Run fully locally via Ollama — no data leaves your machine" />

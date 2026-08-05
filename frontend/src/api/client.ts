@@ -321,7 +321,7 @@ export const api = {
     },
 
     smart: (
-      data: { session_id: string; message: string; file_ids?: string[]; mode?: 'edit' | 'ask' | 'plan' | 'agent'; force_tasks?: boolean },
+      data: { session_id: string; message: string; file_ids?: string[]; mode?: 'edit' | 'ask' | 'plan' | 'agent'; force_tasks?: boolean; enable_web_research?: boolean },
       onProgress: (msg: string) => void,
       onToken: (token: string) => void,
       onResult: (result: any) => void,
@@ -344,6 +344,17 @@ export const api = {
         respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => boolean,
       ) => void,
       onFileCleared?: (filename: string) => void,
+      // Claude native web-search tool events — see services/claude_web_search.py.
+      // Fires zero or more times per turn: 'start' when Claude begins a
+      // search, 'query' once we know what it searched for, 'results' with
+      // the returned citations. `onDone`'s 4th arg carries the final,
+      // de-duplicated source list for persistence-on-reload.
+      onWebSearch?: (event:
+        | { phase: 'start' }
+        | { phase: 'query'; query: string }
+        | { phase: 'results'; results: Array<{ url: string; title: string; domain: string; page_age?: string | null }>; error?: string | null }
+      ) => void,
+      onDoneSources?: (sources: Array<{ url: string; title: string; domain: string; page_age?: string | null }>) => void,
     ): AbortController => {
       const controller = new AbortController()
       const tokens: string[] = []
@@ -351,7 +362,12 @@ export const api = {
       let _modelUsed = ''
       // Back-channel sender, populated once the WS opens (null on HTTP/SSE).
       let sendToServer: ((msg: unknown) => void) | null = null
-      const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone(tokens.join(''), _modelUsed) } }
+      const fireDone = (sources?: any[]) => {
+        if (doneCalled) return
+        doneCalled = true
+        if (sources?.length) onDoneSources?.(sources)
+        onDone(tokens.join(''), _modelUsed)
+      }
 
       // Transport-independent SSE line handler — shared by WS and fetch paths.
       const processLine = (line: string) => {
@@ -367,8 +383,11 @@ export const api = {
             onResult(result)
           }
           else if (chunk.type === 'chat') { tokens.push(chunk.content); onToken(chunk.content) }
-          else if (chunk.type === 'done') { if (chunk.model) _modelUsed = chunk.model; fireDone() }
+          else if (chunk.type === 'done') { if (chunk.model) _modelUsed = chunk.model; fireDone(chunk.web_search_sources) }
           else if (chunk.type === 'error') onError(chunk.content)
+          else if (chunk.type === 'web_search_start') onWebSearch?.({ phase: 'start' })
+          else if (chunk.type === 'web_search_query') onWebSearch?.({ phase: 'query', query: chunk.content })
+          else if (chunk.type === 'web_search_results') onWebSearch?.({ phase: 'results', results: chunk.results || [], error: chunk.error })
           else if (chunk.type === 'thinking_start') onThinking?.('', 'start')
           else if (chunk.type === 'thinking') onThinking?.(chunk.content, 'delta')
           else if (chunk.type === 'thinking_end') onThinking?.('', 'end')

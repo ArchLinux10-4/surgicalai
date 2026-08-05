@@ -12,7 +12,7 @@ import { PickedElementsTray } from './PickedElementsTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
-import { AccountTree, Add, AdsClick, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Lock, Psychology, Security, Send, Warning } from '@mui/icons-material';
+import { AccountTree, Add, AdsClick, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Lock, Psychology, Search, Security, Send, Warning } from '@mui/icons-material';
 import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
 import { acquireApplyLock, releaseApplyLock } from '../lib/fileApplyLock'
@@ -496,6 +496,7 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
             {msg._thinking && <ThinkingBlock text={msg._thinking} isStreaming={false} />}
           </div>
         )}
+        <SourcesRow sources={msg._sources} />
 
         {isSurgical && surgicalResult ? (
           <DiffCardBoundary>
@@ -588,6 +589,42 @@ function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boole
           {isStreaming && <span className="inline-block w-1.5 h-3 bg-purple/60 rounded-sm ml-0.5 animate-pulse" />}
         </div>
       )}
+    </div>
+  )
+}
+
+// ── Claude web-search citations — persisted `msg._sources` (see backend
+//    routers/chat.py get_messages, which reads them straight back out of
+//    chat_messages.metadata so a reload shows exactly what was cited live).
+function SourcesRow({ sources }: { sources?: Array<{ url: string; title: string; domain: string; page_age?: string | null }> }) {
+  if (!sources?.length) return null
+  return (
+    <div className="mb-3">
+      <div className="flex items-center gap-1.5 text-[11px] text-muted/70 mb-1.5">
+        <Search sx={{ fontSize: 12 }} />
+        <span className="font-medium">Sources</span>
+        <span className="text-muted/40">·</span>
+        <span>{sources.length} result{sources.length !== 1 ? 's' : ''}</span>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        {sources.map((s, i) => (
+          <a
+            key={s.url || i}
+            href={s.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            title={s.title}
+            className="group flex items-center gap-1.5 max-w-[220px] px-2.5 py-1 rounded-full bg-overlay/60 border border-border/50 hover:border-sky-500/40 hover:bg-sky-500/10 transition-colors"
+          >
+            <span className="w-3.5 h-3.5 rounded-full bg-sky-500/15 flex items-center justify-center flex-shrink-0 text-[8px] font-bold text-sky-400">
+              {(s.domain || s.title || '?')[0]?.toUpperCase()}
+            </span>
+            <span className="text-[11px] text-ink/80 group-hover:text-sky-400 truncate">
+              {s.domain || s.title}
+            </span>
+          </a>
+        ))}
+      </div>
     </div>
   )
 }
@@ -708,7 +745,7 @@ function PipelineTimeline({ steps, isLive = false }: { steps: string[]; isLive?:
   )
 }
 
-function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit }: { content: string; progress: string; progressHistory: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean }) {
+function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit, webSearchLive }: { content: string; progress: string; progressHistory: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean; webSearchLive?: { searching: boolean; query?: string } | null }) {
   const [elapsed, setElapsed] = useState(0)
 
   // Elapsed timer — ticks every second while streaming
@@ -748,6 +785,15 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
               </span>
             )
           })()}
+          {/* Claude web-search live pill — "Searching…" then the actual query
+              once we know it, per services/claude_web_search.py's events. */}
+          {webSearchLive?.searching && (
+            <span className="text-[11px] flex items-center gap-1.5 px-2 py-0.5 rounded-full border font-medium text-sky-400 bg-sky-500/10 border-sky-500/25">
+              <span className="w-1.5 h-1.5 rounded-full animate-pulse bg-sky-400" />
+              <Search sx={{ fontSize: 12 }} />
+              {webSearchLive.query ? `Searching: “${webSearchLive.query}”` : 'Searching the web…'}
+            </span>
+          )}
           {/* Elapsed timer */}
           {elapsed > 0 && !content && (
             <span className="text-[10px] text-muted/70 tabular-nums">{elapsed}s</span>
@@ -1019,6 +1065,10 @@ export function ChatPanel() {
   const [thinkingText, setThinkingText] = useState('')
   const [isThinking, setIsThinking] = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
+  // ── Claude web-search live indicator (Ask/Plan's global toggle AND the
+  //    Edit/Agent "Research" checkbox both flow through these same events —
+  //    see api.stream.smart's onWebSearch/onDoneSources). ──
+  const [webSearchLive, setWebSearchLive] = useState<{ searching: boolean; query?: string } | null>(null)
   // availableModels/refreshModels now come from the shared appStore (see
   // note there) so verifying a provider key in SettingsModal updates this
   // picker immediately, without needing a page reload.
@@ -1050,6 +1100,26 @@ export function ChatPanel() {
     try { localStorage.setItem('sai_chat_mode', m) } catch { /* storage blocked — session-only */ }
   }
 
+  // ── "Research before editing" checkbox (Edit/Agent mode only) ────────────
+  // Distinct from the Ask/Plan web-search Settings toggle: this is a one-shot,
+  // per-message opt-in for Edit/Agent mode, sent as `enable_web_research` on
+  // the next /smart-stream call only. Claude-only server-side (silently a
+  // no-op on GPT/Grok) — hidden below when the current model isn't Claude so
+  // the checkbox never implies a capability that won't actually run.
+  // See services/claude_web_search.py for the backend rationale.
+  const readWebResearch = (): boolean => {
+    try { return localStorage.getItem('sai_web_research_enabled') === '1' } catch { return false }
+  }
+  const [webResearchEnabled, setWebResearchEnabled] = useState<boolean>(readWebResearch)
+  const toggleWebResearch = () => {
+    setWebResearchEnabled(prev => {
+      const next = !prev
+      try { localStorage.setItem('sai_web_research_enabled', next ? '1' : '0') } catch { /* session-only */ }
+      clientLog('web_research_checkbox_toggled', { enabled: next }, activeSessions || '')
+      return next
+    })
+  }
+
   // ── Offline (Ollama/Qwen) mode gating ──────────────────────────────────
   // Mirror of backend _should_use_ollama: a local "ollama:" model, OR
   // ollama_enabled with no cloud OpenAI key. Offline runs on a 7B local
@@ -1079,6 +1149,14 @@ export function ChatPanel() {
   // downgrades to a normal single-pass edit instead of multi-agent tasks.
   const agentRequiresClaudeForCurrentModel =
     effectiveMode === 'agent' && currentModelProvider === 'openai'
+  // "Research before editing" checkbox — Claude-only, and only meaningful in
+  // Edit/Agent mode (Ask/Plan already have their own always-on-when-toggled
+  // Settings-level web search — see SettingsModal). Not offered offline
+  // either: the local Qwen model never reaches the Claude branch that wires
+  // this tool in (services/pipeline.py `_natural_web_search_enabled` gate).
+  const webResearchAvailable =
+    !isOffline && currentModelProvider === 'anthropic' &&
+    (effectiveMode === 'edit' || effectiveMode === 'agent')
   // Re-arm the dismissible banner whenever the condition it warns about
   // changes — a dismissal only applies to the specific mode/model pairing
   // the user saw it for, never silently suppressed going forward.
@@ -1089,6 +1167,13 @@ export function ChatPanel() {
   // stale closure and without widening its dependency array.
   const isOfflineRef = useRef(isOffline)
   isOfflineRef.current = isOffline
+  // Same stale-closure guard as isOfflineRef — doStream is a useCallback that
+  // doesn't list these in its deps, so read the live value via ref, not the
+  // closure, exactly like _sendMode above does for isOfflineRef.
+  const webResearchAvailableRef = useRef(webResearchAvailable)
+  webResearchAvailableRef.current = webResearchAvailable
+  const webResearchEnabledRef = useRef(webResearchEnabled)
+  webResearchEnabledRef.current = webResearchEnabled
 
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -1096,6 +1181,11 @@ export function ChatPanel() {
   const sentMessageMapRef = useRef<Map<string, string>>(new Map())
   const thinkingTextRef = useRef('')
   const progressHistoryRef = useRef<string[]>([])
+  // Final, de-duplicated web-search sources for the turn just completed —
+  // populated by onDoneSources, attached to the persisted message so a
+  // reload shows the same citations (backend already saves + reloads them
+  // identically — see routers/chat.py get_messages' `_sources` field).
+  const webSearchSourcesRef = useRef<Array<{ url: string; title: string; domain: string; page_age?: string | null }>>([])
 
   // Manual abort (Escape / Stop button): preserve whatever was streamed so far
   // — including any thinking text — as a real message instead of discarding it.
@@ -1190,6 +1280,8 @@ export function ChatPanel() {
     setIsCompacting(false)
     setThinkingText('')
     thinkingTextRef.current = ''
+    webSearchSourcesRef.current = []
+    setWebSearchLive(null)
     setIsBuildingEdit(false)
     setProgressHistory([])
     progressHistoryRef.current = []
@@ -1475,8 +1567,12 @@ export function ChatPanel() {
       ? (_rawMode === 'agent' ? 'edit' : _rawMode === 'plan' ? 'ask' : _rawMode)
       : _rawMode
 
+    // "Research before editing" only applies (and is only ever shown) for
+    // Edit/Agent mode on Claude — see webResearchAvailable. Read fresh here
+    // (not the closure) so the very next send reflects the current toggle.
+    const _sendWebResearch = webResearchAvailableRef.current && webResearchEnabledRef.current
     const ctrl = api.stream.smart(
-      { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id), mode: _sendMode, force_tasks: _sendMode === 'agent' },
+      { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id), mode: _sendMode, force_tasks: _sendMode === 'agent', enable_web_research: _sendWebResearch },
       (progress) => {
         setSessionStreamProgress(sessionId, progress)
         if (useAppStore.getState().activeSessions !== sessionId) return
@@ -1560,6 +1656,9 @@ export function ChatPanel() {
         const _steps = [...progressHistoryRef.current]
         clearSessionStream(sessionId)
         if (useAppStore.getState().activeSessions === sessionId) setIsBuildingEdit(false)
+        const _sources = webSearchSourcesRef.current.length ? [...webSearchSourcesRef.current] : undefined
+        setWebSearchLive(null)
+        if (_sources) clientLog('web_search_sources_attached_to_message', { sourceCount: _sources.length }, sessionId)
         if (fullText.trim()) {
           addMessage({
             id: Date.now().toString() + '_ai',
@@ -1570,7 +1669,8 @@ export function ChatPanel() {
             _thinking,
             _steps,
             _model: streamModel || 'N/A',
-          })
+            _sources,
+          } as any)
         }
         if (isFirst) autoRename()
         else api.chat.getSessions().then(setSessions).catch(() => {})
@@ -1588,9 +1688,11 @@ export function ChatPanel() {
             _thinking: thinkingTextRef.current || undefined,
             _steps: [...progressHistoryRef.current],
             _model: streamModel || 'N/A',
-          })
+            _sources: webSearchSourcesRef.current.length ? [...webSearchSourcesRef.current] : undefined,
+          } as any)
           gotResult = true
         }
+        setWebSearchLive(null)
         if (useAppStore.getState().activeSessions === sessionId) setError(err)
         clearSessionStream(sessionId)
         if (useAppStore.getState().activeSessions === sessionId) setIsBuildingEdit(false)
@@ -1705,6 +1807,24 @@ export function ChatPanel() {
         setFileRequest(null)
         setFileRequestBusy(false)
       },
+      // onWebSearch — Claude's native web-search tool firing mid-turn (Ask/Plan's
+      // global toggle or Edit/Agent's "Research" checkbox — same events either
+      // way). Drives the live "Searching the web…" pill in StreamingBubble.
+      (event) => {
+        const _e = event as { phase: string; query?: string; results?: unknown[] }
+        clientLog('web_search_event', { phase: _e.phase, query: _e.query, resultCount: _e.results?.length }, sessionId)
+        if (useAppStore.getState().activeSessions !== sessionId) return
+        if (event.phase === 'start') setWebSearchLive({ searching: true })
+        else if (event.phase === 'query') setWebSearchLive({ searching: true, query: event.query })
+        else if (event.phase === 'results') setWebSearchLive({ searching: false })
+      },
+      // onDoneSources — final, de-duplicated citation list for this turn.
+      // Stashed in a ref (not state) so it's available synchronously at the
+      // onDone finalize step just below, without an extra render race.
+      (sources) => {
+        webSearchSourcesRef.current = sources
+        clientLog('web_search_done_sources', { sourceCount: sources?.length || 0 }, sessionId)
+      },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change
@@ -1721,6 +1841,8 @@ export function ChatPanel() {
     setThinkingText('')
     setIsThinking(false)
     thinkingTextRef.current = ''
+    webSearchSourcesRef.current = []
+    setWebSearchLive(null)
     progressHistoryRef.current = ['Applying your context...']
     doStream(sid, msg, false, () => {
       api.chat.getSessions().then(setSessions).catch(() => {})
@@ -2141,6 +2263,8 @@ export function ChatPanel() {
     setIsThinking(false)
     setIsBuildingEdit(false)
     thinkingTextRef.current = ''
+    webSearchSourcesRef.current = []
+    setWebSearchLive(null)
     progressHistoryRef.current = ['Thinking...']
 
     doStream(sessionId, text, isFirstMessage, autoNameSession)
@@ -2317,7 +2441,7 @@ export function ChatPanel() {
             )}
             <AgentMissionControl />
             {isStreaming && (streamingMessage || streamProgress) && (
-              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} />
+              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} />
             )}
             {/* Human-in-the-loop: agent needs a file that isn't in the session */}
             {fileRequest && fileRequest.sessionId === activeSessions && (
@@ -2508,6 +2632,25 @@ export function ChatPanel() {
                 lastResponse={messages.filter(m => m.role === 'assistant' && m.content).slice(-1)[0]?.content}
                 disabled={isStreaming || isCompacting}
               />
+              {/* "Research before editing" checkbox — Claude-only, Edit/Agent
+                  mode only. See webResearchAvailable comment above. */}
+              {webResearchAvailable && (
+                <button
+                  onClick={toggleWebResearch}
+                  disabled={isStreaming || isCompacting}
+                  title={webResearchEnabled
+                    ? 'Web research is ON for the next message — Claude may search the web before editing.'
+                    : 'Let Claude research the web before making this edit, if it needs to.'}
+                  className={`h-8 px-2.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors disabled:opacity-40 ${
+                    webResearchEnabled
+                      ? 'bg-sky-500/15 text-sky-400 hover:brightness-110'
+                      : 'text-muted/70 hover:text-ink/80 hover:bg-overlay/60'
+                  }`}
+                >
+                  <Search sx={{ fontSize: 14 }} />
+                  <span className="hidden sm:inline">Research</span>
+                </button>
+              )}
               {/* Mode selector — Edit (default) | Ask | Plan | Agent */}
               <div className="relative">
                 <button

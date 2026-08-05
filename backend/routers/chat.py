@@ -6,7 +6,7 @@ import time
 from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 from models.schemas import ChatRequest, NewSessionRequest, ChatSession
-from database import get_db, get_db_ctx, get_setting, get_user_api_key, GLOBAL_MEMORY_KEY
+from database import get_db, get_db_ctx, get_setting, set_setting, get_user_api_key, GLOBAL_MEMORY_KEY
 from crypto_utils import decrypt_api_key
 from services.pipeline import (
     run_chat, run_chat_stream, _dlog, _clean_history_content, HISTORY_WINDOW,
@@ -616,6 +616,12 @@ def get_messages(session_id: str):
                 _mdl = _meta.get("model")
                 if _mdl:
                     d["_model"] = _mdl
+                # Claude-only web research (Ask/Plan mode) — see
+                # services/claude_web_search.py. Absent for every other
+                # message; frontend only renders the Sources card when set.
+                _wss = _meta.get("web_search_sources")
+                if _wss:
+                    d["_sources"] = _wss
             except Exception:
                 pass
         content = d.get("content", "")
@@ -881,6 +887,21 @@ async def smart_stream(req: dict, request: Request):
     mode = _normalize_mode(req.get("mode"))
     current_user_id = getattr(request.state, "user_id", "") or ""
 
+    # v1.7: "research before editing" checkbox — Claude-only, Edit/Agent mode.
+    # Distinct from the global Ask/Plan `web_search_enabled` Settings toggle:
+    # this is a one-shot, per-message opt-in the frontend sends only when the
+    # user has checked the box for this request. Persisted per-session (not
+    # global) so tasks spawned from this message (execute_task / task_runner)
+    # keep the capability for the life of the task run, without ever
+    # affecting other sessions or Ask/Plan's separate toggle. See
+    # services/claude_web_search.py for the underlying tool.
+    _enable_web_research = bool(req.get("enable_web_research", False))
+    if session_id:
+        set_setting(f"web_search_research_session_{session_id}",
+                    "true" if _enable_web_research else "false")
+    _dlog("smart_stream_web_research_flag", session_id=session_id,
+          user_id=current_user_id, mode=mode, enable_web_research=_enable_web_research)
+
     # Per-user keys only — no global/shared keys
     has_openai = bool(_resolve_chat_key(current_user_id, "openai"))
     has_anthropic = bool(_resolve_chat_key(current_user_id, "anthropic"))
@@ -1023,6 +1044,7 @@ async def smart_stream(req: dict, request: Request):
             _mode_collected = []
             _mode_error = False
             _mode_model = None  # captured from run_chat_stream's `done` event
+            _mode_web_search_sources: list = []  # Claude-only (Ask/Plan) — see claude_web_search.py
             try:
                 # model omitted → run_chat_stream resolves architect_model itself.
                 async for _mchunk in run_chat_stream(
@@ -1044,11 +1066,14 @@ async def smart_stream(req: dict, request: Request):
                                 _mode_collected.append(_md.get("content", ""))
                             elif _mt == "error":
                                 _mode_error = True
-                            elif _mt == "done" and _md.get("model"):
-                                # run_chat_stream doesn't log which backend it
-                                # resolved; capture it here so an empty/short
-                                # Ask/Plan answer isn't an untraceable ghost.
-                                _mode_model = _md.get("model")
+                            elif _mt == "done":
+                                if _md.get("model"):
+                                    # run_chat_stream doesn't log which backend it
+                                    # resolved; capture it here so an empty/short
+                                    # Ask/Plan answer isn't an untraceable ghost.
+                                    _mode_model = _md.get("model")
+                                if _md.get("web_search_sources"):
+                                    _mode_web_search_sources = _md.get("web_search_sources")
                         except Exception:
                             pass
                     yield _mchunk
@@ -1065,11 +1090,14 @@ async def smart_stream(req: dict, request: Request):
             if _mode_text and not _mode_error:
                 try:
                     with get_db_ctx() as _mdb:
+                        _mode_metadata: dict = {"model": _mode_model or ""}
+                        if _mode_web_search_sources:
+                            _mode_metadata["web_search_sources"] = _mode_web_search_sources
                         _mdb.execute(
                             "INSERT INTO chat_messages (id, session_id, role, content, metadata) "
                             "VALUES (?, ?, ?, ?, ?)",
                             (str(uuid.uuid4()), session_id, "assistant", _mode_text,
-                             json.dumps({"model": _mode_model or ""}))
+                             json.dumps(_mode_metadata))
                         )
                         _mdb.execute(
                             "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1296,6 +1324,7 @@ async def smart_stream(req: dict, request: Request):
         # truth — never guessed here). Falls back to configured architect
         # model if the pipeline never emits one (e.g. crash before first done).
         _resolved_model = ""
+        _single_pass_ws_sources: list = []  # v1.7 research checkbox — see below
 
         try:
             _pipe_kwargs = dict(
@@ -1314,6 +1343,15 @@ async def smart_stream(req: dict, request: Request):
             if _pipeline is run_natural_pipeline_stream:
                 _pipe_kwargs["client_inbox"] = getattr(
                     request.state, "client_inbox", None)
+                # v1.7 research checkbox — see smart_stream's top-of-function
+                # comment. Read fresh per-turn (not cached) so toggling it off
+                # mid-session takes effect on the very next message.
+                _pipe_kwargs["web_search_enabled"] = (
+                    get_setting(f"web_search_research_session_{session_id}", "false") == "true"
+                )
+                _dlog("single_pass_web_research_flag", session_id=session_id,
+                      user_id=current_user_id,
+                      web_search_enabled=_pipe_kwargs["web_search_enabled"])
             async for chunk in _with_heartbeat(_pipeline(**_pipe_kwargs)):
                 if chunk.startswith("data: "):
                     try:
@@ -1331,6 +1369,13 @@ async def smart_stream(req: dict, request: Request):
                             # back to the configured architect model if the
                             # chunk (e.g. an early error) never carried one.
                             _resolved_model = data.get("model") or _arch_model
+                            # v1.7 research checkbox — Claude's web-search
+                            # sources for this turn, if any (see
+                            # services/claude_web_search.py). Persisted so a
+                            # reload shows the same citations, exactly like
+                            # the Ask/Plan branch already does.
+                            if data.get("web_search_sources"):
+                                _single_pass_ws_sources = data.get("web_search_sources")
                             # Save assistant message — store both natural text AND result
                             with get_db_ctx() as db:
                                 resp_id = str(uuid.uuid4())
@@ -1370,10 +1415,16 @@ async def smart_stream(req: dict, request: Request):
                                 else:
                                     saved_content = natural_text
 
+                                _single_pass_metadata = {"model": _resolved_model}
+                                if _single_pass_ws_sources:
+                                    _single_pass_metadata["web_search_sources"] = _single_pass_ws_sources
+                                    _dlog("single_pass_web_search_persisted", session_id=session_id,
+                                          user_id=current_user_id,
+                                          source_count=len(_single_pass_ws_sources))
                                 db.execute(
                                     "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
                                     (resp_id, session_id, "assistant", saved_content,
-                                     _json.dumps({"model": _resolved_model}))
+                                     _json.dumps(_single_pass_metadata))
                                 )
                                 db.execute(
                                     "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -1538,8 +1589,14 @@ def _build_prior_work_context(session_id, run_id, current_seq):
     return ctx
 
 
-def _save_task_message(session_id, natural_text, parsed, model=""):
-    """Persist a task's assistant message (natural text + optional diff result)."""
+def _save_task_message(session_id, natural_text, parsed, model="", web_search_sources=None):
+    """Persist a task's assistant message (natural text + optional diff result).
+
+    web_search_sources : v1.7 research checkbox — this task's Claude
+        web-search citations, if any (see services/claude_web_search.py).
+        Optional and additive; every existing call site that omits it keeps
+        saving byte-identical metadata to before this param existed.
+    """
     with get_db_ctx() as db:
         rid = str(uuid.uuid4())
         if parsed:
@@ -1562,9 +1619,14 @@ def _save_task_message(session_id, natural_text, parsed, model=""):
             saved = "__NATURAL_AND_RESULT__:" + json.dumps({"text": _txt, "result": parsed})
         else:
             saved = natural_text
+        _task_msg_metadata = {"model": model}
+        if web_search_sources:
+            _task_msg_metadata["web_search_sources"] = web_search_sources
+            _dlog("save_task_message_web_search_persisted", session_id=session_id,
+                  source_count=len(web_search_sources))
         db.execute(
             "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
-            (rid, session_id, "assistant", saved, json.dumps({"model": model})),
+            (rid, session_id, "assistant", saved, json.dumps(_task_msg_metadata)),
         )
         db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
         db.commit()
@@ -1752,7 +1814,17 @@ async def execute_task(req: dict, request: Request):
         collected, result_content, poll, aborted = [], None, 0, False
         _think_parts: list = []  # accumulated extended-thinking text for this task
         _task_model = ""  # captured from this task's own done chunk
+        _task_ws_sources: list = []  # v1.7 research checkbox — this task's web-search sources, if any
         try:
+            # v1.7 research checkbox — a task spawned from a "research-enabled"
+            # message (see smart_stream) keeps the capability for the whole
+            # task run, read fresh per task so a mid-run toggle-off takes
+            # effect on the next task rather than being baked in at plan time.
+            _task_web_search_enabled = (
+                get_setting(f"web_search_research_session_{session_id}", "false") == "true"
+            )
+            _dlog("execute_task_web_research_flag", session_id=session_id,
+                  task_id=task_id, web_search_enabled=_task_web_search_enabled)
             async for chunk in _with_heartbeat(run_natural_pipeline_stream(
                 session_files=session_files,
                 user_request=_task_request,
@@ -1763,6 +1835,7 @@ async def execute_task(req: dict, request: Request):
                 user_id=current_user_id,
                 client_inbox=getattr(request.state, "client_inbox", None),
                 is_agent_task=True,
+                web_search_enabled=_task_web_search_enabled,
             )):
                 poll += 1
                 if poll % 20 == 0 and cancel_requested_for_run(session_id, run_id):
@@ -1792,8 +1865,14 @@ async def execute_task(req: dict, request: Request):
                                 yield _sse({"type": "task_thinking", "id": task_id, "content": _tc})
                         elif _ct == "error":
                             yield _sse({"type": "task_progress", "id": task_id, "content": "⚠️ " + _d.get("content", "")})
-                        elif _ct == "done" and _d.get("model"):
-                            _task_model = _d.get("model")
+                        elif _ct == "done":
+                            if _d.get("model"):
+                                _task_model = _d.get("model")
+                            if _d.get("web_search_sources"):
+                                _task_ws_sources = _d.get("web_search_sources")
+                                _dlog("execute_task_web_search_captured", session_id=session_id,
+                                      task_id=task_id, task_seq=seq+1,
+                                      source_count=len(_task_ws_sources))
                     except Exception:
                         pass
         except Exception as _ee:
@@ -1834,7 +1913,8 @@ async def execute_task(req: dict, request: Request):
             except Exception:
                 parsed = None
         score, worst = _eval_task_result(parsed) if parsed else (None, "safe")
-        _save_task_message(session_id, natural_text, parsed, model=_task_model)
+        _save_task_message(session_id, natural_text, parsed, model=_task_model,
+                            web_search_sources=_task_ws_sources)
 
         # Non-code ("answer") tasks edit nothing → skip the QA verdict gate.
         _is_answer = task.get("kind") == "answer"

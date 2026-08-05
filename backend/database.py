@@ -637,6 +637,9 @@ def _seed_defaults_sqlite(cur):
         "ollama_enabled": "false",
         "ollama_base_url": "http://localhost:11434",
         "ollama_model": "qwen2.5-coder:7b",
+        # Claude-only web research (Ask/Plan mode). New, additive, off by
+        # default — see services/claude_web_search.py.
+        "web_search_enabled": "false",
     }
     for k, v in defaults.items():
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -953,6 +956,9 @@ def _seed_defaults_postgres(conn):
         "ollama_enabled": "false",
         "ollama_base_url": "http://localhost:11434",
         "ollama_model": "qwen2.5-coder:7b",
+        # Claude-only web research (Ask/Plan mode). New, additive, off by
+        # default — see services/claude_web_search.py.
+        "web_search_enabled": "false",
     }
     for k, v in defaults.items():
         conn.execute(
