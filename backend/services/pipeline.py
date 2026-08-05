@@ -18352,6 +18352,45 @@ async def run_natural_pipeline_stream(
 
                 p_smap = symbol_maps_by_name.get(p_filename, (None, None))[0]
 
+                # ── Plan-execution disconnect checkpoint (session 97224670) ──
+                # Evidence: 3 consecutive Grok attempts each had the client
+                # disconnect (76-266s of silence) WHILE this loop's risky,
+                # long-running edit call was in flight. plan_execute_cancelled
+                # fired and the CancelledError propagated with no checkpoint,
+                # so every edit already applied in THIS phase (chain_ok=True,
+                # file content already updated) vanished — chat.py's safety
+                # net had nothing to recover. User saw a short reply and no
+                # diff, indistinguishable from "the model refused to write
+                # code." The architect turn loop (session 414dfaef) and the
+                # resolution/QA-retry loops (session e4e9d098, QA-retry
+                # parity) already checkpoint before their own risky calls;
+                # this phase was the one gap. Reuses the SAME parser/shape
+                # (_build_architect_checkpoint_resolved) chat.py's recovery
+                # path already understands — zero changes needed there.
+                if edit_blocks_raw or new_file_blocks_raw:
+                    _plan_ckpt_resolved = _build_architect_checkpoint_resolved(
+                        edit_blocks_raw, new_file_blocks_raw)
+                    if _plan_ckpt_resolved:
+                        try:
+                            _dlog("plan_execute_checkpoint_emitted",
+                                  session_id=session_id, user_id=user_id,
+                                  plan_idx=plan_idx,
+                                  total_items=len(_effective_plan),
+                                  edit_blocks=len(edit_blocks_raw),
+                                  new_file_blocks=len(new_file_blocks_raw),
+                                  parsed_count=len(_plan_ckpt_resolved))
+                            yield sse({"type": "checkpoint",
+                                       "content": json.dumps({
+                                           "phase": "plan_execute",
+                                           "plan_idx": plan_idx,
+                                           "resolved": _plan_ckpt_resolved,
+                                       })})
+                        except Exception as _plan_ckpt_err:
+                            _dlog("plan_execute_checkpoint_error",
+                                  session_id=session_id, user_id=user_id,
+                                  plan_idx=plan_idx,
+                                  error=str(_plan_ckpt_err)[:200])
+
                 yield sse({"type": "progress",
                            "content": f"Editing {p_symbol} in {p_filename} ({plan_idx+1}/{len(edit_plan_data)})..."})
 
