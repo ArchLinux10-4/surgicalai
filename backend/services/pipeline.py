@@ -16519,6 +16519,7 @@ async def run_natural_pipeline_stream(
             pending_tool = None            # (kind, data) — set by the parser on a request
             _grok_blocked = False           # grok report_blocked terminal signal this turn
             _grok_tc_acc = None             # grok streamed tool-call accumulator this turn
+            _ctx_shape_checked = False      # false-positive tag-open guard (session 71737af0)
             state = "normal"
             normal_buf = ""
             tag_buf = ""
@@ -16644,6 +16645,7 @@ async def run_natural_pipeline_stream(
                                                     tag_buf = normal_buf[first_idx + len(TAG_DEFS[first_tag]["open"]):]
                                                     normal_buf = ""
                                                     _found_open = True
+                                                    _ctx_shape_checked = False
                                                     _dlog("tag_opened",
                                                           session_id=session_id, user_id=user_id,
                                                           tag_type=first_tag, state=state, turn=_turn)
@@ -16657,6 +16659,37 @@ async def run_natural_pipeline_stream(
                                             _close_tag = TAG_DEFS[_tag_name]["close"]
                                             idx = tag_buf.find(_close_tag)
                                             if idx == -1:
+                                                # ── False-positive tag-open guard ──────────
+                                                # PROVEN BUG (session 71737af0): Claude can
+                                                # mention its own tag syntax as prose (e.g.
+                                                # "`<file_request>` for useRateCardHooks.js"
+                                                # while explaining a past incident) instead of
+                                                # issuing a real tool call. The literal-substring
+                                                # open-tag match above can't tell the difference,
+                                                # so the rest of a perfectly good explanation gets
+                                                # trapped in tag_buf and is silently dropped at
+                                                # end-of-stream (200+ files attached -> "ran out
+                                                # of time, no code changes", zero visible text).
+                                                # A genuine request always starts with JSON ('['
+                                                # or '{') immediately after the open tag per our
+                                                # own system prompt — anything else is prose, not
+                                                # a live request. Check once, as soon as the first
+                                                # non-whitespace char has arrived.
+                                                if (_tag_name in ("search", "filereq", "github", "history")
+                                                        and not _ctx_shape_checked):
+                                                    _ctx_stripped = tag_buf.lstrip()
+                                                    if _ctx_stripped:
+                                                        _ctx_shape_checked = True
+                                                        if _ctx_stripped[0] not in "[{":
+                                                            _reverted_text = TAG_DEFS[_tag_name]["open"] + tag_buf
+                                                            state = "normal"
+                                                            tag_buf = ""
+                                                            _dlog("ctx_tag_false_positive_reverted",
+                                                                  session_id=session_id, user_id=user_id,
+                                                                  tag_type=_tag_name, turn=_turn,
+                                                                  reverted_len=len(_reverted_text),
+                                                                  reverted_preview=_reverted_text[:200])
+                                                            yield sse({"type": "token", "content": _reverted_text})
                                                 break
                                             _content = tag_buf[:idx]
                                             _remainder = tag_buf[idx + len(_close_tag):]
@@ -16940,6 +16973,7 @@ async def run_natural_pipeline_stream(
                                         state = f"in_{first_tag}"
                                         tag_buf = normal_buf[first_idx + len(TAG_DEFS[first_tag]["open"]):]
                                         normal_buf = ""
+                                        _ctx_shape_checked = False
                                     else:
                                         _tag_name = state[3:]
                                         if _tag_name not in TAG_DEFS:
@@ -16947,6 +16981,25 @@ async def run_natural_pipeline_stream(
                                         _close_tag = TAG_DEFS[_tag_name]["close"]
                                         ci = tag_buf.find(_close_tag)
                                         if ci == -1:
+                                            # ── False-positive tag-open guard (parity with the
+                                            # Claude branch above — same proven bug, session
+                                            # 71737af0: a model quoting its own tag syntax in
+                                            # prose must not trap the rest of its real text). ──
+                                            if (_tag_name in ("search", "filereq", "github", "history")
+                                                    and not _ctx_shape_checked):
+                                                _ctx_stripped = tag_buf.lstrip()
+                                                if _ctx_stripped:
+                                                    _ctx_shape_checked = True
+                                                    if _ctx_stripped[0] not in "[{":
+                                                        _reverted_text = TAG_DEFS[_tag_name]["open"] + tag_buf
+                                                        state = "normal"
+                                                        tag_buf = ""
+                                                        _dlog("ctx_tag_false_positive_reverted_gpt",
+                                                              session_id=session_id, user_id=user_id,
+                                                              tag_type=_tag_name, turn=_turn,
+                                                              reverted_len=len(_reverted_text),
+                                                              reverted_preview=_reverted_text[:200])
+                                                        yield sse({"type": "token", "content": _reverted_text})
                                             break
                                         _content = tag_buf[:ci]
                                         _remainder = tag_buf[ci + len(_close_tag):]
@@ -17921,6 +17974,32 @@ async def run_natural_pipeline_stream(
                     _dlog("eos_plan_recovered",
                           session_id=session_id, user_id=user_id,
                           plan_items=len(edit_plan_data) if edit_plan_data else 0)
+
+            elif state.startswith("in_") and state[3:] in ("search", "filereq", "github", "history"):
+                # ── Safety net for a stuck context-request tag ──────────────
+                # PROVEN BUG (session 71737af0): unlike in_edit/in_file/in_plan
+                # above, this branch had NO recovery/surface path at all before
+                # this fix — a search/filereq/github/history tag stuck open at
+                # end-of-stream fell straight to the generic "eos_unknown_state"
+                # log line and its entire buffered content (here, a real,
+                # legitimate 398-char explanation of a prior bug) was silently
+                # discarded with zero trace to the user. The mid-loop guard
+                # added alongside this fix stops the common cause (a quoted/
+                # prose mention of the tag syntax) from ever reaching here, but
+                # this is the last-resort backstop for any other way a request
+                # tag could end up stuck: never silently drop it — mirror the
+                # exact _rejected_prose contract already proven safe for
+                # in_edit/in_file above and surface the model's own words.
+                _uc2 = state[3:]
+                _open_lit = TAG_DEFS.get(_uc2, {}).get("open", f"<{_uc2}_request>")
+                _surface_text = _open_lit + tag_buf
+                state = "normal"
+                tag_buf = ""
+                _dlog("eos_ctx_tag_surfaced_as_text",
+                      session_id=session_id, user_id=user_id,
+                      kind=_uc2, surfaced_len=len(_surface_text),
+                      surfaced_preview=_surface_text[:200])
+                yield sse({"type": "token", "content": _surface_text})
 
             else:
                 _dlog("eos_unknown_state",
