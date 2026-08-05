@@ -493,7 +493,7 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
                 ? <PipelineTimeline steps={msg._steps} />
                 : <PersistentSteps steps={msg._steps} />
             )}
-            {msg._thinking && <ThinkingBlock text={msg._thinking} isStreaming={false} />}
+            {msg._thinking && <ThinkingBlock text={msg._thinking} isStreaming={false} sessionId={sessionId} />}
           </div>
         )}
         <SourcesRow sources={msg._sources} />
@@ -557,20 +557,45 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
 
 // ── Streaming bubble with thinking trail ──────────────────
 // ── Claude Thinking Block ─────────────────────────────────
-function ThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boolean }) {
+function ThinkingBlock({ text, isStreaming, sessionId }: { text: string; isStreaming: boolean; sessionId?: string }) {
   const [expanded, setExpanded] = useState(isStreaming)
+  // Tracks whether the user has explicitly clicked the toggle for *this*
+  // streaming turn. Claude's thinking often fires several thinking_start/
+  // thinking_end pairs within one turn (one pair per phase — e.g. think,
+  // call the web_search tool during Research, think again, answer). Each
+  // pair used to flip `isStreaming` false→true, and the old effect below
+  // force-synced `expanded` to match on *every* flip — wiping out whatever
+  // the user had just clicked open or closed. That's the "thinking keeps
+  // closing/resetting" bug, worst during Research because native web
+  // search is exactly what injects those extra mid-turn phase toggles.
+  //
+  // Fix: only ever auto-*expand* on the rising edge (thinking resumes) and
+  // only if the user hasn't touched the toggle yet this turn. Never
+  // auto-collapse mid-stream — a real end-of-turn unmounts this whole
+  // component (see StreamingBubble's isStreaming-gated render + the
+  // separate isStreaming={false} instance used for finalized messages), so
+  // there is nothing to reset once the turn truly ends.
+  const userToggledRef = useRef(false)
 
   useEffect(() => {
-    if (isStreaming) setExpanded(true)
-    else setExpanded(false)
+    if (isStreaming && !userToggledRef.current) setExpanded(true)
   }, [isStreaming])
+
+  const handleToggle = () => {
+    userToggledRef.current = true
+    setExpanded(prev => {
+      const next = !prev
+      clientLog('thinking_block_toggled', { expanded: next, isStreaming }, sessionId || '')
+      return next
+    })
+  }
 
   if (!text && !isStreaming) return null
 
   return (
     <div className="mb-3">
       <button
-        onClick={() => setExpanded(!expanded)}
+        onClick={handleToggle}
         className="flex items-center gap-2 text-xs text-purple hover:text-purple transition-colors"
       >
         <span className={`transform transition-transform duration-200 ${expanded ? 'rotate-90' : ''}`}>▶</span>
@@ -745,7 +770,7 @@ function PipelineTimeline({ steps, isLive = false }: { steps: string[]; isLive?:
   )
 }
 
-function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit, webSearchLive }: { content: string; progress: string; progressHistory: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean; webSearchLive?: { searching: boolean; query?: string } | null }) {
+function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit, webSearchLive, sessionId }: { content: string; progress: string; progressHistory: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean; webSearchLive?: { searching: boolean; query?: string } | null; sessionId?: string }) {
   const [elapsed, setElapsed] = useState(0)
 
   // Elapsed timer — ticks every second while streaming
@@ -807,7 +832,7 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
 
         {/* Claude thinking block */}
         {(thinkingText || isThinking) && (
-          <ThinkingBlock text={thinkingText || ''} isStreaming={!!isThinking} />
+          <ThinkingBlock text={thinkingText || ''} isStreaming={!!isThinking} sessionId={sessionId} />
         )}
 
         {/* Building edit indicator — shown while parsing a <surgical_edit> block */}
@@ -2449,7 +2474,7 @@ export function ChatPanel() {
             )}
             <AgentMissionControl />
             {isStreaming && (streamingMessage || streamProgress) && (
-              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} />
+              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} />
             )}
             {/* Human-in-the-loop: agent needs a file that isn't in the session */}
             {fileRequest && fileRequest.sessionId === activeSessions && (
