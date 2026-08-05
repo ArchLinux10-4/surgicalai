@@ -96,7 +96,18 @@ def _file_content_hash(content: str) -> str:
 
 
 def _ensure_file_manifest_table():
-    """Create session_file_manifest table if it doesn't exist. Idempotent."""
+    """Create session_file_manifest table if it doesn't exist. Idempotent.
+
+    Also backfills `ever_full_shown` on tables created before this column
+    existed (bug fix, session 71737af0): the manifest previously only
+    tracked byte-identity ("unchanged") across turns, never whether the
+    model had ever actually been shown the file's full content (Tier 1) as
+    opposed to a lean filename+line-count listing (Tier 2). A file that
+    sat in Tier 2 for its entire life still got badged "UNCHANGED —
+    already reviewed", and the steering note told the model not to
+    re-request/re-analyze it — even though the model had never seen a
+    single line of it. `ever_full_shown` closes that gap.
+    """
     try:
         from database import get_db_connection
         conn = get_db_connection()
@@ -108,20 +119,68 @@ def _ensure_file_manifest_table():
                     content_hash  TEXT NOT NULL,
                     first_seen_turn INTEGER NOT NULL DEFAULT 0,
                     last_seen_turn  INTEGER NOT NULL DEFAULT 0,
+                    ever_full_shown INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (session_id, filename)
                 )
             """)
             conn.commit()
+            try:
+                conn.execute(
+                    "ALTER TABLE session_file_manifest "
+                    "ADD COLUMN ever_full_shown INTEGER NOT NULL DEFAULT 0"
+                )
+                conn.commit()
+            except Exception:
+                # Column already exists (SQLite/Postgres both raise here) —
+                # expected on every call after the first successful ALTER.
+                pass
         finally:
             conn.close()
     except Exception:
         pass  # Table creation failure is non-fatal — falls back to "all files unknown"
 
 
+def _mark_files_full_shown(session_id: str, filenames) -> None:
+    """Persist that `filenames` had their FULL content shown to the model
+    this turn (Tier 1), so future turns know not to badge them as
+    "already reviewed" purely off a lean-index listing. Best-effort:
+    failures here must never break the response (matches the same
+    non-fatal pattern as `_ensure_file_manifest_table`/`_classify_session_files`).
+    """
+    if not session_id or not filenames:
+        return
+    try:
+        from database import get_db_connection
+        conn = get_db_connection()
+        try:
+            placeholders = ",".join(["?"] * len(filenames))
+            conn.execute(
+                f"UPDATE session_file_manifest SET ever_full_shown = 1 "
+                f"WHERE session_id = ? AND filename IN ({placeholders})",
+                (session_id, *filenames),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        _dlog("file_manifest_full_shown_marked",
+              session_id=session_id, count=len(filenames))
+    except Exception as e:
+        _dlog("file_manifest_full_shown_error", session_id=session_id, error=str(e))
+
+
 # File status constants used in context annotations
 _FILE_NEW      = "new"       # First time this file appears in this session
 _FILE_MODIFIED = "modified"  # File existed before but content changed
 _FILE_UNCHANGED = "unchanged" # File existed before with same content
+_FILE_LISTED_ONLY = "listed_only"  # Byte-unchanged, but full content has
+                                     # NEVER been shown to the model (Tier 2
+                                     # lean-index only) — must NOT be badged
+                                     # "already reviewed". Bug fix, session
+                                     # 71737af0: previously any UNCHANGED file
+                                     # got the "already reviewed" claim purely
+                                     # from content-hash history, even if it
+                                     # had sat in the lean index (filename +
+                                     # line count only) for its entire life.
 
 
 def _humanize_elapsed(timestamp_val) -> str:
@@ -187,18 +246,18 @@ def _classify_session_files(session_id: str, session_files: list,
     _ensure_file_manifest_table()
 
     # ── Load existing manifest from DB ──
-    existing = {}  # {filename: (content_hash, first_seen_turn, last_seen_turn)}
+    existing = {}  # {filename: (content_hash, first_seen_turn, last_seen_turn, ever_full_shown)}
     try:
         from database import get_db_connection
         conn = get_db_connection()
         try:
             rows = conn.execute(
-                "SELECT filename, content_hash, first_seen_turn, last_seen_turn "
+                "SELECT filename, content_hash, first_seen_turn, last_seen_turn, ever_full_shown "
                 "FROM session_file_manifest WHERE session_id = ?",
                 (session_id,)
             ).fetchall()
             for row in rows:
-                existing[row[0]] = (row[1], row[2], row[3])
+                existing[row[0]] = (row[1], row[2], row[3], row[4] or 0)
         finally:
             conn.close()
     except Exception as e:
@@ -207,7 +266,8 @@ def _classify_session_files(session_id: str, session_files: list,
 
     # ── Classify each file ──
     result = {}
-    upserts = []  # (session_id, filename, content_hash, first_seen_turn, last_seen_turn)
+    # (session_id, filename, content_hash, first_seen_turn, last_seen_turn, ever_full_shown)
+    upserts = []
 
     for sf in session_files:
         fname = sf["filename"]
@@ -219,20 +279,26 @@ def _classify_session_files(session_id: str, session_files: list,
         _elapsed = _humanize_elapsed(sf.get("updated_at") or sf.get("created_at"))
 
         if fname in existing:
-            old_hash, first_turn, _ = existing[fname]
+            old_hash, first_turn, _, ever_shown = existing[fname]
             if c_hash == old_hash:
                 status = _FILE_UNCHANGED
                 detail = f"present since turn {first_turn}, no changes"
             else:
                 status = _FILE_MODIFIED
                 detail = f"first seen turn {first_turn}, content changed this turn"
-            upserts.append((session_id, fname, c_hash, first_turn, current_turn))
-            result[fname] = {"status": status, "first_seen_turn": first_turn, "detail": detail, "elapsed": _elapsed}
+                # Content changed under our feet — a stale "full content
+                # already shown" claim from before the edit is no longer
+                # trustworthy, so require a fresh Tier-1 render to re-earn it.
+                ever_shown = 0
+            upserts.append((session_id, fname, c_hash, first_turn, current_turn, ever_shown))
+            result[fname] = {"status": status, "first_seen_turn": first_turn, "detail": detail,
+                              "elapsed": _elapsed, "ever_full_shown": bool(ever_shown)}
         else:
             status = _FILE_NEW
             detail = "added this turn"
-            upserts.append((session_id, fname, c_hash, current_turn, current_turn))
-            result[fname] = {"status": status, "first_seen_turn": current_turn, "detail": detail, "elapsed": _elapsed}
+            upserts.append((session_id, fname, c_hash, current_turn, current_turn, 0))
+            result[fname] = {"status": status, "first_seen_turn": current_turn, "detail": detail,
+                              "elapsed": _elapsed, "ever_full_shown": False}
 
     # ── Persist updated manifest ──
     try:
@@ -240,22 +306,26 @@ def _classify_session_files(session_id: str, session_files: list,
         conn = get_db_connection()
         try:
             for row in upserts:
-                # Upsert: INSERT OR REPLACE for SQLite, ON CONFLICT for Postgres
+                # Upsert: INSERT OR REPLACE for SQLite, ON CONFLICT for Postgres.
+                # ever_full_shown (row[5]) is carried forward explicitly on both
+                # paths — it must NOT be reset to 0 on every turn, only ever
+                # advanced to 1 by `_mark_files_full_shown` when Tier 1 actually
+                # renders the file's full content.
                 try:
                     conn.execute(
                         """INSERT INTO session_file_manifest
-                           (session_id, filename, content_hash, first_seen_turn, last_seen_turn)
-                           VALUES (?, ?, ?, ?, ?)
+                           (session_id, filename, content_hash, first_seen_turn, last_seen_turn, ever_full_shown)
+                           VALUES (?, ?, ?, ?, ?, ?)
                            ON CONFLICT (session_id, filename)
-                           DO UPDATE SET content_hash = ?, last_seen_turn = ?""",
-                        (row[0], row[1], row[2], row[3], row[4], row[2], row[4])
+                           DO UPDATE SET content_hash = ?, last_seen_turn = ?, ever_full_shown = ?""",
+                        (row[0], row[1], row[2], row[3], row[4], row[5], row[2], row[4], row[5])
                     )
                 except Exception:
                     # Fallback: try INSERT OR REPLACE (SQLite)
                     conn.execute(
                         """INSERT OR REPLACE INTO session_file_manifest
-                           (session_id, filename, content_hash, first_seen_turn, last_seen_turn)
-                           VALUES (?, ?, ?, ?, ?)""",
+                           (session_id, filename, content_hash, first_seen_turn, last_seen_turn, ever_full_shown)
+                           VALUES (?, ?, ?, ?, ?, ?)""",
                         row
                     )
             conn.commit()
@@ -267,7 +337,16 @@ def _classify_session_files(session_id: str, session_files: list,
     _dlog("file_manifest_classified",
           session_id=session_id,
           current_turn=current_turn,
-          classifications={fn: cl["status"] for fn, cl in result.items()})
+          classifications={fn: cl["status"] for fn, cl in result.items()},
+          # Bug fix, session 71737af0: surfaces which UNCHANGED/MODIFIED
+          # files never actually had their full content shown to the model
+          # (still lean-index-only) — the exact condition that produced a
+          # false "already reviewed" badge and blocked the model from
+          # re-requesting a file it had never seen.
+          never_shown_count=sum(
+              1 for cl in result.values()
+              if cl["status"] in (_FILE_UNCHANGED, _FILE_MODIFIED) and not cl["ever_full_shown"]
+          ))
 
     return result
 
@@ -289,6 +368,16 @@ def _file_status_badge(status: str, elapsed: str = "") -> str:
         return (
             f"📎 UNCHANGED — first seen {elapsed}, already reviewed"
             if elapsed else "📎 UNCHANGED from previous turn"
+        )
+    elif status == _FILE_LISTED_ONLY:
+        # Bug fix, session 71737af0: this file's bytes haven't changed since
+        # first upload, but its full content has NEVER actually been shown to
+        # the model (lean-index only, every turn). Must not claim "already
+        # reviewed" — that false claim is what stopped the model from ever
+        # emitting <file_request> for it.
+        return (
+            f"📋 LISTED — first seen {elapsed}, NOT yet loaded"
+            if elapsed else "📋 LISTED — NOT yet loaded"
         )
     return ""
 from models.schemas import (
@@ -14798,6 +14887,37 @@ def _build_natural_file_context(
     tier1.sort(key=lambda sf: original_order.get(sf["filename"], 999))
     tier2.sort(key=lambda sf: original_order.get(sf["filename"], 999))
 
+    # ── Bug fix, session 71737af0 ──────────────────────────────────────────
+    # Root cause (proven from log): a file uploaded N turns ago that has
+    # NEVER once made it into Tier 1 (always demoted to the Tier 2 lean
+    # index — filename + line count only, zero code shown) was still
+    # getting the _FILE_UNCHANGED "📎 already reviewed" badge purely from
+    # byte-hash history. The steering note below then told the model NOT
+    # to re-request/re-analyze it. Result: the model believed it had
+    # already seen a file it had literally never seen a single line of,
+    # and never emitted <file_request> for it — "no edits produced" with
+    # the model itself reporting (correctly) that it never received the
+    # file's content despite needing it.
+    #
+    # Fix: only a Tier 2 file whose full content was ACTUALLY rendered in
+    # Tier 1 on some past turn (`ever_full_shown`, persisted in
+    # session_file_manifest) is allowed to keep the "already reviewed"
+    # framing. Every other Tier 2 file — regardless of byte-unchanged
+    # status — is reclassified to `_FILE_LISTED_ONLY` for THIS render only
+    # (the real classification in `file_statuses` is untouched, so future
+    # turns still see accurate history).
+    if file_statuses:
+        for fname, fs in file_statuses.items():
+            if fname in tier1_names:
+                fs["effective_status"] = fs.get("status")
+            elif fs.get("status") in (_FILE_UNCHANGED, _FILE_MODIFIED) and not fs.get("ever_full_shown"):
+                fs["effective_status"] = _FILE_LISTED_ONLY
+                _dlog("file_badge_downgraded_never_shown",
+                      session_id=session_id, filename=fname,
+                      original_status=fs.get("status"))
+            else:
+                fs["effective_status"] = fs.get("status")
+
     # ── Render Tier 1: full context ───────────────────────────────────────
     parts.append("━━━ UPLOADED FILES ━━━\n")
 
@@ -14808,8 +14928,13 @@ def _build_natural_file_context(
     # this tells Claude explicitly how to act on them. Matches Anthropic's
     # own guidance (timestamps as a relevance proxy) and the fix requested
     # in Claude Code issue #55063 for stale-attachment re-narration.
+    #
+    # Uses effective_status (not raw status) so a never-actually-shown
+    # Tier 2 file can't trigger a "you've already seen this" instruction —
+    # see the bug-fix block above.
     if file_statuses and any(
-        fs.get("status") in (_FILE_UNCHANGED, _FILE_MODIFIED) for fs in file_statuses.values()
+        fs.get("effective_status", fs.get("status")) in (_FILE_UNCHANGED, _FILE_MODIFIED)
+        for fs in file_statuses.values()
     ):
         parts.append(
             "📌 Some files/images below are marked UNCHANGED or MODIFIED — you have already "
@@ -14923,9 +15048,11 @@ def _build_natural_file_context(
         file_type   = sf.get("file_type", "code")
         lines_count = sf.get("lines", sf.get("content", "") and len(sf["content"].splitlines()) or 0)
 
-        # File status badge + real elapsed time
+        # File status badge + real elapsed time — uses effective_status
+        # (bug fix, session 71737af0) so a Tier 2 file that has never once
+        # had its full content shown can't be badged "already reviewed".
         _fs = file_statuses.get(fname, {}) if file_statuses else {}
-        _badge = _file_status_badge(_fs.get("status", ""), _fs.get("elapsed", "")) if _fs else ""
+        _badge = _file_status_badge(_fs.get("effective_status", _fs.get("status", "")), _fs.get("elapsed", "")) if _fs else ""
         _badge_suffix = f"  {_badge}" if _badge else ""
 
         if file_type in ("image", "pdf", "csv", "excel", "text"):
@@ -14946,6 +15073,15 @@ def _build_natural_file_context(
 
     for sf in tier1:
         parts.append(_render_full(sf))
+
+    # Persist which files genuinely had FULL content rendered this turn —
+    # excludes grep-excerpt/truncated-preview files (tier1_excerpt_only),
+    # which only got a partial window, not the complete file. This is what
+    # `ever_full_shown` means and what the bug-fix block above reads on
+    # future turns. Bug fix, session 71737af0.
+    _genuinely_full_this_turn = tier1_names - tier1_excerpt_only
+    if _genuinely_full_this_turn:
+        _mark_files_full_shown(session_id, sorted(_genuinely_full_this_turn))
 
     # ── Render Tier 2: lean index ─────────────────────────────────────────
     if tier2:
