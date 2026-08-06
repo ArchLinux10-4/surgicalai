@@ -630,13 +630,28 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
                 continue
             res.edit_json_strings.append(_json.dumps(args))
             res.results_by_id[cid] = "Surgical edit recorded."
+            # ── No-op detection at the earliest possible point ──
+            # Root-caused via session ecce169c (2026-08-06): Grok can emit a
+            # tool call that LOOKS like a real edit (non-empty old_code/new_code,
+            # first-pass QA scores it 9-10) but is actually old_code==new_code
+            # verbatim — a literal no-op. The second-pass CoVe verifier catches
+            # this downstream and caps the score, but by then we've lost the
+            # chance to see WHAT Grok actually sent (only lengths were logged).
+            # Log truncated previews + an explicit identical flag right here,
+            # at the moment the model's raw tool-call args are parsed, so a
+            # no-op can be confirmed/diagnosed without guessing.
+            _oc = str(args.get("old_code") or "")
+            _nc = str(args.get("new_code") or "")
             _log(dlog, "grok_translate_surgical_edit", session_id=session_id,
                  user_id=user_id, tool_call_id=cid,
                  filename=str(args.get("filename"))[:120],
                  symbol=str(args.get("symbol"))[:120],
-                 new_code_len=len(str(args.get("new_code"))),
-                 has_old_code=_nonempty_str(args.get("old_code")),
-                 has_lines=("edit_start_line" in args and "edit_end_line" in args))
+                 new_code_len=len(_nc),
+                 has_old_code=_nonempty_str(_oc),
+                 has_lines=("edit_start_line" in args and "edit_end_line" in args),
+                 old_code_preview=_oc[:400],
+                 new_code_preview=_nc[:400],
+                 old_new_identical=(bool(_oc) and _oc == _nc))
 
         elif name == TOOL_WRITE_NEW_FILE:
             if not _nonempty_str(args.get("filename")) or not _nonempty_str(args.get("content")):
