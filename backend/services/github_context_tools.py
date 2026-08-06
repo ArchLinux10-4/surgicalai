@@ -186,9 +186,108 @@ _READ_FILE_MAX_CHARS = 14000
 # list_files: cap entries so one giant monorepo can't blow up the context.
 _LIST_FILES_MAX_ENTRIES = 400
 
+# search_code fallback (bounded direct-content scan, only runs when GitHub's
+# code-search index returns zero hits — see _search_code_fallback_scan below
+# for why that happens and why retrying the search itself never helps).
+_SEARCH_FALLBACK_MAX_FILES = 40
+_SEARCH_FALLBACK_MAX_FILE_BYTES = 300_000
+_SEARCH_FALLBACK_MAX_MATCHES = 20
+_SEARCH_FALLBACK_SKIP_EXT = {
+    ".lock", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".pdf", ".woff", ".woff2",
+    ".ttf", ".eot", ".zip", ".tar", ".gz", ".mp4", ".mp3", ".wasm", ".so",
+    ".dylib", ".exe", ".bin", ".svg", ".webp", ".map",
+}
+_SEARCH_FALLBACK_SKIP_NAMES = {
+    "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "cargo.lock",
+    "poetry.lock", "composer.lock",
+}
+
 
 def is_github_context_tool(tool_name: str) -> bool:
     return tool_name in _TOOL_NAMES
+
+
+def _search_code_fallback_scan(r, ref: str, query: str, _log) -> str:
+    """GitHub's Code Search REST index does not cover every repository —
+    it commonly returns 0 hits with incomplete_results=True for new or
+    private repos regardless of the query, and retrying with different
+    search terms never helps (confirmed: GitHub community discussions
+    #18624, #66113, #72266 — indexing lag or repo simply not indexed yet).
+    When that happens, fall back to a bounded direct scan of file content
+    using the same get_git_tree/get_contents calls list_files and read_file
+    already use in production. Never raises — always returns a string
+    (possibly empty) so the caller can append it or skip it safely."""
+    tokens = [t.lower() for t in query.replace('"', " ").split() if len(t) >= 2]
+    if not tokens:
+        return ""
+    try:
+        tree = r.get_git_tree(ref, recursive=True)
+    except Exception as e:
+        _log("github_context_search_fallback_tree_error", error=str(e))
+        return ""
+
+    candidates = []
+    for e in tree.tree:
+        if e.type != "blob":
+            continue
+        name = e.path.rsplit("/", 1)[-1].lower()
+        ext = "." + name.rsplit(".", 1)[-1] if "." in name else ""
+        if name in _SEARCH_FALLBACK_SKIP_NAMES or ext in _SEARCH_FALLBACK_SKIP_EXT:
+            continue
+        if (e.size or 0) > _SEARCH_FALLBACK_MAX_FILE_BYTES:
+            continue
+        candidates.append(e)
+
+    # Cheap relevance boost: scan files whose path already mentions a
+    # query token before the rest, then cap total files scanned so one
+    # zero-hit search can't blow the tool's time/rate-limit budget.
+    def _path_hits(e):
+        p = e.path.lower()
+        return sum(1 for t in tokens if t in p)
+    candidates.sort(key=_path_hits, reverse=True)
+    candidates = candidates[:_SEARCH_FALLBACK_MAX_FILES]
+
+    _log("github_context_search_fallback_scan_start", candidate_count=len(candidates), tokens=tokens)
+
+    import base64
+    matches = []
+    scanned = 0
+    for e in candidates:
+        if len(matches) >= _SEARCH_FALLBACK_MAX_MATCHES:
+            break
+        try:
+            contents = r.get_contents(e.path, ref=ref)
+            if isinstance(contents, list) or contents.encoding != "base64" or contents.content is None:
+                continue
+            text = base64.b64decode(contents.content).decode("utf-8", errors="ignore")
+        except Exception as ex:
+            _log("github_context_search_fallback_file_error", path=e.path, error=str(ex))
+            continue
+        scanned += 1
+        lower_text = text.lower()
+        if all(t in lower_text for t in tokens):
+            snippet = None
+            for i, line in enumerate(text.splitlines(), start=1):
+                if any(t in line.lower() for t in tokens):
+                    snippet = f"{e.path}:{i}: {line.strip()[:180]}"
+                    break
+            matches.append(snippet or f"{e.path}: (match found, no single line shows all terms)")
+
+    _log("github_context_search_fallback_scan_done", scanned=scanned, matches=len(matches))
+    if not matches:
+        return (f"\n\n[Fallback direct-content scan of {scanned} files (code-search index "
+                f"returned no results for this repo) found no matches either — the terms may "
+                f"genuinely not be in the code, or may be in a file skipped by the scan (binary/lock/large-file filters).]")
+    lines = [
+        "\n\n[GitHub's code-search index returned no results for this repo — this is a known "
+        "GitHub limitation where new or private repos are often not indexed yet, not a query "
+        f"problem. Falling back to a direct scan of {scanned} files:]",
+        "",
+    ]
+    lines.extend(matches)
+    if len(matches) >= _SEARCH_FALLBACK_MAX_MATCHES:
+        lines.append(f"... stopped at {_SEARCH_FALLBACK_MAX_MATCHES} matches. Use read_file on a matched path for full context.")
+    return "\n".join(lines)
 
 
 def _find_client_for_repo(user_id: str, owner: str, repo: str, dlog: Callable):
@@ -394,6 +493,16 @@ def execute_github_context_tool(
                 count += 1
             if count == 0:
                 lines.append("(no matches — note: GitHub code search only indexes the default branch)")
+                try:
+                    ref = tool_input.get("ref") or r.default_branch
+                    _log("github_context_search_code_zero_hits_fallback_trigger", query=query, ref=ref)
+                    fallback_text = _search_code_fallback_scan(r, ref, query, _log)
+                    if fallback_text:
+                        lines.append(fallback_text)
+                except Exception as e:
+                    # Fallback must never break the tool call — search_code
+                    # still returns its original (if unhelpful) result.
+                    _log("github_context_search_code_fallback_unexpected_error", error=str(e))
             _log("github_context_search_code_ok", query=query, hit_count=count)
             result = "\n".join(lines)
 
