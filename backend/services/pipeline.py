@@ -24084,6 +24084,61 @@ async def run_natural_pipeline_stream(
                                       f"{len(_t_introduced)} compile error(s) after composing "
                                       f"{len(_tidxs)} edit(s) — shipping with a QA warning, review before applying"})
 
+        # ── Grok-only second QA pass — final accuracy round ────────────────
+        # Grok 4.5 diffs still slipped through the standard QA with subtler
+        # logic mistakes than Claude/GPT diffs (user-reported, confirmed via
+        # research — see grok_second_qa.py header for cited evidence). This
+        # runs ONE additional, independent CoVe-style verification pass,
+        # Grok-only, after all retries have already settled — the true
+        # "final" QA round. It only ever escalates on a concrete, cited
+        # defect; it never re-blocks on vague grounds (overcorrection-safe).
+        # New file, isolated: does not touch run_qa_agent / run_qa_for_changes.
+        if _is_grok_model(arch_model):
+            _dlog("grok_second_qa_round_start",
+                  session_id=session_id, user_id=user_id,
+                  arch_model=arch_model, change_count=len(change_shells))
+            try:
+                from services.grok_second_qa import run_grok_second_qa_pass
+                _g2_tasks = [
+                    (idx, asyncio.create_task(run_grok_second_qa_pass(
+                        qa_results[idx],
+                        original_code=change_shells[idx]["symbol"].code,
+                        new_code=change_shells[idx]["new_code"],
+                        change_description=change_shells[idx]["description"],
+                        filename=change_shells[idx]["filename"],
+                        symbol_path=change_shells[idx]["symbol"].name,
+                        session_id=session_id or "",
+                        user_id=user_id,
+                    )))
+                    for idx in range(len(qa_results))
+                    if qa_results[idx].get("verdict") != "blocked"
+                ]
+                for _g2_idx, _g2_task in _g2_tasks:
+                    try:
+                        qa_results[_g2_idx] = await _g2_task
+                    except Exception as _g2_task_err:
+                        _dlog("grok_second_qa_task_error",
+                              session_id=session_id, user_id=user_id,
+                              filename=change_shells[_g2_idx]["filename"],
+                              error_type=type(_g2_task_err).__name__,
+                              error=str(_g2_task_err)[:300])
+                        # Fail open — keep the existing first-pass qa_result.
+                yield sse({"type": "progress",
+                           "content": f"🔎 Grok second-pass QA: verified {len(_g2_tasks)} change(s)"})
+                _dlog("grok_second_qa_round_done",
+                      session_id=session_id, user_id=user_id,
+                      verified_count=len(_g2_tasks),
+                      escalated_count=sum(
+                          1 for idx in range(len(qa_results))
+                          if qa_results[idx].get("grok_second_pass", {}).get("verdict") == "concrete_issue_found"
+                      ))
+            except Exception as _g2_round_err:
+                _dlog("grok_second_qa_round_error",
+                      session_id=session_id, user_id=user_id,
+                      error_type=type(_g2_round_err).__name__,
+                      error=str(_g2_round_err)[:300])
+                # Fail open — never let this extra round affect delivery.
+
         # ── Assemble SurgicalChange objects from results
         # ADVISORY 8/10 GATE — NOT a hard block. Every change ships regardless
         # of QA outcome. Anything blocked, skipped (QA could not run), unscored,
