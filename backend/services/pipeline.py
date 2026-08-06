@@ -19982,6 +19982,22 @@ async def run_natural_pipeline_stream(
                                     "_symbol_start": symbol.start_line,
                                 })
                                 continue
+                            # ── No-op visibility (session ecce169c) ──
+                            # The splice can "succeed" (old_code matched uniquely)
+                            # while still being a genuine no-op if old_code ==
+                            # new_code verbatim. This is the earliest point at
+                            # which we know the actual match outcome; log it so
+                            # a no-op edit that later gets QA-blocked can be
+                            # traced back to exactly this splice instead of
+                            # guessed at from the QA layer alone.
+                            _dlog("snippet_apply_succeeded",
+                                  session_id=session_id, user_id=user_id,
+                                  filename=filename, symbol=symbol_name,
+                                  model=arch_model,
+                                  match_reason=snip_reason,
+                                  old_code_preview=old_code[:400],
+                                  new_code_preview=new_code[:400],
+                                  old_new_identical=(old_code == new_code))
                             edit_data["new_code"] = full_new
                             edit_data.pop("old_code", None)  # now a full-symbol edit
                         else:
@@ -22857,7 +22873,8 @@ async def run_natural_pipeline_stream(
                                   symbol=change_shells[idx]["symbol"].name,
                                   ok=_ok_snip,
                                   reason=_snip_reason,
-                                  result_chars=len(_full) if _full else 0)
+                                  result_chars=len(_full) if _full else 0,
+                                  old_new_identical=(corrected_old == corrected_code))
 
                             if _ok_snip:
                                 accepted = _full
