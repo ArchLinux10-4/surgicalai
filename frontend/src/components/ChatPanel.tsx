@@ -797,12 +797,30 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
           {progress && (() => {
             const isHeal = /🔁|surgeon retry|auto.fix|fixing blocked/i.test(progress)
             const isQA = /running qa|QA\s*[✅⚠️🚫⏭]/i.test(progress)
+            // Tool-use phases (agent-mode github/codebase requests — mainly
+            // seen with Grok's native tool loop, but harmless for any model
+            // that reaches this dispatch code). Distinct from Claude's
+            // dedicated web-search pill below, which is a separate feature.
+            const isGithub = /🐙|github:/i.test(progress)
+            const isCodeSearch = /🔍|searching codebase/i.test(progress)
             const badgeCls = isHeal
               ? 'text-amber-400 bg-amber-500/10 border-amber-500/25 shadow-sm shadow-amber-500/10'
               : isQA
                 ? 'text-blue-400 bg-blue-500/10 border-blue-500/25'
-                : 'text-accent bg-accent/10 border-accent/20'
-            const dotCls = isHeal ? 'bg-amber-400' : isQA ? 'bg-blue-400' : 'bg-accent'
+                : isGithub
+                  ? 'text-violet-400 bg-violet-500/10 border-violet-500/25'
+                  : isCodeSearch
+                    ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/25'
+                    : 'text-accent bg-accent/10 border-accent/20'
+            const dotCls = isHeal
+              ? 'bg-amber-400'
+              : isQA
+                ? 'bg-blue-400'
+                : isGithub
+                  ? 'bg-violet-400'
+                  : isCodeSearch
+                    ? 'bg-emerald-400'
+                    : 'bg-accent'
             return (
               <span className={`text-[11px] flex items-center gap-1.5 px-2 py-0.5 rounded-full border font-medium ${badgeCls}`}>
                 <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${dotCls}`} />
