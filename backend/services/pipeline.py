@@ -4085,19 +4085,18 @@ async def run_chat_stream(
     # Same knob Edit mode's agent_loop reads (services/pipeline.py ~14904),
     # so Ask/Plan and Edit share one source of truth instead of two
     # independently-hardcoded budgets.
-    # TEMPORARY (2026-08-06): raised 24->60 while we investigate why the
-    # search_code zero-hit fallback (PR #134) isn't always kicking in before
-    # the round budget is exhausted on new/private repos GitHub hasn't
-    # indexed yet (see PR #134 follow-up). This branch is ONLY ever reached
-    # from `if _ask_plan_tools_enabled and _is_grok_model(chat_model):` above
-    # — Grok-only, does not touch Claude or GPT/Gemini Ask/Plan loops, which
-    # never read this constant. Separate env var name (AGENT_MAX_TURNS_GROK)
-    # on purpose so Edit mode's shared AGENT_MAX_TURNS (default 24, used by
-    # Claude/GPT too) is completely untouched.
-    _ASK_PLAN_MAX_ROUNDS = int(_os.getenv("AGENT_MAX_TURNS_GROK", "60"))
+    # UPDATED (2026-08-06): raised 24->60 for ALL models (Grok, Claude, GPT,
+    # Gemini) per explicit user direction, while PR #134's search_code
+    # zero-hit fallback root cause on new/private un-indexed repos is still
+    # being investigated. This was previously Grok-only via a separate
+    # AGENT_MAX_TURNS_GROK env var; now every model reads the same
+    # AGENT_MAX_TURNS knob (default 60) so Ask/Plan and Edit stay in sync
+    # across all providers. Explicitly logged below so future sessions can
+    # see which model + round cap was actually in effect.
+    _ASK_PLAN_MAX_ROUNDS = int(_os.getenv("AGENT_MAX_TURNS", "60"))
     _dlog("ask_plan_max_rounds_configured", session_id=session_id, user_id=user_id,
           model=chat_model, max_rounds=_ASK_PLAN_MAX_ROUNDS,
-          note="temporary_60_cap_pending_pr134_root_cause_fix")
+          note="universal_60_cap_all_models_pending_pr134_root_cause_fix")
     # Wall-clock backstop, same purpose/value as Edit mode's
     # STREAMING_PHASE_DEADLINE_S (services/pipeline.py ~14430/14898). Separate
     # local constant — does NOT touch or share state with Edit mode's
@@ -16492,21 +16491,20 @@ async def run_natural_pipeline_stream(
         STREAMING_HEARTBEAT_S = int(_os.getenv("STREAMING_HEARTBEAT_S", "15"))
         _PHASE2_THINKING_CAP = int(_os.getenv("PHASE2_THINKING_CAP", "12000"))
         # Runaway backstop only — real termination is the deadline/budget above.
-        # TEMPORARY (2026-08-06): Grok gets a raised 60-round cap (separate
-        # AGENT_MAX_TURNS_GROK env var, default 60) while we investigate why
-        # the search_code zero-hit fallback (PR #134) isn't always kicking in
-        # before 24 rounds exhaust on new/private repos GitHub hasn't indexed
-        # yet. Claude and GPT/Gemini are NOT touched — they keep reading
-        # AGENT_MAX_TURNS (default 24, unchanged) via the same shared loop.
+        # UPDATED (2026-08-06): raised 24->60 for ALL models (Grok, Claude,
+        # GPT, Gemini) per explicit user direction, while PR #134's
+        # search_code zero-hit fallback root cause on new/private un-indexed
+        # repos is still being investigated. Previously Grok-only via a
+        # separate AGENT_MAX_TURNS_GROK env var; now every model shares the
+        # single AGENT_MAX_TURNS knob (default 60). Kept as one env var
+        # (not per-model) so all providers get the same ceiling and stay in
+        # sync going forward.
         _agent_max_turns_is_grok = _is_grok_model(arch_model)
-        AGENT_MAX_TURNS = (
-            int(_os.getenv("AGENT_MAX_TURNS_GROK", "60")) if _agent_max_turns_is_grok
-            else int(_os.getenv("AGENT_MAX_TURNS", "24"))
-        )
+        AGENT_MAX_TURNS = int(_os.getenv("AGENT_MAX_TURNS", "60"))
         _dlog("agent_max_turns_configured", session_id=session_id, user_id=user_id,
               model=arch_model, is_grok=_agent_max_turns_is_grok,
               max_turns=AGENT_MAX_TURNS,
-              note="temporary_grok_only_60_cap_pending_pr134_root_cause_fix")
+              note="universal_60_cap_all_models_pending_pr134_root_cause_fix")
         MAX_FILE_REQ_TOTAL = 15
         # Hard, independent circuit breaker for `<file_request>` — see
         # `check_filereq_hard_limit` docstring for why this exists as a
