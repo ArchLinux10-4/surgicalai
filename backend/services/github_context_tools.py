@@ -320,12 +320,25 @@ def execute_github_context_tool(
     tool_input: Dict,
     user_id: str,
     dlog: Optional[Callable] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """Execute one of the GitHub context tools. Never raises — always
     returns a string so the tool-use loop can always form a valid
-    tool_result block, even on total failure."""
+    tool_result block, even on total failure.
+
+    ``session_id`` (added alongside the PR #134 search_code fallback
+    investigation) is purely additive: every _log(...) call inside this
+    function — including calls made through the ``_log`` closure passed
+    down into ``_find_client_for_repo`` and ``_search_code_fallback_scan``
+    — now carries it automatically via kw.setdefault below, so these
+    events show up in per-session debug exports instead of an untagged
+    bucket. No behavior/return-value change for any caller (Claude, GPT,
+    or Grok) — logging only.
+    """
 
     def _log(event, **kw):
+        kw.setdefault("session_id", session_id)
+        kw.setdefault("user_id", user_id)
         if dlog:
             try:
                 dlog(event, **kw)

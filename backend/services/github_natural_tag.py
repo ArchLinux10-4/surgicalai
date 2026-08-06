@@ -307,14 +307,27 @@ def _list_repos(user_id: str, dlog: Optional[Callable]) -> str:
 
 
 def execute_github_request(parsed: dict, user_id: str,
-                           dlog: Optional[Callable] = None) -> str:
+                           dlog: Optional[Callable] = None,
+                           session_id: Optional[str] = None) -> str:
     """Execute one parsed github_request. Always returns a string —
-    never raises, so the streaming loop can always continue."""
+    never raises, so the streaming loop can always continue.
+
+    ``session_id`` (added during the PR #134 fallback investigation) is
+    threaded into this function's own start/done/error events AND passed
+    through to execute_github_context_tool so its internal events (list_files,
+    search_code, the zero-hit fallback scan, etc.) are also tagged — closing
+    the blind spot where these events were previously untagged and invisible
+    in per-session debug exports. Logging only — no behavior change.
+    """
+    def _log(event, **kw):
+        kw.setdefault("session_id", session_id)
+        _safe_dlog(dlog, event, **kw)
+
     try:
         tool = parsed.get("tool", "")
         args = parsed.get("args", {}) or {}
-        _safe_dlog(dlog, "natural_github_execute_start",
-                   user_id=user_id, tool=tool, args=args)
+        _log("natural_github_execute_start",
+             user_id=user_id, tool=tool, args=args)
 
         if tool == "list_repos":
             result = _list_repos(user_id, dlog)
@@ -323,14 +336,14 @@ def execute_github_request(parsed: dict, user_id: str,
             result = check_deploy_status(user_id, args, dlog=dlog)
         else:
             from services.github_context_tools import execute_github_context_tool
-            result = execute_github_context_tool(tool, args, user_id, dlog=dlog)
+            result = execute_github_context_tool(tool, args, user_id, dlog=dlog, session_id=session_id)
 
-        _safe_dlog(dlog, "natural_github_execute_done",
-                   user_id=user_id, tool=tool, result_len=len(result))
+        _log("natural_github_execute_done",
+             user_id=user_id, tool=tool, result_len=len(result))
         return result[:16000]
     except Exception as e:
-        _safe_dlog(dlog, "natural_github_execute_error",
-                   user_id=user_id, error=str(e))
+        _log("natural_github_execute_error",
+             user_id=user_id, error=str(e))
         return f"[GitHub request failed: {e}]"
 
 
