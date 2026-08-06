@@ -35,6 +35,7 @@ BEHAVIOR:
   for visibility in the QA report, regardless of outcome.
 """
 
+import difflib
 import json
 import re
 
@@ -70,6 +71,12 @@ code fragment as the mechanism of the defect. Do NOT report style \
 preferences, naming nitpicks, or "could be cleaner" observations — those are \
 noise, not defects, and the first pass already covers style. If you cannot \
 cite a concrete mechanism, do not report it.
+3b. You are shown a UNIFIED DIFF of the exact change (lines starting with \
+"+" are added, "-" are removed, unprefixed lines are unchanged context). \
+A finding that claims the requested change "is not present" or "is missing" \
+is ONLY valid if you can cite the specific "+"/"-" line(s) proving it — \
+never claim code is absent merely because you don't see it restated outside \
+the diff; the diff IS the change.
 4. Respond with ONLY a JSON object (no prose, no markdown fences):
 {
   "verification_questions": ["q1", "q2", ...],
@@ -88,6 +95,90 @@ def _extract_json(text: str) -> dict:
     if not match:
         raise ValueError("No JSON object found in second-pass QA response")
     return json.loads(match.group(0))
+
+
+# Root cause (proven via surgical_debug_ecce169c.jsonl, 2026-08-06): the old
+# approach sent the FULL original/new symbol text, each independently capped
+# to 60K chars (head+tail split). Real symbols in this app are routinely
+# whole inline <script> blocks — one confirmed case was 145,268 chars — so
+# the edited function (measured at ~68% into the symbol) landed squarely in
+# the elided MIDDLE 85K chars. The second-pass verifier then correctly, and
+# truthfully, reported "the change is not present in the shown code" — it
+# wasn't hallucinating; the code was never shown to it. This is the
+# well-documented "lost in the middle" / truncation-blind-spot failure mode
+# for long-context LLM review (see e.g. context-management literature on
+# lost-in-the-middle effects), and this exact codebase already hit and fixed
+# an equivalent bug in `run_qa_agent` (raised 60K -> 200K + head/tail
+# elision) — but a symbol can always eventually exceed any fixed raw-blob
+# cap again, so a size cap alone is not a permanent fix.
+#
+# Fix: show a UNIFIED DIFF (with generous context) instead of two raw code
+# blobs. A diff scales with the SIZE OF THE CHANGE, not the size of the
+# symbol, so the edited lines are always included regardless of how large
+# the surrounding symbol grows — this is the same "give the model only the
+# relevant slice, not the whole undifferentiated blob" principle underlying
+# retrieval-over-raw-context best practice. A conservative cap remains as a
+# defensive fallback for the rare pathological case (e.g. a full-symbol
+# rewrite producing a massive diff), using the same head+tail elision
+# pattern already proven in `run_qa_agent`, plus a fallback to full-code
+# review if diff generation ever produces nothing despite the code actually
+# differing.
+_MAX_DIFF_CHARS = 100_000
+_MAX_FALLBACK_CODE_CHARS = 200_000  # matches run_qa_agent's proven cap
+
+
+def _cap_with_elision(text: str, max_chars: int) -> tuple[str, bool]:
+    """Head+tail elision (never a naive tail-only cut) — returns (capped_text, was_capped)."""
+    if len(text) <= max_chars:
+        return text, False
+    half = max_chars // 2
+    dropped = len(text) - (2 * half)
+    return (
+        text[:half]
+        + f"\n\n... [{dropped} chars elided from the MIDDLE — head and tail shown in full] ...\n\n"
+        + text[-half:]
+    ), True
+
+
+def _build_review_content(
+    original_code: str, new_code: str, *, session_id: str, user_id: str, filename: str, symbol_path: str,
+) -> str:
+    """Builds the code content shown to the second-pass verifier as a unified
+    diff, so the reviewed slice always scales with the size of the CHANGE
+    rather than the size of the whole symbol. Falls back to capped full-code
+    review only if diffing produces nothing despite the code differing."""
+    orig_lines = (original_code or "").splitlines(keepends=True)
+    new_lines = (new_code or "").splitlines(keepends=True)
+    diff_lines = list(difflib.unified_diff(
+        orig_lines, new_lines, fromfile="ORIGINAL", tofile="NEW (after change)", n=20,
+    ))
+    diff_text = "".join(diff_lines)
+    hunk_count = sum(1 for l in diff_lines if l.startswith("@@"))
+
+    if not diff_text.strip() and (original_code or "").strip() != (new_code or "").strip():
+        # Defensive fallback: diffing produced nothing (e.g. line-ending-only
+        # divergence) despite the code genuinely differing — never silently
+        # show an empty diff. Fall back to full capped code, matching
+        # run_qa_agent's proven 200K approach, so the verifier is never
+        # shown less than before this fix.
+        _dlog("grok_second_qa_diff_empty_fallback",
+              session_id=session_id, user_id=user_id, filename=filename, symbol_path=symbol_path,
+              original_len=len(original_code or ""), new_len=len(new_code or ""))
+        orig_capped, _ = _cap_with_elision(original_code or "", _MAX_FALLBACK_CODE_CHARS)
+        new_capped, _ = _cap_with_elision(new_code or "", _MAX_FALLBACK_CODE_CHARS)
+        content = f"ORIGINAL CODE:\n```\n{orig_capped}\n```\n\nNEW CODE (after change):\n```\n{new_capped}\n```"
+        _dlog("grok_second_qa_content_built",
+              session_id=session_id, user_id=user_id, filename=filename, symbol_path=symbol_path,
+              mode="full_code_fallback", content_len=len(content), hunk_count=0, diff_capped=False)
+        return content
+
+    diff_capped_text, was_capped = _cap_with_elision(diff_text, _MAX_DIFF_CHARS)
+    content = f"UNIFIED DIFF OF THE CHANGE:\n```diff\n{diff_capped_text}\n```"
+    _dlog("grok_second_qa_content_built",
+          session_id=session_id, user_id=user_id, filename=filename, symbol_path=symbol_path,
+          mode="unified_diff", content_len=len(content), hunk_count=hunk_count, diff_capped=was_capped,
+          original_symbol_len=len(original_code or ""), new_symbol_len=len(new_code or ""))
+    return content
 
 
 async def run_grok_second_qa_pass(
@@ -124,23 +215,17 @@ async def run_grok_second_qa_pass(
         return qa_result
 
     try:
-        # Cap code shown to keep this pass fast + focused (same 200K-char
-        # ceiling philosophy as run_qa_agent, but a tighter cap is fine here
-        # since this pass targets the already-narrowed change, not full-file
-        # review).
-        _MAX_CHARS = 60_000
-
-        def _cap(_c: str) -> str:
-            if len(_c) <= _MAX_CHARS:
-                return _c
-            half = _MAX_CHARS // 2
-            return _c[:half] + "\n... [elided for second-pass review] ...\n" + _c[-half:]
+        # Diff-based content (not raw capped blobs) — see _build_review_content
+        # docstring for the proven root-cause evidence behind this approach.
+        _review_content = _build_review_content(
+            original_code, new_code,
+            session_id=session_id, user_id=user_id, filename=filename, symbol_path=symbol_path,
+        )
 
         user_prompt = (
             f"FILE: {filename}\nSYMBOL: {symbol_path}\n\n"
             f"REQUESTED CHANGE:\n{change_description}\n\n"
-            f"ORIGINAL CODE:\n```\n{_cap(original_code)}\n```\n\n"
-            f"NEW CODE (after change):\n```\n{_cap(new_code)}\n```\n\n"
+            f"{_review_content}\n\n"
             f"FIRST-PASS QA SUMMARY: {qa_result.get('summary', '(none)')}"
         )
 
@@ -159,7 +244,21 @@ async def run_grok_second_qa_pass(
         parsed = _extract_json(raw_text)
 
         concrete_findings = parsed.get("concrete_findings", []) or []
-        blocking_findings = [f for f in concrete_findings if f.get("severity") == "blocking"]
+        _all_blocking = [f for f in concrete_findings if f.get("severity") == "blocking"]
+        # Secondary safety net (defense-in-depth, not the root-cause fix — see
+        # _build_review_content above for that): the prompt already instructs
+        # the model to only report a finding it can cite (rule 3, and the
+        # overcorrection-avoidance mitigation cited in this file's own
+        # docstring), but that was never enforced in code. Enforce it here so
+        # a future uncited claim (from any cause) can never silently cap the
+        # score — it's downgraded and logged instead of trusted at face value.
+        blocking_findings = [f for f in _all_blocking if (f.get("cited_line_or_fragment") or "").strip()]
+        _uncited_dropped = [f for f in _all_blocking if not (f.get("cited_line_or_fragment") or "").strip()]
+        if _uncited_dropped:
+            _dlog("grok_second_qa_uncited_finding_discarded",
+                  session_id=session_id, user_id=user_id, filename=filename, symbol_path=symbol_path,
+                  discarded_count=len(_uncited_dropped),
+                  finding=_uncited_dropped[0].get("description", "")[:200])
 
         qa_result["grok_second_pass"] = {
             "verification_questions": parsed.get("verification_questions", []),
