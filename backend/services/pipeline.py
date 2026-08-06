@@ -23132,6 +23132,23 @@ async def run_natural_pipeline_stream(
                 _mw_any_spliced = False   # Bug 3 fix: track partial success
                 _mw_hard_fail = False     # True on parse error / bounds — not on no_edit
                 _mw_correction_model = "claude-sonnet-5"  # correction upgraded to Sonnet 5
+                # ── Memory-parity fix (proven live: session 36118be1) ──────
+                # Multi-window history previously recorded ONLY qa_score +
+                # qa_summary — no code_preview, no specific guard-rejection
+                # reason — even though the single-window path (line ~23062)
+                # records both. Proof this mattered: window_idx=1 of
+                # MiniDataInsightsPanel was rejected by the duplication guard
+                # with the IDENTICAL reason string ("repeated 4-line block,
+                # first at window line 32, repeated at window line 51") in
+                # retry_round 0 AND retry_round 1 — the model re-produced the
+                # exact same duplicate because it was never told the specific
+                # reason its last attempt was rejected, only a generic QA
+                # score. These two vars capture the last rejection's reason
+                # and a preview of the actual code that was rejected, per
+                # window, so _mw_hist_entry below can carry the same memory
+                # quality the single-window path already has.
+                _mw_last_reject_reason: dict[int, str] = {}
+                _mw_last_reject_preview: dict[int, str] = {}
 
                 # ── Fix 2+3: Filter windows to only relevant ones ─────────
                 # Fix 2: Skip windows with changed_line_count == 0 (no diff
@@ -23322,8 +23339,19 @@ async def run_natural_pipeline_stream(
                                 f"QA rejected (score {_mwh.get('qa_score', '?')}/10) — "
                                 f"{_mwh.get('qa_summary', 'no summary')}"
                             )
+                            # Memory-parity fix: mirror the single-window
+                            # path's code_preview so the model can see what
+                            # it actually wrote last round (previously always
+                            # blank for multi-window — proven live to cause
+                            # the same guard rejection to repeat verbatim
+                            # across rounds, session 36118be1).
+                            if _mwh.get("code_preview"):
+                                _mw_hist_parts.append(
+                                    f"    Code tried: {_mwh['code_preview']}"
+                                )
                         _mw_history_block = (
-                            "\n\nPREVIOUS CORRECTION ATTEMPTS (do NOT repeat these):\n"
+                            "\n\nPREVIOUS CORRECTION ATTEMPTS (do NOT repeat these — "
+                            "they were already tried and rejected):\n"
                             + "\n".join(_mw_hist_parts) + "\n"
                         )
                         _dlog("correction_mw_history_injected",
@@ -23712,6 +23740,13 @@ async def run_natural_pipeline_stream(
                                   note="window rejected — not spliced, will retry next round instead of shipping truncated content")
                             _mw_all_ok = False
                             _mw_hard_fail = True  # treat as hard fail: abandon this round's splice for this symbol, do not corrupt change_shells
+                            # ── Memory-parity fix: capture for history ──
+                            _mw_last_reject_reason[_mw_idx] = (
+                                f"window {_mw_wi + 1}/{len(_mw_windows)} rejected — "
+                                f"content-loss guard: expected ~{_mw_expected} lines, "
+                                f"got {len(_mw_corrected)} (truncated content)"
+                            )
+                            _mw_last_reject_preview[_mw_idx] = "\n".join(_mw_corrected)[:300]
                             break
 
                         # ── Content-duplication guard (proven live: session ──
@@ -23736,6 +23771,18 @@ async def run_natural_pipeline_stream(
                                   note="window rejected — not spliced, will retry next round instead of shipping duplicated content")
                             _mw_all_ok = False
                             _mw_hard_fail = True
+                            # ── Memory-parity fix: capture for history ──
+                            # This is the exact reason the model needs to see
+                            # next round — proven live (session 36118be1):
+                            # without this, the model produced the IDENTICAL
+                            # duplicate ("repeated 4-line block, first at
+                            # window line 32, repeated at window line 51")
+                            # in both retry_round 0 and retry_round 1.
+                            _mw_last_reject_reason[_mw_idx] = (
+                                f"window {_mw_wi + 1}/{len(_mw_windows)} rejected — "
+                                f"duplication guard: {_mw_dup_reason}"
+                            )
+                            _mw_last_reject_preview[_mw_idx] = "\n".join(_mw_corrected)[:300]
                             break
 
                         # ── Content-gain size guard (symmetric backstop) ──
@@ -23754,6 +23801,13 @@ async def run_natural_pipeline_stream(
                                   note="window rejected — not spliced, will retry next round instead of shipping over-length content")
                             _mw_all_ok = False
                             _mw_hard_fail = True
+                            # ── Memory-parity fix: capture for history ──
+                            _mw_last_reject_reason[_mw_idx] = (
+                                f"window {_mw_wi + 1}/{len(_mw_windows)} rejected — "
+                                f"content-gain guard: expected ~{_mw_expected} lines, "
+                                f"got {len(_mw_corrected)} (over-length / hallucinated content)"
+                            )
+                            _mw_last_reject_preview[_mw_idx] = "\n".join(_mw_corrected)[:300]
                             break
 
                         _mw_broken_lines[_mw_ws0:_mw_we0 + 1] = _mw_corrected
@@ -23862,15 +23916,37 @@ async def run_natural_pipeline_stream(
 
                 # ── Record multi-window attempt in correction history (Bug 2 fix) ──
                 _mw_qa_for_hist = qa_results[_mw_idx] if _mw_idx < len(qa_results) else {}
+                # Memory-parity fix (session 36118be1 evidence above): surface
+                # the SPECIFIC guard-rejection reason + a preview of the code
+                # that was actually rejected, when one of the size/duplication
+                # guards fired this round. Falls back to "" (old behavior)
+                # when no guard fired (e.g. plain QA-score rejection with no
+                # hard-fail guard involved) — additive only, no path removed.
+                _mw_reject_reason_this_round = _mw_last_reject_reason.get(_mw_idx, "")
+                _mw_qa_summary_text = (
+                    "; ".join(_mw_qa_for_hist.get("issues", [])[:3])
+                    if _mw_qa_for_hist.get("issues")
+                    else _mw_qa_for_hist.get("verdict", "no details")
+                )
+                if _mw_reject_reason_this_round:
+                    _mw_qa_summary_text = (
+                        f"{_mw_qa_summary_text} | AUTO-GUARD REJECTED YOUR "
+                        f"LAST ATTEMPT: {_mw_reject_reason_this_round}"
+                    )
                 _mw_hist_entry = {
                     "round": _qa_retry_round,
                     "qa_score": _mw_qa_for_hist.get("qa_score", "?"),
-                    "qa_summary": "; ".join(
-                        _mw_qa_for_hist.get("issues", [])[:3]
-                    ) if _mw_qa_for_hist.get("issues") else _mw_qa_for_hist.get("verdict", "no details"),
-                    "code_preview": "",  # multi-window: too fragmented for preview
+                    "qa_summary": _mw_qa_summary_text,
+                    "code_preview": _mw_last_reject_preview.get(_mw_idx, ""),
                     "accepted": _mw_idx in fixed_indices,
                 }
+                _dlog("correction_mw_memory_parity_applied",
+                      session_id=session_id, user_id=user_id,
+                      retry_round=_qa_retry_round, idx=_mw_idx,
+                      symbol=_mw_sym.name,
+                      had_guard_reason=bool(_mw_reject_reason_this_round),
+                      guard_reason=_mw_reject_reason_this_round,
+                      code_preview_chars=len(_mw_hist_entry["code_preview"]))
                 _correction_history.setdefault(_mw_idx, []).append(_mw_hist_entry)
                 _dlog("correction_mw_history_recorded",
                       session_id=session_id, user_id=user_id,
