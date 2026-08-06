@@ -16507,6 +16507,17 @@ async def run_natural_pipeline_stream(
         _github_reads_used = 0
         _github_writes_used = 0
         _github_attempts = 0
+        # Grok-only deterministic pagination backstop (proven root cause,
+        # session 36118be1): Grok's read_file result is truncated at ~14,000
+        # chars/call and tells the model to pass start_line to continue, but
+        # nothing forces it to actually do that. When it doesn't, this maps
+        # "owner|repo|path|ref" -> last line shown, so a repeat read_file on
+        # the SAME path with no (or stale) start_line auto-resumes from where
+        # the previous read left off instead of silently re-fetching page 1
+        # and wasting the whole turn. Claude/GPT never read this dict (only
+        # touched inside an `_is_grok_model(arch_model)` guard below) — zero
+        # effect on their already-working paths.
+        _grok_gh_read_progress: dict = {}
 
         _streaming_t0 = time.time()
         _round_t0 = time.time()
@@ -17334,7 +17345,7 @@ async def run_natural_pipeline_stream(
                         ]
                         continue
                     yield sse({"type": "progress",
-                               "content": f"Searching: {', '.join(new_terms[:3])}{'...' if len(new_terms)>3 else ''}"})
+                               "content": f"🔍 Searching codebase: {', '.join(new_terms[:3])}{'...' if len(new_terms)>3 else ''}"})
                     search_results = _resolve_search_multifile(
                         new_terms, symbol_maps_by_name, file_content_lookup_stream)
                     searched_terms.extend(new_terms)
@@ -17817,11 +17828,40 @@ async def run_natural_pipeline_stream(
                                 "<github_request>, or write your edits."},
                         ]
                         continue
+                    # ── Grok-only auto-continue backstop ──────────────────
+                    # See _grok_gh_read_progress comment above. Only rewrites
+                    # start_line for grok read_file calls on a path we've
+                    # already served a page of; Claude/GPT are untouched.
+                    _gh_key = None
+                    if _is_grok_model(arch_model) and _gh_tool == "read_file":
+                        _gh_args = _gh_req.get("args") if isinstance(_gh_req.get("args"), dict) else {}
+                        _gh_key = "|".join(str(_gh_args.get(k, "")) for k in ("owner", "repo", "path", "ref"))
+                        _gh_prev_end = _grok_gh_read_progress.get(_gh_key)
+                        _gh_req_start_line = _gh_args.get("start_line")
+                        if _gh_prev_end and (not _gh_req_start_line or int(_gh_req_start_line) <= 1):
+                            _gh_args = dict(_gh_args)
+                            _gh_args["start_line"] = _gh_prev_end + 1
+                            _gh_req = dict(_gh_req)
+                            _gh_req["args"] = _gh_args
+                            _dlog("grok_gh_auto_continue",
+                                  session_id=session_id, user_id=user_id,
+                                  path=_gh_args.get("path"), resumed_at=_gh_prev_end + 1)
+                    _gh_target = ""
+                    if isinstance(_gh_req.get("args"), dict):
+                        _gh_target = _gh_req["args"].get("path") or _gh_req["args"].get("query") or ""
+                    # 🐙 prefix lets the UI show a distinct "using GitHub tools"
+                    # phase pill instead of the generic accent dot (frontend:
+                    # ChatPanel.tsx StreamingBubble badge classifier).
                     yield sse({"type": "progress",
-                               "content": f"GitHub: {_gh_req.get('tool', 'request')}..."})
+                               "content": f"🐙 GitHub: {_gh_req.get('tool', 'request')}"
+                                          + (f" — {_gh_target}" if _gh_target else "") + "..."})
                     try:
                         _gh_result = execute_github_request(
                             _gh_req, user_id, dlog=_dlog)
+                        if _gh_key is not None:
+                            _gh_end_match = re.search(r"showing lines \d+-(\d+)", str(_gh_result))
+                            if _gh_end_match:
+                                _grok_gh_read_progress[_gh_key] = int(_gh_end_match.group(1))
                         if _gh_is_read:
                             _github_reads_used += 1
                         else:

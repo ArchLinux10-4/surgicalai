@@ -285,24 +285,77 @@ def _schema_request_search():
 
 
 def _schema_request_github():
+    # NOTE (proven root cause — session 36118be1, 2026-08-06): this schema used
+    # to expose only an opaque {tool, args} wrapper with ZERO documentation of
+    # what "tool" values exist or what each one accepts. Claude's equivalent
+    # native schema (services/github_context_tools.py) documents every op
+    # individually, INCLUDING read_file's "start_line" paging parameter — Grok's
+    # never did. Result: Grok never once passed start_line (confirmed: zero
+    # occurrences across a 620-event debug log) and instead re-requested the
+    # same file from the top repeatedly, always getting the same first ~14,000
+    # characters back, burning its entire agent-turn budget on a single large
+    # file without ever reaching an edit. This enum + per-op description gives
+    # Grok the same fidelity Claude already has. See also the deterministic
+    # start_line auto-continue backstop in pipeline.py's github dispatch
+    # (_kind == "github" branch) — this schema fix and that backstop are BOTH
+    # needed: the schema lets Grok ask correctly; the backstop guarantees
+    # forward progress even if it still doesn't.
     return {
         "type": "function",
         "function": {
             "name": TOOL_REQUEST_GITHUB,
             "description": (
-                "Read from the connected GitHub repository (list repos, read a "
-                "file, list a directory, etc.)."
+                "Read from the connected GitHub repository. Large files are "
+                "PAGED: read_file returns at most ~14,000 characters per call. "
+                "If the result ends with '[TRUNCATED — N more lines. Call "
+                "read_file again with start_line=X to continue.]', you have "
+                "NOT seen the whole file — pass that exact start_line on your "
+                "next read_file call for the SAME path to continue from where "
+                "you left off. Do NOT re-call read_file on the same path "
+                "without start_line — that just re-fetches the same first "
+                "page again and wastes a turn. Tip: call search_code first to "
+                "find which lines matter, then jump straight there with "
+                "start_line instead of paging through the whole file."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "tool": {
                         "type": "string",
-                        "description": "The GitHub operation name to invoke.",
+                        "description": (
+                            "The GitHub operation to invoke. One of: "
+                            "list_repos (no args) — list connected repos; "
+                            "list_files (owner, repo, path?, ref?) — list a "
+                            "directory; "
+                            "read_file (owner, repo, path, ref?, start_line?) "
+                            "— read file content, paged at ~14,000 chars; "
+                            "always pass start_line to continue past a "
+                            "'[TRUNCATED]' result; "
+                            "search_code (owner, repo, query) — search file "
+                            "contents (default branch only); returns matching "
+                            "paths, not line numbers — follow up with "
+                            "read_file; "
+                            "check_deploy (owner, repo) — check deploy status; "
+                            "list_prs / get_pr_diff / get_pr_comments / "
+                            "list_issues / get_issue_comments / diff_branches "
+                            "— see 'args' for each op's fields, mirrored "
+                            "from GitHub's REST API of the same name."
+                        ),
+                        "enum": [
+                            "list_repos", "list_files", "read_file",
+                            "search_code", "check_deploy", "list_prs",
+                            "get_pr_diff", "get_pr_comments", "list_issues",
+                            "get_issue_comments", "diff_branches",
+                        ],
                     },
                     "args": {
                         "type": "object",
-                        "description": "Arguments object for the operation (may be empty).",
+                        "description": (
+                            "Arguments for the chosen 'tool' (may be empty for "
+                            "list_repos). For read_file: {owner, repo, path, "
+                            "ref?, start_line?} — start_line is 1-indexed and "
+                            "REQUIRED to see past a truncated first page."
+                        ),
                     },
                 },
                 "required": ["tool"],
