@@ -685,6 +685,49 @@ function PersistentSteps({ steps }: { steps: string[] }) {
 // ── Pipeline Phase Timeline ─────────────────────────────────────────────
 // Structured phase indicator for surgical edits: Analyze → Code → QA → Done
 // Replaces raw step list with visual pipeline. Always visible, no collapse.
+//
+// Phase-text catalogue below must cover BOTH progress-string sources:
+//  (a) the legacy per-symbol pipeline ("Parsing file structure...",
+//      "Narrowing: ...", "found N symbols") — Claude/GPT's original path.
+//  (b) the native-tool agent loop ("✍️ Writing code changes...",
+//      "🔍 Searching codebase...", "Loading:", "🐙 GitHub:",
+//      "Checking history:") — shared by Claude/GPT/Grok when native tools
+//      are used (pipeline.py's agent loop, ~L16620+), but in practice this
+//      is Grok's primary edit path.
+//
+// Bug fixed here (Grok phase UI — proven from real pipeline.py progress
+// strings, not guessed): the (b) strings were NEVER matched by the old
+// regexes. "✍️ Writing code changes..." does not contain "preparing code",
+// and "Loading:"/"🔍 Searching codebase"/"🐙 GitHub:"/"Checking history:"
+// don't contain "loaded:" or any analyze-phase keyword. Result: while Grok
+// was doing real, possibly multi-minute work (search/load/github/write),
+// `reached` never advanced past the isLive-default fallback of 1 (Analyze)
+// — the UI showed "Analyze" pulsing the entire time. The FIRST progress
+// string that ever matched anything was the QA one ("Running QA on N
+// change(s)...", already matched by the qa regex below), which could arrive
+// seconds before the stream's `done` event. So the user saw: Analyze frozen
+// for the whole real duration, then Code+QA+Done all resolve within the
+// last couple of live renders — i.e., exactly the "everything flashes at
+// lightning speed at the end" report. Fix is additive-only: widen the
+// existing regexes to also recognize the native-tool-loop strings, so the
+// timeline advances in real time as Grok actually works, instead of relying
+// on the old catch-all default. No existing match is removed or narrowed.
+const _ANALYZE_PHASE_RE = /reading \d+ file|parsing file|found \d+ symbol|looking up|loaded:|claude is analyzing|searching codebase|^loading:|🐙 github:|checking history:/i
+const _CODE_PHASE_RE = /preparing code|narrowing:|writing code changes|✍️/i
+const _QA_PHASE_RE = /running qa|QA\s*[✅⚠️🚫⏭]/i
+
+// One-time-per-string debug log for progress text that matches NONE of the
+// three phase regexes above. Purely diagnostic — lets us catch the next
+// phase-text mismatch (e.g. a future GPT/Grok wording change) from real
+// clientLog data instead of another silent "stuck on Analyze" bug report.
+// Deduped + capped so it can never spam on a fast-streaming session.
+const _unmatchedPhaseTextSeen = new Set<string>()
+function _logUnmatchedPhaseText(s: string) {
+  if (_unmatchedPhaseTextSeen.has(s) || _unmatchedPhaseTextSeen.size > 200) return
+  _unmatchedPhaseTextSeen.add(s)
+  clientLog('pipeline_timeline_unmatched_progress', { text: s.slice(0, 200) })
+}
+
 function PipelineTimeline({ steps, isLive = false }: { steps: string[]; isLive?: boolean }) {
   const filtered = steps.filter(s => s !== 'Thinking...')
   if (!filtered.length) return null
@@ -696,12 +739,13 @@ function PipelineTimeline({ steps, isLive = false }: { steps: string[]; isLive?:
   let qaIcon = ''
 
   for (const s of filtered) {
-    if (/reading \d+ file|parsing file|found \d+ symbol|looking up|loaded:|claude is analyzing/i.test(s))
-      reached = Math.max(reached, 1)
-    if (/preparing code|narrowing:/i.test(s))
-      reached = Math.max(reached, 2)
-    if (/running qa|QA\s*[✅⚠️🚫⏭]/i.test(s))
-      reached = Math.max(reached, 3)
+    const isAnalyze = _ANALYZE_PHASE_RE.test(s)
+    const isCode = _CODE_PHASE_RE.test(s)
+    const isQA = _QA_PHASE_RE.test(s)
+    if (isAnalyze) reached = Math.max(reached, 1)
+    if (isCode) reached = Math.max(reached, 2)
+    if (isQA) reached = Math.max(reached, 3)
+    if (!isAnalyze && !isCode && !isQA && s !== 'Working...') _logUnmatchedPhaseText(s)
     if (/🔁|surgeon retry|auto.fix|fixing blocked/i.test(s))
       healed = true
     const scoreMatch = s.match(/score:\s*(\d+)/)
