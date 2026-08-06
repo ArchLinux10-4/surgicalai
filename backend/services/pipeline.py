@@ -3964,7 +3964,7 @@ def _ask_plan_execute_tool_round(
                 "Ask/Plan is read-only. Tell the user to switch to Agent/Edit "
                 "mode to make and push that change.")
         else:
-            gr_result = execute_github_request(gr_parsed, user_id, dlog=_dlog)
+            gr_result = execute_github_request(gr_parsed, user_id, dlog=_dlog, session_id=session_id)
             tool_parts.append(f"GitHub {gr_parsed.get('tool')} result:\n{gr_result}")
             _dlog("ask_plan_github_executed", session_id=session_id, user_id=user_id,
                   tool_round=tool_round, tool=gr_parsed.get("tool"),
@@ -4084,8 +4084,20 @@ async def run_chat_stream(
           tools_enabled=_ask_plan_tools_enabled)
     # Same knob Edit mode's agent_loop reads (services/pipeline.py ~14904),
     # so Ask/Plan and Edit share one source of truth instead of two
-    # independently-hardcoded budgets. Default 24 matches Edit mode exactly.
-    _ASK_PLAN_MAX_ROUNDS = int(_os.getenv("AGENT_MAX_TURNS", "24"))
+    # independently-hardcoded budgets.
+    # TEMPORARY (2026-08-06): raised 24->60 while we investigate why the
+    # search_code zero-hit fallback (PR #134) isn't always kicking in before
+    # the round budget is exhausted on new/private repos GitHub hasn't
+    # indexed yet (see PR #134 follow-up). This branch is ONLY ever reached
+    # from `if _ask_plan_tools_enabled and _is_grok_model(chat_model):` above
+    # — Grok-only, does not touch Claude or GPT/Gemini Ask/Plan loops, which
+    # never read this constant. Separate env var name (AGENT_MAX_TURNS_GROK)
+    # on purpose so Edit mode's shared AGENT_MAX_TURNS (default 24, used by
+    # Claude/GPT too) is completely untouched.
+    _ASK_PLAN_MAX_ROUNDS = int(_os.getenv("AGENT_MAX_TURNS_GROK", "60"))
+    _dlog("ask_plan_max_rounds_configured", session_id=session_id, user_id=user_id,
+          model=chat_model, max_rounds=_ASK_PLAN_MAX_ROUNDS,
+          note="temporary_60_cap_pending_pr134_root_cause_fix")
     # Wall-clock backstop, same purpose/value as Edit mode's
     # STREAMING_PHASE_DEADLINE_S (services/pipeline.py ~14430/14898). Separate
     # local constant — does NOT touch or share state with Edit mode's
@@ -11482,7 +11494,7 @@ USER REQUEST:
                                 yield sse({"type": "progress", "content":
                                            f"GitHub: {_tc['name'].replace('_', ' ')}..."})
                                 _gh_res = execute_github_context_tool(
-                                    _tc["name"], _tc["input"], user_id, dlog=_dlog
+                                    _tc["name"], _tc["input"], user_id, dlog=_dlog, session_id=session_id
                                 )
                                 _dlog("tu_github_context_tool_result", tool_name=_tc["name"],
                                       result_len=len(_gh_res), session_id=session_id)
@@ -12611,7 +12623,7 @@ USER REQUEST:
                             yield sse({"type": "progress", "content":
                                        f"GitHub: {_otc_name.replace('_', ' ')}..."})
                             _otc_result = execute_github_context_tool(
-                                _otc_name, _otc_input, user_id, dlog=_dlog
+                                _otc_name, _otc_input, user_id, dlog=_dlog, session_id=session_id
                             )
                             # P7: Register read_file result as session file
                             if _otc_name == "read_file" and _otc_result and not _otc_result.startswith("["):
@@ -16480,7 +16492,21 @@ async def run_natural_pipeline_stream(
         STREAMING_HEARTBEAT_S = int(_os.getenv("STREAMING_HEARTBEAT_S", "15"))
         _PHASE2_THINKING_CAP = int(_os.getenv("PHASE2_THINKING_CAP", "12000"))
         # Runaway backstop only — real termination is the deadline/budget above.
-        AGENT_MAX_TURNS = int(_os.getenv("AGENT_MAX_TURNS", "24"))
+        # TEMPORARY (2026-08-06): Grok gets a raised 60-round cap (separate
+        # AGENT_MAX_TURNS_GROK env var, default 60) while we investigate why
+        # the search_code zero-hit fallback (PR #134) isn't always kicking in
+        # before 24 rounds exhaust on new/private repos GitHub hasn't indexed
+        # yet. Claude and GPT/Gemini are NOT touched — they keep reading
+        # AGENT_MAX_TURNS (default 24, unchanged) via the same shared loop.
+        _agent_max_turns_is_grok = _is_grok_model(arch_model)
+        AGENT_MAX_TURNS = (
+            int(_os.getenv("AGENT_MAX_TURNS_GROK", "60")) if _agent_max_turns_is_grok
+            else int(_os.getenv("AGENT_MAX_TURNS", "24"))
+        )
+        _dlog("agent_max_turns_configured", session_id=session_id, user_id=user_id,
+              model=arch_model, is_grok=_agent_max_turns_is_grok,
+              max_turns=AGENT_MAX_TURNS,
+              note="temporary_grok_only_60_cap_pending_pr134_root_cause_fix")
         MAX_FILE_REQ_TOTAL = 15
         # Hard, independent circuit breaker for `<file_request>` — see
         # `check_filereq_hard_limit` docstring for why this exists as a
@@ -17591,7 +17617,7 @@ async def run_natural_pipeline_stream(
                                                     {"owner": _gh_fb_owner,
                                                      "repo": _gh_fb_repo,
                                                      "query": _gh_search_q},
-                                                    user_id, dlog=_dlog,
+                                                    user_id, dlog=_dlog, session_id=session_id,
                                                 )
                                                 # Parse paths from search results.
                                                 # Each hit line is just the path, e.g.
@@ -17857,7 +17883,7 @@ async def run_natural_pipeline_stream(
                                           + (f" — {_gh_target}" if _gh_target else "") + "..."})
                     try:
                         _gh_result = execute_github_request(
-                            _gh_req, user_id, dlog=_dlog)
+                            _gh_req, user_id, dlog=_dlog, session_id=session_id)
                         if _gh_key is not None:
                             _gh_end_match = re.search(r"showing lines \d+-(\d+)", str(_gh_result))
                             if _gh_end_match:
