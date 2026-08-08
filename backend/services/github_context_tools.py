@@ -20,6 +20,9 @@ Surgeon, QA, or correction handler — this module is not imported by any
 of them.
 """
 import itertools
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Dict, Optional
 
 from github import InputGitTreeElement
@@ -202,12 +205,54 @@ _SEARCH_FALLBACK_SKIP_NAMES = {
     "poetry.lock", "composer.lock",
 }
 
+# Fallback content fetches run concurrently instead of serially. Confirmed
+# root cause (log 46dc1cca-16c3-4643-b767-6ce0dad4829f): 40 serial
+# get_contents() calls per zero-hit search_code call burned the entire
+# Plan-mode round budget across a session's worth of searches, producing a
+# silent 398-char stub. Bounded worker count keeps this well under GitHub's
+# secondary rate limits (App installation tokens: ~5000 req/hr, and this
+# never exceeds _SEARCH_FALLBACK_MAX_FILES=40 concurrent-ish requests for
+# one search_code call).
+_SEARCH_FALLBACK_MAX_WORKERS = 8
+
+# Session-scoped git-tree cache. The same root cause log shows Plan mode
+# issuing many search_code / list_files calls against the same repo+ref
+# within one session — each one re-walked get_git_tree(recursive=True)
+# from scratch even though the tree cannot have changed between calls a
+# few seconds apart. Short TTL (not "forever") so a mid-session push by
+# the user (or push_files from this same tool) can't leave later calls
+# reading a stale tree for long.
+_TREE_CACHE_TTL_SECONDS = 180
+_tree_cache: Dict[str, tuple] = {}
+_tree_cache_lock = threading.Lock()
+
 
 def is_github_context_tool(tool_name: str) -> bool:
     return tool_name in _TOOL_NAMES
 
 
-def _search_code_fallback_scan(r, ref: str, query: str, _log) -> str:
+def _get_cached_tree(r, ref: str, owner: str, repo: str, _log):
+    """get_git_tree(recursive=True) wrapped with a short-TTL in-process
+    cache keyed by owner/repo@ref. Always returns the same object shape as
+    r.get_git_tree(...) (a Tree with .tree). Never raises on cache-layer
+    logic — cache errors fall through to a fresh direct call."""
+    key = f"{owner}/{repo}@{ref}"
+    now = time.monotonic()
+    with _tree_cache_lock:
+        cached = _tree_cache.get(key)
+    if cached and (now - cached[0]) < _TREE_CACHE_TTL_SECONDS:
+        _log("github_context_tree_cache_hit", key=key, age_s=round(now - cached[0], 1))
+        return cached[1]
+    t0 = time.monotonic()
+    tree = r.get_git_tree(ref, recursive=True)
+    elapsed_ms = round((time.monotonic() - t0) * 1000)
+    with _tree_cache_lock:
+        _tree_cache[key] = (now, tree)
+    _log("github_context_tree_cache_miss", key=key, fetch_ms=elapsed_ms, entry_count=len(tree.tree))
+    return tree
+
+
+def _search_code_fallback_scan(r, ref: str, query: str, _log, owner: str = "", repo: str = "") -> str:
     """GitHub's Code Search REST index does not cover every repository —
     it commonly returns 0 hits with incomplete_results=True for new or
     private repos regardless of the query, and retrying with different
@@ -221,7 +266,7 @@ def _search_code_fallback_scan(r, ref: str, query: str, _log) -> str:
     if not tokens:
         return ""
     try:
-        tree = r.get_git_tree(ref, recursive=True)
+        tree = _get_cached_tree(r, ref, owner, repo, _log)
     except Exception as e:
         _log("github_context_search_fallback_tree_error", error=str(e))
         return ""
@@ -247,33 +292,60 @@ def _search_code_fallback_scan(r, ref: str, query: str, _log) -> str:
     candidates.sort(key=_path_hits, reverse=True)
     candidates = candidates[:_SEARCH_FALLBACK_MAX_FILES]
 
-    _log("github_context_search_fallback_scan_start", candidate_count=len(candidates), tokens=tokens)
+    _log("github_context_search_fallback_scan_start", candidate_count=len(candidates), tokens=tokens,
+         max_workers=_SEARCH_FALLBACK_MAX_WORKERS)
 
     import base64
-    matches = []
-    scanned = 0
-    for e in candidates:
-        if len(matches) >= _SEARCH_FALLBACK_MAX_MATCHES:
-            break
+
+    def _fetch_one(e):
+        """Runs on a worker thread — must never raise; PyGithub's requests
+        calls release the GIL while blocked on network I/O, which is what
+        makes this fetch loop actually parallelize instead of just adding
+        thread overhead."""
         try:
             contents = r.get_contents(e.path, ref=ref)
             if isinstance(contents, list) or contents.encoding != "base64" or contents.content is None:
-                continue
+                return (e.path, None, None)
             text = base64.b64decode(contents.content).decode("utf-8", errors="ignore")
+            return (e.path, text, None)
         except Exception as ex:
-            _log("github_context_search_fallback_file_error", path=e.path, error=str(ex))
-            continue
-        scanned += 1
-        lower_text = text.lower()
-        if all(t in lower_text for t in tokens):
-            snippet = None
-            for i, line in enumerate(text.splitlines(), start=1):
-                if any(t in line.lower() for t in tokens):
-                    snippet = f"{e.path}:{i}: {line.strip()[:180]}"
-                    break
-            matches.append(snippet or f"{e.path}: (match found, no single line shows all terms)")
+            return (e.path, None, str(ex))
 
-    _log("github_context_search_fallback_scan_done", scanned=scanned, matches=len(matches))
+    matches = []
+    scanned = 0
+    errors = 0
+    scan_t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=_SEARCH_FALLBACK_MAX_WORKERS) as pool:
+        futures = {pool.submit(_fetch_one, e): e for e in candidates}
+        for fut in as_completed(futures):
+            if len(matches) >= _SEARCH_FALLBACK_MAX_MATCHES:
+                # Stop consuming results early. Futures already running
+                # finish naturally (their threads are already spawned);
+                # this only cancels ones the pool hasn't started yet, so
+                # it still trims the tail instead of waiting on all 40.
+                for other in futures:
+                    other.cancel()
+                break
+            path, text, err = fut.result()
+            if err is not None:
+                errors += 1
+                _log("github_context_search_fallback_file_error", path=path, error=err)
+                continue
+            if text is None:
+                continue
+            scanned += 1
+            lower_text = text.lower()
+            if all(t in lower_text for t in tokens):
+                snippet = None
+                for i, line in enumerate(text.splitlines(), start=1):
+                    if any(t in line.lower() for t in tokens):
+                        snippet = f"{path}:{i}: {line.strip()[:180]}"
+                        break
+                matches.append(snippet or f"{path}: (match found, no single line shows all terms)")
+
+    scan_elapsed_ms = round((time.monotonic() - scan_t0) * 1000)
+    _log("github_context_search_fallback_scan_done", scanned=scanned, matches=len(matches),
+         errors=errors, elapsed_ms=scan_elapsed_ms, candidate_count=len(candidates))
     if not matches:
         return (f"\n\n[Fallback direct-content scan of {scanned} files (code-search index "
                 f"returned no results for this repo) found no matches either — the terms may "
@@ -421,7 +493,7 @@ def execute_github_context_tool(
             ref = tool_input.get("ref") or r.default_branch
             path_prefix = tool_input.get("path_prefix") or ""
             _log("github_context_list_files", ref=ref, path_prefix=path_prefix)
-            tree = r.get_git_tree(ref, recursive=True)
+            tree = _get_cached_tree(r, ref, owner, repo, _log)
             blobs = [e for e in tree.tree if e.type == "blob"]
             if path_prefix:
                 blobs = [e for e in blobs if e.path.startswith(path_prefix)]
@@ -509,7 +581,7 @@ def execute_github_context_tool(
                 try:
                     ref = tool_input.get("ref") or r.default_branch
                     _log("github_context_search_code_zero_hits_fallback_trigger", query=query, ref=ref)
-                    fallback_text = _search_code_fallback_scan(r, ref, query, _log)
+                    fallback_text = _search_code_fallback_scan(r, ref, query, _log, owner=owner, repo=repo)
                     if fallback_text:
                         lines.append(fallback_text)
                 except Exception as e:
