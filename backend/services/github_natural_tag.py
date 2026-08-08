@@ -334,6 +334,19 @@ def execute_github_request(parsed: dict, user_id: str,
         elif tool == "check_deploy":
             from services.deploy_status import check_deploy_status
             result = check_deploy_status(user_id, args, dlog=dlog)
+        elif tool == "push_session_file":
+            # Wire-up fix: the prompt (see module docstring section on
+            # push_session_file) has always told the model to use this
+            # tool for session files, and push_session_file_from_db has
+            # been fully implemented below since it was added — but this
+            # dispatch never called it, so every request fell through to
+            # execute_github_context_tool()'s whitelist, which doesn't
+            # know this tool name, and returned "unknown tool". The model
+            # would then retry with push_files, which requires re-sending
+            # the ENTIRE file content on every push. This elif is the only
+            # change: it calls the already-existing, already-_dlog'd
+            # implementation instead of falling through.
+            result = push_session_file_from_db(parsed, user_id, session_id, dlog=dlog)
         else:
             from services.github_context_tools import execute_github_context_tool
             result = execute_github_context_tool(tool, args, user_id, dlog=dlog, session_id=session_id)
