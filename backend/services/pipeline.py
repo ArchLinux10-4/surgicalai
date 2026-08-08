@@ -6392,7 +6392,7 @@ def diff_introduced_errors(orig_errs: list, new_errs: list) -> list:
     return introduced
 
 
-def wrong_symbol_reason(symbol_name: str, new_code: str):
+def wrong_symbol_reason(symbol_name: str, new_code: str, symbol_code: str = ""):
     """
     Guard for correction full-replacements (session 6930f196): the corrector,
     told to fix a type error rooted in a SIBLING symbol, returned the
@@ -6402,10 +6402,30 @@ def wrong_symbol_reason(symbol_name: str, new_code: str):
 
     A full replacement that never mentions the target symbol's name is never
     a valid replacement for it. Returns a rejection reason, else ``None``.
+
+    Bug fix (session 93f5cff6, applies to every model): ``symbol_name`` is
+    often a SYNTHETIC id the pipeline assigns for indexing (e.g. Express
+    route handlers named ``route_post_api_admin_jobs_refresh_missing``) —
+    that literal string never appears anywhere in real source, only the
+    pipeline's own index uses it. Confirmed by fetching the live file
+    (marketrates.ai/backend/adminRoutes.js, 108KB): the route exists twice
+    via its real signature, but the synthesized id has ZERO occurrences.
+    A guard keyed only on that id false-positives on every correct
+    replacement for any synthesized-name symbol. Falling back to the
+    symbol's OWN first non-blank source line (its real signature, e.g.
+    ``app.post('/api/admin/jobs/refresh-missing', ...``) fixes synthetic
+    names without weakening the guard for symbols whose name IS a literal
+    identifier (unaffected — first branch above already covers those).
     """
     if not symbol_name or not new_code:
         return None
     if symbol_name in new_code:
+        return None
+    _sig_line = next(
+        (ln.strip() for ln in (symbol_code or "").splitlines() if ln.strip()),
+        "",
+    )
+    if _sig_line and len(_sig_line) >= 8 and _sig_line in new_code:
         return None
     return (
         f"new_code does not mention the target symbol `{symbol_name}` anywhere — "
@@ -10037,8 +10057,14 @@ def _regex_extract_edit_block(raw: str) -> dict | None:
     """
     _dlog("regex_extract_invoked", raw_len=len(raw))
     result = {}
+    # file_level_anchor/file_level_insert added (session 93f5cff6, all models):
+    # this fallback previously only knew about the old_code/new_code channel,
+    # so a truncated response using the file_level_anchor/file_level_insert
+    # channel (needed for append-only edits outside the target symbol) fell
+    # through every parser with nothing recovered.
     KNOWN_KEYS = ("filename", "symbol", "description", "old_code", "new_code",
-                  "edit_start_line", "edit_end_line")
+                  "edit_start_line", "edit_end_line",
+                  "file_level_anchor", "file_level_insert")
 
     # ── Find all field key positions to establish boundaries ──
     key_positions = []
@@ -10070,7 +10096,10 @@ def _regex_extract_edit_block(raw: str) -> dict | None:
                 result[field] = int(m_xml.group(1))
 
     # ── Code fields ──
-    for field in ("old_code", "new_code"):
+    # file_level_anchor/file_level_insert use the SAME quoted-string-with-code
+    # shape as old_code/new_code, so they share this exact extraction logic
+    # (session 93f5cff6, all models — see KNOWN_KEYS comment above).
+    for field in ("old_code", "new_code", "file_level_anchor", "file_level_insert"):
         # Try hybrid XML first: "field">...code...</field>
         m_xml = re.search(rf'"{field}"[^>]*>(.*?)</{field}>', raw, re.DOTALL)
         if m_xml:
@@ -10141,7 +10170,10 @@ def _regex_extract_edit_block(raw: str) -> dict | None:
                       had_literal_backslash_n=('\\n' in code))
             result[field] = unescaped
 
-    if result.get("filename") and result.get("new_code"):
+    if result.get("filename") and (
+        result.get("new_code")
+        or (result.get("file_level_anchor") and result.get("file_level_insert"))
+    ):
         # Tag which extraction formats were used for debugging
         _json_keys_found = len(key_positions)
         _xml_tags_used = any(
@@ -21042,6 +21074,19 @@ async def run_natural_pipeline_stream(
             except Exception:
                 pass  # keep current intermediate if apply fails; QA still runs
 
+            # ── _dlog: prove _x_note reaches the shell before QA ever runs ──
+            # Bug fix (session 93f5cff6): _x_note was computed above but
+            # never stored in this dict, so cs.get("_x_note") downstream
+            # (QA prompt build) was always None — QA saw a companion
+            # file-level insertion happen with zero description of it,
+            # concluded "no code changes were made", and blocked a correct
+            # append-only edit. Applies to every model (Claude/GPT/Grok all
+            # share this resolution phase).
+            if _x_ops:
+                _dlog("resolution_x_note_attached",
+                      session_id=session_id, user_id=user_id,
+                      filename=filename, symbol=symbol.name,
+                      extra_op_count=len(_x_ops), x_note_len=len(_x_note))
             change_shells.append({
                 "symbol":              symbol,
                 "sf_entry":            sf_entry,
@@ -21051,6 +21096,7 @@ async def run_natural_pipeline_stream(
                 "new_code":            new_code,
                 "description":         description,
                 "diff":                diff,
+                "_x_note":             _x_note,
                 "_tgt":                _tgt,
                 "_repl":               _repl,
                 "same_run":            _same_run,
@@ -22209,6 +22255,31 @@ async def run_natural_pipeline_stream(
                         )
 
                         if not _sr_match and not _fr_match:
+                            # Bug fix (session 93f5cff6, all models): a response
+                            # that opened <surgical_edit> but never wrote the
+                            # closing tag — most likely cut off mid-JSON by an
+                            # output-token limit on a large file_level_insert
+                            # payload — was discarded here even though it has
+                            # no further context request either (i.e. this WAS
+                            # the model's final, complete-intent answer). The
+                            # downstream parser chain (_extract_json_from_text /
+                            # _regex_extract_edit_block) already exists to
+                            # salvage exactly this kind of truncated payload —
+                            # it just never got the chance to run. Give it that
+                            # chance instead of giving up here.
+                            if ei != -1:
+                                _got_edit = True
+                                _dlog("qa_retry_correction_edit_open_no_close_salvage",
+                                      session_id=session_id, user_id=user_id,
+                                      retry_round=_qa_retry_round, idx=idx,
+                                      react_round=_corr_react_round,
+                                      symbol=change_shells[idx]["symbol"].name,
+                                      response_len=len(corr_text),
+                                      note="EDIT_OPEN found, no EDIT_CLOSE, no "
+                                           "further context request — treating as "
+                                           "a truncated final answer and routing "
+                                           "to the truncation-tolerant parser chain")
+                                break
                             _dlog("qa_retry_correction_no_edit_no_react",
                                   session_id=session_id, user_id=user_id,
                                   retry_round=_qa_retry_round, idx=idx,
@@ -22516,8 +22587,22 @@ async def run_natural_pipeline_stream(
                               via_symbol_accepted=False,
                               note="no_edit_or_clean_abort")
                         continue
-                    if ei != -1 and ec != -1:
-                        raw_edit = corr_text[ei + len(EDIT_OPEN):ec]
+                    if ei != -1:
+                        # Bug fix (session 93f5cff6, all models): previously
+                        # required BOTH tags (ei != -1 and ec != -1) to even
+                        # attempt parsing — a response missing only the
+                        # closing tag (round-1 example: 26,439 chars, a
+                        # complete reasoning preamble + a fully-formed
+                        # file_level_anchor/file_level_insert edit, just never
+                        # terminated with </surgical_edit>) never reached this
+                        # parser chain at all, even though every parser below
+                        # (_extract_json_from_text's brace-balancer,
+                        # _regex_extract_edit_block's field regexes) is
+                        # already built to tolerate exactly this. Feed them
+                        # whatever text exists from EDIT_OPEN to the end when
+                        # the close tag is missing instead of skipping them.
+                        _edit_truncated = ec == -1
+                        raw_edit = corr_text[ei + len(EDIT_OPEN):(ec if ec != -1 else len(corr_text))]
                         edit_data = None
                         for _parse_attempt_label, _parse_fn in [
                             ("json.loads", lambda t: json.loads(t)),
@@ -22527,23 +22612,34 @@ async def run_natural_pipeline_stream(
                         ]:
                             try:
                                 edit_data = _parse_fn(raw_edit.strip())
-                                if isinstance(edit_data, dict) and (edit_data.get("new_code") or (isinstance(edit_data.get("fixes"), list) and len(edit_data["fixes"]) > 0)):
+                                if isinstance(edit_data, dict) and (
+                                    edit_data.get("new_code")
+                                    or (isinstance(edit_data.get("fixes"), list) and len(edit_data["fixes"]) > 0)
+                                    or (edit_data.get("file_level_anchor") and edit_data.get("file_level_insert"))
+                                ):
                                     _corr_ext_fmt = edit_data.pop("_extraction_format", None)
                                     _dlog("qa_retry_correction_parse_method", session_id=session_id, user_id=user_id,
                                           retry_round=_qa_retry_round, idx=idx,
                                           symbol=change_shells[idx]["symbol"].name,
                                           method=_parse_attempt_label,
                                           extraction_format=_corr_ext_fmt,
+                                          truncated_no_close_tag=_edit_truncated,
                                           has_fixes=isinstance(edit_data.get("fixes"), list),
-                                          has_new_code=bool(edit_data.get("new_code")))
+                                          has_new_code=bool(edit_data.get("new_code")),
+                                          has_file_level_anchor=bool(edit_data.get("file_level_anchor")))
                                     break
                                 edit_data = None
                             except Exception:
                                 edit_data = None
-                        if not isinstance(edit_data, dict) or not (edit_data.get("new_code") or (isinstance(edit_data.get("fixes"), list) and len(edit_data["fixes"]) > 0)):
+                        if not isinstance(edit_data, dict) or not (
+                            edit_data.get("new_code")
+                            or (isinstance(edit_data.get("fixes"), list) and len(edit_data["fixes"]) > 0)
+                            or (edit_data.get("file_level_anchor") and edit_data.get("file_level_insert"))
+                        ):
                             _dlog("qa_retry_correction_all_parsers_failed", session_id=session_id, user_id=user_id,
                                   retry_round=_qa_retry_round, idx=idx,
                                   symbol=change_shells[idx]["symbol"].name,
+                                  truncated_no_close_tag=_edit_truncated,
                                   raw_preview=raw_edit.strip()[:300])
                             continue
                         corrected_fixes = edit_data.get("fixes")
@@ -23034,7 +23130,7 @@ async def run_natural_pipeline_stream(
                             # symbol — the sibling-fix corruption that the
                             # fragment guard (<40-line skip) let through.
                             _sym_name_guard = change_shells[idx]["symbol"].name
-                            _wrong_sym = (wrong_symbol_reason(_sym_name_guard, corrected_code)
+                            _wrong_sym = (wrong_symbol_reason(_sym_name_guard, corrected_code, _sym_code)
                                           if _frag_reason is None else None)
                             if _wrong_sym:
                                 _frag_reason = _wrong_sym
@@ -23043,7 +23139,8 @@ async def run_natural_pipeline_stream(
                                       retry_round=_qa_retry_round, idx=idx,
                                       symbol=_sym_name_guard,
                                       corrected_len=len(corrected_code),
-                                      corrected_preview=corrected_code[:200])
+                                      corrected_preview=corrected_code[:200],
+                                      checked_signature_fallback=True)
 
                             if _frag_reason is None:
                                 accepted = corrected_code
