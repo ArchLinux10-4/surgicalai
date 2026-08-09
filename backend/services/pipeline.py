@@ -5027,7 +5027,9 @@ def _mw_window_content_loss(expected_lines: int, corrected_lines: int,
 # legitimate large (non-duplicated) expansions such as the real (44, 48)
 # and (114, 115) grows already covered by the loss-guard's own test suite.
 def _mw_window_content_duplication(corrected_lines: list, min_repeat_len: int = 4,
-                                    min_repeat_char_len: int = 8):
+                                    min_repeat_char_len: int = 8,
+                                    reference_lines: list = None,
+                                    exemptions_out: list = None):
     """
     Return a short description string if ``corrected_lines`` contains a
     contiguous run of >= ``min_repeat_len`` non-blank lines that appears
@@ -5040,11 +5042,52 @@ def _mw_window_content_duplication(corrected_lines: list, min_repeat_len: int = 
     trivial repeats like chains of closing brackets (`)`, `}`, `};`) that
     legitimately recur in normal code and are not the corruption signature
     reported by QA.
+
+    ── Boilerplate exemption (``reference_lines``) ────────────────────────
+    Proven live: session 497169c1, DataStarvationModal.jsx, window_idx=2
+    (the ``defaultQuantity`` gridRow, 42 expected lines). QA correctly asked
+    the corrector to add a second sibling number field (min + max). The ONLY
+    correct edit necessarily emits the MUI ``<TextField>`` opener twice:
+
+        <TextField
+        size="small"
+        type="number"
+        label={
+
+    That exact 4-line block already occurs 4x verbatim in the UNTOUCHED
+    source (every sibling field opens identically), so it is legitimate
+    codebase boilerplate — NOT the model duplicating its own output. Without
+    this exemption the guard vetoed the objectively-correct edit 4/4 times
+    across 2 user sessions (retry_round 0 AND 1, both sessions), an
+    unwinnable trap no retry could ever escape.
+
+    When ``reference_lines`` (the original pre-edit source) is supplied, any
+    candidate block that ALREADY appears >= 2 times there is treated as a
+    naturally recurring structural pattern for this file and is skipped
+    rather than flagged. A genuine corruption block (the model repeating a
+    DISTINCTIVE chunk of its own output — e.g. session 29fba21b) appears at
+    most once in the original, so it is NOT exempted and is still rejected.
+    Real duplication of a whole field is likewise still caught, because the
+    field's distinctive lines (label text, value/handler identifiers) do not
+    recur in the original and form non-exempt repeated blocks of their own.
+
+    Detected exemptions are appended to ``exemptions_out`` (when provided) so
+    the call site can ``_dlog`` them for troubleshooting.
     """
     norm = [l.strip() for l in corrected_lines]
     nonblank_idx = [i for i, l in enumerate(norm) if l]
     if len(nonblank_idx) < min_repeat_len * 2:
         return None  # window too small for a meaningful duplicate block
+
+    # Build the set of blocks that legitimately recur in the ORIGINAL source.
+    _boiler = set()
+    if reference_lines:
+        _rnb = [l.strip() for l in reference_lines if l.strip()]
+        _rcount = {}
+        for i in range(len(_rnb) - min_repeat_len + 1):
+            _blk = tuple(_rnb[i:i + min_repeat_len])
+            _rcount[_blk] = _rcount.get(_blk, 0) + 1
+        _boiler = {b for b, n in _rcount.items() if n >= 2}
 
     seen = {}
     for start in range(len(nonblank_idx) - min_repeat_len + 1):
@@ -5052,6 +5095,17 @@ def _mw_window_content_duplication(corrected_lines: list, min_repeat_len: int = 
         block = tuple(norm[i] for i in idxs)
         if block in seen:
             if any(len(b) >= min_repeat_char_len for b in block):
+                if block in _boiler:
+                    # Legitimate recurring codebase boilerplate — not
+                    # model-introduced corruption. Record and keep scanning
+                    # for a genuinely novel duplicate elsewhere in the window.
+                    if exemptions_out is not None:
+                        exemptions_out.append({
+                            "first_line": seen[block] + 1,
+                            "repeat_line": idxs[0] + 1,
+                            "block": list(block),
+                        })
+                    continue
                 prev_start = seen[block]
                 return (
                     f"corrected window contains a repeated {min_repeat_len}-line "
@@ -24001,7 +24055,28 @@ async def run_natural_pipeline_stream(
                         # blocks". Detects the actual repeated-block
                         # signature directly rather than guessing from a
                         # ratio alone.
-                        _mw_dup_reason = _mw_window_content_duplication(_mw_corrected)
+                        # ── Boilerplate-aware duplication guard ──
+                        # Pass the ORIGINAL pre-edit source (_mw_broken_lines_pre)
+                        # so blocks that already recur 2+ times there (e.g. the
+                        # identical <TextField> opener of every sibling MUI field)
+                        # are exempted as legitimate codebase boilerplate rather
+                        # than flagged as model corruption. Proven live: session
+                        # 497169c1, DataStarvationModal.jsx window_idx=2 — the
+                        # correct min/max field split was vetoed 4/4 times across
+                        # 2 sessions purely because of this recurring opener.
+                        _mw_dup_exempt = []
+                        _mw_dup_reason = _mw_window_content_duplication(
+                            _mw_corrected,
+                            reference_lines=_mw_broken_lines_pre,
+                            exemptions_out=_mw_dup_exempt)
+                        if _mw_dup_exempt:
+                            _dlog("correction_multi_window_duplication_boilerplate_exempted",
+                                  session_id=session_id, user_id=user_id,
+                                  retry_round=_qa_retry_round, idx=_mw_idx,
+                                  symbol=_mw_sym.name, window_idx=_mw_wi,
+                                  exempted_count=len(_mw_dup_exempt),
+                                  exemptions=_mw_dup_exempt[:5],
+                                  note="repeated block(s) already recur 2+ times in the original source — treated as legitimate codebase boilerplate, not model-introduced duplication")
                         if _mw_dup_reason:
                             _dlog("correction_multi_window_duplication_rejected",
                                   session_id=session_id, user_id=user_id,
