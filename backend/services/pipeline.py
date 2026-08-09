@@ -23430,12 +23430,30 @@ async def run_natural_pipeline_stream(
                         for el in _mw_error_lines
                     )
                     # Stash whether this window has a legitimate reason to be
-                    # edited (a real diff change or a QA-reported error line
-                    # actually inside it) — consulted later by the zero-diff
-                    # edit guard (Bug #3 fix) so a changed_line_count==0
-                    # window that was ONLY included via the qa_reference
-                    # exemption cannot silently accept a model edit.
-                    _mw_fw["_has_error_line"] = _fw_has_error_line
+                    # edited — consulted later by the zero-diff edit guard
+                    # (Bug #3 fix) so a changed_line_count==0 window cannot
+                    # silently accept a model edit unless something actually
+                    # justifies editing it.
+                    #
+                    # Fix (proven regression, session 497169c1 (1).jsonl):
+                    # qa_reference windows (added by
+                    # _augment_windows_with_qa_refs / PR #142's local-symbol
+                    # grounding) were NOT counted as a legitimate edit
+                    # reason here, only literal QA "line N" text matches
+                    # were. But _augment_windows_with_qa_refs's own docstring
+                    # says these windows exist specifically "so the model can
+                    # see and edit that code" — there is no code path that
+                    # creates a qa_reference window for pure context. Result:
+                    # the local-symbol-grounding fix correctly found and
+                    # targeted the code QA was blocking on (e.g.
+                    # handleDiscover/estimatedTotal), the model correctly
+                    # edited it, and this guard then silently discarded every
+                    # one of those edits every retry round — regression to
+                    # the original infinite-retry symptom via a different
+                    # mechanism. A qa_reference window is exactly as
+                    # legitimate an edit target as a literal QA line-number
+                    # match, so it now counts the same way.
+                    _mw_fw["_has_error_line"] = _fw_has_error_line or _fw_is_qa_ref
                     if _fw_has_changes or _fw_is_qa_ref or _fw_has_error_line:
                         _mw_relevant_windows.append(_mw_fw)
                     else:
