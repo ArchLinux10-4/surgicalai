@@ -5571,6 +5571,64 @@ def _find_changed_windows(original_code: str, edited_code: str, context_lines: i
 # Helper: _extract_qa_reference_lines  (find QA-referenced code locations)
 # ---------------------------------------------------------------------------
 
+def _extract_local_declared_identifiers(code: str) -> set:
+    """Extract locally-declared identifier names from a symbol's OWN source.
+
+    Bug (proven live, session 497169c1-a8f2-40e8-946d-955de85a5368, Grok 4.5
+    -- but the mechanism is model-agnostic, affects Claude/GPT/Grok equally):
+    the AST-symbol allow-list used by ``_extract_qa_reference_lines`` for
+    grounding QA-reference windows (commit b2f5f18) is built ONLY from
+    top-level file symbols (``symbol_maps_by_name``). For a large,
+    self-contained symbol (e.g. a 1300-line React component or a big route
+    handler), QA's blocked-verdict prose almost always names INTERNAL locals
+    -- ``handleDiscover``, ``estimatedTotal``, ``handleImpute`` -- which are
+    never top-level file symbols, so the allow-list rejects every one of
+    them. Live simulation with the session's real QA text and real
+    known-symbol set confirmed 9/9 flagged identifiers dropped to zero.
+    Result: ``_extract_qa_reference_lines`` returns no QA-reference windows,
+    correction stays bounded to the original diff-touched windows (which
+    never covered the stale usages because the model's edit never touched
+    them), and QA blocks the IDENTICAL verdict every retry round forever
+    (proven: 6 rounds, 30+ minutes, same complaint verbatim, retries
+    exhausted).
+
+    This extracts declaration-site identifiers from the symbol's OWN code
+    (const/let/var incl. destructuring and useState pairs, function/def) so
+    those locals are grounded too. Only names that appear at an actual
+    declaration site are added -- prose/DOM/style tokens (Box, Dialog,
+    overflowX) are never declared this way, so the original garbage-window
+    fix (commit b2f5f18) is fully preserved; this only ADDS legitimate local
+    symbols the file-level AST could never see.
+    """
+    names: set = set()
+    if not code:
+        return names
+    # JS/TS: const/let/var NAME = ...
+    for m in re.finditer(r'\b(?:const|let|var)\s+(\w+)\s*=', code):
+        names.add(m.group(1))
+    # JS/TS: array destructure -- const [value, setValue] = useState(...)
+    for m in re.finditer(r'\b(?:const|let|var)\s*\[\s*([^\]]{1,200}?)\s*\]\s*=', code):
+        for part in m.group(1).split(','):
+            part = part.strip().lstrip('.').strip()
+            if re.fullmatch(r'\w+', part):
+                names.add(part)
+    # JS/TS: object destructure -- const { a, b: renamed } = ...
+    for m in re.finditer(r'\b(?:const|let|var)\s*\{\s*([^}]{1,400}?)\s*\}\s*=', code):
+        for part in m.group(1).split(','):
+            part = part.strip()
+            part = part.split(':')[-1].strip()   # `a: b` rename -> local name is `b`
+            part = part.split('=')[0].strip()     # drop default value
+            if re.fullmatch(r'\w+', part):
+                names.add(part)
+    # JS/TS: named function declarations
+    for m in re.finditer(r'\bfunction\s+(\w+)\s*\(', code):
+        names.add(m.group(1))
+    # Python: def name(
+    for m in re.finditer(r'\bdef\s+(\w+)\s*\(', code):
+        names.add(m.group(1))
+    return names
+
+
 def _extract_qa_reference_lines(
     qa_dict: dict,
     code: str,
@@ -21786,6 +21844,35 @@ async def run_natural_pipeline_stream(
                               session_id=session_id, user_id=user_id,
                               error=str(_e_ks), fallback="frequency_backstop")
                         _qa_known_symbols = None
+
+                    # ── Local-declaration fix (bug proven: session 497169c1) ──
+                    # File-level AST symbols alone miss every local the model
+                    # declares INSIDE this one large symbol (handleDiscover,
+                    # estimatedTotal, ...). Union those in so QA prose that
+                    # names them still grounds correctly. See
+                    # _extract_local_declared_identifiers docstring for the
+                    # full proof. This only adds names found at a real
+                    # declaration site in the symbol's own code — it cannot
+                    # reopen the generic-token bug (b2f5f18) since prose/DOM
+                    # tokens are never declared this way.
+                    try:
+                        _qa_local_symbols = _extract_local_declared_identifiers(symbol.code)
+                    except Exception as _e_ls:
+                        _qa_local_symbols = set()
+                        _dlog("qa_ref_local_symbols_error",
+                              session_id=session_id, user_id=user_id,
+                              error=str(_e_ls))
+                    if _qa_local_symbols:
+                        _qa_known_symbols = (_qa_known_symbols or set()) | _qa_local_symbols
+                    _dlog("qa_ref_local_symbols_extracted",
+                          session_id=session_id, user_id=user_id,
+                          filename=cs.get("filename"),
+                          symbol=symbol.name,
+                          local_symbol_count=len(_qa_local_symbols),
+                          local_symbol_sample=sorted(_qa_local_symbols)[:25],
+                          combined_known_symbol_count=(
+                              len(_qa_known_symbols) if _qa_known_symbols is not None else 0
+                          ))
 
                     _all_windows = _augment_windows_with_qa_refs(
                         _all_windows, qa_d, symbol.code, cs["new_code"],
