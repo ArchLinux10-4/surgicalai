@@ -24434,6 +24434,88 @@ async def run_natural_pipeline_stream(
                 else:
                     _tsc_round_best[_rfname] = _new_count
 
+            # ── Per-round QA-SCORE regression check + rollback (trace 497169c1) ──
+            # Sibling of the tsc regression guard above, but for the SEMANTIC QA
+            # score rather than the compiler-error count. Smoking gun (session
+            # 497169c1, "Retry with QA"): idx 0 went blocked(2) → round-0 fix →
+            # warning(5) → round-1 fix → blocked(3), and the pipeline shipped the
+            # 3. The tsc guard never fired (0→0 introduced errors both rounds),
+            # so the strictly-worse round-1 result overwrote the better round-0
+            # result and became the advisory-shipped version — nothing retained
+            # the higher-scoring attempt. Because every regressing round is now
+            # reverted (here and by the tsc guard), the pre-round snapshot is
+            # always the best state achieved so far; so if this round's re-QA
+            # score for an idx is strictly lower than its snapshot score (or ties
+            # on score but drops to a worse verdict), revert that idx to the
+            # snapshot. Fires ONLY when BOTH scores are real numbers: a
+            # None/"skipped" re-QA means the QA *check* failed to run (handled by
+            # the unscored machinery) — not that the code regressed — so we never
+            # revert on that. Skips idxs the tsc guard already reverted this round.
+            _qa_verdict_rank = {"safe": 2, "warning": 1, "blocked": 0}
+            for _qri in fixed_indices:
+                if _qri not in _pre_round_snapshot:
+                    continue
+                if qa_results[_qri].get("regression_detected"):
+                    continue  # already reverted by the tsc guard this round
+                _snap_q = _pre_round_snapshot[_qri]["qa_result"] or {}
+                _new_score = qa_results[_qri].get("qa_score")
+                _snap_score = _snap_q.get("qa_score")
+                if (not isinstance(_new_score, (int, float))
+                        or not isinstance(_snap_score, (int, float))):
+                    _dlog("qa_retry_qa_score_regression_skipped_unscored",
+                          session_id=session_id, user_id=user_id,
+                          retry_round=_qa_retry_round, idx=_qri,
+                          this_round_score=_new_score, snapshot_score=_snap_score)
+                    continue
+                _new_verdict = qa_results[_qri].get("verdict")
+                _snap_verdict = _snap_q.get("verdict")
+                _score_regressed = _new_score < _snap_score
+                _verdict_regressed = (
+                    _new_score == _snap_score
+                    and _qa_verdict_rank.get(_new_verdict, -1)
+                        < _qa_verdict_rank.get(_snap_verdict, -1)
+                )
+                _dlog("qa_retry_qa_score_check", session_id=session_id, user_id=user_id,
+                      retry_round=_qa_retry_round, idx=_qri,
+                      symbol=change_shells[_qri]["symbol"].name,
+                      filename=change_shells[_qri]["filename"],
+                      snapshot_score=_snap_score, this_round_score=_new_score,
+                      snapshot_verdict=_snap_verdict, this_round_verdict=_new_verdict,
+                      score_regressed=_score_regressed,
+                      verdict_regressed=_verdict_regressed)
+                if not (_score_regressed or _verdict_regressed):
+                    continue
+                _snap = _pre_round_snapshot[_qri]
+                change_shells[_qri]["new_code"] = _snap["new_code"]
+                change_shells[_qri]["diff"] = _snap["diff"]
+                qa_results[_qri] = _snap["qa_result"]
+                qa_results[_qri]["regression_detected"] = True
+                qa_results[_qri]["qa_score_regression_detected"] = True
+                if _qri in _correction_history and _correction_history[_qri]:
+                    _correction_history[_qri][-1]["accepted"] = False
+                    _correction_history[_qri][-1]["qa_summary"] = (
+                        f"[auto-reverted: this attempt lowered the QA score "
+                        f"{_snap_score}\u2192{_new_score} "
+                        f"(verdict {_snap_verdict}\u2192{_new_verdict}); kept the "
+                        f"higher-scoring prior version] "
+                        + _correction_history[_qri][-1].get("qa_summary", "")
+                    )
+                _dlog("qa_retry_qa_score_regression_detected",
+                      session_id=session_id, user_id=user_id,
+                      retry_round=_qa_retry_round, idx=_qri,
+                      symbol=change_shells[_qri]["symbol"].name,
+                      filename=change_shells[_qri]["filename"],
+                      snapshot_score=_snap_score, this_round_score=_new_score,
+                      snapshot_verdict=_snap_verdict, this_round_verdict=_new_verdict,
+                      score_regressed=_score_regressed,
+                      verdict_regressed=_verdict_regressed,
+                      reverted_to_snapshot_score=_snap_score)
+                yield sse({"type": "progress",
+                           "content": f"⛔ {change_shells[_qri]['symbol'].name}: that correction "
+                                      f"attempt lowered the QA score ({_snap_score}\u2192{_new_score}) — "
+                                      f"reverted to the higher-scoring version "
+                                      f"(attempt {_qa_retry_round + 1}/{MAX_QA_RETRIES})."})
+
             # ── Gap C fix (session deb639d1): end-of-round disconnect checkpoint ──
             # The existing checkpoint above only fires at the START of each
             # retry round, built from blocked_indices as they stood BEFORE this
