@@ -3836,16 +3836,26 @@ def _ask_plan_build_tool_instructions(
     """
     Composes the Ask/Plan tool-instructions system-prompt block from
     whichever tags are actually usable this turn: <search_request>/
-    <file_request> require attached session_files, <github_request>
-    requires a connected + verified GitHub installation. Built dynamically
-    (rather than one fixed string covering both) so the model is only ever
-    told about tags it can actually use — including the has_files=False,
-    gh_enabled=True combination (GitHub connected, no file attached) that
-    the previous fixed-string version could never describe correctly,
-    since it was only ever reached when has_files was True.
+    <file_request>/<history_request> require attached session_files,
+    <github_request> requires a connected + verified GitHub installation.
+    Built dynamically (rather than one fixed string covering both) so the
+    model is only ever told about tags it can actually use — including the
+    has_files=False, gh_enabled=True combination (GitHub connected, no file
+    attached) that the previous fixed-string version could never describe
+    correctly, since it was only ever reached when has_files was True.
     Only called when at least one of has_files/gh_enabled is True (see
     _ask_plan_tools_enabled gate in run_chat_stream) — never emits an
     empty/no-op tools block.
+
+    <history_request> (all-modes rollout, additive): gated on has_files —
+    `session_files` is loaded as ALL files ever attached to this session
+    (see chat.py: `SELECT ... FROM session_files WHERE session_id = ?`), so
+    has_files=True is already the correct signal that this session may have
+    file-version history worth offering the tool for. Reuses
+    search_file_version_history() verbatim (same function Agent mode's
+    handler calls) — degrades gracefully when a file has no history yet, so
+    advertising it unconditionally whenever has_files is True carries no new
+    failure mode.
     """
     parts = ["## Tools available in this conversation"]
     tag_blocks: list = []
@@ -3863,6 +3873,15 @@ def _ask_plan_build_tool_instructions(
         tag_blocks.append(
             '<file_request>["filename1.py", "filename2.tsx"]</file_request>\n'
             "Use to view the full contents of specific file(s) by exact name."
+        )
+        tag_blocks.append(
+            '<history_request>{"filename": "...", "query": "optional keyword"}'
+            "</history_request>\nUse to look up an OLDER/original version of a "
+            "file from THIS session's edit history. Omit query for the very "
+            "first (pre-edit) version; include a query to search across all "
+            "saved versions. Returned content is clearly marked HISTORICAL — "
+            "it is NOT the current file, never use it as ground truth for "
+            "what exists now."
         )
 
     if gh_enabled:
@@ -3901,25 +3920,33 @@ def _ask_plan_build_tool_instructions(
 
 
 def _ask_plan_strip_tool_tags(text: str) -> str:
-    """Scrub raw <search_request>/<file_request>/<github_request> markup
-    before it can ever reach the user — shared by every model backend."""
+    """Scrub raw <search_request>/<file_request>/<github_request>/
+    <history_request> markup before it can ever reach the user — shared by
+    every model backend."""
     text = re.sub(r'<search_request>.*?</search_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<file_request>.*?</file_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<github_request>.*?</github_request>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<history_request>.*?</history_request>', '', text, flags=re.DOTALL)
     return text.strip()
 
 
 def _ask_plan_execute_tool_round(
-    *, sr_match, fr_match, gr_match, symbol_maps_by_name, file_content_lookup,
-    user_id, session_id, tool_round,
+    *, sr_match, fr_match, gr_match, hr_match=None, symbol_maps_by_name,
+    file_content_lookup, user_id, session_id, tool_round,
 ):
     """
     Executes whichever tag(s) the model emitted this round, reusing the
     exact same _resolve_search_multifile / _parse_filereq_content /
-    _parse_search_content / execute_github_request helpers Edit mode's
-    agent loop already relies on. Shared by the Claude native loop and the
-    OpenAI-compatible (GPT/Gemini) loop so a future fix to search/file/
-    GitHub tool behavior only has to be made once.
+    _parse_search_content / execute_github_request / _parse_history_content /
+    search_file_version_history helpers Edit/Agent mode's agent loop already
+    relies on. Shared by the Claude native loop and the OpenAI-compatible
+    (GPT/Gemini) loop so a future fix to search/file/GitHub/history tool
+    behavior only has to be made once.
+    `hr_match` (all-modes rollout, additive, default None so every existing
+    caller/test that omits it is unaffected) mirrors sr_match/fr_match/
+    gr_match's `.group(1)`-bearing contract — including grok_ask_plan_native.py's
+    duck-typed `_FakeMatch`, so the Grok native path can reuse this
+    unmodified too.
     Returns the list of result strings to feed back to the model.
     """
     from services.github_natural_tag import parse_github_request, execute_github_request
@@ -3969,6 +3996,48 @@ def _ask_plan_execute_tool_round(
             _dlog("ask_plan_github_executed", session_id=session_id, user_id=user_id,
                   tool_round=tool_round, tool=gr_parsed.get("tool"),
                   result_chars=len(gr_result))
+    if hr_match:
+        # All-modes rollout: same handler shape as Agent mode's <history_request>
+        # branch in natural_conversation_pipeline (agent_history_* dlog names
+        # mirrored here as ask_plan_history_* so both paths are distinguishable
+        # in an exported log, but easy to find via the shared "history" substring).
+        from routers.session_files import search_file_version_history
+        _hd = _parse_history_content(hr_match.group(1))
+        if not _hd:
+            _dlog("ask_plan_history_parse_failed", session_id=session_id,
+                  user_id=user_id, tool_round=tool_round,
+                  raw_preview=hr_match.group(1)[:200])
+            tool_parts.append(
+                "Your <history_request> was not valid JSON (needs at least "
+                '{"filename": "..."}). Emit a corrected <history_request>, '
+                "or answer with what you already know.")
+        else:
+            _hr_fn = _hd.get("filename", "")
+            _hr_query = _hd.get("query")
+            _dlog("ask_plan_history_requested", session_id=session_id,
+                  user_id=user_id, tool_round=tool_round,
+                  filename=_hr_fn, query=_hr_query)
+            try:
+                _hr_result = search_file_version_history(
+                    session_id, _hr_fn, query=_hr_query, dlog=_dlog)
+                if _hr_result.get("found"):
+                    _hr_body = ("\n\n".join(_hr_result["matches"])
+                                if "matches" in _hr_result
+                                else _hr_result.get("content", ""))
+                else:
+                    _hr_body = _hr_result.get("message", "No history found.")
+                tool_parts.append(_hr_body)
+                _dlog("ask_plan_history_executed", session_id=session_id,
+                      user_id=user_id, tool_round=tool_round,
+                      filename=_hr_fn, found=bool(_hr_result.get("found")),
+                      result_chars=len(_hr_body))
+            except Exception as _hr_err:
+                _dlog("ask_plan_history_error", session_id=session_id,
+                      user_id=user_id, tool_round=tool_round,
+                      filename=_hr_fn, error=str(_hr_err)[:300])
+                tool_parts.append(
+                    f"Could not search file history for '{_hr_fn}': "
+                    f"{str(_hr_err)[:150]}")
     return tool_parts
 
 
@@ -4197,6 +4266,10 @@ async def run_chat_stream(
                 mode=_grok_ask_plan_effective_mode,
                 gh_nat_enabled=_gh_nat_enabled,
                 gh_known_repos=_gh_known_repos,
+                # All-modes rollout: same has_files gate as the Claude/GPT/
+                # Gemini tag loop above (_ask_plan_build_tool_instructions) —
+                # not is_agent_task, this is Ask/Plan, not Edit/Agent.
+                history_enabled=_ask_plan_has_files,
                 symbol_maps_by_name=symbol_maps_by_name,
                 file_content_lookup=file_content_lookup,
                 execute_tool_round_fn=_ask_plan_execute_tool_round,
@@ -4240,13 +4313,19 @@ async def run_chat_stream(
                     re.search(r'<github_request>\s*(.*?)\s*</github_request>', _round_text, re.DOTALL)
                     if _gh_nat_enabled else None
                 )
+                # All-modes rollout: gated on _ask_plan_has_files, same condition
+                # search/file use above — see _ask_plan_build_tool_instructions.
+                _hr_match = (
+                    re.search(r'<history_request>\s*(.*?)\s*</history_request>', _round_text, re.DOTALL)
+                    if _ask_plan_has_files else None
+                )
 
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
-                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match
+                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match and not _hr_match
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -4264,6 +4343,7 @@ async def run_chat_stream(
                 yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 _tool_parts = _ask_plan_execute_tool_round(
                     sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
+                    hr_match=_hr_match,
                     symbol_maps_by_name=symbol_maps_by_name,
                     file_content_lookup=file_content_lookup,
                     user_id=user_id, session_id=session_id, tool_round=_tool_round,
@@ -4461,13 +4541,19 @@ async def run_chat_stream(
                     re.search(r'<github_request>\s*(.*?)\s*</github_request>', _round_text, re.DOTALL)
                     if _gh_nat_enabled else None
                 )
+                # All-modes rollout: gated on _ask_plan_has_files, same condition
+                # search/file use above — see _ask_plan_build_tool_instructions.
+                _hr_match = (
+                    re.search(r'<history_request>\s*(.*?)\s*</history_request>', _round_text, re.DOTALL)
+                    if _ask_plan_has_files else None
+                )
 
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
-                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match
+                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match and not _hr_match
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -4485,6 +4571,7 @@ async def run_chat_stream(
                 yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 _tool_parts = _ask_plan_execute_tool_round(
                     sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
+                    hr_match=_hr_match,
                     symbol_maps_by_name=symbol_maps_by_name,
                     file_content_lookup=file_content_lookup,
                     user_id=user_id, session_id=session_id, tool_round=_tool_round,
@@ -16426,21 +16513,28 @@ async def run_natural_pipeline_stream(
                   session_id=session_id, user_id=user_id,
                   error=str(_gh_nat_err))
 
-        # ── History-search tag (Agent Mode only) ───────────────────────────
-        # Lets the agent pull an OLDER/original version of a session file
-        # from session_file_versions (already-existing, per-session-scoped
-        # storage — see routers/session_files.py). Registered into TAG_DEFS
-        # only when is_agent_task=True, mirroring the _gh_nat_enabled
-        # pattern above: when False (every single-pass chat/edit call),
-        # TAG_DEFS never gets this key, so the tag-open scanner and
-        # _stop_tag_order filter (`if t in TAG_DEFS`) silently skip it —
-        # zero footprint on the single-pass path, not a special-case branch.
+        # ── History-search tag (Edit + Agent Mode) ──────────────────────────
+        # Lets the agent/edit loop pull an OLDER/original version of a
+        # session file from session_file_versions (already-existing,
+        # per-session-scoped storage — see routers/session_files.py).
+        # EXTENDED (all-modes rollout): previously registered into TAG_DEFS
+        # only when is_agent_task=True. That was a deliberate scoping choice
+        # at first ship, not a technical constraint — every OTHER context
+        # tool (<search_request>/<file_request>/<github_request>, via
+        # _AGENT_INSTRUCTION below) was already unconditional for Edit mode
+        # too. _history_enabled is now always True so Edit mode gets the
+        # exact same lookup tool Agent mode already had; Agent mode behavior
+        # is unchanged (was already True). search_file_version_history()
+        # itself never raises and degrades gracefully when a file has no
+        # history yet, so there is no new failure mode from widening this.
+        _history_enabled = True
         HISTORY_TAG_OPEN = "<history_request>"
         HISTORY_TAG_CLOSE = "</history_request>"
-        if is_agent_task:
+        if _history_enabled:
             TAG_DEFS["history"] = {"open": HISTORY_TAG_OPEN, "close": HISTORY_TAG_CLOSE}
             _dlog("natural_history_tag_registered",
-                  session_id=session_id, user_id=user_id)
+                  session_id=session_id, user_id=user_id,
+                  mode=("agent" if is_agent_task else "edit"))
 
         # ── Debug: confirm quality rules and project memory reached the prompt ──
         _total_sys_chars = sum(b.get("text", "") if isinstance(b, dict) else b for b in system_prompt if isinstance(b, dict)) if False else sum(len(b["text"]) for b in system_prompt if isinstance(b, dict) and "text" in b)
@@ -16502,7 +16596,7 @@ async def run_natural_pipeline_stream(
                 _grok_sys_suffix = _grok_build_system_suffix(
                     mode=("agent" if is_agent_task else "edit"),
                     github_enabled=_gh_nat_enabled,
-                    history_enabled=is_agent_task,
+                    history_enabled=_history_enabled,
                     dlog=_dlog, session_id=session_id, user_id=user_id)
                 _gpt_system_text += _grok_sys_suffix
                 _dlog("natural_grok_system_suffix_appended",
@@ -16772,7 +16866,7 @@ async def run_natural_pipeline_stream(
                "history. Omit query for the very first (pre-edit) version; include a "
                "query to search across all saved versions. Returned content is clearly "
                "marked HISTORICAL — it is NOT the current file, never use it as ground "
-               "truth for what exists now.\n" if is_agent_task else "")
+               "truth for what exists now.\n" if _history_enabled else "")
             + "\nWhen you request context the stream pauses, the results are handed\n"
             "back to you, and you continue from there.\n\n"
             "OUTPUT — emit when (and only when) you have the context to be correct:\n"
@@ -16795,7 +16889,7 @@ async def run_natural_pipeline_stream(
         if _is_grok_model(arch_model):
             _active_agent_instruction = _grok_build_agent_instruction(
                 mode=("agent" if is_agent_task else "edit"),
-                github_enabled=_gh_nat_enabled, history_enabled=is_agent_task,
+                github_enabled=_gh_nat_enabled, history_enabled=_history_enabled,
                 dlog=_dlog, session_id=session_id, user_id=user_id)
 
         current_messages = list(messages)
@@ -17236,7 +17330,7 @@ async def run_natural_pipeline_stream(
                     _grok_tools = _grok_build_tools(
                         mode=("agent" if is_agent_task else "edit"),
                         github_enabled=_gh_nat_enabled,
-                        history_enabled=is_agent_task,
+                        history_enabled=_history_enabled,
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
                     # Plan-first gate decides tool_choice: forced write_edit_plan
