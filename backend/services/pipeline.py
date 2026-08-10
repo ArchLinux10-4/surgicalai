@@ -16829,6 +16829,24 @@ async def run_natural_pipeline_stream(
         _consecutive_empty_turns = 0
         _consecutive_text_only_turns = 0
 
+        # ── Grok-only plan-first reliability gate (compound-request detection +
+        #    forced write_edit_plan before any shallow single edit). No-op for
+        #    Claude/GPT and for non-compound requests; see
+        #    services/grok_plan_gate.py. Constructed once per request. ──
+        _grok_plan_gate = None
+        if _is_grok_model(arch_model):
+            try:
+                from services.grok_plan_gate import GrokPlanGate as _GrokPlanGate  # noqa: E402
+                _grok_plan_gate = _GrokPlanGate(
+                    user_request, is_agent_task, dlog=_dlog,
+                    session_id=session_id, user_id=user_id,
+                    mode=("agent" if is_agent_task else "edit"))
+            except Exception as _pg_exc:
+                _dlog("grok_plan_gate_init_error", session_id=session_id,
+                      user_id=user_id, error_type=type(_pg_exc).__name__,
+                      error=str(_pg_exc)[:200])
+                _grok_plan_gate = None
+
         while True:
             _turn += 1
 
@@ -17221,7 +17239,17 @@ async def run_natural_pipeline_stream(
                         history_enabled=is_agent_task,
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
-                    _gpt_call_kwargs["tool_choice"] = "auto"
+                    # Plan-first gate decides tool_choice: forced write_edit_plan
+                    # on a compound request that tried to edit without a plan,
+                    # else "auto" (unchanged). Fail-open to "auto".
+                    if _grok_plan_gate is not None and _grok_plan_gate.is_forcing_plan(_turn):
+                        yield sse({"type": "progress",
+                                   "content": "🧭 Planning the multi-part change first..."})
+                        _dlog("grok_plan_gate_tool_choice_forced",
+                              session_id=session_id, user_id=user_id, turn=_turn)
+                    _gpt_call_kwargs["tool_choice"] = (
+                        _grok_plan_gate.tool_choice(_turn)
+                        if _grok_plan_gate is not None else "auto")
                     _grok_tc_acc = _GrokToolCallAccumulator(
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _dlog("natural_grok_native_tools_attached",
@@ -17454,6 +17482,12 @@ async def run_natural_pipeline_stream(
                 else:
                     _grok_tr = _grok_translate_tool_calls(
                         _grok_calls, dlog=_dlog, session_id=session_id, user_id=user_id)
+                    # Plan-first gate: on a compound request, HOLD any writes
+                    # emitted before a plan exists (rewrites their tool-results
+                    # + arms a forced write_edit_plan next turn), and note plan
+                    # capture. Mutates _grok_tr in place; no-op otherwise.
+                    if _grok_plan_gate is not None:
+                        _grok_plan_gate.filter_translation(_grok_tr, _turn)
                     if _grok_tr.edit_json_strings:
                         edit_blocks_raw.extend(_grok_tr.edit_json_strings)
                     if _grok_tr.new_file_json_strings:
