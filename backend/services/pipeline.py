@@ -20572,11 +20572,37 @@ async def run_natural_pipeline_stream(
                             for _ck in resolved_edits
                         ],
                     }
+                    # ── Full-fidelity recovery attach (session 430d9711) ──
+                    # The thin `resolved` list above CANNOT render or apply on
+                    # the frontend (no diff / id / full-symbol / original_code
+                    # -> InlineDiffCard ghost-diff filter drops it, POST /apply
+                    # 422s). Attach a render/apply-ready `changes_by_file` built
+                    # the same way the normal done path builds it, so a
+                    # disconnect during the upcoming correction wait can be
+                    # recovered as real diff cards, not a dead markdown bubble.
+                    try:
+                        from services.checkpoint_recovery import (
+                            enrich_checkpoint_payload as _enrich_ckpt,
+                        )
+                        from services.session_file_store import (
+                            resolve_session_file_id as _rsf_ckpt,
+                        )
+                        _enrich_ckpt(
+                            _ckpt_payload, resolved_edits,
+                            make_diff=_make_diff,
+                            resolve_file_id=lambda _fn: _rsf_ckpt(session_id, _fn),
+                            session_id=session_id, user_id=user_id, dlog=_dlog,
+                        )
+                    except Exception as _enrich_err:
+                        _dlog("resolution_checkpoint_enrich_error",
+                              session_id=session_id, user_id=user_id,
+                              error=str(_enrich_err)[:200])
                     _dlog("resolution_checkpoint_emitted",
                           session_id=session_id,
                           resolve_round=resolve_round,
                           resolved_count=len(resolved_edits),
                           unresolved_count=len(still_unresolved),
+                          recoverable=bool(_ckpt_payload.get("changes_by_file")),
                           payload_bytes=len(json.dumps(_ckpt_payload)),
                           user_id=user_id)
                     yield sse({"type": "checkpoint",
@@ -21909,12 +21935,36 @@ async def run_natural_pipeline_stream(
                             for _si in _safe_indices
                         ],
                     }
+                    # Full-fidelity recovery attach (session 430d9711) — see
+                    # the symbol-resolution checkpoint above. change_shells
+                    # already carry symbol/new_code/diff/sf_entry, so the
+                    # builder reuses their precomputed diff.
+                    try:
+                        from services.checkpoint_recovery import (
+                            enrich_checkpoint_payload as _enrich_ckpt,
+                        )
+                        from services.session_file_store import (
+                            resolve_session_file_id as _rsf_ckpt,
+                        )
+                        _enrich_ckpt(
+                            _qa_ckpt_payload,
+                            [change_shells[_si] for _si in _safe_indices],
+                            make_diff=_make_diff,
+                            resolve_file_id=lambda _fn: _rsf_ckpt(session_id, _fn),
+                            session_id=session_id, user_id=user_id, dlog=_dlog,
+                        )
+                    except Exception as _enrich_err:
+                        _dlog("qa_retry_checkpoint_enrich_error",
+                              session_id=session_id, user_id=user_id,
+                              phase="round_start",
+                              error=str(_enrich_err)[:200])
                     _dlog("qa_retry_checkpoint_emitted",
                           session_id=session_id, user_id=user_id,
                           retry_round=_qa_retry_round,
                           phase="round_start",
                           safe_count=len(_safe_indices),
                           blocked_count=len(blocked_indices),
+                          recoverable=bool(_qa_ckpt_payload.get("changes_by_file")),
                           payload_bytes=len(json.dumps(_qa_ckpt_payload)))
                     yield sse({"type": "checkpoint",
                                "content": json.dumps(_qa_ckpt_payload)})
@@ -24754,12 +24804,34 @@ async def run_natural_pipeline_stream(
                             for _psi in _post_round_safe
                         ],
                     }
+                    # Full-fidelity recovery attach (session 430d9711) — see
+                    # the symbol-resolution checkpoint above.
+                    try:
+                        from services.checkpoint_recovery import (
+                            enrich_checkpoint_payload as _enrich_ckpt,
+                        )
+                        from services.session_file_store import (
+                            resolve_session_file_id as _rsf_ckpt,
+                        )
+                        _enrich_ckpt(
+                            _qa_post_ckpt_payload,
+                            [change_shells[_psi] for _psi in _post_round_safe],
+                            make_diff=_make_diff,
+                            resolve_file_id=lambda _fn: _rsf_ckpt(session_id, _fn),
+                            session_id=session_id, user_id=user_id, dlog=_dlog,
+                        )
+                    except Exception as _enrich_err:
+                        _dlog("qa_retry_checkpoint_enrich_error",
+                              session_id=session_id, user_id=user_id,
+                              phase="round_end",
+                              error=str(_enrich_err)[:200])
                     _dlog("qa_retry_checkpoint_emitted",
                           session_id=session_id, user_id=user_id,
                           retry_round=_qa_retry_round,
                           phase="round_end",
                           safe_count=len(_post_round_safe),
                           blocked_count=len(_post_round_blocked),
+                          recoverable=bool(_qa_post_ckpt_payload.get("changes_by_file")),
                           payload_bytes=len(json.dumps(_qa_post_ckpt_payload)))
                     yield sse({"type": "checkpoint",
                                "content": json.dumps(_qa_post_ckpt_payload)})
