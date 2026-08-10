@@ -125,13 +125,24 @@ def _dispatch_context_request(
     tool_round: int,
 ) -> str:
     """Route a translated native context request through the existing,
-    unmodified ``_ask_plan_execute_tool_round`` via a duck-typed match."""
+    unmodified ``_ask_plan_execute_tool_round`` via a duck-typed match.
+
+    All-modes rollout (additive): ``"history"`` is the tag_kind
+    ``services/grok_agent_tools.py``'s ``_context_body()`` already emits for
+    ``TOOL_REQUEST_HISTORY`` (that module was ALWAYS history-aware — it just
+    was never called with ``history_enabled=True`` from this file until now,
+    see ``run_grok_ask_plan_native_stream`` below). Mapped to ``hr_match``,
+    the same duck-typed contract ``_ask_plan_execute_tool_round`` already
+    accepts for the Claude/GPT/Gemini tag loop.
+    """
     match = _FakeMatch(body)
     sr_match = match if tag_kind == "search" else None
     fr_match = match if tag_kind == "filereq" else None
     gr_match = match if tag_kind == "github" else None
+    hr_match = match if tag_kind == "history" else None
     tool_parts = execute_tool_round_fn(
         sr_match=sr_match, fr_match=fr_match, gr_match=gr_match,
+        hr_match=hr_match,
         symbol_maps_by_name=symbol_maps_by_name,
         file_content_lookup=file_content_lookup,
         user_id=user_id, session_id=session_id, tool_round=tool_round,
@@ -159,6 +170,7 @@ async def run_grok_ask_plan_native_stream(
     session_id: str,
     user_id: str,
     dlog: Optional[Callable] = None,
+    history_enabled: bool = False,
 ):
     """Native-tool-calling Ask/Plan loop for Grok. Yields raw SSE strings.
 
@@ -166,12 +178,21 @@ async def run_grok_ask_plan_native_stream(
     (same round cap, same deadline, same progress/token event shape) but
     drives Grok through real ``tools=[...]`` function calling instead of the
     tag protocol PR #116 proved unreliable for this model family.
+
+    ``history_enabled`` (all-modes rollout, additive, defaults False so any
+    existing caller/test that omits it is byte-for-byte unaffected): gates
+    the native ``request_history`` tool exactly like ``gh_nat_enabled`` gates
+    ``request_github`` below. ``build_grok_agent_tools``/``build_grok_system_suffix``
+    (services/grok_agent_tools.py) were ALREADY fully history-aware — Edit/
+    Agent mode has called them with a real ``history_enabled`` value all
+    along — this module was simply the one remaining caller still hardcoding
+    ``False``.
     """
     dlog = dlog or _noop_dlog
     t0 = time.time()
 
     tools = build_grok_agent_tools(
-        mode=mode, github_enabled=gh_nat_enabled, history_enabled=False,
+        mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
         dlog=dlog, session_id=session_id, user_id=user_id,
     )
 
@@ -183,7 +204,7 @@ async def run_grok_ask_plan_native_stream(
     for i, m in enumerate(messages):
         if m.get("role") == "system":
             suffix = build_grok_system_suffix(
-                mode=mode, github_enabled=gh_nat_enabled, history_enabled=False,
+                mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
                 dlog=dlog, session_id=session_id, user_id=user_id,
             )
             messages[i] = {**m, "content": (m.get("content") or "") + suffix}
