@@ -22,7 +22,7 @@ of them.
 import itertools
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
 from typing import Callable, Dict, Optional
 
 from github import InputGitTreeElement
@@ -250,6 +250,196 @@ def _get_cached_tree(r, ref: str, owner: str, repo: str, _log):
         _tree_cache[key] = (now, tree)
     _log("github_context_tree_cache_miss", key=key, fetch_ms=elapsed_ms, entry_count=len(tree.tree))
     return tree
+
+
+def classify_paths_against_tree(names, exact_paths, by_basename, truncated):
+    """Pure, dependency-free resolution decision used by resolve_paths_via_tree.
+
+    Kept import-free on purpose so it can be unit-tested in isolation (the
+    truncation + ambiguity guards are the P0 correctness core). Given the set
+    of exact repo paths, a basename -> [paths] index, and the tree's
+    ``truncated`` flag, classify each requested name.
+
+    Rules:
+      * exact normalized-path match  -> "resolved"
+      * requested subdir suffix uniquely matching one candidate -> "resolved"
+      * exactly one basename candidate -> "resolved"
+      * more than one candidate       -> "ambiguous" (never auto-pick)
+      * zero candidates + COMPLETE tree -> "absent"
+      * zero candidates + TRUNCATED tree -> "unknown"  (absence unprovable)
+    """
+    def _norm(n):
+        n = n.strip()
+        while n.startswith("./"):
+            n = n[2:]
+        return n.lstrip("/")
+
+    resolutions = {}
+    for n in names:
+        nn = _norm(n)
+        base = nn.rsplit("/", 1)[-1]
+        if nn in exact_paths:
+            resolutions[n] = {"status": "resolved", "path": nn, "candidates": []}
+            continue
+        cands = list(by_basename.get(base, []))
+        if "/" in nn:
+            suffix_hits = [p for p in cands if p == nn or p.endswith("/" + nn)]
+            if len(suffix_hits) == 1:
+                resolutions[n] = {"status": "resolved",
+                                  "path": suffix_hits[0], "candidates": []}
+                continue
+            if len(suffix_hits) > 1:
+                cands = suffix_hits
+        if len(cands) == 1:
+            resolutions[n] = {"status": "resolved", "path": cands[0],
+                              "candidates": []}
+        elif len(cands) > 1:
+            resolutions[n] = {"status": "ambiguous", "path": None,
+                              "candidates": cands[:10]}
+        else:
+            resolutions[n] = {"status": "unknown" if truncated else "absent",
+                              "path": None, "candidates": []}
+    return resolutions
+
+
+def resolve_paths_via_tree(
+    owner: str,
+    repo: str,
+    user_id: str,
+    requested_names,
+    dlog: Optional[Callable] = None,
+    session_id: Optional[str] = None,
+    deadline_s: Optional[float] = None,
+) -> Dict:
+    """Resolve many requested file names against the repo in ONE cached
+    recursive-tree lookup, instead of ~8 speculative get_contents path reads
+    plus code-search variants *per file* (session 05190c82: that per-file
+    guessing cost ~41s/file and, for files not in the repo at all, burned
+    minutes before the pipeline ever paused to ask the user).
+
+    Returns (never raises):
+      {
+        "tree_sha": str|None,
+        "truncated": bool,
+        "entry_count": int,
+        "error": str|None,
+        "resolutions": {
+            <requested_name>: {
+                "status": "resolved"|"absent"|"ambiguous"|"unknown",
+                "path": str|None,          # exact repo path when resolved
+                "candidates": [str, ...],  # basename candidates (ambiguous)
+            }, ...
+        }
+      }
+
+    P0 correctness — GitHub Tree API truncation: get_git_tree(recursive=True)
+    sets truncated=True when the repo exceeds GitHub's limits (~100k entries /
+    ~7MB). When truncated, a name we did not see is NOT proven absent, so its
+    status is "unknown" and the caller MUST fall back to the legacy resolver
+    rather than jumping straight to a human pause. Only a COMPLETE tree yields
+    "absent".
+
+    P0 correctness — basename ambiguity: the basename index is candidate
+    generation only. An exact normalized-path match always wins. A bare
+    basename that maps to >1 repo path is "ambiguous" (logged) and is never
+    silently resolved to an arbitrary path.
+
+    P1 — bounded fetch: the tree fetch runs under deadline_s (when given) so a
+    slow or rate-limited GitHub call can't hang the streaming phase; on timeout
+    every name is "unknown" (→ legacy fallback).
+    """
+    def _log(event, **kw):
+        kw.setdefault("session_id", session_id)
+        kw.setdefault("user_id", user_id)
+        if dlog:
+            try:
+                dlog(event, **kw)
+            except Exception:
+                pass
+        try:
+            _db_dlog(event, **kw)
+        except Exception:
+            pass
+
+    names = [n for n in (requested_names or []) if n]
+    out = {"tree_sha": None, "truncated": False, "entry_count": 0,
+           "error": None, "resolutions": {}}
+    if not names:
+        return out
+
+    def _all_unknown(reason, **extra):
+        out["resolutions"] = {n: {"status": "unknown", "path": None,
+                                  "candidates": []} for n in names}
+        out["error"] = reason
+        _log("github_filereq_tree_resolve_fallback", reason=reason,
+             names=names[:10], **extra)
+        return out
+
+    if not is_github_app_configured():
+        return _all_unknown("app_not_configured")
+
+    g, inst, err = _find_client_for_repo(user_id, owner, repo, _log)
+    if err:
+        return _all_unknown("no_client", owner=owner, repo=repo, detail=err)
+
+    try:
+        r = g.get_repo(f"{owner}/{repo}")
+        ref = r.default_branch or "main"
+    except Exception as e:
+        return _all_unknown("get_repo_error", owner=owner, repo=repo,
+                            detail=str(e)[:200])
+
+    # ── P1: bounded tree fetch ──
+    t0 = time.monotonic()
+    try:
+        if deadline_s and deadline_s > 0:
+            with ThreadPoolExecutor(max_workers=1) as _pool:
+                _fut = _pool.submit(_get_cached_tree, r, ref, owner, repo, _log)
+                tree = _fut.result(timeout=deadline_s)
+        else:
+            tree = _get_cached_tree(r, ref, owner, repo, _log)
+    except FuturesTimeoutError:
+        return _all_unknown("tree_fetch_timeout", owner=owner, repo=repo,
+                            ref=ref, deadline_s=round(float(deadline_s or 0), 1))
+    except Exception as e:
+        return _all_unknown("tree_fetch_error", owner=owner, repo=repo,
+                            ref=ref, detail=str(e)[:200])
+
+    # P0: truncation makes "absent" unprovable — read the completeness flag
+    # from the raw payload (already populated; no extra network call).
+    raw = getattr(tree, "raw_data", None) or {}
+    truncated = bool(raw.get("truncated", False))
+    out["truncated"] = truncated
+    out["tree_sha"] = getattr(tree, "sha", None)
+
+    exact_paths = set()
+    by_basename: Dict[str, list] = {}
+    for e in (getattr(tree, "tree", None) or []):
+        if getattr(e, "type", None) != "blob":
+            continue
+        p = e.path
+        exact_paths.add(p)
+        base = p.rsplit("/", 1)[-1]
+        by_basename.setdefault(base, []).append(p)
+    out["entry_count"] = len(exact_paths)
+
+    out["resolutions"] = classify_paths_against_tree(
+        names, exact_paths, by_basename, truncated)
+    for _rn, _rv in out["resolutions"].items():
+        if _rv["status"] == "ambiguous":
+            _log("github_filereq_tree_resolve_ambiguous", filename=_rn,
+                 candidate_count=len(_rv["candidates"]),
+                 candidates=_rv["candidates"])
+
+    _log("github_filereq_tree_resolve_done", owner=owner, repo=repo, ref=ref,
+         tree_sha=out["tree_sha"], truncated=truncated,
+         entry_count=out["entry_count"],
+         fetch_ms=round((time.monotonic() - t0) * 1000),
+         resolved=[k for k, v in out["resolutions"].items() if v["status"] == "resolved"],
+         absent=[k for k, v in out["resolutions"].items() if v["status"] == "absent"],
+         ambiguous=[k for k, v in out["resolutions"].items() if v["status"] == "ambiguous"],
+         unknown=[k for k, v in out["resolutions"].items() if v["status"] == "unknown"])
+    return out
 
 
 def _search_code_fallback_scan(r, ref: str, query: str, _log, owner: str = "", repo: str = "") -> str:

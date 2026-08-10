@@ -16106,8 +16106,14 @@ async def run_natural_pipeline_stream(
     # SSE keepalive every 5s during any stall, and we also cap the wait so a
     # silent user never hangs the pipeline against its Railway deadline.
     FILE_WAIT_TIMEOUT_S = 240
+    # Phase seconds held back so the model still gets a turn to WRITE edits
+    # after gathering files, instead of spending the whole phase gathering
+    # and then aborting with nothing (session 05190c82).
+    FILEREQ_EDIT_RESERVE_S = 90
 
-    async def _await_user_file(missing_fn: str, outcome: dict, is_retry: bool = False):
+    async def _await_user_file(missing_fn: str, outcome: dict,
+                               is_retry: bool = False,
+                               max_wait: float | None = None):
         """Pause the agent loop and ask the user to supply a file that is not
         in the session and could not be auto-fetched from GitHub.
 
@@ -16132,6 +16138,27 @@ async def run_natural_pipeline_stream(
                   user_id=user_id, filename=missing_fn)
             return
 
+        # ── Phase-budget cap (session 05190c82) ──────────────────────────
+        # Never open a pause we cannot afford within the streaming phase.
+        # The caller passes the fair-share budget still available (already
+        # net of FILEREQ_EDIT_RESERVE_S); clamp it to [0, FILE_WAIT_TIMEOUT_S].
+        _wait_cap = (float(FILE_WAIT_TIMEOUT_S) if max_wait is None
+                     else max(0.0, min(float(FILE_WAIT_TIMEOUT_S), float(max_wait))))
+        if _wait_cap <= 0:
+            # No phase budget left to wait on a human: tell the model to
+            # proceed with what it has so the reserved edit budget is not
+            # spent waiting and the turn ends promptly (no deadline overshoot).
+            outcome["message"] = (
+                f"FILE NOT PROVIDED: '{missing_fn}' — no time left this phase to "
+                f"wait for an upload. Proceed with the files you already have. "
+                f"Do NOT guess this file's contents; if you cannot proceed "
+                f"safely, say so clearly with <blocked>…</blocked>.")
+            _dlog("agent_filereq_pause_skipped_phase_budget",
+                  session_id=session_id, user_id=user_id,
+                  filename=missing_fn,
+                  max_wait=round(float(max_wait or 0.0), 1))
+            return
+
         # Discard any stale replies so we never consume a previous file's answer.
         try:
             while True:
@@ -16140,7 +16167,9 @@ async def run_natural_pipeline_stream(
             pass
 
         _dlog("agent_filereq_pause_ask", session_id=session_id,
-              user_id=user_id, filename=missing_fn, is_retry=is_retry)
+              user_id=user_id, filename=missing_fn, is_retry=is_retry,
+              wait_cap_s=round(_wait_cap, 1),
+              capped=(max_wait is not None and _wait_cap < float(FILE_WAIT_TIMEOUT_S)))
         yield sse({
             "type": "file_needed",
             "filename": missing_fn,
@@ -16158,7 +16187,7 @@ async def run_natural_pipeline_stream(
 
         _wait_t0 = time.time()
         _resp = None
-        while (time.time() - _wait_t0) < FILE_WAIT_TIMEOUT_S:
+        while (time.time() - _wait_t0) < _wait_cap:
             if _pipeline_over_budget():
                 break
             try:
@@ -17645,7 +17674,316 @@ async def run_natural_pipeline_stream(
                     yield sse({"type": "progress",
                                "content": f"Loading: {', '.join(new_fnames[:3])}{'...' if len(new_fnames)>3 else ''}"})
                     file_result_parts = []
-                    for fn in new_fnames:
+                    # ── Repo-first resolution + fair-share HITL (session 05190c82) ──
+                    def _prepass_resolve_from_repo(fn, _turn):
+                        """Resolve one requested file from the known repo (GitHub)
+                        BEFORE any human pause. Populates file_content_lookup_stream /
+                        symbol_maps_by_name on success; side-effect only. Doing all repo
+                        lookups up front means the HITL fair-share budget is split only
+                        across files that genuinely need a human — a repo-resolvable file
+                        (e.g. package.json) no longer dilutes the wait budget."""
+                        content = ""
+                        if _gh_nat_enabled and _gh_known_repos:
+                            _gh_fb_owner_repo = _gh_known_repos[0]
+                            _gh_fb_owner, _gh_fb_repo = (
+                                _gh_fb_owner_repo.split("/", 1)
+                                if "/" in _gh_fb_owner_repo
+                                else (_gh_fb_owner_repo, ""))
+                            if _gh_fb_repo:
+                                # ── Fast tree resolution first (session 05190c82) ──
+                                # A single cached recursive-tree lookup (done in
+                                # the batch pre-pass below) tells us the exact
+                                # repo path — or that the file is definitively
+                                # absent — so we skip ~41s of speculative path
+                                # reads + code-search per file.
+                                _tr = (_tree_res_map or {}).get(fn)
+                                if _tr and _tr.get("status") == "resolved" and _tr.get("path"):
+                                    try:
+                                        from services.github_natural_tag import (
+                                            fetch_and_register_github_file as _tr_fetch,
+                                        )
+                                        _tr_parsed = {
+                                            "tool": "read_file",
+                                            "args": {
+                                                "owner": _gh_fb_owner,
+                                                "repo": _gh_fb_repo,
+                                                "path": _tr["path"],
+                                            },
+                                            "reason": f"Auto-fetch (tree-resolved): {fn}",
+                                        }
+                                        _tr_entry = _tr_fetch(
+                                            _tr_parsed, user_id, session_id, dlog=_dlog)
+                                        if _tr_entry and _tr_entry.get("content"):
+                                            content = _tr_entry["content"]
+                                            file_content_lookup_stream[fn] = content
+                                            try:
+                                                _tr_smap = parser.parse(content, fn)
+                                                symbol_maps_by_name[fn] = (_tr_smap, _tr_entry)
+                                            except Exception:
+                                                pass
+                                            _dlog("agent_filereq_tree_resolved_ok",
+                                                  session_id=session_id, user_id=user_id,
+                                                  turn=_turn, filename=fn,
+                                                  github_path=_tr["path"],
+                                                  content_len=len(content))
+                                            return
+                                    except Exception as _tr_err:
+                                        _dlog("agent_filereq_tree_resolved_err",
+                                              session_id=session_id, user_id=user_id,
+                                              turn=_turn, filename=fn,
+                                              github_path=_tr.get("path"),
+                                              error=str(_tr_err)[:200])
+                                        # fall through to legacy resolution below
+                                if _tr and _tr.get("status") == "absent":
+                                    # Complete tree proves the file is not in the
+                                    # repo: skip all path-guessing + code search
+                                    # and go straight to the human pause. This is
+                                    # the fix for minutes of fruitless search on
+                                    # local-only files (session 05190c82).
+                                    _dlog("agent_filereq_tree_absent_skip_search",
+                                          session_id=session_id, user_id=user_id,
+                                          turn=_turn, filename=fn,
+                                          tree_sha=(_tree_res_meta or {}).get("tree_sha"))
+                                    return
+                                # ambiguous / unknown / truncated / no-result →
+                                # fall through to the legacy resolver below (P0:
+                                # never treat a truncated tree as proof of absence)
+                                # Try common paths for the file
+                                _gh_fb_candidates = [
+                                    fn,
+                                    f"backend/{fn}",
+                                    f"backend/services/{fn}",
+                                    f"backend/routers/{fn}",
+                                    f"frontend/src/{fn}",
+                                    f"frontend/src/api/{fn}",
+                                    f"frontend/src/components/{fn}",
+                                    f"frontend/src/utils/{fn}",
+                                ]
+                                from services.github_natural_tag import (
+                                    fetch_and_register_github_file,
+                                )
+                                for _gh_fb_path in _gh_fb_candidates:
+                                    try:
+                                        _gh_fb_parsed = {
+                                            "tool": "read_file",
+                                            "args": {
+                                                "owner": _gh_fb_owner,
+                                                "repo": _gh_fb_repo,
+                                                "path": _gh_fb_path,
+                                            },
+                                            "reason": f"Auto-fetch missing file: {fn}",
+                                        }
+                                        _gh_fb_entry = fetch_and_register_github_file(
+                                            _gh_fb_parsed, user_id,
+                                            session_id, dlog=_dlog)
+                                        if _gh_fb_entry and _gh_fb_entry.get("content"):
+                                            content = _gh_fb_entry["content"]
+                                            file_content_lookup_stream[fn] = content
+                                            try:
+                                                _gh_fb_smap = parser.parse(content, fn)
+                                                symbol_maps_by_name[fn] = (
+                                                    _gh_fb_smap, _gh_fb_entry)
+                                            except Exception:
+                                                pass
+                                            _dlog("agent_filereq_github_fallback_ok",
+                                                  session_id=session_id,
+                                                  user_id=user_id, turn=_turn,
+                                                  filename=fn,
+                                                  github_path=_gh_fb_path,
+                                                  content_len=len(content))
+                                            break
+                                    except Exception as _gh_fb_err:
+                                        _dlog("agent_filereq_github_fallback_err",
+                                              session_id=session_id,
+                                              user_id=user_id, turn=_turn,
+                                              filename=fn,
+                                              github_path=_gh_fb_path,
+                                              error=str(_gh_fb_err)[:200])
+                                        continue
+
+                                # ── Step 1b: Dynamic search — if hardcoded
+                                #    prefixes all missed, use search_code to
+                                #    find the file by name anywhere in repo,
+                                #    then read_file the discovered path. ──
+                                if not content:
+                                    try:
+                                        from services.github_context_tools import (
+                                            execute_github_context_tool,
+                                        )
+                                        # ── Try an ordered list of query
+                                        #    variants + acceptable-basename
+                                        #    matchers (see
+                                        #    build_filereq_search_variants
+                                        #    docstring for the proof).
+                                        #    Stop at the first variant
+                                        #    that yields a real match, so
+                                        #    a wrong subdir guess or a
+                                        #    .ts/.tsx (or .js/.jsx)
+                                        #    mismatch doesn't sink the
+                                        #    whole lookup. ──
+                                        _fr_stem = fn.split("/")[-1].rpartition(".")[0]
+                                        _fr_variants = build_filereq_search_variants(fn)
+
+                                        _gh_search_paths = []
+                                        _fr_matched_variant = None
+                                        for _fr_query_base, _fr_ok_bases, _fr_allow_barrel in _fr_variants:
+                                            _gh_search_q = f"filename:{_fr_query_base}"
+                                            _dlog("agent_filereq_search_code_start",
+                                                  session_id=session_id,
+                                                  user_id=user_id, turn=_turn,
+                                                  filename=fn, query=_gh_search_q)
+                                            _gh_search_res = execute_github_context_tool(
+                                                "search_code",
+                                                {"owner": _gh_fb_owner,
+                                                 "repo": _gh_fb_repo,
+                                                 "query": _gh_search_q},
+                                                user_id, dlog=_dlog, session_id=session_id,
+                                            )
+                                            # Parse paths from search results.
+                                            # Each hit line is just the path, e.g.
+                                            #   "frontend/src/api/client.ts"
+                                            _variant_paths = []
+                                            for _sr_line in (_gh_search_res or "").splitlines():
+                                                _sr_line = _sr_line.strip()
+                                                if (not _sr_line
+                                                        or _sr_line.startswith("Code search")
+                                                        or _sr_line.startswith("(no match")
+                                                        or _sr_line.startswith("[")):
+                                                    continue
+                                                if filereq_path_matches(
+                                                        _sr_line, _fr_ok_bases,
+                                                        _fr_allow_barrel, _fr_stem):
+                                                    _variant_paths.append(_sr_line)
+                                            _dlog("agent_filereq_search_code_results",
+                                                  session_id=session_id,
+                                                  user_id=user_id, turn=_turn,
+                                                  filename=fn,
+                                                  query=_gh_search_q,
+                                                  paths=_variant_paths[:5])
+                                            if _variant_paths:
+                                                _gh_search_paths = _variant_paths
+                                                _fr_matched_variant = _gh_search_q
+                                                break
+                                        if _gh_search_paths:
+                                            _dlog("agent_filereq_search_code_variant_matched",
+                                                  session_id=session_id,
+                                                  user_id=user_id, turn=_turn,
+                                                  filename=fn,
+                                                  matched_query=_fr_matched_variant,
+                                                  paths=_gh_search_paths[:5])
+                                        for _sr_path in _gh_search_paths[:3]:
+                                            try:
+                                                _sr_parsed = {
+                                                    "tool": "read_file",
+                                                    "args": {
+                                                        "owner": _gh_fb_owner,
+                                                        "repo": _gh_fb_repo,
+                                                        "path": _sr_path,
+                                                    },
+                                                    "reason": f"Auto-fetch via search: {fn}",
+                                                }
+                                                _sr_entry = fetch_and_register_github_file(
+                                                    _sr_parsed, user_id,
+                                                    session_id, dlog=_dlog)
+                                                if _sr_entry and _sr_entry.get("content"):
+                                                    content = _sr_entry["content"]
+                                                    file_content_lookup_stream[fn] = content
+                                                    try:
+                                                        _sr_smap = parser.parse(content, fn)
+                                                        symbol_maps_by_name[fn] = (
+                                                            _sr_smap, _sr_entry)
+                                                    except Exception:
+                                                        pass
+                                                    _dlog("agent_filereq_search_fallback_ok",
+                                                          session_id=session_id,
+                                                          user_id=user_id, turn=_turn,
+                                                          filename=fn,
+                                                          github_path=_sr_path,
+                                                          content_len=len(content))
+                                                    break
+                                            except Exception as _sr_err:
+                                                _dlog("agent_filereq_search_fallback_err",
+                                                      session_id=session_id,
+                                                      user_id=user_id, turn=_turn,
+                                                      filename=fn,
+                                                      github_path=_sr_path,
+                                                      error=str(_sr_err)[:200])
+                                                continue
+                                    except Exception as _gh_search_err:
+                                        _dlog("agent_filereq_search_code_failed",
+                                              session_id=session_id,
+                                              user_id=user_id, turn=_turn,
+                                              filename=fn,
+                                              error=str(_gh_search_err)[:200])
+                        return
+                    # ── Batch tree pre-resolution (session 05190c82) ──
+                    # ONE cached recursive-tree lookup resolves/rejects every
+                    # requested file at once. Absent files (complete tree) skip
+                    # all searching and go straight to HITL; truncated /
+                    # ambiguous / unknown fall back to the legacy resolver so a
+                    # truncated tree is never mistaken for proof of absence.
+                    _tree_res_map: dict = {}
+                    _tree_res_meta: dict = {}
+                    if _gh_nat_enabled and _gh_known_repos:
+                        _tr_names = [
+                            n for n in new_fnames
+                            if n not in _rerequestable
+                            and not file_content_lookup_stream.get(n)]
+                        if _tr_names:
+                            _tr_owner_repo = _gh_known_repos[0]
+                            _tr_owner, _tr_repo = (
+                                _tr_owner_repo.split("/", 1)
+                                if "/" in _tr_owner_repo
+                                else (_tr_owner_repo, ""))
+                            if _tr_repo:
+                                try:
+                                    from services.github_context_tools import (
+                                        resolve_paths_via_tree,
+                                    )
+                                    # Bound the tree fetch to a slice of the phase
+                                    # so the lookup itself can never blow the
+                                    # deadline (P1).
+                                    _tr_deadline = max(5.0, min(
+                                        30.0,
+                                        STREAMING_PHASE_DEADLINE_S
+                                        - (time.time() - _streaming_t0)
+                                        - FILEREQ_EDIT_RESERVE_S))
+                                    _tr_result = resolve_paths_via_tree(
+                                        _tr_owner, _tr_repo, user_id, _tr_names,
+                                        dlog=_dlog, session_id=session_id,
+                                        deadline_s=_tr_deadline)
+                                    _tree_res_map = _tr_result.get("resolutions", {}) or {}
+                                    _tree_res_meta = {
+                                        "tree_sha": _tr_result.get("tree_sha"),
+                                        "truncated": _tr_result.get("truncated"),
+                                        "entry_count": _tr_result.get("entry_count"),
+                                        "error": _tr_result.get("error")}
+                                    _dlog("agent_filereq_tree_prepass",
+                                          session_id=session_id, user_id=user_id,
+                                          turn=_turn, names=_tr_names[:10],
+                                          truncated=_tr_result.get("truncated"),
+                                          tree_sha=_tr_result.get("tree_sha"),
+                                          entry_count=_tr_result.get("entry_count"),
+                                          deadline_s=round(_tr_deadline, 1),
+                                          error=_tr_result.get("error"))
+                                except Exception as _tr_err:
+                                    _dlog("agent_filereq_tree_prepass_error",
+                                          session_id=session_id, user_id=user_id,
+                                          turn=_turn, error=str(_tr_err)[:200])
+                    # PRE-PASS: fetch every repo-available file first.
+                    for _pp_fn in new_fnames:
+                        if _pp_fn in _rerequestable:
+                            continue  # same-name re-request must come from the user
+                        if file_content_lookup_stream.get(_pp_fn):
+                            continue  # already in session
+                        try:
+                            _prepass_resolve_from_repo(_pp_fn, _turn)
+                        except Exception as _pp_err:
+                            _dlog("agent_filereq_prepass_error",
+                                  session_id=session_id, user_id=user_id,
+                                  turn=_turn, filename=_pp_fn,
+                                  error=str(_pp_err)[:200])
+                    for _fi, fn in enumerate(new_fnames):
                         _is_reretry = fn in _rerequestable
                         if _is_reretry:
                             # Force a fresh HITL pause: drop the wrong copy and skip
@@ -17659,193 +17997,50 @@ async def run_natural_pipeline_stream(
                         else:
                             content = file_content_lookup_stream.get(fn, "")
                         if not content:
-                            # ── Step 1: GitHub fallback — try to fetch the file
-                            #    from the known repo before bothering the user.
-                            #    Skipped on a same-name correction re-request: that
-                            #    file came from the user, not the repo. ──
-                            if not _is_reretry and _gh_nat_enabled and _gh_known_repos:
-                                _gh_fb_owner_repo = _gh_known_repos[0]
-                                _gh_fb_owner, _gh_fb_repo = (
-                                    _gh_fb_owner_repo.split("/", 1)
-                                    if "/" in _gh_fb_owner_repo
-                                    else (_gh_fb_owner_repo, ""))
-                                if _gh_fb_repo:
-                                    # Try common paths for the file
-                                    _gh_fb_candidates = [
-                                        fn,
-                                        f"backend/{fn}",
-                                        f"backend/services/{fn}",
-                                        f"backend/routers/{fn}",
-                                        f"frontend/src/{fn}",
-                                        f"frontend/src/api/{fn}",
-                                        f"frontend/src/components/{fn}",
-                                        f"frontend/src/utils/{fn}",
-                                    ]
-                                    from services.github_natural_tag import (
-                                        fetch_and_register_github_file,
-                                    )
-                                    for _gh_fb_path in _gh_fb_candidates:
-                                        try:
-                                            _gh_fb_parsed = {
-                                                "tool": "read_file",
-                                                "args": {
-                                                    "owner": _gh_fb_owner,
-                                                    "repo": _gh_fb_repo,
-                                                    "path": _gh_fb_path,
-                                                },
-                                                "reason": f"Auto-fetch missing file: {fn}",
-                                            }
-                                            _gh_fb_entry = fetch_and_register_github_file(
-                                                _gh_fb_parsed, user_id,
-                                                session_id, dlog=_dlog)
-                                            if _gh_fb_entry and _gh_fb_entry.get("content"):
-                                                content = _gh_fb_entry["content"]
-                                                file_content_lookup_stream[fn] = content
-                                                try:
-                                                    _gh_fb_smap = parser.parse(content, fn)
-                                                    symbol_maps_by_name[fn] = (
-                                                        _gh_fb_smap, _gh_fb_entry)
-                                                except Exception:
-                                                    pass
-                                                _dlog("agent_filereq_github_fallback_ok",
-                                                      session_id=session_id,
-                                                      user_id=user_id, turn=_turn,
-                                                      filename=fn,
-                                                      github_path=_gh_fb_path,
-                                                      content_len=len(content))
-                                                break
-                                        except Exception as _gh_fb_err:
-                                            _dlog("agent_filereq_github_fallback_err",
-                                                  session_id=session_id,
-                                                  user_id=user_id, turn=_turn,
-                                                  filename=fn,
-                                                  github_path=_gh_fb_path,
-                                                  error=str(_gh_fb_err)[:200])
-                                            continue
-
-                                    # ── Step 1b: Dynamic search — if hardcoded
-                                    #    prefixes all missed, use search_code to
-                                    #    find the file by name anywhere in repo,
-                                    #    then read_file the discovered path. ──
-                                    if not content:
-                                        try:
-                                            from services.github_context_tools import (
-                                                execute_github_context_tool,
-                                            )
-                                            # ── Try an ordered list of query
-                                            #    variants + acceptable-basename
-                                            #    matchers (see
-                                            #    build_filereq_search_variants
-                                            #    docstring for the proof).
-                                            #    Stop at the first variant
-                                            #    that yields a real match, so
-                                            #    a wrong subdir guess or a
-                                            #    .ts/.tsx (or .js/.jsx)
-                                            #    mismatch doesn't sink the
-                                            #    whole lookup. ──
-                                            _fr_stem = fn.split("/")[-1].rpartition(".")[0]
-                                            _fr_variants = build_filereq_search_variants(fn)
-
-                                            _gh_search_paths = []
-                                            _fr_matched_variant = None
-                                            for _fr_query_base, _fr_ok_bases, _fr_allow_barrel in _fr_variants:
-                                                _gh_search_q = f"filename:{_fr_query_base}"
-                                                _dlog("agent_filereq_search_code_start",
-                                                      session_id=session_id,
-                                                      user_id=user_id, turn=_turn,
-                                                      filename=fn, query=_gh_search_q)
-                                                _gh_search_res = execute_github_context_tool(
-                                                    "search_code",
-                                                    {"owner": _gh_fb_owner,
-                                                     "repo": _gh_fb_repo,
-                                                     "query": _gh_search_q},
-                                                    user_id, dlog=_dlog, session_id=session_id,
-                                                )
-                                                # Parse paths from search results.
-                                                # Each hit line is just the path, e.g.
-                                                #   "frontend/src/api/client.ts"
-                                                _variant_paths = []
-                                                for _sr_line in (_gh_search_res or "").splitlines():
-                                                    _sr_line = _sr_line.strip()
-                                                    if (not _sr_line
-                                                            or _sr_line.startswith("Code search")
-                                                            or _sr_line.startswith("(no match")
-                                                            or _sr_line.startswith("[")):
-                                                        continue
-                                                    if filereq_path_matches(
-                                                            _sr_line, _fr_ok_bases,
-                                                            _fr_allow_barrel, _fr_stem):
-                                                        _variant_paths.append(_sr_line)
-                                                _dlog("agent_filereq_search_code_results",
-                                                      session_id=session_id,
-                                                      user_id=user_id, turn=_turn,
-                                                      filename=fn,
-                                                      query=_gh_search_q,
-                                                      paths=_variant_paths[:5])
-                                                if _variant_paths:
-                                                    _gh_search_paths = _variant_paths
-                                                    _fr_matched_variant = _gh_search_q
-                                                    break
-                                            if _gh_search_paths:
-                                                _dlog("agent_filereq_search_code_variant_matched",
-                                                      session_id=session_id,
-                                                      user_id=user_id, turn=_turn,
-                                                      filename=fn,
-                                                      matched_query=_fr_matched_variant,
-                                                      paths=_gh_search_paths[:5])
-                                            for _sr_path in _gh_search_paths[:3]:
-                                                try:
-                                                    _sr_parsed = {
-                                                        "tool": "read_file",
-                                                        "args": {
-                                                            "owner": _gh_fb_owner,
-                                                            "repo": _gh_fb_repo,
-                                                            "path": _sr_path,
-                                                        },
-                                                        "reason": f"Auto-fetch via search: {fn}",
-                                                    }
-                                                    _sr_entry = fetch_and_register_github_file(
-                                                        _sr_parsed, user_id,
-                                                        session_id, dlog=_dlog)
-                                                    if _sr_entry and _sr_entry.get("content"):
-                                                        content = _sr_entry["content"]
-                                                        file_content_lookup_stream[fn] = content
-                                                        try:
-                                                            _sr_smap = parser.parse(content, fn)
-                                                            symbol_maps_by_name[fn] = (
-                                                                _sr_smap, _sr_entry)
-                                                        except Exception:
-                                                            pass
-                                                        _dlog("agent_filereq_search_fallback_ok",
-                                                              session_id=session_id,
-                                                              user_id=user_id, turn=_turn,
-                                                              filename=fn,
-                                                              github_path=_sr_path,
-                                                              content_len=len(content))
-                                                        break
-                                                except Exception as _sr_err:
-                                                    _dlog("agent_filereq_search_fallback_err",
-                                                          session_id=session_id,
-                                                          user_id=user_id, turn=_turn,
-                                                          filename=fn,
-                                                          github_path=_sr_path,
-                                                          error=str(_sr_err)[:200])
-                                                    continue
-                                        except Exception as _gh_search_err:
-                                            _dlog("agent_filereq_search_code_failed",
-                                                  session_id=session_id,
-                                                  user_id=user_id, turn=_turn,
-                                                  filename=fn,
-                                                  error=str(_gh_search_err)[:200])
-
-                        if not content:
                             # ── Step 2: Human-in-the-loop — pause and ask the
                             #    user to supply the file. Degrades to a "tell
                             #    the user and stop" instruction when there is no
                             #    back-channel (plain HTTP/SSE / offline). ──
                             _fr_outcome: dict = {}
+                            # ── Phase-budget fair-share (session 05190c82) ──
+                            # Split the phase time still remaining (net of the
+                            # edit reserve) evenly across the files from here on
+                            # that still need a human, so one never-provided file
+                            # can't burn the whole budget and starve both the
+                            # responsive uploads AND the edit turn.
+                            _fr_pending = sum(
+                                1 for _pf in new_fnames[_fi:]
+                                if (_pf in _rerequestable)
+                                or not file_content_lookup_stream.get(_pf))
+                            _fr_phase_left = (
+                                STREAMING_PHASE_DEADLINE_S
+                                - (time.time() - _streaming_t0)
+                                - FILEREQ_EDIT_RESERVE_S)
+                            _fr_share = _fr_phase_left / max(1, _fr_pending)
+                            # Structured budget + tree provenance so a future
+                            # deadline overshoot is fully diagnosable from logs.
+                            _fr_cap_reason = (
+                                "exhausted" if _fr_share <= 0
+                                else ("capped" if _fr_share < FILE_WAIT_TIMEOUT_S
+                                      else "full"))
+                            _dlog("agent_filereq_pause_budget",
+                                  session_id=session_id, user_id=user_id,
+                                  turn=_turn, filename=fn,
+                                  phase_deadline_s=STREAMING_PHASE_DEADLINE_S,
+                                  elapsed_s=round(time.time() - _streaming_t0, 1),
+                                  phase_left_s=round(_fr_phase_left, 1),
+                                  pending=_fr_pending,
+                                  share_s=round(_fr_share, 1),
+                                  granted_wait_s=round(
+                                      max(0.0, min(float(FILE_WAIT_TIMEOUT_S),
+                                                   _fr_share)), 1),
+                                  reserve_s=FILEREQ_EDIT_RESERVE_S,
+                                  cap_reason=_fr_cap_reason,
+                                  tree_sha=(_tree_res_meta or {}).get("tree_sha"),
+                                  tree_truncated=(_tree_res_meta or {}).get("truncated"))
                             async for _fr_ev in _await_user_file(
-                                    fn, _fr_outcome, is_retry=_is_reretry):
+                                    fn, _fr_outcome, is_retry=_is_reretry,
+                                    max_wait=_fr_share):
                                 yield _fr_ev
                             if _fr_outcome.get("content"):
                                 content = _fr_outcome["content"]
