@@ -1,0 +1,191 @@
+"""Multi-window correction *collapse* recovery.
+
+Smoking gun (session 430d9711, surgical_debug_430d9711 (3).jsonl):
+------------------------------------------------------------------
+A large blocked symbol (`DashboardAIAssistant`, 881 lines) was routed to the
+multi-window correction path (3 scattered windows). The surgeon attempted an
+edit that SPANNED window 1 -> window 2 (it opened a bracket in window 1 whose
+match belonged in window 2), but then REFUSED window 2
+(`correction_multi_window_no_edit`: "I still need the actual message-construction
+block"). The splicer faithfully reassembled the windows (line arithmetic exact:
+881 + 1 + 0 = 882), but the resulting *full symbol* was structurally broken:
+
+    correction_multi_window_fragment_rejected
+      is_brace_unbalanced=true
+      brace_balance_reason="mismatched bracket: found closing ')' but the
+                            innermost open bracket was '['"
+
+The brace guard CORRECTLY refused to ship the broken code -> that behaviour is
+healthy and is NOT changed here. The defect is purely in *recovery*: the symbol
+stayed blocked and the next retry round re-ran the IDENTICAL N-window
+decomposition, reproducing the IDENTICAL imbalance (round 0 AND round 1 both
+failed the same way). Meanwhile a manual re-prompt — which sees the whole
+changed region at once and can make the cross-window edit atomically — healed it
+cleanly in a single pass.
+
+Root cause: the multi-window decomposition splits an edit that must be made
+atomically across a window boundary; when one window is left unedited the join
+is malformed. There is no splicer/guard bug to fix.
+
+Fix (this module):
+------------------
+When a multi-window correction is rejected specifically for a brace/bracket
+imbalance, record a per-idx "collapse" hint. On the next correction round the
+routing collapses all scattered change-clusters into a SINGLE contiguous window
+(by passing a very large ``merge_gap`` to ``_find_changed_windows``). A single
+window routes through the already-proven single-window correction branch: one
+atomic splice, no cross-window boundary, and its own brace guard still protects
+against shipping broken code — exactly reproducing what the manual re-prompt did.
+
+Why this is safe / cannot regress a passing case:
+  * The hint is only ever set on ``is_brace_unbalanced`` rejection, which today
+    is a GUARANTEED hard-block (zero landed cards for that symbol). Anything on
+    this path can only turn a guaranteed failure into a possible success.
+  * No existing splicer, guard, accept path, or the single-pass path is touched.
+  * Worst case (collapsed window still imbalances) is identical to today: the
+    single-window path widens context via ``_window_widen_hint`` next round and,
+    failing that, the symbol stays blocked — same outcome as before.
+  * No infinite loop: once collapsed the symbol is a single window (handled by
+    the single-window path, which uses ``_window_widen_hint``, not this hint),
+    and the whole retry loop is capped by ``MAX_QA_RETRIES``.
+
+Every branch emits a ``_dlog`` event (passed in as ``dlog``) so the behaviour is
+fully traceable in the surgical debug log, per project logging policy.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Callable
+
+# Larger than any realistic symbol line count. Passed as ``merge_gap`` to
+# ``_find_changed_windows`` so the gap-based clustering (gap > merge_gap) never
+# splits -> every scattered change region falls into ONE cluster -> exactly one
+# window. See _find_changed_windows clustering loop.
+MW_COLLAPSE_MERGE_GAP = 10 ** 9
+
+
+def record_brace_collapse_hint(
+    collapse_hint: dict[int, bool],
+    idx: int,
+    *,
+    is_brace_unbalanced: bool,
+    dlog: Callable[..., Any],
+    **dlog_ctx: Any,
+) -> bool:
+    """Record a collapse hint for ``idx`` iff the multi-window rejection was a
+    brace/bracket imbalance.
+
+    Returns True when a hint was recorded (i.e. next round will collapse).
+
+    Only the brace-imbalance signature is handled here — that is the class of
+    failure proven to be caused by an un-completable cross-window edit. Other
+    multi-window rejection reasons (content-loss / duplication / content-gain)
+    have their own dedicated guards and retry semantics and are deliberately
+    left untouched.
+    """
+    if not is_brace_unbalanced:
+        dlog(
+            "mw_collapse_hint_skipped",
+            idx=idx,
+            reason="rejection_not_brace_imbalance",
+            note="collapse recovery only applies to brace/bracket-imbalanced "
+                 "multi-window splices; other guards handle their own retries",
+            **dlog_ctx,
+        )
+        return False
+
+    collapse_hint[idx] = True
+    dlog(
+        "mw_collapse_hint_recorded",
+        idx=idx,
+        note="multi-window splice was brace/bracket-unbalanced (un-completable "
+             "cross-window edit) — next round will collapse scattered windows "
+             "into ONE atomic window and route through the single-window path",
+        **dlog_ctx,
+    )
+    return True
+
+
+def should_collapse(idx: int, collapse_hint: dict[int, bool]) -> bool:
+    """True when ``idx`` was previously brace-rejected on the multi-window path
+    and should therefore be corrected as a single collapsed window this round."""
+    return bool(collapse_hint.get(idx))
+
+
+def build_collapsed_windows(
+    symbol_code: str,
+    broken_code: str,
+    find_changed_windows: Callable[..., list],
+    context_lines: int,
+    dlog: Callable[..., Any],
+    **dlog_ctx: Any,
+) -> list:
+    """Return change-windows for ``symbol_code`` -> ``broken_code`` collapsed
+    into a SINGLE contiguous window.
+
+    Delegates entirely to the caller's proven ``_find_changed_windows`` (passed
+    in) with a very large ``merge_gap`` so its own gap-based clustering merges
+    every scattered change region into one cluster -> one window. This reuses
+    the exact, already-tested window-building code — this module adds no new
+    diffing or splicing logic of its own.
+
+    Returns:
+      * a 1-element list  -> routes through the single-window correction branch;
+      * an empty list     -> caller degrades safely (full-symbol re-emit branch).
+
+    A >1 result is not expected (merge_gap makes clustering impossible) but is
+    handled defensively: it is logged and returned unchanged so the caller keeps
+    its existing multi-window behaviour rather than crashing — i.e. worst case is
+    identical to today.
+    """
+    try:
+        windows = find_changed_windows(
+            symbol_code,
+            broken_code,
+            context_lines=context_lines,
+            merge_gap=MW_COLLAPSE_MERGE_GAP,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        dlog(
+            "mw_collapse_build_error",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            note="collapse window build raised — returning [] so caller degrades "
+                 "to the full-symbol re-emit branch (safe fallback)",
+            **dlog_ctx,
+        )
+        return []
+
+    window_count = len(windows)
+    if window_count == 1:
+        _w = windows[0]
+        dlog(
+            "mw_collapse_windows_built",
+            window_count=window_count,
+            window_start=_w.get("window_start", -1) + 1,
+            window_end=_w.get("window_end", -1) + 1,
+            window_line_count=_w.get("window_line_count", -1),
+            total_edit_lines=_w.get("total_edit_lines", -1),
+            note="scattered windows collapsed into ONE atomic window — will route "
+                 "through the proven single-window correction/splice path",
+            **dlog_ctx,
+        )
+    elif window_count == 0:
+        dlog(
+            "mw_collapse_windows_empty",
+            window_count=0,
+            note="find_changed_windows returned no windows — caller degrades to "
+                 "full-symbol re-emit (safe fallback)",
+            **dlog_ctx,
+        )
+    else:
+        dlog(
+            "mw_collapse_windows_unexpected_count",
+            window_count=window_count,
+            note="expected exactly 1 collapsed window with huge merge_gap; got "
+                 ">1 — returning as-is so caller keeps existing behaviour (no "
+                 "regression vs today)",
+            **dlog_ctx,
+        )
+
+    return windows

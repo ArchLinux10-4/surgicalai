@@ -21904,6 +21904,16 @@ async def run_natural_pipeline_stream(
         # (see ``_find_changed_windows`` call below) gives the model more
         # surrounding code instead of repeating the same losing window size.
         _window_widen_hint: dict[int, int] = {}
+        # ── Multi-window brace-imbalance collapse recovery (session 430d9711) ──
+        # Sibling to _window_widen_hint above, for the MULTI-window path. When a
+        # multi-window splice is rejected for a brace/bracket imbalance (an
+        # un-completable cross-window edit), the affected idx is recorded here so
+        # the NEXT round collapses its scattered windows into ONE atomic window
+        # and routes through the proven single-window path. Only ever set on a
+        # brace-imbalance rejection (today a guaranteed hard-block), so it can
+        # only turn a guaranteed failure into a possible success — see
+        # services.mw_collapse_recovery for the full proof.
+        _mw_collapse_hint: dict[int, bool] = {}
 
         for _qa_retry_round in range(MAX_QA_RETRIES):
             # ── Pipeline deadline gate ─────────────────────────────────────
@@ -22203,9 +22213,28 @@ async def run_natural_pipeline_stream(
                     # Gap A fix: widen context on a prior brace-balance rejection
                     # instead of re-sending the exact window that already failed.
                     _ctx_lines_for_window = _window_widen_hint.get(idx, 20)
-                    _all_windows = _find_changed_windows(
-                        symbol.code, cs["new_code"], context_lines=_ctx_lines_for_window
+                    # ── Multi-window brace-imbalance collapse recovery ──
+                    # If this idx was brace-rejected on the multi-window path a
+                    # prior round, collapse all scattered clusters into ONE
+                    # atomic window (routes through the proven single-window
+                    # branch) instead of re-running the same losing N-window
+                    # decomposition. See services.mw_collapse_recovery.
+                    from services.mw_collapse_recovery import (
+                        should_collapse as _mw_should_collapse,
+                        build_collapsed_windows as _mw_build_collapsed,
                     )
+                    _mw_collapse_active = _mw_should_collapse(idx, _mw_collapse_hint)
+                    if _mw_collapse_active:
+                        _all_windows = _mw_build_collapsed(
+                            symbol.code, cs["new_code"], _find_changed_windows,
+                            _ctx_lines_for_window, _dlog,
+                            session_id=session_id, user_id=user_id,
+                            retry_round=_qa_retry_round, idx=idx, symbol=symbol.name,
+                        )
+                    else:
+                        _all_windows = _find_changed_windows(
+                            symbol.code, cs["new_code"], context_lines=_ctx_lines_for_window
+                        )
                     if idx in _window_widen_hint:
                         _dlog("correction_windowed_context_widened",
                               session_id=session_id, user_id=user_id,
@@ -22285,10 +22314,23 @@ async def run_natural_pipeline_stream(
                               len(_qa_known_symbols) if _qa_known_symbols is not None else 0
                           ))
 
-                    _all_windows = _augment_windows_with_qa_refs(
-                        _all_windows, qa_d, symbol.code, cs["new_code"],
-                        known_symbols=_qa_known_symbols,
-                    )
+                    if _mw_collapse_active:
+                        # Collapse recovery keeps the single atomic window on
+                        # purpose. QA-ref augmentation would re-scatter it into
+                        # multiple windows, reintroducing the cross-window
+                        # boundary we are trying to eliminate — so skip it for
+                        # this retry only.
+                        _dlog("mw_collapse_skip_qa_ref_augment",
+                              session_id=session_id, user_id=user_id,
+                              retry_round=_qa_retry_round, idx=idx, symbol=symbol.name,
+                              window_count=len(_all_windows),
+                              note="collapse recovery active — keeping single atomic "
+                                   "window; QA-ref augmentation skipped this retry")
+                    else:
+                        _all_windows = _augment_windows_with_qa_refs(
+                            _all_windows, qa_d, symbol.code, cs["new_code"],
+                            known_symbols=_qa_known_symbols,
+                        )
 
                     if len(_all_windows) == 1:
                         _window_info = _all_windows[0]
@@ -24569,6 +24611,24 @@ async def run_natural_pipeline_stream(
                               brace_balance_reason=_mw_brace,
                               running_len=len(_mw_running_code),
                               sym_len=len(_mw_sym.code))
+                        # ── Collapse recovery (session 430d9711) ──
+                        # A brace/bracket imbalance here means the surgeon made
+                        # an edit spanning a window boundary that could not be
+                        # completed (e.g. one window left unedited). Record a
+                        # hint so next round collapses the scattered windows
+                        # into ONE atomic window instead of re-running the same
+                        # losing decomposition. Only fires on brace imbalance —
+                        # other rejection reasons keep their existing retries.
+                        from services.mw_collapse_recovery import (
+                            record_brace_collapse_hint as _mw_record_collapse,
+                        )
+                        _mw_record_collapse(
+                            _mw_collapse_hint, _mw_idx,
+                            is_brace_unbalanced=_mw_brace is not None,
+                            dlog=_dlog,
+                            session_id=session_id, user_id=user_id,
+                            retry_round=_qa_retry_round, symbol=_mw_sym.name,
+                        )
                 else:
                     _dlog("correction_multi_window_failed",
                           session_id=session_id, user_id=user_id,
