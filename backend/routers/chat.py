@@ -1471,10 +1471,70 @@ async def smart_stream(req: dict, request: Request):
                         # 10.2KB edit was lost.  If the pipeline emitted a
                         # resolution checkpoint, reconstruct the resolved
                         # edits as a readable message so the work survives.
+                        _did_structured = False
                         if checkpoint_content:
                             try:
                                 _ckpt = _json.loads(checkpoint_content)
-                                _rec = _ckpt.get("resolved", [])
+                                # ── Structured disconnect recovery (session 430d9711) ──
+                                # A v2 checkpoint (format_version>=2) carries a
+                                # render/apply-ready `changes_by_file`. Save it through
+                                # the SAME "__NATURAL_AND_RESULT__:" envelope the healthy
+                                # done path uses (see ~line 1426) so the frontend renders
+                                # real, APPLYABLE diff cards. The old path below saved a
+                                # markdown bubble -> inert text, never cards, which is why
+                                # session 430d9711 loaded 201 files yet applied zero edits.
+                                _ckpt_cbf = _ckpt.get("changes_by_file")
+                                if _ckpt_cbf:
+                                    _rec_n = sum(
+                                        len(_v.get("changes", []))
+                                        for _v in _ckpt_cbf.values()
+                                    )
+                                    _rec_text = (
+                                        (fallback_text + ("\n\n" if fallback_text else ""))
+                                        + "⚡ **Connection was interrupted** before I could "
+                                          "finish, but I recovered "
+                                        + f"{_rec_n} completed edit(s) below — review and "
+                                          "apply them, or re-send the prompt to finish the rest."
+                                    ).strip()
+                                    _rec_result = {
+                                        "intent": "edit",
+                                        "summary": f"Recovered {_rec_n} edit(s) from an interrupted run",
+                                        "reasoning": "Recovered from a connection interruption before the run finished.",
+                                        "risks": [],
+                                        "skipped_changes": [],
+                                        "changes_by_file": _ckpt_cbf,
+                                        "new_files": [],
+                                        "natural_text": _rec_text,
+                                        "recovered": True,
+                                    }
+                                    _rec_saved_content = "__NATURAL_AND_RESULT__:" + _json.dumps({
+                                        "text": _rec_text,
+                                        "result": _rec_result,
+                                    })
+                                    db.execute(
+                                        "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
+                                        (resp_id, session_id, "assistant", _rec_saved_content,
+                                         _json.dumps({"model": _resolved_model or _arch_model,
+                                                      "recovered": True}))
+                                    )
+                                    db.execute(
+                                        "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                                        (session_id,)
+                                    )
+                                    db.commit()
+                                    _saved = True
+                                    _did_structured = True
+                                    _dlog("safety_net_structured_recovery",
+                                          session_id=session_id,
+                                          user_id=current_user_id,
+                                          recovered_files=len(_ckpt_cbf),
+                                          recovered_changes=_rec_n,
+                                          format_version=_ckpt.get("format_version"))
+                                    print(f"[STREAM] Safety-net STRUCTURED save: {_rec_n} edit(s) for session {session_id}")
+                                # Legacy thin checkpoint (no changes_by_file) keeps the
+                                # original markdown fallback so older in-flight streams and
+                                # older saved sessions still degrade gracefully.
+                                _rec = [] if _did_structured else _ckpt.get("resolved", [])
                                 if _rec:
                                     _parts = [
                                         "\n\n---\n⚡ **Connection was interrupted**, "
@@ -1505,7 +1565,7 @@ async def smart_stream(req: dict, request: Request):
                                           ))
                             except Exception as _ckpt_parse_err:
                                 print(f"[STREAM] Checkpoint recovery failed: {_ckpt_parse_err}")
-                        if fallback_text:
+                        if fallback_text and not _did_structured:
                             db.execute(
                                 "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
                                 (resp_id, session_id, "assistant", fallback_text,
