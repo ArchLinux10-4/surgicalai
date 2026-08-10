@@ -20256,33 +20256,87 @@ async def run_natural_pipeline_stream(
                                           user_id=user_id)
 
                             if not _optb_rescued:
-                                _dlog("snippet_apply_failed",
-                                      session_id=session_id,
-                                      filename=filename,
-                                      symbol=symbol_name,
-                                      reason=snip_reason,
-                                      edit_start_line=_isl,
-                                      edit_end_line=_iel,
-                                      symbol_start_line=_sym_abs_start,
-                                      symbol_code_len=len(_accum_base),
-                                      had_old_code=bool(old_code),
+                                # ── Cross-boundary text-region PROMOTION (sessions
+                                # 430d9711 Grok + Sonnet 5) ──────────────────
+                                # The line-number edit is "out of bounds" only
+                                # because the resolved symbol box (e.g. the 1-line
+                                # const ADMIN_USERNAMES at L72) is smaller than the
+                                # true edit span (L72-81, which reaches into the
+                                # adjacent, UN-indexed module.exports block). Rather
+                                # than drop the edit (degenerate_drop -> silent
+                                # failure with no diff card), promote it to a virtual
+                                # text-region symbol over the real file window so the
+                                # edit applies and QA judges a REAL before->after diff.
+                                _trp_sym = None
+                                _trp_new = None
+                                _trp_ok = False
+                                _trp_reason = "not_attempted"
+                                try:
+                                    from services.text_region_promotion import (
+                                        promote_to_text_region_edit as _promote_trp,
+                                    )
+                                    _trp_sym, _trp_new, _trp_ok, _trp_reason = _promote_trp(
+                                        file_content=file_content_lookup.get(filename, ""),
+                                        resolved_symbol=symbol,
+                                        new_code=new_code,
+                                        edit_start_line=_isl,
+                                        edit_end_line=_iel,
+                                        apply_by_lines=_apply_snippet_by_lines,
+                                        dlog=_dlog,
+                                        session_id=session_id,
+                                        filename=filename,
+                                        symbol_name=symbol_name,
+                                        user_id=user_id,
+                                        site="option_b_line_splice",
+                                    )
+                                except Exception as _trp_err:
+                                    _dlog("text_region_promotion_error",
+                                          session_id=session_id, filename=filename,
+                                          symbol=symbol_name, site="option_b_line_splice",
+                                          error=str(_trp_err)[:300], user_id=user_id)
+                                if _trp_ok and _trp_sym is not None:
+                                    symbol = _trp_sym
+                                    edit_data["new_code"] = _trp_new
+                                    edit_data.pop("old_code", None)
+                                    edit_data.pop("edit_start_line", None)
+                                    edit_data.pop("edit_end_line", None)
+                                    edit_data.pop("_extra_ops", None)
+                                    _dlog("text_region_promotion_accepted",
+                                          session_id=session_id, filename=filename,
+                                          symbol=symbol_name, site="option_b_line_splice",
+                                          promoted_region=f"{symbol.start_line}-{symbol.end_line}",
+                                          new_code_len=len(_trp_new or ""),
+                                          reason=_trp_reason, user_id=user_id)
+                                    # fall through to the resolved bookkeeping below
+                                else:
+                                    _dlog("snippet_apply_failed",
+                                          session_id=session_id,
+                                          filename=filename,
+                                          symbol=symbol_name,
+                                          reason=snip_reason,
+                                          edit_start_line=_isl,
+                                          edit_end_line=_iel,
+                                          symbol_start_line=_sym_abs_start,
+                                          symbol_code_len=len(_accum_base),
+                                          had_old_code=bool(old_code),
+                                          promotion_skipped_reason=_trp_reason,
                                           user_id=user_id)
-                                still_unresolved.append({
-                                    "filename": filename,
-                                    "symbol": symbol_name,
-                                    "new_code": new_code,
-                                    "description": description,
-                                    "_raw": edit_raw,
-                                    "_snippet_reason": snip_reason,
-                                    # CURRENT accumulated content — not symbol.code
-                                    # (the pristine original). Showing stale content
-                                    # made the correction model re-anchor against
-                                    # lines that no longer exist (the correction-drop
-                                    # bug).
-                                    "_symbol_code": _accum_base,
-                                    "_symbol_start": symbol.start_line,
-                                })
-                                continue
+                                    still_unresolved.append({
+                                        "filename": filename,
+                                        "symbol": symbol_name,
+                                        "new_code": new_code,
+                                        "description": description,
+                                        "_raw": edit_raw,
+                                        "_snippet_reason": snip_reason,
+                                        # CURRENT accumulated content — not symbol.code
+                                        # (the pristine original). Showing stale content
+                                        # made the correction model re-anchor against
+                                        # lines that no longer exist (the correction-drop
+                                        # bug).
+                                        "_symbol_code": _accum_base,
+                                        "_symbol_start": symbol.start_line,
+                                    })
+                                    continue
                     elif old_code:
                         # ── Option A: string-match splice (legacy fallback) ──
                         # Splice into the running (cumulative) symbol so a second
@@ -20358,19 +20412,77 @@ async def run_natural_pipeline_stream(
                                 _rf_file, old_code
                             )
                             if _rf_ok and _rf_old and _rf_old not in _accum_base:
-                                edit_data["new_code"] = _accum_base  # no-op symbol edit
-                                edit_data.pop("old_code", None)
-                                edit_data.setdefault("_extra_ops", []).append(
-                                    {"find": _rf_old, "replace": new_code}
-                                )
-                                _dlog("resolution_file_level_op_accepted",
-                                      session_id=session_id,
-                                      filename=filename,
-                                      symbol=symbol_name,
-                                      match_kind=_rf_reason,
-                                      find_preview=_rf_old[:200],
-                                      replace_preview=new_code[:200],
-                                      user_id=user_id)
+                                # ── Cross-boundary text-region PROMOTION (session
+                                # 430d9711 Grok) ────────────────────────
+                                # old_code matched the FILE but lives outside the
+                                # resolved symbol (it spans the adjacent, un-indexed
+                                # module.exports block). The legacy fallback below
+                                # keeps the symbol edit as a NO-OP sentinel and hides
+                                # the real change in a companion op, which makes QA
+                                # see an EMPTY primary diff and flakily BLOCK a
+                                # correct edit. Prefer promoting the edit to a virtual
+                                # text-region symbol so QA verifies a REAL
+                                # before->after diff. Fall back to the sentinel +
+                                # companion op only if promotion declines.
+                                _trp_sym = None
+                                _trp_new = None
+                                _trp_ok = False
+                                _trp_reason = "not_attempted"
+                                try:
+                                    from services.text_region_promotion import (
+                                        promote_to_text_region_edit as _promote_trp,
+                                    )
+                                    _trp_sym, _trp_new, _trp_ok, _trp_reason = _promote_trp(
+                                        file_content=_rf_file,
+                                        resolved_symbol=symbol,
+                                        new_code=new_code,
+                                        located_old_code=_rf_old,
+                                        apply_by_lines=_apply_snippet_by_lines,
+                                        dlog=_dlog,
+                                        session_id=session_id,
+                                        filename=filename,
+                                        symbol_name=symbol_name,
+                                        user_id=user_id,
+                                        site="option_a_file_level",
+                                    )
+                                except Exception as _trp_err:
+                                    _dlog("text_region_promotion_error",
+                                          session_id=session_id, filename=filename,
+                                          symbol=symbol_name, site="option_a_file_level",
+                                          error=str(_trp_err)[:300], user_id=user_id)
+                                if _trp_ok and _trp_sym is not None:
+                                    symbol = _trp_sym
+                                    edit_data["new_code"] = _trp_new
+                                    edit_data.pop("old_code", None)
+                                    edit_data.pop("edit_start_line", None)
+                                    edit_data.pop("edit_end_line", None)
+                                    edit_data.pop("_extra_ops", None)
+                                    _dlog("text_region_promotion_accepted",
+                                          session_id=session_id,
+                                          filename=filename,
+                                          symbol=symbol_name,
+                                          site="option_a_file_level",
+                                          promoted_region=f"{symbol.start_line}-{symbol.end_line}",
+                                          new_code_len=len(_trp_new or ""),
+                                          reason=_trp_reason,
+                                          user_id=user_id)
+                                else:
+                                    # Legacy no-op sentinel + companion op (unchanged
+                                    # behaviour; QA still receives the _x_note).
+                                    edit_data["new_code"] = _accum_base  # no-op symbol edit
+                                    edit_data.pop("old_code", None)
+                                    edit_data.setdefault("_extra_ops", []).append(
+                                        {"find": _rf_old, "replace": new_code}
+                                    )
+                                    _dlog("resolution_file_level_op_accepted",
+                                          session_id=session_id,
+                                          filename=filename,
+                                          symbol=symbol_name,
+                                          match_kind=_rf_reason,
+                                          find_preview=_rf_old[:200],
+                                          replace_preview=new_code[:200],
+                                          promotion_skipped_reason=_trp_reason,
+                                          user_id=user_id)
                                 # fall through to the resolved path below
                             else:
                                 # ── Claude last-ditch: fuzzy content-anchor rescue ──
