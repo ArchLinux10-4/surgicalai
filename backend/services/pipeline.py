@@ -16943,6 +16943,7 @@ async def run_natural_pipeline_stream(
 
         while True:
             _turn += 1
+            _grok_plan_held_writes = False  # plan gate held writes this turn (force-plan next)
 
             # grok: rewrite prior dispatch echo into native tool messages
             if _is_grok_model(arch_model) and _grok_native_turn is not None:
@@ -17580,8 +17581,11 @@ async def run_natural_pipeline_stream(
                     # emitted before a plan exists (rewrites their tool-results
                     # + arms a forced write_edit_plan next turn), and note plan
                     # capture. Mutates _grok_tr in place; no-op otherwise.
+                    # True return ⇒ writes held this turn — pipeline must continue
+                    # into the forced-plan turn (see continue_after_hold below).
                     if _grok_plan_gate is not None:
-                        _grok_plan_gate.filter_translation(_grok_tr, _turn)
+                        _grok_plan_held_writes = bool(
+                            _grok_plan_gate.filter_translation(_grok_tr, _turn))
                     if _grok_tr.edit_json_strings:
                         edit_blocks_raw.extend(_grok_tr.edit_json_strings)
                     if _grok_tr.new_file_json_strings:
@@ -17606,7 +17610,8 @@ async def run_natural_pipeline_stream(
                           new_files=len(_grok_tr.new_file_json_strings),
                           has_plan=_grok_tr.edit_plan is not None,
                           has_context=_grok_tr.context_request is not None,
-                          blocked=_grok_blocked, errors=len(_grok_tr.errors))
+                          blocked=_grok_blocked, errors=len(_grok_tr.errors),
+                          plan_held=_grok_plan_held_writes)
 
             _new_edits = (len(edit_blocks_raw) + len(new_file_blocks_raw)) - _edits_before
 
@@ -18479,6 +18484,41 @@ async def run_natural_pipeline_stream(
                                 "you with <blocked>…</blocked>."},
                         ]
                     continue
+
+            # ── Plan-gate held writes: CONTINUE into forced write_edit_plan ──
+            # Evidence (session cb380321, Retry with QA / grok-4.5):
+            #   turn 6 → agent_loop_text_only_nudge (missing new_code on 4 writes)
+            #   turn 7 → grok_plan_gate_hold_writes (4 valid writes held)
+            #          → agent_loop_text_only_exit (consecutive>=2)
+            #          → no_edits_produced / silent failure
+            # Never reached grok_plan_gate_tool_choice_forced.
+            # Same session earlier (hold on turn 5 with consecutive=0) took the
+            # text-only nudge path, continued, and captured a plan on turn 6 —
+            # proving the gate works ONLY when the loop survives the hold.
+            # A hold clears edit_json_strings, so the text-only exit counter
+            # must not treat it as a failed prose turn.
+            if (_grok_plan_held_writes and _grok_native_turn is not None
+                    and edit_plan_data is None and pending_tool is None):
+                _consecutive_text_only_turns = 0
+                _consecutive_empty_turns = 0
+                _assistant_echo = (full_response or "").strip() or "(planning…)"
+                # Shape normalize_dispatch_pair expects so next turn rewrites
+                # this pair into native tool-results carrying the plan-first
+                # instruction from results_by_id.
+                current_messages = current_messages + [
+                    {"role": "assistant", "content": _assistant_echo},
+                    {"role": "user", "content":
+                        "Plan required before edits on this multi-part request. "
+                        "Call write_edit_plan with one step per symbol for every "
+                        "part of the request; the steps are then implemented for you."},
+                ]
+                _dlog("grok_plan_gate_continue_after_hold",
+                      session_id=session_id, user_id=user_id, turn=_turn,
+                      holds=getattr(_grok_plan_gate, "holds", None),
+                      response_len=len(full_response or ""))
+                yield sse({"type": "progress",
+                           "content": "🧭 Planning the multi-part change first..."})
+                continue
 
             # ── Grok report_blocked: terminate cleanly (native equivalent of
             #    the <blocked> prose path; full_response already carries the
