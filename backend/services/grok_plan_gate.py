@@ -33,7 +33,10 @@ it). It:
    held write call's tool-result is rewritten to a "plan first" instruction so
    the xAI tool protocol still answers every ``tool_call_id``) and the next
    turn's ``tool_choice`` is forced to ``write_edit_plan``. Grok cannot skip
-   planning.
+   planning. The pipeline MUST continue after a hold (see
+   ``grok_plan_gate_continue_after_hold``) — a held turn looks like "no edits"
+   to the text-only exit counter, and exiting there silently drops the forced
+   plan turn (session cb380321 / Retry with QA).
 
 WHY THIS IS ENOUGH (verified against real pipeline.py)
 ------------------------------------------------------
@@ -233,12 +236,15 @@ class GrokPlanGate:
     # ── Seam 2: inspect/adjust a translation result in place ─────────────────
     def filter_translation(self, tr, turn):
         """MUTATE ``tr`` in place to enforce plan-before-write and note plan
-        capture. Returns None (no pipeline branching required — the existing
-        per-turn nudge appends the assistant/tool message pair, and the rewritten
-        tool-results + next-turn forced ``tool_choice`` drive the plan)."""
+        capture.
+
+        Returns ``True`` when writes were held this call (pipeline must continue
+        into the forced-plan turn — do NOT count the hold as a text-only exit).
+        Returns ``False`` otherwise.
+        """
         try:
             if not (self.active and self.compound) or tr is None:
-                return None
+                return False
 
             # (a) A plan arrived (model chose it OR was forced) — record it.
             if getattr(tr, "edit_plan", None) and not self.plan_captured:
@@ -252,7 +258,7 @@ class GrokPlanGate:
                      step_count=len(steps),
                      steps=[{"filename": s.get("filename"), "symbol": s.get("symbol")}
                             for s in steps][:40])
-                return None
+                return False
 
             # (b) Enforce plan-before-write: hold any writes emitted with no plan.
             edits = list(getattr(tr, "edit_json_strings", []) or [])
@@ -271,12 +277,13 @@ class GrokPlanGate:
                 _log(self._dlog, "grok_plan_gate_hold_writes", turn=turn,
                      session_id=self._session_id, user_id=self._user_id,
                      held_writes=held, total_holds=self.holds)
-            return None
+                return True
+            return False
         except Exception as e:  # pragma: no cover - defensive
             _log(self._dlog, "grok_plan_gate_filter_error", turn=turn,
                  session_id=self._session_id, user_id=self._user_id,
                  error_type=type(e).__name__, error=str(e)[:200])
-            return None
+            return False
 
     def _rewrite_write_results(self, tr, message):
         """Point every held write call's tool-result at ``message`` so the xAI
