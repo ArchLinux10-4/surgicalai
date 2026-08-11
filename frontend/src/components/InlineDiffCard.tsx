@@ -15,7 +15,8 @@ import { Cancel, CheckCircle, Close, Description, FileDownload, History, Keyboar
 import { ApplyProgressStrip } from './ApplyProgressStrip'
 import type { ApplyProgress } from '../lib/applyProgress'
 import { applyStageLabel } from '../lib/applyProgress'
-import { clientLog } from '../lib/clientLog';
+import { clientLog } from '../lib/clientLog'
+import { getApplyGate, provenanceEvidence } from '../lib/qaApplyPolicy';
 interface Props {
   result: SmartResult
   sessionId: string
@@ -47,6 +48,10 @@ function buildQARetryReportText(filename: string, change: any): string {
   bucket('Logic errors', qa.logic_errors)
   bucket('Downstream risks', qa.downstream_risks)
   if (qa.plan_deviation) lines.push(`Plan deviation: ${qa.plan_deviation}`)
+  const sources = Array.isArray(qa.block_sources) ? qa.block_sources.filter(Boolean) : []
+  if (sources.length) {
+    lines.push(`Block sources: ${sources.join(', ')}${qa.machine_verified ? ' (machine-verified)' : ''}`)
+  }
   return lines.join('\n\n')
 }
 
@@ -167,6 +172,22 @@ function QABadge({ qa }: { qa: QAResult }) {
             <button onClick={() => setExpanded(false)} className="text-muted hover:text-ink">✕</button>
           </div>
           <p className="text-muted mb-2">{qa.summary || 'No summary'}</p>
+          {(() => {
+            const gate = getApplyGate(qa)
+            if (gate.kind === 'allowed') return null
+            return (
+              <div className={`mb-2 px-2 py-1.5 rounded border text-[11px] ${
+                gate.kind === 'hard_stop'
+                  ? 'border-danger/40 bg-danger/10 text-danger'
+                  : 'border-warning/40 bg-warning/10 text-warning'
+              }`}>
+                <div className="font-semibold mb-0.5">
+                  {gate.kind === 'hard_stop' ? 'Machine-verified block — Apply hard-stopped' : 'LLM QA only — Apply requires acknowledgment'}
+                </div>
+                <div>{gate.reasons.join(' · ')}</div>
+              </div>
+            )
+          })()}
           {qa.hard_blocked && (
             <p className="text-danger font-semibold mb-2">
               ⛔ Still blocked after every auto-fix attempt — this diff was NOT applied.
@@ -614,12 +635,18 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 
   const changeIds = realChanges.map((c: any) => c.id)
 
-  // Checkbox: all checked by default except QA-blocked ones
+  // Checkbox: all checked by default except QA hard-stops / unacked LLM blocks
   const [checked, setChecked] = useState<Record<string, boolean>>(() =>
     Object.fromEntries(
-      realChanges.map((c: any) => [c.id, c.qa_result?.verdict !== 'blocked'])
+      realChanges.map((c: any) => {
+        const gate = getApplyGate(c.qa_result)
+        if (gate.kind === 'hard_stop' || gate.kind === 'ack_required') return [c.id, false]
+        return [c.id, c.qa_result?.verdict !== 'blocked']
+      })
     )
   )
+  // LLM-only blocks require an explicit per-change acknowledgment before Apply.
+  const [llmAck, setLlmAck] = useState<Record<string, boolean>>({})
 
   // Diff expand/collapse per change — collapsed by default
   const [diffExpanded, setDiffExpanded] = useState<Record<string, boolean>>({})
@@ -711,8 +738,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 
   // Pending = not yet applied AND not skipped
   const pendingChanges = realChanges.filter((c: any) => !applied[c.id] && !skipped[c.id])
-  // Selected = pending + checked
-  const selectedChanges = pendingChanges.filter((c: any) => checked[c.id])
+  // Selected = pending + checked + not apply-locked (hard-stop / unacked LLM)
+  const selectedChanges = pendingChanges.filter((c: any) => {
+    if (!checked[c.id]) return false
+    const gate = getApplyGate(c.qa_result)
+    if (gate.kind === 'hard_stop') return false
+    if (gate.kind === 'ack_required' && !llmAck[c.id]) return false
+    return true
+  })
   const allApplied = realChanges.every((c: any) => applied[c.id] || skipped[c.id])
 
   // Aggregate +/- for the collapsed file row (screenshot clutter was open rows
@@ -776,6 +809,25 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   // Apply all selected changes in one call
   const handleApplySelected = async () => {
     if (selectedChanges.length === 0) return
+    // Defense in depth — never apply machine hard-stops or unacked LLM blocks
+    // even if UI state desyncs.
+    for (const ch of selectedChanges) {
+      const gate = getApplyGate(ch.qa_result)
+      if (gate.kind === 'hard_stop') {
+        clientLog('qa_apply_rejected_hard_stop', {
+          filename, changeId: ch.id, sources: gate.sources,
+        }, sessionId)
+        toast.error('Cannot apply — machine-verified QA block. Use Retry with QA.')
+        return
+      }
+      if (gate.kind === 'ack_required' && !llmAck[ch.id]) {
+        clientLog('qa_apply_rejected_needs_ack', {
+          filename, changeId: ch.id, sources: gate.sources,
+        }, sessionId)
+        toast.error('Acknowledge the LLM QA finding before applying this change.')
+        return
+      }
+    }
     // Session d021ff07: empty file_id made apply URL collapse and silently fail.
     if (!effectiveFileId) {
       clientLog('diff_apply_missing_file_id', {
@@ -1363,11 +1415,15 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           )}
 
           {realChanges.map((change: any, idx: number) => {
-            const isBlocked = change.qa_result?.verdict === 'blocked'
+            const gate = getApplyGate(change.qa_result)
+            const acked = Boolean(llmAck[change.id])
+            const applyLocked =
+              gate.kind === 'hard_stop' || (gate.kind === 'ack_required' && !acked)
             const isApplied = applied[change.id]
             const isSkipped = !isApplied && skipped[change.id]
-            const isChecked = checked[change.id] && !isBlocked && !isSkipped
+            const isChecked = checked[change.id] && !applyLocked && !isSkipped
             const isExpanded = diffExpanded[change.id]
+            const evidence = provenanceEvidence(change.qa_result, 4)
 
             const addCount = (change.diff || '').split('\n')
               .filter((l: string) => l.startsWith('+') && !l.startsWith('+++')).length
@@ -1384,10 +1440,16 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                       <input
                         type="checkbox"
                         checked={isChecked}
-                        disabled={isBlocked}
+                        disabled={applyLocked}
                         onChange={() => toggleCheck(change.id)}
                         className="w-4 h-4 cursor-pointer accent-emerald-500 disabled:opacity-40"
-                        title={isBlocked ? 'Blocked by QA — cannot apply' : isChecked ? 'Uncheck to skip this change' : 'Check to include this change'}
+                        title={
+                          gate.kind === 'hard_stop'
+                            ? 'Machine-verified QA block — fix or Retry with QA'
+                            : gate.kind === 'ack_required' && !acked
+                              ? 'Acknowledge the LLM QA finding below to enable Apply'
+                              : isChecked ? 'Uncheck to skip this change' : 'Check to include this change'
+                        }
                       />
                     )}
                   </div>
@@ -1421,7 +1483,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     <ConfidenceBadge change={change} />
                     {change.qa_result && <QABadge qa={change.qa_result} />}
                     {change.qa_result && <BlastRadius change={{ qa: change.qa_result }} />}
-                    {change.confidence < 7 && !isBlocked && (
+                    {change.confidence < 7 && !applyLocked && (
                       <span className="flex items-center gap-1 text-[10px] text-warning">
                         <Warning sx={{ fontSize: 10 }} /> Review
                       </span>
@@ -1434,10 +1496,16 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                         <Cancel sx={{ fontSize: 9 }} /> Skipped
                       </span>
                     )}
-                    {change.qa_result?.hard_blocked && onRetryWithQA && (
+                    {(gate.kind === 'hard_stop' || change.qa_result?.hard_blocked) && onRetryWithQA && (
                       <button
                         onClick={() => {
                           const reportText = buildQARetryReportText(fileData.filename || filename, change)
+                          clientLog('qa_retry_with_qa_clicked', {
+                            filename,
+                            changeId: change.id,
+                            sources: gate.sources,
+                            hardStop: gate.kind === 'hard_stop',
+                          }, sessionId)
                           onRetryWithQA(reportText)
                           toast.success('Sent the QA report back — asking for another fix...')
                         }}
@@ -1459,6 +1527,68 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     </button>
                   </div>
                 </div>
+
+                {/* Provenance + Option A apply policy (must not hide Diff/Retry/History) */}
+                {!isApplied && gate.kind !== 'allowed' && (
+                  <div className={`px-4 py-2 border-t border-border/40 text-[11px] ${
+                    gate.kind === 'hard_stop'
+                      ? 'bg-danger/5 text-danger'
+                      : 'bg-warning/5 text-warning'
+                  }`}>
+                    <div className="font-semibold mb-1">
+                      {gate.kind === 'hard_stop'
+                        ? 'Blocked — machine-verified (Apply disabled)'
+                        : 'Blocked — LLM QA only'}
+                      <span className="font-normal opacity-80"> · {gate.reasons.join(' · ')}</span>
+                    </div>
+                    {evidence.length > 0 && (
+                      <ul className="space-y-0.5 mb-1.5 text-muted">
+                        {evidence.map((line, i) => (
+                          <li key={i} className="font-mono text-[10px] truncate" title={line}>• {line}</li>
+                        ))}
+                      </ul>
+                    )}
+                    {gate.kind === 'hard_stop' ? (
+                      <p className="text-muted">
+                        Use <span className="font-semibold text-danger">Retry with QA</span> to regenerate a fix.
+                        Apply stays locked while compile/structural/plan evidence remains.
+                      </p>
+                    ) : (
+                      <label className="flex items-start gap-2 cursor-pointer text-ink">
+                        <input
+                          type="checkbox"
+                          className="mt-0.5 accent-amber-500"
+                          checked={acked}
+                          onChange={(e) => {
+                            const next = e.target.checked
+                            setLlmAck(p => ({ ...p, [change.id]: next }))
+                            if (next) {
+                              setChecked(p => ({ ...p, [change.id]: true }))
+                              clientLog('qa_llm_ack_confirmed', {
+                                filename,
+                                changeId: change.id,
+                                sources: gate.sources,
+                                score: change.qa_result?.qa_score ?? null,
+                              }, sessionId)
+                            } else {
+                              setChecked(p => ({ ...p, [change.id]: false }))
+                              clientLog('qa_llm_ack_revoked', {
+                                filename,
+                                changeId: change.id,
+                              }, sessionId)
+                            }
+                          }}
+                        />
+                        <span>
+                          I reviewed this LLM QA finding — allow Apply for this change.
+                          <span className="block text-muted mt-0.5">
+                            Sticky Apply All still skips blocked rows; use this card’s Apply after acknowledging.
+                          </span>
+                        </span>
+                      </label>
+                    )}
+                  </div>
+                )}
 
                 {isExpanded && (
                   <div className="border-t border-border">

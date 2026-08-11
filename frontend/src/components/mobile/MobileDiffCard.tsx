@@ -9,6 +9,7 @@ import React, { useState, useEffect } from 'react'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import { clientLog } from '../../lib/clientLog'
+import { getApplyGate, provenanceEvidence } from '../../lib/qaApplyPolicy'
 import type { SmartResult, SessionFile } from '../../types'
 import { useAppStore } from '../../stores/appStore'
 
@@ -81,6 +82,8 @@ function FileCard({
   const [confOpen, setConfOpen]     = useState(false)
   // Per-change applied state — keyed by change.id, same as InlineDiffCard
   const [appliedMap, setAppliedMap] = useState<Record<string, boolean>>({})
+  // LLM-only QA ack (Option A) — machine hard-stops never ack-apply on mobile.
+  const [llmAck, setLlmAck] = useState<Record<string, boolean>>({})
 
   const changes    = fileData.changes || []
   // file_id recovery net — see InlineDiffCard for the proven failure this
@@ -119,14 +122,23 @@ function FileCard({
 
   const handleApply = async () => {
     if (applying || allApplied) return
-    // Only apply QA-clean changes; QA-blocked ones must be reviewed individually.
-    const applyChanges = changes.filter((c: any) => c?.qa_result?.verdict !== 'blocked')
+    // Option A: never bulk-apply machine hard-stops; LLM-only only if acked.
+    const applyChanges = changes.filter((c: any) => {
+      const gate = getApplyGate(c?.qa_result)
+      if (gate.kind === 'hard_stop') return false
+      if (gate.kind === 'ack_required') return Boolean(llmAck[c?.id])
+      return c?.qa_result?.verdict !== 'blocked'
+    })
     if (applyChanges.length === 0) {
+      const anyHard = changes.some((c: any) => getApplyGate(c?.qa_result).kind === 'hard_stop')
       clientLog('mobile_diff_apply_all_qa_blocked', {
         filename,
         changeCount: changes.length,
+        hardStop: anyHard,
       }, sessionId)
-      toast.error('All changes here are QA-flagged — review them individually before applying')
+      toast.error(anyHard
+        ? 'Machine-verified QA block — retry on desktop / Retry with QA'
+        : 'Acknowledge LLM QA (below) before applying, or review on desktop')
       return
     }
     if (!effectiveFileId) {
@@ -378,24 +390,28 @@ function FileCard({
         {!allApplied ? (
           <button
             onClick={handleApply}
-            disabled={applying || currentChange?.qa_result?.verdict === 'blocked'}
+            disabled={applying || (() => {
+              const applyable = changes.filter((c: any) => {
+                const gate = getApplyGate(c?.qa_result)
+                if (gate.kind === 'hard_stop') return false
+                if (gate.kind === 'ack_required') return Boolean(llmAck[c?.id])
+                return c?.qa_result?.verdict !== 'blocked'
+              })
+              return applyable.length === 0
+            })()}
             className={`flex-1 py-2.5 rounded-xl text-sm font-semibold transition-all flex items-center justify-center gap-2 ${
-              currentChange?.qa_result?.verdict === 'blocked'
-                ? 'bg-red-500/10 border border-red-500/25 text-red-400/60 cursor-not-allowed'
-                : applying
-                  ? 'bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)] text-[#4ade80]/60 cursor-wait'
-                  : 'bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.35)] text-[#4ade80] hover:bg-[rgba(74,222,128,0.2)] active:scale-95'
-            }`}
+              applying
+                ? 'bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)] text-[#4ade80]/60 cursor-wait'
+                : 'bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.35)] text-[#4ade80] hover:bg-[rgba(74,222,128,0.2)] active:scale-95'
+            } disabled:opacity-50 disabled:cursor-not-allowed`}
           >
             {applying ? (
               <>
                 <span className="w-3.5 h-3.5 border-2 border-[rgba(74,222,128,0.35)] border-t-orange rounded-full animate-spin" />
                 Applying...
               </>
-            ) : currentChange?.qa_result?.verdict === 'blocked' ? (
-              <>🚫 Blocked by QA</>
             ) : (
-              <>✓ Apply {changes.length > 1 ? `All ${changes.length} Changes` : 'Change'}</>
+              <>✓ Apply {changes.length > 1 ? `ready changes` : 'Change'}</>
             )}
           </button>
         ) : (
@@ -418,11 +434,46 @@ function FileCard({
         )}
       </div>
 
-      {!allApplied && currentChange?.qa_result?.verdict === 'blocked' && (
-        <p className="text-[10px] text-red-400/60 text-center pb-2">
-          QA blocked this change. Review on desktop for details.
-        </p>
-      )}
+      {!allApplied && currentChange?.qa_result?.verdict === 'blocked' && (() => {
+        const gate = getApplyGate(currentChange.qa_result)
+        const evidence = provenanceEvidence(currentChange.qa_result, 3)
+        return (
+          <div className={`mx-3 mb-2 px-2.5 py-2 rounded-lg border text-[10px] ${
+            gate.kind === 'hard_stop'
+              ? 'border-red-500/30 bg-red-500/10 text-red-300'
+              : 'border-amber-500/30 bg-amber-500/10 text-amber-200'
+          }`}>
+            <div className="font-semibold mb-0.5">
+              {gate.kind === 'hard_stop' ? 'Machine-verified block' : 'LLM QA only'}
+              <span className="font-normal opacity-80"> · {gate.reasons.join(' · ')}</span>
+            </div>
+            {evidence.map((line, i) => (
+              <div key={i} className="font-mono opacity-80 truncate">• {line}</div>
+            ))}
+            {gate.kind === 'hard_stop' ? (
+              <p className="mt-1 opacity-80">Use Retry with QA on desktop to regenerate.</p>
+            ) : (
+              <label className="mt-1.5 flex items-start gap-2 text-ink">
+                <input
+                  type="checkbox"
+                  className="mt-0.5"
+                  checked={Boolean(llmAck[currentChange.id])}
+                  onChange={(e) => {
+                    const next = e.target.checked
+                    setLlmAck(p => ({ ...p, [currentChange.id]: next }))
+                    clientLog(next ? 'mobile_qa_llm_ack_confirmed' : 'mobile_qa_llm_ack_revoked', {
+                      filename,
+                      changeId: currentChange.id,
+                      sources: gate.sources,
+                    }, sessionId)
+                  }}
+                />
+                <span>I reviewed this LLM finding — allow Apply</span>
+              </label>
+            )}
+          </div>
+        )
+      })()}
     </div>
   )
 }
