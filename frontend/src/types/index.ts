@@ -251,4 +251,6 @@ export interface SmartResult {
   }>
   skipped_changes?: { symbol: string; reason: string }[]
   new_files?: NewFile[]
+  /** Set when chat.py safety_net saved Apply cards after SSE disconnect. */
+  recovered?: boolean
 }

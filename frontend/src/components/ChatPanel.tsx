@@ -561,13 +561,20 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
         <SourcesRow sources={msg._sources} />
 
         {isSurgical && surgicalResult ? (
-          <DiffCardBoundary>
-            {surgicalResult.intent === 'create' ? (
-              <NewFileCard result={surgicalResult} sessionId={sessionId} />
-            ) : (
-              <InlineDiffCard result={surgicalResult} sessionId={sessionId} onRetryWithQA={onRetryWithQA} />
+          <div className="space-y-3">
+            {surgicalResult.recovered && (
+              <div className="flex items-center gap-1.5 text-[11px] text-warning/90 px-2.5 py-1.5 bg-warning/10 rounded-lg border border-warning/25">
+                Recovered after interruption — apply or re-send
+              </div>
             )}
-          </DiffCardBoundary>
+            <DiffCardBoundary>
+              {surgicalResult.intent === 'create' ? (
+                <NewFileCard result={surgicalResult} sessionId={sessionId} />
+              ) : (
+                <InlineDiffCard result={surgicalResult} sessionId={sessionId} onRetryWithQA={onRetryWithQA} />
+              )}
+            </DiffCardBoundary>
+          </div>
         ) : isNaturalResult ? (
           /* Natural result: show markdown text first, then diff card below */
           <div className="space-y-3">
@@ -579,13 +586,20 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
               </div>
             )}
             {surgicalResult && (
-              <DiffCardBoundary>
-                {surgicalResult.intent === 'create' ? (
-                  <NewFileCard result={surgicalResult} sessionId={sessionId} />
-                ) : (
-                  <InlineDiffCard result={surgicalResult} sessionId={sessionId} onRetryWithQA={onRetryWithQA} />
+              <>
+                {surgicalResult.recovered && (
+                  <div className="flex items-center gap-1.5 text-[11px] text-warning/90 px-2.5 py-1.5 bg-warning/10 rounded-lg border border-warning/25">
+                    Recovered after interruption — apply or re-send
+                  </div>
                 )}
-              </DiffCardBoundary>
+                <DiffCardBoundary>
+                  {surgicalResult.intent === 'create' ? (
+                    <NewFileCard result={surgicalResult} sessionId={sessionId} />
+                  ) : (
+                    <InlineDiffCard result={surgicalResult} sessionId={sessionId} onRetryWithQA={onRetryWithQA} />
+                  )}
+                </DiffCardBoundary>
+              </>
             )}
           </div>
         ) : (

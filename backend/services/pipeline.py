@@ -17779,17 +17779,53 @@ async def run_natural_pipeline_stream(
                     edit_blocks_raw, new_file_blocks_raw)
                 if _ckpt_resolved:
                     try:
+                        _arch_ckpt_payload = {
+                            "phase": "architect",
+                            "turn": _turn,
+                            "resolved": _ckpt_resolved,
+                        }
+                        # Full-fidelity attach (session 430d9711 gap for architect):
+                        # thin resolved alone becomes markdown on disconnect —
+                        # enrich to changes_by_file so chat.py safety_net saves
+                        # applyable NATURAL_AND_RESULT cards after Vercel reload.
+                        try:
+                            from services.checkpoint_recovery import (
+                                enrich_thin_checkpoint_payload as _enrich_thin,
+                            )
+                            from services.session_file_store import (
+                                resolve_session_file_id as _rsf_ckpt,
+                            )
+
+                            def _arch_thin_lookup(_fn, _sn, _maps=symbol_maps_by_name):
+                                _smap, _ = _maps.get(_fn, (None, None))
+                                if not _smap:
+                                    return None
+                                _sym, _ = _fuzzy_find_symbol(_smap, _sn)
+                                return _sym
+
+                            _enrich_thin(
+                                _arch_ckpt_payload,
+                                _ckpt_resolved,
+                                lookup_symbol=_arch_thin_lookup,
+                                make_diff=_make_diff,
+                                resolve_file_id=lambda _fn: _rsf_ckpt(session_id, _fn),
+                                session_id=session_id,
+                                user_id=user_id,
+                                dlog=_dlog,
+                            )
+                        except Exception as _enrich_err:
+                            _dlog("architect_checkpoint_enrich_error",
+                                  session_id=session_id, user_id=user_id,
+                                  turn=_turn, error=str(_enrich_err)[:200])
                         _dlog("architect_checkpoint_emitted",
                               session_id=session_id, user_id=user_id, turn=_turn,
                               edit_blocks=len(edit_blocks_raw),
                               new_file_blocks=len(new_file_blocks_raw),
-                              parsed_count=len(_ckpt_resolved))
+                              parsed_count=len(_ckpt_resolved),
+                              recoverable=bool(_arch_ckpt_payload.get("changes_by_file")),
+                              payload_bytes=len(json.dumps(_arch_ckpt_payload)))
                         yield sse({"type": "checkpoint",
-                                   "content": json.dumps({
-                                       "phase": "architect",
-                                       "turn": _turn,
-                                       "resolved": _ckpt_resolved,
-                                   })})
+                                   "content": json.dumps(_arch_ckpt_payload)})
                     except Exception as _arch_ckpt_err:
                         _dlog("architect_checkpoint_error",
                               session_id=session_id, user_id=user_id, turn=_turn,
@@ -19305,19 +19341,55 @@ async def run_natural_pipeline_stream(
                         edit_blocks_raw, new_file_blocks_raw)
                     if _plan_ckpt_resolved:
                         try:
+                            _plan_ckpt_payload = {
+                                "phase": "plan_execute",
+                                "plan_idx": plan_idx,
+                                "resolved": _plan_ckpt_resolved,
+                            }
+                            # Full-fidelity attach (session 97224670 / 430d9711):
+                            # completed plan items must recover as Apply cards,
+                            # not markdown, when SSE drops mid later edit call.
+                            try:
+                                from services.checkpoint_recovery import (
+                                    enrich_thin_checkpoint_payload as _enrich_thin,
+                                )
+                                from services.session_file_store import (
+                                    resolve_session_file_id as _rsf_ckpt,
+                                )
+
+                                def _plan_thin_lookup(_fn, _sn, _maps=symbol_maps_by_name):
+                                    _smap, _ = _maps.get(_fn, (None, None))
+                                    if not _smap:
+                                        return None
+                                    _sym, _ = _fuzzy_find_symbol(_smap, _sn)
+                                    return _sym
+
+                                _enrich_thin(
+                                    _plan_ckpt_payload,
+                                    _plan_ckpt_resolved,
+                                    lookup_symbol=_plan_thin_lookup,
+                                    make_diff=_make_diff,
+                                    resolve_file_id=lambda _fn: _rsf_ckpt(session_id, _fn),
+                                    session_id=session_id,
+                                    user_id=user_id,
+                                    dlog=_dlog,
+                                )
+                            except Exception as _enrich_err:
+                                _dlog("plan_execute_checkpoint_enrich_error",
+                                      session_id=session_id, user_id=user_id,
+                                      plan_idx=plan_idx,
+                                      error=str(_enrich_err)[:200])
                             _dlog("plan_execute_checkpoint_emitted",
                                   session_id=session_id, user_id=user_id,
                                   plan_idx=plan_idx,
                                   total_items=len(_effective_plan),
                                   edit_blocks=len(edit_blocks_raw),
                                   new_file_blocks=len(new_file_blocks_raw),
-                                  parsed_count=len(_plan_ckpt_resolved))
+                                  parsed_count=len(_plan_ckpt_resolved),
+                                  recoverable=bool(_plan_ckpt_payload.get("changes_by_file")),
+                                  payload_bytes=len(json.dumps(_plan_ckpt_payload)))
                             yield sse({"type": "checkpoint",
-                                       "content": json.dumps({
-                                           "phase": "plan_execute",
-                                           "plan_idx": plan_idx,
-                                           "resolved": _plan_ckpt_resolved,
-                                       })})
+                                       "content": json.dumps(_plan_ckpt_payload)})
                         except Exception as _plan_ckpt_err:
                             _dlog("plan_execute_checkpoint_error",
                                   session_id=session_id, user_id=user_id,

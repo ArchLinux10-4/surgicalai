@@ -171,6 +171,13 @@ def test_checkpoint_emission_wired_into_turn_loop_before_tool_dispatch():
     assert '"phase": "architect"' in between, \
         "checkpoint payload must be tagged so it's distinguishable from the " \
         "resolution-phase checkpoint if both ever coexist in one session"
+    # Thin→rich enrich (disconnect → Apply cards, not markdown): must run
+    # after the thin builder and before the checkpoint yield.
+    thin_idx = between.index("_build_architect_checkpoint_resolved(")
+    enrich_idx = between.index("enrich_thin_checkpoint_payload")
+    yield_idx = between.index('"type": "checkpoint"')
+    assert thin_idx < enrich_idx < yield_idx, \
+        "enrich_thin_checkpoint_payload must sit between thin builder and yield"
 
     # Must be gated — never yield a checkpoint of nothing when the turn
     # produced no new edits (would spam every plain search/thinking turn).
@@ -187,6 +194,8 @@ def test_checkpoint_yield_wrapped_in_try_except():
     checkpoint's own try/except (`resolution_checkpoint_error`)."""
     src = inspect.getsource(run_natural_pipeline_stream)
     idx = src.index('"phase": "architect"')
-    surrounding = src[max(0, idx - 400):idx + 400]
+    surrounding = src[max(0, idx - 200):idx + 3200]
     assert "except Exception as _arch_ckpt_err:" in surrounding
     assert '"architect_checkpoint_error"' in surrounding
+    assert "except Exception as _enrich_err:" in surrounding
+    assert '"architect_checkpoint_enrich_error"' in surrounding

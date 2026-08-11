@@ -262,6 +262,173 @@ def build_recovery_changes_by_file(
     return changes_by_file
 
 
+def entries_from_thin_resolved(
+    thin_list: List[dict],
+    *,
+    lookup_symbol: Callable[[str, str], Any],
+    session_id: str = "",
+    user_id: str = "",
+    dlog: Callable[..., None] = _noop_dlog,
+) -> List[dict]:
+    """Convert architect/plan-execute thin checkpoint items into entries that
+    :func:`build_recovery_changes_by_file` already accepts.
+
+    Thin shape (from ``_build_architect_checkpoint_resolved``)::
+
+        {filename, symbol: str, description, new_code}
+
+    Recovery entry shape::
+
+        {filename, symbol: SymbolInfo|dict, new_code, description}
+
+    ``lookup_symbol(filename, symbol_name)`` must return a real SymbolInfo /
+    symbol dict from the pipeline's ``symbol_maps_by_name`` (typically via
+    ``_fuzzy_find_symbol``), or ``None`` when unresolvable.
+
+    New-file items (``symbol == "(new file)"``) get a synthetic empty-original
+    symbol so ``make_diff("", new_code)`` still produces a real ``+`` body.
+
+    Pure and defensive: never raises; skips items that cannot be looked up
+    (except new files). Does not invent symbol bodies from guesses.
+    """
+    out: List[dict] = []
+    skipped = 0
+    for item in thin_list or []:
+        try:
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+            filename = (item.get("filename") or "").strip()
+            sym_name = item.get("symbol") or ""
+            new_code = item.get("new_code") or ""
+            description = item.get("description") or ""
+            if not filename or not new_code:
+                skipped += 1
+                continue
+
+            # New-file thin markers — original is empty; entire body is additive.
+            if sym_name == "(new file)":
+                bare = filename.rsplit("/", 1)[-1]
+                n_lines = max(1, new_code.count("\n") + 1)
+                symbol = {
+                    "name": bare,
+                    "symbol_type": "variable",
+                    "start_line": 1,
+                    "end_line": n_lines,
+                    "parent": None,
+                    "indentation": 0,
+                    "code": "",
+                    "signature": filename,
+                    "full_path": bare,
+                }
+                out.append({
+                    "filename": filename,
+                    "symbol": symbol,
+                    "new_code": new_code,
+                    "description": description or f"Create {bare}",
+                })
+                continue
+
+            if not sym_name or sym_name == "?":
+                skipped += 1
+                continue
+
+            symbol = None
+            try:
+                symbol = lookup_symbol(filename, sym_name)
+            except Exception as e:
+                dlog(
+                    "checkpoint_thin_lookup_error",
+                    session_id=session_id,
+                    user_id=user_id,
+                    filename=filename,
+                    symbol=sym_name,
+                    error=str(e)[:200],
+                )
+                skipped += 1
+                continue
+
+            if not symbol:
+                skipped += 1
+                dlog(
+                    "checkpoint_thin_lookup_miss",
+                    session_id=session_id,
+                    user_id=user_id,
+                    filename=filename,
+                    symbol=sym_name,
+                )
+                continue
+
+            out.append({
+                "filename": filename,
+                "symbol": symbol,
+                "new_code": new_code,
+                "description": description,
+            })
+        except Exception as e:
+            skipped += 1
+            dlog(
+                "checkpoint_thin_entry_error",
+                session_id=session_id,
+                user_id=user_id,
+                error=str(e)[:200],
+            )
+    dlog(
+        "checkpoint_thin_entries_built",
+        session_id=session_id,
+        user_id=user_id,
+        input=len(thin_list or []),
+        output=len(out),
+        skipped=skipped,
+    )
+    return out
+
+
+def enrich_thin_checkpoint_payload(
+    payload: dict,
+    thin_resolved: List[dict],
+    *,
+    lookup_symbol: Callable[[str, str], Any],
+    make_diff: Callable[[str, str, str], str],
+    resolve_file_id: Optional[Callable[[str], str]] = None,
+    confidence: int = 8,
+    session_id: str = "",
+    user_id: str = "",
+    dlog: Callable[..., None] = _noop_dlog,
+) -> dict:
+    """Thin architect/plan_execute checkpoint → attach ``changes_by_file``.
+
+    Preserves the thin ``resolved`` list already on ``payload``. Never raises.
+    """
+    try:
+        entries = entries_from_thin_resolved(
+            thin_resolved,
+            lookup_symbol=lookup_symbol,
+            session_id=session_id,
+            user_id=user_id,
+            dlog=dlog,
+        )
+        if entries:
+            enrich_checkpoint_payload(
+                payload,
+                entries,
+                make_diff=make_diff,
+                resolve_file_id=resolve_file_id,
+                confidence=confidence,
+                session_id=session_id,
+                user_id=user_id,
+                dlog=dlog,
+            )
+    except Exception as e:
+        dlog(
+            "checkpoint_thin_enrich_error",
+            session_id=session_id,
+            user_id=user_id,
+            error=str(e)[:200],
+        )
+    return payload
+
+
 def enrich_checkpoint_payload(
     payload: dict,
     resolved_entries: List[dict],
