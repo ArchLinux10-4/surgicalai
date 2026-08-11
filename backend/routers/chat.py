@@ -1717,6 +1717,77 @@ def _save_task_message(session_id, natural_text, parsed, model="", web_search_so
         db.commit()
 
 
+def _persist_structured_checkpoint_recovery(
+    session_id: str,
+    checkpoint_content: str,
+    *,
+    fallback_text: str = "",
+    model: str = "",
+    user_id: str = "",
+    dlog_event: str = "execute_task_safety_net_structured_recovery",
+) -> dict:
+    """Save a v2 checkpoint as applyable NATURAL_AND_RESULT (Agent disconnect).
+
+    Mirrors smart_stream's safety_net_structured_recovery (~1485–1543). Used by
+    execute-task when the client drops mid-task after the pipeline emitted
+    changes_by_file. Returns a status dict — never raises.
+    """
+    out = {"saved": False, "recovered_changes": 0, "format_version": None}
+    if not checkpoint_content:
+        return out
+    try:
+        ckpt = json.loads(checkpoint_content)
+    except Exception as e:
+        _dlog(dlog_event + "_parse_error", session_id=session_id, user_id=user_id,
+              error=str(e)[:200])
+        return out
+    cbf = ckpt.get("changes_by_file") if isinstance(ckpt, dict) else None
+    if not cbf:
+        return out
+    try:
+        rec_n = sum(len(v.get("changes", [])) for v in cbf.values() if isinstance(v, dict))
+        if rec_n <= 0:
+            return out
+        rec_text = (
+            ((fallback_text or "").strip() + ("\n\n" if (fallback_text or "").strip() else ""))
+            + "⚡ **Connection was interrupted** before I could finish, but I recovered "
+            + f"{rec_n} completed edit(s) below — review and apply them, or Resume "
+              "remaining agent tasks after applying."
+        ).strip()
+        rec_result = {
+            "intent": "edit",
+            "summary": f"Recovered {rec_n} edit(s) from an interrupted agent task",
+            "reasoning": "Recovered from a connection interruption mid agent task.",
+            "risks": [],
+            "skipped_changes": [],
+            "changes_by_file": cbf,
+            "new_files": [],
+            "natural_text": rec_text,
+            "recovered": True,
+        }
+        _save_task_message(session_id, rec_text, rec_result, model=model or "")
+        out["saved"] = True
+        out["recovered_changes"] = rec_n
+        out["format_version"] = ckpt.get("format_version")
+        _dlog(
+            dlog_event,
+            session_id=session_id,
+            user_id=user_id,
+            recovered_files=len(cbf),
+            recovered_changes=rec_n,
+            format_version=out["format_version"],
+        )
+    except Exception as e:
+        _dlog(dlog_event + "_error", session_id=session_id, user_id=user_id,
+              error=str(e)[:200])
+    return out
+
+
+def _result_is_credit_paused(parsed) -> bool:
+    """True when pipeline soft-failed with Anthropic credit pause (cb380321)."""
+    return bool(isinstance(parsed, dict) and parsed.get("credit_paused"))
+
+
 def _save_run_note(session_id, text):
     """Persist a plain assistant note (run summary lines)."""
     with get_db_ctx() as db:
@@ -1900,6 +1971,7 @@ async def execute_task(req: dict, request: Request):
         _think_parts: list = []  # accumulated extended-thinking text for this task
         _task_model = ""  # captured from this task's own done chunk
         _task_ws_sources: list = []  # v1.7 research checkbox — this task's web-search sources, if any
+        _credit_paused_view = None  # Anthropic credit pause payload (cb380321)
         try:
             # v1.7 research checkbox — a task spawned from a "research-enabled"
             # message (see smart_stream) keeps the capability for the whole
@@ -1935,8 +2007,20 @@ async def execute_task(req: dict, request: Request):
                         _ct = _d.get("type", "")
                         if _ct in ("token", "chat"):
                             collected.append(_d.get("content", ""))
+                            _guard_state["collected_tokens"] = collected
                         elif _ct == "smart_result":
                             result_content = _d.get("content", "")
+                        elif _ct == "checkpoint":
+                            # Capture for disconnect safety net (parity with
+                            # smart_stream ~1389). Not forwarded as UI noise.
+                            _guard_state["checkpoint_content"] = _d.get("content", "")
+                        elif _ct == "credit_paused":
+                            # Forward so desktop/mobile can show Resume banner.
+                            # Previously dropped → empty smart_result looked like
+                            # success (done/no_edits) and the queue kept going.
+                            _credit_paused_view = _d.get("content")
+                            _guard_state["credit_paused"] = True
+                            yield _sse({"type": "credit_paused", "content": _credit_paused_view})
                         elif _ct == "progress":
                             yield _sse({"type": "task_progress", "id": task_id, "content": _d.get("content", "")})
                         elif _ct == "thinking":
@@ -1967,6 +2051,7 @@ async def execute_task(req: dict, request: Request):
             update_task(task_id, status="blocked", verdict="error",
                         result_summary=("".join(collected))[:500],
                         thinking=("".join(_think_parts))[:24000])
+            _guard_state["owns_running"] = False
             mark_pending_cancelled(session_id, run_id)
             yield _sse({"type": "task_blocked", "id": task_id, "qa_score": None, "verdict": "error"})
             note = _run_summary_note(session_id, run_id, status="blocked", blocked_title=task["title"], reason="error")
@@ -1978,6 +2063,7 @@ async def execute_task(req: dict, request: Request):
 
         if aborted:
             update_task(task_id, status="cancelled")
+            _guard_state["owns_running"] = False
             mark_pending_cancelled(session_id, run_id)
             _dlog("sse_exec_task_done", session_id=session_id, user_id=current_user_id,
                   task_id=task_id, task_seq=seq+1, status="cancelled",
@@ -1997,6 +2083,71 @@ async def execute_task(req: dict, request: Request):
                 parsed = json.loads(result_content)
             except Exception:
                 parsed = None
+
+        # ── Credit-pause halt (cb380321 / Agent gap C1) ────────────────────
+        # Do NOT mark done/no_edits and continue the queue. Leave siblings
+        # pending; mark THIS task blocked so Resume-interrupted can pick up
+        # remaining tasks after credits are restored + credit Resume applied.
+        if _guard_state.get("credit_paused") or _result_is_credit_paused(parsed):
+            if _credit_paused_view is None and isinstance(parsed, dict):
+                # Pipeline always emits credit_paused before smart_result, but
+                # be defensive if only the flag on smart_result survived.
+                _credit_paused_view = {
+                    "pause_id": parsed.get("pause_id"),
+                    "session_id": session_id,
+                    "message": parsed.get("summary") or "Anthropic credits exhausted — progress saved.",
+                }
+                yield _sse({"type": "credit_paused", "content": _credit_paused_view})
+            # Persist Apply cards when plan_execute already resolved some edits
+            # before the pause (same envelope as the healthy done path). Only
+            # fall back to prose-only when there is nothing applyable.
+            _cp_has_edits = False
+            if isinstance(parsed, dict):
+                for _fd in (parsed.get("changes_by_file") or {}).values():
+                    if isinstance(_fd, dict) and _fd.get("changes"):
+                        _cp_has_edits = True
+                        break
+                if not _cp_has_edits and parsed.get("new_files"):
+                    _cp_has_edits = True
+            try:
+                if _cp_has_edits and isinstance(parsed, dict):
+                    _rp = dict(parsed)
+                    _rp["natural_text"] = natural_text
+                    _rp["credit_paused"] = True
+                    _save_task_message(session_id, natural_text, _rp, model=_task_model,
+                                        web_search_sources=_task_ws_sources)
+                    yield _sse({"type": "smart_result", "content": json.dumps(_rp)})
+                elif natural_text:
+                    _save_task_message(session_id, natural_text, None, model=_task_model,
+                                        web_search_sources=_task_ws_sources)
+            except Exception:
+                pass
+            update_task(
+                task_id,
+                status="blocked",
+                qa_score=None,
+                verdict="credit_paused",
+                result_summary=(natural_text or "Anthropic credits exhausted mid-task")[:500],
+                thinking=("".join(_think_parts))[:24000],
+            )
+            _guard_state["owns_running"] = False
+            _dlog("sse_exec_task_credit_paused", session_id=session_id,
+                  user_id=current_user_id, task_id=task_id, task_seq=seq+1,
+                  duration_s=round(time.time() - _t0, 1))
+            yield _sse({"type": "task_blocked", "id": task_id, "qa_score": None,
+                        "verdict": "credit_paused"})
+            note = (
+                f"💳 Anthropic credits exhausted on task {seq+1}/{total}"
+                f"{(' — ' + task['title']) if task.get('title') else ''}. "
+                f"Progress for this task is saved — add credits, Resume, then "
+                f"resume remaining agent tasks if any are still pending."
+            )
+            _save_run_note(session_id, note)
+            yield _sse({"type": "tasks_complete", "status": "credit_paused",
+                        **_run_counts(session_id, run_id), "summary": note})
+            yield _sse({"type": "done"})
+            return
+
         score, worst = _eval_task_result(parsed) if parsed else (None, "safe")
         _save_task_message(session_id, natural_text, parsed, model=_task_model,
                             web_search_sources=_task_ws_sources)
@@ -2007,6 +2158,7 @@ async def execute_task(req: dict, request: Request):
             update_task(task_id, status="blocked", qa_score=score,
                         verdict=worst, result_summary=natural_text[:500],
                         thinking=("".join(_think_parts))[:24000])
+            _guard_state["owns_running"] = False
             mark_pending_cancelled(session_id, run_id)
             _dlog("sse_exec_task_done", session_id=session_id, user_id=current_user_id,
                   task_id=task_id, task_seq=seq+1, status="blocked",
@@ -2053,6 +2205,7 @@ async def execute_task(req: dict, request: Request):
             _rp["natural_text"] = natural_text
             yield _sse({"type": "smart_result", "content": json.dumps(_rp)})
         yield _sse({"type": "task_done", "id": task_id, "qa_score": _score, "verdict": _verdict})
+        _guard_state["owns_running"] = False
 
         # Run is complete once no pending tasks remain.
         remaining = [t for t in list_tasks(session_id, run_id) if t.get("status") == "pending"]
@@ -2066,10 +2219,14 @@ async def execute_task(req: dict, request: Request):
               task_id=task_id, task_seq=seq+1, duration_s=round(time.time() - _t0, 1))
         yield _sse({"type": "done"})
 
-    # Shared flag: set by stream_one_task once it flips the task to "running".
-    # Lets the disconnect guard distinguish a task WE started (safe to reset)
-    # from one another stream owns (guard-skipped duplicate — never touch it).
-    _guard_state = {"owns_running": False}
+    # Shared stream state for disconnect guard + credit/checkpoint capture.
+    # owns_running: this stream flipped pending→running (safe to reset/recover).
+    _guard_state = {
+        "owns_running": False,
+        "checkpoint_content": None,
+        "collected_tokens": [],
+        "credit_paused": False,
+    }
 
     async def stream_with_disconnect_guard():
         # If the client vanishes mid-task (tab close, refresh, network drop),
@@ -2086,10 +2243,40 @@ async def execute_task(req: dict, request: Request):
                     _rows = list_tasks(session_id, run_id)
                     _row = next((t for t in _rows if t["id"] == task_id), None)
                     if _row and _row.get("status") == "running":
-                        update_task(task_id, status="pending")
-                        _dlog("sse_exec_task_orphan_reset", session_id=session_id,
-                              user_id=current_user_id, task_id=task_id,
-                              from_status="running", to_status="pending")
+                        # Prefer structured checkpoint recovery (Apply cards)
+                        # over a bare pending reset — same envelope as
+                        # smart_stream safety_net_structured_recovery.
+                        _ckpt = _guard_state.get("checkpoint_content")
+                        _toks = _guard_state.get("collected_tokens") or []
+                        _fallback = "".join(_toks).strip() if isinstance(_toks, list) else ""
+                        _rec = _persist_structured_checkpoint_recovery(
+                            session_id,
+                            _ckpt or "",
+                            fallback_text=_fallback,
+                            model="",
+                            user_id=current_user_id,
+                            dlog_event="execute_task_safety_net_structured_recovery",
+                        )
+                        if _rec.get("saved"):
+                            update_task(
+                                task_id,
+                                status="done",
+                                verdict="interrupted_recovered",
+                                result_summary=(
+                                    f"Recovered {_rec.get('recovered_changes', 0)} "
+                                    "edit(s) after connection drop"
+                                )[:500],
+                            )
+                            _dlog("sse_exec_task_orphan_recovered",
+                                  session_id=session_id, user_id=current_user_id,
+                                  task_id=task_id,
+                                  recovered_changes=_rec.get("recovered_changes"),
+                                  from_status="running", to_status="done")
+                        else:
+                            update_task(task_id, status="pending")
+                            _dlog("sse_exec_task_orphan_reset", session_id=session_id,
+                                  user_id=current_user_id, task_id=task_id,
+                                  from_status="running", to_status="pending")
             except Exception as _ox:
                 _dlog("sse_exec_task_orphan_reset_error", session_id=session_id,
                       task_id=task_id, error=str(_ox)[:200])

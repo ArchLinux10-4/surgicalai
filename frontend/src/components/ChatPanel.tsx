@@ -1686,9 +1686,30 @@ export function ChatPanel() {
             const row: any = (rows || []).find((r: any) => r.id === t.id)
             const status = row?.status
             if (status === 'done') {
+              updateAgentTask(t.id, { status: 'done', qa_score: row.qa_score, verdict: row.verdict })
+              // Disconnect safety net recovered Apply cards into the DB after
+              // the stream died — do not race into the next agent task before
+              // the user can see/apply them. Refresh history + offer Resume
+              // for remaining pending work.
+              if (row.verdict === 'interrupted_recovered') {
+                api.chat.getMessages(sid).then(saved => {
+                  if (useAppStore.getState().activeSessions === sid && saved?.length) {
+                    setMessages(saved)
+                  }
+                }).catch(() => {})
+                const remaining = tasks.slice(idx) // current task already done
+                if (remaining.length > 0) {
+                  setResumableRun({ sid, runId, tasks: remaining })
+                }
+                setError(
+                  streamErr
+                  || 'Connection dropped mid-task. Recovered edits are ready to review — apply them, then Resume remaining tasks.',
+                )
+                finishTaskRun(sid, onFinish)
+                return
+              }
               // Backend finished the task but the task_done event was lost
               // in transit — record it and keep the queue moving.
-              updateAgentTask(t.id, { status: 'done', qa_score: row.qa_score, verdict: row.verdict })
               runNext()
             } else if (status === 'blocked' || status === 'cancelled') {
               updateAgentTask(t.id, { status, qa_score: row?.qa_score, verdict: row?.verdict })
@@ -1723,7 +1744,33 @@ export function ChatPanel() {
           }
           handleTaskEvent(event)
           if (event.type === 'task_done') runNext()
-          else if (event.type === 'task_blocked' || event.type === 'task_cancelled') finishTaskRun(sid, onFinish)
+          else if (event.type === 'task_blocked' || event.type === 'task_cancelled') {
+            // Credit pause leaves siblings pending — surface Resume for them
+            // mid-session (session reload already detects pending, but the
+            // user stays on this screen after the credit banner appears).
+            if (event.type === 'task_blocked' && event.verdict === 'credit_paused') {
+              const remaining = tasks.slice(idx)
+              if (remaining.length > 0) {
+                setResumableRun({ sid, runId, tasks: remaining })
+              }
+            }
+            finishTaskRun(sid, onFinish)
+          }
+        },
+        // Mid-task Anthropic credit pause — same banner as single-pass smart().
+        (info) => {
+          if (!info?.pause_id) return
+          if (useAppStore.getState().activeSessions !== sid) return
+          setCreditPause({
+            sid,
+            pauseId: info.pause_id,
+            remainingCount: info.remaining_count || 0,
+            completedEditCount: info.completed_edit_count || 0,
+            heldWriteCount: info.held_write_count || 0,
+            message: info.message || 'Anthropic credits exhausted — progress saved.',
+            creditsOk: false,
+            probing: false,
+          })
         },
       )
       abortMapRef.current.set(sid, ctrl)

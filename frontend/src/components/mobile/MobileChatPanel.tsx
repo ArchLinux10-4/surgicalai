@@ -796,20 +796,94 @@ export function MobileChatPanel() {
 
     const runTaskQueue = (sid: string, runId: string, tasks: any[]) => {
       let idx = 0
+      const onTaskCreditPaused = (info: any) => {
+        if (!info?.pause_id) return
+        if (useAppStore.getState().activeSessions !== sid) return
+        setCreditPause({
+          sid,
+          pauseId: info.pause_id,
+          remainingCount: info.remaining_count || 0,
+          completedEditCount: info.completed_edit_count || 0,
+          heldWriteCount: info.held_write_count || 0,
+          message: info.message || 'Anthropic credits exhausted — progress saved.',
+          creditsOk: false,
+          probing: false,
+        })
+      }
       const runNext = () => {
         if (idx >= tasks.length) { finishTaskRun(); return }
         const t = tasks[idx++]
+        let sawTerminal = false
+        let streamErr = ''
+        const reconcileOnClose = () => {
+          if (sawTerminal) return
+          api.tasks.list(sid, runId)
+            .then((rows: any[]) => {
+              const row: any = (rows || []).find((r: any) => r.id === t.id)
+              const status = row?.status
+              if (status === 'done') {
+                updateAgentTask(t.id, { status: 'done', qa_score: row.qa_score, verdict: row.verdict })
+                if (row.verdict === 'interrupted_recovered') {
+                  api.chat.getMessages(sid).then(saved => {
+                    if (useAppStore.getState().activeSessions === sid && saved?.length) {
+                      setMessages(saved)
+                    }
+                  }).catch(() => {})
+                  const remaining = tasks.slice(idx)
+                  if (remaining.length > 0) {
+                    setResumableRun({ sid, runId, tasks: remaining })
+                  }
+                  setError(
+                    streamErr
+                    || 'Connection dropped mid-task. Recovered edits are ready to review — apply them, then Resume remaining tasks.',
+                  )
+                  finishTaskRun()
+                  return
+                }
+                runNext()
+              } else if (status === 'blocked' || status === 'cancelled') {
+                updateAgentTask(t.id, { status, qa_score: row?.qa_score, verdict: row?.verdict })
+                if (status === 'blocked' && row?.verdict === 'credit_paused') {
+                  const remaining = tasks.slice(idx)
+                  if (remaining.length > 0) setResumableRun({ sid, runId, tasks: remaining })
+                }
+                finishTaskRun()
+              } else if (status === 'pending') {
+                updateAgentTask(t.id, { status: 'pending', progress: undefined })
+                setResumableRun({ sid, runId, tasks: tasks.slice(idx - 1) })
+                setError(streamErr || 'Connection dropped mid-task. The run is paused — tap Resume to continue.')
+                finishTaskRun()
+              } else {
+                setError(streamErr || 'Connection dropped mid-task. Task status is unresolved — reopen the session to check progress.')
+                finishTaskRun()
+              }
+            })
+            .catch(() => {
+              setError(streamErr || 'Connection dropped and task status could not be verified.')
+              finishTaskRun()
+            })
+        }
         const ctrl = api.stream.executeTask(
           { session_id: sid, run_id: runId, task_id: t.id },
           (progress) => setProgress(progress),
           (result) => addTaskResultCard(result),
-          () => {},  // per-task stream closed; queue advances on task_done
-          (err) => { setError(err); finishTaskRun() },
+          reconcileOnClose,
+          (err) => { streamErr = err },
           (event) => {
+            if (event.type === 'task_done' || event.type === 'task_blocked' || event.type === 'task_cancelled') {
+              sawTerminal = true
+            }
             handleTaskEvent(event)
             if (event.type === 'task_done') runNext()
-            else if (event.type === 'task_blocked' || event.type === 'task_cancelled') finishTaskRun()
+            else if (event.type === 'task_blocked' || event.type === 'task_cancelled') {
+              if (event.type === 'task_blocked' && event.verdict === 'credit_paused') {
+                const remaining = tasks.slice(idx)
+                if (remaining.length > 0) setResumableRun({ sid, runId, tasks: remaining })
+              }
+              finishTaskRun()
+            }
           },
+          onTaskCreditPaused,
         )
         ctrlRef.current = ctrl
       }
@@ -1057,6 +1131,56 @@ export function MobileChatPanel() {
     const runNext = () => {
       if (idx >= tasks.length) { finish(); return }
       const t = tasks[idx++]
+      let sawTerminal = false
+      let streamErr = ''
+      const reconcileOnClose = () => {
+        if (sawTerminal) return
+        api.tasks.list(sid, runId)
+          .then((rows: any[]) => {
+            const row: any = (rows || []).find((r: any) => r.id === t.id)
+            const status = row?.status
+            if (status === 'done') {
+              updateAgentTask(t.id, { status: 'done', qa_score: row.qa_score, verdict: row.verdict })
+              if (row.verdict === 'interrupted_recovered') {
+                api.chat.getMessages(sid).then(saved => {
+                  if (useAppStore.getState().activeSessions === sid && saved?.length) {
+                    setMessages(saved)
+                  }
+                }).catch(() => {})
+                const remaining = tasks.slice(idx)
+                if (remaining.length > 0) {
+                  setResumableRun({ sid, runId, tasks: remaining })
+                }
+                setError(
+                  streamErr
+                  || 'Connection dropped mid-task. Recovered edits are ready to review — apply them, then Resume remaining tasks.',
+                )
+                finish()
+                return
+              }
+              runNext()
+            } else if (status === 'blocked' || status === 'cancelled') {
+              updateAgentTask(t.id, { status, qa_score: row?.qa_score, verdict: row?.verdict })
+              if (status === 'blocked' && row?.verdict === 'credit_paused') {
+                const remaining = tasks.slice(idx)
+                if (remaining.length > 0) setResumableRun({ sid, runId, tasks: remaining })
+              }
+              finish()
+            } else if (status === 'pending') {
+              updateAgentTask(t.id, { status: 'pending', progress: undefined })
+              setResumableRun({ sid, runId, tasks: tasks.slice(idx - 1) })
+              setError(streamErr || 'Connection dropped mid-task. The run is paused — tap Resume to continue.')
+              finish()
+            } else {
+              setError(streamErr || 'Connection dropped mid-task. Task status is unresolved — reopen the session to check progress.')
+              finish()
+            }
+          })
+          .catch(() => {
+            setError(streamErr || 'Connection dropped and task status could not be verified.')
+            finish()
+          })
+      }
       const ctrl = api.stream.executeTask(
         { session_id: sid, run_id: runId, task_id: t.id },
         (progress) => setProgress(progress),
@@ -1076,9 +1200,12 @@ export function MobileChatPanel() {
           })
           api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
         },
-        () => {},
-        (err) => { setError(err); finish() },
+        reconcileOnClose,
+        (err) => { streamErr = err },
         (event) => {
+          if (event.type === 'task_done' || event.type === 'task_blocked' || event.type === 'task_cancelled') {
+            sawTerminal = true
+          }
           if (event.type === 'task_start') updateAgentTask(event.id, { status: 'running', progress: undefined })
           else if (event.type === 'task_progress') updateAgentTask(event.id, { progress: event.content })
           else if (event.type === 'task_done') {
@@ -1086,14 +1213,32 @@ export function MobileChatPanel() {
             runNext()
           } else if (event.type === 'task_blocked' || event.type === 'task_cancelled') {
             updateAgentTask(event.id, { status: event.type === 'task_blocked' ? 'blocked' : 'cancelled', qa_score: event.qa_score, verdict: event.verdict })
+            if (event.type === 'task_blocked' && event.verdict === 'credit_paused') {
+              const remaining = tasks.slice(idx)
+              if (remaining.length > 0) setResumableRun({ sid, runId, tasks: remaining })
+            }
             finish()
           }
+        },
+        (info) => {
+          if (!info?.pause_id) return
+          if (useAppStore.getState().activeSessions !== sid) return
+          setCreditPause({
+            sid,
+            pauseId: info.pause_id,
+            remainingCount: info.remaining_count || 0,
+            completedEditCount: info.completed_edit_count || 0,
+            heldWriteCount: info.held_write_count || 0,
+            message: info.message || 'Anthropic credits exhausted — progress saved.',
+            creditsOk: false,
+            probing: false,
+          })
         },
       )
       ctrlRef.current = ctrl
     }
     runNext()
-  }, [resumableRun, isStreaming, stopStream, setAgentPhase, setSessionFiles, setSessions, addMessage, updateAgentTask])
+  }, [resumableRun, isStreaming, stopStream, setAgentPhase, setSessionFiles, setSessions, addMessage, updateAgentTask, setMessages])
 
   const dismissCreditPause = useCallback(() => {
     if (!creditPause) return
