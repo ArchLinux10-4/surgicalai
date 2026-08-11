@@ -246,6 +246,91 @@ export const api = {
     deleteSession: (id: string) => request(`/chat/sessions/${id}`, { method: 'DELETE' }),
     renameSession: (id: string, title: string) => request(`/chat/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
     search: (q: string) => request<any[]>(`/chat/search?q=${encodeURIComponent(q)}`),
+    getCreditPause: (sessionId: string) =>
+      request<{
+        active: boolean
+        pause: any | null
+        credits_ok: boolean | null
+        probe_error?: string | null
+        message?: string
+      }>(`/chat/credit-pause/${sessionId}`),
+    probeCreditPause: (pauseId: string) =>
+      request<{ pause: any; credits_ok: boolean; probe_error?: string | null }>(
+        `/chat/credit-pause/${pauseId}/probe`,
+        { method: 'POST', body: JSON.stringify({}) },
+      ),
+    dismissCreditPause: (pauseId: string) =>
+      request<{ ok: boolean }>(`/chat/credit-pause/${pauseId}/dismiss`, {
+        method: 'POST',
+        body: JSON.stringify({}),
+      }),
+    /** Resume a saved plan after Anthropic credits are restored (SSE). */
+    resumeCreditPause: (
+      pauseId: string,
+      onProgress: (msg: string) => void,
+      onToken: (token: string) => void,
+      onResult: (result: any) => void,
+      onDone: (fullText: string, model?: string) => void,
+      onError: (err: string) => void,
+      onCreditPaused?: (info: any) => void,
+    ): AbortController => {
+      const controller = new AbortController()
+      const tokens: string[] = []
+      let doneCalled = false
+      let _modelUsed = ''
+      const fireDone = () => {
+        if (doneCalled) return
+        doneCalled = true
+        onDone(tokens.join(''), _modelUsed)
+      }
+      fetch(`${BASE}/chat/credit-pause/${pauseId}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({}),
+        signal: controller.signal,
+      }).then(async res => {
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }))
+          onError(typeof err.detail === 'string' ? err.detail : (err.detail?.message || `HTTP ${res.status}`))
+          fireDone()
+          return
+        }
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+        let lineBuffer = ''
+        const pump = (): any => reader.read().then(({ done, value }) => {
+          if (done) { fireDone(); return }
+          lineBuffer += decoder.decode(value, { stream: true })
+          const parts = lineBuffer.split('\n')
+          lineBuffer = parts.pop() ?? ''
+          for (const line of parts) {
+            if (!line.startsWith('data: ')) continue
+            try {
+              const chunk = JSON.parse(line.slice(6))
+              if (chunk.type === 'progress') onProgress(chunk.content)
+              else if (chunk.type === 'token' || chunk.type === 'chat') {
+                tokens.push(chunk.content); onToken(chunk.content)
+              } else if (chunk.type === 'smart_result') {
+                const result = JSON.parse(chunk.content)
+                if (chunk.model) { _modelUsed = chunk.model; result._model = chunk.model }
+                onResult(result)
+              } else if (chunk.type === 'done') {
+                if (chunk.model) _modelUsed = chunk.model
+                fireDone()
+              } else if (chunk.type === 'error') onError(chunk.content)
+              else if (chunk.type === 'credit_paused') onCreditPaused?.(chunk.content)
+            } catch { /* ignore partial SSE */ }
+          }
+          return pump()
+        }).catch((e: any) => {
+          if (e?.name !== 'AbortError') { onError(e.message); fireDone() }
+        })
+        return pump()
+      }).catch(e => {
+        if (e.name !== 'AbortError') { onError(e.message); fireDone() }
+      })
+      return controller
+    },
   },
   files: {
     getTree: (root?: string) => request<any>(`/files/tree${root ? `?root=${encodeURIComponent(root)}` : ''}`),
@@ -355,6 +440,18 @@ export const api = {
         | { phase: 'results'; results: Array<{ url: string; title: string; domain: string; page_age?: string | null }>; error?: string | null }
       ) => void,
       onDoneSources?: (sources: Array<{ url: string; title: string; domain: string; page_age?: string | null }>) => void,
+      // Anthropic credit exhaustion pause (session cb380321). Fires when
+      // plan_execute hits "credit balance is too low"; remaining plan is
+      // persisted server-side for Resume.
+      onCreditPaused?: (info: {
+        pause_id?: string
+        session_id?: string
+        remaining_count?: number
+        remaining_symbols?: Array<{ filename?: string; symbol?: string }>
+        completed_edit_count?: number
+        held_write_count?: number
+        message?: string
+      }) => void,
     ): AbortController => {
       const controller = new AbortController()
       const tokens: string[] = []
@@ -385,6 +482,14 @@ export const api = {
           else if (chunk.type === 'chat') { tokens.push(chunk.content); onToken(chunk.content) }
           else if (chunk.type === 'done') { if (chunk.model) _modelUsed = chunk.model; fireDone(chunk.web_search_sources) }
           else if (chunk.type === 'error') onError(chunk.content)
+          else if (chunk.type === 'credit_paused') {
+            const info = (chunk.content && typeof chunk.content === 'object')
+              ? chunk.content
+              : (typeof chunk.content === 'string'
+                  ? (() => { try { return JSON.parse(chunk.content) } catch { return { message: chunk.content } } })()
+                  : chunk)
+            onCreditPaused?.(info)
+          }
           else if (chunk.type === 'web_search_start') onWebSearch?.({ phase: 'start' })
           else if (chunk.type === 'web_search_query') onWebSearch?.({ phase: 'query', query: chunk.content })
           else if (chunk.type === 'web_search_results') onWebSearch?.({ phase: 'results', results: chunk.results || [], error: chunk.error })

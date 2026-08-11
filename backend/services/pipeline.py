@@ -1048,6 +1048,18 @@ from services.gpt_retry import (  # noqa: E402
     gpt_429_user_message as _gpt_429_user_message,
     GPT_429_BILLING as _GPT_429_BILLING,
 )
+# Session cb380321: Anthropic credit exhaustion during plan_execute (HTTP 400
+# "credit balance is too low") was swallowed as "no valid edit block". Classify
+# + persist remaining plan / held Grok writes so the UI can pause, probe, and
+# resume without losing work.
+from services.anthropic_billing import (  # noqa: E402
+    AnthropicCreditExhaustedError as _AnthropicCreditExhaustedError,
+    raise_if_anthropic_credit_error as _raise_if_anthropic_credit_error,
+    anthropic_credit_user_message as _anthropic_credit_user_message,
+    save_credit_pause as _save_credit_pause,
+    credit_pause_public_view as _credit_pause_public_view,
+    get_credit_pause as _get_credit_pause,
+)
 # Ask/Plan native tool-calling for Grok (new file, Grok-only). Fixes the same
 # "narrates instead of emitting tags" failure PR #116 fixed for Edit/Agent
 # mode, plus a Grok-only sandwich reinforcement against jumping to code in
@@ -1598,6 +1610,21 @@ def _friendly_error(e: Exception) -> str:
                     "code patterns (e.g. security- or scraping-related logic) even when the code "
                     "itself is legitimate. Try rephrasing your request or breaking the change into "
                     "a smaller step.")
+        # Session cb380321: Anthropic credit 400 must not fall through to the
+        # generic "Something went wrong" / "file too large" copy.
+        if isinstance(e, _AnthropicCreditExhaustedError) or any(
+            m in low for m in (
+                "credit balance is too low",
+                "purchase credits",
+                "plans & billing",
+            )
+        ):
+            _dlog("friendly_error_anthropic_credit", raw_error=msg[:300])
+            return _anthropic_credit_user_message()
+
+    if isinstance(e, _AnthropicCreditExhaustedError):
+        _dlog("friendly_error_anthropic_credit", raw_error=str(e)[:300])
+        return _anthropic_credit_user_message()
 
     # Grok (xAI)-specific errors — additive only, never touches any branch
     # above. Reuses the classified-billing-429 marker exception raised by
@@ -16085,6 +16112,10 @@ async def _execute_single_edit(
         return None
 
     except Exception as e:
+        # Session cb380321: credit exhaustion must NOT be swallowed as None
+        # (that remapped to "Focused edit call produced no valid edit block").
+        _raise_if_anthropic_credit_error(
+            e, dlog=_dlog, session_id=session_id, user_id=user_id)
         _dlog("plan_execute_error",
               session_id=session_id, user_id=user_id,
               filename=filename, symbol=symbol_name,
@@ -16103,6 +16134,12 @@ async def run_natural_pipeline_stream(
     client_inbox=None,
     is_agent_task: bool = False,
     web_search_enabled: bool = False,
+    forced_edit_plan: list = None,
+    resume_completed_edit_blocks: list = None,
+    resume_completed_new_file_blocks: list = None,
+    resume_held_grok_writes: list = None,
+    resume_file_content_snapshot: dict = None,
+    resume_pause_id: str = None,
 ):
     """
     Natural conversation pipeline — Claude talks like Claude.
@@ -16121,6 +16158,13 @@ async def run_natural_pipeline_stream(
         architect models (_natural_use_claude gates it below) and adds
         nothing to the request unless True — byte-identical behaviour
         otherwise.
+
+    forced_edit_plan / resume_* : credit-pause resume path (session cb380321).
+        When ``forced_edit_plan`` is set, the agent loop is skipped and the
+        existing Plan→Execute + QA machinery runs against the saved remaining
+        plan, seeded with any completed blocks / held Grok writes / chained
+        file snapshot persisted at pause time. Normal chat/edit calls leave
+        these kwargs unset — byte-identical behaviour.
 
     is_agent_task : True only when this call is one task of a Claude Agent
         Mode run (task_runner.py's server-side runner, or chat.py's
@@ -16744,11 +16788,106 @@ async def run_natural_pipeline_stream(
         _hit_agent_max_turns = False       # set True only by the AGENT_MAX_TURNS ceiling break
         _phase2_filereq_used = False      # retained: read by post-stream starvation dlog
         _no_text_recovery_used = False    # retained: read by post-stream starvation dlog
+        # Held Grok surgical writes stashed by the plan gate — saved into
+        # credit_pauses when Anthropic plan_exec dies on zero credits.
+        _held_grok_writes_for_resume: list = []
+        _credit_pause_emitted = False
 
         # Per-file content lookup (built once, reused across every turn)
         file_content_lookup_stream: dict = {
             sf["filename"]: sf.get("content", "") for sf in session_files
         }
+
+        # ── Credit-pause resume short-circuit (session cb380321) ──────────
+        # Skip the agent loop; seed Plan→Execute from the saved pause row.
+        # Trigger when ANY resume seed is present — not only forced_edit_plan —
+        # so a pause that only has held Grok writes still resumes without
+        # re-running the architect loop.
+        _resume_seeded = bool(
+            forced_edit_plan
+            or resume_completed_edit_blocks
+            or resume_completed_new_file_blocks
+            or resume_held_grok_writes
+            or resume_pause_id
+        )
+        if _resume_seeded:
+            def _block_symbol_key(raw: str):
+                try:
+                    import json as _jj
+                    obj = _jj.loads(raw) if isinstance(raw, str) else raw
+                    if isinstance(obj, dict):
+                        return (
+                            (obj.get("filename") or "").strip(),
+                            (obj.get("symbol") or "").strip(),
+                        )
+                except Exception:
+                    pass
+                return ("", "")
+
+            edit_plan_data = [
+                p for p in (forced_edit_plan or [])
+                if isinstance(p, dict) and (p.get("filename") or p.get("symbol"))
+            ]
+            if resume_completed_edit_blocks:
+                edit_blocks_raw.extend(
+                    b for b in resume_completed_edit_blocks if isinstance(b, str) and b.strip()
+                )
+            if resume_completed_new_file_blocks:
+                new_file_blocks_raw.extend(
+                    b for b in resume_completed_new_file_blocks if isinstance(b, str) and b.strip()
+                )
+            if isinstance(resume_file_content_snapshot, dict):
+                for _fn, _fc in resume_file_content_snapshot.items():
+                    if isinstance(_fn, str) and isinstance(_fc, str) and _fc:
+                        file_content_lookup_stream[_fn] = _fc
+
+            _resume_held = [
+                b for b in (resume_held_grok_writes or [])
+                if isinstance(b, str) and b.strip()
+            ]
+            if _resume_held:
+                # Prefer Grok's already-authored edits for matching symbols —
+                # don't re-pay Claude to regenerate them.
+                _covered = set()
+                for _hb in _resume_held:
+                    _k = _block_symbol_key(_hb)
+                    if _k[0] or _k[1]:
+                        _covered.add(_k)
+                    edit_blocks_raw.append(_hb)
+                if _covered and edit_plan_data:
+                    _before = len(edit_plan_data)
+                    edit_plan_data = [
+                        p for p in edit_plan_data
+                        if (
+                            (p.get("filename") or "").strip(),
+                            (p.get("symbol") or "").strip(),
+                        ) not in _covered
+                    ]
+                    _dlog("credit_pause_resume_held_writes_applied",
+                          session_id=session_id, user_id=user_id,
+                          pause_id=resume_pause_id,
+                          held=len(_resume_held),
+                          plan_before=_before,
+                          plan_after=len(edit_plan_data),
+                          covered=[{"filename": a, "symbol": b} for a, b in list(_covered)[:20]])
+
+            full_response = (
+                "Resuming saved planned edits after Anthropic credits were restored."
+            )
+            yield sse({"type": "token", "content": full_response + "\n\n"})
+            yield sse({"type": "progress",
+                       "content": f"Resuming {len(edit_plan_data)} saved plan step(s)..."})
+            _dlog("credit_pause_resume_short_circuit",
+                  session_id=session_id, user_id=user_id,
+                  pause_id=resume_pause_id,
+                  remaining_plan=len(edit_plan_data or []),
+                  seeded_edits=len(edit_blocks_raw),
+                  seeded_new_files=len(new_file_blocks_raw))
+            # Jump past the agent loop into post-stream cleanup / plan_exec.
+            # `while True` below is skipped via this flag.
+            _skip_agent_loop_for_credit_resume = True
+        else:
+            _skip_agent_loop_for_credit_resume = False
 
         # ---- Governors (application-level budgets; WS removed only the transport
         #      ceiling, never these). These are the honest bounds on the loop. ----
@@ -16928,7 +17067,7 @@ async def run_natural_pipeline_stream(
         #    Claude/GPT and for non-compound requests; see
         #    services/grok_plan_gate.py. Constructed once per request. ──
         _grok_plan_gate = None
-        if _is_grok_model(arch_model):
+        if (not _skip_agent_loop_for_credit_resume) and _is_grok_model(arch_model):
             try:
                 from services.grok_plan_gate import GrokPlanGate as _GrokPlanGate  # noqa: E402
                 _grok_plan_gate = _GrokPlanGate(
@@ -16942,6 +17081,8 @@ async def run_natural_pipeline_stream(
                 _grok_plan_gate = None
 
         while True:
+            if _skip_agent_loop_for_credit_resume:
+                break
             _turn += 1
             _grok_plan_held_writes = False  # plan gate held writes this turn (force-plan next)
 
@@ -17586,6 +17727,12 @@ async def run_natural_pipeline_stream(
                     if _grok_plan_gate is not None:
                         _grok_plan_held_writes = bool(
                             _grok_plan_gate.filter_translation(_grok_tr, _turn))
+                        if _grok_plan_held_writes:
+                            _stashed = list(
+                                getattr(_grok_plan_gate,
+                                        "last_held_edit_json_strings", []) or [])
+                            if _stashed:
+                                _held_grok_writes_for_resume = _stashed
                     if _grok_tr.edit_json_strings:
                         edit_blocks_raw.extend(_grok_tr.edit_json_strings)
                     if _grok_tr.new_file_json_strings:
@@ -19334,6 +19481,61 @@ async def run_natural_pipeline_stream(
                         yield sse({"type": "progress",
                                    "content": f"⚠️ {p_symbol} — no edit produced"})
 
+                except _AnthropicCreditExhaustedError as _cred_err:
+                    # Session cb380321: pause + persist remaining work instead of
+                    # burning the rest of the plan on identical 400s and reporting
+                    # "no valid edit block".
+                    _remaining = list(_effective_plan[plan_idx:])
+                    _pause_id = _save_credit_pause(
+                        session_id=session_id or "",
+                        user_id=user_id or "",
+                        user_request=user_request or "",
+                        remaining_plan=_remaining,
+                        completed_edit_blocks=list(edit_blocks_raw),
+                        completed_new_file_blocks=list(new_file_blocks_raw),
+                        held_grok_writes=list(_held_grok_writes_for_resume),
+                        file_content_snapshot=dict(file_content_lookup_stream),
+                        error_message=str(_cred_err)[:500],
+                        dlog=_dlog,
+                    )
+                    for ri in _remaining:
+                        skipped_changes_struct.append({
+                            "filename": ri.get("filename", ""),
+                            "symbol": ri.get("symbol", ""),
+                            "reason": "Paused — Anthropic credit balance too low (saved for Resume)",
+                        })
+                    _pause_view = _credit_pause_public_view(
+                        _get_credit_pause(_pause_id) if _pause_id else {
+                            "id": _pause_id,
+                            "session_id": session_id,
+                            "status": "paused",
+                            "remaining_plan": _remaining,
+                            "completed_edit_blocks": edit_blocks_raw,
+                            "held_grok_writes": _held_grok_writes_for_resume,
+                            "error_message": str(_cred_err)[:300],
+                        }
+                    ) or {
+                        "pause_id": _pause_id,
+                        "session_id": session_id,
+                        "remaining_count": len(_remaining),
+                        "message": _anthropic_credit_user_message(),
+                    }
+                    _credit_pause_emitted = True
+                    _dlog("credit_pause_emitted",
+                          session_id=session_id, user_id=user_id,
+                          pause_id=_pause_id,
+                          plan_idx=plan_idx,
+                          remaining=len(_remaining),
+                          completed_edits=len(edit_blocks_raw),
+                          held_writes=len(_held_grok_writes_for_resume))
+                    yield sse({"type": "credit_paused", "content": _pause_view})
+                    yield sse({"type": "progress",
+                               "content": "💳 Anthropic credits exhausted — progress saved. Add credits, then Resume."})
+                    yield sse({"type": "error",
+                               "content": _anthropic_credit_user_message(),
+                               "model": arch_model})
+                    break
+
                 except asyncio.CancelledError:
                     # SSE disconnect: Starlette cancels the generator task.
                     # Log remaining plan items as skipped so they're visible
@@ -19357,6 +19559,10 @@ async def run_natural_pipeline_stream(
                     raise  # Re-raise CancelledError so the task actually cancels
 
                 except Exception as exec_err:
+                    # Credit errors are raised as AnthropicCreditExhaustedError
+                    # from _execute_single_edit and caught by the dedicated
+                    # handler above. Do NOT re-raise here — that skips the
+                    # pause/persist path.
                     _dlog("plan_execute_error",
                           session_id=session_id, user_id=user_id,
                           filename=p_filename, symbol=p_symbol,
@@ -19375,28 +19581,47 @@ async def run_natural_pipeline_stream(
                   response_preview=full_response[:500],
                   had_thinking=had_thinking,
                   skipped_count=len(skipped_changes_struct),
-                  skipped_details=skipped_changes_struct[:10])
+                  skipped_details=skipped_changes_struct[:10],
+                  credit_paused=_credit_pause_emitted)
             # If plan tasks ran but all failed, report the errors to the user
             if skipped_changes_struct:
                 _sk_detail = "\n".join(
                     f"• **{s.get('symbol', '?')}** in `{s.get('filename', '?')}`: {s.get('reason', 'unknown')}"
                     for s in skipped_changes_struct[:10]
                 )
-                _fail_msg = (
-                    f"I planned {len(skipped_changes_struct)} change(s) but all of them failed:\n\n"
-                    f"{_sk_detail}\n\n"
-                    "This usually means the file is very large. Try pointing me at a specific "
-                    "section or symbol to edit, and I\'ll take a more focused approach."
-                )
+                if _credit_pause_emitted:
+                    _fail_msg = (
+                        f"{_anthropic_credit_user_message()}\n\n"
+                        f"Saved {len(skipped_changes_struct)} plan step(s) for Resume:\n\n"
+                        f"{_sk_detail}"
+                    )
+                    _fail_summary = (
+                        f"{len(skipped_changes_struct)} planned change(s) — "
+                        "paused (Anthropic credits); saved for Resume"
+                    )
+                    _fail_reason = (
+                        "Anthropic credit balance exhausted during plan execution. "
+                        "Remaining plan and any held Grok writes were persisted."
+                    )
+                else:
+                    _fail_msg = (
+                        f"I planned {len(skipped_changes_struct)} change(s) but all of them failed:\n\n"
+                        f"{_sk_detail}\n\n"
+                        "This usually means the file is very large. Try pointing me at a specific "
+                        "section or symbol to edit, and I'll take a more focused approach."
+                    )
+                    _fail_summary = f"{len(skipped_changes_struct)} planned change(s) — all failed"
+                    _fail_reason = "All planned edits failed before producing any code."
                 _fail_result = {
                     "intent": "edit",
-                    "summary": f"{len(skipped_changes_struct)} planned change(s) — all failed",
-                    "reasoning": "All planned edits failed before producing any code.",
+                    "summary": _fail_summary,
+                    "reasoning": _fail_reason,
                     "risks": [],
                     "skipped_changes": skipped_changes_struct,
                     "changes_by_file": {},
                     "new_files": [],
                     "natural_text": _fail_msg,
+                    "credit_paused": bool(_credit_pause_emitted),
                 }
                 yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(_fail_result)})
             elif not skipped_changes_struct:
