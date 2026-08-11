@@ -26,13 +26,16 @@ import pytest
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _BACKEND_DIR)
 
+from auth_test_utils import fake_request  # noqa: E402
+
 
 @pytest.fixture()
 def isolated_db(monkeypatch):
     tmp_home = tempfile.mkdtemp(prefix="surgicalai_test_home_")
     monkeypatch.setenv("HOME", tmp_home)
     for mod in list(sys.modules):
-        if mod == "database" or mod == "routers" or mod.startswith("routers."):
+        if (mod == "database" or mod == "routers" or mod.startswith("routers.")
+                or mod == "services.session_auth"):
             del sys.modules[mod]
     import database as _database
     _database.init_db()
@@ -43,6 +46,10 @@ def isolated_db(monkeypatch):
 
 def _seed_file(database, session_id, file_id, filename, content):
     with database.get_db_ctx() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_sessions (id, title, user_id) VALUES (?, ?, ?)",
+            (session_id, "t", None),
+        )
         conn.execute(
             "INSERT INTO session_files (id, session_id, filename, content, lines, symbol_count, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
@@ -69,8 +76,8 @@ def test_no_query_returns_oldest_version_with_banner(isolated_db):
     database, session_files = isolated_db
     session_id, file_id = "s2", "f2"
     _seed_file(database, session_id, file_id, "app.py", "print('v1 ORIGINAL')")
-    session_files.update_session_file(session_id, file_id, {"content": "print('v2')", "label": "Edit A"})
-    session_files.update_session_file(session_id, file_id, {"content": "print('v3 CURRENT')", "label": "Edit B"})
+    session_files.update_session_file(session_id, file_id, {"content": "print('v2')", "label": "Edit A"}, request=fake_request())
+    session_files.update_session_file(session_id, file_id, {"content": "print('v3 CURRENT')", "label": "Edit B"}, request=fake_request())
 
     result = session_files.search_file_version_history(session_id, "app.py")
     assert result["found"] is True
@@ -87,7 +94,8 @@ def test_query_searches_across_all_versions_with_context(isolated_db):
     _seed_file(database, session_id, file_id, "app.py", "def old_helper():\n    return 1\n")
     session_files.update_session_file(
         session_id, file_id,
-        {"content": "def new_helper():\n    return 2\n", "label": "Rename"})
+        {"content": "def new_helper():\n    return 2\n", "label": "Rename"},
+        request=fake_request())
 
     result = session_files.search_file_version_history(session_id, "app.py", query="old_helper")
     assert result["found"] is True
@@ -100,7 +108,7 @@ def test_query_no_match_returns_honest_message(isolated_db):
     database, session_files = isolated_db
     session_id, file_id = "s4", "f4"
     _seed_file(database, session_id, file_id, "app.py", "print('v1')")
-    session_files.update_session_file(session_id, file_id, {"content": "print('v2')"})
+    session_files.update_session_file(session_id, file_id, {"content": "print('v2')"}, request=fake_request())
 
     result = session_files.search_file_version_history(session_id, "app.py", query="nonexistent_symbol_xyz")
     assert result["found"] is False
@@ -120,10 +128,10 @@ def test_strictly_scoped_to_session_id(isolated_db):
     — the isolation boundary the user explicitly required."""
     database, session_files = isolated_db
     _seed_file(database, "session-A", "fA", "shared.py", "print('session A v1')")
-    session_files.update_session_file("session-A", "fA", {"content": "print('session A v2')"})
+    session_files.update_session_file("session-A", "fA", {"content": "print('session A v2')"}, request=fake_request())
 
     _seed_file(database, "session-B", "fB", "shared.py", "print('session B v1')")
-    session_files.update_session_file("session-B", "fB", {"content": "print('session B v2')"})
+    session_files.update_session_file("session-B", "fB", {"content": "print('session B v2')"}, request=fake_request())
 
     result_a = session_files.search_file_version_history("session-A", "shared.py")
     result_b = session_files.search_file_version_history("session-B", "shared.py")
@@ -164,7 +172,8 @@ def test_query_result_capped_at_five_matches(isolated_db):
     _seed_file(database, session_id, file_id, "app.py", "TARGET line v0\n")
     for i in range(1, 7):
         session_files.update_session_file(
-            session_id, file_id, {"content": f"TARGET line v{i}\n", "label": f"Edit {i}"})
+            session_id, file_id, {"content": f"TARGET line v{i}\n", "label": f"Edit {i}"},
+            request=fake_request())
 
     result = session_files.search_file_version_history(session_id, "app.py", query="TARGET")
     assert result["found"] is True

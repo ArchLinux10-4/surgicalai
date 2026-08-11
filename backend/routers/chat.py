@@ -11,6 +11,11 @@ from crypto_utils import decrypt_api_key
 from services.pipeline import (
     run_chat, run_chat_stream, _dlog, _clean_history_content, HISTORY_WINDOW,
 )
+from services.session_auth import (
+    require_session_access_from_request,
+    require_credit_pause_access,
+    get_request_user_id,
+)
 
 
 def _resolve_chat_key(user_id: str, key_type: str) -> str:
@@ -596,7 +601,8 @@ def list_sessions(request: Request):
 
 
 @router.get("/sessions/{session_id}/messages")
-def get_messages(session_id: str):
+def get_messages(session_id: str, request: Request):
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         rows = conn.execute(
             "SELECT * FROM chat_messages WHERE session_id = ? ORDER BY created_at ASC",
@@ -829,7 +835,8 @@ async def stream_message(req: ChatRequest, request: Request):
 
 
 @router.delete("/sessions/{session_id}")
-def delete_session(session_id: str):
+def delete_session(session_id: str, request: Request):
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         # Cascade: delete files and messages before session row
         conn.execute("DELETE FROM session_files WHERE session_id = ?", (session_id,))
@@ -837,15 +844,17 @@ def delete_session(session_id: str):
         conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
         conn.commit()
         # Hard-delete all session-scoped auxiliary rows so nothing orphans by
-        # session_id (code-diff history, applied/undo state, tasks, audit logs).
-        # Each runs in its own committed step and is best-effort: a not-yet-created
-        # table simply rolls back and is skipped, never breaking the core delete.
+        # session_id (code-diff history, applied/undo state, tasks, audit logs,
+        # credit pauses). Each runs in its own committed step and is best-effort:
+        # a not-yet-created table simply rolls back and is skipped, never breaking
+        # the core delete.
         for _tbl in (
             "change_history",
             "applied_changes",
             "agent_tasks",
             "qa_log",
             "compliance_log",
+            "credit_pauses",
         ):
             try:
                 conn.execute(f"DELETE FROM {_tbl} WHERE session_id = ?", (session_id,))
@@ -856,7 +865,8 @@ def delete_session(session_id: str):
 
 
 @router.patch("/sessions/{session_id}")
-def rename_session(session_id: str, body: dict):
+def rename_session(session_id: str, body: dict, request: Request):
+    require_session_access_from_request(session_id, request)
     title = body.get("title", "")
     if not title:
         raise HTTPException(status_code=400, detail="Title required")
@@ -2309,8 +2319,11 @@ async def get_session_credit_pause(session_id: str, request: Request):
         probe_anthropic_credits,
         anthropic_credit_user_message,
     )
-    current_user_id = getattr(request.state, "user_id", "") or ""
+    require_session_access_from_request(session_id, request)
+    current_user_id = get_request_user_id(request)
     pause = get_active_credit_pause(session_id)
+    if pause:
+        require_credit_pause_access(pause, current_user_id)
     view = credit_pause_public_view(pause)
     if not view:
         return {"active": False, "pause": None, "credits_ok": None}
@@ -2337,12 +2350,11 @@ async def probe_credit_pause(pause_id: str, request: Request):
         credit_pause_public_view,
         probe_anthropic_credits,
     )
-    current_user_id = getattr(request.state, "user_id", "") or ""
+    current_user_id = get_request_user_id(request)
     pause = get_credit_pause(pause_id)
     if not pause or pause.get("status") != "paused":
         raise HTTPException(status_code=404, detail="No active credit pause found")
-    if pause.get("user_id") and current_user_id and pause["user_id"] != current_user_id:
-        raise HTTPException(status_code=403, detail="Not your credit pause")
+    require_credit_pause_access(pause, current_user_id)
 
     anthropic_key = _resolve_chat_key(current_user_id, "anthropic")
     probe = await probe_anthropic_credits(
@@ -2364,12 +2376,11 @@ async def dismiss_credit_pause(pause_id: str, request: Request):
         get_credit_pause,
         update_credit_pause_status,
     )
-    current_user_id = getattr(request.state, "user_id", "") or ""
+    current_user_id = get_request_user_id(request)
     pause = get_credit_pause(pause_id)
     if not pause:
         raise HTTPException(status_code=404, detail="Credit pause not found")
-    if pause.get("user_id") and current_user_id and pause["user_id"] != current_user_id:
-        raise HTTPException(status_code=403, detail="Not your credit pause")
+    require_credit_pause_access(pause, current_user_id)
     update_credit_pause_status(pause_id, "dismissed", dlog=_dlog)
     return {"ok": True}
 
@@ -2391,12 +2402,11 @@ async def resume_credit_pause(pause_id: str, request: Request):
         anthropic_credit_user_message,
     )
 
-    current_user_id = getattr(request.state, "user_id", "") or ""
+    current_user_id = get_request_user_id(request)
     pause = get_credit_pause(pause_id)
     if not pause or pause.get("status") != "paused":
         raise HTTPException(status_code=404, detail="No active credit pause found")
-    if pause.get("user_id") and current_user_id and pause["user_id"] != current_user_id:
-        raise HTTPException(status_code=403, detail="Not your credit pause")
+    require_credit_pause_access(pause, current_user_id)
 
     session_id = pause.get("session_id") or ""
     if not session_id:

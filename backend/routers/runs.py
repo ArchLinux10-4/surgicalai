@@ -9,6 +9,7 @@ from fastapi import APIRouter, Request
 
 from services.pipeline import _dlog
 from services import task_runner
+from services.session_auth import require_session_access_from_request
 
 router = APIRouter()
 
@@ -27,6 +28,8 @@ async def start_run(body: dict, request: Request):
               user_id=user_id)
         return {"ok": False, "mode": "bad_request",
                 "detail": "session_id and run_id are required"}
+    # Ownership first — never start a run against another user's session.
+    require_session_access_from_request(session_id, request)
     try:
         result = await task_runner.start_run(session_id, run_id, user_id)
         _dlog("runs_start_result", session_id=session_id, run_id=run_id,
@@ -45,6 +48,8 @@ async def start_run(body: dict, request: Request):
 def get_status(request: Request, run_id: str, session_id: str = ""):
     """Live supervisor state for a run (registry-backed; task rows themselves
     are served by GET /tasks, which the UI already polls)."""
+    if session_id:
+        require_session_access_from_request(session_id, request)
     try:
         status = task_runner.run_status(run_id)
         status["enabled"] = task_runner.server_runner_enabled()

@@ -24,6 +24,7 @@ from services.datalab.config import datalab_enabled
 from services.datalab import store, persist
 from services.datalab.loader import load_workbook, LoadError
 from services.datalab.transform import run_transform
+from services.session_auth import require_session_access_from_request
 
 logger = logging.getLogger("datalab")
 router = APIRouter()
@@ -59,6 +60,7 @@ def enabled():
 @router.post("/{session_id}/transform")
 def transform_file(session_id: str, body: dict, request: Request):
     _guard()
+    require_session_access_from_request(session_id, request)
     file_id = body.get("file_id")
     prompt = (body.get("prompt") or "").strip()
     if not file_id or not prompt:
@@ -122,8 +124,9 @@ def transform_file(session_id: str, body: dict, request: Request):
 
 
 @router.get("/{session_id}/download/{file_id}")
-def download_file(session_id: str, file_id: str):
+def download_file(session_id: str, file_id: str, request: Request):
     _guard()
+    require_session_access_from_request(session_id, request)
     _verify_file_in_session(session_id, file_id)
     artifact_id = store.artifact_id_for_file(file_id)
     if not artifact_id:
@@ -137,8 +140,9 @@ def download_file(session_id: str, file_id: str):
 
 
 @router.get("/{session_id}/versions/{file_id}")
-def versions(session_id: str, file_id: str):
+def versions(session_id: str, file_id: str, request: Request):
     _guard()
+    require_session_access_from_request(session_id, request)
     _verify_file_in_session(session_id, file_id)
     return {"versions": store.list_versions(file_id)}
 

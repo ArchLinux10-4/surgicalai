@@ -34,6 +34,7 @@ importlib.reload(database)
 database.init_db()
 
 from routers import chat as chat_router  # noqa: E402
+from auth_test_utils import fake_request  # noqa: E402
 
 
 def _make_session():
@@ -52,7 +53,7 @@ def test_save_task_message_without_sources_unchanged():
     exact same metadata shape as before this param existed (no regression)."""
     sid = _make_session()
     chat_router._save_task_message(sid, "hello world", None, model="claude-x")
-    msgs = chat_router.get_messages(sid)
+    msgs = chat_router.get_messages(sid, request=fake_request())
     saved = [m for m in msgs if m["role"] == "assistant"][-1]
     # get_messages should NOT attach _sources when none were saved
     assert "_sources" not in saved or not saved.get("_sources")
@@ -69,7 +70,7 @@ def test_save_task_message_persists_and_reloads_sources():
     ]
     chat_router._save_task_message(sid, "researched answer", None, model="claude-x",
                                     web_search_sources=sources)
-    msgs = chat_router.get_messages(sid)
+    msgs = chat_router.get_messages(sid, request=fake_request())
     saved = [m for m in msgs if m["role"] == "assistant"][-1]
     assert saved.get("_sources") == sources
     assert saved["content"] == "researched answer"
@@ -82,6 +83,6 @@ def test_save_task_message_empty_sources_list_is_noop():
     sid = _make_session()
     chat_router._save_task_message(sid, "no research needed", None, model="claude-x",
                                     web_search_sources=[])
-    msgs = chat_router.get_messages(sid)
+    msgs = chat_router.get_messages(sid, request=fake_request())
     saved = [m for m in msgs if m["role"] == "assistant"][-1]
     assert not saved.get("_sources")

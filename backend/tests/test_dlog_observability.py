@@ -160,12 +160,42 @@ def test_rate_limit_allow_path_emits_nothing():
 
 @pytest.fixture()
 def upload_client():
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
     from fastapi.testclient import TestClient
     from routers import session_files
+    import database
+
+    # Prior tests may have rebound DB_PATH; re-init on the active path.
+    database.init_db()
+
     app = FastAPI()
+
+    @app.middleware("http")
+    async def _stamp(request: Request, call_next):
+        request.state.user_id = "server_user"
+        request.state.username = "server"
+        request.state.is_admin = False
+        return await call_next(request)
+
     app.include_router(session_files.router, prefix="/chat")
-    return TestClient(app)
+    client = TestClient(app)
+
+    _orig_post = client.post
+
+    def _post(url, *args, **kwargs):
+        parts = url.strip("/").split("/")
+        if len(parts) >= 2 and parts[0] == "chat":
+            sid = parts[1]
+            with database.get_db_ctx() as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO chat_sessions (id, title, user_id) VALUES (?, ?, ?)",
+                    (sid, "t", "server_user"),
+                )
+                conn.commit()
+        return _orig_post(url, *args, **kwargs)
+
+    client.post = _post
+    return client
 
 
 def test_json_upload_ok_and_rejected_events(upload_client):

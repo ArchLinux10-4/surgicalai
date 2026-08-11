@@ -32,6 +32,8 @@ import pytest
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _BACKEND_DIR)
 
+from auth_test_utils import fake_request  # noqa: E402
+
 
 @pytest.fixture()
 def isolated_db(monkeypatch):
@@ -50,7 +52,8 @@ def isolated_db(monkeypatch):
     # itself must be dropped too so the whole chain re-binds to the fresh
     # `database` module.
     for mod in list(sys.modules):
-        if mod == "database" or mod == "routers" or mod.startswith("routers."):
+        if (mod == "database" or mod == "routers" or mod.startswith("routers.")
+                or mod == "services.session_auth"):
             del sys.modules[mod]
     import database as _database
     _database.init_db()
@@ -60,11 +63,13 @@ def isolated_db(monkeypatch):
 
 
 def _seed_file(database, session_id: str, file_id: str, filename: str, content: str):
-    # session_files has no enforced FK to chat_sessions in sqlite (foreign_keys
-    # pragma is off by default), so a standalone row is sufficient here —
-    # matches how these router functions actually query (by session_id +
-    # file_id only, no join).
+    # Ownership gates require a chat_sessions row; user_id NULL matches the
+    # legacy list_sessions visibility rule (any authed user may access).
     with database.get_db_ctx() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_sessions (id, title, user_id) VALUES (?, ?, ?)",
+            (session_id, "t", None),
+        )
         conn.execute(
             "INSERT INTO session_files (id, session_id, filename, content, lines, symbol_count, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
@@ -81,10 +86,10 @@ def test_update_snapshots_previous_content_as_a_version(isolated_db):
     session_id, file_id = "s1", "f1"
     _seed_file(database, session_id, file_id, "app.py", "print('v1')")
 
-    session_files.update_session_file(session_id, file_id, {"content": "print('v2')", "label": "Edit A"})
-    session_files.update_session_file(session_id, file_id, {"content": "print('v3')", "label": "Edit B"})
+    session_files.update_session_file(session_id, file_id, {"content": "print('v2')", "label": "Edit A"}, request=fake_request())
+    session_files.update_session_file(session_id, file_id, {"content": "print('v3')", "label": "Edit B"}, request=fake_request())
 
-    versions = session_files.list_session_file_versions(session_id, file_id)
+    versions = session_files.list_session_file_versions(session_id, file_id, request=fake_request())
     # Two edits => two snapshots of the states they replaced (v1, v2)
     assert len(versions) == 2, f"expected 2 snapshots, got {len(versions)}: {versions}"
     labels = [v["label"] for v in versions]
@@ -103,11 +108,11 @@ def test_undo_restores_most_recent_version_regardless_of_change_count(isolated_d
     session_id, file_id = "s2", "f2"
     _seed_file(database, session_id, file_id, "app.py", "print('v1')")
 
-    session_files.update_session_file(session_id, file_id, {"content": "print('v2')"})
-    session_files.update_session_file(session_id, file_id, {"content": "print('v3')"})
-    session_files.update_session_file(session_id, file_id, {"content": "print('v4')"})
+    session_files.update_session_file(session_id, file_id, {"content": "print('v2')"}, request=fake_request())
+    session_files.update_session_file(session_id, file_id, {"content": "print('v3')"}, request=fake_request())
+    session_files.update_session_file(session_id, file_id, {"content": "print('v4')"}, request=fake_request())
 
-    result = session_files.undo_session_file(session_id, file_id)
+    result = session_files.undo_session_file(session_id, file_id, request=fake_request())
     assert result["content"] == "print('v3')", "undo must restore the immediately-prior state (v3), not v1 or a stale slot"
 
     with database.get_db_ctx() as conn:
@@ -124,7 +129,7 @@ def test_undo_with_no_history_returns_400_not_a_crash(isolated_db):
 
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc_info:
-        session_files.undo_session_file(session_id, file_id)
+        session_files.undo_session_file(session_id, file_id, request=fake_request())
     assert exc_info.value.status_code == 400
 
 
@@ -135,15 +140,15 @@ def test_restore_arbitrary_past_version_not_just_the_last_one(isolated_db):
     session_id, file_id = "s4", "f4"
     _seed_file(database, session_id, file_id, "app.py", "print('v1')")
 
-    session_files.update_session_file(session_id, file_id, {"content": "print('v2')", "label": "Edit A"})
-    session_files.update_session_file(session_id, file_id, {"content": "print('v3')", "label": "Edit B"})
-    session_files.update_session_file(session_id, file_id, {"content": "print('v4')", "label": "Edit C"})
+    session_files.update_session_file(session_id, file_id, {"content": "print('v2')", "label": "Edit A"}, request=fake_request())
+    session_files.update_session_file(session_id, file_id, {"content": "print('v3')", "label": "Edit B"}, request=fake_request())
+    session_files.update_session_file(session_id, file_id, {"content": "print('v4')", "label": "Edit C"}, request=fake_request())
 
-    versions = session_files.list_session_file_versions(session_id, file_id)
+    versions = session_files.list_session_file_versions(session_id, file_id, request=fake_request())
     # newest first: Edit C (snapshot of v3), Edit B (snapshot of v2), Edit A (snapshot of v1)
     edit_a_version = next(v for v in versions if v["label"] == "Edit A")
 
-    result = session_files.restore_session_file_version(session_id, file_id, edit_a_version["id"])
+    result = session_files.restore_session_file_version(session_id, file_id, edit_a_version["id"], request=fake_request())
     assert result["content"] == "print('v1')", "must be able to restore all the way back to the original content, not just one step"
 
     with database.get_db_ctx() as conn:
@@ -159,14 +164,14 @@ def test_restore_is_itself_reversible(isolated_db):
     session_id, file_id = "s5", "f5"
     _seed_file(database, session_id, file_id, "app.py", "print('v1')")
 
-    session_files.update_session_file(session_id, file_id, {"content": "print('v2')", "label": "Edit A"})
-    versions = session_files.list_session_file_versions(session_id, file_id)
+    session_files.update_session_file(session_id, file_id, {"content": "print('v2')", "label": "Edit A"}, request=fake_request())
+    versions = session_files.list_session_file_versions(session_id, file_id, request=fake_request())
     v1_version = versions[0]
 
-    session_files.restore_session_file_version(session_id, file_id, v1_version["id"])
+    session_files.restore_session_file_version(session_id, file_id, v1_version["id"], request=fake_request())
     # Current content is now back to v1. v2 (what we just replaced) must
     # have been snapshotted so it's not lost.
-    versions_after = session_files.list_session_file_versions(session_id, file_id)
+    versions_after = session_files.list_session_file_versions(session_id, file_id, request=fake_request())
     contents = set()
     for v in versions_after:
         # fetch each version's content directly to check v2 survived
@@ -181,10 +186,10 @@ def test_versions_list_ordered_newest_first(isolated_db):
     session_id, file_id = "s6", "f6"
     _seed_file(database, session_id, file_id, "app.py", "print('v1')")
 
-    session_files.update_session_file(session_id, file_id, {"content": "print('v2')", "label": "First"})
-    session_files.update_session_file(session_id, file_id, {"content": "print('v3')", "label": "Second"})
+    session_files.update_session_file(session_id, file_id, {"content": "print('v2')", "label": "First"}, request=fake_request())
+    session_files.update_session_file(session_id, file_id, {"content": "print('v3')", "label": "Second"}, request=fake_request())
 
-    versions = session_files.list_session_file_versions(session_id, file_id)
+    versions = session_files.list_session_file_versions(session_id, file_id, request=fake_request())
     assert versions[0]["label"] == "Second", "most recently created snapshot must be first"
     assert versions[1]["label"] == "First"
 
@@ -193,5 +198,5 @@ def test_versions_endpoint_404s_for_unknown_file(isolated_db):
     database, session_files = isolated_db
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc_info:
-        session_files.list_session_file_versions("no-such-session", "no-such-file")
+        session_files.list_session_file_versions("no-such-session", "no-such-file", request=fake_request())
     assert exc_info.value.status_code == 404
