@@ -117,6 +117,8 @@ def test_qa_result_object_forwards_new_fields_to_frontend_payload():
     always see the default (False) regardless of what actually happened."""
     src = _pipeline_src()
     idx = src.index("qa_result_obj = _QAResult(")
-    call_src = src[idx:idx + 900]
+    call_src = src[idx:idx + 1200]
     assert "hard_blocked=qa_dict.get(\"hard_blocked\"" in call_src
     assert "regression_detected=qa_dict.get(\"regression_detected\"" in call_src
+    assert "block_sources=list(qa_dict.get(\"block_sources\")" in call_src
+    assert "machine_verified=bool(qa_dict.get(\"machine_verified\")" in call_src

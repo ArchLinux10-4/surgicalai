@@ -200,6 +200,13 @@ class QAResult(BaseModel):
     # made tsc-introduced errors WORSE than the prior round (or than the
     # pre-correction baseline) and was rolled back rather than kept.
     regression_detected: bool = False
+    # ── Apply-gate provenance (session 3a6150e9 / Option A) ───────────────
+    # block_sources: why this edit is blocked — stamped at exact force-block
+    # sites ("tsc", "structural", "plan_incomplete", "plan_noop", "llm").
+    # machine_verified: True when any source is tsc/structural/plan_* —
+    # those hard-stop Apply; LLM-only may Apply after explicit ack.
+    block_sources: List[str] = []
+    machine_verified: bool = False
 
 
 class SurgicalOperation(BaseModel):

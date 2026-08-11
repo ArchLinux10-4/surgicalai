@@ -7692,6 +7692,14 @@ async def analyze_and_plan_stream(
                     qa["verdict"] = "blocked"
                     qa["qa_score"] = min(qa.get("qa_score", 10) or 10, 3)
                     qa_risks.extend([f"[STRUCTURAL] {m}" for m in _sq_msgs])
+                    try:
+                        from services.qa_provenance import append_structural_block_sources
+                        append_structural_block_sources(
+                            qa,
+                            [si for si in _sq_issues if si.get("severity") == "error"],
+                        )
+                    except Exception:
+                        pass
                     yield sse({"type": "progress",
                                "content": f"🔍 Structural QA: {len(_sq_msgs)} blocking issue(s) found"})
 
@@ -8178,6 +8186,14 @@ async def analyze_and_plan_stream(
                                         qa["verdict"] = "blocked"
                                         qa["qa_score"] = min(qa.get("qa_score", 10) or 10, 3)
                                         qa_risks.extend([f"[STRUCTURAL] {m}" for m in _sq_m2])
+                                        try:
+                                            from services.qa_provenance import append_structural_block_sources
+                                            append_structural_block_sources(
+                                                qa,
+                                                [x for x in _sq_i2 if x.get("severity") == "error"],
+                                            )
+                                        except Exception:
+                                            pass
                                 if not _sq_still_bad and qa.get("verdict") != "blocked":
                                     yield sse({"type": "progress",
                                                "content": f"✅ Retry {_aps_attempt + 1} passed QA (score: {qa.get('qa_score', '?')})"})
@@ -8329,6 +8345,14 @@ async def analyze_and_plan_stream(
                                             qa["verdict"] = "blocked"
                                             qa["qa_score"] = min(qa.get("qa_score", 10) or 10, 3)
                                             qa_risks.extend([f"[STRUCTURAL] {m}" for m in _sq_m2])
+                                            try:
+                                                from services.qa_provenance import append_structural_block_sources
+                                                append_structural_block_sources(
+                                                    qa,
+                                                    [x for x in _sq_i2 if x.get("severity") == "error"],
+                                                )
+                                            except Exception:
+                                                pass
                                     if not _sq_still_bad and qa.get("verdict") != "blocked":
                                         yield sse({"type": "progress",
                                                    "content": f"✅ Retry {_aps_attempt + 1} passed QA (score: {qa.get('qa_score', '?')})"})
@@ -22439,6 +22463,16 @@ async def run_natural_pipeline_stream(
                         f"Structural QA: {len(_sq_msgs)} blocking issue(s). "
                         + qa_results[_sq_i].get("summary", "")
                     )
+                    # Provenance for Apply gates (Option A) — stamp only at this
+                    # force-block site so hard-stops require real structural QA.
+                    try:
+                        from services.qa_provenance import append_structural_block_sources
+                        append_structural_block_sources(
+                            qa_results[_sq_i],
+                            [si for si in _sq_issues if si.get("severity") == "error"],
+                        )
+                    except Exception:
+                        pass
                     yield sse({"type": "progress",
                                "content": f"🔍 Structural QA found {len(_sq_msgs)} blocking issue(s) "
                                           f"in {_sq_cs['symbol'].name} — will auto-fix"})
@@ -22577,6 +22611,13 @@ async def run_natural_pipeline_stream(
                 f"tsc: {len(_msgs)} compile error(s){_suffix}. "
                 + (qa_results[_idx].get("summary", "") or "")
             )
+            # Apply-gate provenance: only stamp at this exact force-block site
+            # (compose+attribute already limited which indices reach here).
+            try:
+                from services.qa_provenance import append_block_sources
+                append_block_sources(qa_results[_idx], "tsc")
+            except Exception:
+                pass
             return _msgs
 
         # ── tsc pre-check — feed introduced compile errors into the retry loop ─
@@ -25951,6 +25992,25 @@ async def run_natural_pipeline_stream(
 
             all_qa_risks.extend(qa_dict.get("downstream_risks", []))
 
+            # Finalize Apply-gate provenance once — tags LLM-only blocked when
+            # no machine source was stamped (Option A; never invents tsc/structural
+            # from free-text LLM prose).
+            try:
+                from services.qa_provenance import finalize_block_provenance
+                finalize_block_provenance(qa_dict)
+            except Exception:
+                pass
+            _dlog("qa_block_provenance",
+                  session_id=session_id,
+                  filename=filename,
+                  symbol=symbol.name,
+                  verdict=qa_dict.get("verdict"),
+                  score=qa_dict.get("qa_score"),
+                  block_sources=qa_dict.get("block_sources") or [],
+                  machine_verified=bool(qa_dict.get("machine_verified")),
+                  hard_blocked=bool(qa_dict.get("hard_blocked")),
+                  user_id=user_id)
+
             qa_result_obj = _QAResult(
                 verdict=qa_dict.get("verdict", "skipped"),
                 qa_score=qa_dict.get("qa_score"),
@@ -25963,6 +26023,8 @@ async def run_natural_pipeline_stream(
                 risk_verdicts=qa_dict.get("risk_verdicts", []),
                 hard_blocked=qa_dict.get("hard_blocked", False),
                 regression_detected=qa_dict.get("regression_detected", False),
+                block_sources=list(qa_dict.get("block_sources") or []),
+                machine_verified=bool(qa_dict.get("machine_verified")),
             )
 
             verdict_icon = (

@@ -85,6 +85,13 @@ export interface QAResult {
   // worse (more real compile errors) than the version before it, and the
   // pipeline reverted that round's attempt rather than keeping it.
   regression_detected?: boolean
+  // Apply-gate provenance (session 3a6150e9 / Option A).
+  // block_sources: why blocked — "tsc" | "structural" | "plan_incomplete" |
+  // "plan_noop" | "llm" (stamped at pipeline force-block sites).
+  // machine_verified: true when any source is tsc/structural/plan_* —
+  // those hard-stop Apply; LLM-only may Apply after explicit ack.
+  block_sources?: string[]
+  machine_verified?: boolean
 }
 
 export interface SurgicalChange {
