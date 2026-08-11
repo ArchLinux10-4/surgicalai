@@ -138,8 +138,14 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
   if (cleanChanges === 0) return null
 
   const handleApplyAll = async () => {
+    const started = Date.now()
+    clientLog('apply_all_started', {
+      cleanChanges,
+      flaggedChanges,
+      totalFiles,
+    }, sessionId)
     setApplying(true)
-    setApplyStartedAt(Date.now())
+    setApplyStartedAt(started)
     setApplyProgress({
       stage: 'reading',
       label: applyStageLabel('reading'),
@@ -178,6 +184,9 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
             ''
           if (!fdFileId) {
             failed++
+            clientLog('apply_all_missing_file_id', {
+              filename: fd.filename || '',
+            }, sessionId)
             if (!firstFailReason) {
               firstFailReason =
                 `${fd.filename || 'file'} is not attached to this session ` +
@@ -194,7 +203,14 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
           // is already applying this exact file right now, skip it this
           // round rather than racing on a stale content snapshot; it will
           // simply no longer need Apply All once the other apply finishes.
-          if (!acquireApplyLock(fdFileId)) { skippedLocked++; continue }
+          if (!acquireApplyLock(fdFileId)) {
+            skippedLocked++
+            clientLog('apply_all_file_lock_busy', {
+              filename: fd.filename || '',
+              fileId: fdFileId,
+            }, sessionId)
+            continue
+          }
           fileCursor += 1
           const fileFracBase = totalFiles > 0 ? (fileCursor - 1) / totalFiles : 0
           const fileFracStep = totalFiles > 0 ? 1 / totalFiles : 1
@@ -261,6 +277,11 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
             })
           } catch (e: any) {
             failed++
+            clientLog('apply_all_file_failed', {
+              filename: fd.filename || '',
+              fileId: fdFileId,
+              error: String(e?.message || e).slice(0, 240),
+            }, sessionId)
             if (!firstFailReason) firstFailReason = e?.message || ''
           } finally {
             releaseApplyLock(fdFileId)
@@ -291,6 +312,16 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       const lockedNote = skippedLocked > 0
         ? ` (${skippedLocked} file${skippedLocked !== 1 ? 's' : ''} skipped — already being applied elsewhere, try Apply All again in a moment)`
         : ''
+      clientLog('apply_all_finished', {
+        appliedFiles,
+        appliedChanges,
+        failedFiles: failed,
+        failedChanges,
+        skippedLocked,
+        rescuedChanges,
+        elapsedMs: Date.now() - started,
+        firstFailReason: firstFailReason.slice(0, 200),
+      }, sessionId)
       if (failed === 0 && failedChanges === 0) {
         if (appliedFiles === 0 && skippedLocked > 0) {
           toast.error(`Nothing applied — every clean file is currently being applied elsewhere. Try again in a moment.`)
@@ -316,6 +347,10 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
         )
       }
     } catch (e: any) {
+      clientLog('apply_all_crashed', {
+        error: String(e?.message || e).slice(0, 240),
+        elapsedMs: Date.now() - started,
+      }, sessionId)
       toast.error(e.message || 'Apply all failed')
     } finally {
       setApplying(false)
