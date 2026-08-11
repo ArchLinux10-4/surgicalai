@@ -528,6 +528,102 @@ HISTORY_WINDOW       = 20   # turns of conversation history passed to every prom
 TEXT_SEARCH_WINDOW   = 75   # ±lines around a text hit when no symbol contains the line
 SYMBOL_FOCUS_WINDOW  = 100  # ±lines to slice when a symbol is huge but text is inside it
 LARGE_FILE_WINDOW    = 500  # files above this get windowed context instead of full dump
+# Plan→Execute: never dump a mega-component (session 3a6150e9 FilterSidebar
+# 689L / MongoRecordManager 819L) as the full edit context — that produced
+# duplicated signatures and truncated bodies. Cap focused windows to this size
+# and center on the change-description terms inside the symbol.
+PLAN_EXECUTE_MAX_WINDOW = 300
+
+
+def compute_plan_execute_window(
+    file_lines: list,
+    symbol_start: int,
+    symbol_end: int,
+    change_description: str = "",
+    max_window: int = PLAN_EXECUTE_MAX_WINDOW,
+    edge_padding: int = 50,
+) -> dict:
+    """Compute a plan-execute display window for one symbol.
+
+    Returns ``{ws, we, reason, capped, symbol_lines}`` where ``ws``/``we`` are
+    0-indexed inclusive start / exclusive end into ``file_lines``.
+
+    Small symbols (≤ max_window lines): full symbol + edge_padding (legacy).
+    Mega symbols: ≤ max_window lines centered on the densest match of
+    ``change_description`` terms inside the symbol span.
+    """
+    total = len(file_lines or [])
+    try:
+        ss = max(1, int(symbol_start))
+        se = max(ss, int(symbol_end))
+    except (TypeError, ValueError):
+        ss, se = 1, max(1, total)
+    symbol_lines = se - ss + 1
+    out = {
+        "ws": 0,
+        "we": total,
+        "reason": "full_file_fallback",
+        "capped": False,
+        "symbol_lines": symbol_lines,
+    }
+    if total <= 0:
+        return out
+
+    # Legacy small-symbol path: whole symbol + pad.
+    if symbol_lines <= max_window:
+        ws = max(0, ss - 1 - edge_padding)
+        we = min(total, se + edge_padding)
+        out.update(ws=ws, we=we, reason="full_symbol", capped=False)
+        return out
+
+    # Mega-symbol: score lines inside the symbol by description terms.
+    terms = []
+    for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", change_description or ""):
+        tl = tok.lower()
+        if tl not in {
+            "the", "and", "for", "add", "with", "from", "into", "that", "this",
+            "file", "code", "edit", "change", "update", "function", "const",
+            "return", "true", "false", "null", "undefined", "async", "await",
+        } and tl not in terms:
+            terms.append(tl)
+
+    best_line = ss + symbol_lines // 2  # 1-indexed default: middle of symbol
+    if terms:
+        best_score = -1
+        # Prefer densest local cluster via a sliding 40-line score inside symbol.
+        span = min(40, symbol_lines)
+        scores = [0] * symbol_lines
+        for i, abs_i in enumerate(range(ss - 1, min(se, total))):
+            ll = (file_lines[abs_i] if abs_i < total else "").lower()
+            scores[i] = sum(1 for t in terms if t in ll)
+        if any(scores):
+            cur = sum(scores[:span])
+            best_score = cur
+            best_off = 0
+            for i in range(1, symbol_lines - span + 1):
+                cur = cur - scores[i - 1] + scores[i + span - 1]
+                if cur > best_score:
+                    best_score = cur
+                    best_off = i
+            best_line = ss + best_off + span // 2
+
+    half = max_window // 2
+    center0 = best_line - 1  # 0-indexed
+    ws = max(0, center0 - half)
+    we = min(total, ws + max_window)
+    # Re-anchor if we hit EOF early
+    if we - ws < max_window:
+        ws = max(0, we - max_window)
+    # Prefer staying near the symbol when possible
+    sym_ws = max(0, ss - 1)
+    sym_we = min(total, se)
+    if we <= sym_ws or ws >= sym_we:
+        # Center fell outside (shouldn't) — clamp to symbol start
+        ws = sym_ws
+        we = min(total, ws + max_window)
+    out.update(ws=ws, we=we, reason="mega_symbol_term_focus", capped=True)
+    return out
+
 
 # ── Shared chat persona ───────────────────────────────────────────────────────
 CHAT_PERSONA = (
@@ -16071,10 +16167,18 @@ async def _execute_single_edit(
                 break
 
         if target_sym:
-            # Show the full symbol + 50 lines padding for surrounding context
-            padding = 50
-            ws = max(0, target_sym.start_line - 1 - padding)
-            we = min(file_line_count, target_sym.end_line + padding)
+            # Session 3a6150e9: full-symbol dump of FilterSidebar (689L) /
+            # MongoRecordManager (819L) caused truncated/duplicated bodies.
+            # Cap mega-symbols to PLAN_EXECUTE_MAX_WINDOW, centered on the
+            # change-description terms inside the symbol.
+            _win = compute_plan_execute_window(
+                file_lines,
+                target_sym.start_line,
+                target_sym.end_line,
+                change_description=change_description or "",
+            )
+            ws = int(_win["ws"])
+            we = int(_win["we"])
             window_parts = []
             if ws > 0:
                 window_parts.append(f"... [{ws} lines above] ...\n")
@@ -16086,6 +16190,12 @@ async def _execute_single_edit(
                 window_parts.append(
                     f"\n... [{file_line_count - we} lines below] ..."
                 )
+            if _win.get("capped"):
+                window_parts.append(
+                    f"\n⚠️ MEGA-SYMBOL ({_win['symbol_lines']} lines) — showing "
+                    f"focused {we - ws}-line window only. Prefer old_code/new_code "
+                    f"for the few lines that change; do NOT rewrite the whole component."
+                )
             file_display = "\n".join(window_parts)
 
             _dlog("execute_task_windowed",
@@ -16094,7 +16204,10 @@ async def _execute_single_edit(
                   total_lines=file_line_count,
                   window_start=ws + 1, window_end=we,
                   symbol_start=target_sym.start_line,
-                  symbol_end=target_sym.end_line)
+                  symbol_end=target_sym.end_line,
+                  symbol_lines=_win.get("symbol_lines"),
+                  capped=bool(_win.get("capped")),
+                  window_reason=_win.get("reason"))
         else:
             # Symbol not found in map — show full content as fallback
             file_display = file_content
@@ -22211,6 +22324,7 @@ async def run_natural_pipeline_stream(
                         {"filename": _s.get("filename"), "new_code": _s.get("new_code")}
                         for _s in change_shells
                     ],
+                    change_description=_sq_cs.get("description") or "",
                 )
                 # Filter out pre-existing issues in the ORIGINAL code before
                 # the edit — only block on errors the edit INTRODUCED.
