@@ -1129,6 +1129,26 @@ export function ChatPanel() {
   const [isBuildingEdit, setIsBuildingEdit] = useState(false)
   const [isComposerExpanded, setIsComposerExpanded] = useState(false)
 
+  // Holds an interrupted run detected on session load (pending tasks, none
+  // running) — rendered as a Resume banner above the Mission Control panel.
+  // Declared early: the session-switch effect below clears it.
+  const [resumableRun, setResumableRun] = useState<{ sid: string; runId: string; tasks: any[] } | null>(null)
+
+  // Anthropic credit-pause (session cb380321): remaining plan + held writes
+  // are persisted server-side; poll until credits_ok, then enable Resume.
+  // Declared early: the session-switch + poll effects below read these.
+  const [creditPause, setCreditPause] = useState<{
+    sid: string
+    pauseId: string
+    remainingCount: number
+    completedEditCount: number
+    heldWriteCount: number
+    message: string
+    creditsOk: boolean
+    probing: boolean
+  } | null>(null)
+  const creditPausePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
   // Consume pending input injected from sidebar components (e.g. deploy watcher "Ask Claude to fix")
   useEffect(() => {
     if (pendingChatInput) {
@@ -1518,24 +1538,6 @@ export function ChatPanel() {
   // /smart-stream ends right after planning. We then run each task in its
   // own short-lived SSE stream, sequentially, so no single connection can
   // hit the proxy/process timeout that previously killed long runs.
-
-  // Holds an interrupted run detected on session load (pending tasks, none
-  // running) — rendered as a Resume banner above the Mission Control panel.
-  const [resumableRun, setResumableRun] = useState<{ sid: string; runId: string; tasks: any[] } | null>(null)
-
-  // Anthropic credit-pause (session cb380321): remaining plan + held writes
-  // are persisted server-side; poll until credits_ok, then enable Resume.
-  const [creditPause, setCreditPause] = useState<{
-    sid: string
-    pauseId: string
-    remainingCount: number
-    completedEditCount: number
-    heldWriteCount: number
-    message: string
-    creditsOk: boolean
-    probing: boolean
-  } | null>(null)
-  const creditPausePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const addTaskResultCard = (sid: string, result: any) => {
     const naturalText = (result.natural_text || '')
