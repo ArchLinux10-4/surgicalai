@@ -647,6 +647,11 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   const [applying, setApplying] = useState(false)
   const [applyProgress, setApplyProgress] = useState<ApplyProgress | null>(null)
   const [applyStartedAt, setApplyStartedAt] = useState(0)
+  // Cmd+Y ownership: every FileChangeCard used to register a global
+  // keydown that all clicked document.querySelector('[data-apply-btn]') —
+  // with N file cards that fired N times and raced the apply lock.
+  // Only the card that owns the first enabled apply button handles Cmd+Y.
+  const applyBtnRef = useRef<HTMLButtonElement | null>(null)
   const [undoing, setUndoing] = useState<Record<string, boolean>>({})
   const [applied, setApplied] = useState<Record<string, boolean>>(() =>
     loadApplied(sessionId, changeIds)
@@ -731,18 +736,22 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     return originalCode.slice(0, idx) + next + originalCode.slice(idx + orig.length)
   }
 
-  // Cmd+Y: apply selected
+  // Cmd+Y: apply selected — only the first enabled apply button responds
+  // so multi-file results don't N×click the same first card.
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'y') {
-        e.preventDefault()
-        const btn = document.querySelector<HTMLButtonElement>('[data-apply-btn]')
-        if (btn && !btn.disabled) btn.click()
-      }
+      if (!((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y'))) return
+      const mine = applyBtnRef.current
+      if (!mine || mine.disabled) return
+      const firstEnabled = document.querySelector<HTMLButtonElement>('[data-apply-btn]:not(:disabled)')
+      if (firstEnabled !== mine) return
+      e.preventDefault()
+      clientLog('diff_apply_cmd_y', { filename }, sessionId)
+      mine.click()
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [])
+  }, [filename, sessionId])
 
   const markApplied = (changeId: string, diff?: string) => {
     saveApplied(sessionId, changeId)
@@ -1314,6 +1323,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             </span>
           ) : (
             <button
+              ref={applyBtnRef}
               onClick={handleApplySelected}
               data-apply-btn
               disabled={selectedChanges.length === 0 || applying}
@@ -1501,7 +1511,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 
                 <button
                   onClick={handleApplySelected}
-                  data-apply-btn
                   disabled={selectedChanges.length === 0 || applying}
                   className="flex items-center gap-1.5 px-4 py-1.5 bg-success/15 text-success border border-success/30 rounded-lg text-[12px] font-semibold hover:bg-success/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
                   title={selectedChanges.length === 0 ? 'No changes selected — check at least one above' : `Apply ${selectedChanges.length} selected change${selectedChanges.length !== 1 ? 's' : ''}`}

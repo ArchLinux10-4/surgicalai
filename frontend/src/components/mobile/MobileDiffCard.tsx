@@ -244,7 +244,15 @@ function FileCard({
       {/* Header row */}
       <button
         className="w-full flex items-center gap-2 px-3 py-2.5 text-left"
-        onClick={() => setExpanded(!expanded)}
+        onClick={() => {
+          const next = !expanded
+          setExpanded(next)
+          clientLog('mobile_diff_file_expanded_toggled', {
+            filename,
+            expanded: next,
+            changeCount: changes.length,
+          }, sessionId)
+        }}
       >
         <span className="text-[11px] font-mono text-ink/80 truncate flex-1">{filename}</span>
         <span className="text-[10px] text-muted/60 flex-shrink-0">{changes.length} change{changes.length !== 1 ? 's' : ''}</span>
