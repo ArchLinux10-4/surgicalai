@@ -152,12 +152,19 @@ function MessageBubble({ msg, sessionId, sessionFiles, setSessionFiles }: {
 
         {/* Diff card */}
         {result && (
-          <MobileDiffCard
-            result={result}
-            sessionId={sessionId}
-            sessionFiles={sessionFiles}
-            setSessionFiles={setSessionFiles}
-          />
+          <>
+            {result.recovered && (
+              <div className="flex items-center gap-1.5 text-[11px] text-warning/90 px-2.5 py-1.5 mb-2 bg-warning/10 rounded-lg border border-warning/25">
+                Recovered after interruption — apply or re-send
+              </div>
+            )}
+            <MobileDiffCard
+              result={result}
+              sessionId={sessionId}
+              sessionFiles={sessionFiles}
+              setSessionFiles={setSessionFiles}
+            />
+          </>
         )}
       </div>
     </div>

@@ -58,6 +58,13 @@ def test_checkpoint_wired_before_risky_edit_call_in_plan_execution_loop():
     assert '"phase": "plan_execute"' in between, \
         "checkpoint payload must be tagged so it's distinguishable from the " \
         "architect-phase and resolution-phase checkpoints"
+    # Thin→rich enrich (disconnect → Apply cards, not markdown): must run
+    # after the thin builder and before the checkpoint yield.
+    thin_idx = between.index("_build_architect_checkpoint_resolved(")
+    enrich_idx = between.index("enrich_thin_checkpoint_payload")
+    yield_idx = between.index('"type": "checkpoint"')
+    assert thin_idx < enrich_idx < yield_idx, \
+        "enrich_thin_checkpoint_payload must sit between thin builder and yield"
 
     # Must be gated — never yield a checkpoint of nothing when no edits
     # have been produced yet (would spam every plan's very first item).
@@ -73,6 +80,8 @@ def test_checkpoint_yield_wrapped_in_try_except():
     resolution-phase checkpoints' own try/except pattern."""
     src = inspect.getsource(run_natural_pipeline_stream)
     idx = src.index('"phase": "plan_execute"')
-    surrounding = src[max(0, idx - 600):idx + 600]
+    surrounding = src[max(0, idx - 200):idx + 3400]
     assert "except Exception as _plan_ckpt_err:" in surrounding
     assert '"plan_execute_checkpoint_error"' in surrounding
+    assert "except Exception as _enrich_err:" in surrounding
+    assert '"plan_execute_checkpoint_enrich_error"' in surrounding
