@@ -18,6 +18,9 @@ import { validateFileSize } from '../utils/fileValidation'
 import { acquireApplyLock, releaseApplyLock } from '../lib/fileApplyLock'
 import { runWithConcurrency, retryRateLimited, UPLOAD_CONCURRENCY } from '../lib/uploadQueue'
 import { clientLog } from '../lib/clientLog'
+import { ApplyProgressStrip } from './ApplyProgressStrip'
+import type { ApplyProgress } from '../lib/applyProgress'
+import { applyStageLabel } from '../lib/applyProgress'
 
 
 // ── Chat mode selector ────────────────────────────────────────────────────────
@@ -84,6 +87,8 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
   const [applying, setApplying] = useState(false)
   const [done, setDone]         = useState(false)
   const [appliedIds, setAppliedIds] = useState<Set<string>>(new Set())
+  const [applyProgress, setApplyProgress] = useState<ApplyProgress | null>(null)
+  const [applyStartedAt, setApplyStartedAt] = useState(0)
 
   // Fetch applied IDs from DB on mount + re-sync when individual cards apply changes
   useEffect(() => {
@@ -134,6 +139,13 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
 
   const handleApplyAll = async () => {
     setApplying(true)
+    setApplyStartedAt(Date.now())
+    setApplyProgress({
+      stage: 'reading',
+      label: applyStageLabel('reading'),
+      detail: `Preparing ${cleanChanges} change${cleanChanges !== 1 ? 's' : ''} across ${totalFiles} file${totalFiles !== 1 ? 's' : ''}…`,
+      fraction: 0,
+    })
     let appliedFiles   = 0
     let failed         = 0
     let appliedChanges = 0
@@ -141,6 +153,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
     let failedChanges  = 0
     let skippedLocked  = 0
     let firstFailReason = ''
+    let fileCursor = 0
 
     const markPromises: Promise<any>[] = []
     try {
@@ -182,14 +195,35 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
           // round rather than racing on a stale content snapshot; it will
           // simply no longer need Apply All once the other apply finishes.
           if (!acquireApplyLock(fdFileId)) { skippedLocked++; continue }
+          fileCursor += 1
+          const fileFracBase = totalFiles > 0 ? (fileCursor - 1) / totalFiles : 0
+          const fileFracStep = totalFiles > 0 ? 1 / totalFiles : 1
           try {
+            setApplyProgress({
+              stage: 'reading',
+              label: applyStageLabel('reading'),
+              detail: `File ${fileCursor}/${totalFiles}: reading ${fd.filename}…`,
+              fraction: fileFracBase + fileFracStep * 0.15,
+            })
             const current = await api.sessionFiles.get(sessionId, fdFileId)
+            setApplyProgress({
+              stage: 'applying',
+              label: applyStageLabel('applying'),
+              detail: `File ${fileCursor}/${totalFiles}: applying ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''} to ${fd.filename}…`,
+              fraction: fileFracBase + fileFracStep * 0.45,
+            })
             const applied = await api.surgical.applyAll({
               file_path: fd.filename,
               changes: applyChanges,
               file_content: current.content,
             })
             if (applied.modified_content) {
+              setApplyProgress({
+                stage: 'saving',
+                label: applyStageLabel('saving'),
+                detail: `File ${fileCursor}/${totalFiles}: saving ${fd.filename}…`,
+                fraction: fileFracBase + fileFracStep * 0.8,
+              })
               await api.sessionFiles.update(sessionId, fdFileId, applied.modified_content,
                 `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''}`)
               appliedFiles++
@@ -219,6 +253,12 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
                 }
               }
             }
+            setApplyProgress({
+              stage: 'applying',
+              label: applyStageLabel('applying'),
+              detail: `File ${fileCursor}/${totalFiles}: finished ${fd.filename}`,
+              fraction: fileFracBase + fileFracStep,
+            })
           } catch (e: any) {
             failed++
             if (!firstFailReason) firstFailReason = e?.message || ''
@@ -229,10 +269,22 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       }
 
       // Refresh file list
+      setApplyProgress({
+        stage: 'finishing',
+        label: applyStageLabel('finishing'),
+        detail: 'Refreshing session files…',
+        fraction: 0.95,
+      })
       const fresh = await api.sessionFiles.list(sessionId)
       setSessionFiles(fresh)
 
       // Wait for all DB marks to land before telling diff cards refresh
+      setApplyProgress({
+        stage: 'marking',
+        label: applyStageLabel('marking'),
+        detail: 'Recording applied status…',
+        fraction: 0.98,
+      })
       await Promise.all(markPromises)
 
       const rescuedNote = rescuedChanges > 0 ? ` (${rescuedChanges} AI-rescued)` : ''
@@ -267,29 +319,39 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       toast.error(e.message || 'Apply all failed')
     } finally {
       setApplying(false)
+      setApplyProgress(null)
     }
   }
 
   if (done) return null
 
   return (
-    <button
-      onClick={handleApplyAll}
-      disabled={applying}
-      className="flex items-center gap-2 px-3.5 py-2 rounded-xl border text-[12px] font-medium transition-all
-                 bg-success/10 border-success/30 text-success
-                 hover:bg-success/20 hover:border-success/50 hover:text-success
-                 disabled:opacity-50 disabled:cursor-wait"
-    >
-      <DoneAll sx={{ fontSize: 14 }} />
-      {applying
-        ? 'Applying…'
-        : flaggedChanges > 0
-          ? `Apply All  ·  ${cleanChanges} clean change${cleanChanges !== 1 ? 's' : ''} ` +
-            `(${flaggedChanges} QA-flagged, apply individually)`
-          : `Apply All  ·  ${cleanChanges} change${cleanChanges !== 1 ? 's' : ''} across ${totalFiles} file${totalFiles !== 1 ? 's' : ''}`
-      }
-    </button>
+    <div className="flex flex-col gap-1.5 min-w-0">
+      {applying && applyProgress && (
+        <ApplyProgressStrip
+          progress={applyProgress}
+          startedAt={applyStartedAt}
+          className="min-w-[260px] max-w-[420px]"
+        />
+      )}
+      <button
+        onClick={handleApplyAll}
+        disabled={applying}
+        className="flex items-center gap-2 px-3.5 py-2 rounded-xl border text-[12px] font-medium transition-all
+                   bg-success/10 border-success/30 text-success
+                   hover:bg-success/20 hover:border-success/50 hover:text-success
+                   disabled:opacity-50 disabled:cursor-wait"
+      >
+        <DoneAll sx={{ fontSize: 14 }} />
+        {applying
+          ? (applyProgress?.label || 'Applying…')
+          : flaggedChanges > 0
+            ? `Apply All  ·  ${cleanChanges} clean change${cleanChanges !== 1 ? 's' : ''} ` +
+              `(${flaggedChanges} QA-flagged, apply individually)`
+            : `Apply All  ·  ${cleanChanges} change${cleanChanges !== 1 ? 's' : ''} across ${totalFiles} file${totalFiles !== 1 ? 's' : ''}`
+        }
+      </button>
+    </div>
   )
 }
 
