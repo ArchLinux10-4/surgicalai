@@ -41,6 +41,8 @@ import pytest
 _BACKEND_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _BACKEND_DIR)
 
+from auth_test_utils import fake_request  # noqa: E402
+
 _PIPELINE_PATH = os.path.join(_BACKEND_DIR, "services", "pipeline.py")
 
 
@@ -57,7 +59,8 @@ def isolated_db(monkeypatch):
     for mod in list(sys.modules):
         if (mod in ("database", "routers", "services")
                 or mod.startswith("routers.")
-                or mod.startswith("services.session_file_store")):
+                or mod.startswith("services.session_file_store")
+                or mod == "services.session_auth"):
             del sys.modules[mod]
     import database as _database
     _database.init_db()
@@ -93,7 +96,13 @@ def test_pasted_file_gets_a_real_id_and_is_fetchable(isolated_db):
     assert entry["content"] == content
 
     # And the id must actually resolve through the real GET route.
-    fetched = session_files.get_session_file("d021ff07", entry["id"])
+    with database.get_db_ctx() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_sessions (id, title, user_id) VALUES (?, ?, ?)",
+            ("d021ff07", "t", None),
+        )
+        conn.commit()
+    fetched = session_files.get_session_file("d021ff07", entry["id"], request=fake_request())
     assert fetched["filename"] == "UserManagementModal.jsx"
     assert fetched["content"] == content
 
@@ -163,11 +172,24 @@ def test_resolve_session_file_id_returns_none_when_absent(isolated_db):
 def test_empty_file_id_returns_400_not_a_redirect_to_the_list(isolated_db):
     """`GET /chat/{sid}/files/` used to 307 to the list route, so a broken
     apply received a JSON array and looked like it had worked."""
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
     from fastapi.testclient import TestClient
-    _database, session_files, _store = isolated_db
+    database, session_files, _store = isolated_db
+
+    with database.get_db_ctx() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_sessions (id, title, user_id) VALUES (?, ?, ?)",
+            ("d021ff07", "t", "server_user"),
+        )
+        conn.commit()
 
     app = FastAPI()
+
+    @app.middleware("http")
+    async def _stamp(request: Request, call_next):
+        request.state.user_id = "server_user"
+        return await call_next(request)
+
     app.include_router(session_files.router, prefix="/chat")
     client = TestClient(app)
 
@@ -182,12 +204,25 @@ def test_empty_file_id_returns_400_not_a_redirect_to_the_list(isolated_db):
 
 def test_valid_file_id_still_routes_normally(isolated_db):
     """The 400 guard must not shadow real file requests."""
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
     from fastapi.testclient import TestClient
-    _database, session_files, store = isolated_db
+    database, session_files, store = isolated_db
     entry = store.register_session_file("s1", "a.js", "hello")
 
+    with database.get_db_ctx() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO chat_sessions (id, title, user_id) VALUES (?, ?, ?)",
+            ("s1", "t", "server_user"),
+        )
+        conn.commit()
+
     app = FastAPI()
+
+    @app.middleware("http")
+    async def _stamp(request: Request, call_next):
+        request.state.user_id = "server_user"
+        return await call_next(request)
+
     app.include_router(session_files.router, prefix="/chat")
     client = TestClient(app)
 

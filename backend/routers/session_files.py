@@ -9,11 +9,12 @@ import logging
 import datetime as _dt
 from pathlib import Path
 import mimetypes
-from fastapi import APIRouter, HTTPException, File, UploadFile, Form
+from fastapi import APIRouter, HTTPException, File, UploadFile, Form, Request
 from fastapi.responses import Response
 from database import get_db, get_db_ctx, _dlog
 from middleware.file_validator import validate_file_size, validate_session_total
 from services.ast_parser import ASTParser
+from services.session_auth import require_session_access_from_request
 
 logger = logging.getLogger(__name__)
 
@@ -378,7 +379,7 @@ def _parse_excel_to_markdown(base64_data: str, filename: str) -> str:
 
 
 @router.post("/{session_id}/files")
-def upload_session_file(session_id: str, body: dict):
+def upload_session_file(session_id: str, body: dict, request: Request):
     """Upload a file to a chat session (legacy JSON path).
 
     Thin observability wrapper: emits a decisive per-attempt outcome
@@ -387,6 +388,7 @@ def upload_session_file(session_id: str, body: dict):
     and response body are unchanged — every path still returns/raises exactly
     as before.
     """
+    require_session_access_from_request(session_id, request)
     filename = body.get("filename", "untitled") if isinstance(body, dict) else "untitled"
     try:
         return _upload_session_file_impl(session_id, body)
@@ -533,6 +535,7 @@ def _upload_session_file_impl(session_id: str, body: dict):
 @router.post("/{session_id}/files/upload")
 async def upload_session_file_multipart(
     session_id: str,
+    request: Request,
     file: UploadFile = File(...),
     filename: str = Form(None),
 ):
@@ -543,6 +546,7 @@ async def upload_session_file_multipart(
     storm is reconstructable. Behaviour, status codes and response body are
     unchanged.
     """
+    require_session_access_from_request(session_id, request)
     _wrapper_filename = filename or (file.filename if file is not None else None) or "upload"
     try:
         return await _upload_session_file_multipart_impl(session_id, file, filename)
@@ -679,8 +683,9 @@ async def _upload_session_file_multipart_impl(
 
 
 @router.get("/{session_id}/files")
-def list_session_files(session_id: str):
+def list_session_files(session_id: str, request: Request):
     """List files attached to a session (metadata only, no content)."""
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         rows = conn.execute(
             """SELECT id, session_id, filename, language, lines, symbol_count, file_type, origin, github_meta, created_at, updated_at, github_pushed_at, edited
@@ -693,7 +698,7 @@ def list_session_files(session_id: str):
 @router.get("/{session_id}/files/")
 @router.put("/{session_id}/files/")
 @router.delete("/{session_id}/files/")
-def _reject_empty_file_id(session_id: str):
+def _reject_empty_file_id(session_id: str, request: Request):
     """Fail loudly when a client sends an EMPTY file id.
 
     `/chat/{sid}/files/{file_id}` with an empty `file_id` collapses to
@@ -705,6 +710,7 @@ def _reject_empty_file_id(session_id: str):
 
     Returning 400 here turns that silent misroute into a visible error.
     """
+    require_session_access_from_request(session_id, request)
     logger.warning(
         f"[session_files] Rejected request with EMPTY file id "
         f"(session={session_id[:8]}) — client bug: the caller built a URL from "
@@ -718,8 +724,9 @@ def _reject_empty_file_id(session_id: str):
 
 
 @router.get("/{session_id}/files/{file_id}")
-def get_session_file(session_id: str, file_id: str):
+def get_session_file(session_id: str, file_id: str, request: Request):
     """Get a specific file's full content."""
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         row = conn.execute(
             "SELECT * FROM session_files WHERE id = ? AND session_id = ?",
@@ -731,7 +738,7 @@ def get_session_file(session_id: str, file_id: str):
 
 
 @router.put("/{session_id}/files/{file_id}")
-def update_session_file(session_id: str, file_id: str, body: dict):
+def update_session_file(session_id: str, file_id: str, body: dict, request: Request):
     """Update file content after applying a change.
 
     Uses optimistic concurrency: the UPDATE includes AND updated_at = ?
@@ -743,6 +750,7 @@ def update_session_file(session_id: str, file_id: str, body: dict):
     restored to this exact point via the version history, not just the
     single most-recent edit.
     """
+    require_session_access_from_request(session_id, request)
     new_content = body.get("content", "")
     label = body.get("label") or "Edit applied"
     with get_db_ctx() as conn:
@@ -972,13 +980,14 @@ def search_file_version_history(session_id: str, filename: str, query: str = Non
 
 
 @router.get("/{session_id}/files/{file_id}/versions")
-def list_session_file_versions(session_id: str, file_id: str):
+def list_session_file_versions(session_id: str, file_id: str, request: Request):
     """List all saved versions of a file, newest first.
 
     Backed by session_file_versions — a real, unbounded, append-only
     history (not the old single-slot previous_content column), so every
     past state of the file is browsable and restorable, not just the last.
     """
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         file_row = conn.execute(
             "SELECT updated_at FROM session_files WHERE id = ? AND session_id = ?",
@@ -1011,13 +1020,15 @@ def list_session_file_versions(session_id: str, file_id: str):
 
 
 @router.post("/{session_id}/files/{file_id}/versions/{version_id}/restore")
-def restore_session_file_version(session_id: str, file_id: str, version_id: str):
+def restore_session_file_version(session_id: str, file_id: str, version_id: str,
+                                 request: Request):
     """Restore a file to an arbitrary past version by id.
 
     Optimistic concurrency: AND updated_at = ? prevents restore from
     silently overwriting a concurrent edit made while the History panel
     was open.
     """
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         file_row = conn.execute(
             "SELECT content, filename, updated_at FROM session_files WHERE id = ? AND session_id = ?",
@@ -1053,7 +1064,7 @@ def restore_session_file_version(session_id: str, file_id: str, version_id: str)
 
 
 @router.post("/{session_id}/files/{file_id}/undo")
-def undo_session_file(session_id: str, file_id: str):
+def undo_session_file(session_id: str, file_id: str, request: Request):
     """Undo — restore the file to its most recent saved version.
 
     Now backed by session_file_versions instead of a single previous_content
@@ -1061,6 +1072,7 @@ def undo_session_file(session_id: str, file_id: str):
     edits. The undo itself is snapshotted too, so it can be reversed by
     restoring a later version from the History panel if needed.
     """
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         file_row = conn.execute(
             "SELECT content, filename, updated_at FROM session_files WHERE id = ? AND session_id = ?",
@@ -1099,8 +1111,9 @@ def undo_session_file(session_id: str, file_id: str):
 
 
 @router.delete("/{session_id}/files/{file_id}")
-def delete_session_file(session_id: str, file_id: str):
+def delete_session_file(session_id: str, file_id: str, request: Request):
     """Remove a file from a session."""
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         conn.execute(
             "DELETE FROM session_files WHERE id = ? AND session_id = ?",
@@ -1111,7 +1124,7 @@ def delete_session_file(session_id: str, file_id: str):
 
 
 @router.post("/{session_id}/files/import-folder")
-def import_folder(session_id: str, body: dict = None):
+def import_folder(session_id: str, request: Request, body: dict = None):
     """Bulk-import every code file from a local folder into this session,
     so Chat/Edit/Agent can see an entire project at once (like opening a
     folder in Cursor), instead of uploading files one at a time.
@@ -1132,6 +1145,7 @@ def import_folder(session_id: str, body: dict = None):
       - Hard cap of MAX_IMPORT_FILES per call so a mistaken huge directory
         can't hang the request.
     """
+    require_session_access_from_request(session_id, request)
     from routers.files import IGNORED_DIRS, IGNORED_EXTS, _get_workspace_root, _safe_path
 
     MAX_IMPORT_FILES = 500
@@ -1258,8 +1272,9 @@ def import_folder(session_id: str, body: dict = None):
 
 
 @router.get("/{session_id}/files/{file_id}/preview")
-def preview_session_file(session_id: str, file_id: str):
+def preview_session_file(session_id: str, file_id: str, request: Request):
     """Serve file content for live preview with correct Content-Type."""
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         row = conn.execute(
             "SELECT filename, content FROM session_files WHERE id = ? AND session_id = ?",
@@ -1286,7 +1301,7 @@ _NON_GRAPH_TYPES = {"image", "pdf", "csv", "excel"}
 
 
 @router.post("/{session_id}/files/{file_id}/preview-bundle")
-def preview_bundle(session_id: str, file_id: str, body: dict = None):
+def preview_bundle(session_id: str, file_id: str, request: Request, body: dict = None):
     """Resolve the import graph for a TSX/JSX/TS/JS file across the session.
 
     Returns a Sandpack-ready file map so the live preview renders with all of
@@ -1297,6 +1312,7 @@ def preview_bundle(session_id: str, file_id: str, body: dict = None):
     stored content is used. This lets the frontend preview the *modified* version
     of a file without first persisting it.
     """
+    require_session_access_from_request(session_id, request)
     body = body or {}
     override = body.get("content")
 

@@ -11,8 +11,14 @@ from database import get_setting, get_db_ctx
 from services.pipeline import analyze_and_plan, analyze_and_plan_stream, _dlog
 from services.surgical_editor import apply_changes_to_file
 from services.edit_rescue import rescue_failed_changes
+from services.session_auth import require_session_access_from_request
 
 router = APIRouter()
+
+
+def _require_admin(request: Request):
+    if not getattr(request.state, "is_admin", False):
+        raise HTTPException(status_code=403, detail="Admin access required")
 
 
 def _attempt_rescue(req: SurgicalApplyRequest, request: Request,
@@ -305,8 +311,16 @@ def get_history(file_path: str = None, limit: int = 50):
 
 
 @router.get("/qa-log")
-def get_qa_log(session_id: str = None, limit: int = 100):
-    """Admin: view QA log entries. Proof that QA ran on every edit."""
+def get_qa_log(request: Request, session_id: str = None, limit: int = 100):
+    """Admin: view QA log entries. Proof that QA ran on every edit.
+
+    When session_id is set, any owner of that session may read its rows.
+    Unscoped queries require admin (cross-user dump).
+    """
+    if session_id:
+        require_session_access_from_request(session_id, request)
+    else:
+        _require_admin(request)
     with get_db_ctx() as conn:
         if session_id:
             rows = conn.execute(
@@ -322,8 +336,16 @@ def get_qa_log(session_id: str = None, limit: int = 100):
 
 
 @router.get("/compliance-log")
-def get_compliance_log(session_id: str = None, limit: int = 50):
-    """Admin: view pipeline compliance records. Proves all required steps ran."""
+def get_compliance_log(request: Request, session_id: str = None, limit: int = 50):
+    """Admin: view pipeline compliance records. Proves all required steps ran.
+
+    When session_id is set, any owner of that session may read its rows.
+    Unscoped queries require admin (cross-user dump).
+    """
+    if session_id:
+        require_session_access_from_request(session_id, request)
+    else:
+        _require_admin(request)
     with get_db_ctx() as conn:
         if session_id:
             rows = conn.execute(
@@ -339,8 +361,9 @@ def get_compliance_log(session_id: str = None, limit: int = 50):
 
 
 @router.post("/applied/{session_id}/{change_id}")
-def mark_change_applied(session_id: str, change_id: str):
+def mark_change_applied(session_id: str, change_id: str, request: Request):
     """Persist that a user applied a change — survives page refresh."""
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS applied_changes
@@ -357,8 +380,9 @@ def mark_change_applied(session_id: str, change_id: str):
 
 
 @router.delete("/applied/{session_id}/{change_id}")
-def unmark_change_applied(session_id: str, change_id: str):
+def unmark_change_applied(session_id: str, change_id: str, request: Request):
     """Remove applied state (undo support)."""
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         conn.execute(
             "DELETE FROM applied_changes WHERE session_id = ? AND change_id = ?",
@@ -369,8 +393,9 @@ def unmark_change_applied(session_id: str, change_id: str):
 
 
 @router.get("/applied/{session_id}")
-def get_applied_changes(session_id: str):
+def get_applied_changes(session_id: str, request: Request):
     """Return all applied change IDs for a session — used on page load."""
+    require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
         conn.execute(
             """CREATE TABLE IF NOT EXISTS applied_changes
