@@ -493,6 +493,8 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
     ? new Date(msg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
     : ''
   const [copied, setCopied] = useState(false)
+  // Dense chat: long agent markdown above Apply cards starts collapsed.
+  const [narrativeOpen, setNarrativeOpen] = useState(false)
   const handleCopy = () => {
     const text = stripInternalTags(msg.content || '')
     navigator.clipboard.writeText(text).then(() => {
@@ -576,15 +578,61 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
             </DiffCardBoundary>
           </div>
         ) : isNaturalResult ? (
-          /* Natural result: show markdown text first, then diff card below */
+          /* Natural result: dense narrative + Apply cards */
           <div className="space-y-3">
-            {msg.content && (
-              <div className="prose-ai">
-                <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                  {stripInternalTags(msg.content)}
-                </ReactMarkdown>
-              </div>
-            )}
+            {msg.content && (() => {
+              const narrative = stripInternalTags(msg.content)
+              const hasCards = Boolean(surgicalResult)
+              const longNarrative = narrative.length > 280
+              const collapseNarrative = hasCards && longNarrative && !narrativeOpen
+              return (
+                <div>
+                  {collapseNarrative ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setNarrativeOpen(true)
+                        clientLog('chat_narrative_toggled', {
+                          open: true,
+                          contentLen: narrative.length,
+                          hasCards: true,
+                        }, sessionId)
+                      }}
+                      className="w-full flex items-center gap-2 px-2.5 py-1.5 rounded-lg border border-border/50 bg-surface/40 text-left hover:bg-overlay/40 transition-colors"
+                    >
+                      <span className="text-[12px] text-muted truncate flex-1">
+                        {narrative.replace(/\s+/g, ' ').slice(0, 120)}…
+                      </span>
+                      <span className="text-[11px] font-semibold text-accent flex-shrink-0">Show summary</span>
+                    </button>
+                  ) : (
+                    <>
+                      <div className="prose-ai">
+                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
+                          {narrative}
+                        </ReactMarkdown>
+                      </div>
+                      {hasCards && longNarrative && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setNarrativeOpen(false)
+                            clientLog('chat_narrative_toggled', {
+                              open: false,
+                              contentLen: narrative.length,
+                              hasCards: true,
+                            }, sessionId)
+                          }}
+                          className="mt-1 text-[11px] font-semibold text-muted hover:text-ink"
+                        >
+                          Hide summary
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              )
+            })()}
             {surgicalResult && (
               <>
                 {surgicalResult.recovered && (

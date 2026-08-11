@@ -11,10 +11,11 @@ import { LivePreview, isVisualFile } from './LivePreview'
 import { useAppStore } from '../stores/appStore'
 import { recordDiffStats, revertDiffStats } from '../lib/fileClassify'
 import { acquireApplyLock, releaseApplyLock } from '../lib/fileApplyLock'
-import { Cancel, CheckCircle, Close, Description, FileDownload, History, KeyboardArrowDown, KeyboardArrowUp, Replay, SkipNext, Visibility, Warning } from '@mui/icons-material'
+import { Cancel, CheckCircle, Close, Description, FileDownload, History, KeyboardArrowDown, KeyboardArrowRight, KeyboardArrowUp, Replay, SkipNext, Visibility, Warning } from '@mui/icons-material'
 import { ApplyProgressStrip } from './ApplyProgressStrip'
 import type { ApplyProgress } from '../lib/applyProgress'
-import { applyStageLabel } from '../lib/applyProgress';
+import { applyStageLabel } from '../lib/applyProgress'
+import { clientLog } from '../lib/clientLog';
 interface Props {
   result: SmartResult
   sessionId: string
@@ -623,6 +624,10 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   // Diff expand/collapse per change — collapsed by default
   const [diffExpanded, setDiffExpanded] = useState<Record<string, boolean>>({})
 
+  // File body collapsed by default (Cursor-like dense row). Expand to review
+  // change list / diffs; Apply stays available on the collapsed header.
+  const [fileExpanded, setFileExpanded] = useState(false)
+
   // Preview toggle — one per file, not per change (Live Preview renders the whole file)
   const [showFilePreview, setShowFilePreview] = useState(false)
 
@@ -705,6 +710,17 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   const selectedChanges = pendingChanges.filter((c: any) => checked[c.id])
   const allApplied = realChanges.every((c: any) => applied[c.id] || skipped[c.id])
 
+  // Aggregate +/- for the collapsed file row (screenshot clutter was open rows
+  // with per-change stats always visible).
+  let fileAddCount = 0
+  let fileRemoveCount = 0
+  for (const c of realChanges) {
+    for (const l of (c.diff || '').split('\n')) {
+      if (l.startsWith('+') && !l.startsWith('+++')) fileAddCount++
+      else if (l.startsWith('-') && !l.startsWith('---')) fileRemoveCount++
+    }
+  }
+
   const getProposedCode = (change: any): string => {
     if (!originalCode) return '// Loading preview...'
     const orig = change.original_code
@@ -751,16 +767,39 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   // Apply all selected changes in one call
   const handleApplySelected = async () => {
     if (selectedChanges.length === 0) return
+    // Session d021ff07: empty file_id made apply URL collapse and silently fail.
+    if (!effectiveFileId) {
+      clientLog('diff_apply_missing_file_id', {
+        filename,
+        changeCount: selectedChanges.length,
+        fileExpanded,
+      }, sessionId)
+      toast.error('Cannot apply — file id missing. Refresh the session and try again.')
+      return
+    }
     // Mutual exclusion with the global "Apply All" bar (and other diff cards
     // for the same file) — see fileApplyLock.ts for the proven race this
     // closes. When nothing else is applying this file (the normal case),
     // this acquires instantly and every line below runs exactly as before.
     if (!acquireApplyLock(effectiveFileId)) {
+      clientLog('diff_apply_lock_busy', {
+        filename,
+        fileId: effectiveFileId,
+        changeCount: selectedChanges.length,
+        fileExpanded,
+      }, sessionId)
       toast.error('This file is being applied elsewhere right now — please wait a moment and try again')
       return
     }
     const n = selectedChanges.length
     const started = Date.now()
+    clientLog('diff_apply_started', {
+      filename,
+      fileId: effectiveFileId,
+      changeCount: n,
+      fileExpanded,
+      fromCollapsedHeader: !fileExpanded,
+    }, sessionId)
     setApplyStartedAt(started)
     setApplying(true)
     setApplyProgress({
@@ -847,6 +886,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 
       if (failedChanges.length > 0) {
         console.warn('[InlineDiffCard] apply reported failed changes:', failedChanges)
+        clientLog('diff_apply_partial_failures', {
+          filename,
+          fileId: effectiveFileId,
+          failedCount: failedChanges.length,
+          okCount,
+          symbols: failedChanges.map((f: any) => String(f.symbol || '?')).slice(0, 8),
+          elapsedMs: Date.now() - started,
+        }, sessionId)
         const names = failedChanges.map((f: any) => f.symbol || '?').slice(0, 3).join(', ')
         toast.error(
           `${failedChanges.length} change${failedChanges.length !== 1 ? 's' : ''} could not be applied (${names})`,
@@ -854,6 +901,13 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         )
       }
       if (okCount > 0) {
+        clientLog('diff_apply_succeeded', {
+          filename,
+          fileId: effectiveFileId,
+          okCount,
+          failedCount: failedChanges.length,
+          elapsedMs: Date.now() - started,
+        }, sessionId)
         toast.success(`Applied ${okCount} change${okCount !== 1 ? 's' : ''} to ${filename}`)
       }
       setModifiedCode(undefined)  // clear so LivePreview falls back to originalCode (fresh from DB)
@@ -906,9 +960,23 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         } catch (refetchErr: any) {
           console.warn('[InlineDiffCard] originalCode re-fetch failed (non-fatal):', refetchErr?.message)
         }
+        clientLog('diff_apply_already_applied_fallback', {
+          filename,
+          fileId: effectiveFileId,
+          changeCount: selectedChanges.length,
+          elapsedMs: Date.now() - started,
+        }, sessionId)
         toast.success('These changes appear to already be applied ✓')
         window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
       } else {
+        clientLog('diff_apply_failed', {
+          filename,
+          fileId: effectiveFileId,
+          changeCount: selectedChanges.length,
+          error: String(errMsg).slice(0, 240),
+          elapsedMs: Date.now() - started,
+          fileExpanded,
+        }, sessionId)
         toast.error(errMsg)
       }
     } finally {
@@ -1104,19 +1172,47 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   }
 
   return (
-    <div className="border border-border rounded-xl mb-3">
-      {/* ── File header ─────────────────────────────────────────────────── */}
-      <div className="flex items-center gap-2.5 px-4 py-2.5 bg-surface/80 rounded-t-xl">
-        <Description sx={{ fontSize: 14 }} className="text-accent flex-shrink-0" />
-        <span className="text-sm font-semibold text-ink">{filename}</span>
-        <span className="text-[11px] text-muted/70 ml-1">
-          {realChanges.length} change{realChanges.length !== 1 ? 's' : ''}
-        </span>
-        <div className="flex items-center gap-1.5 ml-auto relative">
-          {/* File-level Undo — reverts the file to its most recent saved
-               version. Backed by real version history (session_file_versions),
-               so this always works when any change has been applied — it is
-               no longer limited to "exactly one change applied this session". */}
+    <div className={`border rounded-xl mb-2 overflow-hidden ${
+      allApplied ? 'border-success/30 bg-success/5' : 'border-border'
+    }`}>
+      {/* ── Collapsed-by-default file row (Cursor-like) ─────────────────── */}
+      <div className={`flex items-center gap-2 px-3 py-2 ${fileExpanded ? 'bg-surface border-b border-border/50' : 'bg-surface/80'}`}>
+        <button
+          type="button"
+          onClick={() => {
+            const next = !fileExpanded
+            setFileExpanded(next)
+            clientLog('diff_file_expanded_toggled', {
+              filename,
+              expanded: next,
+              changeCount: realChanges.length,
+              pendingCount: pendingChanges.length,
+            }, sessionId)
+          }}
+          className="flex items-center gap-1.5 min-w-0 flex-1 text-left rounded-md -ml-1 pl-1 py-0.5 hover:bg-overlay/40 transition-colors"
+          title={fileExpanded ? 'Collapse file details' : 'Expand to review changes'}
+          aria-expanded={fileExpanded}
+        >
+          <KeyboardArrowRight
+            sx={{ fontSize: 16 }}
+            className={`text-muted flex-shrink-0 transition-transform ${fileExpanded ? 'rotate-90' : ''}`}
+          />
+          <Description sx={{ fontSize: 14 }} className="text-accent flex-shrink-0" />
+          <span className="text-[13px] font-semibold text-ink truncate">{filename}</span>
+          <span className="text-[11px] text-muted/70 flex-shrink-0">
+            {realChanges.length} change{realChanges.length !== 1 ? 's' : ''}
+          </span>
+          <span className="text-[11px] font-mono flex-shrink-0 tabular-nums">
+            <span className="text-success">+{fileAddCount}</span>
+            <span className="text-muted/40 mx-0.5">/</span>
+            <span className="text-danger">-{fileRemoveCount}</span>
+          </span>
+        </button>
+
+        <div
+          className="flex items-center gap-1.5 flex-shrink-0 relative"
+          onClick={e => e.stopPropagation()}
+        >
           {Object.values(applied).some(Boolean) && (
             <button
               onClick={handleFileUndo}
@@ -1129,9 +1225,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             </button>
           )}
 
-          {/* Version History — browse & restore ANY past saved state of this
-               file, not just the last one. This is what makes "always
-               reversible" actually true. */}
           <button
             onClick={() => (showHistory ? setShowHistory(false) : openHistory())}
             className="flex items-center gap-1 px-2 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
@@ -1191,20 +1284,19 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             </div>
           )}
 
-          {/* File-level Live Preview button — on open, replicate browser refresh:
-               fetch fresh file from DB, clear stale state, force full remount */}
           {isVisualFile(filename) && (
             <button
               onClick={async () => {
                 const opening = !showFilePreview
                 if (opening) {
-                  // Replicate what browser refresh does on mount: fresh DB fetch
                   try {
                     const freshFile = await api.sessionFiles.get(sessionId, effectiveFileId)
                     if (freshFile?.content) setOriginalCode(freshFile.content)
                   } catch {}
                   setModifiedCode(undefined)
                   setPreviewKey(k => k + 1)
+                  setFileExpanded(true)
+                  clientLog('diff_file_preview_opened', { filename, fileId: effectiveFileId }, sessionId)
                 }
                 setShowFilePreview(opening)
               }}
@@ -1215,231 +1307,230 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
               {showFilePreview ? 'Hide Preview' : 'Preview'}
             </button>
           )}
-          {allApplied && (
-            <span className="flex items-center gap-1.5 text-[12px] text-success font-semibold">
+
+          {allApplied ? (
+            <span className="flex items-center gap-1.5 text-[12px] text-success font-semibold px-1">
               <CheckCircle sx={{ fontSize: 13 }} /> All applied
             </span>
-          )}
-        </div>
-      </div>
-
-      {/* File-level Live Preview — one preview for the entire file */}
-      {isVisualFile(filename) && showFilePreview && (
-        <div className="border-t border-border">
-          <LivePreview
-            key={previewKey}
-            code={originalCode || '// Loading...'}
-            filename={filename}
-            modifiedCode={modifiedCode}
-            sessionId={sessionId}
-            fileId={effectiveFileId}
-          />
-        </div>
-      )}
-
-      {/* ── Change rows ─────────────────────────────────────────────────── */}
-      {realChanges.map((change: any, idx: number) => {
-        const isBlocked = change.qa_result?.verdict === 'blocked'
-        const isApplied = applied[change.id]
-        const isSkipped = !isApplied && skipped[change.id]
-        const isChecked = checked[change.id] && !isBlocked && !isSkipped
-        const isExpanded = diffExpanded[change.id]
-
-        const addCount = (change.diff || '').split('\n')
-          .filter((l: string) => l.startsWith('+') && !l.startsWith('+++')).length
-        const removeCount = (change.diff || '').split('\n')
-          .filter((l: string) => l.startsWith('-') && !l.startsWith('---')).length
-
-        return (
-          <div key={change.id} className={`border-t border-border/60`}>
-            {/* Row header — this IS the apply decision row */}
-            <div className={`flex items-center gap-3 px-4 py-3 ${isApplied ? 'bg-success/5' : 'bg-base/60'}`}>
-
-              {/* Checkbox OR applied checkmark */}
-              <div className="flex-shrink-0 w-5 flex items-center justify-center">
-                {isApplied ? (
-                  <CheckCircle sx={{ fontSize: 16 }} className="text-success" />
-                ) : (
-                  <input
-                    type="checkbox"
-                    checked={isChecked}
-                    disabled={isBlocked}
-                    onChange={() => toggleCheck(change.id)}
-                    className="w-4 h-4 cursor-pointer accent-emerald-500 disabled:opacity-40"
-                    title={isBlocked ? 'Blocked by QA — cannot apply' : isChecked ? 'Uncheck to skip this change' : 'Check to include this change'}
-                  />
-                )}
-              </div>
-
-              {/* Number badge */}
-              <span className="w-5 h-5 flex items-center justify-center text-[11px] font-bold bg-accent/15 text-accent rounded-full flex-shrink-0">
-                {idx + 1}
-              </span>
-
-              {/* Symbol name + description */}
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  <code className="text-[12px] text-accent font-mono truncate max-w-[180px]">
-                    {change.symbol?.full_path || change.symbol?.name || 'unknown'}
-                  </code>
-                  {change.symbol?.start_line && (
-                    <span className="text-[10px] px-1.5 py-0.5 bg-accent/10 text-accent border border-accent/20 rounded font-mono">
-                      L{change.symbol.start_line}
-                      {change.symbol.end_line && change.symbol.end_line !== change.symbol.start_line
-                        ? `–${change.symbol.end_line}` : ''}
-                    </span>
-                  )}
-                </div>
-                <p className="text-[12px] text-muted mt-0.5 truncate">{change.description}</p>
-              </div>
-
-              {/* Stats + badges */}
-              <div className="flex items-center gap-1.5 flex-shrink-0 flex-wrap justify-end">
-                <span className="text-[11px] font-mono">
-                  <span className="text-success">+{addCount}</span>
-                  <span className="text-muted/40 mx-0.5">/</span>
-                  <span className="text-danger">-{removeCount}</span>
-                </span>
-                <ConfidenceBadge change={change} />
-                {change.qa_result && <QABadge qa={change.qa_result} />}
-                {change.qa_result && <BlastRadius change={{ qa: change.qa_result }} />}
-                {change.confidence < 7 && !isBlocked && (
-                  <span className="flex items-center gap-1 text-[10px] text-warning">
-                    <Warning sx={{ fontSize: 10 }} /> Review
-                  </span>
-                )}
-              </div>
-
-              {/* Right controls: Skipped badge + Undo (if applied) + Preview button + Diff toggle */}
-              <div className="flex items-center gap-1.5 flex-shrink-0">
-                {isSkipped && !isApplied && (
-                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-muted/20 text-muted/70 text-[10px] font-semibold border border-border/50">
-                    <Cancel sx={{ fontSize: 9 }} /> Skipped
-                  </span>
-                )}
-                {/* Per-change Undo removed — Undo is file-level (see file header
-                     above) since the backend reverts the whole file's most
-                     recent saved state, not an individual row. Use the file
-                     header's Undo/History controls instead. */}
-
-                {/* Retry with QA (trace 414dfaef): automates the manual
-                    copy-paste-the-QA-report workflow that reliably fixed a
-                    2/10 -> 9/10 case. Only shown once every automatic retry
-                    round is exhausted and the change is still genuinely
-                    blocked — routine warnings/borderline scores don't need
-                    it. Disabled mid-stream so it can't double-fire. */}
-                {change.qa_result?.hard_blocked && onRetryWithQA && (
-                  <button
-                    onClick={() => {
-                      const reportText = buildQARetryReportText(fileData.filename || filename, change)
-                      onRetryWithQA(reportText)
-                      toast.success('Sent the QA report back — asking for another fix...')
-                    }}
-                    className="flex items-center gap-1 px-2.5 py-1 bg-danger/10 text-danger border border-danger/40 rounded-lg text-[11px] font-semibold hover:bg-danger/20 transition-colors animate-pulse"
-                    title="Send this failed QA report back to the agent for another fix — the same thing as pasting it into chat yourself"
-                  >
-                    <Replay sx={{ fontSize: 12 }} />
-                    <span>Retry with QA</span>
-                  </button>
-                )}
-
-                <button
-                  onClick={() => toggleDiff(change.id)}
-                  className="flex items-center gap-1 px-2.5 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
-                  title={isExpanded ? 'Collapse diff' : 'View diff'}
-                >
-                  {isExpanded ? <KeyboardArrowUp sx={{ fontSize: 12 }} /> : <KeyboardArrowDown sx={{ fontSize: 12 }} />}
-                  <span>Diff</span>
-                </button>
-              </div>
-            </div>
-
-
-
-            {/* Expandable diff — only shown when toggled */}
-            {isExpanded && (
-              <div className="border-t border-border">
-                <div className="flex items-center gap-2 px-4 py-1.5 bg-base border-b border-border/60">
-                  <span className="text-[11px] font-semibold uppercase tracking-wide text-muted/70">Diff Preview</span>
-                  {(() => {
-                    const startLine = parseDiffStartLine(change.diff || '')
-                    return startLine ? (
-                      <span className="text-[10px] text-accent/70 font-mono">@ line {startLine}</span>
-                    ) : null
-                  })()}
-                  <span className="text-[10px] text-faint ml-auto">
-                    <span className="text-success">+{addCount}</span>
-                    {' · '}
-                    <span className="text-danger">-{removeCount}</span>
-                  </span>
-                </div>
-                <div className="bg-base max-h-96 overflow-y-auto">
-                  <DiffBlock diff={change.diff || ''} language={langFromFilename} />
-                </div>
-              </div>
-            )}
-          </div>
-        )
-      })}
-
-      {/* ── Action bar — download always visible, apply/skip only when pending ── */}
-      <div className="flex flex-col gap-2 px-4 py-3 bg-surface/60 border-t border-border rounded-b-xl">
-        {applying && applyProgress && (
-          <ApplyProgressStrip progress={applyProgress} startedAt={applyStartedAt} />
-        )}
-        <div className="flex items-center gap-2">
-        {/* Download — always available */}
-        <button
-          onClick={handleDownload}
-          disabled={applying}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors disabled:opacity-40"
-          title="Download file with changes applied"
-        >
-          <FileDownload sx={{ fontSize: 12 }} /> Download
-        </button>
-
-        {!allApplied && (
-          <div className="ml-auto flex items-center gap-2">
-            {/* Skip all = uncheck all pending */}
-            {selectedChanges.length > 0 && (
-              <button
-                onClick={skipAll}
-                disabled={applying}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors disabled:opacity-40"
-                title="Uncheck all pending changes"
-              >
-                <Cancel sx={{ fontSize: 12 }} /> Skip All
-              </button>
-            )}
-
-            {/* Apply Selected */}
+          ) : (
             <button
               onClick={handleApplySelected}
               data-apply-btn
               disabled={selectedChanges.length === 0 || applying}
-              className="flex items-center gap-1.5 px-4 py-1.5 bg-success/15 text-success border border-success/30 rounded-lg text-[12px] font-semibold hover:bg-success/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-              title={selectedChanges.length === 0 ? 'No changes selected — check at least one above' : `Apply ${selectedChanges.length} selected change${selectedChanges.length !== 1 ? 's' : ''}`}
+              className="flex items-center gap-1 px-2.5 py-1 bg-success/15 text-success border border-success/30 rounded-lg text-[11px] font-semibold hover:bg-success/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              title={selectedChanges.length === 0 ? 'No changes selected — expand to review checkboxes' : `Apply ${selectedChanges.length} selected change${selectedChanges.length !== 1 ? 's' : ''}`}
             >
               <CheckCircle sx={{ fontSize: 12 }} />
               {applying
-                ? (applyProgress?.label || 'Applying...')
+                ? (applyProgress?.label || 'Applying…')
                 : selectedChanges.length === 0
-                  ? 'Nothing selected'
-                  : `Apply Selected (${selectedChanges.length})`
-              }
+                  ? 'Apply'
+                  : `Apply ${selectedChanges.length}`}
             </button>
-          </div>
-        )}
+          )}
         </div>
       </div>
+
+      {applying && applyProgress && (
+        <div className="px-3 pb-2 border-t border-border/40 bg-surface/60">
+          <ApplyProgressStrip progress={applyProgress} startedAt={applyStartedAt} />
+        </div>
+      )}
+
+      {fileExpanded && (
+        <>
+          {isVisualFile(filename) && showFilePreview && (
+            <div className="border-t border-border">
+              <LivePreview
+                key={previewKey}
+                code={originalCode || '// Loading...'}
+                filename={filename}
+                modifiedCode={modifiedCode}
+                sessionId={sessionId}
+                fileId={effectiveFileId}
+              />
+            </div>
+          )}
+
+          {realChanges.map((change: any, idx: number) => {
+            const isBlocked = change.qa_result?.verdict === 'blocked'
+            const isApplied = applied[change.id]
+            const isSkipped = !isApplied && skipped[change.id]
+            const isChecked = checked[change.id] && !isBlocked && !isSkipped
+            const isExpanded = diffExpanded[change.id]
+
+            const addCount = (change.diff || '').split('\n')
+              .filter((l: string) => l.startsWith('+') && !l.startsWith('+++')).length
+            const removeCount = (change.diff || '').split('\n')
+              .filter((l: string) => l.startsWith('-') && !l.startsWith('---')).length
+
+            return (
+              <div key={change.id} className={`border-t border-border/60`}>
+                <div className={`flex items-center gap-3 px-4 py-3 ${isApplied ? 'bg-success/5' : 'bg-base/60'}`}>
+                  <div className="flex-shrink-0 w-5 flex items-center justify-center">
+                    {isApplied ? (
+                      <CheckCircle sx={{ fontSize: 16 }} className="text-success" />
+                    ) : (
+                      <input
+                        type="checkbox"
+                        checked={isChecked}
+                        disabled={isBlocked}
+                        onChange={() => toggleCheck(change.id)}
+                        className="w-4 h-4 cursor-pointer accent-emerald-500 disabled:opacity-40"
+                        title={isBlocked ? 'Blocked by QA — cannot apply' : isChecked ? 'Uncheck to skip this change' : 'Check to include this change'}
+                      />
+                    )}
+                  </div>
+
+                  <span className="w-5 h-5 flex items-center justify-center text-[11px] font-bold bg-accent/15 text-accent rounded-full flex-shrink-0">
+                    {idx + 1}
+                  </span>
+
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-1.5 flex-wrap">
+                      <code className="text-[12px] text-accent font-mono truncate max-w-[180px]">
+                        {change.symbol?.full_path || change.symbol?.name || 'unknown'}
+                      </code>
+                      {change.symbol?.start_line && (
+                        <span className="text-[10px] px-1.5 py-0.5 bg-accent/10 text-accent border border-accent/20 rounded font-mono">
+                          L{change.symbol.start_line}
+                          {change.symbol.end_line && change.symbol.end_line !== change.symbol.start_line
+                            ? `–${change.symbol.end_line}` : ''}
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[12px] text-muted mt-0.5 truncate">{change.description}</p>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 flex-shrink-0 flex-wrap justify-end">
+                    <span className="text-[11px] font-mono">
+                      <span className="text-success">+{addCount}</span>
+                      <span className="text-muted/40 mx-0.5">/</span>
+                      <span className="text-danger">-{removeCount}</span>
+                    </span>
+                    <ConfidenceBadge change={change} />
+                    {change.qa_result && <QABadge qa={change.qa_result} />}
+                    {change.qa_result && <BlastRadius change={{ qa: change.qa_result }} />}
+                    {change.confidence < 7 && !isBlocked && (
+                      <span className="flex items-center gap-1 text-[10px] text-warning">
+                        <Warning sx={{ fontSize: 10 }} /> Review
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex items-center gap-1.5 flex-shrink-0">
+                    {isSkipped && !isApplied && (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-muted/20 text-muted/70 text-[10px] font-semibold border border-border/50">
+                        <Cancel sx={{ fontSize: 9 }} /> Skipped
+                      </span>
+                    )}
+                    {change.qa_result?.hard_blocked && onRetryWithQA && (
+                      <button
+                        onClick={() => {
+                          const reportText = buildQARetryReportText(fileData.filename || filename, change)
+                          onRetryWithQA(reportText)
+                          toast.success('Sent the QA report back — asking for another fix...')
+                        }}
+                        className="flex items-center gap-1 px-2.5 py-1 bg-danger/10 text-danger border border-danger/40 rounded-lg text-[11px] font-semibold hover:bg-danger/20 transition-colors animate-pulse"
+                        title="Send this failed QA report back to the agent for another fix — the same thing as pasting it into chat yourself"
+                      >
+                        <Replay sx={{ fontSize: 12 }} />
+                        <span>Retry with QA</span>
+                      </button>
+                    )}
+
+                    <button
+                      onClick={() => toggleDiff(change.id)}
+                      className="flex items-center gap-1 px-2.5 py-1 bg-surface text-muted border border-border rounded-lg text-[11px] font-semibold hover:bg-overlay hover:text-ink transition-colors"
+                      title={isExpanded ? 'Collapse diff' : 'View diff'}
+                    >
+                      {isExpanded ? <KeyboardArrowUp sx={{ fontSize: 12 }} /> : <KeyboardArrowDown sx={{ fontSize: 12 }} />}
+                      <span>Diff</span>
+                    </button>
+                  </div>
+                </div>
+
+                {isExpanded && (
+                  <div className="border-t border-border">
+                    <div className="flex items-center gap-2 px-4 py-1.5 bg-base border-b border-border/60">
+                      <span className="text-[11px] font-semibold uppercase tracking-wide text-muted/70">Diff Preview</span>
+                      {(() => {
+                        const startLine = parseDiffStartLine(change.diff || '')
+                        return startLine ? (
+                          <span className="text-[10px] text-accent/70 font-mono">@ line {startLine}</span>
+                        ) : null
+                      })()}
+                      <span className="text-[10px] text-faint ml-auto">
+                        <span className="text-success">+{addCount}</span>
+                        {' · '}
+                        <span className="text-danger">-{removeCount}</span>
+                      </span>
+                    </div>
+                    <div className="bg-base max-h-96 overflow-y-auto">
+                      <DiffBlock diff={change.diff || ''} language={langFromFilename} />
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+
+          <div className="flex flex-col gap-2 px-4 py-3 bg-surface/60 border-t border-border">
+            <div className="flex items-center gap-2">
+            <button
+              onClick={handleDownload}
+              disabled={applying}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors disabled:opacity-40"
+              title="Download file with changes applied"
+            >
+              <FileDownload sx={{ fontSize: 12 }} /> Download
+            </button>
+
+            {!allApplied && (
+              <div className="ml-auto flex items-center gap-2">
+                {selectedChanges.length > 0 && (
+                  <button
+                    onClick={skipAll}
+                    disabled={applying}
+                    className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors disabled:opacity-40"
+                    title="Uncheck all pending changes"
+                  >
+                    <Cancel sx={{ fontSize: 12 }} /> Skip All
+                  </button>
+                )}
+
+                <button
+                  onClick={handleApplySelected}
+                  data-apply-btn
+                  disabled={selectedChanges.length === 0 || applying}
+                  className="flex items-center gap-1.5 px-4 py-1.5 bg-success/15 text-success border border-success/30 rounded-lg text-[12px] font-semibold hover:bg-success/25 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  title={selectedChanges.length === 0 ? 'No changes selected — check at least one above' : `Apply ${selectedChanges.length} selected change${selectedChanges.length !== 1 ? 's' : ''}`}
+                >
+                  <CheckCircle sx={{ fontSize: 12 }} />
+                  {applying
+                    ? (applyProgress?.label || 'Applying...')
+                    : selectedChanges.length === 0
+                      ? 'Nothing selected'
+                      : `Apply Selected (${selectedChanges.length})`
+                  }
+                </button>
+              </div>
+            )}
+            </div>
+          </div>
+        </>
+      )}
     </div>
   )
 }
 
 export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA }: Props) {
   const [showTestRunner, setShowTestRunner] = useState(false)
+  const [detailsOpen, setDetailsOpen] = useState(false)
+  const [risksOpen, setRisksOpen] = useState(false)
   const fileEntries = Object.entries(result.changes_by_file)
   const totalChanges = fileEntries.reduce((sum, [, v]) => sum + v.changes.length, 0)
+  const fileCount = fileEntries.length
 
   // Track how many changes have been applied to hide the risks alert
   const [appliedCount, setAppliedCount] = useState(0)
@@ -1447,16 +1538,38 @@ export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA }: 
 
   return (
     <div className="mt-2">
-      {/* Summary header */}
-      <div className="flex items-center gap-2 mb-3 pb-2 border-b border-border/50">
-        <span className="text-sm font-semibold text-ink">✂️ {result.summary || `${totalChanges} change${totalChanges !== 1 ? 's' : ''} ready`}</span>
+      {/* Dense one-line result strip — reasoning is opt-in; risks have their own toggle */}
+      <div className="flex items-center gap-2 mb-2 min-w-0">
+        <span className="text-[13px] font-semibold text-ink truncate min-w-0">
+          {result.summary || `${totalChanges} change${totalChanges !== 1 ? 's' : ''} ready`}
+        </span>
+        <span className="text-[11px] text-muted/70 flex-shrink-0 tabular-nums">
+          {fileCount} file{fileCount !== 1 ? 's' : ''} · {totalChanges} change{totalChanges !== 1 ? 's' : ''}
+        </span>
+        {result.reasoning && (
+          <button
+            type="button"
+            onClick={() => {
+              const next = !detailsOpen
+              setDetailsOpen(next)
+              clientLog('diff_result_details_toggled', {
+                open: next,
+                fileCount,
+                totalChanges,
+              }, sessionId)
+            }}
+            className="ml-auto flex-shrink-0 text-[11px] text-muted hover:text-ink font-semibold px-1.5 py-0.5 rounded border border-border/60 hover:bg-overlay transition-colors"
+          >
+            {detailsOpen ? 'Hide details' : 'Details'}
+          </button>
+        )}
       </div>
 
-      {result.reasoning && (
-        <p className="text-[12px] text-muted/70 mb-3 italic">{result.reasoning}</p>
+      {detailsOpen && result.reasoning && (
+        <p className="text-[12px] text-muted/70 mb-2 italic">{result.reasoning}</p>
       )}
 
-      {/* Per-file cards */}
+      {/* Per-file cards — each collapsed by default */}
       {fileEntries.map(([filename, fileData]) => (
         <FileChangeCard
           key={filename}
@@ -1540,17 +1653,32 @@ export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA }: 
         }
         return (
           <div className={`mt-2 px-3 py-2 bg-warning/10 border border-warning/25 rounded-lg transition-opacity duration-300 ${allApplied ? 'hidden' : ''}`}>
-            <div className="flex items-center gap-2 mb-1.5">
+            <button
+              type="button"
+              onClick={() => {
+                const next = !risksOpen
+                setRisksOpen(next)
+                clientLog('diff_risks_toggled', {
+                  open: next,
+                  riskCount: result.risks.length,
+                }, sessionId)
+              }}
+              className="w-full flex items-center gap-2 text-left"
+            >
               <Warning sx={{ fontSize: 13 }} className="text-warning flex-shrink-0" />
-              <span className="text-[12px] font-semibold text-warning">
+              <span className="text-[12px] font-semibold text-warning flex-1">
                 {hasVerdicts
                   ? allResolved
                     ? `✅ All ${result.risks.length} risks reviewed — safe to apply`
                     : `Risks: ${resolvedCount}/${result.risks.length} verified safe`
-                  : `Risks:`}
+                  : `${result.risks.length} risk${result.risks.length !== 1 ? 's' : ''}`}
               </span>
-            </div>
-            <ul className="space-y-1.5 list-none">
+              <span className={`text-[10px] text-warning/80 transition-transform inline-flex ${risksOpen ? 'rotate-90' : ''}`}>
+                <KeyboardArrowRight sx={{ fontSize: 14 }} />
+              </span>
+            </button>
+            {risksOpen && (
+            <ul className="space-y-1.5 list-none mt-1.5">
               {result.risks.map((r: string, i: number) => {
                 const verdict = allVerdicts[r]
                 return (
@@ -1573,6 +1701,7 @@ export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA }: 
                 )
               })}
             </ul>
+            )}
           </div>
         )
       })()}
