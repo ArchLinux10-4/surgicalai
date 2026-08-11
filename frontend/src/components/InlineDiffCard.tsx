@@ -11,7 +11,10 @@ import { LivePreview, isVisualFile } from './LivePreview'
 import { useAppStore } from '../stores/appStore'
 import { recordDiffStats, revertDiffStats } from '../lib/fileClassify'
 import { acquireApplyLock, releaseApplyLock } from '../lib/fileApplyLock'
-import { Cancel, CheckCircle, Close, Description, FileDownload, History, KeyboardArrowDown, KeyboardArrowUp, Replay, SkipNext, Visibility, Warning } from '@mui/icons-material';
+import { Cancel, CheckCircle, Close, Description, FileDownload, History, KeyboardArrowDown, KeyboardArrowUp, Replay, SkipNext, Visibility, Warning } from '@mui/icons-material'
+import { ApplyProgressStrip } from './ApplyProgressStrip'
+import type { ApplyProgress } from '../lib/applyProgress'
+import { applyStageLabel } from '../lib/applyProgress';
 interface Props {
   result: SmartResult
   sessionId: string
@@ -637,6 +640,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     sessionFilesForId.find(f => f.filename === (fileData.filename || filename))?.id ||
     ''
   const [applying, setApplying] = useState(false)
+  const [applyProgress, setApplyProgress] = useState<ApplyProgress | null>(null)
+  const [applyStartedAt, setApplyStartedAt] = useState(0)
   const [undoing, setUndoing] = useState<Record<string, boolean>>({})
   const [applied, setApplied] = useState<Record<string, boolean>>(() =>
     loadApplied(sessionId, changeIds)
@@ -754,11 +759,24 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       toast.error('This file is being applied elsewhere right now — please wait a moment and try again')
       return
     }
+    const n = selectedChanges.length
+    const started = Date.now()
+    setApplyStartedAt(started)
     setApplying(true)
+    setApplyProgress({
+      stage: 'reading',
+      label: applyStageLabel('reading'),
+      detail: `Reading ${filename}…`,
+    })
     try {
       const fileData2 = await api.sessionFiles.get(sessionId, effectiveFileId)
       if (!originalCode) setOriginalCode(fileData2.content)
 
+      setApplyProgress({
+        stage: 'applying',
+        label: applyStageLabel('applying'),
+        detail: `Applying ${n} change${n !== 1 ? 's' : ''} to ${filename}…`,
+      })
       let result: any
       if (selectedChanges.length === 1) {
         result = await api.surgical.apply({
@@ -777,6 +795,11 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       const newContent = result.modified_content || ''
       if (newContent) {
         try {
+          setApplyProgress({
+            stage: 'saving',
+            label: applyStageLabel('saving'),
+            detail: `Saving updated ${filename}…`,
+          })
           const changeLabel = selectedChanges.length === 1
             ? `Applied: ${selectedChanges[0]?.symbol?.full_path || selectedChanges[0]?.symbol?.name || 'change'}`
             : `Applied ${selectedChanges.length} changes`
@@ -785,6 +808,11 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           // Re-fetch originalCode from DB — replicates what page refresh does on mount.
           // This ensures the next round of edits starts from the true DB state.
           try {
+            setApplyProgress({
+              stage: 'syncing',
+              label: applyStageLabel('syncing'),
+              detail: `Refreshing ${filename} from session…`,
+            })
             const freshFile = await api.sessionFiles.get(sessionId, effectiveFileId)
             if (freshFile?.content) {
               setOriginalCode(freshFile.content)
@@ -831,6 +859,11 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       setModifiedCode(undefined)  // clear so LivePreview falls back to originalCode (fresh from DB)
       setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
       onApplied?.(filename, newContent)
+      setApplyProgress({
+        stage: 'marking',
+        label: applyStageLabel('marking'),
+        detail: 'Recording applied status…',
+      })
       const markPromises: Promise<any>[] = []
       for (const change of selectedChanges) {
         // Already-applied changes are marked done too (no error, no retry
@@ -880,6 +913,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       }
     } finally {
       setApplying(false)
+      setApplyProgress(null)
       releaseApplyLock(effectiveFileId)
     }
   }
@@ -1349,11 +1383,16 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       })}
 
       {/* ── Action bar — download always visible, apply/skip only when pending ── */}
-      <div className="flex items-center gap-2 px-4 py-3 bg-surface/60 border-t border-border rounded-b-xl">
+      <div className="flex flex-col gap-2 px-4 py-3 bg-surface/60 border-t border-border rounded-b-xl">
+        {applying && applyProgress && (
+          <ApplyProgressStrip progress={applyProgress} startedAt={applyStartedAt} />
+        )}
+        <div className="flex items-center gap-2">
         {/* Download — always available */}
         <button
           onClick={handleDownload}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors"
+          disabled={applying}
+          className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors disabled:opacity-40"
           title="Download file with changes applied"
         >
           <FileDownload sx={{ fontSize: 12 }} /> Download
@@ -1365,7 +1404,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             {selectedChanges.length > 0 && (
               <button
                 onClick={skipAll}
-                className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors"
+                disabled={applying}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-surface text-muted border border-border rounded-lg text-[12px] font-semibold hover:bg-overlay transition-colors disabled:opacity-40"
                 title="Uncheck all pending changes"
               >
                 <Cancel sx={{ fontSize: 12 }} /> Skip All
@@ -1382,7 +1422,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             >
               <CheckCircle sx={{ fontSize: 12 }} />
               {applying
-                ? 'Applying...'
+                ? (applyProgress?.label || 'Applying...')
                 : selectedChanges.length === 0
                   ? 'Nothing selected'
                   : `Apply Selected (${selectedChanges.length})`
@@ -1390,6 +1430,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
             </button>
           </div>
         )}
+        </div>
       </div>
     </div>
   )
