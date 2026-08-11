@@ -127,6 +127,28 @@ def test_plan_complete_when_field_in_container():
     assert issues == []
 
 
+def test_plan_skips_prose_add_x_to_help():
+    """False-positive guard: 'Add logging to help with debugging' is not an object plan."""
+    orig = "function f(){ console.log('a') }\n"
+    new = "function f(){ console.log('a'); console.log('b') }\n"
+    issues = check_plan_completeness(
+        "Add logging to help with debugging",
+        orig, new,
+    )
+    assert issues == []
+
+
+def test_plan_skips_when_container_not_object_literal():
+    """Without Y = { … }, 'add X to Y' prose must not block JSX/prose edits."""
+    orig = "function FilterSidebar(){ return <Box/> }\n"
+    new = "function FilterSidebar(){ return <Box><TextField label='Country'/></Box> }\n"
+    issues = check_plan_completeness(
+        "Add Country text field to Location section of FilterSidebar",
+        orig, new,
+    )
+    assert issues == []
+
+
 def test_run_structural_qa_wires_change_description():
     code = "export function foo() { return 1 }\n"
     issues = run_structural_qa(
@@ -142,3 +164,5 @@ def test_pipeline_execute_task_uses_compute_helper():
     src = inspect.getsource(p._execute_single_edit)
     assert "compute_plan_execute_window" in src
     assert "capped" in src
+    assert "execute_task_mega_window_capped" in src
+    assert "plan_completeness_blocked" in inspect.getsource(p)

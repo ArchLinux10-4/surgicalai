@@ -97,9 +97,23 @@ def run_structural_qa(
     # NEW CODE identical to ORIGINAL for "add endpoints" plans. Deterministic
     # checks catch these before burning QA-retry budget.
     if change_description:
-        issues.extend(check_plan_completeness(
-            change_description, original_code, new_code
-        ))
+        try:
+            issues.extend(check_plan_completeness(
+                change_description, original_code, new_code
+            ))
+        except Exception as _pc_err:
+            # Never let plan-completeness regex/parsing blow up structural QA.
+            try:
+                from database import _dlog as _pc_dlog
+                _pc_dlog(
+                    "plan_completeness_error",
+                    filename=filename,
+                    symbol_path=symbol_path or "",
+                    error=str(_pc_err)[:300],
+                    description=(change_description or "")[:200],
+                )
+            except Exception:
+                pass
 
     return issues
 
@@ -396,6 +410,10 @@ def check_plan_completeness(
          (e.g. "insert new endpoints" with zero bytes changed).
       2. Half-implemented "add X to/in Y" plans — e.g. Country destructured
          from req.body but never written into commonData (LLM QA scored 3).
+
+    Object-literal only for (2): prose like "Add logging to help with debugging"
+    must NOT fire — we only enforce when ``Y`` exists as ``Y = {`` / ``Y: {``
+    in the edit code (the proven failure shape).
     """
     issues: List[Dict] = []
     desc = (description or "").strip()
@@ -419,6 +437,16 @@ def check_plan_completeness(
         r"\s+(?:to|into|in|on|inside|within)\s+"
         r"[`'\"]?([A-Za-z_][\w]*)[`'\"]?"
     )
+    _CONTAINER_SKIP = {
+        "code", "file", "function", "component", "handler", "response",
+        "request", "the", "this", "that", "order", "place",
+        # English / prose containers — never object bindings
+        "help", "support", "ensure", "make", "see", "allow", "prevent",
+        "improve", "fix", "debug", "debugging", "user", "users",
+        "ui", "page", "section", "form", "screen", "view", "panel",
+        "sidebar", "modal", "button", "input", "field", "fields",
+        "api", "db", "database", "server", "client", "app", "project",
+    }
     seen = set()
     for m in pair_re.finditer(desc):
         field, container = m.group(1), m.group(2)
@@ -428,27 +456,22 @@ def check_plan_completeness(
         seen.add(key)
         if len(field) < 2 or len(container) < 2:
             continue
-        if container.lower() in {
-            "code", "file", "function", "component", "handler", "response",
-            "request", "the", "this", "that", "order", "place",
-        }:
+        if container.lower() in _CONTAINER_SKIP or field.lower() in _CONTAINER_SKIP:
             continue
 
-        # Prefer object-block membership when container looks like an object
-        # binding (commonData, cleanedData, props, state, …). Fall back to
-        # proximity only when no object literal exists for that name.
+        # Only enforce when container is a real object literal in the edit.
+        # Co-occurrence fallback was dropped after FP: "Add logging to help …".
         orig_has_obj = bool(re.search(
             rf"(?<![A-Za-z0-9_]){re.escape(container)}\s*[=:]\s*\{{", orig
         ))
         new_has_obj = bool(re.search(
             rf"(?<![A-Za-z0-9_]){re.escape(container)}\s*[=:]\s*\{{", new
         ))
-        if orig_has_obj or new_has_obj:
-            had = _field_in_object_block(orig, container, field)
-            has = _field_in_object_block(new, container, field)
-        else:
-            had = _tokens_cooccur(orig, container, field)
-            has = _tokens_cooccur(new, container, field)
+        if not (orig_has_obj or new_has_obj):
+            continue
+
+        had = _field_in_object_block(orig, container, field)
+        has = _field_in_object_block(new, container, field)
 
         if had and not has:
             issues.append(_error(

@@ -545,8 +545,9 @@ def compute_plan_execute_window(
 ) -> dict:
     """Compute a plan-execute display window for one symbol.
 
-    Returns ``{ws, we, reason, capped, symbol_lines}`` where ``ws``/``we`` are
-    0-indexed inclusive start / exclusive end into ``file_lines``.
+    Returns ``{ws, we, reason, capped, symbol_lines, center_line, terms,
+    term_hit}`` where ``ws``/``we`` are 0-indexed inclusive start / exclusive
+    end into ``file_lines``.
 
     Small symbols (≤ max_window lines): full symbol + edge_padding (legacy).
     Mega symbols: ≤ max_window lines centered on the densest match of
@@ -565,6 +566,9 @@ def compute_plan_execute_window(
         "reason": "full_file_fallback",
         "capped": False,
         "symbol_lines": symbol_lines,
+        "center_line": ss + symbol_lines // 2,
+        "terms": [],
+        "term_hit": False,
     }
     if total <= 0:
         return out
@@ -573,7 +577,10 @@ def compute_plan_execute_window(
     if symbol_lines <= max_window:
         ws = max(0, ss - 1 - edge_padding)
         we = min(total, se + edge_padding)
-        out.update(ws=ws, we=we, reason="full_symbol", capped=False)
+        out.update(
+            ws=ws, we=we, reason="full_symbol", capped=False,
+            center_line=ss + symbol_lines // 2,
+        )
         return out
 
     # Mega-symbol: score lines inside the symbol by description terms.
@@ -588,15 +595,18 @@ def compute_plan_execute_window(
             terms.append(tl)
 
     best_line = ss + symbol_lines // 2  # 1-indexed default: middle of symbol
+    term_hit = False
     if terms:
-        best_score = -1
         # Prefer densest local cluster via a sliding 40-line score inside symbol.
-        span = min(40, symbol_lines)
+        span = min(40, max(1, symbol_lines))
         scores = [0] * symbol_lines
         for i, abs_i in enumerate(range(ss - 1, min(se, total))):
+            if i >= symbol_lines:
+                break
             ll = (file_lines[abs_i] if abs_i < total else "").lower()
             scores[i] = sum(1 for t in terms if t in ll)
         if any(scores):
+            term_hit = True
             cur = sum(scores[:span])
             best_score = cur
             best_off = 0
@@ -621,7 +631,10 @@ def compute_plan_execute_window(
         # Center fell outside (shouldn't) — clamp to symbol start
         ws = sym_ws
         we = min(total, ws + max_window)
-    out.update(ws=ws, we=we, reason="mega_symbol_term_focus", capped=True)
+    out.update(
+        ws=ws, we=we, reason="mega_symbol_term_focus", capped=True,
+        center_line=best_line, terms=terms[:12], term_hit=term_hit,
+    )
     return out
 
 
@@ -16171,12 +16184,33 @@ async def _execute_single_edit(
             # MongoRecordManager (819L) caused truncated/duplicated bodies.
             # Cap mega-symbols to PLAN_EXECUTE_MAX_WINDOW, centered on the
             # change-description terms inside the symbol.
-            _win = compute_plan_execute_window(
-                file_lines,
-                target_sym.start_line,
-                target_sym.end_line,
-                change_description=change_description or "",
-            )
+            _padding = 50
+            try:
+                _win = compute_plan_execute_window(
+                    file_lines,
+                    target_sym.start_line,
+                    target_sym.end_line,
+                    change_description=change_description or "",
+                )
+            except Exception as _win_err:
+                # Fail soft to legacy full-symbol+pad — never abort execute.
+                _ss = max(1, int(getattr(target_sym, "start_line", 1) or 1))
+                _se = max(_ss, int(getattr(target_sym, "end_line", _ss) or _ss))
+                ws = max(0, _ss - 1 - _padding)
+                we = min(file_line_count, _se + _padding)
+                _win = {
+                    "ws": ws, "we": we, "capped": False,
+                    "reason": "compute_error_fallback",
+                    "symbol_lines": _se - _ss + 1,
+                    "center_line": _ss + (_se - _ss) // 2,
+                    "terms": [], "term_hit": False,
+                }
+                _dlog("execute_task_window_compute_error",
+                      session_id=session_id, user_id=user_id,
+                      filename=filename, symbol=symbol_name,
+                      error=str(_win_err)[:300],
+                      symbol_start=_ss, symbol_end=_se,
+                      fallback_ws=ws + 1, fallback_we=we)
             ws = int(_win["ws"])
             we = int(_win["we"])
             window_parts = []
@@ -16203,11 +16237,25 @@ async def _execute_single_edit(
                   filename=filename, symbol=symbol_name,
                   total_lines=file_line_count,
                   window_start=ws + 1, window_end=we,
+                  window_lines=we - ws,
                   symbol_start=target_sym.start_line,
                   symbol_end=target_sym.end_line,
                   symbol_lines=_win.get("symbol_lines"),
                   capped=bool(_win.get("capped")),
-                  window_reason=_win.get("reason"))
+                  window_reason=_win.get("reason"),
+                  center_line=_win.get("center_line"),
+                  term_hit=bool(_win.get("term_hit")),
+                  terms=(_win.get("terms") or [])[:12],
+                  description=(change_description or "")[:200])
+            if _win.get("capped"):
+                _dlog("execute_task_mega_window_capped",
+                      session_id=session_id, user_id=user_id,
+                      filename=filename, symbol=symbol_name,
+                      symbol_lines=_win.get("symbol_lines"),
+                      window_lines=we - ws,
+                      center_line=_win.get("center_line"),
+                      term_hit=bool(_win.get("term_hit")),
+                      terms=(_win.get("terms") or [])[:12])
         else:
             # Symbol not found in map — show full content as fallback
             file_display = file_content
@@ -22360,12 +22408,28 @@ async def run_natural_pipeline_stream(
                           symbol=_sq_cs["symbol"].name,
                           blocking_count=len(_sq_msgs),
                           messages=[m[:300] for m in _sq_msgs],
-                          all_issues=[{"severity": si["severity"],
+                          all_issues=[{"check": si.get("check"),
+                                       "severity": si["severity"],
                                        "message": si["message"][:300]}
                                       for si in _sq_issues],
                           prior_llm_verdict=qa_results[_sq_i].get("verdict"),
                           prior_llm_score=qa_results[_sq_i].get("qa_score"),
                           user_id=user_id)
+                    # Dedicated plan-completeness signal (session 3a6150e9) —
+                    # easy grep when half-done plan edits trip the gate.
+                    _plan_hits = [
+                        si for si in _sq_issues
+                        if (si.get("check") or "").startswith("plan_")
+                    ]
+                    if _plan_hits:
+                        _dlog("plan_completeness_blocked",
+                              session_id=session_id,
+                              filename=_sq_fname,
+                              symbol=_sq_cs["symbol"].name,
+                              checks=[si.get("check") for si in _plan_hits],
+                              messages=[si["message"][:300] for si in _plan_hits],
+                              description=(_sq_cs.get("description") or "")[:200],
+                              user_id=user_id)
                     qa_results[_sq_i]["import_issues"] = (
                         qa_results[_sq_i].get("import_issues", []) + _sq_msgs
                     )
