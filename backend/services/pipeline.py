@@ -6596,6 +6596,80 @@ def compose_symbol_edits(orig_full: str, edits: list, apply_fn):
     return composed, applied
 
 
+def attribute_tsc_errors_to_indices(
+    composed: str,
+    applied_new_codes: list,
+    errors: list,
+) -> dict:
+    """Map composed-file tsc error lines → applied edit indices that own them.
+
+    ``applied_new_codes``: list of ``(idx, new_code)`` for edits that landed
+    in ``composed`` (order does not matter). Returns ``{idx: [error, ...]}``
+    covering every error — unattributable lines attach to the nearest symbol
+    by line distance (never silently dropped).
+
+    WHY (session 3a6150e9 / marketrates-ai): pre_check composed MongoRecordManager
+    edits then force-blocked EVERY index when 8 syntactic errors appeared.
+    EMPTY_CRITERIA / BATCH_UPDATE_FIELDS / buildQuery had LLM QA
+    verdict=safe score=10 ("exactly as planned") and were overwritten to
+    blocked/3 with ``tsc: 8 compile error(s)`` prefix — poisoning the retry
+    loop into no-op corrections (``corrected_code_identical_to_original``)
+    while the real breakage lived in FilterSidebar / RightEditDrawer /
+    MongoRecordManager mega-symbol regions. Keep composed tsc (6930f196) but
+    only mark the owning edit(s) blocked.
+    """
+    if not errors:
+        return {}
+    ranges = []  # (start, end, idx) 1-indexed inclusive lines in composed
+    for item in applied_new_codes or []:
+        if not isinstance(item, (tuple, list)) or len(item) < 2:
+            continue
+        idx, new_code = item[0], item[1]
+        if not isinstance(new_code, str) or not new_code:
+            continue
+        pos = composed.find(new_code)
+        if pos < 0:
+            continue
+        start = composed.count("\n", 0, pos) + 1
+        end = start + new_code.count("\n")
+        ranges.append((start, end, idx))
+    by_idx: dict = {}
+    if not ranges:
+        # Cannot locate any applied body — preserve prior safety: all callers
+        # must blanket-block when attribution returns empty with non-empty errs.
+        return {}
+
+    def _nearest_idx(line: int) -> int:
+        def _dist(r):
+            s, e, _i = r
+            if s <= line <= e:
+                return 0
+            return min(abs(line - s), abs(line - e))
+        return min(ranges, key=_dist)[2]
+
+    for err in errors:
+        try:
+            line = int(err.get("line"))
+        except (TypeError, ValueError):
+            line = None
+        if line is None:
+            owner = ranges[0][2]
+        else:
+            owners = [i for s, e, i in ranges if s <= line <= e]
+            if not owners:
+                owner = _nearest_idx(line)
+            elif len(owners) == 1:
+                owner = owners[0]
+            else:
+                # Nested / overlapping symbols — pick the tightest span.
+                owner = min(
+                    owners,
+                    key=lambda i: next(e - s for s, e, j in ranges if j == i),
+                )
+        by_idx.setdefault(owner, []).append(err)
+    return by_idx
+
+
 def diff_introduced_errors(orig_errs: list, new_errs: list) -> list:
     """
     Return errors in ``new_errs`` not accounted for by ``orig_errs``,
@@ -22215,11 +22289,11 @@ async def run_natural_pipeline_stream(
         # used for QA/structural issues — no parallel loop.
         async def _tsc_file_introduced_errors(fname, idx_list, orig_cache, phase):
             if not fname.lower().endswith((".ts", ".tsx", ".js", ".jsx")):
-                return []
+                return [], {}
             try:
                 from services.linter_validator import validate_linters as _vl
             except Exception:
-                return []
+                return [], {}
             orig_full = change_shells[idx_list[0]]["file_content"]
             _edit_pairs = []
             for _ci in idx_list:
@@ -22236,14 +22310,14 @@ async def run_natural_pipeline_stream(
             composed, applied_idxs = await asyncio.to_thread(
                 compose_symbol_edits, orig_full, _edit_pairs, _apply_change_fn)
             if not applied_idxs or composed == orig_full:
-                return []
+                return [], {}
             try:
                 if fname not in orig_cache:
                     orig_cache[fname] = await asyncio.to_thread(_vl, orig_full, fname)
                 _orig_errs = orig_cache[fname]
                 _new_errs = await asyncio.to_thread(_vl, composed, fname)
             except Exception:
-                return []
+                return [], {}
             _introduced_all = diff_introduced_errors(_orig_errs, _new_errs)
             # ── Long-term structural fix (session 6930f196 round 2) ───────────
             # An ISOLATED single-file compile has no module graph (no
@@ -22266,6 +22340,13 @@ async def run_natural_pipeline_stream(
                            if _tk(e.get("code", ""), e.get("kind")) == "syntactic"]
             _advisory_semantic = [e for e in _introduced_all
                                   if _tk(e.get("code", ""), e.get("kind")) != "syntactic"]
+            # Session 3a6150e9: attribute each introduced error to the composed
+            # edit whose new_code spans that line — do NOT blanket-block siblings.
+            _applied_new = [
+                (_ai, change_shells[_ai].get("new_code") or "")
+                for _ai in applied_idxs
+            ]
+            _by_idx = attribute_tsc_errors_to_indices(composed, _applied_new, _introduced)
             # Session 6930f196: the actual TS error messages never reached the
             # debug log — only the count did — making root-cause impossible
             # from logs alone. Always log the full introduced-error list, split
@@ -22278,6 +22359,11 @@ async def run_natural_pipeline_stream(
                   skipped_indices=[i for i in idx_list if i not in applied_idxs],
                   introduced_count=len(_introduced),
                   advisory_semantic_count=len(_advisory_semantic),
+                  attributed={
+                      change_shells[i]["symbol"].name: len(errs)
+                      for i, errs in _by_idx.items()
+                      if isinstance(i, int) and 0 <= i < len(change_shells)
+                  },
                   introduced=[{"code": e.get("code", ""),
                                "kind": e.get("kind"),
                                "line": e.get("line"),
@@ -22288,7 +22374,7 @@ async def run_natural_pipeline_stream(
                                       "line": e.get("line"),
                                       "message": (e.get("message", "") or "")[:300]}
                                      for e in _advisory_semantic])
-            return _introduced
+            return _introduced, _by_idx
 
         def _force_block_on_tsc(_idx, _errs, _suffix):
             _msgs = [
@@ -22339,17 +22425,25 @@ async def run_natural_pipeline_stream(
         for _tfname, _tidxs in _tsc_pre_groups.items():
             if _qa_over_budget:
                 break
-            _t_introduced = await _tsc_file_introduced_errors(
+            _t_introduced, _t_by_idx = await _tsc_file_introduced_errors(
                 _tfname, _tidxs, _tsc_orig_cache, "pre_check")
             _tsc_round_best[_tfname] = len(_t_introduced)
             _dlog("tsc_round_baseline_seeded", session_id=session_id, user_id=user_id,
                   filename=_tfname, baseline_introduced_count=len(_t_introduced))
             if _t_introduced:
-                for _ti in _tidxs:
-                    _force_block_on_tsc(_ti, _t_introduced, "")
+                # Session 3a6150e9: only force-block owning indices. Fall back
+                # to full composed set only when attribution could not place
+                # any error (preserve prior safety net).
+                _block_map = _t_by_idx if _t_by_idx else {
+                    _ti: _t_introduced for _ti in _tidxs
+                }
+                for _ti, _errs in _block_map.items():
+                    if _errs:
+                        _force_block_on_tsc(_ti, _errs, "")
                 yield sse({"type": "progress",
                            "content": f"🔧 tsc found {len(_t_introduced)} compile error(s) in "
-                                      f"{_tfname} ({len(_tidxs)} edit(s) composed) — will auto-fix"})
+                                      f"{_tfname} ({len(_block_map)} of {len(_tidxs)} "
+                                      f"edit(s) owning) — will auto-fix"})
 
         # ── QA retry loop — fix blocked changes before showing to user ────────
         # Triggers on verdict=="blocked" OR score<=5 with hard issues.
@@ -25275,14 +25369,15 @@ async def run_natural_pipeline_stream(
                 _ridxs = _tsc_pre_groups.get(_rfname, [])
                 if not _ridxs:
                     continue
-                _r_introduced = await _tsc_file_introduced_errors(
+                _r_introduced, _r_by_idx = await _tsc_file_introduced_errors(
                     _rfname, _ridxs, _tsc_round_cache, f"round_{_qa_retry_round}_check")
                 _prev_best = _tsc_round_best.get(_rfname, 0)
                 _new_count = len(_r_introduced)
                 _dlog("qa_retry_round_tsc_check", session_id=session_id, user_id=user_id,
                       retry_round=_qa_retry_round, filename=_rfname,
                       prev_best_introduced=_prev_best, this_round_introduced=_new_count,
-                      regressed=(_new_count > _prev_best))
+                      regressed=(_new_count > _prev_best),
+                      attributed_owners=list((_r_by_idx or {}).keys()))
                 if _new_count > _prev_best:
                     _rolled_back = []
                     for _ri in _ridxs:
@@ -25494,15 +25589,21 @@ async def run_natural_pipeline_stream(
         for _ti, _tcs in enumerate(change_shells):
             _tsc_final_groups.setdefault(_tcs["filename"], []).append(_ti)
         for _tfname, _tidxs in _tsc_final_groups.items():
-            _t_introduced = await _tsc_file_introduced_errors(
+            _t_introduced, _t_by_idx = await _tsc_file_introduced_errors(
                 _tfname, _tidxs, _tsc_final_cache, "final_gate")
             if _t_introduced:
-                for _ti in _tidxs:
-                    _force_block_on_tsc(_ti, _t_introduced, " remain after auto-fix")
+                _block_map = _t_by_idx if _t_by_idx else {
+                    _ti: _t_introduced for _ti in _tidxs
+                }
+                for _ti, _errs in _block_map.items():
+                    if _errs:
+                        _force_block_on_tsc(_ti, _errs, " remain after auto-fix")
                 yield sse({"type": "progress",
                            "content": f"🔴 tsc check: {_tfname} still has "
                                       f"{len(_t_introduced)} compile error(s) after composing "
-                                      f"{len(_tidxs)} edit(s) — shipping with a QA warning, review before applying"})
+                                      f"{len(_tidxs)} edit(s) "
+                                      f"({len(_block_map)} owning) — shipping with a QA warning, "
+                                      f"review before applying"})
 
         # ── Grok-only second QA pass — final accuracy round ────────────────
         # Grok 4.5 diffs still slipped through the standard QA with subtler

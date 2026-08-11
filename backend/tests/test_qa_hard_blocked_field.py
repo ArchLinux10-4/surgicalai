@@ -76,14 +76,17 @@ def test_force_block_on_tsc_only_hard_blocks_on_final_gate_suffix():
 
 def test_pre_check_call_passes_empty_suffix_final_gate_passes_nonempty():
     src = _pipeline_src()
-    assert '_force_block_on_tsc(_ti, _t_introduced, "")' in src, (
+    # Session 3a6150e9: pre_check / final_gate force-block ONLY attributed
+    # owners (or fall back to full set). Suffix contract is unchanged.
+    assert '_force_block_on_tsc(_ti, _errs, "")' in src, (
         "pre_check call to _force_block_on_tsc must pass an empty suffix "
         "(never hard_blocked -- the retry loop hasn't even run yet)"
     )
-    assert '_force_block_on_tsc(_ti, _t_introduced, " remain after auto-fix")' in src, (
+    assert '_force_block_on_tsc(_ti, _errs, " remain after auto-fix")' in src, (
         "final gate call must pass a non-empty suffix so surviving errors "
         "are marked hard_blocked"
     )
+    assert "attribute_tsc_errors_to_indices" in src
 
 
 def test_advisory_block_marks_genuine_blocked_verdict_hard_blocked():
