@@ -3,7 +3,7 @@
  * Mirrors ChatPanel.tsx logic exactly — same API calls, same store, same streaming.
  * Render layer is completely separate: no shared JSX with desktop ChatPanel.
  */
-import React, { useState, useRef, useEffect, useCallback } from 'react'
+import React, { useState, useRef, useEffect, useCallback, memo } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAppStore } from '../../stores/appStore'
@@ -36,6 +36,8 @@ function ProgressSteps({ steps }: { steps: string[] }) {
 }
 
 // ── Streaming bubble ─────────────────────────────────────────────────────────
+// Plain text while streaming (no ReactMarkdown per token — major mobile jank).
+// Completed history bubbles still markdown on finalize.
 function StreamingBubble({ text, progress, isBuildingEdit }: {
   text: string; progress: string; isBuildingEdit: boolean
 }) {
@@ -58,8 +60,8 @@ function StreamingBubble({ text, progress, isBuildingEdit }: {
           </div>
         )}
         {text && (
-          <div className="text-sm text-ink leading-relaxed prose-mobile">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+          <div className="text-sm text-ink leading-relaxed whitespace-pre-wrap break-words">
+            {text}
           </div>
         )}
         {!text && !isBuildingEdit && (
@@ -105,7 +107,7 @@ function CompactMarkerChip({ msg }: { msg: any }) {
 }
 
 // ── Message bubble ────────────────────────────────────────────────────────────
-function MessageBubble({ msg, sessionId, sessionFiles, setSessionFiles }: {
+function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
   msg: any; sessionId: string
   sessionFiles: SessionFile[]; setSessionFiles: (f: SessionFile[]) => void
 }) {
@@ -170,6 +172,20 @@ function MessageBubble({ msg, sessionId, sessionFiles, setSessionFiles }: {
     </div>
   )
 }
+
+const MessageBubble = memo(MessageBubbleImpl, (prev, next) => (
+  prev.msg.id === next.msg.id &&
+  prev.msg.content === next.msg.content &&
+  prev.msg.surgical_data === next.msg.surgical_data &&
+  prev.msg.message_type === next.msg.message_type &&
+  prev.msg._aborted === next.msg._aborted &&
+  prev.msg._steps === next.msg._steps &&
+  prev.msg.compact_summary === next.msg.compact_summary &&
+  prev.msg.compact_count === next.msg.compact_count &&
+  prev.sessionId === next.sessionId &&
+  prev.sessionFiles === next.sessionFiles &&
+  prev.setSessionFiles === next.setSessionFiles
+))
 
 // ── File chip ─────────────────────────────────────────────────────────────────
 function FileChip({ file, onRemove }: { file: SessionFile; onRemove: () => void }) {
@@ -355,12 +371,23 @@ function EmptyHomeScreen() {
 }
 
 export function MobileChatPanel() {
-  const {
-    activeSessions, setActiveSession, messages, addMessage, setMessages,
-    sessions, setSessions, settings,
-    sessionFiles, setSessionFiles,
-    setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble, setAgentPhase,
-  } = useAppStore()
+  // Scoped selectors — bare useAppStore() re-rendered the whole tree on every
+  // agentTasks poll (2.5s). Do not subscribe to agent task arrays here;
+  // AgentMissionControl owns that slice. Setters are stable.
+  const activeSessions = useAppStore(s => s.activeSessions)
+  const setActiveSession = useAppStore(s => s.setActiveSession)
+  const messages = useAppStore(s => s.messages)
+  const addMessage = useAppStore(s => s.addMessage)
+  const setSessions = useAppStore(s => s.setSessions)
+  const settings = useAppStore(s => s.settings)
+  const sessionFiles = useAppStore(s => s.sessionFiles)
+  const setSessionFiles = useAppStore(s => s.setSessionFiles)
+  const setAgentTasks = useAppStore(s => s.setAgentTasks)
+  const updateAgentTask = useAppStore(s => s.updateAgentTask)
+  const clearAgentTasks = useAppStore(s => s.clearAgentTasks)
+  const setTaskRunId = useAppStore(s => s.setTaskRunId)
+  const setTaskPreamble = useAppStore(s => s.setTaskPreamble)
+  const setAgentPhase = useAppStore(s => s.setAgentPhase)
 
   // Keep the task list in sync with the DB-backed source of truth while a run
   // is active (SSE is the instant channel; polling reconciles after drops).
@@ -370,12 +397,13 @@ export function MobileChatPanel() {
   const [isStreaming, setIsStreaming]    = useState(false)
   const [streamProgress, setProgress]   = useState('')
   const [streamingMsg, setStreamingMsg] = useState('')
-  const [progressHistory, setProgHist]  = useState<string[]>([])
   const [isBuildingEdit, setBuildEdit]  = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
   const [composeOpen, setComposeOpen]   = useState(false)
   const [error, setError]               = useState<string | null>(null)
 
+  // Progress steps for finalize/_steps only — no live React state (StreamingBubble
+  // does not paint a step history during stream).
   const progressHistoryRef = useRef<string[]>([])
   const ctrlRef            = useRef<AbortController | null>(null)
   // Bridge refs so a manual Stop (outside the streaming closure) can still see
@@ -388,6 +416,9 @@ export function MobileChatPanel() {
   // per-task execution queue can start once /smart-stream returns.
   const pendingRunRef      = useRef<{ runId: string; tasks: any[] } | null>(null)
   const bottomRef          = useRef<HTMLDivElement>(null)
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const userScrolledUpRef  = useRef(false)
+  const tokenRafRef        = useRef(0)
   const textareaRef        = useRef<HTMLTextAreaElement>(null)
 
   // ── Agent Mode toggle (multi-agent task breakdown) — shares the desktop
@@ -403,8 +434,27 @@ export function MobileChatPanel() {
   })
   const fileInputRef       = useRef<HTMLInputElement>(null)
 
-  // Scroll to bottom on new messages/streaming
+  // Smart auto-scroll: same 80px sticky-bottom gate as desktop ChatPanel.
+  // While tokens stream, use instant scroll (smooth per-token fights iOS).
   useEffect(() => {
+    const el = scrollContainerRef.current
+    if (!el) return
+    const handleScroll = () => {
+      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+      userScrolledUpRef.current = distanceFromBottom > 80
+    }
+    el.addEventListener('scroll', handleScroll, { passive: true })
+    return () => el.removeEventListener('scroll', handleScroll)
+  }, [])
+
+  useEffect(() => {
+    if (userScrolledUpRef.current) return
+    if (streamingMsg) {
+      const el = scrollContainerRef.current
+      if (el) el.scrollTop = el.scrollHeight
+      else bottomRef.current?.scrollIntoView({ behavior: 'auto' })
+      return
+    }
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages, streamingMsg])
 
@@ -441,10 +491,13 @@ export function MobileChatPanel() {
   const stopStream = useCallback(() => {
     ctrlRef.current?.abort()
     ctrlRef.current = null
+    if (tokenRafRef.current) {
+      cancelAnimationFrame(tokenRafRef.current)
+      tokenRafRef.current = 0
+    }
     setIsStreaming(false)
     setProgress('')
     setStreamingMsg('')
-    setProgHist([])
     setBuildEdit(false)
     progressHistoryRef.current = []
   }, [])
@@ -509,12 +562,15 @@ export function MobileChatPanel() {
     setIsStreaming(true)
     setProgress('Thinking...')
     setStreamingMsg('')
-    setProgHist(['Thinking...'])
     setBuildEdit(false)
     progressHistoryRef.current = ['Thinking...']
     streamingSessionIdRef.current = sessionId
     accumulatedRef.current = ''
     gotResultRef.current = false
+    if (tokenRafRef.current) {
+      cancelAnimationFrame(tokenRafRef.current)
+      tokenRafRef.current = 0
+    }
 
     let accumulated  = ''
     let gotResult    = false
@@ -592,16 +648,22 @@ export function MobileChatPanel() {
       { session_id: sessionId, message: text, file_ids: sessionFiles.map(f => f.id), force_tasks: agentModeOn() },
       (progress) => {
         setProgress(progress)
-        setProgHist(prev => {
-          if (prev[prev.length - 1] !== progress) {
-            const next = [...prev, progress]
-            progressHistoryRef.current = next
-            return next
-          }
-          return prev
-        })
+        // Ref-only: live StreamingBubble does not paint step history.
+        if (progressHistoryRef.current[progressHistoryRef.current.length - 1] !== progress) {
+          progressHistoryRef.current = [...progressHistoryRef.current, progress]
+        }
       },
-      (token) => { accumulated += token; accumulatedRef.current = accumulated; setStreamingMsg(accumulated) },
+      (token) => {
+        accumulated += token
+        accumulatedRef.current = accumulated
+        // ≤1 React update per animation frame — do not throttle in client.ts
+        if (!tokenRafRef.current) {
+          tokenRafRef.current = requestAnimationFrame(() => {
+            tokenRafRef.current = 0
+            setStreamingMsg(accumulatedRef.current)
+          })
+        }
+      },
       (result) => {
         gotResult = true
         gotResultRef.current = true
@@ -768,7 +830,7 @@ export function MobileChatPanel() {
   return (
     <div className="flex flex-col h-full bg-base">
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto">
+      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
         {messages.length === 0 && !isStreaming ? (
           <EmptyHomeScreen />
         ) : (
