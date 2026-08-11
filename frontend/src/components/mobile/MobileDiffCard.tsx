@@ -8,6 +8,7 @@
 import React, { useState, useEffect } from 'react'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
+import { clientLog } from '../../lib/clientLog'
 import type { SmartResult, SessionFile } from '../../types'
 import { useAppStore } from '../../stores/appStore'
 
@@ -121,9 +122,27 @@ function FileCard({
     // Only apply QA-clean changes; QA-blocked ones must be reviewed individually.
     const applyChanges = changes.filter((c: any) => c?.qa_result?.verdict !== 'blocked')
     if (applyChanges.length === 0) {
+      clientLog('mobile_diff_apply_all_qa_blocked', {
+        filename,
+        changeCount: changes.length,
+      }, sessionId)
       toast.error('All changes here are QA-flagged — review them individually before applying')
       return
     }
+    if (!effectiveFileId) {
+      clientLog('mobile_diff_apply_missing_file_id', {
+        filename,
+        changeCount: applyChanges.length,
+      }, sessionId)
+      toast.error('Cannot apply — file id missing. Refresh the session and try again.')
+      return
+    }
+    const started = Date.now()
+    clientLog('mobile_diff_apply_started', {
+      filename,
+      fileId: effectiveFileId,
+      changeCount: applyChanges.length,
+    }, sessionId)
     setApplying(true)
     try {
       const current = await api.sessionFiles.get(sessionId, effectiveFileId)
@@ -147,6 +166,13 @@ function FileCard({
       }
       setAppliedMap(prev => ({ ...prev, ...newApplied }))
       const flagged = changes.length - applyChanges.length
+      clientLog('mobile_diff_apply_succeeded', {
+        filename,
+        fileId: effectiveFileId,
+        okCount: applyChanges.length,
+        flaggedSkipped: flagged,
+        elapsedMs: Date.now() - started,
+      }, sessionId)
       toast.success(
         `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''} to ${filename}` +
         (flagged > 0 ? ` (${flagged} QA-flagged, skipped)` : '')
@@ -169,8 +195,19 @@ function FileCard({
           }
         }
         setAppliedMap(prev => ({ ...prev, ...newApplied }))
+        clientLog('mobile_diff_apply_already_applied_fallback', {
+          filename,
+          fileId: effectiveFileId,
+          elapsedMs: Date.now() - started,
+        }, sessionId)
         toast.success('Changes appear to already be applied ✓')
       } else {
+        clientLog('mobile_diff_apply_failed', {
+          filename,
+          fileId: effectiveFileId,
+          error: String(msg).slice(0, 240),
+          elapsedMs: Date.now() - started,
+        }, sessionId)
         toast.error(msg)
       }
     } finally {

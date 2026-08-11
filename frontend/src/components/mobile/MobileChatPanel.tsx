@@ -32,6 +32,7 @@ import { useCodeRain } from '../../hooks/useCodeRain'
 import { useThemeStore } from '../../stores/themeStore'
 import type { SessionFile, SmartResult } from '../../types'
 import { validateFileSize } from '../../utils/fileValidation'
+import { clientLog } from '../../lib/clientLog'
 
 // ── Thin progress steps component ───────────────────────────────────────────
 function ProgressSteps({ steps }: { steps: string[] }) {
@@ -159,6 +160,7 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
 }) {
   const isUser = msg.role === 'user'
   const isResult = msg.message_type === 'natural_result' || msg.message_type === 'surgical_result'
+  const [narrativeOpen, setNarrativeOpen] = useState(false)
 
   if (msg.message_type === 'compact_marker') {
     return <CompactMarkerChip msg={msg} />
@@ -195,12 +197,55 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
           <MobileThinkingBlock text={msg._thinking} isStreaming={false} />
         )}
 
-        {/* Natural text */}
-        {msg.content && (
-          <div className="text-sm text-ink leading-relaxed mb-2">
-            <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
-          </div>
-        )}
+        {/* Natural text — collapse long narratives when Apply cards are present */}
+        {msg.content && (() => {
+          const narrative = msg.content as string
+          const hasCards = Boolean(result)
+          const longNarrative = narrative.length > 280
+          const collapseNarrative = hasCards && longNarrative && !narrativeOpen
+          if (collapseNarrative) {
+            return (
+              <button
+                type="button"
+                onClick={() => {
+                  setNarrativeOpen(true)
+                  clientLog('mobile_narrative_toggled', {
+                    open: true,
+                    contentLen: narrative.length,
+                  }, sessionId)
+                }}
+                className="w-full flex items-center gap-2 px-2.5 py-1.5 mb-2 rounded-lg border border-border/50 bg-surface/40 text-left"
+              >
+                <span className="text-[12px] text-muted truncate flex-1">
+                  {narrative.replace(/\s+/g, ' ').slice(0, 100)}…
+                </span>
+                <span className="text-[11px] font-semibold text-[#4ade80] flex-shrink-0">Show</span>
+              </button>
+            )
+          }
+          return (
+            <div className="mb-2">
+              <div className="text-sm text-ink leading-relaxed">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{narrative}</ReactMarkdown>
+              </div>
+              {hasCards && longNarrative && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setNarrativeOpen(false)
+                    clientLog('mobile_narrative_toggled', {
+                      open: false,
+                      contentLen: narrative.length,
+                    }, sessionId)
+                  }}
+                  className="mt-1 text-[11px] font-semibold text-muted/70"
+                >
+                  Hide summary
+                </button>
+              )}
+            </div>
+          )
+        })()}
 
         {/* Diff card */}
         {result && (
