@@ -2291,3 +2291,263 @@ async def ws_smart_stream(websocket: WebSocket):
 async def ws_execute_task(websocket: WebSocket):
     """WebSocket transport for execute_task (see isolation contract above)."""
     await _ws_pump(websocket, execute_task, "ws/execute-task")
+
+
+# ── Anthropic credit pause / probe / resume (session cb380321) ─────────────
+# Plan→Execute can die with HTTP 400 "credit balance is too low". The pipeline
+# persists remaining plan + completed blocks + held Grok writes into
+# credit_pauses; these endpoints let the UI poll until credits work and then
+# resume WITHOUT re-running the agent loop from scratch.
+
+
+@router.get("/credit-pause/{session_id}")
+async def get_session_credit_pause(session_id: str, request: Request):
+    """Return the active credit pause for a session (if any) + live probe."""
+    from services.anthropic_billing import (
+        get_active_credit_pause,
+        credit_pause_public_view,
+        probe_anthropic_credits,
+        anthropic_credit_user_message,
+    )
+    current_user_id = getattr(request.state, "user_id", "") or ""
+    pause = get_active_credit_pause(session_id)
+    view = credit_pause_public_view(pause)
+    if not view:
+        return {"active": False, "pause": None, "credits_ok": None}
+
+    anthropic_key = _resolve_chat_key(current_user_id, "anthropic")
+    probe = await probe_anthropic_credits(
+        anthropic_key, dlog=_dlog,
+        session_id=session_id, user_id=current_user_id,
+    )
+    return {
+        "active": True,
+        "pause": view,
+        "credits_ok": bool(probe.get("ok")),
+        "probe_error": probe.get("error"),
+        "message": anthropic_credit_user_message(),
+    }
+
+
+@router.post("/credit-pause/{pause_id}/probe")
+async def probe_credit_pause(pause_id: str, request: Request):
+    """Probe Anthropic to see whether credits are available again."""
+    from services.anthropic_billing import (
+        get_credit_pause,
+        credit_pause_public_view,
+        probe_anthropic_credits,
+    )
+    current_user_id = getattr(request.state, "user_id", "") or ""
+    pause = get_credit_pause(pause_id)
+    if not pause or pause.get("status") != "paused":
+        raise HTTPException(status_code=404, detail="No active credit pause found")
+    if pause.get("user_id") and current_user_id and pause["user_id"] != current_user_id:
+        raise HTTPException(status_code=403, detail="Not your credit pause")
+
+    anthropic_key = _resolve_chat_key(current_user_id, "anthropic")
+    probe = await probe_anthropic_credits(
+        anthropic_key, dlog=_dlog,
+        session_id=pause.get("session_id") or "",
+        user_id=current_user_id,
+    )
+    return {
+        "pause": credit_pause_public_view(pause),
+        "credits_ok": bool(probe.get("ok")),
+        "probe_error": probe.get("error"),
+    }
+
+
+@router.post("/credit-pause/{pause_id}/dismiss")
+async def dismiss_credit_pause(pause_id: str, request: Request):
+    """User dismissed the credit-pause banner without resuming."""
+    from services.anthropic_billing import (
+        get_credit_pause,
+        update_credit_pause_status,
+    )
+    current_user_id = getattr(request.state, "user_id", "") or ""
+    pause = get_credit_pause(pause_id)
+    if not pause:
+        raise HTTPException(status_code=404, detail="Credit pause not found")
+    if pause.get("user_id") and current_user_id and pause["user_id"] != current_user_id:
+        raise HTTPException(status_code=403, detail="Not your credit pause")
+    update_credit_pause_status(pause_id, "dismissed", dlog=_dlog)
+    return {"ok": True}
+
+
+@router.post("/credit-pause/{pause_id}/resume")
+async def resume_credit_pause(pause_id: str, request: Request):
+    """Resume a saved plan after Anthropic credits are restored.
+
+    Streams the same SSE event types as /smart-stream. Skips the agent loop
+    and continues Plan→Execute (+ QA) from the persisted remaining plan,
+    seeding any completed edit blocks / held Grok writes so work is not lost.
+    """
+    from fastapi.responses import StreamingResponse
+    from services.pipeline import run_natural_pipeline_stream
+    from services.anthropic_billing import (
+        get_credit_pause,
+        update_credit_pause_status,
+        probe_anthropic_credits,
+        anthropic_credit_user_message,
+    )
+
+    current_user_id = getattr(request.state, "user_id", "") or ""
+    pause = get_credit_pause(pause_id)
+    if not pause or pause.get("status") != "paused":
+        raise HTTPException(status_code=404, detail="No active credit pause found")
+    if pause.get("user_id") and current_user_id and pause["user_id"] != current_user_id:
+        raise HTTPException(status_code=403, detail="Not your credit pause")
+
+    session_id = pause.get("session_id") or ""
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Credit pause has no session_id")
+
+    anthropic_key = _resolve_chat_key(current_user_id, "anthropic")
+    probe = await probe_anthropic_credits(
+        anthropic_key, dlog=_dlog,
+        session_id=session_id, user_id=current_user_id,
+    )
+    if not probe.get("ok"):
+        raise HTTPException(
+            status_code=402,
+            detail=probe.get("error") or anthropic_credit_user_message(),
+        )
+
+    remaining = pause.get("remaining_plan") or []
+    held = pause.get("held_grok_writes") or []
+    completed = pause.get("completed_edit_blocks") or []
+    if not remaining and not held and not completed:
+        raise HTTPException(status_code=400, detail="Credit pause has nothing to resume")
+
+    with get_db_ctx() as conn:
+        sess_row = conn.execute(
+            "SELECT session_summary FROM chat_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        session_summary = (
+            (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "")
+            or ""
+        )
+        history = conn.execute(
+            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
+            "AND content NOT LIKE ? ORDER BY created_at ASC",
+            (session_id, "__COMPACTION_EVENT__:%"),
+        ).fetchall()
+        conversation_history = [
+            {"role": r["role"], "content": r["content"]} for r in history
+        ]
+        file_rows = conn.execute(
+            "SELECT id, filename, content, language, lines, symbol_count, "
+            "file_type, created_at, updated_at FROM session_files "
+            "WHERE session_id = ? ORDER BY created_at ASC",
+            (session_id,),
+        ).fetchall()
+        session_files = [dict(r) for r in file_rows]
+        project_memory = _load_effective_memory(conn, session_id)
+        conn.commit()
+
+    if not session_files:
+        raise HTTPException(status_code=400, detail="Session has no files to resume against")
+
+    user_request = pause.get("user_request") or "Resume saved planned edits."
+    update_credit_pause_status(pause_id, "resuming", dlog=_dlog)
+    _dlog("credit_pause_resume_started", session_id=session_id,
+          user_id=current_user_id, pause_id=pause_id,
+          remaining=len(remaining), held=len(held), completed=len(completed))
+
+    async def stream_resume():
+        import json as _json
+        collected_tokens = []
+        result_content = None
+        _resolved_model = ""
+        _ok = False
+        try:
+            async for chunk in _with_heartbeat(run_natural_pipeline_stream(
+                session_files=session_files,
+                user_request=user_request,
+                conversation_history=conversation_history,
+                session_id=session_id,
+                project_memory=project_memory,
+                session_summary=session_summary,
+                user_id=current_user_id,
+                client_inbox=getattr(request.state, "client_inbox", None),
+                forced_edit_plan=remaining or [],
+                resume_completed_edit_blocks=completed,
+                resume_completed_new_file_blocks=pause.get("completed_new_file_blocks") or [],
+                resume_held_grok_writes=held,
+                resume_file_content_snapshot=pause.get("file_content_snapshot") or {},
+                resume_pause_id=pause_id,
+            )):
+                if chunk.startswith("data: "):
+                    try:
+                        data = _json.loads(chunk[6:])
+                        chunk_type = data.get("type", "")
+                        if chunk_type in ("token", "chat"):
+                            collected_tokens.append(data.get("content", ""))
+                        elif chunk_type == "smart_result":
+                            result_content = data.get("content", "")
+                            # Only count as success if we actually produced edits
+                            # (credit_paused smart_result is a soft failure).
+                            try:
+                                _parsed_sr = _json.loads(result_content)
+                                if _parsed_sr.get("credit_paused"):
+                                    _ok = False
+                                elif _parsed_sr.get("changes_by_file") or _parsed_sr.get("new_files"):
+                                    _ok = True
+                                else:
+                                    _ok = not bool(_parsed_sr.get("skipped_changes"))
+                            except Exception:
+                                _ok = True
+                        elif chunk_type == "credit_paused":
+                            _ok = False
+                        elif chunk_type in ("done", "error"):
+                            _resolved_model = data.get("model") or _resolved_model
+                            if chunk_type == "done" and result_content:
+                                pass  # _ok already decided from smart_result
+                            elif chunk_type == "done" and not result_content:
+                                _ok = True
+                    except Exception:
+                        pass
+                yield chunk
+
+            # Persist assistant turn (mirrors smart-stream's natural+result save)
+            natural_text = "".join(collected_tokens).strip()
+            with get_db_ctx() as db:
+                resp_id = str(uuid.uuid4())
+                if result_content:
+                    try:
+                        _res_obj = _json.loads(result_content)
+                    except Exception:
+                        _res_obj = {"raw": result_content}
+                    content = (
+                        f"__NATURAL_AND_RESULT__:"
+                        f"{_json.dumps({'natural': natural_text, 'result': _res_obj})}"
+                    )
+                else:
+                    content = natural_text or "(credit-pause resume finished)"
+                db.execute(
+                    "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+                    (resp_id, session_id, "assistant", content),
+                )
+                db.commit()
+        except Exception as e:
+            _dlog("credit_pause_resume_error", session_id=session_id,
+                  user_id=current_user_id, pause_id=pause_id, error=str(e)[:300])
+            _ok = False
+            yield f"data: {_json.dumps({'type': 'error', 'content': str(e)[:300]})}\n\n"
+        finally:
+            update_credit_pause_status(
+                pause_id, "completed" if _ok else "paused", dlog=_dlog)
+            _dlog("credit_pause_resume_finished", session_id=session_id,
+                  user_id=current_user_id, pause_id=pause_id, ok=_ok,
+                  model=_resolved_model)
+
+    return StreamingResponse(
+        stream_resume(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )

@@ -198,6 +198,12 @@ class GrokPlanGate:
         self._force_plan_next = False
         self._force_attempts = 0
         self.holds = 0
+        # Last held write payloads (session cb380321): plan-exec can die on
+        # Anthropic credit exhaustion AFTER we force a plan; keeping the
+        # Grok writes lets credit-pause resume re-apply them without
+        # re-calling Claude for symbols Grok already edited.
+        self.last_held_edit_json_strings: list = []
+        self.last_held_new_file_json_strings: list = []
 
         _log(dlog, "grok_plan_gate_init", session_id=session_id, user_id=user_id,
              active=self.active, mode=self.mode, compound=self.compound,
@@ -265,6 +271,9 @@ class GrokPlanGate:
             newfiles = list(getattr(tr, "new_file_json_strings", []) or [])
             if (edits or newfiles) and not self.plan_captured:
                 held = len(edits) + len(newfiles)
+                # Persist copies BEFORE clearing — credit-pause resume needs them.
+                self.last_held_edit_json_strings = list(edits)
+                self.last_held_new_file_json_strings = list(newfiles)
                 tr.edit_json_strings = []
                 tr.new_file_json_strings = []
                 self._force_plan_next = True
@@ -276,7 +285,9 @@ class GrokPlanGate:
                     "the request; the steps are then implemented for you.")
                 _log(self._dlog, "grok_plan_gate_hold_writes", turn=turn,
                      session_id=self._session_id, user_id=self._user_id,
-                     held_writes=held, total_holds=self.holds)
+                     held_writes=held, total_holds=self.holds,
+                     stashed_edits=len(self.last_held_edit_json_strings),
+                     stashed_new_files=len(self.last_held_new_file_json_strings))
                 return True
             return False
         except Exception as e:  # pragma: no cover - defensive

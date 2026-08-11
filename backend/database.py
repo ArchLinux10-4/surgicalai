@@ -583,6 +583,31 @@ def _init_sqlite():
         )
     """)
 
+    # credit_pauses — Anthropic credit exhaustion pause/resume (session cb380321).
+    # Stores remaining plan + already-produced edit blocks + held Grok writes
+    # so a run can resume when console credits are topped up.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS credit_pauses (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            user_id TEXT DEFAULT '',
+            status TEXT DEFAULT 'paused',
+            user_request TEXT DEFAULT '',
+            remaining_plan_json TEXT DEFAULT '[]',
+            completed_edit_blocks_json TEXT DEFAULT '[]',
+            completed_new_file_blocks_json TEXT DEFAULT '[]',
+            held_grok_writes_json TEXT DEFAULT '[]',
+            file_content_snapshot_json TEXT DEFAULT '{}',
+            error_message TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_credit_pauses_session "
+        "ON credit_pauses(session_id, status)"
+    )
+
     # github_app_installations — one row per (user, installation). A user can
     # have multiple installations (e.g. personal account + one or more orgs).
     # permission_tier gates write access at the API layer (routers/github_app.py)
@@ -902,6 +927,28 @@ def _init_postgres():
         conn.execute("""
             CREATE INDEX IF NOT EXISTS idx_debug_events_session
             ON debug_events(session_id)
+        """)
+        # credit_pauses — Anthropic credit exhaustion pause/resume (session cb380321)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS credit_pauses (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                user_id TEXT DEFAULT '',
+                status TEXT DEFAULT 'paused',
+                user_request TEXT DEFAULT '',
+                remaining_plan_json TEXT DEFAULT '[]',
+                completed_edit_blocks_json TEXT DEFAULT '[]',
+                completed_new_file_blocks_json TEXT DEFAULT '[]',
+                held_grok_writes_json TEXT DEFAULT '[]',
+                file_content_snapshot_json TEXT DEFAULT '{}',
+                error_message TEXT DEFAULT '',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_credit_pauses_session
+            ON credit_pauses(session_id, status)
         """)
         # github_app_installations — one row per (user, installation). A user can
         # have multiple installations (e.g. personal account + one or more orgs).

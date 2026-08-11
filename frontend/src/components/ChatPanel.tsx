@@ -1129,6 +1129,26 @@ export function ChatPanel() {
   const [isBuildingEdit, setIsBuildingEdit] = useState(false)
   const [isComposerExpanded, setIsComposerExpanded] = useState(false)
 
+  // Holds an interrupted run detected on session load (pending tasks, none
+  // running) — rendered as a Resume banner above the Mission Control panel.
+  // Declared early: the session-switch effect below clears it.
+  const [resumableRun, setResumableRun] = useState<{ sid: string; runId: string; tasks: any[] } | null>(null)
+
+  // Anthropic credit-pause (session cb380321): remaining plan + held writes
+  // are persisted server-side; poll until credits_ok, then enable Resume.
+  // Declared early: the session-switch + poll effects below read these.
+  const [creditPause, setCreditPause] = useState<{
+    sid: string
+    pauseId: string
+    remainingCount: number
+    completedEditCount: number
+    heldWriteCount: number
+    message: string
+    creditsOk: boolean
+    probing: boolean
+  } | null>(null)
+  const creditPausePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
   // Consume pending input injected from sidebar components (e.g. deploy watcher "Ask Claude to fix")
   useEffect(() => {
     if (pendingChatInput) {
@@ -1369,6 +1389,11 @@ export function ChatPanel() {
   useEffect(() => {
     // Concurrent sessions: no abort on switch — streams continue in background
     setResumableRun(null)  // stale banner never survives a session switch
+    setCreditPause(null)
+    if (creditPausePollRef.current) {
+      clearInterval(creditPausePollRef.current)
+      creditPausePollRef.current = null
+    }
     // Reset local display state so stale flags from the previous session don't
     // bleed into the new one (e.g. isCompacting disabling input permanently)
     setIsThinking(false)
@@ -1383,6 +1408,23 @@ export function ChatPanel() {
     if (activeSessions) {
       api.sessionFiles.list(activeSessions)
         .then(files => setSessionFiles(files))
+        .catch(() => {})
+      // Rehydrate any active Anthropic credit-pause for this session.
+      api.chat.getCreditPause(activeSessions)
+        .then((resp) => {
+          if (!resp?.active || !resp.pause?.pause_id) return
+          if (useAppStore.getState().activeSessions !== activeSessions) return
+          setCreditPause({
+            sid: activeSessions,
+            pauseId: resp.pause.pause_id,
+            remainingCount: resp.pause.remaining_count || 0,
+            completedEditCount: resp.pause.completed_edit_count || 0,
+            heldWriteCount: resp.pause.held_write_count || 0,
+            message: resp.message || resp.pause.message || 'Anthropic credits exhausted — progress saved.',
+            creditsOk: !!resp.credits_ok,
+            probing: false,
+          })
+        })
         .catch(() => {})
       // Reconcile the agentic task list: only show tasks for ACTIVE runs.
       // Completed runs are historical — their results are already in the chat
@@ -1428,6 +1470,39 @@ export function ChatPanel() {
     }
   }, [activeSessions])
 
+  // Poll Anthropic until credits restore; only then enable the Resume button.
+  useEffect(() => {
+    if (creditPausePollRef.current) {
+      clearInterval(creditPausePollRef.current)
+      creditPausePollRef.current = null
+    }
+    if (!creditPause || creditPause.creditsOk) return
+    const pauseId = creditPause.pauseId
+    const sid = creditPause.sid
+    const tick = () => {
+      setCreditPause(prev => (prev && prev.pauseId === pauseId ? { ...prev, probing: true } : prev))
+      api.chat.probeCreditPause(pauseId)
+        .then((resp) => {
+          if (useAppStore.getState().activeSessions !== sid) return
+          setCreditPause(prev => {
+            if (!prev || prev.pauseId !== pauseId) return prev
+            return { ...prev, creditsOk: !!resp.credits_ok, probing: false }
+          })
+        })
+        .catch(() => {
+          setCreditPause(prev => (prev && prev.pauseId === pauseId ? { ...prev, probing: false } : prev))
+        })
+    }
+    tick()
+    creditPausePollRef.current = setInterval(tick, 15000)
+    return () => {
+      if (creditPausePollRef.current) {
+        clearInterval(creditPausePollRef.current)
+        creditPausePollRef.current = null
+      }
+    }
+  }, [creditPause?.pauseId, creditPause?.creditsOk, creditPause?.sid])
+
   // Keyboard shortcuts
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -1463,10 +1538,6 @@ export function ChatPanel() {
   // /smart-stream ends right after planning. We then run each task in its
   // own short-lived SSE stream, sequentially, so no single connection can
   // hit the proxy/process timeout that previously killed long runs.
-
-  // Holds an interrupted run detected on session load (pending tasks, none
-  // running) — rendered as a Resume banner above the Mission Control panel.
-  const [resumableRun, setResumableRun] = useState<{ sid: string; runId: string; tasks: any[] } | null>(null)
 
   const addTaskResultCard = (sid: string, result: any) => {
     const naturalText = (result.natural_text || '')
@@ -1598,6 +1669,98 @@ export function ChatPanel() {
     // Server runner (when enabled) also handles resume — /runs/start simply
     // executes whatever is still pending. Non-ok → client queue, as always.
     startServerRun(sid, runId, tasks)
+  }
+
+  const dismissCreditPause = () => {
+    if (!creditPause) return
+    const { pauseId } = creditPause
+    api.chat.dismissCreditPause(pauseId).catch(() => {})
+    setCreditPause(null)
+  }
+
+  const resumeCreditPause = () => {
+    if (!creditPause || isStreaming || !creditPause.creditsOk) return
+    const { sid, pauseId } = creditPause
+    if (useAppStore.getState().activeSessions !== sid) { setCreditPause(null); return }
+    setError(null)
+    setSessionStreaming(sid, true)
+    setSessionStreamProgress(sid, 'Resuming saved edits…')
+    setSessionStreamingMessage(sid, '')
+    setProgressHistory(['Resuming saved edits…'])
+    progressHistoryRef.current = ['Resuming saved edits…']
+    setThinkingText('')
+    thinkingTextRef.current = ''
+    setIsThinking(false)
+    let gotResult = false
+    let accumulated = ''
+    const ctrl = api.chat.resumeCreditPause(
+      pauseId,
+      (msg) => {
+        if (useAppStore.getState().activeSessions !== sid) return
+        setSessionStreamProgress(sid, msg)
+        setProgressHistory(prev => {
+          const next = prev[prev.length - 1] === msg ? prev : [...prev, msg]
+          progressHistoryRef.current = next
+          return next
+        })
+      },
+      (token) => {
+        if (useAppStore.getState().activeSessions !== sid) return
+        accumulated += token
+        setSessionStreamingMessage(sid, accumulated)
+      },
+      (result) => {
+        gotResult = true
+        if (result?.credit_paused) {
+          setCreditPause(prev => prev ? { ...prev, creditsOk: false } : prev)
+          return
+        }
+        const naturalText = (result.natural_text || '')
+          .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
+          .replace(/<new_file>[\s\S]*$/, '')
+          .trim()
+        addMessage({
+          id: Date.now().toString() + '_credit_resume',
+          session_id: sid,
+          role: 'assistant',
+          message_type: naturalText ? 'natural_result' : 'surgical_result',
+          surgical_data: JSON.stringify(result),
+          content: naturalText,
+          created_at: new Date().toISOString(),
+          _model: result._model || 'N/A',
+        } as any)
+        api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
+        setCreditPause(null)
+      },
+      (_full, _model) => {
+        clearSessionStream(sid)
+        if (!gotResult) {
+          api.chat.getMessages(sid).then(saved => {
+            if (useAppStore.getState().activeSessions === sid && saved?.length) setMessages(saved)
+          }).catch(() => {})
+        }
+        abortMapRef.current.delete(sid)
+      },
+      (err) => {
+        if (useAppStore.getState().activeSessions === sid) setError(err)
+        clearSessionStream(sid)
+        abortMapRef.current.delete(sid)
+      },
+      (info) => {
+        if (!info?.pause_id) return
+        setCreditPause({
+          sid,
+          pauseId: info.pause_id,
+          remainingCount: info.remaining_count || 0,
+          completedEditCount: info.completed_edit_count || 0,
+          heldWriteCount: info.held_write_count || 0,
+          message: info.message || 'Anthropic credits exhausted — progress saved.',
+          creditsOk: false,
+          probing: false,
+        })
+      },
+    )
+    abortMapRef.current.set(sid, ctrl)
   }
 
   // ── v2.0 server-side task runner ──────────────────────────────────────
@@ -1919,6 +2082,22 @@ export function ChatPanel() {
       (sources) => {
         webSearchSourcesRef.current = sources
         clientLog('web_search_done_sources', { sourceCount: sources?.length || 0 }, sessionId)
+      },
+      // onCreditPaused — Anthropic balance hit zero mid plan_execute; work saved.
+      (info) => {
+        if (useAppStore.getState().activeSessions !== sessionId) return
+        const pauseId = info?.pause_id
+        if (!pauseId) return
+        setCreditPause({
+          sid: sessionId,
+          pauseId,
+          remainingCount: info.remaining_count || 0,
+          completedEditCount: info.completed_edit_count || 0,
+          heldWriteCount: info.held_write_count || 0,
+          message: info.message || 'Anthropic credits exhausted — progress saved.',
+          creditsOk: false,
+          probing: false,
+        })
       },
     )
     abortMapRef.current.set(sessionId, ctrl)
@@ -2531,6 +2710,40 @@ export function ChatPanel() {
                   >
                     Dismiss
                   </button>
+                </div>
+              </div>
+            )}
+            {creditPause && creditPause.sid === activeSessions && !isStreaming && (
+              <div className="mx-3 mb-2 rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-2.5 animate-slide-up">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-[12px] font-semibold text-ink">
+                      Anthropic credits exhausted — progress saved
+                    </div>
+                    <p className="mt-1 text-[11px] text-muted leading-snug">
+                      {creditPause.remainingCount} plan step{creditPause.remainingCount === 1 ? '' : 's'} waiting
+                      {creditPause.completedEditCount > 0 ? ` · ${creditPause.completedEditCount} edit(s) already done` : ''}
+                      {creditPause.heldWriteCount > 0 ? ` · ${creditPause.heldWriteCount} Grok write(s) saved` : ''}
+                      . Add credits at console.anthropic.com, then Resume.
+                      {creditPause.probing ? ' Checking balance…' : creditPause.creditsOk ? ' Credits detected — ready to resume.' : ' Waiting for credits…'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      onClick={resumeCreditPause}
+                      disabled={!creditPause.creditsOk || isStreaming}
+                      className="text-[11px] font-semibold px-2.5 py-1 rounded-lg text-accent bg-accent/10 border border-accent/20 hover:bg-accent/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                      title={creditPause.creditsOk ? 'Resume saved plan' : 'Waiting until Anthropic credits are available'}
+                    >
+                      Resume
+                    </button>
+                    <button
+                      onClick={dismissCreditPause}
+                      className="text-[11px] font-medium px-2 py-1 rounded-lg text-muted hover:bg-overlay/60 transition-colors"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
                 </div>
               </div>
             )}
