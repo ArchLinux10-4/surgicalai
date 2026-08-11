@@ -577,6 +577,8 @@ export const api = {
       onDone: () => void,
       onError: (err: string) => void,
       onTask: (event: any) => void,
+      // Anthropic credit exhaustion mid agent task (parity with smart()).
+      onCreditPaused?: (info: any) => void,
     ): AbortController => {
       const controller = new AbortController()
       let doneCalled = false
@@ -590,6 +592,14 @@ export const api = {
           if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
           else if (chunk.type === 'done') fireDone()
           else if (chunk.type === 'error') onError(chunk.content)
+          else if (chunk.type === 'credit_paused') {
+            const info = (chunk.content && typeof chunk.content === 'object')
+              ? chunk.content
+              : (typeof chunk.content === 'string'
+                  ? (() => { try { return JSON.parse(chunk.content) } catch { return { message: chunk.content } } })()
+                  : chunk)
+            onCreditPaused?.(info)
+          }
           else if (
             chunk.type === 'task_start' || chunk.type === 'task_progress' ||
             chunk.type === 'task_thinking' ||

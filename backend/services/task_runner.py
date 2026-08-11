@@ -249,6 +249,7 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
         think_parts: list = []  # accumulated extended-thinking text for this task
         last_progress_write = 0.0
         last_thinking_write = 0.0
+        saw_credit_paused = False  # SSE event (partials may omit flag on smart_result)
         # v1.7 research checkbox — mirrors routers/chat.py's execute_task
         # branch exactly: the flag lives per-session (set by smart_stream when
         # the user checked the box), not per-task, and is read fresh on every
@@ -285,6 +286,10 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
                         collected.append(d.get("content", ""))
                     elif ct == "smart_result":
                         result_content = d.get("content", "")
+                    elif ct == "credit_paused":
+                        # Partial plan_execute may still resolve prior edits into
+                        # smart_result without credit_paused=True — capture SSE.
+                        saw_credit_paused = True
                     elif ct == "thinking":
                         # No SSE client on this path — persist the reasoning
                         # trail (throttled) so the UI's poll can show it live
@@ -341,6 +346,48 @@ async def _execute_one_task(session_id: str, run_id: str, task: dict,
                 parsed = json.loads(result_content)
             except Exception:
                 parsed = None
+
+        # Credit-pause (cb380321): do not mark done/no_edits — halt the wave.
+        # SSE or smart_result.credit_paused (zero-edit path). Keep Apply cards
+        # when plan_execute already resolved some edits before the pause.
+        if saw_credit_paused or (
+            isinstance(parsed, dict) and parsed.get("credit_paused")
+        ):
+            _cp_has_edits = False
+            if isinstance(parsed, dict):
+                for fd in (parsed.get("changes_by_file") or {}).values():
+                    if isinstance(fd, dict) and fd.get("changes"):
+                        _cp_has_edits = True
+                        break
+                if not _cp_has_edits and parsed.get("new_files"):
+                    _cp_has_edits = True
+            try:
+                if _cp_has_edits and isinstance(parsed, dict):
+                    _rp = dict(parsed)
+                    _rp["natural_text"] = natural_text
+                    _rp["credit_paused"] = True
+                    _save_task_message(session_id, natural_text, _rp,
+                                        web_search_sources=_runner_ws_sources)
+                elif natural_text:
+                    _save_task_message(session_id, natural_text, None,
+                                        web_search_sources=_runner_ws_sources)
+            except Exception as smx:
+                _dlog("runner_save_message_error", session_id=session_id,
+                      task_id=task_id, error=str(smx)[:200])
+            update_task(
+                task_id,
+                status="blocked",
+                qa_score=None,
+                verdict="credit_paused",
+                result_summary=(natural_text or "Anthropic credits exhausted mid-task")[:500],
+                thinking=("".join(think_parts))[:24000],
+            )
+            _dlog("runner_task_credit_paused", session_id=session_id, run_id=run_id,
+                  task_id=task_id, task_seq=seq + 1,
+                  duration_s=round(time.time() - t0, 1),
+                  had_applyable_edits=_cp_has_edits)
+            return "blocked"
+
         score, worst = _eval_task_result(parsed) if parsed else (None, "safe")
         try:
             _save_task_message(session_id, natural_text, parsed,
