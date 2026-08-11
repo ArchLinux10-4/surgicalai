@@ -35,6 +35,7 @@ def run_structural_qa(
     symbol_path: str = "",
     file_content: str = "",
     all_changes: Optional[List[dict]] = None,
+    change_description: str = "",
 ) -> List[Dict]:
     """
     Run all structural checks on a single change.
@@ -47,6 +48,8 @@ def run_structural_qa(
     symbol_path     : AST symbol name (e.g. "MobileChatPanel")
     file_content    : full original file content (for cross-reference checks)
     all_changes     : list of all change dicts in this batch (for cross-change checks)
+    change_description : optional plan/edit description — enables deterministic
+                         plan-completeness checks (session 3a6150e9)
 
     Returns
     -------
@@ -88,6 +91,29 @@ def run_structural_qa(
     # ── Check 8: Dead imports (imported but never used in new code) ──────
     if is_ts:
         issues.extend(_check_dead_destructured_bindings(new_code, filename))
+
+    # ── Check 9: Plan completeness (half-implemented edits) ──────────────
+    # Session 3a6150e9: Country destructured but never written to commonData;
+    # NEW CODE identical to ORIGINAL for "add endpoints" plans. Deterministic
+    # checks catch these before burning QA-retry budget.
+    if change_description:
+        try:
+            issues.extend(check_plan_completeness(
+                change_description, original_code, new_code
+            ))
+        except Exception as _pc_err:
+            # Never let plan-completeness regex/parsing blow up structural QA.
+            try:
+                from database import _dlog as _pc_dlog
+                _pc_dlog(
+                    "plan_completeness_error",
+                    filename=filename,
+                    symbol_path=symbol_path or "",
+                    error=str(_pc_err)[:300],
+                    description=(change_description or "")[:200],
+                )
+            except Exception:
+                pass
 
     return issues
 
@@ -319,6 +345,158 @@ def _check_import_depth(code: str, filename: str) -> List[Dict]:
                             f"to reach the '{sd.rstrip('/')}' directory."
                         ))
                         break
+
+    return issues
+
+
+def _tokens_cooccur(code: str, a: str, b: str, window: int = 500) -> bool:
+    """True if identifiers ``a`` and ``b`` appear within ``window`` chars."""
+    if not code or not a or not b:
+        return False
+    pat_a = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(a)}(?![A-Za-z0-9_])")
+    pat_b = re.compile(rf"(?<![A-Za-z0-9_]){re.escape(b)}(?![A-Za-z0-9_])")
+    a_pos = [m.start() for m in pat_a.finditer(code)]
+    b_pos = [m.start() for m in pat_b.finditer(code)]
+    if not a_pos or not b_pos:
+        return False
+    for ap in a_pos:
+        for bp in b_pos:
+            if abs(ap - bp) <= window:
+                return True
+    return False
+
+
+def _field_in_object_block(code: str, container: str, field: str) -> bool:
+    """True if ``field`` appears inside a ``container = { ... }`` / ``: {`` object.
+
+    Session 3a6150e9: plain proximity matched Country in ``const { Country } =
+    req.body`` next to ``commonData = { ... }`` even when Country was never
+    written into the object body — that half-implementation must fail.
+    """
+    if not code or not container or not field:
+        return False
+    for m in re.finditer(
+        rf"(?<![A-Za-z0-9_]){re.escape(container)}\s*[=:]\s*\{{",
+        code,
+    ):
+        start = m.end() - 1  # index of '{'
+        depth = 0
+        for i in range(start, len(code)):
+            ch = code[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    body = code[start : i + 1]
+                    if re.search(
+                        rf"(?<![A-Za-z0-9_]){re.escape(field)}(?![A-Za-z0-9_])",
+                        body,
+                    ):
+                        return True
+                    break
+    return False
+
+
+def check_plan_completeness(
+    description: str,
+    original_code: str,
+    new_code: str,
+) -> List[Dict]:
+    """Deterministic plan-fulfillment checks (session 3a6150e9 / marketrates).
+
+    Catches:
+      1. NEW CODE identical to ORIGINAL when a plan description was provided
+         (e.g. "insert new endpoints" with zero bytes changed).
+      2. Half-implemented "add X to/in Y" plans — e.g. Country destructured
+         from req.body but never written into commonData (LLM QA scored 3).
+
+    Object-literal only for (2): prose like "Add logging to help with debugging"
+    must NOT fire — we only enforce when ``Y`` exists as ``Y = {`` / ``Y: {``
+    in the edit code (the proven failure shape).
+    """
+    issues: List[Dict] = []
+    desc = (description or "").strip()
+    if not desc:
+        return issues
+    orig = original_code or ""
+    new = new_code or ""
+
+    if new.strip() == orig.strip():
+        issues.append(_error(
+            "plan_noop",
+            "NEW CODE is identical to ORIGINAL CODE — the change plan was not "
+            "applied. Re-emit the edit so the planned change is actually present.",
+        ))
+        return issues
+
+    pair_re = re.compile(
+        r"(?i)\b(?:add|persist|include|inject|wire|set|default)\s+"
+        r"[`'\"]?([A-Za-z_][\w]*)[`'\"]?"
+        r"(?:\s+(?:field|key|prop|property|param|parameter|value|endpoint|route))?"
+        r"\s+(?:to|into|in|on|inside|within)\s+"
+        r"[`'\"]?([A-Za-z_][\w]*)[`'\"]?"
+    )
+    _CONTAINER_SKIP = {
+        "code", "file", "function", "component", "handler", "response",
+        "request", "the", "this", "that", "order", "place",
+        # English / prose containers — never object bindings
+        "help", "support", "ensure", "make", "see", "allow", "prevent",
+        "improve", "fix", "debug", "debugging", "user", "users",
+        "ui", "page", "section", "form", "screen", "view", "panel",
+        "sidebar", "modal", "button", "input", "field", "fields",
+        "api", "db", "database", "server", "client", "app", "project",
+    }
+    seen = set()
+    for m in pair_re.finditer(desc):
+        field, container = m.group(1), m.group(2)
+        key = (field.lower(), container.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        if len(field) < 2 or len(container) < 2:
+            continue
+        if container.lower() in _CONTAINER_SKIP or field.lower() in _CONTAINER_SKIP:
+            continue
+
+        # Only enforce when container is a real object literal in the edit.
+        # Co-occurrence fallback was dropped after FP: "Add logging to help …".
+        orig_has_obj = bool(re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(container)}\s*[=:]\s*\{{", orig
+        ))
+        new_has_obj = bool(re.search(
+            rf"(?<![A-Za-z0-9_]){re.escape(container)}\s*[=:]\s*\{{", new
+        ))
+        if not (orig_has_obj or new_has_obj):
+            continue
+
+        had = _field_in_object_block(orig, container, field)
+        has = _field_in_object_block(new, container, field)
+
+        if had and not has:
+            issues.append(_error(
+                "plan_incomplete",
+                f"Plan requires `{field}` in `{container}`, but `{field}` was "
+                f"removed from `{container}` in NEW CODE.",
+            ))
+        elif not had and not has:
+            field_in_new = bool(re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(field)}(?![A-Za-z0-9_])", new
+            ))
+            if field_in_new:
+                issues.append(_error(
+                    "plan_incomplete",
+                    f"Plan requires `{field}` to be added to `{container}`, but "
+                    f"`{field}` appears in NEW CODE without being written into "
+                    f"`{container}` (half-implemented — e.g. destructured but "
+                    f"never assigned into `{container}`).",
+                ))
+            else:
+                issues.append(_error(
+                    "plan_incomplete",
+                    f"Plan requires `{field}` to be added to `{container}`, but "
+                    f"`{field}` is absent from `{container}` in NEW CODE.",
+                ))
 
     return issues
 
