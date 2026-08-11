@@ -10,6 +10,20 @@ import { useAppStore } from '../../stores/appStore'
 import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import { MobileDiffCard } from './MobileDiffCard'
+import { MobileModeSheet } from './MobileModeSheet'
+import {
+  CHAT_MODES,
+  MODE_COLOR,
+  MODE_META,
+  degradeModeForOffline,
+  isOfflineSettings,
+  readChatMode,
+  readWebResearch,
+  webResearchAvailableFor,
+  writeChatMode,
+  writeWebResearch,
+  type ChatMode,
+} from './chatMode'
 import { SessionFilesTray } from '../SessionFilesTray'
 import { AgentMissionControl } from '../AgentMissionControl'
 import { useTaskPolling } from '../../hooks/useTaskPolling'
@@ -35,11 +49,40 @@ function ProgressSteps({ steps }: { steps: string[] }) {
   )
 }
 
+/** Lightweight thinking toggle — plain text (no Prism) to preserve lag wins. */
+function MobileThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boolean }) {
+  const [expanded, setExpanded] = useState(isStreaming)
+  const userToggledRef = useRef(false)
+  useEffect(() => {
+    if (isStreaming && !userToggledRef.current) setExpanded(true)
+  }, [isStreaming])
+  if (!text && !isStreaming) return null
+  return (
+    <div className="mb-2">
+      <button
+        type="button"
+        onClick={() => { userToggledRef.current = true; setExpanded(e => !e) }}
+        className="flex items-center gap-1.5 text-[11px] text-purple"
+      >
+        <span className={`transform transition-transform ${expanded ? 'rotate-90' : ''}`}>▶</span>
+        {isStreaming ? <span>Thinking<span className="animate-pulse">…</span></span> : <span>Reasoning</span>}
+      </button>
+      {expanded && text && (
+        <div className="mt-1.5 ml-3 pl-2 border-l-2 border-purple/30 text-[11px] text-muted/90 whitespace-pre-wrap max-h-48 overflow-y-auto font-mono leading-relaxed">
+          {text}
+          {isStreaming && <span className="inline-block w-1 h-2.5 bg-purple/60 ml-0.5 animate-pulse" />}
+        </div>
+      )}
+    </div>
+  )
+}
+
 // ── Streaming bubble ─────────────────────────────────────────────────────────
 // Plain text while streaming (no ReactMarkdown per token — major mobile jank).
 // Completed history bubbles still markdown on finalize.
-function StreamingBubble({ text, progress, isBuildingEdit }: {
+function StreamingBubble({ text, progress, isBuildingEdit, thinkingText, isThinking }: {
   text: string; progress: string; isBuildingEdit: boolean
+  thinkingText?: string; isThinking?: boolean
 }) {
   return (
     <div className="flex items-start gap-2.5 px-4 py-3">
@@ -47,6 +90,9 @@ function StreamingBubble({ text, progress, isBuildingEdit }: {
         <span className="text-[#4ade80] text-[10px] font-bold">AI</span>
       </div>
       <div className="flex-1 min-w-0">
+        {(thinkingText || isThinking) && (
+          <MobileThinkingBlock text={thinkingText || ''} isStreaming={!!isThinking} />
+        )}
         {progress && progress !== 'Thinking...' && (
           <div className="flex items-center gap-1.5 text-[11px] text-muted/70 mb-1.5">
             <span className="w-1.5 h-1.5 rounded-full bg-[#4ade80] animate-pulse" />
@@ -64,7 +110,7 @@ function StreamingBubble({ text, progress, isBuildingEdit }: {
             {text}
           </div>
         )}
-        {!text && !isBuildingEdit && (
+        {!text && !isBuildingEdit && !thinkingText && !isThinking && (
           <div className="flex gap-1">
             {[0, 1, 2].map(i => (
               <span key={i} className="w-1.5 h-1.5 rounded-full bg-muted/40 animate-bounce"
@@ -145,6 +191,10 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
         {/* Steps trail */}
         {msg._steps && <ProgressSteps steps={msg._steps} />}
 
+        {msg._thinking && (
+          <MobileThinkingBlock text={msg._thinking} isStreaming={false} />
+        )}
+
         {/* Natural text */}
         {msg.content && (
           <div className="text-sm text-ink leading-relaxed mb-2">
@@ -180,6 +230,7 @@ const MessageBubble = memo(MessageBubbleImpl, (prev, next) => (
   prev.msg.message_type === next.msg.message_type &&
   prev.msg._aborted === next.msg._aborted &&
   prev.msg._steps === next.msg._steps &&
+  prev.msg._thinking === next.msg._thinking &&
   prev.msg.compact_summary === next.msg.compact_summary &&
   prev.msg.compact_count === next.msg.compact_count &&
   prev.sessionId === next.sessionId &&
@@ -378,6 +429,7 @@ export function MobileChatPanel() {
   const setActiveSession = useAppStore(s => s.setActiveSession)
   const messages = useAppStore(s => s.messages)
   const addMessage = useAppStore(s => s.addMessage)
+  const setMessages = useAppStore(s => s.setMessages)
   const setSessions = useAppStore(s => s.setSessions)
   const settings = useAppStore(s => s.settings)
   const sessionFiles = useAppStore(s => s.sessionFiles)
@@ -420,18 +472,55 @@ export function MobileChatPanel() {
   const userScrolledUpRef  = useRef(false)
   const tokenRafRef        = useRef(0)
   const textareaRef        = useRef<HTMLTextAreaElement>(null)
+  const thinkingTextRef    = useRef('')
+  const creditPausePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const fileRequestInputRef = useRef<HTMLInputElement>(null)
+  const fileRequestRespondRef = useRef<((resp: { filename?: string; content?: string; action?: 'skip' }) => boolean) | null>(null)
 
-  // ── Agent Mode toggle (multi-agent task breakdown) — shares the desktop
-  // localStorage key; read at send time so the payload is never stale.
-  const agentModeOn = () => {
-    try { return localStorage.getItem('sai_agent_mode') === '1' } catch { return false }
+  // Mode + Research — same localStorage keys as desktop ChatPanel.
+  const [chatMode, setChatMode] = useState<ChatMode>(readChatMode)
+  const [modeSheetOpen, setModeSheetOpen] = useState(false)
+  const [webResearchEnabled, setWebResearchEnabled] = useState(readWebResearch)
+  const webResearchEnabledRef = useRef(webResearchEnabled)
+  webResearchEnabledRef.current = webResearchEnabled
+
+  const [thinkingText, setThinkingText] = useState('')
+  const [isThinking, setIsThinking] = useState(false)
+
+  const [resumableRun, setResumableRun] = useState<{ sid: string; runId: string; tasks: any[] } | null>(null)
+  const [creditPause, setCreditPause] = useState<{
+    sid: string
+    pauseId: string
+    remainingCount: number
+    completedEditCount: number
+    heldWriteCount: number
+    message: string
+    creditsOk: boolean
+    probing: boolean
+  } | null>(null)
+  const [fileRequest, setFileRequest] = useState<{
+    sessionId: string
+    filename: string
+    message: string
+    retry?: boolean
+  } | null>(null)
+  const [fileRequestBusy, setFileRequestBusy] = useState(false)
+
+  const offline = isOfflineSettings(settings)
+  const availableModes: ChatMode[] = offline ? ['edit', 'ask'] : CHAT_MODES
+  const effectiveMode = degradeModeForOffline(chatMode, offline)
+  const researchAvailable = webResearchAvailableFor(settings, offline)
+  const selectChatMode = (m: ChatMode) => {
+    setChatMode(m)
+    writeChatMode(m)
   }
-  const [agentMode, setAgentMode] = useState(agentModeOn)
-  const toggleAgentMode = () => setAgentMode(prev => {
-    const next = !prev
-    try { localStorage.setItem('sai_agent_mode', next ? '1' : '0') } catch { /* storage blocked — session-only toggle */ }
-    return next
-  })
+  const toggleWebResearch = () => {
+    setWebResearchEnabled(prev => {
+      const next = !prev
+      writeWebResearch(next)
+      return next
+    })
+  }
   const fileInputRef       = useRef<HTMLInputElement>(null)
 
   // Smart auto-scroll: same 80px sticky-bottom gate as desktop ChatPanel.
@@ -460,16 +549,44 @@ export function MobileChatPanel() {
 
   // Load session files when active session changes
   useEffect(() => {
+    setResumableRun(null)
+    setCreditPause(null)
+    setFileRequest(null)
+    setFileRequestBusy(false)
+    fileRequestRespondRef.current = null
+    if (creditPausePollRef.current) {
+      clearInterval(creditPausePollRef.current)
+      creditPausePollRef.current = null
+    }
     if (activeSessions) {
       api.sessionFiles.list(activeSessions).then(setSessionFiles).catch(() => {})
-      // Reconcile the agentic task list to whatever this session has on the
-      // server (clears stale cross-session state; repopulates if a run exists).
+      // Rehydrate any active Anthropic credit-pause (same API as desktop).
+      api.chat.getCreditPause(activeSessions)
+        .then((resp) => {
+          if (!resp?.active || !resp.pause?.pause_id) return
+          if (useAppStore.getState().activeSessions !== activeSessions) return
+          setCreditPause({
+            sid: activeSessions,
+            pauseId: resp.pause.pause_id,
+            remainingCount: resp.pause.remaining_count || 0,
+            completedEditCount: resp.pause.completed_edit_count || 0,
+            heldWriteCount: resp.pause.held_write_count || 0,
+            message: resp.message || resp.pause.message || 'Anthropic credits exhausted — progress saved.',
+            creditsOk: !!resp.credits_ok,
+            probing: false,
+          })
+        })
+        .catch(() => {})
+      // Reconcile agentic tasks: only show ACTIVE runs (desktop parity).
       clearAgentTasks()
       api.tasks.list(activeSessions)
         .then((rows: any[]) => {
           if (!Array.isArray(rows) || rows.length === 0) return
           const latestRun = rows[0]?.run_id
           const forRun = rows.filter(r => r.run_id === latestRun)
+          const TERMINAL = ['done', 'blocked', 'cancelled', 'error']
+          const allTerminal = forRun.every(r => TERMINAL.includes(r.status))
+          if (allTerminal) return
           setTaskRunId(latestRun || null)
           setAgentTasks(forRun
             .slice()
@@ -480,6 +597,15 @@ export function MobileChatPanel() {
               status: r.status, qa_score: r.qa_score ?? null, verdict: r.verdict ?? null,
               run_id: r.run_id, progress: r.result_summary ?? undefined,
             })))
+          const pendingTasks = forRun
+            .filter(r => r.status === 'pending')
+            .slice()
+            .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
+            .map(r => ({ id: r.id, seq: r.seq, title: r.title }))
+          const anyRunning = forRun.some(r => r.status === 'running')
+          if (pendingTasks.length > 0 && !anyRunning && latestRun) {
+            setResumableRun({ sid: activeSessions, runId: latestRun, tasks: pendingTasks })
+          }
         })
         .catch(() => {})
     } else {
@@ -487,6 +613,39 @@ export function MobileChatPanel() {
       clearAgentTasks()
     }
   }, [activeSessions])
+
+  // Poll Anthropic until credits restore (same 15s cadence as desktop).
+  useEffect(() => {
+    if (creditPausePollRef.current) {
+      clearInterval(creditPausePollRef.current)
+      creditPausePollRef.current = null
+    }
+    if (!creditPause || creditPause.creditsOk) return
+    const pauseId = creditPause.pauseId
+    const sid = creditPause.sid
+    const tick = () => {
+      setCreditPause(prev => (prev && prev.pauseId === pauseId ? { ...prev, probing: true } : prev))
+      api.chat.probeCreditPause(pauseId)
+        .then((resp) => {
+          if (useAppStore.getState().activeSessions !== sid) return
+          setCreditPause(prev => {
+            if (!prev || prev.pauseId !== pauseId) return prev
+            return { ...prev, creditsOk: !!resp.credits_ok, probing: false }
+          })
+        })
+        .catch(() => {
+          setCreditPause(prev => (prev && prev.pauseId === pauseId ? { ...prev, probing: false } : prev))
+        })
+    }
+    tick()
+    creditPausePollRef.current = setInterval(tick, 15000)
+    return () => {
+      if (creditPausePollRef.current) {
+        clearInterval(creditPausePollRef.current)
+        creditPausePollRef.current = null
+      }
+    }
+  }, [creditPause?.pauseId, creditPause?.creditsOk, creditPause?.sid])
 
   const stopStream = useCallback(() => {
     ctrlRef.current?.abort()
@@ -499,6 +658,7 @@ export function MobileChatPanel() {
     setProgress('')
     setStreamingMsg('')
     setBuildEdit(false)
+    setIsThinking(false)
     progressHistoryRef.current = []
   }, [])
 
@@ -506,7 +666,7 @@ export function MobileChatPanel() {
   // instead of discarding it. Long-term fix: nothing streamed is ever silently
   // dropped on user-initiated stop.
   const handleStopClick = useCallback(() => {
-    if (!gotResultRef.current && accumulatedRef.current.trim() && streamingSessionIdRef.current) {
+    if (!gotResultRef.current && (accumulatedRef.current.trim() || thinkingTextRef.current.trim()) && streamingSessionIdRef.current) {
       addMessage({
         id: Date.now().toString() + '_ai_aborted',
         session_id: streamingSessionIdRef.current,
@@ -514,10 +674,13 @@ export function MobileChatPanel() {
         content: accumulatedRef.current.trim(),
         created_at: new Date().toISOString(),
         _steps: [...progressHistoryRef.current],
+        _thinking: thinkingTextRef.current || undefined,
         _aborted: true,
       })
       gotResultRef.current = true
     }
+    thinkingTextRef.current = ''
+    setThinkingText('')
     stopStream()
   }, [addMessage, stopStream])
 
@@ -563,6 +726,10 @@ export function MobileChatPanel() {
     setProgress('Thinking...')
     setStreamingMsg('')
     setBuildEdit(false)
+    setResumableRun(null)
+    setThinkingText('')
+    thinkingTextRef.current = ''
+    setIsThinking(false)
     progressHistoryRef.current = ['Thinking...']
     streamingSessionIdRef.current = sessionId
     accumulatedRef.current = ''
@@ -571,6 +738,11 @@ export function MobileChatPanel() {
       cancelAnimationFrame(tokenRafRef.current)
       tokenRafRef.current = 0
     }
+
+    const _rawMode = readChatMode()
+    const _sendMode = degradeModeForOffline(_rawMode, isOfflineSettings(settings))
+    const _sendWebResearch = webResearchAvailableFor(settings, isOfflineSettings(settings))
+      && webResearchEnabledRef.current
 
     let accumulated  = ''
     let gotResult    = false
@@ -645,7 +817,14 @@ export function MobileChatPanel() {
     }
 
     const ctrl = api.stream.smart(
-      { session_id: sessionId, message: text, file_ids: sessionFiles.map(f => f.id), force_tasks: agentModeOn() },
+      {
+        session_id: sessionId,
+        message: text,
+        file_ids: sessionFiles.map(f => f.id),
+        mode: _sendMode,
+        force_tasks: _sendMode === 'agent',
+        enable_web_research: _sendWebResearch,
+      },
       (progress) => {
         setProgress(progress)
         // Ref-only: live StreamingBubble does not paint step history.
@@ -668,9 +847,12 @@ export function MobileChatPanel() {
         gotResult = true
         gotResultRef.current = true
         const _steps = [...progressHistoryRef.current]
+        const _thinking = thinkingTextRef.current
         const naturalText = result.natural_text || accumulated
         stopStream()
         setBuildEdit(false)
+        thinkingTextRef.current = ''
+        setThinkingText('')
         addMessage({
           id: Date.now().toString() + '_ai',
           session_id: sessionId,
@@ -680,6 +862,7 @@ export function MobileChatPanel() {
           content: naturalText.trim(),
           created_at: new Date().toISOString(),
           _steps,
+          _thinking,
         })
         if (isFirst) autoName()
         else api.chat.getSessions().then(setSessions).catch(() => {})
@@ -697,7 +880,10 @@ export function MobileChatPanel() {
         if (gotResult) return
         gotResultRef.current = true
         const _steps = [...progressHistoryRef.current]
+        const _thinking = thinkingTextRef.current
         stopStream()
+        thinkingTextRef.current = ''
+        setThinkingText('')
         if (fullText.trim()) {
           addMessage({
             id: Date.now().toString() + '_ai',
@@ -706,6 +892,7 @@ export function MobileChatPanel() {
             content: fullText,
             created_at: new Date().toISOString(),
             _steps,
+            _thinking,
           })
         }
         if (isFirst) autoName()
@@ -715,7 +902,7 @@ export function MobileChatPanel() {
       (err) => {
         // Preserve whatever was streamed before the connection error — same
         // long-term fix as manual stop: nothing streamed is silently dropped.
-        if (accumulated.trim() && !gotResult) {
+        if ((accumulated.trim() || thinkingTextRef.current.trim()) && !gotResult) {
           addMessage({
             id: Date.now().toString() + '_ai_err',
             session_id: sessionId,
@@ -723,13 +910,29 @@ export function MobileChatPanel() {
             content: accumulated.trim(),
             created_at: new Date().toISOString(),
             _steps: [...progressHistoryRef.current],
+            _thinking: thinkingTextRef.current || undefined,
           })
           gotResult = true
           gotResultRef.current = true
         }
+        thinkingTextRef.current = ''
+        setThinkingText('')
         setError(err); stopStream(); setBuildEdit(false)
       },
-      undefined, // onThinking — omitted on mobile for simplicity
+      // onThinking — do not wipe on every start (multi-round within one turn).
+      (thinkToken, phase) => {
+        if (phase === 'start') {
+          setIsThinking(true)
+          if (thinkingTextRef.current) {
+            const next = thinkingTextRef.current + '\n\n---\n\n'
+            setThinkingText(next); thinkingTextRef.current = next
+          }
+        } else if (phase === 'delta') {
+          setThinkingText(prev => { const next = prev + thinkToken; thinkingTextRef.current = next; return next })
+        } else if (phase === 'end') {
+          setIsThinking(false)
+        }
+      },
       // onCompacting
       (phase, info) => {
         if (phase === 'start') {
@@ -790,11 +993,231 @@ export function MobileChatPanel() {
             break
         }
       },
+      // onFileNeeded
+      (info, respond) => {
+        if (useAppStore.getState().activeSessions !== sessionId) {
+          respond({ action: 'skip' })
+          return
+        }
+        fileRequestRespondRef.current = respond
+        setFileRequestBusy(false)
+        setFileRequest({ sessionId, filename: info.filename, message: info.message, retry: info.retry })
+      },
+      // onFileCleared
+      () => {
+        setFileRequest(null)
+        setFileRequestBusy(false)
+        fileRequestRespondRef.current = null
+      },
+      // onWebSearch — light progress only (full sources UI is PR2)
+      (event) => {
+        if (event.phase === 'start' || event.phase === 'query') {
+          setProgress(event.phase === 'query' && 'query' in event ? `Searching: ${event.query}` : 'Searching the web…')
+        }
+      },
+      undefined, // onDoneSources — deferred to PR2 citations strip
+      // onCreditPaused
+      (info) => {
+        if (useAppStore.getState().activeSessions !== sessionId) return
+        const pauseId = info?.pause_id
+        if (!pauseId) return
+        setCreditPause({
+          sid: sessionId,
+          pauseId,
+          remainingCount: info.remaining_count || 0,
+          completedEditCount: info.completed_edit_count || 0,
+          heldWriteCount: info.held_write_count || 0,
+          message: info.message || 'Anthropic credits exhausted — progress saved.',
+          creditsOk: false,
+          probing: false,
+        })
+      },
     )
     ctrlRef.current = ctrl
   }, [input, isStreaming, settings, ensureSession, messages.length, sessionFiles,
-      addMessage, setSessions, stopStream])
+      addMessage, setSessions, stopStream, updateAgentTask, setAgentPhase, setTaskRunId,
+      setTaskPreamble, setAgentTasks, setSessionFiles])
 
+  const resumeInterruptedRun = useCallback(() => {
+    if (!resumableRun || isStreaming) return
+    if (useAppStore.getState().activeSessions !== resumableRun.sid) { setResumableRun(null); return }
+    const { sid, runId, tasks } = resumableRun
+    setResumableRun(null)
+    setError(null)
+    setIsStreaming(true)
+    setProgress('Resuming tasks…')
+    setAgentPhase('executing')
+    let idx = 0
+    const finish = () => {
+      stopStream()
+      setAgentPhase('complete')
+      api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
+      api.chat.getSessions().then(setSessions).catch(() => {})
+    }
+    const runNext = () => {
+      if (idx >= tasks.length) { finish(); return }
+      const t = tasks[idx++]
+      const ctrl = api.stream.executeTask(
+        { session_id: sid, run_id: runId, task_id: t.id },
+        (progress) => setProgress(progress),
+        (result) => {
+          const naturalText = (result.natural_text || '')
+            .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
+            .replace(/<new_file>[\s\S]*$/, '')
+            .trim()
+          addMessage({
+            id: Date.now().toString() + '_task_' + Math.random().toString(36).slice(2, 7),
+            session_id: sid,
+            role: 'assistant',
+            message_type: naturalText ? 'natural_result' : 'surgical_result',
+            surgical_data: JSON.stringify(result),
+            content: naturalText,
+            created_at: new Date().toISOString(),
+          })
+          api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
+        },
+        () => {},
+        (err) => { setError(err); finish() },
+        (event) => {
+          if (event.type === 'task_start') updateAgentTask(event.id, { status: 'running', progress: undefined })
+          else if (event.type === 'task_progress') updateAgentTask(event.id, { progress: event.content })
+          else if (event.type === 'task_done') {
+            updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict })
+            runNext()
+          } else if (event.type === 'task_blocked' || event.type === 'task_cancelled') {
+            updateAgentTask(event.id, { status: event.type === 'task_blocked' ? 'blocked' : 'cancelled', qa_score: event.qa_score, verdict: event.verdict })
+            finish()
+          }
+        },
+      )
+      ctrlRef.current = ctrl
+    }
+    runNext()
+  }, [resumableRun, isStreaming, stopStream, setAgentPhase, setSessionFiles, setSessions, addMessage, updateAgentTask])
+
+  const dismissCreditPause = useCallback(() => {
+    if (!creditPause) return
+    api.chat.dismissCreditPause(creditPause.pauseId).catch(() => {})
+    setCreditPause(null)
+  }, [creditPause])
+
+  const resumeCreditPause = useCallback(() => {
+    if (!creditPause || isStreaming || !creditPause.creditsOk) return
+    const { sid, pauseId } = creditPause
+    if (useAppStore.getState().activeSessions !== sid) { setCreditPause(null); return }
+    setError(null)
+    setIsStreaming(true)
+    setProgress('Resuming saved edits…')
+    setStreamingMsg('')
+    progressHistoryRef.current = ['Resuming saved edits…']
+    thinkingTextRef.current = ''
+    setThinkingText('')
+    setIsThinking(false)
+    let gotResult = false
+    let accumulated = ''
+    const ctrl = api.chat.resumeCreditPause(
+      pauseId,
+      (msg) => {
+        setProgress(msg)
+        if (progressHistoryRef.current[progressHistoryRef.current.length - 1] !== msg) {
+          progressHistoryRef.current = [...progressHistoryRef.current, msg]
+        }
+      },
+      (token) => {
+        accumulated += token
+        accumulatedRef.current = accumulated
+        if (!tokenRafRef.current) {
+          tokenRafRef.current = requestAnimationFrame(() => {
+            tokenRafRef.current = 0
+            setStreamingMsg(accumulatedRef.current)
+          })
+        }
+      },
+      (result) => {
+        gotResult = true
+        if (result?.credit_paused) {
+          setCreditPause(prev => prev ? { ...prev, creditsOk: false } : prev)
+          return
+        }
+        const naturalText = (result.natural_text || '')
+          .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
+          .replace(/<new_file>[\s\S]*$/, '')
+          .trim()
+        addMessage({
+          id: Date.now().toString() + '_credit_resume',
+          session_id: sid,
+          role: 'assistant',
+          message_type: naturalText ? 'natural_result' : 'surgical_result',
+          surgical_data: JSON.stringify(result),
+          content: naturalText,
+          created_at: new Date().toISOString(),
+        } as any)
+        api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
+        setCreditPause(null)
+      },
+      () => {
+        stopStream()
+        if (!gotResult) {
+          api.chat.getMessages(sid).then(saved => {
+            if (useAppStore.getState().activeSessions === sid && saved?.length) setMessages(saved)
+          }).catch(() => {})
+        }
+      },
+      (err) => { setError(err); stopStream() },
+      (info) => {
+        if (!info?.pause_id) return
+        setCreditPause({
+          sid,
+          pauseId: info.pause_id,
+          remainingCount: info.remaining_count || 0,
+          completedEditCount: info.completed_edit_count || 0,
+          heldWriteCount: info.held_write_count || 0,
+          message: info.message || 'Anthropic credits exhausted — progress saved.',
+          creditsOk: false,
+          probing: false,
+        })
+      },
+    )
+    ctrlRef.current = ctrl
+  }, [creditPause, isStreaming, addMessage, setSessionFiles, stopStream])
+
+  const handleFileRequestUpload = () => fileRequestInputRef.current?.click()
+
+  const handleFileRequestFileChosen = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    e.target.value = ''
+    const respond = fileRequestRespondRef.current
+    if (!file || !fileRequest || !respond) return
+    const sizeErr = validateFileSize(file.name, file.size)
+    if (sizeErr) { setError(sizeErr); return }
+    setFileRequestBusy(true)
+    try {
+      const content = await file.text()
+      const sent = respond({ filename: file.name, content })
+      if (!sent) {
+        setFileRequestBusy(false)
+        setFileRequest(null)
+        fileRequestRespondRef.current = null
+        setError('Connection to the agent was lost — please resend your message.')
+      }
+    } catch {
+      setFileRequestBusy(false)
+      setError('Could not read that file — please try again or skip.')
+    }
+  }
+
+  const handleFileRequestSkip = () => {
+    const respond = fileRequestRespondRef.current
+    if (!fileRequest || !respond) return
+    setFileRequestBusy(true)
+    const sent = respond({ action: 'skip' })
+    if (!sent) {
+      setFileRequestBusy(false)
+      setFileRequest(null)
+      fileRequestRespondRef.current = null
+      setError('Connection to the agent was lost — please resend your message.')
+    }
+  }
   // File upload
   const handleFileUpload = async (files: FileList | null) => {
     if (!files?.length) return
@@ -845,11 +1268,104 @@ export function MobileChatPanel() {
               />
             ))}
             <AgentMissionControl />
+            {resumableRun && resumableRun.sid === activeSessions && !isStreaming && (
+              <div className="mx-3 mb-2 flex items-center justify-between gap-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5">
+                <span className="text-[12px] text-ink leading-snug">
+                  This task run was interrupted — {resumableRun.tasks.length} task{resumableRun.tasks.length === 1 ? '' : 's'} remaining.
+                </span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={resumeInterruptedRun}
+                    className="text-[11px] font-semibold px-2.5 py-1 rounded-lg text-accent bg-accent/10 border border-accent/20"
+                  >
+                    Resume
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setResumableRun(null)}
+                    className="text-[11px] font-medium px-2 py-1 rounded-lg text-muted"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
+            {creditPause && creditPause.sid === activeSessions && !isStreaming && (
+              <div className="mx-3 mb-2 rounded-xl border border-danger/30 bg-danger/10 px-3.5 py-2.5">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="text-[12px] font-semibold text-ink">
+                      Anthropic credits exhausted — progress saved
+                    </div>
+                    <p className="mt-1 text-[11px] text-muted leading-snug">
+                      {creditPause.remainingCount} plan step{creditPause.remainingCount === 1 ? '' : 's'} waiting
+                      {creditPause.completedEditCount > 0 ? ` · ${creditPause.completedEditCount} edit(s) already done` : ''}
+                      {creditPause.heldWriteCount > 0 ? ` · ${creditPause.heldWriteCount} Grok write(s) saved` : ''}
+                      . Add credits at console.anthropic.com, then Resume.
+                      {creditPause.probing ? ' Checking balance…' : creditPause.creditsOk ? ' Credits detected — ready to resume.' : ' Waiting for credits…'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      onClick={resumeCreditPause}
+                      disabled={!creditPause.creditsOk || isStreaming}
+                      className="text-[11px] font-semibold px-2.5 py-1 rounded-lg text-accent bg-accent/10 border border-accent/20 disabled:opacity-40"
+                    >
+                      Resume
+                    </button>
+                    <button
+                      type="button"
+                      onClick={dismissCreditPause}
+                      className="text-[11px] font-medium px-2 py-1 rounded-lg text-muted"
+                    >
+                      Dismiss
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+            {fileRequest && fileRequest.sessionId === activeSessions && (
+              <div className="mx-4 my-3 rounded-xl border border-accent/40 bg-accent/10 px-4 py-3.5">
+                <div className="text-[13px] font-semibold text-ink">
+                  File needed to continue{' '}
+                  <code className="px-1.5 py-0.5 rounded bg-surface/70 border border-border text-[11px] font-mono text-accent">{fileRequest.filename}</code>
+                </div>
+                <p className="mt-1 text-[12px] text-muted leading-snug">{fileRequest.message}</p>
+                <div className="mt-2.5 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleFileRequestUpload}
+                    disabled={fileRequestBusy}
+                    className="text-[12px] font-semibold px-3 py-1.5 rounded-lg text-white bg-accent disabled:opacity-50"
+                  >
+                    {fileRequestBusy ? 'Sending…' : 'Upload file'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleFileRequestSkip}
+                    disabled={fileRequestBusy}
+                    className="text-[12px] font-medium px-2.5 py-1.5 rounded-lg text-muted disabled:opacity-50"
+                  >
+                    Skip
+                  </button>
+                </div>
+                <input
+                  ref={fileRequestInputRef}
+                  type="file"
+                  className="hidden"
+                  onChange={handleFileRequestFileChosen}
+                />
+              </div>
+            )}
             {isStreaming && (
               <StreamingBubble
                 text={streamingMsg}
                 progress={streamProgress}
                 isBuildingEdit={isBuildingEdit}
+                thinkingText={thinkingText}
+                isThinking={isThinking}
               />
             )}
             {error && (
@@ -940,25 +1456,34 @@ export function MobileChatPanel() {
                 size="compact"
               />
 
-              {/* Agent Mode toggle — forces multi-agent task breakdown */}
+              {/* Mode chip — opens MobileModeSheet (Edit/Ask/Plan/Agent) */}
               <button
-                onClick={toggleAgentMode}
+                type="button"
+                onClick={() => setModeSheetOpen(true)}
                 disabled={isStreaming || isCompacting}
-                className={`w-9 h-9 flex items-center justify-center rounded-xl transition-colors disabled:opacity-40 ${
-                  agentMode
-                    ? 'text-accent bg-accent/15 active:bg-accent/25'
-                    : 'text-muted/60 hover:text-ink hover:bg-overlay/60 active:bg-overlay'
-                }`}
-                title="Agent Mode: breaks your request into tasks and runs them with a team of AI agents (architect, surgeon, QA per task + integration review). Requires a Claude model."
+                className={`h-9 px-2.5 flex items-center gap-1.5 rounded-xl text-[11px] font-semibold border transition-colors disabled:opacity-40 ${MODE_COLOR[effectiveMode].text} ${MODE_COLOR[effectiveMode].bg} ${MODE_COLOR[effectiveMode].border}`}
+                title={`${MODE_META[effectiveMode].label}: ${MODE_META[effectiveMode].desc}`}
               >
-                <svg width="17" height="17" viewBox="0 0 24 24" fill="none"
-                  stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <rect x="9" y="2" width="6" height="5" rx="1"/>
-                  <rect x="2" y="17" width="6" height="5" rx="1"/>
-                  <rect x="16" y="17" width="6" height="5" rx="1"/>
-                  <path d="M12 7v4M12 11H5v6M12 11h7v6"/>
-                </svg>
+                <span className={`w-1.5 h-1.5 rounded-full ${MODE_COLOR[effectiveMode].dot}`} />
+                {MODE_META[effectiveMode].label}
               </button>
+
+              {/* Research — Claude-only; same key as desktop sai_web_research_enabled */}
+              {researchAvailable && (
+                <button
+                  type="button"
+                  onClick={toggleWebResearch}
+                  disabled={isStreaming || isCompacting}
+                  className={`h-9 px-2.5 flex items-center rounded-xl text-[11px] font-semibold border transition-colors disabled:opacity-40 ${
+                    webResearchEnabled
+                      ? 'text-accent bg-accent/15 border-accent/40'
+                      : 'text-muted/60 border-transparent hover:bg-overlay/60'
+                  }`}
+                  title="Research: enable Claude web search for the next message"
+                >
+                  Research
+                </button>
+              )}
 
               {/* Expand to full-screen compose */}
               <button
@@ -1026,6 +1551,14 @@ export function MobileChatPanel() {
             disabled={isCompacting}
           />
         )}
+
+        <MobileModeSheet
+          open={modeSheetOpen}
+          current={effectiveMode}
+          available={availableModes}
+          onSelect={selectChatMode}
+          onClose={() => setModeSheetOpen(false)}
+        />
       </div>
     </div>
   )
