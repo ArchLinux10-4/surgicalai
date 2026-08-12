@@ -112,6 +112,116 @@ def should_collapse(idx: int, collapse_hint: dict[int, bool]) -> bool:
     return bool(collapse_hint.get(idx))
 
 
+def build_span_collapsed_window(
+    windows: list,
+    original_code: str,
+    broken_code: str,
+    context_lines: int,
+    dlog: Callable[..., Any],
+    **dlog_ctx: Any,
+) -> list:
+    """Collapse ALREADY-COMPUTED scattered correction windows into ONE atomic
+    window spanning ``[min(window_start), max(window_end)]`` (edited/broken
+    line-space).
+
+    Why this exists (session 3d9da3fd, DashboardAIAssistant.jsx):
+    --------------------------------------------------------------
+    ``build_collapsed_windows`` above re-runs the *diff* with a huge merge_gap.
+    That only ever spans regions that actually CHANGED between original and
+    broken code. But the class of bug that most needs collapsing is an
+    *omission*: the surgeon referenced an identifier (``researchCountry``) in a
+    changed window while its declaration — the real fix site — lives in a
+    DIFFERENT, UNCHANGED region that only exists as a window because
+    ``_augment_windows_with_qa_refs`` seeded it from the QA finding. A diff-only
+    collapse drops that augmented window entirely, so the model never sees the
+    declaration site and can never add the missing ``useState``.
+
+    This helper instead collapses the windows the caller ALREADY built (diff
+    windows + QA-ref-augmented windows) by taking their min/max bounds, so the
+    single atomic window provably contains BOTH the changed usage and the
+    augmented fix site. It routes through the proven single-window correction
+    branch (one atomic splice, own brace guard) — exactly what a manual
+    re-prompt that sees the whole region does.
+
+    Returns a 1-element list (routes single-window) or ``[]`` (caller degrades
+    to the full-symbol re-emit branch). Never raises.
+    """
+    if not windows:
+        dlog(
+            "mw_span_collapse_no_windows",
+            note="no windows to collapse — caller degrades to full-symbol re-emit",
+            **dlog_ctx,
+        )
+        return []
+    try:
+        broken_lines = broken_code.splitlines()
+        orig_lines = original_code.splitlines()
+        if not broken_lines:
+            dlog("mw_span_collapse_empty_broken", **dlog_ctx)
+            return []
+
+        ws = min(int(w["window_start"]) for w in windows)
+        we = max(int(w["window_end"]) for w in windows)
+        ws = max(0, ws)
+        we = min(len(broken_lines) - 1, we)
+        if ws > we:
+            dlog("mw_span_collapse_bad_range", ws=ws, we=we, **dlog_ctx)
+            return []
+
+        window_lines = broken_lines[ws:we + 1]
+        numbered_broken = "\n".join(
+            f"{ws + i + 1:4d} | {line}" for i, line in enumerate(window_lines)
+        )
+        # Same-index original mapping as _augment_windows_with_qa_refs: the
+        # splice is authoritative in broken space; numbered_original is context.
+        ows = min(ws, len(orig_lines) - 1) if orig_lines else 0
+        owe = min(we, len(orig_lines) - 1) if orig_lines else -1
+        if orig_lines and ows <= owe:
+            orig_window = orig_lines[ows:owe + 1]
+            numbered_original = "\n".join(
+                f"{ows + i + 1:4d} | {line}" for i, line in enumerate(orig_window)
+            )
+        else:
+            numbered_original = "(no corresponding original lines)"
+
+        collapsed = {
+            "window_start": ws,
+            "window_end": we,
+            "numbered_broken": numbered_broken,
+            "numbered_original": numbered_original,
+            "window_line_count": we - ws + 1,
+            "total_edit_lines": len(broken_lines),
+            "total_orig_lines": len(orig_lines),
+            "changed_line_count": sum(
+                int(w.get("changed_line_count", 0) or 0) for w in windows
+            ),
+            "cluster_index": 0,
+            "total_clusters": 1,
+        }
+        dlog(
+            "mw_span_collapse_built",
+            source_window_count=len(windows),
+            window_start=ws + 1,
+            window_end=we + 1,
+            window_line_count=collapsed["window_line_count"],
+            note="augmented scattered windows collapsed into ONE atomic span "
+                 "covering both the changed usage and the QA-ref fix site — "
+                 "routes through the proven single-window correction path",
+            **dlog_ctx,
+        )
+        return [collapsed]
+    except Exception as exc:  # pragma: no cover - defensive
+        dlog(
+            "mw_span_collapse_error",
+            error=str(exc),
+            error_type=type(exc).__name__,
+            note="span collapse raised — returning [] so caller degrades to the "
+                 "full-symbol re-emit branch (safe fallback)",
+            **dlog_ctx,
+        )
+        return []
+
+
 def build_collapsed_windows(
     symbol_code: str,
     broken_code: str,

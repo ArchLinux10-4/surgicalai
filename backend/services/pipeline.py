@@ -22778,8 +22778,32 @@ async def run_natural_pipeline_stream(
         # only turn a guaranteed failure into a possible success — see
         # services.mw_collapse_recovery for the full proof.
         _mw_collapse_hint: dict[int, bool] = {}
+        # ── Collapse-recovery reachability (session 3d9da3fd) ──────────────
+        # The brace-collapse hint above only takes effect on the NEXT round.
+        # When the brace-rejection happens on the FINAL normal round the fix is
+        # unreachable and the symbol stays hard-blocked forever (proven: the
+        # 2/10 DashboardAIAssistant block — collapse hint recorded round 1, but
+        # rounds were [0, 1] so it never ran). We therefore allow ONE extra,
+        # bounded "collapse-only" round that runs ONLY to consume a pending
+        # collapse hint. With no pending hint the extra iteration breaks
+        # immediately at the top, so normal runs behave exactly as before.
+        _mw_bonus_round_used = False
 
-        for _qa_retry_round in range(MAX_QA_RETRIES):
+        for _qa_retry_round in range(MAX_QA_RETRIES + 1):
+            if _qa_retry_round >= MAX_QA_RETRIES:
+                # Beyond the normal budget: this iteration exists solely to run
+                # the collapse recovery for an idx that was brace-rejected on
+                # the last normal round. No pending hint (or already used) →
+                # behave exactly like the old range(MAX_QA_RETRIES) loop.
+                if _mw_bonus_round_used or not any(_mw_collapse_hint.values()):
+                    break
+                _mw_bonus_round_used = True
+                _dlog("qa_retry_bonus_collapse_round",
+                      session_id=session_id, user_id=user_id,
+                      retry_round=_qa_retry_round,
+                      collapse_pending=[i for i, v in _mw_collapse_hint.items() if v],
+                      note="extra bounded round to run brace-collapse recovery that "
+                           "was recorded on the final normal round (otherwise unreachable)")
             # ── Pipeline deadline gate ─────────────────────────────────────
             if _pipeline_over_budget():
                 _dlog("pipeline_deadline_skip",
@@ -23085,20 +23109,17 @@ async def run_natural_pipeline_stream(
                     # decomposition. See services.mw_collapse_recovery.
                     from services.mw_collapse_recovery import (
                         should_collapse as _mw_should_collapse,
-                        build_collapsed_windows as _mw_build_collapsed,
+                        build_span_collapsed_window as _mw_build_span_collapsed,
                     )
                     _mw_collapse_active = _mw_should_collapse(idx, _mw_collapse_hint)
-                    if _mw_collapse_active:
-                        _all_windows = _mw_build_collapsed(
-                            symbol.code, cs["new_code"], _find_changed_windows,
-                            _ctx_lines_for_window, _dlog,
-                            session_id=session_id, user_id=user_id,
-                            retry_round=_qa_retry_round, idx=idx, symbol=symbol.name,
-                        )
-                    else:
-                        _all_windows = _find_changed_windows(
-                            symbol.code, cs["new_code"], context_lines=_ctx_lines_for_window
-                        )
+                    # Always start from the real diff windows. When collapse is
+                    # active we still augment (below) and THEN span-collapse, so
+                    # the QA-ref fix site (e.g. a missing declaration referenced
+                    # from the changed region) is provably inside the single
+                    # atomic window — see build_span_collapsed_window.
+                    _all_windows = _find_changed_windows(
+                        symbol.code, cs["new_code"], context_lines=_ctx_lines_for_window
+                    )
                     if idx in _window_widen_hint:
                         _dlog("correction_windowed_context_widened",
                               session_id=session_id, user_id=user_id,
@@ -23178,23 +23199,42 @@ async def run_natural_pipeline_stream(
                               len(_qa_known_symbols) if _qa_known_symbols is not None else 0
                           ))
 
+                    # Augment with QA-referenced locations FIRST — even when
+                    # collapse recovery is active. For an *omission* bug (a
+                    # newly-referenced identifier whose declaration was never
+                    # added) the fix site is an UNCHANGED region that only
+                    # appears as a window because augmentation seeds it from the
+                    # QA finding. If we skipped augmentation on the collapse
+                    # round we would span only the changed usage and the model
+                    # could never reach the declaration site (proven: session
+                    # 3d9da3fd, DashboardAIAssistant.jsx researchCountry).
+                    _all_windows = _augment_windows_with_qa_refs(
+                        _all_windows, qa_d, symbol.code, cs["new_code"],
+                        known_symbols=_qa_known_symbols,
+                    )
                     if _mw_collapse_active:
-                        # Collapse recovery keeps the single atomic window on
-                        # purpose. QA-ref augmentation would re-scatter it into
-                        # multiple windows, reintroducing the cross-window
-                        # boundary we are trying to eliminate — so skip it for
-                        # this retry only.
-                        _dlog("mw_collapse_skip_qa_ref_augment",
-                              session_id=session_id, user_id=user_id,
-                              retry_round=_qa_retry_round, idx=idx, symbol=symbol.name,
-                              window_count=len(_all_windows),
-                              note="collapse recovery active — keeping single atomic "
-                                   "window; QA-ref augmentation skipped this retry")
-                    else:
-                        _all_windows = _augment_windows_with_qa_refs(
-                            _all_windows, qa_d, symbol.code, cs["new_code"],
-                            known_symbols=_qa_known_symbols,
+                        # A prior round brace-rejected the scattered multi-window
+                        # splice (an un-completable cross-window edit). Collapse
+                        # the augmented windows into ONE atomic span so the
+                        # changed usage AND the QA-ref fix site are corrected
+                        # together, with no cross-window boundary to imbalance.
+                        # Routes through the proven single-window path (its own
+                        # brace guard still protects against shipping broken
+                        # code). See services.mw_collapse_recovery.
+                        _span = _mw_build_span_collapsed(
+                            _all_windows, symbol.code, cs["new_code"],
+                            _ctx_lines_for_window, _dlog,
+                            session_id=session_id, user_id=user_id,
+                            retry_round=_qa_retry_round, idx=idx, symbol=symbol.name,
                         )
+                        if _span:
+                            _all_windows = _span
+                        # Consume the hint: it has now been attempted this round.
+                        # "Pending" hereafter means recorded-but-not-yet-attempted,
+                        # which is exactly what the bonus-round guard keys off, so
+                        # a normal (non-final-round) collapse never triggers the
+                        # extra iteration.
+                        _mw_collapse_hint.pop(idx, None)
 
                     if len(_all_windows) == 1:
                         _window_info = _all_windows[0]
