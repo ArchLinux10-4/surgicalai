@@ -53,6 +53,7 @@ Every branch calls ``dlog`` (the caller's ``_dlog``) — required by project
 convention, and essential here since this is a brand-new code path.
 """
 import json
+import os
 import time
 from typing import Callable, Optional
 
@@ -63,6 +64,9 @@ from services.grok_agent_tools import (
     StreamedToolCallAccumulator,
     translate_tool_calls,
     build_native_followup_messages,
+    format_tool_call_progress,
+    extract_reasoning_delta,
+    summarize_translation_progress,
 )
 
 
@@ -246,6 +250,10 @@ async def run_grok_ask_plan_native_stream(
         dlog("grok_ask_plan_native_round_start", session_id=session_id,
              user_id=user_id, model=chat_model, mode=mode, tool_round=tool_round)
 
+        if tool_round > 0:
+            yield _sse({"type": "progress",
+                        "content": f"Continuing… round {tool_round + 1}"})
+
         stream = chat_create_fn(
             client, model=chat_model, messages=messages,
             temperature=0.0, tools=tools, stream=True,
@@ -253,15 +261,60 @@ async def run_grok_ask_plan_native_stream(
 
         round_text = ""
         acc = StreamedToolCallAccumulator(dlog=dlog, session_id=session_id, user_id=user_id)
+        round_t0 = time.time()
+        last_activity_ts = round_t0
+        last_silence_progress_ts = 0.0
+        thinking_open = False
+        thinking_deltas = 0
+        silence_s = int(os.getenv("GROK_SILENCE_PROGRESS_S", "3"))
         for chunk in iter_chunks_fn(stream, model=chat_model, session_id=session_id,
                                     user_id=user_id):
+            now = time.time()
+            if ((now - last_activity_ts) >= silence_s
+                    and (now - last_silence_progress_ts) >= silence_s):
+                last_silence_progress_ts = now
+                yield _sse({"type": "progress",
+                            "content": f"Reasoning… {int(now - round_t0)}s"})
+                dlog("grok_agent_silence_heartbeat", session_id=session_id,
+                     user_id=user_id, tool_round=tool_round,
+                     elapsed_s=int(now - round_t0), mode=mode)
+
             delta = chunk.choices[0].delta
+            rc = extract_reasoning_delta(delta)
+            if rc:
+                last_activity_ts = time.time()
+                thinking_deltas += 1
+                if not thinking_open:
+                    thinking_open = True
+                    yield _sse({"type": "thinking_start", "content": ""})
+                yield _sse({"type": "thinking", "content": rc})
+                dlog("grok_agent_reasoning_delta", session_id=session_id,
+                     user_id=user_id, tool_round=tool_round, chars=len(rc), mode=mode)
+
             content = getattr(delta, "content", None)
             if content:
+                last_activity_ts = time.time()
+                if thinking_open:
+                    thinking_open = False
+                    yield _sse({"type": "thinking_end", "content": ""})
                 round_text += content
             tc_delta = getattr(delta, "tool_calls", None)
             if tc_delta:
-                acc.add_delta(tc_delta)
+                named = acc.add_delta(tc_delta) or []
+                if named:
+                    last_activity_ts = time.time()
+                    if thinking_open:
+                        thinking_open = False
+                        yield _sse({"type": "thinking_end", "content": ""})
+                    for tn in named:
+                        yield _sse({"type": "progress",
+                                    "content": format_tool_call_progress(tn)})
+                        dlog("grok_agent_tool_named", session_id=session_id,
+                             user_id=user_id, tool_round=tool_round,
+                             tool_name=tn, mode=mode)
+
+        if thinking_open:
+            yield _sse({"type": "thinking_end", "content": ""})
 
         if not acc.has_calls():
             # Plain-text answer, no tool calls this round — done.
@@ -269,13 +322,20 @@ async def run_grok_ask_plan_native_stream(
                 "I don't have anything more to add — try rephrasing your question."
             )
             dlog("grok_ask_plan_native_final_answer", session_id=session_id,
-                 user_id=user_id, tool_round=tool_round, chars=len(final_text))
+                 user_id=user_id, tool_round=tool_round, chars=len(final_text),
+                 thinking_deltas=thinking_deltas)
             yield _sse({"type": "token", "content": final_text})
             break
 
         calls = acc.finalize()
         translated = translate_tool_calls(calls, dlog=dlog, session_id=session_id,
                                           user_id=user_id)
+        sum_prog = summarize_translation_progress(translated)
+        if sum_prog:
+            yield _sse({"type": "progress", "content": sum_prog})
+            dlog("grok_agent_tool_progress", session_id=session_id,
+                 user_id=user_id, tool_round=tool_round, summary=sum_prog[:200],
+                 mode=mode)
 
         if translated.blocked_reason:
             dlog("grok_ask_plan_native_blocked", session_id=session_id,

@@ -135,6 +135,67 @@ def test_accumulator_handles_dict_deltas():
     assert calls[0]["name"] == "report_blocked"
 
 
+def test_accumulator_returns_newly_named_once():
+    """First fragment that carries a name is reported; later arg-only deltas are not."""
+    acc = gat.StreamedToolCallAccumulator()
+    first = acc.add_delta([FakeToolCallDelta(0, id="c0", name="request_search",
+                                             arguments='{"terms":[')])
+    assert first == ["request_search"]
+    second = acc.add_delta([FakeToolCallDelta(0, arguments='"auth"]}')])
+    assert second == []
+    # Whole-chunk second parallel call reports its name once.
+    third = acc.add_delta([FakeToolCallDelta(1, id="c1", name="request_file",
+                                             arguments='{"filenames":["a.py"]}')])
+    assert third == ["request_file"]
+    # Re-sending the same name on an already-named index must not re-notify.
+    fourth = acc.add_delta([FakeToolCallDelta(1, name="request_file")])
+    assert fourth == []
+
+
+def test_accumulator_empty_delta_returns_empty_list():
+    acc = gat.StreamedToolCallAccumulator()
+    assert acc.add_delta(None) == []
+    assert acc.add_delta([]) == []
+
+
+def test_format_tool_call_progress_known_and_unknown():
+    assert gat.format_tool_call_progress("request_search") == "Calling request_search…"
+    assert gat.format_tool_call_progress("") == "Calling tool…"
+    assert gat.format_tool_call_progress("custom_tool") == "Calling custom tool…"
+
+
+def test_extract_reasoning_delta_from_dict_and_object():
+    assert gat.extract_reasoning_delta({"reasoning_content": "step 1"}) == "step 1"
+    assert gat.extract_reasoning_delta({"reasoning": "alt"}) == "alt"
+    assert gat.extract_reasoning_delta({"content": "nope"}) == ""
+    assert gat.extract_reasoning_delta(None) == ""
+
+    class _D:
+        reasoning_content = "from attr"
+    assert gat.extract_reasoning_delta(_D()) == "from attr"
+
+    class _Extra:
+        model_extra = {"reasoning_content": "from extra"}
+    assert gat.extract_reasoning_delta(_Extra()) == "from extra"
+
+
+def test_summarize_translation_progress_shapes():
+    tr = gat.TranslationResult()
+    assert gat.summarize_translation_progress(tr) == ""
+    tr.edit_json_strings = ["{}"]
+    tr.new_file_json_strings = ["{}", "{}"]
+    tr.edit_plan = [{"filename": "a.py", "symbol": "f", "description": "d"}]
+    tr.context_request = ("search", "{}")
+    msg = gat.summarize_translation_progress(tr)
+    assert "1 edit" in msg
+    assert "2 new files" in msg
+    assert "plan" in msg
+    assert "fetching search" in msg
+    tr2 = gat.TranslationResult()
+    tr2.blocked_reason = "nope"
+    assert "blocked" in gat.summarize_translation_progress(tr2)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # translate_tool_calls — each tool type -> producer shapes
 # ─────────────────────────────────────────────────────────────────────────────

@@ -1136,6 +1136,9 @@ from services.grok_agent_tools import (  # noqa: E402
     normalize_dispatch_pair as _grok_normalize_dispatch_pair,
     build_grok_system_suffix as _grok_build_system_suffix,
     build_grok_agent_instruction as _grok_build_agent_instruction,
+    format_tool_call_progress as _grok_format_tool_progress,
+    extract_reasoning_delta as _grok_extract_reasoning_delta,
+    summarize_translation_progress as _grok_summarize_translation_progress,
 )
 # Gap #2 (billing-429 pointlessly retried) — new file, Grok-only, does NOT
 # touch api_retry.py or _chat_create's shared body. Only reached from
@@ -17154,6 +17157,10 @@ async def run_natural_pipeline_stream(
         STREAMING_THINKING_STALL_S = 120   # dead-stream (no bytes of any kind) guard
         STREAMING_NO_TEXT_CEILING_S = int(_os.getenv("STREAMING_NO_TEXT_CEILING_S", "180"))
         STREAMING_HEARTBEAT_S = int(_os.getenv("STREAMING_HEARTBEAT_S", "15"))
+        # Grok agent UX: first "Reasoning… Ns" after this many silent seconds,
+        # then refresh at the same cadence (chat.completions often has no
+        # reasoning_content on deltas — silence progress fills the gap).
+        GROK_SILENCE_PROGRESS_S = int(_os.getenv("GROK_SILENCE_PROGRESS_S", "3"))
         _PHASE2_THINKING_CAP = int(_os.getenv("PHASE2_THINKING_CAP", "12000"))
         # Runaway backstop only — real termination is the deadline/budget above.
         # UPDATED (2026-08-06): raised 24->60 for ALL models (Grok, Claude,
@@ -17390,6 +17397,8 @@ async def run_natural_pipeline_stream(
             _edit_hb_bytes = 0
             _edit_hb_last = 0
             _last_hb_ts = time.time()
+            _last_silence_progress_ts = 0.0  # Grok UX: last Reasoning… progress emit
+            _grok_thinking_open = False      # Grok UX: thinking_start issued, awaiting end
             _last_stop_reason = None
             _matched_stop_seq = None
             _edits_before = len(edit_blocks_raw) + len(new_file_blocks_raw)
@@ -17401,6 +17410,12 @@ async def run_natural_pipeline_stream(
                   new_file_blocks=len(new_file_blocks_raw),
                   searched_terms=len(searched_terms),
                   requested_files=len(requested_files))
+
+            if _is_grok_model(arch_model) and _turn > 1:
+                yield sse({"type": "progress",
+                           "content": f"Continuing… turn {_turn}"})
+                _dlog("grok_agent_turn_progress",
+                      session_id=session_id, user_id=user_id, turn=_turn)
 
             if _natural_use_claude:
                 stream_kwargs = {
@@ -17783,7 +17798,24 @@ async def run_natural_pipeline_stream(
                                       elapsed_s=round(_gpt_stall_elapsed, 1),
                                       text_len=len(full_response),
                                       last_text_age_s=round(time.time() - _round_last_text_ts, 1),
+                                      thinking_deltas=_round_thinking_deltas,
                                       state=state, attempt=_attempt)
+                            # Grok: surface silent reasoning windows as progress
+                            # (chat.completions often has no reasoning_content).
+                            if (_grok_tc_acc is not None
+                                    and (time.time() - _round_last_activity_ts)
+                                    >= GROK_SILENCE_PROGRESS_S
+                                    and (time.time() - _last_silence_progress_ts)
+                                    >= GROK_SILENCE_PROGRESS_S):
+                                _last_silence_progress_ts = time.time()
+                                _silence_s = int(time.time() - _round_t0)
+                                yield sse({"type": "progress",
+                                           "content": f"Reasoning… {_silence_s}s"})
+                                _dlog("grok_agent_silence_heartbeat",
+                                      session_id=session_id, user_id=user_id,
+                                      turn=_turn, elapsed_s=_silence_s,
+                                      text_len=len(full_response),
+                                      thinking_deltas=_round_thinking_deltas)
                             if (_pipeline_over_budget()
                                     or (time.time() - _streaming_t0) >= STREAMING_PHASE_DEADLINE_S):
                                 _dlog("streaming_deadline_abort_gpt",
@@ -17794,18 +17826,49 @@ async def run_natural_pipeline_stream(
                                 _streaming_starvation_abort = True
                                 break
                             if (not full_response
+                                    and _round_thinking_deltas == 0
+                                    and not (_grok_tc_acc is not None and _grok_tc_acc.has_calls())
                                     and _gpt_stall_elapsed >= STREAMING_NO_TEXT_CEILING_S):
                                 _dlog("streaming_no_text_ceiling_abort_gpt",
                                       session_id=session_id, user_id=user_id, turn=_turn,
                                       elapsed_s=round(_gpt_stall_elapsed, 1))
                                 _streaming_starvation_abort = True
                                 break
+                            if (not full_response
+                                    and _round_thinking_deltas > 0
+                                    and not _ceiling_waived_logged
+                                    and _gpt_stall_elapsed >= STREAMING_NO_TEXT_CEILING_S):
+                                _ceiling_waived_logged = True
+                                _dlog("streaming_thinking_active_no_abort_gpt",
+                                      session_id=session_id, user_id=user_id, turn=_turn,
+                                      elapsed_s=round(_gpt_stall_elapsed, 1),
+                                      thinking_deltas=_round_thinking_deltas)
 
                             _gpt_delta = getattr(_gpt_choice, "delta", None)
+
+                            # Best-effort Grok summarized reasoning → thinking_* SSE
+                            if _grok_tc_acc is not None and _gpt_delta is not None:
+                                _rc = _grok_extract_reasoning_delta(_gpt_delta)
+                                if _rc:
+                                    _round_last_activity_ts = time.time()
+                                    _round_last_thinking_ts = _round_last_activity_ts
+                                    _round_thinking_deltas += 1
+                                    if not _grok_thinking_open:
+                                        _grok_thinking_open = True
+                                        yield sse({"type": "thinking_start", "content": ""})
+                                    yield sse({"type": "thinking", "content": _rc})
+                                    _dlog("grok_agent_reasoning_delta",
+                                          session_id=session_id, user_id=user_id,
+                                          turn=_turn, chars=len(_rc))
+
                             if _gpt_delta and hasattr(_gpt_delta, "content") and _gpt_delta.content:
                                 text_chunk = _gpt_delta.content
                                 full_response += text_chunk
                                 _round_last_text_ts = time.time()
+                                _round_last_activity_ts = _round_last_text_ts
+                                if _grok_thinking_open:
+                                    _grok_thinking_open = False
+                                    yield sse({"type": "thinking_end", "content": ""})
                                 if state == "normal":
                                     normal_buf += text_chunk
                                 else:
@@ -17900,10 +17963,26 @@ async def run_natural_pipeline_stream(
                             if _grok_tc_acc is not None and _gpt_delta is not None:
                                 _tcd = getattr(_gpt_delta, "tool_calls", None)
                                 if _tcd:
-                                    _grok_tc_acc.add_delta(_tcd)
+                                    _named = _grok_tc_acc.add_delta(_tcd) or []
+                                    if _named:
+                                        _round_last_activity_ts = time.time()
+                                        if _grok_thinking_open:
+                                            _grok_thinking_open = False
+                                            yield sse({"type": "thinking_end", "content": ""})
+                                        for _tn in _named:
+                                            yield sse({
+                                                "type": "progress",
+                                                "content": _grok_format_tool_progress(_tn),
+                                            })
+                                            _dlog("grok_agent_tool_named",
+                                                  session_id=session_id, user_id=user_id,
+                                                  turn=_turn, tool_name=_tn)
 
                             if pending_tool is not None or edit_plan_data is not None:
                                 break
+                        if _grok_thinking_open:
+                            _grok_thinking_open = False
+                            yield sse({"type": "thinking_end", "content": ""})
                         break  # success
 
                     except Exception as _gpt_err:
@@ -17977,6 +18056,13 @@ async def run_natural_pipeline_stream(
                 else:
                     _grok_tr = _grok_translate_tool_calls(
                         _grok_calls, dlog=_dlog, session_id=session_id, user_id=user_id)
+                    _sum_prog = _grok_summarize_translation_progress(_grok_tr)
+                    if _sum_prog:
+                        yield sse({"type": "progress", "content": _sum_prog})
+                        _dlog("grok_agent_tool_progress",
+                              session_id=session_id, user_id=user_id, turn=_turn,
+                              summary=_sum_prog[:200],
+                              tool_names=[c.get("name") for c in _grok_calls])
                     # Plan-first gate: on a compound request, HOLD any writes
                     # emitted before a plan exists (rewrites their tool-results
                     # + arms a forced write_edit_plan next turn), and note plan
