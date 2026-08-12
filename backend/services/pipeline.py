@@ -23417,32 +23417,71 @@ async def run_natural_pipeline_stream(
                         _ws1 = _window_info["window_start"] + 1   # 1-indexed
                         _we1 = _window_info["window_end"] + 1
 
-                        _format_instructions = (
-                            f"This symbol is {_sym_line_count} lines. You are seeing ONLY the "
-                            f"changed region (lines {_ws1}–{_we1}, {_wl} lines) plus context.\n\n"
-                            f"Return a <surgical_edit> block with the CORRECTED version of this "
-                            f"window. The server will splice it back into the full symbol automatically.\n\n"
-                            f"Format:\n"
-                            f"<surgical_edit>\n"
-                            f'{{"filename": "{cs["filename"]}", "symbol": "{symbol.name}", '
-                            f'"new_code": "<corrected lines {_ws1}–{_we1}>"}}\n'
-                            f"</surgical_edit>\n\n"
-                            f"RULES:\n"
-                            f"- Return ALL {_wl} lines of the window (context lines + corrected changes)\n"
-                            f"- Do NOT return the entire {_sym_line_count}-line symbol\n"
-                            f"- Do NOT include line-number prefixes (the \"1234 | \" part) in new_code\n"
-                            f"- Fix every issue listed above while preserving the original request\n"
-                            f"- Adding or removing lines within the window is fine"
+                        # A collapse-recovery window can span the WHOLE symbol
+                        # (see mw_span_collapse_snapped_full_symbol). In that
+                        # case the partial-window wording is actively harmful:
+                        # "Do NOT return the entire symbol" contradicts
+                        # "Return ALL {n} lines" and invites truncation
+                        # (proven: 3d9da3fd_round5 — a 92% slice made the model
+                        # close open JSX early and the splice brace-rejected).
+                        _window_is_full_symbol = (
+                            _window_info["window_start"] == 0
+                            and _we1 >= _sym_line_count
                         )
-                        _original_code_block = (
-                            f"ORIGINAL CODE (lines {_ws1}–{_we1} of "
-                            f"{_window_info['total_orig_lines']} total — before your edit):\n"
-                            f"```\n{_window_info['numbered_original']}\n```"
-                        )
-                        _broken_code_block = (
-                            f"YOUR BROKEN EDIT (lines {_ws1}–{_we1} — fix this):\n"
-                            f"```\n{_window_info['numbered_broken']}\n```"
-                        )
+                        if _window_is_full_symbol:
+                            _format_instructions = (
+                                f"You are seeing the ENTIRE symbol ({_sym_line_count} lines). "
+                                f"There is nothing outside these lines.\n\n"
+                                f"Return a <surgical_edit> block with the CORRECTED version of the "
+                                f"complete symbol.\n\n"
+                                f"Format:\n"
+                                f"<surgical_edit>\n"
+                                f'{{"filename": "{cs["filename"]}", "symbol": "{symbol.name}", '
+                                f'"new_code": "<the complete corrected symbol>"}}\n'
+                                f"</surgical_edit>\n\n"
+                                f"RULES:\n"
+                                f"- Return the COMPLETE symbol from its first line to its final closing brace\n"
+                                f"- Every bracket/brace/paren you open must be closed within your output\n"
+                                f"- Do NOT include line-number prefixes (the \"1234 | \" part) in new_code\n"
+                                f"- Fix every issue listed above while preserving the original request\n"
+                                f"- Adding or removing lines is fine"
+                            )
+                            _original_code_block = (
+                                f"ORIGINAL CODE (complete symbol, "
+                                f"{_window_info['total_orig_lines']} lines — before your edit):\n"
+                                f"```\n{_window_info['numbered_original']}\n```"
+                            )
+                            _broken_code_block = (
+                                f"YOUR BROKEN EDIT (complete symbol — fix this):\n"
+                                f"```\n{_window_info['numbered_broken']}\n```"
+                            )
+                        else:
+                            _format_instructions = (
+                                f"This symbol is {_sym_line_count} lines. You are seeing ONLY the "
+                                f"changed region (lines {_ws1}–{_we1}, {_wl} lines) plus context.\n\n"
+                                f"Return a <surgical_edit> block with the CORRECTED version of this "
+                                f"window. The server will splice it back into the full symbol automatically.\n\n"
+                                f"Format:\n"
+                                f"<surgical_edit>\n"
+                                f'{{"filename": "{cs["filename"]}", "symbol": "{symbol.name}", '
+                                f'"new_code": "<corrected lines {_ws1}–{_we1}>"}}\n'
+                                f"</surgical_edit>\n\n"
+                                f"RULES:\n"
+                                f"- Return ALL {_wl} lines of the window (context lines + corrected changes)\n"
+                                f"- Do NOT return the entire {_sym_line_count}-line symbol\n"
+                                f"- Do NOT include line-number prefixes (the \"1234 | \" part) in new_code\n"
+                                f"- Fix every issue listed above while preserving the original request\n"
+                                f"- Adding or removing lines within the window is fine"
+                            )
+                            _original_code_block = (
+                                f"ORIGINAL CODE (lines {_ws1}–{_we1} of "
+                                f"{_window_info['total_orig_lines']} total — before your edit):\n"
+                                f"```\n{_window_info['numbered_original']}\n```"
+                            )
+                            _broken_code_block = (
+                                f"YOUR BROKEN EDIT (lines {_ws1}–{_we1} — fix this):\n"
+                                f"```\n{_window_info['numbered_broken']}\n```"
+                            )
                         # ── Suffix context: show a few lines after the window
                         # so the correction agent knows what comes next and
                         # won't re-emit those lines in its output.
