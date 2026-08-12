@@ -256,7 +256,17 @@ class ASTParser:
             return sig[:200]
 
         def _classify_value(decl_node) -> str:
-            """What does a variable_declarator's RHS look like?"""
+            """What does a variable_declarator's RHS look like?
+
+            Returns:
+              "arrow"  — arrow function literal
+              "function" — function / generator expression
+              "call"   — HOC/factory call that should be indexed as a function
+                         (React.memo, zustand create, …)
+              "value"  — data (object/array/template OR a value-producing call
+                         like .reduce / .map / Object.fromEntries)
+              "other" / "unknown"
+            """
             for child in decl_node.children:
                 if child.type == "variable_declarator":
                     # Walk the declarator's children to find the value
@@ -268,8 +278,22 @@ class ASTParser:
                             continue
                         if vc.type == "arrow_function":
                             return "arrow"
+                        elif vc.type in (
+                            "function",
+                            "function_expression",
+                            "generator_function",
+                            "generator_function_expression",
+                        ):
+                            return "function"
                         elif vc.type == "call_expression":
-                            return "call"
+                            # Proven false-positive (3d9da3fd_round6):
+                            # `const RESEARCH_COUNTRIES = LIST.reduce(...)` was
+                            # labeled [function] because ANY multi-line call
+                            # became FUNCTION. QA then hard-blocked correct
+                            # `RESEARCH_COUNTRIES[key]` indexing as a type error.
+                            # Value-producing calls stay "value"; only known
+                            # HOC/factory callees stay "call".
+                            return _call_rhs_kind(vc)
                         elif vc.type in ("template_string", "object", "array"):
                             return "value"
                         elif vc.type == "parenthesized_expression":
@@ -277,10 +301,71 @@ class ASTParser:
                             for pc in vc.children:
                                 if pc.type == "arrow_function":
                                     return "arrow"
+                                if pc.type in (
+                                    "function",
+                                    "function_expression",
+                                    "generator_function",
+                                    "generator_function_expression",
+                                ):
+                                    return "function"
                             return "other"
                         else:
                             return "other"
             return "unknown"
+
+        # Call RHS whose result is DATA (maps, lists, derived objects) — must
+        # be indexed as VARIABLE so QA/context don't treat bracket lookup as
+        # "indexing a function". Keep this list focused on well-known value
+        # producers; unknown callees default to VARIABLE too (safer than the
+        # old blanket FUNCTION which caused hard-block false positives).
+        _VALUE_CALL_METHODS = frozenset({
+            "reduce", "map", "filter", "flatMap", "fromEntries",
+            "assign", "keys", "values", "entries", "parse", "stringify",
+            "concat", "slice", "sort", "flat", "join", "freeze", "from",
+        })
+        # Known HOC / store / component factories — keep as FUNCTION so they
+        # remain editable mega-symbols (React.memo, zustand create, …).
+        _FACTORY_CALLEES = frozenset({
+            "memo", "forwardRef", "lazy", "create", "styled",
+            "defineStore", "defineComponent", "observer", "connect",
+            "withRouter", "createContext", "createSlice", "createStore",
+            "createApp", "configureStore",
+        })
+
+        def _callee_leaf_name(call_node) -> str:
+            """Best-effort last identifier of a call_expression's callee."""
+            callee = None
+            for c in call_node.children:
+                if c.type in ("identifier", "member_expression", "call_expression"):
+                    callee = c
+                    break
+            if callee is None:
+                return ""
+            if callee.type == "identifier":
+                try:
+                    return callee.text.decode()
+                except Exception:
+                    return ""
+            if callee.type == "member_expression":
+                for c in reversed(callee.children):
+                    if c.type in ("property_identifier", "identifier"):
+                        try:
+                            return c.text.decode()
+                        except Exception:
+                            return ""
+            return ""
+
+        def _call_rhs_kind(call_node) -> str:
+            name = _callee_leaf_name(call_node)
+            if name in _FACTORY_CALLEES:
+                return "call"
+            if name in _VALUE_CALL_METHODS:
+                return "value"
+            # Default: treat as data-producing. A wrong VARIABLE label is a
+            # mild UX issue; a wrong FUNCTION label hard-blocks correct code
+            # (proven). Real factories not in the allowlist still get indexed
+            # as VARIABLE and remain editable.
+            return "value"
 
         def _add(name: str, sym_type_str: str, node, parent: Optional[str] = None):
             start_line = node.start_point[0] + 1
@@ -363,12 +448,17 @@ class ASTParser:
 
                 if val_type == "arrow":
                     _add(name, "ARROW_FUNCTION", target)
+                elif val_type == "function":
+                    # const foo = function () { ... } / generator expression
+                    _add(name, "FUNCTION", target)
                 elif val_type == "call":
                     # HOC wrappers: React.memo(), forwardRef(), styled(), etc.
+                    # Only known factory callees reach here (see _call_rhs_kind).
                     if size >= 3:
                         _add(name, "FUNCTION", target)
                 elif val_type == "value":
-                    # Template literals, objects, arrays.
+                    # Template literals, objects, arrays, AND value-producing
+                    # calls (.reduce / .map / Object.fromEntries / …).
                     # Previously gated at size >= 3, which silently dropped compact
                     # single-line style constants (e.g. DashboardStyles.js export const
                     # S_POS_ABS_TOP_1REM_RIGHT_0_D_FLEX = { ... }).  Those never appeared
@@ -527,10 +617,25 @@ class ASTParser:
         # zustand's `export const useAppStore = create<AppState>((set) => ({`.
         # arrow_re misses these because the RHS starts with an identifier,
         # not a parameter list.
+        #
+        # IMPORTANT (3d9da3fd_round6): do NOT blanket-label every
+        # `const X = foo.bar(` as FUNCTION — that mislabeled
+        # `RESEARCH_COUNTRIES = LIST.reduce(...)` as [function] and QA
+        # hard-blocked correct bracket indexing. Only known HOC/factory
+        # callees stay FUNCTION; value-producing methods (.reduce/.map/…)
+        # and unknown callees are VARIABLE.
         factory_re = re.compile(
-            r"^(export\s+)?(const|let|var)\s+(\w+)(?:\s*:\s*[^=\n]+?)?\s*=\s*[\w.]+\s*(?:<[^>\n]*>)?\s*\(",
+            r"^(export\s+)?(const|let|var)\s+(\w+)(?:\s*:\s*[^=\n]+?)?\s*=\s*"
+            r"(?:([\w.]+)\s*(?:<[^>\n]*>)?\s*)?\(",
             re.MULTILINE,
         )
+        _REGEX_FACTORY_CALLEES = frozenset({
+            "memo", "forwardRef", "lazy", "create", "styled",
+            "defineStore", "defineComponent", "observer", "connect",
+            "withRouter", "createContext", "createSlice", "createStore",
+            "createApp", "configureStore",
+        })
+        # Non-factory callees (reduce/map/fromEntries/unknown) → VARIABLE below.
 
         class_spans = []
         for m in class_re.finditer(source):
@@ -615,11 +720,19 @@ class ASTParser:
             end_line = self._find_block_end(lines, line_no - 1)
             if end_line - line_no + 1 < 3:
                 continue  # single-line consts stay out of the map (matches tree-sitter path)
+            callee_expr = (m.group(4) or "").strip()
+            leaf = callee_expr.split(".")[-1] if callee_expr else ""
+            if leaf in _REGEX_FACTORY_CALLEES:
+                stype = SymbolType.FUNCTION
+            else:
+                # Value-producing (.reduce/.map/…) OR unknown callee → VARIABLE.
+                # Matches tree-sitter _call_rhs_kind default.
+                stype = SymbolType.VARIABLE
             seen.add((name, line_no))
             symbols.append(
                 SymbolInfo(
                     name=name,
-                    symbol_type=SymbolType.FUNCTION,
+                    symbol_type=stype,
                     start_line=line_no,
                     end_line=end_line,
                     parent=None,
