@@ -168,6 +168,36 @@ def build_span_collapsed_window(
             dlog("mw_span_collapse_bad_range", ws=ws, we=we, **dlog_ctx)
             return []
 
+        # ── Seam elimination (session 3d9da3fd_round5) ───────────────────
+        # A min/max span of the augmented windows can still end mid-structure
+        # (round5: span 1–1054 of a 1147-line JSX component — the closing
+        # JSX/braces lived in the excluded 93-line tail). Asked to re-emit a
+        # 92% slice, the model closed the still-open structures at the end of
+        # its window (+27 lines); the untouched broken tail then followed and
+        # the splice was brace-rejected: "found closing ')' but the innermost
+        # open bracket was '['". No prompt reliably stops a model from
+        # completing open JSX at the end of its window, so the atomic window
+        # must have NO seam: snap to the ENTIRE symbol. This path only runs
+        # after a guaranteed hard-block (brace-rejected multi-window), the
+        # full re-emit is the proven manual-re-prompt shape, and output cost
+        # is well under model caps (~13K tokens for an 1147-line symbol vs
+        # 64K/128K limits). Worst case is identical to today: the Path W
+        # brace guard still refuses a broken re-emit.
+        _pre_snap = (ws, we)
+        ws = 0
+        we = len(broken_lines) - 1
+        if _pre_snap != (ws, we):
+            dlog(
+                "mw_span_collapse_snapped_full_symbol",
+                span_before_start=_pre_snap[0] + 1,
+                span_before_end=_pre_snap[1] + 1,
+                total_lines=len(broken_lines),
+                note="span ended mid-structure — snapped to whole symbol so the "
+                     "correction has no splice seam (round5: partial 1–1054 slice "
+                     "of 1147-line JSX invited early structure-closing)",
+                **dlog_ctx,
+            )
+
         window_lines = broken_lines[ws:we + 1]
         numbered_broken = "\n".join(
             f"{ws + i + 1:4d} | {line}" for i, line in enumerate(window_lines)

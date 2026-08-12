@@ -22,10 +22,18 @@ Round 2 (score 1, tsc+structural block — `[...)` bracket imbalance):
     scheduled a context-widen for a round 2 that MAX_QA_RETRIES never allowed.
 
 Fix under test (services.mw_collapse_recovery.build_span_collapsed_window):
-  Collapse the ALREADY-AUGMENTED windows (diff windows + QA-ref windows) by
-  their min/max bounds into ONE atomic span, so the single-window correction
-  provably sees BOTH the changed region AND the fix site. Routes through the
-  proven single-window splice path (its own brace guard still protects).
+  Collapse the ALREADY-AUGMENTED windows (diff windows + QA-ref windows) into
+  ONE atomic window, so the single-window correction provably sees BOTH the
+  changed region AND the fix site. Routes through the proven single-window
+  splice path (its own brace guard still protects).
+
+Round 5 (score 1 — seam-induced imbalance):
+  The min/max span (1–1054 of 1147) still ended mid-JSX: the closing braces
+  lived in the excluded 93-line tail. Asked to re-emit a 92% slice, the model
+  closed the still-open structures early (+27 lines) and the splice was
+  brace-rejected ("found closing ')' but the innermost open bracket was '['").
+  Fix: the collapsed window is snapped to the ENTIRE symbol so there is no
+  splice seam at all — the model re-emits a complete, self-balanced symbol.
 """
 from __future__ import annotations
 
@@ -89,14 +97,16 @@ def test_span_includes_augmented_declaration_and_changed_usage():
 
     assert len(res) == 1, "collapse must yield exactly one atomic window"
     w = res[0]
-    # Spans min(window_start)..max(window_end) across ALL windows.
-    assert w["window_start"] == 15
-    assert w["window_end"] == 437
+    # Round5 fix: the window is snapped to the ENTIRE symbol (no splice seam),
+    # which trivially contains min(window_start)..max(window_end).
+    assert w["window_start"] == 0
+    assert w["window_end"] == 1144
     # The model can now see BOTH the declaration site and the usage.
     assert "const [researchCity" in w["numbered_broken"]
     assert "researchCountry.trim()" in w["numbered_broken"]
     assert w["total_clusters"] == 1
     assert any(e == "mw_span_collapse_built" for e, _ in seen)
+    assert any(e == "mw_span_collapse_snapped_full_symbol" for e, _ in seen)
 
 
 def test_span_excludes_neither_site_even_when_only_usage_changed():
@@ -138,6 +148,37 @@ def test_span_covers_whole_symbol_for_fully_scattered_windows():
 
 
 # ---------------------------------------------------------------------------
+# Round-5 shape: span ends mid-structure (tail excluded) → must snap to full
+# ---------------------------------------------------------------------------
+
+def test_span_ending_mid_structure_snaps_to_full_symbol():
+    """Regression for 3d9da3fd_round5: windows spanned 1–1054 of a 1147-line
+    JSX component. The 93-line tail held the closing braces, so a partial
+    re-emit invited the model to close open structures early and the splice
+    brace-rejected. The collapsed window must cover the WHOLE symbol so there
+    is no splice seam."""
+    code = _synthetic_component(total_lines=1147)
+    # The exact augmented windows logged in round 5 (1-indexed → 0-indexed).
+    aug = [(1, 117, 42), (168, 340, 2), (373, 431, 0), (518, 558, 0), (989, 1054, 0)]
+    windows = [
+        {"window_start": ws - 1, "window_end": we - 1, "changed_line_count": ch}
+        for ws, we, ch in aug
+    ]
+    seen, dlog = _events()
+    res = build_span_collapsed_window(windows, code, code, 20, dlog)
+    w = res[0]
+    assert w["window_start"] == 0
+    assert w["window_end"] == 1146
+    assert w["window_line_count"] == 1147
+    # The closing brace of the component is inside the window — no seam.
+    assert w["numbered_broken"].splitlines()[-1].endswith("}")
+    snap = [kw for e, kw in seen if e == "mw_span_collapse_snapped_full_symbol"]
+    assert len(snap) == 1
+    assert snap[0]["span_before_start"] == 1
+    assert snap[0]["span_before_end"] == 1054
+
+
+# ---------------------------------------------------------------------------
 # Window-dict contract: must plug into the single-window splice path (Path W)
 # ---------------------------------------------------------------------------
 
@@ -172,7 +213,8 @@ def test_span_clamps_out_of_range_end_to_broken_length():
     windows = [{"window_start": 1, "window_end": 999, "changed_line_count": 1}]
     w = build_span_collapsed_window(windows, code, code, 20, _noop_dlog)[0]
     assert w["window_end"] == 4  # clamped to len-1
-    assert w["window_start"] == 1
+    assert w["window_start"] == 0  # snapped to full symbol (round5 fix)
+    assert w["window_line_count"] == 5
 
 
 def test_span_never_raises_on_garbage():
