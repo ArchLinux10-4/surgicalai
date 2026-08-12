@@ -457,7 +457,94 @@ def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=Fa
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 2. Streamed tool-call delta accumulator
+# 2. Progress helpers (Agent / Ask / Plan real-time UX)
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Human progress lines when a native tool name first appears on the stream.
+TOOL_PROGRESS_LABELS = {
+    TOOL_WRITE_SURGICAL_EDIT: "Calling write_surgical_edit…",
+    TOOL_WRITE_NEW_FILE: "Calling write_new_file…",
+    TOOL_WRITE_EDIT_PLAN: "Calling write_edit_plan…",
+    TOOL_REQUEST_FILE: "Calling request_file…",
+    TOOL_REQUEST_SEARCH: "Calling request_search…",
+    TOOL_REQUEST_GITHUB: "Calling request_github…",
+    TOOL_REQUEST_HISTORY: "Calling request_history…",
+    TOOL_REPORT_BLOCKED: "Reporting blocked…",
+}
+
+
+def format_tool_call_progress(name: str) -> str:
+    """One-line progress string for a newly named tool call."""
+    n = (name or "").strip()
+    if not n:
+        return "Calling tool…"
+    if n in TOOL_PROGRESS_LABELS:
+        return TOOL_PROGRESS_LABELS[n]
+    return f"Calling {n.replace('_', ' ')}…"
+
+
+def extract_reasoning_delta(delta) -> str:
+    """Best-effort summarized reasoning text from a chat.completions delta.
+
+    xAI documents ``reasoning_content`` on the native SDK / Responses API.
+    Chat Completions may still surface it as an extra field — never raises.
+    """
+    if delta is None:
+        return ""
+    keys = ("reasoning_content", "reasoning")
+    try:
+        if isinstance(delta, dict):
+            for k in keys:
+                v = delta.get(k)
+                if isinstance(v, str) and v:
+                    return v
+        else:
+            for k in keys:
+                v = getattr(delta, k, None)
+                if isinstance(v, str) and v:
+                    return v
+            extra = getattr(delta, "model_extra", None) or getattr(
+                delta, "__pydantic_extra__", None)
+            if isinstance(extra, dict):
+                for k in keys:
+                    v = extra.get(k)
+                    if isinstance(v, str) and v:
+                        return v
+    except Exception:
+        return ""
+    return ""
+
+
+def summarize_translation_progress(tr) -> str:
+    """Short progress line after ``translate_tool_calls`` (empty if nothing)."""
+    if tr is None:
+        return ""
+    parts = []
+    try:
+        n_edits = len(getattr(tr, "edit_json_strings", None) or [])
+        n_new = len(getattr(tr, "new_file_json_strings", None) or [])
+        if n_edits:
+            parts.append(f"{n_edits} edit{'s' if n_edits != 1 else ''}")
+        if n_new:
+            parts.append(f"{n_new} new file{'s' if n_new != 1 else ''}")
+        if getattr(tr, "edit_plan", None) is not None:
+            n_plan = len(tr.edit_plan) if isinstance(tr.edit_plan, list) else 1
+            parts.append(f"plan ({n_plan} item{'s' if n_plan != 1 else ''})")
+        ctx = getattr(tr, "context_request", None)
+        if ctx is not None:
+            kind = ctx[0] if isinstance(ctx, (tuple, list)) and ctx else "context"
+            parts.append(f"fetching {kind}")
+        if getattr(tr, "blocked_reason", None):
+            parts.append("blocked")
+    except Exception:
+        return ""
+    if not parts:
+        return ""
+    return "Next: " + ", ".join(parts) + "…"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. Streamed tool-call delta accumulator
 # ─────────────────────────────────────────────────────────────────────────────
 
 class StreamedToolCallAccumulator:
@@ -470,6 +557,11 @@ class StreamedToolCallAccumulator:
     characters (and nothing else). Accumulation MUST be keyed on ``index`` —
     ``id`` is only present on the first fragment. Handles both SDK objects and
     plain dicts (used by tests). Never raises.
+
+    ``add_delta`` returns the list of tool names that became known for the
+    *first* time in this call (for real-time progress SSE). Empty list when
+    nothing new was named. Existing callers that ignore the return value are
+    unchanged.
     """
 
     def __init__(self, dlog=None, session_id="", user_id=""):
@@ -480,8 +572,9 @@ class StreamedToolCallAccumulator:
         self._order = []
 
     def add_delta(self, tool_calls_delta):
+        newly_named = []
         if not tool_calls_delta:
-            return
+            return newly_named
         for tc in tool_calls_delta:
             try:
                 idx = _get(tc, "index")
@@ -500,6 +593,8 @@ class StreamedToolCallAccumulator:
                 if fn is not None:
                     name = _get(fn, "name")
                     if name:
+                        if not entry["name"]:
+                            newly_named.append(name)
                         entry["name"] = name
                     args = _get(fn, "arguments")
                     if args:
@@ -508,6 +603,7 @@ class StreamedToolCallAccumulator:
                 _log(self._dlog, "grok_tc_accumulate_error",
                      session_id=self._session_id, user_id=self._user_id,
                      error_type=type(e).__name__, error=str(e)[:200])
+        return newly_named
 
     def has_calls(self):
         return bool(self._by_index)
@@ -533,7 +629,7 @@ class StreamedToolCallAccumulator:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 3. Translator: completed tool calls -> pipeline producer shapes
+# 4. Translator: completed tool calls -> pipeline producer shapes
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TranslationResult:

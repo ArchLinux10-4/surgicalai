@@ -38,9 +38,10 @@ class _TCDelta:
 
 
 class _Delta:
-    def __init__(self, content=None, tool_calls=None):
+    def __init__(self, content=None, tool_calls=None, reasoning_content=None):
         self.content = content
         self.tool_calls = tool_calls
+        self.reasoning_content = reasoning_content
 
 
 class _Choice:
@@ -266,3 +267,52 @@ def test_native_loop_round_cap_yields_budget_message():
     tokens = [e["content"] for e in events if e["type"] == "token"]
     assert len(tokens) == 1
     assert "lookup budget" in tokens[0]
+
+
+def test_native_loop_emits_tool_named_and_reasoning_progress():
+    """Real-time UX: reasoning deltas → thinking_*; tool name → progress."""
+    search_args = json.dumps({"terms": ["login"], "reason": "find auth"})
+    rounds = [
+        [
+            _Chunk(_Delta(reasoning_content="I should search for login.")),
+            _Chunk(_Delta(tool_calls=[
+                _TCDelta(0, id="call_1", name="request_search", arguments=search_args)])),
+            _Chunk(finish_reason="tool_calls"),
+        ],
+        [
+            _Chunk(_Delta(content="Auth is in login.py.")),
+            _Chunk(finish_reason="stop"),
+        ],
+    ]
+    call_log = []
+    events_log = []
+
+    def _fake_chat_create(client, model=None, messages=None, temperature=None,
+                          tools=None, stream=None):
+        call_log.append(1)
+        return rounds[len(call_log) - 1]
+
+    def _dlog(event, **kw):
+        events_log.append(event)
+
+    agen = gapn.run_grok_ask_plan_native_stream(
+        client=object(), chat_model="grok-4.5",
+        all_messages=[{"role": "user", "content": "How does login work?"}],
+        mode="ask", gh_nat_enabled=False, gh_known_repos=[],
+        symbol_maps_by_name={}, file_content_lookup={},
+        execute_tool_round_fn=lambda **_kw: ["hit"],
+        chat_create_fn=_fake_chat_create, iter_chunks_fn=_iter_chunks_fn,
+        max_rounds=24, deadline_s=480, session_id="s", user_id="u",
+        dlog=_dlog,
+    )
+    events = _sse_events(_drain(agen))
+    types = [e["type"] for e in events]
+    assert "thinking_start" in types
+    assert "thinking" in types
+    assert "thinking_end" in types
+    progress = [e["content"] for e in events if e["type"] == "progress"]
+    assert any("request_search" in p for p in progress)
+    assert any("Next:" in p or "Looking at the code" in p for p in progress)
+    assert "grok_agent_tool_named" in events_log
+    assert "grok_agent_reasoning_delta" in events_log
+    assert "grok_agent_tool_progress" in events_log
