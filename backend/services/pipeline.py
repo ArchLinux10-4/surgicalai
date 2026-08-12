@@ -5635,6 +5635,74 @@ def _apply_snippet_by_lines(
     return full_new, True, f"line-number-splice:{edit_start_line}-{edit_end_line}{_clamp_tag}"
 
 
+def should_try_path_l_linesplice(
+    *,
+    accepted,
+    has_new_code: bool,
+    has_old_code: bool,
+    has_edit_lines: bool,
+    has_winfo: bool,
+    windowed_attempted: bool,
+) -> bool:
+    """True when Path L (edit_start/end_line splice) should run.
+
+    Runs on the classic un-windowed path, AND as a fallthrough when Path W
+    was attempted but did not accept — so a surgical edit_start_line payload
+    is not discarded after a full-window fragment reject (3d9da3fd_round6).
+    """
+    if accepted is not None:
+        return False
+    if not has_new_code or has_old_code or not has_edit_lines:
+        return False
+    return (not has_winfo) or windowed_attempted
+
+
+def _apply_correction_line_splice(
+    symbol_code: str,
+    symbol_start_line: int,
+    edit_start_line: int,
+    edit_end_line: int,
+    new_code: str,
+    *,
+    prefer_symbol_relative: bool = False,
+):
+    """Apply a correction ``edit_start_line``/``edit_end_line`` splice.
+
+    Windowed correction prompts number lines in *symbol-relative* space
+    (line 1 = first line of the symbol). Non-windowed / resolution prompts
+    use *absolute file* line numbers. Models emit either, so we try both
+    interpretations: the preferred numbering first, then the other.
+
+    Proven necessary (session 3d9da3fd_round6): after full-symbol collapse,
+    Sonnet returned a valid 6-line surgical edit with ``edit_start_line`` /
+    ``edit_end_line`` matching the window numbering. Path W fragment-rejected
+    the 6-line payload as a full-window replacement, and Path L was gated off
+    because ``_winfo`` was set — discarding the heal. Falling through to this
+    helper with ``prefer_symbol_relative=True`` lands the surgical fix.
+
+    Returns ``(full_new_code, ok, reason, numbering_mode)``.
+    """
+    attempts = []
+    if prefer_symbol_relative:
+        attempts.append(("symbol_relative", 1))
+        if (symbol_start_line or 1) != 1:
+            attempts.append(("absolute_file", symbol_start_line or 1))
+    else:
+        attempts.append(("absolute_file", symbol_start_line or 1))
+        if (symbol_start_line or 1) != 1:
+            attempts.append(("symbol_relative", 1))
+
+    last_reason = "no_attempts"
+    for mode, start in attempts:
+        full, ok, reason = _apply_snippet_by_lines(
+            symbol_code, start, edit_start_line, edit_end_line, new_code
+        )
+        if ok:
+            return full, True, reason, mode
+        last_reason = reason
+    return None, False, last_reason, attempts[-1][0] if attempts else "none"
+
+
 # ---------------------------------------------------------------------------
 # Helper: _number_lines  (prepend 1-indexed line numbers to code)
 # ---------------------------------------------------------------------------
@@ -24525,24 +24593,41 @@ async def run_natural_pipeline_stream(
                                   new_code_len=len(corrected_code),
                                   note="windowed prompt sent but model used old_code/new_code format — trying Path 2")
 
-                        # ── Path L: edit_start_line/edit_end_line splice (un-windowed) ──
+                        # ── Path L: edit_start_line/edit_end_line splice ──
                         # Claude is explicitly told it MAY answer a correction with
                         # edit_start_line/edit_end_line + new_code instead of a full
                         # symbol or an old_code/new_code snippet (this is the SAME
                         # format the main resolution path already supports via
-                        # _apply_snippet_by_lines — see line ~4432 and its call site
-                        # at ~17674). Before this fix, this branch of the correction
-                        # applier never read edit_start_line/edit_end_line at all, so
-                        # a correction using this format fell straight through to
-                        # Path 3 (full-symbol replacement), which fragment-rejected
-                        # the small snippet and the correction was silently dropped
-                        # even though it was a perfectly valid targeted edit.
-                        # Only applies when NOT windowed — Path W already owns the
-                        # windowed-splice case above.
-                        if (accepted is None and not _winfo and not _windowed_path_attempted
-                                and corrected_code and not corrected_old
-                                and corrected_edit_start_line and corrected_edit_end_line):
+                        # _apply_snippet_by_lines). Before this fix, this branch of
+                        # the correction applier never read edit_start_line/
+                        # edit_end_line at all, so a correction using this format
+                        # fell straight through to Path 3 (full-symbol replacement),
+                        # which fragment-rejected the small snippet and the
+                        # correction was silently dropped even though it was a
+                        # perfectly valid targeted edit.
+                        #
+                        # Windowed fallthrough (session 3d9da3fd_round6):
+                        # When Path W is active (_winfo set) it OWNS the attempt
+                        # first. But if Path W rejects (fragment / brace) AND the
+                        # model also provided edit_start_line/edit_end_line, fall
+                        # through here — that is exactly the surgical-fix shape
+                        # Sonnet produces for a 1-line deps bug when asked to
+                        # re-emit a 1147-line full-symbol window. Gating on
+                        # `not _winfo` discarded the heal. Prefer symbol-relative
+                        # numbering when coming from a windowed prompt (those
+                        # prompts number 1..N inside the symbol).
+                        if should_try_path_l_linesplice(
+                                accepted=accepted,
+                                has_new_code=bool(corrected_code),
+                                has_old_code=bool(corrected_old),
+                                has_edit_lines=bool(
+                                    corrected_edit_start_line and corrected_edit_end_line
+                                ),
+                                has_winfo=bool(_winfo),
+                                windowed_attempted=_windowed_path_attempted,
+                        ):
                             _sym_abs_start = getattr(change_shells[idx]["symbol"], "start_line", 1) or 1
+                            _prefer_rel = bool(_winfo and _windowed_path_attempted)
                             try:
                                 _isl_corr = int(corrected_edit_start_line)
                                 _iel_corr = int(corrected_edit_end_line)
@@ -24559,8 +24644,12 @@ async def run_natural_pipeline_stream(
                                            "falling through to Path 2/3")
 
                             if _isl_corr is not None and _iel_corr is not None:
-                                _ls_full, _ls_ok, _ls_reason = _apply_snippet_by_lines(
-                                    _sym_code, _sym_abs_start, _isl_corr, _iel_corr, corrected_code
+                                _ls_full, _ls_ok, _ls_reason, _ls_mode = (
+                                    _apply_correction_line_splice(
+                                        _sym_code, _sym_abs_start,
+                                        _isl_corr, _iel_corr, corrected_code,
+                                        prefer_symbol_relative=_prefer_rel,
+                                    )
                                 )
 
                                 _dlog("correction_linesplice_attempt",
@@ -24569,6 +24658,9 @@ async def run_natural_pipeline_stream(
                                       symbol=change_shells[idx]["symbol"].name,
                                       edit_start_line=_isl_corr, edit_end_line=_iel_corr,
                                       sym_abs_start=_sym_abs_start,
+                                      numbering_mode=_ls_mode,
+                                      prefer_symbol_relative=_prefer_rel,
+                                      windowed_fallthrough=_prefer_rel,
                                       ok=_ls_ok, reason=_ls_reason,
                                       new_code_len=len(corrected_code),
                                       sym_code_len=len(_sym_code))
@@ -24582,7 +24674,12 @@ async def run_natural_pipeline_stream(
                                               retry_round=_qa_retry_round, idx=idx,
                                               symbol=change_shells[idx]["symbol"].name,
                                               edit_start_line=_isl_corr, edit_end_line=_iel_corr,
+                                              numbering_mode=_ls_mode,
+                                              windowed_fallthrough=_prefer_rel,
                                               result_lines=len(_ls_full.splitlines()))
+                                        # Clear any widen hint — a surgical Path L
+                                        # land is a successful correction for this idx.
+                                        _window_widen_hint.pop(idx, None)
                                     else:
                                         _dlog("correction_linesplice_fragment_rejected",
                                               session_id=session_id, user_id=user_id,
@@ -24600,9 +24697,13 @@ async def run_natural_pipeline_stream(
                                           symbol=change_shells[idx]["symbol"].name,
                                           edit_start_line=_isl_corr, edit_end_line=_iel_corr,
                                           sym_abs_start=_sym_abs_start,
+                                          numbering_mode=_ls_mode,
+                                          prefer_symbol_relative=_prefer_rel,
                                           reason=_ls_reason,
                                           note="edit_start_line/edit_end_line out of bounds for "
-                                               "this symbol — falling through to Path 2/3")
+                                               "this symbol under both absolute and "
+                                               "symbol-relative numbering — falling through "
+                                               "to Path 2/3")
 
                         # ── Path 2: old_code/new_code snippet splice (fallback) ──
                         _file_level_fixed = False
