@@ -5487,6 +5487,68 @@ def _apply_fuzzy_splice(text: str, start_idx: int, end_idx: int, new_code: str) 
 
 
 # ---------------------------------------------------------------------------
+# Helper: line-splice content-loss guard (session 3d9da3fd_round3)
+# ---------------------------------------------------------------------------
+# Proven: model emitted edit_start_line=1693 / edit_end_line=1822 (130-line
+# span) with an ~8-line new_code (useState block). plan_chain_update preferred
+# line_splice over a correct old_code match and deleted ~122 lines of the
+# symbol (file 123665→119144 chars). Reuse _mw_window_content_loss thresholds
+# so line-splice and multi-window correction share one definition of "too much
+# content lost".
+
+def _line_splice_would_lose_content(span_lines: int, new_code: str) -> bool:
+    """True when replacing ``span_lines`` with ``new_code`` would gut content.
+
+    Delegates entirely to ``_mw_window_content_loss`` (max_loss_ratio=0.40,
+    min_window_size=8) so thresholds stay in one place.
+    """
+    new_lines = len((new_code or "").splitlines()) if new_code else 0
+    return _mw_window_content_loss(span_lines, new_lines)
+
+
+def _plan_chain_splice_method(
+    span_lines: int,
+    new_code: str,
+    old_code: Optional[str],
+    file_content: str,
+) -> str:
+    """Decide how plan_chain_update should apply a line-targeted edit.
+
+    Returns one of:
+      * ``"line_splice"`` — span size is compatible with new_code
+      * ``"old_code_fallback"`` — span would lose content, but old_code matches
+      * ``"refuse"`` — span would lose content and no usable old_code
+
+    Pure decision helper so the round3 shape is unit-testable without the
+    full plan-execute loop.
+    """
+    if not _line_splice_would_lose_content(span_lines, new_code):
+        return "line_splice"
+    if old_code and file_content and old_code in file_content:
+        return "old_code_fallback"
+    return "refuse"
+
+
+def should_defer_no_fixes_for_collapse(
+    collapse_hint: dict,
+    bonus_used: bool,
+    retry_round: int,
+    max_retries: int,
+) -> bool:
+    """True when zero-fixes on the final normal round must CONTINUE (not break)
+    so the bonus brace-collapse round can run.
+
+    Proven unreachable without this (3d9da3fd_round3): hint recorded on round 1,
+    then qa_retry_no_fixes_breaking exited before bonus round 2.
+    """
+    if retry_round < max_retries - 1:
+        return False
+    if bonus_used:
+        return False
+    return bool(any(collapse_hint.values()) if collapse_hint else False)
+
+
+# ---------------------------------------------------------------------------
 # Helper: _apply_snippet_by_lines  (Option B — line-number targeted edit)
 # ---------------------------------------------------------------------------
 
@@ -5539,6 +5601,26 @@ def _apply_snippet_by_lines(
             f"is out of bounds for symbol at file lines "
             f"{symbol_start_line}–{symbol_start_line + n - 1}. "
             f"Check the line numbers from the search results."
+        )
+
+    # ── Content-loss guard (session 3d9da3fd_round3) ──────────────
+    # Reject a splice that would replace a large span with a tiny
+    # new_code (e.g. 130 lines → 8). Callers fall back to old_code
+    # matching or refuse rather than gutting the symbol.
+    span_lines = rel_end - rel_start + 1
+    if _line_splice_would_lose_content(span_lines, new_code):
+        new_lines = len((new_code or "").splitlines()) if new_code else 0
+        _dlog(
+            "line_splice_content_loss_rejected",
+            edit_start_line=edit_start_line,
+            edit_end_line=edit_end_line,
+            span_lines=span_lines,
+            new_code_lines=new_lines,
+            note="line-number splice would delete too much content vs new_code — "
+                 "refusing; caller should fall back to old_code or leave unchanged",
+        )
+        return None, False, (
+            f"line_splice_content_loss:span={span_lines},new={new_lines}"
         )
 
     before = "".join(lines[:rel_start])
@@ -19842,27 +19924,74 @@ async def run_natural_pipeline_stream(
                                 _c_oc = _parsed.get("old_code")
                                 _c_lines = p_content.splitlines(keepends=True)
                                 _chain_ok = False
+                                _chain_method = None
                                 if _c_esl and _c_eel and _c_nc is not None:
                                     # Line-number splice at file level
                                     _si = int(_c_esl) - 1  # 0-based
                                     _ei = int(_c_eel)       # exclusive
-                                    if 0 <= _si < len(_c_lines) and _ei <= len(_c_lines):
-                                        _repl = _c_nc
-                                        if _repl and not _repl.endswith("\n"):
-                                            _repl += "\n"
-                                        _new_content = (
-                                            "".join(_c_lines[:_si])
-                                            + _repl
-                                            + "".join(_c_lines[_ei:])
+                                    if 0 <= _si < len(_c_lines) and _ei <= len(_c_lines) and _ei > _si:
+                                        _span_lines = _ei - _si
+                                        _chain_method = _plan_chain_splice_method(
+                                            _span_lines, _c_nc, _c_oc, p_content
                                         )
-                                        file_content_lookup_stream[p_filename] = _new_content
+                                        if _chain_method == "line_splice":
+                                            _repl = _c_nc
+                                            if _repl and not _repl.endswith("\n"):
+                                                _repl += "\n"
+                                            _new_content = (
+                                                "".join(_c_lines[:_si])
+                                                + _repl
+                                                + "".join(_c_lines[_ei:])
+                                            )
+                                            file_content_lookup_stream[p_filename] = _new_content
+                                            _chain_ok = True
+                                        elif _chain_method == "old_code_fallback":
+                                            # Span would gut the file; apply the
+                                            # correct old_code match instead
+                                            # (round3: 130→8 would have deleted
+                                            # clearConversation / useEffects).
+                                            _dlog(
+                                                "plan_chain_line_splice_content_loss",
+                                                session_id=session_id,
+                                                user_id=user_id,
+                                                filename=p_filename,
+                                                symbol=p_symbol,
+                                                edit_start_line=int(_c_esl),
+                                                edit_end_line=int(_c_eel),
+                                                span_lines=_span_lines,
+                                                new_code_lines=len((_c_nc or "").splitlines()),
+                                                fallback="old_code_replace",
+                                            )
+                                            file_content_lookup_stream[p_filename] = p_content.replace(
+                                                _c_oc, _c_nc, 1
+                                            )
+                                            _chain_ok = True
+                                        else:
+                                            # refuse — leave file unchanged
+                                            _dlog(
+                                                "plan_chain_line_splice_content_loss",
+                                                session_id=session_id,
+                                                user_id=user_id,
+                                                filename=p_filename,
+                                                symbol=p_symbol,
+                                                edit_start_line=int(_c_esl),
+                                                edit_end_line=int(_c_eel),
+                                                span_lines=_span_lines,
+                                                new_code_lines=len((_c_nc or "").splitlines()),
+                                                fallback="refuse",
+                                                note="no usable old_code — leaving file unchanged "
+                                                     "so resolution can retry Option A",
+                                            )
+                                if (not _chain_ok) and _c_oc and _c_nc is not None and _c_oc in p_content:
+                                    # old_code string replacement (also reached when
+                                    # line fields were absent, or refused above without
+                                    # already taking the old_code_fallback branch)
+                                    if _chain_method != "old_code_fallback":
+                                        file_content_lookup_stream[p_filename] = p_content.replace(
+                                            _c_oc, _c_nc, 1
+                                        )
                                         _chain_ok = True
-                                elif _c_oc and _c_nc is not None and _c_oc in p_content:
-                                    # old_code string replacement
-                                    file_content_lookup_stream[p_filename] = p_content.replace(
-                                        _c_oc, _c_nc, 1
-                                    )
-                                    _chain_ok = True
+                                        _chain_method = "old_code_replace"
                                 # Tag the edit block with its generation
                                 # sequence so resolution preserves order.
                                 # Chained edits MUST be applied in generation
@@ -19879,7 +20008,15 @@ async def run_natural_pipeline_stream(
                                 _dlog("plan_chain_update",
                                       session_id=session_id, user_id=user_id,
                                       filename=p_filename, symbol=p_symbol,
-                                      method="line_splice" if (_c_esl and _c_eel) else "old_code_replace",
+                                      method=(
+                                          "old_code_fallback_after_splice_loss"
+                                          if _chain_method == "old_code_fallback"
+                                          else (
+                                              "line_splice"
+                                              if _chain_method == "line_splice"
+                                              else (_chain_method or "none")
+                                          )
+                                      ),
                                       applied=_chain_ok,
                                       chain_seq=plan_idx if _chain_ok else None,
                                       file_len_before=len(p_content),
@@ -20970,15 +21107,52 @@ async def run_natural_pipeline_stream(
 
                         _accum_base = _symbol_accum.get(_akey, symbol.code)
                         _sym_abs_start = getattr(symbol, "start_line", 1) or 1
-                        full_new, ok_snip, snip_reason = _apply_snippet_by_lines(
-                            _accum_base, _sym_abs_start,
-                            _isl, _iel,
-                            new_code,
-                        )
+                        # ── Content-loss downgrade (session 3d9da3fd_round3) ──
+                        # When the line span would gut the symbol relative to
+                        # new_code (e.g. 130 lines → 8) but a correct old_code
+                        # is present, force Option A (string match) instead of
+                        # trusting the bad span.
+                        _optb_used_olda = False
+                        _span_for_loss = max(0, int(_iel) - int(_isl) + 1)
+                        if (
+                            old_code
+                            and _line_splice_would_lose_content(_span_for_loss, new_code)
+                        ):
+                            _dlog(
+                                "optb_downgrade_to_olda_content_loss",
+                                session_id=session_id,
+                                user_id=user_id,
+                                filename=filename,
+                                symbol=symbol_name,
+                                edit_start_line=_isl,
+                                edit_end_line=_iel,
+                                span_lines=_span_for_loss,
+                                new_code_lines=len((new_code or "").splitlines()),
+                                note="line span would lose too much content — "
+                                     "forcing Option A old_code match",
+                            )
+                            full_new, ok_snip, snip_reason = _apply_snippet_to_symbol(
+                                _accum_base, old_code, new_code
+                            )
+                            _optb_used_olda = bool(ok_snip)
+                            if not ok_snip:
+                                full_new, ok_snip, snip_reason = _apply_snippet_by_lines(
+                                    _accum_base, _sym_abs_start,
+                                    _isl, _iel,
+                                    new_code,
+                                )
+                        else:
+                            full_new, ok_snip, snip_reason = _apply_snippet_by_lines(
+                                _accum_base, _sym_abs_start,
+                                _isl, _iel,
+                                new_code,
+                            )
                         if ok_snip:
                             # Record the applied range so subsequent edits to
-                            # this symbol can detect overlaps.
-                            _ln_applied_ranges.setdefault(_akey, []).append((_isl, _iel))
+                            # this symbol can detect overlaps — only for real
+                            # line-number splices, not old_code downgrades.
+                            if not _optb_used_olda:
+                                _ln_applied_ranges.setdefault(_akey, []).append((_isl, _iel))
                             edit_data["new_code"] = full_new
                             edit_data.pop("old_code", None)
                             edit_data.pop("edit_start_line", None)
@@ -25616,6 +25790,27 @@ async def run_natural_pipeline_stream(
                       retry_round=_qa_retry_round,
                       rounds_remaining=MAX_QA_RETRIES - _qa_retry_round - 1)
                 if _qa_retry_round >= MAX_QA_RETRIES - 1:
+                    # Pending brace-collapse hint needs the bonus iteration
+                    # (range(MAX_QA_RETRIES + 1)); don't strand it here.
+                    # Proven unreachable without this: 3d9da3fd_round3 —
+                    # hint recorded on round 1, then this break fired before
+                    # qa_retry_bonus_collapse_round / mw_span_collapse_built.
+                    if should_defer_no_fixes_for_collapse(
+                        _mw_collapse_hint, _mw_bonus_round_used,
+                        _qa_retry_round, MAX_QA_RETRIES,
+                    ):
+                        _dlog(
+                            "qa_retry_no_fixes_defer_for_collapse",
+                            session_id=session_id, user_id=user_id,
+                            retry_round=_qa_retry_round,
+                            collapse_pending=[
+                                i for i, v in _mw_collapse_hint.items() if v
+                            ],
+                            note="zero fixes on final normal round but collapse "
+                                 "hint pending — continue so bonus collapse "
+                                 "round can run",
+                        )
+                        continue
                     _dlog("qa_retry_no_fixes_breaking", session_id=session_id, user_id=user_id,
                           retry_round=_qa_retry_round)
                     break  # No code changed AND out of rounds — stop retrying
