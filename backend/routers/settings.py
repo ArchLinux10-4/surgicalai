@@ -261,13 +261,23 @@ def get_available_models(request: Request):
     # `provider` is "grok", NOT "openai", so the frontend mode-lock check in
     # ChatPanel.tsx (`const isGpt = m.provider === 'openai'`) does not catch
     # these — Grok intentionally gets the same access GPT has today, no new
-    # restriction. Only the confirmed shipping model id is listed.
+    # restriction.
+    # Pricing (docs.x.ai/developers/models, <200k prompt): both grok-4.5 and
+    # grok-4.6 are $2.00 input / $6.00 output per 1M tokens — same list price.
+    # Cached input differs slightly (4.5 $0.30 vs 4.6 $0.50). Relative to this
+    # app's cost scale: tier 2 (same as Sonnet / GPT-5.5 / Terra), well below
+    # Opus premium tier 4 ($10/$50). Keep both at cost=2.
     grok_models = []
     has_grok = bool(_resolve_api_key(user_id, "grok"))
     if has_grok:
         grok_models = [
             {"id": "grok-4.5", "name": "Grok 4.5", "role": "architect",
-             "description": "xAI reasoning model — 500K context, strong at agentic coding",
+             "description": "xAI reasoning — 500K context ($2/$6 per M tokens)",
+             "provider": "grok", "cost": 2},
+            # Confirmed shipping id: docs.x.ai/developers/models/grok-4.6
+            # (dot, not hyphen — grok-4-6 is rejected by xAI).
+            {"id": "grok-4.6", "name": "Grok 4.6", "role": "architect",
+             "description": "xAI frontier coding/agents — 500K context ($2/$6, same as 4.5)",
              "provider": "grok", "cost": 2},
         ]
     _dlog("settings_models_grok_gate", user_id=user_id, has_grok=has_grok,

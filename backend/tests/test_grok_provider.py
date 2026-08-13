@@ -39,7 +39,8 @@ def _pipeline_src() -> str:
 @pytest.mark.parametrize("model", [
     "grok-4.5",
     "grok-4.5-latest",
-    "grok-build-latest" if False else "grok-4",   # only "grok-" prefixed ids match
+    "grok-4.6",
+    "grok-4",   # only "grok-" prefixed ids match
     "grok-code-fast-1",
 ])
 def test_is_grok_model_true_for_grok_ids(model):
@@ -126,8 +127,12 @@ def test_grok_base_url_constant_is_xai():
 
 
 def test_grok_default_model_is_the_confirmed_shipping_id():
-    """Only research-confirmed ids may be registered — nothing invented."""
+    """Default stays 4.5; 4.6 is also a confirmed selectable id."""
     assert gp.GROK_DEFAULT_MODEL == "grok-4.5"
+    assert "grok-4.5" in gp.GROK_CONFIRMED_MODELS
+    assert "grok-4.6" in gp.GROK_CONFIRMED_MODELS
+    # xAI rejects the hyphenated form (docs / migration notes).
+    assert "grok-4-6" not in gp.GROK_CONFIRMED_MODELS
 
 
 def test_get_grok_client_uses_xai_base_url(monkeypatch):

@@ -28,10 +28,10 @@ before; when the model is GPT, the pre-existing ``gpt_correction.py`` path runs
 exactly as before. This module is only ever reached on a third, previously
 dead branch.
 
-Model: ``"grok-4.5"`` — the confirmed shipping xAI model id
-(docs.x.ai/developers/models/grok-4.5), also registered in
-``routers/settings.py``'s model list and matched by
-``services/grok_provider.py:_is_grok_model``.
+Model: caller-supplied Grok id (``grok-4.5`` or ``grok-4.6`` — confirmed at
+docs.x.ai/developers/models). Default fallback is
+``services.grok_provider.GROK_DEFAULT_MODEL`` (``grok-4.5``). Also listed in
+``routers/settings.py`` and matched by ``services/grok_provider.py:_is_grok_model``.
 
 DESIGN RULES (mirrors services/gpt_correction.py / services/gpt_reasoning.py):
   - Dependency injection only: ``chat_create``, ``dlog``, ``get_setting`` are
