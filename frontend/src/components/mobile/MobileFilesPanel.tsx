@@ -9,6 +9,7 @@ import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import type { SessionFile } from '../../types'
 import { FileFilterTabs, NewBadge, matchesFileFilter, fileCounts, isCreatedFile } from '../../lib/fileClassify'
+import { relativeTimeFromServer } from '../../lib/relativeTime'
 
 const EXT_COLORS: Record<string, string> = {
   ts: '#3178c6', tsx: '#3178c6', js: '#f7df1e', jsx: '#61dafb',
@@ -35,14 +36,7 @@ function syncStatus(file: SessionFile): 'synced' | 'modified' | 'never' {
 }
 
 function relativeTime(dateStr?: string): string {
-  if (!dateStr) return ''
-  const diff = Date.now() - new Date(dateStr).getTime()
-  const m = Math.floor(diff / 60000)
-  if (m < 1)  return 'just now'
-  if (m < 60) return `${m}m ago`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h ago`
-  return `${Math.floor(h / 24)}d ago`
+  return relativeTimeFromServer(dateStr)
 }
 
 export function MobileFilesPanel() {

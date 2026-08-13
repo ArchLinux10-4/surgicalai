@@ -4,6 +4,7 @@ import type { SessionFile } from '../types'
 import { GitHubCommitModal } from './GitHubCommitModal'
 import { useAppStore } from '../stores/appStore'
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile, DiffStatsBadge } from '../lib/fileClassify'
+import { parseServerUtc, relativeTimeFromServer } from '../lib/relativeTime'
 import { GitHub } from '@mui/icons-material';
 import { DownloadSessionButton } from './DownloadSessionButton'
 
@@ -14,21 +15,6 @@ interface SessionFilesTrayProps {
   onAddFiles?: () => void
   /** Removes a file. When omitted, the per-row × and "Clear all" are hidden. */
   onRemove?: (fileId: string) => void
-}
-
-function relativeTime(dateStr?: string): string {
-  if (!dateStr) return ''
-  const date = new Date(dateStr)
-  const now = new Date()
-  const diffMs = now.getTime() - date.getTime()
-  const diffSec = Math.floor(diffMs / 1000)
-  if (diffSec < 60) return 'just now'
-  const diffMin = Math.floor(diffSec / 60)
-  if (diffMin < 60) return `${diffMin}m ago`
-  const diffHr = Math.floor(diffMin / 60)
-  if (diffHr < 24) return `${diffHr}h ago`
-  const diffDay = Math.floor(diffHr / 24)
-  return `${diffDay}d ago`
 }
 
 // Theme-safe language badge classes (semantic tokens — adapt to light + dark)
@@ -50,8 +36,8 @@ function langColor(lang: string): string {
 // sync status: 'synced' | 'modified' | 'never'
 function syncStatus(file: SessionFile): 'synced' | 'modified' | 'never' {
   if (!file.github_pushed_at) return 'never'
-  const pushed = new Date(file.github_pushed_at).getTime()
-  const updated = file.updated_at ? new Date(file.updated_at).getTime() : 0
+  const pushed = parseServerUtc(file.github_pushed_at)?.getTime() ?? 0
+  const updated = parseServerUtc(file.updated_at)?.getTime() ?? 0
   // Give 2s grace period to avoid race conditions
   return updated > pushed + 2000 ? 'modified' : 'synced'
 }
@@ -256,7 +242,7 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
                         {file.github_meta && status === 'synced' && (
                           <span className="flex items-center gap-1 text-[9px] font-medium px-1.5 py-0.5 bg-accent/10 text-accent border border-accent/20 rounded-md">
                             <span className="w-1.5 h-1.5 rounded-full bg-accent inline-block" />
-                            Synced · {relativeTime(file.github_pushed_at)}
+                            Synced · {relativeTimeFromServer(file.github_pushed_at)}
                           </span>
                         )}
                         {file.github_meta && status === 'modified' && (
@@ -280,7 +266,7 @@ export function SessionFilesTray({ sessionId, sessionFiles, onAddFiles, onRemove
                         )}
                         <span className="text-[11px] text-muted/40">·</span>
                         <span className="text-[11px] text-muted/60" title={timestamp}>
-                          {isModified ? 'Last edit ' : 'Uploaded '}{relativeTime(timestamp)}
+                          {isModified ? 'Last edit ' : 'Uploaded '}{relativeTimeFromServer(timestamp)}
                         </span>
                       </div>
                     </div>
