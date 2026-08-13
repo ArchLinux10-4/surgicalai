@@ -533,6 +533,10 @@ LARGE_FILE_WINDOW    = 500  # files above this get windowed context instead of f
 # duplicated signatures and truncated bodies. Cap focused windows to this size
 # and center on the change-description terms inside the symbol.
 PLAN_EXECUTE_MAX_WINDOW = 300
+# Extra lines a mega-window may grow by to pull in a declaration that sits
+# just outside the term-focused slice (session 3d9da3fd_round7: researchDeep
+# at L1804, send() window 1811–2110 — miss by 7 lines → ReferenceError).
+PLAN_EXECUTE_DECL_EXPAND_BUDGET = 200
 
 
 def compute_plan_execute_window(
@@ -634,6 +638,220 @@ def compute_plan_execute_window(
     out.update(
         ws=ws, we=we, reason="mega_symbol_term_focus", capped=True,
         center_line=best_line, terms=terms[:12], term_hit=term_hit,
+    )
+    return out
+
+
+def _description_idents(change_description: str) -> list[str]:
+    """Camel/snake identifiers from a plan-item description (preserve case)."""
+    skip = {
+        "the", "and", "for", "add", "with", "from", "into", "that", "this",
+        "file", "code", "edit", "change", "update", "function", "const",
+        "return", "true", "false", "null", "undefined", "async", "await",
+        "when", "then", "after", "before", "near", "other", "existing",
+        "extend", "accept", "param", "forward", "request", "body", "state",
+        "alongside", "reset", "pass", "through", "flag", "array", "avoid",
+        "stale", "closure", "signature", "compute", "explicit", "value",
+        "survives", "wizard", "race", "mirroring", "pattern", "toggle",
+        "switch", "info", "tooltip", "using", "classes", "standard", "mode",
+    }
+    out: list[str] = []
+    seen = set()
+    for tok in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", change_description or ""):
+        if tok.lower() in skip:
+            continue
+        # Prefer real identifiers (camelCase / snake / Pascal), not prose.
+        if not re.search(r"[A-Z_]", tok[1:]) and tok[0].islower() and "_" not in tok:
+            # all-lowercase single word like "send" — keep short known API names
+            if tok.lower() not in {"send", "fetch", "map", "set"}:
+                continue
+        key = tok.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tok)
+    return out
+
+
+def _camel_token_permutations(ident: str) -> list[str]:
+    """Reorder camelCase tokens: deepResearch → researchDeep (round7 mismatch)."""
+    if not ident or "_" in ident:
+        return []
+    parts = re.findall(r"[A-Z]?[a-z]+|[A-Z]+(?![a-z])|[0-9]+", ident)
+    if len(parts) < 2 or len(parts) > 4:
+        return []
+    from itertools import permutations
+    out: list[str] = []
+    seen = {ident}
+    for perm in permutations(parts):
+        cand = "".join(
+            (p.lower() if i == 0 else (p[:1].upper() + p[1:].lower()))
+            for i, p in enumerate(perm)
+        )
+        if cand in seen:
+            continue
+        seen.add(cand)
+        out.append(cand)
+    return out
+
+
+def _find_decl_lines_in_symbol(
+    file_lines: list,
+    symbol_start: int,
+    symbol_end: int,
+    ident: str,
+) -> list[int]:
+    """1-indexed file lines inside the symbol that declare ``ident``.
+
+    Matches React/JS declaration shapes proven in round7:
+      const [researchDeep, setResearchDeep] = useState(...)
+      const researchDeep = ...
+      function researchDeep(...)
+    """
+    if not ident or not file_lines:
+        return []
+    ss = max(1, int(symbol_start))
+    se = min(len(file_lines), max(ss, int(symbol_end)))
+    # word-bound declaration patterns
+    pats = [
+        re.compile(rf"\bconst\s*\[\s*{re.escape(ident)}\s*,"),
+        re.compile(rf"\b(?:const|let|var)\s+{re.escape(ident)}\s*="),
+        re.compile(rf"\bfunction\s+{re.escape(ident)}\s*\("),
+        re.compile(rf"\b{re.escape(ident)}\s*=\s*useCallback\b"),
+        re.compile(rf"\b{re.escape(ident)}\s*=\s*useMemo\b"),
+        re.compile(rf"\b{re.escape(ident)}\s*=\s*useState\b"),
+    ]
+    hits = []
+    for abs_i in range(ss - 1, se):
+        line = file_lines[abs_i]
+        if any(p.search(line) for p in pats):
+            hits.append(abs_i + 1)  # 1-indexed
+    return hits
+
+
+def expand_plan_execute_window_for_declarations(
+    file_lines: list,
+    window: dict,
+    symbol_start: int,
+    symbol_end: int,
+    change_description: str = "",
+    expand_budget: int = PLAN_EXECUTE_DECL_EXPAND_BUDGET,
+) -> dict:
+    """Expand a capped mega-window so declaration sites stay reachable.
+
+    Proven failure (surgical_debug_3d9da3fd_round7.jsonl + Desktop/New files):
+      * Plan item 1 added ``const [researchDeep, ...] = useState(false)`` at
+        file L1804 (right after ``researchSourceInput``).
+      * Plan item "Extend send() … forward deepResearch in the request body"
+        opened a 300-line mega-window at L1811–2110 — **7 lines below** the
+        new declaration.
+      * Description named the API field ``deepResearch`` while state was
+        ``researchDeep``; without fuzzy token reorder the decl was invisible.
+      * The model invented undeclared ``deepResearch`` → QA score 2
+        (ReferenceError). Auto-correction then failed to heal.
+
+    Only expands when the window is already capped. Grows toward each missing
+    declaration by at most ``expand_budget`` total extra lines (never a full
+    symbol dump). Returns a new dict; never mutates ``window``.
+    """
+    if not window or not window.get("capped"):
+        return dict(window or {})
+    total = len(file_lines or [])
+    if total <= 0:
+        return dict(window)
+
+    ws = int(window["ws"])
+    we = int(window["we"])
+    try:
+        ss = max(1, int(symbol_start))
+        se = max(ss, int(symbol_end))
+    except (TypeError, ValueError):
+        return dict(window)
+
+    sym_ws = max(0, ss - 1)
+    sym_we = min(total, se)
+    idents = _description_idents(change_description)
+    # setResearchDeep → researchDeep
+    extra: list[str] = []
+    for tok in re.findall(r"\bset([A-Z][A-Za-z0-9_]*)\b", change_description or ""):
+        cand = tok[0].lower() + tok[1:] if tok else ""
+        if cand and cand.lower() not in {i.lower() for i in idents}:
+            extra.append(cand)
+    # deepResearch → also try researchDeep (exact round7 name mismatch)
+    for ident in list(idents) + list(extra):
+        for alt in _camel_token_permutations(ident):
+            if alt.lower() not in {i.lower() for i in idents} and alt.lower() not in {
+                e.lower() for e in extra
+            }:
+                extra.append(alt)
+    idents = idents + extra
+
+    pulled: list[dict] = []
+    seen_lines: set[int] = set()
+    for ident in idents:
+        for decl_1 in _find_decl_lines_in_symbol(file_lines, ss, se, ident):
+            if decl_1 in seen_lines:
+                continue
+            decl0 = decl_1 - 1
+            if ws <= decl0 < we:
+                continue  # already visible
+            if not (sym_ws <= decl0 < sym_we):
+                continue
+            seen_lines.add(decl_1)
+            pulled.append({"ident": ident, "line": decl_1})
+            # Expand toward the declaration with a small pad.
+            pad = 5
+            if decl0 < ws:
+                ws = max(sym_ws, decl0 - pad)
+            else:
+                we = min(sym_we, decl0 + 1 + pad)
+
+    if not pulled:
+        return dict(window)
+
+    # Enforce expand budget: if we grew too far, shrink from the side opposite
+    # the primary (first) pulled declaration while keeping all pulled lines.
+    base_size = int(window["we"]) - int(window["ws"])
+    new_size = we - ws
+    max_size = base_size + max(0, int(expand_budget))
+    if new_size > max_size:
+        # Keep every pulled decl; trim from the far edge.
+        must_lo = min(p["line"] - 1 for p in pulled)
+        must_hi = max(p["line"] - 1 for p in pulled) + 1
+        # Prefer keeping original center when possible.
+        center0 = int(window.get("center_line", (ws + we) // 2 + 1)) - 1
+        # Start from must-range, grow toward center up to max_size.
+        ws = must_lo
+        we = must_hi
+        # Expand toward center / original window until budget filled.
+        while (we - ws) < max_size and (ws > sym_ws or we < sym_we):
+            grew = False
+            if center0 < ws and ws > sym_ws and (we - ws) < max_size:
+                ws -= 1
+                grew = True
+            if center0 >= we and we < sym_we and (we - ws) < max_size:
+                we += 1
+                grew = True
+            if not grew:
+                # Fill remaining budget from either edge.
+                if ws > sym_ws and (we - ws) < max_size:
+                    ws -= 1
+                    grew = True
+                if we < sym_we and (we - ws) < max_size:
+                    we += 1
+                    grew = True
+            if not grew:
+                break
+        ws = max(sym_ws, ws)
+        we = min(sym_we, we)
+
+    out = dict(window)
+    out.update(
+        ws=ws,
+        we=we,
+        reason="mega_symbol_term_focus_decl_expanded",
+        decl_expand_pulled=pulled,
+        decl_expand_lines=we - ws,
     )
     return out
 
@@ -14795,8 +15013,8 @@ on the real symbol. A new file is only correct when genuinely net-new code is re
 
 ━━━ MULTI-EDIT PLANNING (3+ EDITS) ━━━
 
-When your response requires 3 or more <surgical_edit> blocks, do NOT produce them all inline
-and do NOT write a long explanation first.
+When your response requires changes across 3 or more DISTINCT files or DISTINCT
+symbols, do NOT produce them all inline and do NOT write a long explanation first.
 
 In AT MOST 2 short sentences, state what you're about to do. Then IMMEDIATELY emit an
 <edit_plan> block — do not describe each file's changes in prose, that's what the
@@ -14814,6 +15032,13 @@ between, or after the block beyond the 2-sentence intro. The system will execute
 individually with focused context, preventing output truncation. For 1-2 edits, produce
 <surgical_edit> blocks directly as usual. You may still produce <new_file> blocks alongside
 an <edit_plan>.
+
+CRITICAL — MEGA-SYMBOL EXCEPTION (do not plan-split one large component):
+When several coordinated sites live inside ONE large component/function (hundreds of
+lines — e.g. state + handler + JSX in the same React component), do NOT emit multiple
+<edit_plan> steps for that same symbol. Emit <file_request> for that file if needed,
+then multiple <surgical_edit> blocks (old_code/new_code per site) in one response.
+Plan-splitting a mega-symbol causes incomplete edits and ReferenceErrors.
 
 ━━━ CONVERSATION RECENCY ━━━
 
@@ -16369,6 +16594,17 @@ async def _execute_single_edit(
                     target_sym.end_line,
                     change_description=change_description or "",
                 )
+                # Round7: after capping, pull in declaration sites named (or
+                # camelCase-token-reordered) in the plan item that sit just
+                # outside the 300-line slice — e.g. researchDeep 7 lines above
+                # a send() window focused on deepResearch.
+                _win = expand_plan_execute_window_for_declarations(
+                    file_lines,
+                    _win,
+                    target_sym.start_line,
+                    target_sym.end_line,
+                    change_description=change_description or "",
+                )
             except Exception as _win_err:
                 # Fail soft to legacy full-symbol+pad — never abort execute.
                 _ss = max(1, int(getattr(target_sym, "start_line", 1) or 1))
@@ -16423,7 +16659,16 @@ async def _execute_single_edit(
                   center_line=_win.get("center_line"),
                   term_hit=bool(_win.get("term_hit")),
                   terms=(_win.get("terms") or [])[:12],
+                  decl_expand_pulled=_win.get("decl_expand_pulled") or [],
                   description=(change_description or "")[:200])
+            if _win.get("decl_expand_pulled"):
+                _dlog("execute_task_mega_window_decl_expanded",
+                      session_id=session_id, user_id=user_id,
+                      filename=filename, symbol=symbol_name,
+                      window_start=ws + 1, window_end=we,
+                      window_lines=we - ws,
+                      pulled=_win.get("decl_expand_pulled"),
+                      description=(change_description or "")[:200])
             if _win.get("capped"):
                 _dlog("execute_task_mega_window_capped",
                       session_id=session_id, user_id=user_id,
@@ -17186,6 +17431,8 @@ async def run_natural_pipeline_stream(
         edit_blocks_raw: list = []
         new_file_blocks_raw: list = []
         edit_plan_data: list | None = None
+        # Round7: at most one mega-symbol plan→surgical reroute per request.
+        _mega_plan_reroute_count = 0
         full_response = ""
         in_thinking = False
         had_thinking = False
@@ -19186,9 +19433,12 @@ async def run_natural_pipeline_stream(
                 current_messages = current_messages + [
                     {"role": "assistant", "content": _assistant_echo},
                     {"role": "user", "content":
-                        "Plan required before edits on this multi-part request. "
-                        "Call write_edit_plan with one step per symbol for every "
-                        "part of the request; the steps are then implemented for you."},
+                        "Plan or direct multi-snippet edits required on this "
+                        "multi-part request. Prefer write_edit_plan with ONE "
+                        "step per DISTINCT symbol/file; if several sites live "
+                        "inside ONE large component, call request_file then "
+                        "multiple write_surgical_edit snippets instead of "
+                        "plan-splitting that mega-symbol."},
                 ]
                 _dlog("grok_plan_gate_continue_after_hold",
                       session_id=session_id, user_id=user_id, turn=_turn,
@@ -19197,6 +19447,67 @@ async def run_natural_pipeline_stream(
                 yield sse({"type": "progress",
                            "content": "🧭 Planning the multi-part change first..."})
                 continue
+
+            # ── Mega-symbol plan reroute (session 3d9da3fd_round7) ──────────
+            # Grok/GPT emitted write_edit_plan / <edit_plan> with 4–5 steps all
+            # on DashboardAIAssistant (~1186L). Plan-exec mega-windows then
+            # produced QA 2/1. Opus skipped the plan and emitted coordinated
+            # surgical snippets → QA 9. When the captured plan plan-splits one
+            # mega-symbol, clear it and continue once with Opus's winning path.
+            if (edit_plan_data
+                    and _mega_plan_reroute_count < 1
+                    and pending_tool is None):
+                try:
+                    from services.mega_symbol_tool_routing import (
+                        classify_mega_symbol_edit_plan as _cls_mega_plan,
+                        build_mega_symbol_reroute_instruction as _mega_instr,
+                        symbol_line_count_from_maps as _sym_lines,
+                    )
+                    def _line_fn(_fn, _sy, _maps=symbol_maps_by_name):
+                        return _sym_lines(_maps, _fn, _sy)
+                    _mega_dec = _cls_mega_plan(edit_plan_data, _line_fn)
+                except Exception as _mega_err:
+                    _mega_dec = None
+                    _dlog("mega_symbol_plan_reroute_classify_error",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          error=str(_mega_err)[:300])
+                if _mega_dec is not None and _mega_dec.should_reroute:
+                    _mega_plan_reroute_count += 1
+                    _is_native = _is_grok_model(arch_model)
+                    _instr = _mega_instr(_mega_dec, native_tools=_is_native)
+                    _dlog("mega_symbol_plan_reroute",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          reason=_mega_dec.reason,
+                          attempt=_mega_plan_reroute_count,
+                          groups=[{
+                              "filename": g.filename,
+                              "symbol": g.symbol,
+                              "symbol_lines": g.symbol_lines,
+                              "step_count": g.step_count,
+                          } for g in (_mega_dec.groups or [])],
+                          rerouted_steps=len(_mega_dec.rerouted_steps or []),
+                          kept_steps=len(_mega_dec.kept_steps or []),
+                          native_tools=_is_native)
+                    # Drop the whole plan — model must emit surgical edits for
+                    # mega groups AND any kept cross-file steps listed in the
+                    # instruction (handler etc.).
+                    edit_plan_data = None
+                    _consecutive_text_only_turns = 0
+                    _consecutive_empty_turns = 0
+                    _assistant_echo = (full_response or "").strip() or "(replanning…)"
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": _assistant_echo},
+                        {"role": "user", "content": _instr},
+                    ]
+                    yield sse({
+                        "type": "progress",
+                        "content": (
+                            "↪️ Mega-component plan rerouted — requesting "
+                            "coordinated surgical edits instead of windowed "
+                            "plan-exec…"
+                        ),
+                    })
+                    continue
 
             # ── Grok report_blocked: terminate cleanly (native equivalent of
             #    the <blocked> prose path; full_response already carries the
@@ -19721,11 +20032,27 @@ async def run_natural_pipeline_stream(
                                 break
 
                     if _sym_line_count > LARGE_SYMBOL_LINES:
-                        # Large symbol — keep edits separate to avoid
-                        # merged-output timeout.  Each individual edit
-                        # produces a small surgical block that completes
-                        # well within 120s.
-                        _dlog("plan_items_large_symbol_skip_merge",
+                        # Round7 (3d9da3fd): skip-merge + N×300L windows on
+                        # DashboardAIAssistant produced QA 2/1. Prefer one
+                        # snippet-oriented pass covering every site. Session
+                        # 336ac3bf timed out on a full-span rewrite — the
+                        # description below forbids rewriting the whole symbol.
+                        _merged_desc = (
+                            "Coordinated multi-site edit inside this LARGE symbol. "
+                            "Emit ONLY small old_code→new_code snippet replacements "
+                            "covering ALL of the following sites (do NOT rewrite the "
+                            "whole component): "
+                            + " AND ALSO ".join(
+                                f"({i+1}) {item.get('description', '')}"
+                                for i, item in enumerate(_gitems)
+                            )
+                        )
+                        _effective_plan.append({
+                            "filename": _gkey[0],
+                            "symbol": _gkey[1],
+                            "description": _merged_desc,
+                        })
+                        _dlog("plan_items_mega_symbol_force_merge_snippets",
                               session_id=session_id, user_id=user_id,
                               filename=_sym_fname, symbol=_sym_name,
                               symbol_lines=_sym_line_count,
@@ -19735,8 +20062,6 @@ async def run_natural_pipeline_stream(
                                   it.get("description", "")[:200]
                                   for it in _gitems
                               ])
-                        for _gi in _gitems:
-                            _effective_plan.append(_gi)
                     else:
                         # Small symbol — merge to prevent dead-code
                         # from partial success (session 82eb1056).

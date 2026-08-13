@@ -2034,7 +2034,19 @@ export function ChatPanel() {
     // "Research before editing" only applies (and is only ever shown) for
     // Edit/Agent mode on Claude — see webResearchAvailable. Read fresh here
     // (not the closure) so the very next send reflects the current toggle.
-    const _sendWebResearch = webResearchAvailableRef.current && webResearchEnabledRef.current
+    // Round7: Retry-with-QA builds "QA failed for …" and was re-sent with
+    // Research still on → dummy web searches + no_edits. Force Research off
+    // for that override path (and for a pasted QA report with the same prefix).
+    const _isQaRetry = /^\s*QA failed for\b/i.test(messageText)
+    const _sendWebResearch = !_isQaRetry
+      && webResearchAvailableRef.current
+      && webResearchEnabledRef.current
+    if (_isQaRetry) {
+      clientLog('qa_retry_research_forced_off', {
+        researchWasEnabled: !!(webResearchAvailableRef.current && webResearchEnabledRef.current),
+        length: messageText.length,
+      }, sessionId)
+    }
     const ctrl = api.stream.smart(
       { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id), mode: _sendMode, force_tasks: _sendMode === 'agent', enable_web_research: _sendWebResearch },
       (progress) => {
