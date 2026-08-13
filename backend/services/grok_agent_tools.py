@@ -203,8 +203,11 @@ def _schema_write_edit_plan():
         "function": {
             "name": TOOL_WRITE_EDIT_PLAN,
             "description": (
-                "For large/multi-part changes (3+ edits): emit a symbol-level "
-                "plan instead of inline edits. One step per symbol to change."
+                "For multi-part changes that span DISTINCT files or DISTINCT "
+                "symbols (3+ symbols): emit a symbol-level plan. One step per "
+                "symbol — NEVER multiple steps for the same large component. "
+                "For several coordinated sites inside ONE mega-symbol, call "
+                "request_file then multiple write_surgical_edit snippets instead."
             ),
             "parameters": {
                 "type": "object",
@@ -1008,15 +1011,23 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     if m in _EDIT_MODES:
         lines += [
             "• write_surgical_edit — make a precise edit to an existing file "
-            "(call once per symbol; include the COMPLETE new_code, and old_code "
-            "as your anchor).",
+            "(call once per site with old_code + new_code; for several sites "
+            "inside one large component, call this tool multiple times).",
             "• write_new_file — create a brand-new file.",
-            "• write_edit_plan — for 3+ edits, emit a symbol-level plan.",
+            "• write_edit_plan — ONLY when steps target different files or "
+            "different symbols (one step per symbol). Do NOT plan-split one "
+            "mega-component into many steps.",
         ]
     lines += [
-        "• request_file — load full file contents you need before editing.",
+        "• request_file — load full file contents you need before editing "
+        "(prefer this over repeated request_search when you already know the file).",
         "• request_search — grep the codebase for symbols/keywords.",
     ]
+    if m in _EDIT_MODES:
+        from services.mega_symbol_tool_routing import (  # local import: avoid cycles
+            prompt_mega_symbol_tool_routing_rules as _mega_rules,
+        )
+        lines += ["", _mega_rules(native_tools=True)]
     if github_enabled:
         lines.append("• request_github — read from the connected GitHub repo.")
     if history_enabled:
@@ -1055,18 +1066,24 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
         "\n\n[AGENTIC EDIT MODE — NATIVE TOOLS]",
         "Complete this task autonomously using the FUNCTION TOOLS provided to "
         "you. Do not write XML tags as text.",
-        "Gather context with request_search / request_file"
+        "Gather context with request_file first when you know the target file; "
+        "use request_search"
         + (" / request_github" if github_enabled else "")
         + (" / request_history" if history_enabled else "")
-        + " as many times as you need.",
+        + " only to find unknowns.",
     ]
     if m in _EDIT_MODES:
+        from services.mega_symbol_tool_routing import (
+            prompt_mega_symbol_tool_routing_rules as _mega_rules,
+        )
+        parts.append(_mega_rules(native_tools=True))
         parts.append(
             "Produce your changes by CALLING write_surgical_edit / "
-            "write_new_file / write_edit_plan — never by describing them in "
-            "prose. If you already have enough context, write the edits now; "
-            "never guess at code you have not seen. If you truly cannot "
-            "proceed, call report_blocked. When your edits are complete, stop.")
+            "write_new_file (or write_edit_plan only for distinct "
+            "files/symbols) — never by describing them in prose. If you "
+            "already have enough context, write the edits now; never guess "
+            "at code you have not seen. If you truly cannot proceed, call "
+            "report_blocked. When your edits are complete, stop.")
     else:
         parts.append(
             "Answer the user's question in plain text once you have gathered "

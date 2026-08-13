@@ -280,9 +280,12 @@ class GrokPlanGate:
                 self.holds += 1
                 self._rewrite_write_results(
                     tr,
-                    "This is a multi-part request. Do NOT edit yet. FIRST call "
-                    "write_edit_plan with one step per symbol for EVERY part of "
-                    "the request; the steps are then implemented for you.")
+                    "This is a multi-part request. Do NOT emit a shallow single "
+                    "edit. Either (A) call write_edit_plan with ONE step per "
+                    "DISTINCT symbol/file, or (B) if several sites live inside "
+                    "ONE large component, call request_file then multiple "
+                    "write_surgical_edit snippets covering every site — do NOT "
+                    "plan-split that mega-symbol.")
                 _log(self._dlog, "grok_plan_gate_hold_writes", turn=turn,
                      session_id=self._session_id, user_id=self._user_id,
                      held_writes=held, total_holds=self.holds,
