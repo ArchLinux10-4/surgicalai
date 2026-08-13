@@ -16,7 +16,8 @@ import { ApplyProgressStrip } from './ApplyProgressStrip'
 import type { ApplyProgress } from '../lib/applyProgress'
 import { applyStageLabel } from '../lib/applyProgress'
 import { clientLog } from '../lib/clientLog'
-import { getApplyGate, provenanceEvidence } from '../lib/qaApplyPolicy';
+import { getApplyGate, provenanceEvidence } from '../lib/qaApplyPolicy'
+import { parseServerUtc, relativeTimeFromServer } from '../lib/relativeTime';
 interface Props {
   result: SmartResult
   sessionId: string
@@ -1175,13 +1176,10 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 
   const formatVersionTime = (iso: string) => {
     try {
-      const d = new Date(iso.endsWith('Z') ? iso : iso + 'Z')
-      const diffMs = Date.now() - d.getTime()
-      const mins = Math.round(diffMs / 60000)
-      if (mins < 1) return 'just now'
-      if (mins < 60) return `${mins}m ago`
-      const hrs = Math.round(mins / 60)
-      if (hrs < 24) return `${hrs}h ago`
+      const d = parseServerUtc(iso)
+      if (!d) return iso
+      const mins = Math.round((Date.now() - d.getTime()) / 60000)
+      if (mins < 24 * 60) return relativeTimeFromServer(iso)
       return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })
     } catch { return iso }
   }
