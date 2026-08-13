@@ -70,9 +70,13 @@ isolation rather than buried inside the 23K-line pipeline:
 
 MODEL
 -----
-``grok-4.5`` — confirmed shipping model id (docs.x.ai/developers/models/grok-4.5).
-No other Grok model ids are registered here: only ids confirmed by research are
-used, nothing invented.
+Confirmed shipping model ids (docs.x.ai/developers/models):
+  * ``grok-4.5``
+  * ``grok-4.6``  (dot, not hyphen — ``grok-4-6`` is rejected by xAI)
+
+``GROK_DEFAULT_MODEL`` stays ``grok-4.5``. The Settings picker lists both;
+runtime paths must use the user's selected architect model (any ``grok-*``
+id matched by ``_is_grok_model``), not a hardcoded id.
 
 LOGGING
 -------
@@ -105,7 +109,12 @@ except Exception:  # pragma: no cover
 #: xAI OpenAI-compatible base URL (https://docs.x.ai/developers/quickstart).
 GROK_BASE_URL = "https://api.x.ai/v1"
 
-#: Confirmed shipping model id — do not add unverified ids here.
+#: Confirmed shipping model ids (docs.x.ai/developers/models/grok-4.5 and
+#: docs.x.ai/developers/models/grok-4.6). Use a dot (``grok-4.6``), never a
+#: hyphen (``grok-4-6`` is rejected by xAI).
+GROK_CONFIRMED_MODELS = ("grok-4.5", "grok-4.6")
+
+#: Default when a Grok path needs a model id but none was selected.
 GROK_DEFAULT_MODEL = "grok-4.5"
 
 #: Params xAI reasoning models REJECT (error, not ignore). Both snake_case

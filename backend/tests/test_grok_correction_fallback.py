@@ -154,11 +154,20 @@ def test_gpt_fallback_call_sites_are_all_still_present_and_unchanged():
     assert scoped.count("from services.gpt_correction import") == 9
 
 
-def test_grok_branches_use_only_the_confirmed_model_id():
+def test_grok_branches_use_selected_architect_model_not_hardcoded_id():
+    """Grok correction/plan-exec sites must pass ``arch_model`` so selecting
+    grok-4.6 (docs.x.ai/developers/models/grok-4.6) actually runs 4.6 — not a
+    hardcoded grok-4.5 override."""
     scoped = _scoped_src()
-    assert scoped.count('"grok-4.5"') == 9
-    # No invented Grok ids anywhere in pipeline.py.
-    for invented in ("grok-4.6", "grok-5", "grok-4.5-turbo", "grok-max"):
+    # No hardcoded shipping id left in the live call sites.
+    assert '"grok-4.5"' not in scoped
+    assert '"grok-4.6"' not in scoped
+    # Nine Grok call sites previously hard-coded the model; they now pass
+    # the user-selected architect id.
+    assert scoped.count("model=arch_model") >= 5
+    assert scoped.count("arch_model,") >= 3 or "arch_model," in scoped
+    # Invented / rejected ids must still not appear.
+    for invented in ("grok-4-6", "grok-5", "grok-4.5-turbo", "grok-max"):
         assert invented not in _pipeline_src()
 
 

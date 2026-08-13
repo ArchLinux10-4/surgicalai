@@ -19907,7 +19907,7 @@ async def run_natural_pipeline_stream(
                                       session_id=session_id, user_id=user_id,
                                       filename=_retry_fname, symbol=_retry_sym)
                                 _redit_coro = retry_truncated_edit_grok(
-                                    _get_client_for_model(arch_model, user_id, session_id=session_id), "grok-4.5",
+                                    _get_client_for_model(arch_model, user_id, session_id=session_id), arch_model,
                                     _retry_fname, _retry_sym, _retry_content,
                                     _retry_smap, user_request,
                                     _chat_create, _dlog,
@@ -19998,7 +19998,7 @@ async def run_natural_pipeline_stream(
                                   session_id=session_id, user_id=user_id,
                                   filename=_retry_fname)
                             _rnf_coro = retry_truncated_newfile_grok(
-                                _get_client_for_model(arch_model, user_id, session_id=session_id), "grok-4.5",
+                                _get_client_for_model(arch_model, user_id, session_id=session_id), arch_model,
                                 _retry_fname, user_request,
                                 _chat_create, _dlog,
                                 get_setting=get_setting,
@@ -20321,7 +20321,7 @@ async def run_natural_pipeline_stream(
                               session_id=session_id, user_id=user_id,
                               filename=p_filename, symbol=p_symbol)
                         _edit_coro = execute_single_edit_grok(
-                            _get_client_for_model(arch_model, user_id, session_id=session_id), "grok-4.5",
+                            _get_client_for_model(arch_model, user_id, session_id=session_id), arch_model,
                             p_filename, p_symbol, p_description,
                             p_content, p_smap, user_request,
                             _chat_create, _dlog,
@@ -22219,7 +22219,7 @@ async def run_natural_pipeline_stream(
                     # and the GPT branch below are unchanged. See
                     # services/grok_correction.py.
                     from services.grok_correction import safe_grok_correction_call
-                    _corr_correction_model = "grok-4.5"
+                    _corr_correction_model = arch_model  # user-selected Grok id (4.5 or 4.6)
                     _dlog("correction_call_config", session_id=session_id,
                           model=_corr_correction_model,
                           wrapper="safe_grok_correction_call",
@@ -22428,7 +22428,7 @@ async def run_natural_pipeline_stream(
                                           session_id=session_id, user_id=user_id)
                                     _fu_coro = safe_grok_correction_call(
                                         _get_client_for_model(arch_model, user_id, session_id=session_id),
-                                        model="grok-4.5",
+                                        model=arch_model,
                                         desired_text_tokens=12000,
                                         system=system_prompt,
                                         messages=_fu_msgs,
@@ -22540,7 +22540,7 @@ async def run_natural_pipeline_stream(
                                                   session_id=session_id, user_id=user_id)
                                             _fu2_coro = safe_grok_correction_call(
                                                 _get_client_for_model(arch_model, user_id, session_id=session_id),
-                                                model="grok-4.5",
+                                                model=arch_model,
                                                 desired_text_tokens=12000,
                                                 system=system_prompt,
                                                 messages=_fu2_msgs,
@@ -22676,7 +22676,7 @@ async def run_natural_pipeline_stream(
                                           session_id=session_id, user_id=user_id)
                                     _fu0_coro = safe_grok_correction_call(
                                         _get_client_for_model(arch_model, user_id, session_id=session_id),
-                                        model="grok-4.5",
+                                        model=arch_model,
                                         desired_text_tokens=12000,
                                         system=system_prompt,
                                         messages=_fu0_msgs,
@@ -24293,7 +24293,7 @@ async def run_natural_pipeline_stream(
                                               retry_round=_qa_retry_round, idx=idx)
                                         _fu_coro = safe_grok_correction_call(
                                             _get_client_for_model(arch_model, user_id, session_id=session_id),
-                                            model="grok-4.5",
+                                            model=arch_model,
                                             desired_text_tokens=12000,
                                             system=system_prompt,
                                             messages=_react_msgs,
@@ -24578,7 +24578,7 @@ async def run_natural_pipeline_stream(
                                       session_id=session_id, user_id=user_id)
                                 _fu_coro = safe_grok_correction_call(
                                     _get_client_for_model(arch_model, user_id, session_id=session_id),
-                                    model="grok-4.5",
+                                    model=arch_model,
                                     desired_text_tokens=12000,
                                     system=system_prompt,
                                     messages=_react_msgs,

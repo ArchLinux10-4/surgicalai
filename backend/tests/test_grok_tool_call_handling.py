@@ -139,7 +139,7 @@ def test_gotcha3_grok_id_is_not_in_pipeline_reasoning_effort_models():
     regression guard: adding a grok-* id to that set fails this test."""
     from services import pipeline  # heavy import, done lazily inside the test
     rec = _Rec()
-    for model in ("grok-4.5", "grok-4.5-latest", "grok-4", "grok-code-fast-1"):
+    for model in ("grok-4.5", "grok-4.5-latest", "grok-4.6", "grok-4", "grok-code-fast-1"):
         assert gp.o_series_injection_can_misfire(
             model, pipeline.REASONING_EFFORT_MODELS, dlog=rec) is False
     assert "grok_o_series_gate_safe" in rec.names
