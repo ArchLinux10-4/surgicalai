@@ -5713,13 +5713,76 @@ def _apply_fuzzy_splice(text: str, start_idx: int, end_idx: int, new_code: str) 
 # symbol (file 123665→119144 chars). Reuse _mw_window_content_loss thresholds
 # so line-splice and multi-window correction share one definition of "too much
 # content lost".
+#
+# Exception (session 3d9da3fd_round9): Opus correctly targeted a stale duplicate
+# function at L2029–2046 for deletion (empty / comment-only new_code). The
+# round3 guard rejected it as content loss three times. Allow bounded
+# intentional deletes whose new_code is empty or delete-residue only — still
+# refuse round3's "130 lines → 8 lines of real code" gutting shape.
+
+# Max span (lines) an intentional empty/residue delete may remove. Round9 was
+# 18–20; keep headroom without allowing a 130-line gut.
+INTENTIONAL_DELETE_MAX_SPAN = 80
+
+
+def _new_code_is_delete_residue(new_code: str) -> bool:
+    """True when ``new_code`` is empty or only blank/comment/brace glue.
+
+    Round9 attempt 1: ``new_code=""``.
+    Round9 attempt 2: only a ``// ─── JD title extractor`` header.
+    Round9 attempt 3: ``}`` + blank + section comment.
+    Round3 gutting: real ``const [..] = useState`` lines → False.
+    """
+    if not (new_code or "").strip():
+        return True
+    for line in (new_code or "").splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if (
+            s.startswith("//")
+            or s.startswith("#")
+            or s.startswith("/*")
+            or s.startswith("*")
+            or s.startswith("<!--")
+        ):
+            continue
+        # Lone structural glue sometimes left when deleting a mid-file block.
+        if s in {"{", "}", "};", ")", "];", "},"}:
+            continue
+        return False
+    return True
+
+
+def _is_intentional_line_deletion(
+    span_lines: int,
+    new_code: str,
+    max_span: int = INTENTIONAL_DELETE_MAX_SPAN,
+) -> bool:
+    """True when a line-splice is a bounded intentional delete, not a gut.
+
+    Requires:
+      * span in 1..max_span (round9 ~20; refuses empty 130-line wipes)
+      * new_code empty or delete-residue only (no real replacement code)
+    """
+    try:
+        span = int(span_lines)
+    except (TypeError, ValueError):
+        return False
+    if span < 1 or span > int(max_span):
+        return False
+    return _new_code_is_delete_residue(new_code)
+
 
 def _line_splice_would_lose_content(span_lines: int, new_code: str) -> bool:
     """True when replacing ``span_lines`` with ``new_code`` would gut content.
 
-    Delegates entirely to ``_mw_window_content_loss`` (max_loss_ratio=0.40,
-    min_window_size=8) so thresholds stay in one place.
+    Delegates to ``_mw_window_content_loss`` (max_loss_ratio=0.40,
+    min_window_size=8) so thresholds stay in one place — except for bounded
+    intentional deletions (round9), which are allowed.
     """
+    if _is_intentional_line_deletion(span_lines, new_code):
+        return False
     new_lines = len((new_code or "").splitlines()) if new_code else 0
     return _mw_window_content_loss(span_lines, new_lines)
 
@@ -5825,6 +5888,8 @@ def _apply_snippet_by_lines(
     # Reject a splice that would replace a large span with a tiny
     # new_code (e.g. 130 lines → 8). Callers fall back to old_code
     # matching or refuse rather than gutting the symbol.
+    # Round9: bounded empty/comment-only deletes are intentional and
+    # pass via _is_intentional_line_deletion inside the helper.
     span_lines = rel_end - rel_start + 1
     if _line_splice_would_lose_content(span_lines, new_code):
         new_lines = len((new_code or "").splitlines()) if new_code else 0
@@ -5839,6 +5904,17 @@ def _apply_snippet_by_lines(
         )
         return None, False, (
             f"line_splice_content_loss:span={span_lines},new={new_lines}"
+        )
+    elif _is_intentional_line_deletion(span_lines, new_code):
+        new_lines = len((new_code or "").splitlines()) if new_code else 0
+        _dlog(
+            "line_splice_intentional_delete_allowed",
+            edit_start_line=edit_start_line,
+            edit_end_line=edit_end_line,
+            span_lines=span_lines,
+            new_code_lines=new_lines,
+            note="bounded empty/residue new_code treated as intentional delete "
+                 "(session 3d9da3fd_round9); round3 gutting shapes still rejected",
         )
 
     before = "".join(lines[:rel_start])
