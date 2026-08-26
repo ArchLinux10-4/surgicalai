@@ -24,13 +24,34 @@ import types
 # out of pipeline.py, so there's no separate artifact to go stale or get lost.
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PIPELINE = os.path.normpath(os.path.join(_HERE, "..", "services", "pipeline.py"))
-_FUNCS_TO_EXTRACT = ["_apply_snippet_to_symbol", "_fragment_reason", "_compute_target_element"]
+_FUNCS_TO_EXTRACT = [
+    "_apply_snippet_to_symbol",
+    "_fragment_reason",
+    "_compute_target_element",
+    # aa1584f4 structural invariant — pulled with apply so isolated extracts
+    # exercise the same gate as production (globals().get fallback otherwise).
+    "_finalize_snippet_apply",
+    "_delimiter_parity_reason",
+    "_superseded_tail_reason",
+    "_post_splice_structure_reason",
+    "_html_jsx_tag_nets",
+    "_html_jsx_closer_counts",
+    "_iter_html_jsx_tag_events",
+    "_bracket_balance_reason",
+]
 
 
 def _extract_helpers():
     src = open(_PIPELINE, encoding="utf-8").read()
     tree = ast.parse(src)
-    ns = {"_dlog": lambda *a, **kw: None}
+    ns = {
+        "_dlog": lambda *a, **kw: None,
+        "_VOID_HTML_TAGS": frozenset({
+            "area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+            "meta", "param", "source", "track", "wbr",
+        }),
+        "Optional": object,  # type hint only; unused at runtime in extracted bodies
+    }
     # Pull in top-level stdlib imports (e.g. `re`) the extracted functions
     # rely on but don't carry with them as AST source segments.
     for node in ast.iter_child_nodes(tree):
@@ -41,15 +62,21 @@ def _extract_helpers():
                     exec(segment, ns)
                 except Exception:
                     pass
+    # typing.Optional is referenced in _bracket_balance_reason annotations;
+    # provide a real alias when the typing import was skipped/failed.
+    try:
+        from typing import Optional as _Opt
+        ns["Optional"] = _Opt
+    except Exception:
+        pass
     for node in ast.iter_child_nodes(tree):
-        if isinstance(node, ast.FunctionDef) and node.name in _FUNCS_TO_EXTRACT:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in _FUNCS_TO_EXTRACT:
             segment = ast.get_source_segment(src, node)
             if segment:
                 exec(segment, ns)
     for fn_name in _FUNCS_TO_EXTRACT:
         assert fn_name in ns, f"Failed to extract {fn_name} from pipeline.py"
-    mod = types.SimpleNamespace(**{k: v for k, v in ns.items() if k in _FUNCS_TO_EXTRACT})
-    return mod
+    return types.SimpleNamespace(**{k: ns[k] for k in _FUNCS_TO_EXTRACT})
 
 
 H = _extract_helpers()

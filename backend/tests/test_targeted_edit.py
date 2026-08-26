@@ -12,32 +12,15 @@ downstream stage (diff, QA, structural QA, retry loop, apply) keeps operating
 on the full before/after symbol exactly as before.
 """
 import os
-import re
+import sys
 
 import pytest
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-def _load_helper():
-    """Load _apply_snippet_to_symbol from pipeline.py in isolation."""
-    here = os.path.dirname(__file__)
-    candidates = [
-        os.path.join(here, "..", "services", "pipeline.py"),
-        os.path.join(here, "pipeline.py"),
-    ]
-    src = None
-    for c in candidates:
-        if os.path.exists(c):
-            src = open(c).read()
-            break
-    assert src is not None, "pipeline.py not found"
-    start = src.index("def _apply_snippet_to_symbol")
-    end = src.index("\n# ---", start)
-    ns = {"re": re}
-    exec(src[start:end], ns)
-    return ns["_apply_snippet_to_symbol"]
+from services.pipeline import _apply_snippet_to_symbol  # noqa: E402
 
-
-apply_snippet = _load_helper()
+apply_snippet = _apply_snippet_to_symbol
 
 
 def _big_symbol():

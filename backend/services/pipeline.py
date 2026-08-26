@@ -5227,19 +5227,37 @@ def _apply_snippet_to_symbol(symbol_code: str, old_code: str, new_code: str):
       3. Line-number-prefix strip — if Claude copied numbered search output
          (e.g. "  736: <div>"), strip the "NNN: " prefix and retry (1) & (2).
 
+    After a successful match, ``_finalize_snippet_apply`` enforces the
+    structural invariant (session aa1584f4): delimiter parity, no superseded
+    closer left in the unmatched tail, post-splice structure not worse than
+    the original. Violations either promote to a full-symbol ``new_code``
+    (when ``_fragment_reason`` allows) or reject with an explicit reason.
+
     Returns (full_new_code, ok, reason).
       ok=True  -> full_new_code is the complete new symbol body.
-      ok=False -> reason explains why (not found / ambiguous) for a correction round.
+      ok=False -> reason explains why (not found / ambiguous / structural) for a correction round.
     """
     if not old_code:
         return None, False, "no old_code provided"
     if not symbol_code:
         return None, False, "empty symbol"
 
+    matched_old = old_code
+
+    def _done(raw_result: str, matched: str, why: str):
+        # Late-bound so AST-isolated extracts (test_lf2_fix) that only pull
+        # ``_apply_snippet_to_symbol`` still work; production module always
+        # has ``_finalize_snippet_apply`` defined below.
+        finalize = globals().get("_finalize_snippet_apply")
+        if finalize is None:
+            return raw_result, True, why
+        return finalize(symbol_code, matched, new_code, raw_result, why)
+
     # 1. Exact verbatim
     cnt = symbol_code.count(old_code)
     if cnt == 1:
-        return symbol_code.replace(old_code, new_code, 1), True, "exact"
+        raw = symbol_code.replace(old_code, new_code, 1)
+        return _done(raw, matched_old, "exact")
     if cnt > 1:
         return None, False, (
             f"old_code appears {cnt} times in the symbol — it is ambiguous. "
@@ -5263,10 +5281,13 @@ def _apply_snippet_to_symbol(symbol_code: str, old_code: str, new_code: str):
     if stripped_old != old_code:
         c2 = symbol_code.count(stripped_old)
         if c2 == 1:
-            return symbol_code.replace(stripped_old, new_code, 1), True, "exact-after-strip"
+            matched_old = stripped_old
+            raw = symbol_code.replace(stripped_old, new_code, 1)
+            return _done(raw, matched_old, "exact-after-strip")
         if c2 > 1:
             return None, False, "old_code (after stripping line numbers) is ambiguous"
         old_code = stripped_old  # fall through to whitespace-tolerant below
+        matched_old = stripped_old
 
     # 2. Whitespace-tolerant match (tabs→spaces + trailing whitespace per line).
     def _norm(s: str) -> str:
@@ -5286,13 +5307,13 @@ def _apply_snippet_to_symbol(symbol_code: str, old_code: str, new_code: str):
             if window == target_norm:
                 before = "".join(sym_lines[:i])
                 after = "".join(sym_lines[i + old_line_count:])
-                # Preserve a trailing newline convention between segments.
-                joiner = "" if (not new_code.endswith("\n") and after.startswith("\n")) else ""
+                # Verbatim matched span in the original symbol (for invariant).
+                matched_old = "".join(sym_lines[i:i + old_line_count])
                 rebuilt = before + new_code
                 if after and not rebuilt.endswith("\n") and not after.startswith("\n"):
                     rebuilt += "\n"
                 rebuilt += after
-                return rebuilt, True, "whitespace-tolerant"
+                return _done(rebuilt, matched_old, "whitespace-tolerant")
 
     return None, False, (
         "old_code was not found verbatim in the target symbol. Copy the exact lines "
@@ -7123,6 +7144,196 @@ def _bracket_balance_reason(code: str) -> Optional[str]:
             f"({''.join(stack)}) — the spliced result is structurally unbalanced."
         )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Helper: snippet structural invariant (session aa1584f4)
+# ---------------------------------------------------------------------------
+# ``_apply_snippet_to_symbol`` historically did symbol.replace(old, new, 1) with
+# no post-splice check. Short-prefix old_code + complete-shaped new_code left
+# the unmatched original tail after </head>/</body> (QA score 1). NATURAL_SYSTEM
+# already required old↔new tag-balance; this enforces it in code for every
+# successful snippet splice (Option A + correction Path 2 via the apply helper).
+
+_VOID_HTML_TAGS = frozenset({
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+    "param", "source", "track", "wbr",
+})
+
+
+def _iter_html_jsx_tag_events(code: str):
+    """Yield (kind, name) for HTML/JSX tags. kind in open|close|self."""
+    if not code:
+        return
+    stripped = re.sub(r"<!--.*?-->", "", code, flags=re.DOTALL)
+    for m in re.finditer(r"</?([A-Za-z][\w.-]*)\b[^>]*?/?>", stripped):
+        full = m.group(0)
+        name = m.group(1).lower()
+        if full.startswith("</"):
+            yield ("close", name)
+        elif full.endswith("/>") or name in _VOID_HTML_TAGS:
+            yield ("self", name)
+        else:
+            yield ("open", name)
+
+
+def _html_jsx_tag_nets(code: str) -> dict:
+    """Per-tag open-minus-close nets (self-closing ignored)."""
+    nets: dict = {}
+    for kind, name in _iter_html_jsx_tag_events(code):
+        if kind == "self":
+            continue
+        nets[name] = nets.get(name, 0) + (1 if kind == "open" else -1)
+    return nets
+
+
+def _html_jsx_closer_counts(code: str) -> dict:
+    counts: dict = {}
+    for kind, name in _iter_html_jsx_tag_events(code):
+        if kind == "close":
+            counts[name] = counts.get(name, 0) + 1
+    return counts
+
+
+def _delimiter_parity_reason(old_code: str, new_code: str):
+    """
+    old↔new delimiter parity for braces and HTML/JSX tags.
+
+    Mirrors NATURAL_SYSTEM targeted-edit rule (net tag balance of new_code must
+    match old_code) and the Option A brace net-delta guard — in one place.
+    Returns a reason string when nets diverge, else None.
+    """
+    old_code = old_code or ""
+    new_code = new_code or ""
+    ob = old_code.count("{") - old_code.count("}")
+    nb = new_code.count("{") - new_code.count("}")
+    if ob != nb:
+        return (
+            f"delimiter_parity: brace net old={ob} new={nb} — "
+            f"old_code/new_code must cover the same region "
+            f"(or omit old_code for a full-symbol rewrite)"
+        )
+    on = _html_jsx_tag_nets(old_code)
+    nn = _html_jsx_tag_nets(new_code)
+    for name in sorted(set(on) | set(nn)):
+        if on.get(name, 0) != nn.get(name, 0):
+            return (
+                f"delimiter_parity: tag <{name}> net old={on.get(name, 0)} "
+                f"new={nn.get(name, 0)} — old_code/new_code must cover the "
+                f"same region (or omit old_code for a full-symbol rewrite)"
+            )
+    return None
+
+
+def _superseded_tail_reason(symbol_code: str, old_code: str, new_code: str):
+    """
+    Reject when new_code closes a region that old_code left open, but the
+    unmatched ``after`` tail still holds the original closer (session aa1584f4:
+    short-prefix old_code opened <head>, new_code closed </head>, after still
+    had </head>).
+
+    Only fires when old_code's net for that delimiter is positive — so a
+    balanced mid-symbol insert (e.g. adding a new </section> pair) is allowed.
+    """
+    if not symbol_code or not old_code or not new_code:
+        return None
+    if symbol_code.count(old_code) != 1:
+        return None
+    idx = symbol_code.find(old_code)
+    if idx < 0:
+        return None
+    after = symbol_code[idx + len(old_code):]
+    if not after.strip():
+        return None
+
+    old_nets = _html_jsx_tag_nets(old_code)
+    closers = [
+        m.group(1).lower()
+        for m in re.finditer(r"</([A-Za-z][\w.-]*)\s*>", new_code)
+    ]
+    seen = set()
+    for c in reversed(closers):
+        if c in seen:
+            continue
+        seen.add(c)
+        if old_nets.get(c, 0) > 0 and re.search(
+            rf"</{re.escape(c)}\s*>", after, flags=re.IGNORECASE
+        ):
+            return (
+                f"superseded_tail: new_code closes </{c}> but unmatched "
+                f"after still contains </{c}>"
+            )
+
+    old_brace_net = old_code.count("{") - old_code.count("}")
+    if (
+        old_brace_net > 0
+        and new_code.rstrip().endswith("}")
+        and "}" in after
+    ):
+        return (
+            "superseded_tail: new_code closes with '}' but unmatched "
+            "after still contains '}'"
+        )
+
+    # Prefix + complete-looking new_code (Python / brace-light full-def rewrite).
+    prefix = (idx == 0) or (not symbol_code[:idx].strip())
+    if prefix and after.strip():
+        frag = _fragment_reason(symbol_code, new_code)
+        if frag is None:
+            return (
+                "superseded_tail: prefix old_code left unmatched symbol "
+                "tail after complete-looking new_code"
+            )
+    return None
+
+
+def _post_splice_structure_reason(symbol_code: str, result: str):
+    """Reject when the spliced result is structurally worse than the original."""
+    if not result:
+        return "post_splice_structure: empty result"
+    br_sym = _bracket_balance_reason(symbol_code or "")
+    br_res = _bracket_balance_reason(result)
+    if br_res and not br_sym:
+        return f"post_splice_structure: {br_res}"
+    # Closer-duplication is handled by ``_superseded_tail_reason`` (requires
+    # old_code net > 0). Do not count raw closer inflation here — inserting a
+    # new balanced <section>…</section> into a component is legitimate.
+    return None
+
+
+def _finalize_snippet_apply(
+    symbol_code: str,
+    old_code: str,
+    new_code: str,
+    result: str,
+    match_reason: str,
+):
+    """
+    Post-splice structural gate + gated full-symbol promotion.
+
+    Returns (code, ok, reason) — same contract as ``_apply_snippet_to_symbol``.
+    """
+    failures = []
+    for reason in (
+        _delimiter_parity_reason(old_code, new_code),
+        _superseded_tail_reason(symbol_code, old_code, new_code),
+        _post_splice_structure_reason(symbol_code, result),
+    ):
+        if reason:
+            failures.append(reason)
+    if not failures:
+        return result, True, match_reason
+
+    frag = _fragment_reason(symbol_code, new_code)
+    if frag is None:
+        return (
+            new_code,
+            True,
+            f"promoted_full_symbol:{failures[0]}",
+        )
+    return None, False, (
+        f"{failures[0]} — new_code failed full-symbol promotion ({frag})"
+    )
 
 
 def compose_symbol_edits(orig_full: str, edits: list, apply_fn):
@@ -21802,9 +22013,16 @@ async def run_natural_pipeline_stream(
                         if ok_snip:
                             # Structural-balance guard: detect when new_code changes
                             # the net brace balance vs old_code (e.g. drops a closing })
+                            # Skip when the snippet invariant already promoted to a
+                            # full-symbol rewrite (session aa1584f4) — short-prefix
+                            # old_code intentionally has a different net than the
+                            # complete new_code.
+                            _promoted_full = str(snip_reason or "").startswith(
+                                "promoted_full_symbol")
                             _ob_delta = old_code.count("{") - old_code.count("}")
                             _nb_delta = new_code.count("{") - new_code.count("}")
-                            if abs(_ob_delta - _nb_delta) >= 1:
+                            if (not _promoted_full
+                                    and abs(_ob_delta - _nb_delta) >= 1):
                                 _snip_bal_reason = (
                                     ("brace_imbalance: your old_code had net " + str(_ob_delta) + " braces " + "but new_code has net " + str(_nb_delta) + " braces " + " \u2014 you likely dropped a closing } or {. " + "Copy your old_code closing lines verbatim into new_code.")
                                 )
@@ -21843,7 +22061,16 @@ async def run_natural_pipeline_stream(
                                   match_reason=snip_reason,
                                   old_code_preview=old_code[:400],
                                   new_code_preview=new_code[:400],
-                                  old_new_identical=(old_code == new_code))
+                                  old_new_identical=(old_code == new_code),
+                                  promoted_full_symbol=_promoted_full)
+                            if _promoted_full:
+                                _dlog("snippet_promoted_to_full_symbol",
+                                      session_id=session_id, user_id=user_id,
+                                      filename=filename, symbol=symbol_name,
+                                      reason=str(snip_reason)[:300],
+                                      old_code_len=len(old_code or ""),
+                                      new_code_len=len(new_code or ""),
+                                      result_len=len(full_new or ""))
                             edit_data["new_code"] = full_new
                             edit_data.pop("old_code", None)  # now a full-symbol edit
                         else:
