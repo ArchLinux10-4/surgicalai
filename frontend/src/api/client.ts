@@ -244,6 +244,10 @@ export const api = {
     getMessages: (sessionId: string) => request<any[]>(`/chat/sessions/${sessionId}/messages`),
     send: (data: any) => request<any>('/chat/send', { method: 'POST', body: JSON.stringify(data) }),
     deleteSession: (id: string) => request(`/chat/sessions/${id}`, { method: 'DELETE' }),
+    getActivePlan: (sessionId: string) =>
+      request<{ run_id: string | null; phase: string; tasks: import('../types').PlanTask[] }>(
+        `/chat/plans/active?session_id=${encodeURIComponent(sessionId)}`,
+      ),
     /** Sidebar multi-select: one round-trip instead of N sequential DELETEs. */
     deleteSessions: (ids: string[]) =>
       request<{ ok: boolean; deleted: string[]; errors: { id: string; status: number; detail: string }[] }>(
@@ -458,6 +462,7 @@ export const api = {
         held_write_count?: number
         message?: string
       }) => void,
+      onPlan?: (event: any) => void,
     ): AbortController => {
       const controller = new AbortController()
       const tokens: string[] = []
@@ -525,6 +530,11 @@ export const api = {
             chunk.type === 'task_blocked' || chunk.type === 'task_cancelled' ||
             chunk.type === 'tasks_complete'
           ) onTask?.(chunk)
+          else if (
+            chunk.type === 'plan_ready' || chunk.type === 'plan_updated' ||
+            chunk.type === 'plan_unchanged' || chunk.type === 'plan_locked' ||
+            chunk.type === 'plan_coverage'
+          ) onPlan?.(chunk)
         } catch {}
       }
 
@@ -702,6 +712,62 @@ export const api = {
         pump()
       }).catch(e => { if (e.name !== 'AbortError') onError(e.message) })
 
+      return controller
+    },
+
+    /** Chat Plan Implement — forced_edit_plan + coverage. Never uses task_plan. */
+    implementPlan: (
+      sessionId: string,
+      runId: string,
+      onProgress: (msg: string) => void,
+      onResult: (result: any) => void,
+      onDone: () => void,
+      onError: (err: string) => void,
+      onPlan?: (event: any) => void,
+    ): AbortController => {
+      const controller = new AbortController()
+      let doneCalled = false
+      const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone() } }
+      fetch(`${BASE}/chat/plans/implement`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ session_id: sessionId, run_id: runId }),
+        signal: controller.signal,
+      }).then(async res => {
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({ detail: res.statusText }))
+          onError(typeof err.detail === 'string' ? err.detail : (err.detail?.message || `HTTP ${res.status}`))
+          fireDone()
+          return
+        }
+        const reader = res.body!.getReader()
+        const decoder = new TextDecoder()
+        let lineBuffer = ''
+        const processLine = (line: string) => {
+          if (!line.startsWith('data: ')) return
+          try {
+            const chunk = JSON.parse(line.slice(6))
+            if (chunk.type === 'progress') onProgress(chunk.content)
+            else if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
+            else if (chunk.type === 'done') fireDone()
+            else if (chunk.type === 'error') onError(chunk.content)
+            else if (
+              chunk.type === 'plan_ready' || chunk.type === 'plan_updated' ||
+              chunk.type === 'plan_unchanged' || chunk.type === 'plan_locked' ||
+              chunk.type === 'plan_coverage'
+            ) onPlan?.(chunk)
+          } catch {}
+        }
+        const pump = (): any => reader.read().then(({ done, value }) => {
+          if (done) { fireDone(); return }
+          lineBuffer += decoder.decode(value, { stream: true })
+          const parts = lineBuffer.split('\n')
+          lineBuffer = parts.pop() ?? ''
+          for (const line of parts) processLine(line.trimEnd())
+          pump()
+        }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
+        pump()
+      }).catch(e => { if (e.name !== 'AbortError') { onError(e.message); fireDone() } })
       return controller
     },
   },

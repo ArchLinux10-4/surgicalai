@@ -98,6 +98,7 @@ _GROK_ASK_PLAN_REINFORCEMENT_TMPL = (
     "illustrative snippet is fine if the user needs it to follow the "
     "explanation, but you are not implementing anything here. If the user "
     "actually wants the change made, tell them to switch to Edit/Agent mode."
+    "{plan_json}"
 )
 
 
@@ -110,7 +111,14 @@ def build_grok_ask_plan_reinforcement(mode: str) -> str:
     Pure string builder, no side effects; safe to unit test directly.
     """
     label = "PLAN" if (mode or "").strip().lower() == "plan" else "ASK"
-    return _GROK_ASK_PLAN_REINFORCEMENT_TMPL.format(label=label)
+    plan_json = ""
+    if label == "PLAN":
+        plan_json = (
+            " You MUST end with a fenced ```implementation_plan JSON block "
+            "listing every step as {\"filename\",\"symbol\",\"description\"}. "
+            "No edits — the fence is the machine-readable plan only."
+        )
+    return _GROK_ASK_PLAN_REINFORCEMENT_TMPL.format(label=label, plan_json=plan_json)
 
 
 def _sse(obj: dict) -> str:

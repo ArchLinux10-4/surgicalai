@@ -234,6 +234,21 @@ export interface NewFile {
 
 export type AgentTaskStatus = 'pending' | 'running' | 'done' | 'blocked' | 'cancelled' | 'error'
 
+export type PlanPhase = 'idle' | 'ready' | 'implementing' | 'complete' | 'blocked'
+
+export interface PlanTask {
+  id: string
+  seq: number
+  title: string
+  detail: string
+  filename: string
+  symbol: string
+  status: AgentTaskStatus
+  run_id?: string
+  verdict?: string | null
+  result_summary?: string
+}
+
 export interface AgentTask {
   id: string
   seq: number

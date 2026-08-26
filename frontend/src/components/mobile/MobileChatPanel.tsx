@@ -26,6 +26,7 @@ import {
 } from './chatMode'
 import { SessionFilesTray } from '../SessionFilesTray'
 import { AgentMissionControl } from '../AgentMissionControl'
+import { PlanTracker } from '../PlanTracker'
 import { useTaskPolling } from '../../hooks/useTaskPolling'
 import { VoiceButton } from '../VoiceButton'
 import { useCodeRain } from '../../hooks/useCodeRain'
@@ -199,7 +200,9 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
 
         {/* Natural text — collapse long narratives when Apply cards are present */}
         {msg.content && (() => {
-          const narrative = msg.content as string
+          const narrative = (msg.content as string)
+            .replace(/```(?:implementation_plan|plan-json)[\s\S]*?```/gi, '')
+            .trim()
           const hasCards = Boolean(result)
           const longNarrative = narrative.length > 280
           const collapseNarrative = hasCards && longNarrative && !narrativeOpen
@@ -485,10 +488,31 @@ export function MobileChatPanel() {
   const setTaskRunId = useAppStore(s => s.setTaskRunId)
   const setTaskPreamble = useAppStore(s => s.setTaskPreamble)
   const setAgentPhase = useAppStore(s => s.setAgentPhase)
+  const applyPlanEvent = useAppStore(s => s.applyPlanEvent)
+  const clearPlanTracker = useAppStore(s => s.clearPlanTracker)
+  const setPlanTasks = useAppStore(s => s.setPlanTasks)
+  const setPlanRunId = useAppStore(s => s.setPlanRunId)
+  const setPlanPhase = useAppStore(s => s.setPlanPhase)
 
   // Keep the task list in sync with the DB-backed source of truth while a run
   // is active (SSE is the instant channel; polling reconciles after drops).
   useTaskPolling(activeSessions)
+
+  useEffect(() => {
+    if (!activeSessions) { clearPlanTracker(); return }
+    let cancelled = false
+    api.chat.getActivePlan(activeSessions).then((p) => {
+      if (cancelled) return
+      if (p?.run_id && p.tasks?.length) {
+        setPlanRunId(p.run_id)
+        setPlanTasks(p.tasks)
+        setPlanPhase((p.phase as any) || 'ready')
+      } else {
+        clearPlanTracker()
+      }
+    }).catch(() => { if (!cancelled) clearPlanTracker() })
+    return () => { cancelled = true }
+  }, [activeSessions, clearPlanTracker, setPlanRunId, setPlanTasks, setPlanPhase])
 
   const [input, setInput]               = useState('')
   const [isStreaming, setIsStreaming]    = useState(false)
@@ -1151,6 +1175,13 @@ export function MobileChatPanel() {
           probing: false,
         })
       },
+      (event) => {
+        if (useAppStore.getState().activeSessions !== sessionId) return
+        applyPlanEvent(event)
+        if (event?.type === 'plan_unchanged' && event.reason === 'invalid_json') {
+          toast.error('Plan not updated', 'The model did not emit a valid implementation_plan. Previous checklist kept.')
+        }
+      },
     )
     ctrlRef.current = ctrl
   }, [input, isStreaming, settings, ensureSession, messages.length, sessionFiles,
@@ -1458,6 +1489,7 @@ export function MobileChatPanel() {
               />
             ))}
             <AgentMissionControl />
+            <PlanTracker />
             {resumableRun && resumableRun.sid === activeSessions && !isStreaming && (
               <div className="mx-3 mb-2 flex items-center justify-between gap-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5">
                 <span className="text-[12px] text-ink leading-snug">
