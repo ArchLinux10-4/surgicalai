@@ -23,6 +23,8 @@ export interface ChatSession {
   created_at: string
   updated_at: string
   message_count: number
+  /** Attached session_files count from list_sessions (sidebar bulk-delete). */
+  file_count?: number
 }
 
 export interface FileNode {

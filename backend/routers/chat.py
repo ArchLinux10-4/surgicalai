@@ -577,26 +577,34 @@ async def _compact_session(session_id: str, user_id: str) -> tuple[str, int]:
 @router.get("/sessions")
 def list_sessions(request: Request):
     user_id = getattr(request.state, "user_id", None)
+    # Subqueries (not JOINs) keep message_count / file_count independent —
+    # a JOIN on both tables would multiply counts. file_count lets the sidebar
+    # bulk-delete confirm skip an N+1 of GET /files per selected chat.
+    _session_select = """
+                SELECT s.*,
+                    (SELECT COUNT(*) FROM chat_messages m WHERE m.session_id = s.id) AS message_count,
+                    (SELECT COUNT(*) FROM session_files f WHERE f.session_id = s.id) AS file_count
+                FROM chat_sessions s
+    """
     with get_db_ctx() as conn:
         if user_id:
-            rows = conn.execute("""
-                SELECT s.*, COUNT(m.id) as message_count
-                FROM chat_sessions s
-                LEFT JOIN chat_messages m ON m.session_id = s.id
+            rows = conn.execute(
+                _session_select
+                + """
                 WHERE s.user_id = ? OR s.user_id IS NULL
-                GROUP BY s.id
                 ORDER BY s.updated_at DESC
                 LIMIT 50
-            """, (user_id,)).fetchall()
+            """,
+                (user_id,),
+            ).fetchall()
         else:
-            rows = conn.execute("""
-                SELECT s.*, COUNT(m.id) as message_count
-                FROM chat_sessions s
-                LEFT JOIN chat_messages m ON m.session_id = s.id
-                GROUP BY s.id
+            rows = conn.execute(
+                _session_select
+                + """
                 ORDER BY s.updated_at DESC
                 LIMIT 50
-            """).fetchall()
+            """
+            ).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -834,34 +842,81 @@ async def stream_message(req: ChatRequest, request: Request):
     })
 
 
+_SESSION_AUX_TABLES = (
+    "change_history",
+    "applied_changes",
+    "agent_tasks",
+    "qa_log",
+    "compliance_log",
+    "credit_pauses",
+)
+
+
+def _purge_session(conn, session_id: str) -> None:
+    """Delete a session and all session-scoped rows in one connection.
+
+    Core tables commit first. Auxiliary tables are best-effort (a missing
+    table rolls back that step only) so schema drift never breaks delete.
+    """
+    conn.execute("DELETE FROM session_files WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
+    conn.commit()
+    for _tbl in _SESSION_AUX_TABLES:
+        try:
+            conn.execute(f"DELETE FROM {_tbl} WHERE session_id = ?", (session_id,))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+
+
 @router.delete("/sessions/{session_id}")
 def delete_session(session_id: str, request: Request):
     require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
-        # Cascade: delete files and messages before session row
-        conn.execute("DELETE FROM session_files WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
-        conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
-        conn.commit()
-        # Hard-delete all session-scoped auxiliary rows so nothing orphans by
-        # session_id (code-diff history, applied/undo state, tasks, audit logs,
-        # credit pauses). Each runs in its own committed step and is best-effort:
-        # a not-yet-created table simply rolls back and is skipped, never breaking
-        # the core delete.
-        for _tbl in (
-            "change_history",
-            "applied_changes",
-            "agent_tasks",
-            "qa_log",
-            "compliance_log",
-            "credit_pauses",
-        ):
-            try:
-                conn.execute(f"DELETE FROM {_tbl} WHERE session_id = ?", (session_id,))
-                conn.commit()
-            except Exception:
-                conn.rollback()
+        _purge_session(conn, session_id)
     return {"ok": True}
+
+
+@router.post("/sessions/bulk-delete")
+def bulk_delete_sessions(body: dict, request: Request):
+    """Delete many chats in one request (sidebar multi-select).
+
+    Sequential per-id DELETE from the browser was both slow (N round trips)
+    and fragile (hover-sidebar unmount mid-flight). One POST keeps the UI
+    responsive; ownership is still checked per id.
+    """
+    ids = body.get("ids") if isinstance(body, dict) else None
+    if not isinstance(ids, list) or not ids:
+        raise HTTPException(status_code=400, detail="ids required")
+    # Cap matches list_sessions LIMIT so a runaway client cannot wipe unbounded.
+    if len(ids) > 50:
+        raise HTTPException(status_code=400, detail="Too many ids (max 50)")
+
+    deleted: list[str] = []
+    errors: list[dict] = []
+    # Dedupe while preserving order — UI may re-send after a partial failure.
+    seen: set[str] = set()
+    unique_ids: list[str] = []
+    for raw in ids:
+        sid = str(raw or "").strip()
+        if not sid or sid in seen:
+            continue
+        seen.add(sid)
+        unique_ids.append(sid)
+
+    with get_db_ctx() as conn:
+        for sid in unique_ids:
+            try:
+                require_session_access_from_request(sid, request)
+                _purge_session(conn, sid)
+                deleted.append(sid)
+            except HTTPException as e:
+                errors.append({"id": sid, "status": e.status_code, "detail": e.detail})
+            except Exception as e:
+                errors.append({"id": sid, "status": 500, "detail": str(e)})
+
+    return {"ok": len(errors) == 0, "deleted": deleted, "errors": errors}
 
 
 @router.patch("/sessions/{session_id}")
