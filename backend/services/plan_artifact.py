@@ -107,11 +107,61 @@ def serialize_plan_task(row: dict) -> dict:
 
 
 def _norm_key(filename: str, symbol: str) -> tuple[str, str]:
-    return ((filename or "").strip().lower(), (symbol or "").strip())
+    return (_norm_filename(filename), _norm_symbol(symbol))
+
+
+def _norm_filename(filename: str) -> str:
+    fn = (filename or "").strip().replace("\\", "/").casefold()
+    while fn.startswith("./"):
+        fn = fn[2:]
+    return fn
+
+
+def _norm_symbol(symbol: str) -> str:
+    return (symbol or "").strip().casefold()
+
+
+def _files_compatible(a: str, b: str) -> bool:
+    a, b = _norm_filename(a), _norm_filename(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return a.endswith("/" + b) or b.endswith("/" + a)
+
+
+def _symbols_compatible(a: str, b: str) -> bool:
+    a, b = _norm_symbol(a), _norm_symbol(b)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    return (
+        a.endswith("." + b) or b.endswith("." + a)
+        or a.endswith("/" + b) or b.endswith("/" + a)
+    )
+
+
+def _keys_compatible(left: tuple[str, str], right: tuple[str, str]) -> bool:
+    return _files_compatible(left[0], right[0]) and _symbols_compatible(left[1], right[1])
 
 
 def _task_key(row: dict) -> tuple[str, str]:
     return _norm_key(row.get("filename") or "", row.get("symbol") or "")
+
+
+def _extract_symbol(item: dict) -> str:
+    symbol = item.get("symbol")
+    if isinstance(symbol, dict):
+        return str(
+            symbol.get("full_path")
+            or symbol.get("name")
+            or symbol.get("symbol_path")
+            or ""
+        )
+    if symbol:
+        return str(symbol)
+    return str(item.get("symbol_path") or item.get("name") or "")
 
 
 def plan_run_phase(tasks: list[dict]) -> str:
@@ -133,9 +183,9 @@ def plan_run_phase(tasks: list[dict]) -> str:
 def latest_plan_run(session_id: str) -> dict | None:
     """Most recent source=plan run for this session (any phase).
 
-    Prefers a run that is not fully superseded so a same-second revise
-    does not lose to the cancelled previous run (SQLite CURRENT_TIMESTAMP
-    is 1s resolution).
+    Excludes fully superseded runs, then picks max(created_at).
+    ``create_tasks`` writes a sub-second UTC stamp so same-second
+    complete-then-revise does not need a phase-rank tiebreak.
     """
     rows = [r for r in list_tasks(session_id) if (r.get("source") or "agent") == "plan"]
     if not rows:
@@ -159,22 +209,7 @@ def latest_plan_run(session_id: str) -> dict | None:
 
     live = [rid for rid, ts in by_run.items() if not _is_superseded(ts)]
     candidates = live or list(by_run.keys())
-    # Same-second SQLite CURRENT_TIMESTAMP: prefer an active checklist
-    # (implementing/ready/blocked) over a just-completed history run.
-    _phase_rank = {
-        "implementing": 4,
-        "ready": 3,
-        "blocked": 2,
-        "complete": 1,
-        "idle": 0,
-    }
-    run_id = max(
-        candidates,
-        key=lambda rid: (
-            _phase_rank.get(plan_run_phase(by_run[rid]), 0),
-            _stamp(by_run[rid]),
-        ),
-    )
+    run_id = max(candidates, key=lambda rid: _stamp(by_run[rid]))
     tasks = by_run[run_id]
     tasks.sort(key=lambda t: t.get("seq") or 0)
     return {"run_id": run_id, "tasks": tasks, "phase": plan_run_phase(tasks)}
@@ -265,6 +300,22 @@ def mark_plan_implementing(session_id: str, run_id: str) -> list[dict]:
     return tasks
 
 
+def revert_plan_after_implement_error(session_id: str, run_id: str, reason: str) -> list[dict]:
+    """Unlock a crashed Implement. Pending/running → pending. No coverage."""
+    note = (reason or "Implement failed").strip()[:300]
+    updated = []
+    for t in list_tasks(session_id, run_id):
+        if (t.get("source") or "") != "plan":
+            continue
+        if (t.get("status") or "") in ("running", "pending"):
+            update_task(t["id"], status="pending", result_summary=note)
+            t["status"] = "pending"
+            t["result_summary"] = note
+        updated.append(t)
+    updated.sort(key=lambda r: r.get("seq") or 0)
+    return updated
+
+
 def forced_edit_plan_from_run(session_id: str, run_id: str) -> list[dict]:
     tasks = [t for t in list_tasks(session_id, run_id) if (t.get("source") or "") == "plan"]
     tasks.sort(key=lambda t: t.get("seq") or 0)
@@ -283,8 +334,8 @@ def forced_edit_plan_from_run(session_id: str, run_id: str) -> list[dict]:
     return plan
 
 
-def _keys_from_changes_by_file(changes_by_file) -> set[tuple[str, str]]:
-    keys: set[tuple[str, str]] = set()
+def _keys_from_changes_by_file(changes_by_file) -> list[tuple[str, str]]:
+    keys: list[tuple[str, str]] = []
     if not isinstance(changes_by_file, dict):
         return keys
     for filename, fd in changes_by_file.items():
@@ -299,15 +350,15 @@ def _keys_from_changes_by_file(changes_by_file) -> set[tuple[str, str]]:
         for ch in changes:
             if not isinstance(ch, dict):
                 continue
-            symbol = ch.get("symbol")
-            if isinstance(symbol, dict):
-                symbol = symbol.get("full_path") or symbol.get("name") or ""
-            keys.add(_norm_key(str(fn or ""), str(symbol or "")))
-    return {k for k in keys if k[0] or k[1]}
+            symbol = _extract_symbol(ch)
+            pair = (str(fn or ""), str(symbol or ""))
+            if pair[0] or pair[1]:
+                keys.append(pair)
+    return keys
 
 
-def _keys_from_skipped(skipped) -> set[tuple[str, str]]:
-    keys: set[tuple[str, str]] = set()
+def _keys_from_skipped(skipped) -> list[tuple[str, str]]:
+    keys: list[tuple[str, str]] = []
     if not isinstance(skipped, list):
         return keys
     for item in skipped:
@@ -316,45 +367,46 @@ def _keys_from_skipped(skipped) -> set[tuple[str, str]]:
         reason = str(item.get("reason") or "").strip()
         if not reason:
             continue
-        keys.add(_norm_key(item.get("filename") or "", item.get("symbol") or ""))
-    return {k for k in keys if k[0] or k[1]}
+        fn = str(item.get("filename") or "")
+        symbol = _extract_symbol(item)
+        if fn or symbol:
+            keys.append((fn, symbol))
+    return keys
 
 
 def compute_plan_coverage(planned_steps: list[dict], result: dict) -> dict:
     """Deterministic planned vs produced. No LLM.
 
-    A planned key is covered if it appears in changes_by_file OR in
-    skipped_changes with a reason. Extra produced keys are allowed.
+    A planned key is covered if any produced or skipped-with-reason key is
+    file/symbol-compatible (path suffix, dotted symbol suffix). Extra
+    produced keys are allowed.
     """
-    planned = []
-    planned_keys: set[tuple[str, str]] = set()
+    planned: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
     for s in planned_steps or []:
         if not isinstance(s, dict):
             continue
-        key = _norm_key(s.get("filename") or "", s.get("symbol") or "")
-        if not (key[0] and key[1]):
+        pair = (str(s.get("filename") or ""), str(s.get("symbol") or ""))
+        key = _norm_key(pair[0], pair[1])
+        if not (key[0] and key[1]) or key in seen:
             continue
-        planned_keys.add(key)
-        planned.append({"filename": s.get("filename") or "", "symbol": s.get("symbol") or ""})
+        seen.add(key)
+        planned.append(pair)
 
     produced = _keys_from_changes_by_file((result or {}).get("changes_by_file"))
     skipped = _keys_from_skipped((result or {}).get("skipped_changes"))
-    covered = planned_keys & (produced | skipped)
-    missing = [
-        {"filename": fn, "symbol": sym}
-        for fn, sym in sorted(planned_keys - covered)
-    ]
-    extra = [
-        {"filename": fn, "symbol": sym}
-        for fn, sym in sorted(produced - planned_keys)
-        if fn or sym
-    ]
+    pool = produced + skipped
+
+    covered = [p for p in planned if any(_keys_compatible(p, q) for q in pool)]
+    missing = [p for p in planned if p not in covered]
+    extra = [q for q in produced if not any(_keys_compatible(q, p) for p in planned)]
+    skipped_hit = [q for q in skipped if any(_keys_compatible(q, p) for p in planned)]
     return {
         "ok": len(missing) == 0,
-        "covered": [{"filename": fn, "symbol": sym} for fn, sym in sorted(covered)],
-        "missing": missing,
-        "extra": extra,
-        "skipped": [{"filename": fn, "symbol": sym} for fn, sym in sorted(skipped & planned_keys)],
+        "covered": [{"filename": fn, "symbol": sym} for fn, sym in covered],
+        "missing": [{"filename": fn, "symbol": sym} for fn, sym in missing],
+        "extra": [{"filename": fn, "symbol": sym} for fn, sym in extra],
+        "skipped": [{"filename": fn, "symbol": sym} for fn, sym in skipped_hit],
     }
 
 

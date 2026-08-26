@@ -71,6 +71,46 @@ async def _with_heartbeat(aiter, interval: int = 5):
             _dlog("heartbeat_swallow", exc_type=type(_hb_exc).__name__, exc_msg=str(_hb_exc))
 
 
+async def _with_heartbeat_propagate(aiter, interval: int = 5):
+    """Like ``_with_heartbeat`` but re-raises the producer error.
+
+    Implement uses this so a crashed pipeline becomes ``plan_failed``,
+    not silent empty coverage. Agent/Edit keep the swallow-on-cancel helper.
+    """
+    _DONE = object()
+    queue: asyncio.Queue = asyncio.Queue()
+    produce_error: list = []
+
+    async def _produce():
+        try:
+            async for item in aiter:
+                await queue.put(item)
+        except Exception as e:
+            produce_error.append(e)
+        finally:
+            await queue.put(_DONE)
+
+    task = asyncio.create_task(_produce())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield ": keepalive\n\n"
+                continue
+            if item is _DONE:
+                break
+            yield item
+        if produce_error:
+            raise produce_error[0]
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 # ── Mode selector helpers (pure, unit-tested in test_mode_selector.py) ─────────
 # "edit" (default) and "agent" use the existing pipeline. "ask" and "plan"
 # short-circuit to a plain streamed answer with no edit pipeline.
@@ -104,6 +144,12 @@ _PLAN_JSON_TRAILER = (
     "\n\n[PLAN MODE — required] End with a ```implementation_plan JSON fence "
     "listing every step as {\"filename\",\"symbol\",\"description\"}. "
     "Do NOT produce <surgical_edit> tags."
+)
+
+_PLAN_FENCE_RETRY = (
+    "Your previous reply omitted the required ```implementation_plan JSON fence. "
+    "Reply with ONLY that fence listing every step as "
+    "{\"filename\",\"symbol\",\"description\"}. No diffs. No <surgical_edit> tags."
 )
 
 
@@ -1045,7 +1091,7 @@ async def implement_plan(body: dict, request: Request):
                 "phase": "implementing",
                 "tasks": [serialize_plan_task(t) for t in mark_plan_implementing(session_id, run_id)],
             }) + "\n\n"
-            async for chunk in _with_heartbeat(run_natural_pipeline_stream(
+            async for chunk in _with_heartbeat_propagate(run_natural_pipeline_stream(
                 session_files=session_files,
                 user_request=user_request,
                 conversation_history=conversation_history,
@@ -1112,13 +1158,13 @@ async def implement_plan(body: dict, request: Request):
             _dlog("plan_implement_error", session_id=session_id,
                   user_id=current_user_id, run_id=run_id, error=str(e)[:300])
             try:
-                coverage = compute_plan_coverage(plan_steps, {})
-                updated = apply_coverage_to_run(session_id, run_id, coverage)
+                from services.plan_artifact import revert_plan_after_implement_error
+                updated = revert_plan_after_implement_error(session_id, run_id, str(e)[:300])
                 yield "data: " + _json.dumps({
-                    "type": "plan_coverage",
+                    "type": "plan_failed",
                     "run_id": run_id,
-                    "phase": plan_run_phase(updated),
-                    "coverage": coverage,
+                    "phase": "ready",
+                    "error": str(e)[:300],
                     "tasks": [serialize_plan_task(t) for t in updated],
                 }) + "\n\n"
             except Exception:
@@ -1326,7 +1372,8 @@ async def smart_stream(req: dict, request: Request):
             _mode_error = False
             _mode_model = None  # captured from run_chat_stream's `done` event
             _mode_web_search_sources: list = []  # Claude-only (Ask/Plan) — see claude_web_search.py
-            _plan_event = None  # plan_ready / plan_updated — set once on done
+            _plan_event = None  # plan_ready / plan_updated — set once after persist
+            _plan_needs_retry = False
             # Research-checkbox parity fix: the SAME per-session flag the
             # Edit/Agent "Research" checkbox writes above (top of this
             # function, unconditional on mode) now also drives Ask/Plan's web
@@ -1341,6 +1388,16 @@ async def smart_stream(req: dict, request: Request):
             _dlog("ask_plan_web_research_flag", session_id=session_id,
                   user_id=current_user_id, mode=_eff_mode,
                   web_search_enabled=_ask_plan_web_search_enabled)
+
+            def _persist_plan_event(text: str):
+                try:
+                    from services.plan_artifact import persist_plan_from_assistant_text
+                    return persist_plan_from_assistant_text(session_id, text)
+                except Exception as _pe:
+                    _dlog("sse_plan_persist_error", session_id=session_id,
+                          user_id=current_user_id, error=str(_pe))
+                    return None
+
             try:
                 # model omitted → run_chat_stream resolves architect_model itself.
                 async for _mchunk in run_chat_stream(
@@ -1373,23 +1430,77 @@ async def smart_stream(req: dict, request: Request):
                                     _mode_web_search_sources = _md.get("web_search_sources")
                                 # Emit plan_ready/updated BEFORE forwarding done
                                 # so the client tracker is populated when onDone runs.
+                                # Missing fence: swallow this done and retry once.
                                 if _eff_mode == "plan" and not _mode_error:
+                                    from services.plan_artifact import (
+                                        parse_implementation_plan,
+                                        latest_plan_run,
+                                    )
                                     _early = "".join(_mode_collected)
-                                    if _early:
-                                        try:
-                                            from services.plan_artifact import persist_plan_from_assistant_text
-                                            _plan_event = persist_plan_from_assistant_text(
-                                                session_id, _early
-                                            )
-                                        except Exception as _pe:
-                                            _dlog("sse_plan_persist_error", session_id=session_id,
-                                                  user_id=current_user_id, error=str(_pe))
-                                            _plan_event = None
+                                    _latest = latest_plan_run(session_id)
+                                    if _latest and _latest.get("phase") == "implementing":
+                                        _plan_event = _persist_plan_event(_early)
+                                        if _plan_event:
+                                            yield "data: " + _json.dumps(_plan_event) + "\n\n"
+                                    elif parse_implementation_plan(_early) is None:
+                                        _plan_needs_retry = True
+                                        continue
+                                    else:
+                                        _plan_event = _persist_plan_event(_early)
                                         if _plan_event:
                                             yield "data: " + _json.dumps(_plan_event) + "\n\n"
                         except Exception:
                             pass
                     yield _mchunk
+
+                if _plan_needs_retry and not _mode_error and _eff_mode == "plan":
+                    yield "data: " + _json.dumps({
+                        "type": "progress",
+                        "content": "Asking the model for the implementation_plan fence…",
+                    }) + "\n\n"
+                    _repair_messages = list(_mode_messages) + [
+                        {"role": "assistant", "content": "".join(_mode_collected)},
+                        {"role": "user", "content": _PLAN_FENCE_RETRY},
+                    ]
+                    try:
+                        async for _rchunk in run_chat_stream(
+                            _repair_messages,
+                            file_content=_mode_file_ctx,
+                            project_memory=project_memory,
+                            user_id=current_user_id,
+                            session_id=session_id,
+                            session_files=session_files,
+                            mode=_eff_mode,
+                            web_search_enabled=_ask_plan_web_search_enabled,
+                        ):
+                            if _rchunk.startswith("data: "):
+                                try:
+                                    _rd = _json.loads(_rchunk[6:])
+                                    _rt = _rd.get("type")
+                                    if _rt == "token":
+                                        _mode_collected.append(_rd.get("content", ""))
+                                    elif _rt == "error":
+                                        _mode_error = True
+                                    elif _rt == "done":
+                                        if _rd.get("model"):
+                                            _mode_model = _rd.get("model")
+                                        if _rd.get("web_search_sources"):
+                                            _mode_web_search_sources = _rd.get("web_search_sources")
+                                        _plan_event = _persist_plan_event("".join(_mode_collected))
+                                        if _plan_event:
+                                            yield "data: " + _json.dumps(_plan_event) + "\n\n"
+                                        else:
+                                            yield "data: " + _json.dumps({
+                                                "type": "plan_missing",
+                                            }) + "\n\n"
+                                except Exception:
+                                    pass
+                            yield _rchunk
+                    except Exception as _re:
+                        _dlog("sse_plan_fence_retry_error", session_id=session_id,
+                              user_id=current_user_id, error=str(_re))
+                        yield "data: " + _json.dumps({"type": "plan_missing"}) + "\n\n"
+                        yield "data: " + _json.dumps({"type": "done", "content": ""}) + "\n\n"
             except Exception as _me:
                 _mode_error = True
                 _dlog("sse_mode_error", session_id=session_id,

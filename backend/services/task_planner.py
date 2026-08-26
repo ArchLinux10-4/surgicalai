@@ -14,7 +14,9 @@ multiple workers/instances — the running loop polls the flag.
 """
 import json
 import re
+import time
 import uuid
+from datetime import datetime, timezone
 
 from database import get_db, get_setting
 
@@ -224,12 +226,20 @@ def create_tasks(session_id: str, run_id: str, tasks: list) -> list:
             source = (t.get("source") or "agent") if isinstance(t, dict) else "agent"
             if source not in ("plan", "agent"):
                 source = "agent"
+            # Sub-second stamp so latest_plan_run does not need a phase-rank
+            # tiebreak (SQLite CURRENT_TIMESTAMP is 1s resolution).
+            _ns = time.time_ns()
+            _sec, _nsec = divmod(_ns, 1_000_000_000)
+            created_at = (
+                datetime.fromtimestamp(_sec, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                + f".{_nsec:09d}Z"
+            )
             conn.execute(
                 "INSERT INTO agent_tasks (id, session_id, run_id, seq, title, detail, kind, status, "
-                "filename, symbol, source) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                "filename, symbol, source, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)",
                 (tid, session_id, run_id, i, t.get("title", ""), t.get("detail", ""), kind,
-                 filename, symbol, source),
+                 filename, symbol, source, created_at),
             )
             created.append({
                 "id": tid,
@@ -245,6 +255,7 @@ def create_tasks(session_id: str, run_id: str, tasks: list) -> list:
                 "filename": filename,
                 "symbol": symbol,
                 "source": source,
+                "created_at": created_at,
             })
         conn.commit()
     finally:
