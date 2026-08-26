@@ -338,11 +338,11 @@ export const useAppStore = create<AppState>((set) => ({
   applyPlanEvent: (event) => {
     if (!event || typeof event !== 'object') return
     const t = event.type
-    if (t === 'plan_ready' || t === 'plan_updated' || t === 'plan_coverage') {
+    if (t === 'plan_ready' || t === 'plan_updated' || t === 'plan_coverage' || t === 'plan_failed') {
       set({
         planRunId: event.run_id || null,
         planTasks: Array.isArray(event.tasks) ? event.tasks : [],
-        planPhase: event.phase || (t === 'plan_ready' ? 'ready' : 'ready'),
+        planPhase: event.phase || (t === 'plan_failed' ? 'ready' : 'ready'),
       })
       return
     }
@@ -353,6 +353,7 @@ export const useAppStore = create<AppState>((set) => ({
         planPhase: event.phase || (t === 'plan_locked' ? 'implementing' : 'ready'),
       })
     }
+    // plan_missing: leave the tracker empty / unchanged
   },
 
   pendingChatInput: null,

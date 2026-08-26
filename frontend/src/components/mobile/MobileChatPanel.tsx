@@ -1181,6 +1181,9 @@ export function MobileChatPanel() {
         if (event?.type === 'plan_unchanged' && event.reason === 'invalid_json') {
           toast.error('Plan not updated', 'The model did not emit a valid implementation_plan. Previous checklist kept.')
         }
+        if (event?.type === 'plan_missing') {
+          toast.error('No plan checklist', 'The model did not emit a valid implementation_plan. Stay in Plan and ask again.')
+        }
       },
     )
     ctrlRef.current = ctrl

@@ -142,7 +142,10 @@ def test_ask_plan_never_touch_edit_pipeline(_mock_backends, mode):
 
     # Streamed a plain answer...
     assert "ANSWER" in body
-    assert _mock_backends["chat_stream"] == 1
+    # Plan may make one extra run_chat_stream call to recover a missing
+    # implementation_plan fence. Ask stays at a single call. Neither mode
+    # may enter the edit pipeline.
+    assert _mock_backends["chat_stream"] == (2 if mode == "plan" else 1)
     # ...and the edit pipeline was NEVER entered. This is the core guarantee.
     assert _mock_backends["pipeline"] == 0
 

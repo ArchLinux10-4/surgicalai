@@ -983,96 +983,90 @@ export function ChatPanel() {
           } catch {}
         }, 3000)
       },
-      // onThinking — injection point: when thinking ends and injection is queued, restart
-      (thinkToken, phase) => {
-        if (useAppStore.getState().activeSessions !== sessionId) return
-        if (phase === 'start') {
-          setIsThinking(true); setThinkingText(''); thinkingTextRef.current = ''
-        } else if (phase === 'delta') {
-          setThinkingText(prev => { const next = prev + thinkToken; thinkingTextRef.current = next; return next })
-        } else if (phase === 'end') {
-          setIsThinking(false)
-          if (pendingInjectionRef.current) {
-            const inj = pendingInjectionRef.current
-            pendingInjectionRef.current = ''
-            setInjectionQueued(false)
-            abortRef.current?.abort()
-            setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
-            const combined = sentMessageRef.current + '\n\n[Context added while thinking]: ' + inj
-            setRestartSignal({ msg: combined, sid: sessionId })
+      {
+        onThinking: (thinkToken, phase) => {
+          if (useAppStore.getState().activeSessions !== sessionId) return
+          if (phase === 'start') {
+            setIsThinking(true); setThinkingText(''); thinkingTextRef.current = ''
+          } else if (phase === 'delta') {
+            setThinkingText(prev => { const next = prev + thinkToken; thinkingTextRef.current = next; return next })
+          } else if (phase === 'end') {
+            setIsThinking(false)
+            if (pendingInjectionRef.current) {
+              const inj = pendingInjectionRef.current
+              pendingInjectionRef.current = ''
+              setInjectionQueued(false)
+              abortRef.current?.abort()
+              setIsStreaming(false); setStreamingMessage(''); setStreamProgress('')
+              const combined = sentMessageRef.current + '\n\n[Context added while thinking]: ' + inj
+              setRestartSignal({ msg: combined, sid: sessionId })
+            }
           }
-        }
-      },
-      // onCompacting
-      (phase) => {
-        if (phase === 'start') {
-          setIsCompacting(true)
-        } else {
-          setIsCompacting(false)
-          addMessage({
-            id: Date.now().toString() + '_compact',
-            session_id: sessionId,
-            role: 'system' as any,
-            message_type: 'compact_marker',
-            content: '',
-            created_at: new Date().toISOString(),
-          })
-        }
-      },
-      // onEditStart
-      () => { setIsBuildingEdit(true) },
-      // onEditEnd
-      () => { setIsBuildingEdit(false) },
-      // onTask
-      (event) => {
-        switch (event.type) {
-          case 'planning_started':
-            setAgentPhase('planning')
-            break
-          case 'task_plan':
-            setAgentPhase('executing')
-            setTaskRunId(event.run_id)
-            setTaskPreamble(event.preamble || '')
-            setAgentTasks((event.tasks || []).map((t: any) => ({
-              id: t.id, seq: t.seq, title: t.title, detail: t.detail,
-              kind: t.kind || 'code',
-              status: t.status || 'pending', qa_score: null, verdict: null,
-              run_id: event.run_id,
-            })))
-            // Stash the plan; the queue starts once the planning stream closes.
-            pendingRunRef.current = { runId: event.run_id, tasks: event.tasks || [] }
-            break
-          case 'task_start':
-            updateAgentTask(event.id, { status: 'running', progress: undefined })
-            break
-          case 'task_progress':
-            updateAgentTask(event.id, { progress: event.content })
-            break
-          case 'task_done':
-            updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict })
-            break
-          case 'task_blocked':
-            updateAgentTask(event.id, { status: 'blocked', qa_score: event.qa_score, verdict: event.verdict })
-            break
-          case 'task_cancelled':
-            updateAgentTask(event.id, { status: 'cancelled' })
-            break
-          case 'tasks_complete':
-            setAgentPhase('complete')
-            break
-        }
-      },
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      (event) => {
-        if (useAppStore.getState().activeSessions !== sessionId) return
-        applyPlanEvent(event)
-        if (event?.type === 'plan_unchanged' && event.reason === 'invalid_json') {
-          toast.error('Plan not updated', 'The model did not emit a valid implementation_plan. Previous checklist kept.')
-        }
+        },
+        onCompacting: (phase) => {
+          if (phase === 'start') {
+            setIsCompacting(true)
+          } else {
+            setIsCompacting(false)
+            addMessage({
+              id: Date.now().toString() + '_compact',
+              session_id: sessionId,
+              role: 'system' as any,
+              message_type: 'compact_marker',
+              content: '',
+              created_at: new Date().toISOString(),
+            })
+          }
+        },
+        onEditStart: () => { setIsBuildingEdit(true) },
+        onEditEnd: () => { setIsBuildingEdit(false) },
+        onTask: (event) => {
+          switch (event.type) {
+            case 'planning_started':
+              setAgentPhase('planning')
+              break
+            case 'task_plan':
+              setAgentPhase('executing')
+              setTaskRunId(event.run_id)
+              setTaskPreamble(event.preamble || '')
+              setAgentTasks((event.tasks || []).map((t: any) => ({
+                id: t.id, seq: t.seq, title: t.title, detail: t.detail,
+                kind: t.kind || 'code',
+                status: t.status || 'pending', qa_score: null, verdict: null,
+                run_id: event.run_id,
+              })))
+              pendingRunRef.current = { runId: event.run_id, tasks: event.tasks || [] }
+              break
+            case 'task_start':
+              updateAgentTask(event.id, { status: 'running', progress: undefined })
+              break
+            case 'task_progress':
+              updateAgentTask(event.id, { progress: event.content })
+              break
+            case 'task_done':
+              updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict })
+              break
+            case 'task_blocked':
+              updateAgentTask(event.id, { status: 'blocked', qa_score: event.qa_score, verdict: event.verdict })
+              break
+            case 'task_cancelled':
+              updateAgentTask(event.id, { status: 'cancelled' })
+              break
+            case 'tasks_complete':
+              setAgentPhase('complete')
+              break
+          }
+        },
+        onPlan: (event) => {
+          if (useAppStore.getState().activeSessions !== sessionId) return
+          applyPlanEvent(event)
+          if (event?.type === 'plan_unchanged' && event.reason === 'invalid_json') {
+            toast.error('Plan not updated', 'The model did not emit a valid implementation_plan. Previous checklist kept.')
+          }
+          if (event?.type === 'plan_missing') {
+            toast.error('No plan checklist', 'The model did not emit a valid implementation_plan. Stay in Plan and ask again.')
+          }
+        },
       },
     )
     abortRef.current = ctrl

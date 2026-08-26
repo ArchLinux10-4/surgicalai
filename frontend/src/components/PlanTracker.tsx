@@ -140,6 +140,14 @@ export function PlanTracker() {
           Some planned steps were not produced. Implement again for remaining, or stay in Plan to revise.
         </div>
       )}
+      {planPhase === 'ready' && planTasks.some(t => t.status === 'pending' && t.result_summary) && (
+        <div className="px-3 py-2 border-t border-border/60 text-[11px] text-danger">
+          Implement failed — try again
+          {planTasks.find(t => t.result_summary)?.result_summary
+            ? `: ${planTasks.find(t => t.result_summary)?.result_summary}`
+            : ''}
+        </div>
+      )}
     </div>
   )
 }

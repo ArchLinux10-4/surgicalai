@@ -6,6 +6,35 @@ const BASE = (import.meta.env.VITE_API_URL ?? '') + '/api'
  *  (e.g. clientLog) hit the same origin/prefix as every other API call. */
 export const API_BASE = BASE
 
+export type SmartStreamHandlers = {
+  onThinking?: (text: string, phase: 'start' | 'delta' | 'end') => void
+  onCompacting?: (phase: 'start' | 'done', info?: { summary?: string; compacted_count?: number }) => void
+  onEditStart?: () => void
+  onEditEnd?: () => void
+  onTask?: (event: any) => void
+  onFileNeeded?: (
+    info: { filename: string; message: string; retry?: boolean },
+    respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => boolean,
+  ) => void
+  onFileCleared?: (filename: string) => void
+  onWebSearch?: (event:
+    | { phase: 'start' }
+    | { phase: 'query'; query: string }
+    | { phase: 'results'; results: Array<{ url: string; title: string; domain: string; page_age?: string | null }>; error?: string | null }
+  ) => void
+  onDoneSources?: (sources: Array<{ url: string; title: string; domain: string; page_age?: string | null }>) => void
+  onCreditPaused?: (info: {
+    pause_id?: string
+    session_id?: string
+    remaining_count?: number
+    remaining_symbols?: Array<{ filename?: string; symbol?: string }>
+    completed_edit_count?: number
+    held_write_count?: number
+    message?: string
+  }) => void
+  onPlan?: (event: any) => void
+}
+
 /** Fire-and-forget clientLog bridge for wrappers defined in this file.
  *  lib/clientLog.ts imports API_BASE/getAuthToken from here, so clientLog must
  *  be pulled in lazily (dynamic import) to avoid a circular module dependency.
@@ -422,48 +451,27 @@ export const api = {
       onResult: (result: any) => void,
       onDone: (fullText: string, model?: string) => void,
       onError: (err: string) => void,
-      onThinking?: (text: string, phase: 'start' | 'delta' | 'end') => void,
-      onCompacting?: (phase: 'start' | 'done', info?: { summary?: string; compacted_count?: number }) => void,
-      onEditStart?: () => void,
-      onEditEnd?: () => void,
-      onTask?: (event: any) => void,
-      // Human-in-the-loop: the agent paused because it needs a file that isn't
-      // in the session. `respond` sends the file (or a skip) back over the same
-      // WebSocket. `onFileCleared` fires when the prompt should be dismissed
-      // (provided / skipped / timed out).
-      // `respond` returns false when the back-channel is dead (WS already
-      // closed) so the caller can surface that instead of hanging forever
-      // on a request that will never be delivered.
-      onFileNeeded?: (
-        info: { filename: string; message: string; retry?: boolean },
-        respond: (resp: { filename?: string; content?: string; action?: 'skip' }) => boolean,
-      ) => void,
-      onFileCleared?: (filename: string) => void,
-      // Claude native web-search tool events — see services/claude_web_search.py.
-      // Fires zero or more times per turn: 'start' when Claude begins a
-      // search, 'query' once we know what it searched for, 'results' with
-      // the returned citations. `onDone`'s 4th arg carries the final,
-      // de-duplicated source list for persistence-on-reload.
-      onWebSearch?: (event:
-        | { phase: 'start' }
-        | { phase: 'query'; query: string }
-        | { phase: 'results'; results: Array<{ url: string; title: string; domain: string; page_age?: string | null }>; error?: string | null }
-      ) => void,
-      onDoneSources?: (sources: Array<{ url: string; title: string; domain: string; page_age?: string | null }>) => void,
-      // Anthropic credit exhaustion pause (session cb380321). Fires when
-      // plan_execute hits "credit balance is too low"; remaining plan is
-      // persisted server-side for Resume.
-      onCreditPaused?: (info: {
-        pause_id?: string
-        session_id?: string
-        remaining_count?: number
-        remaining_symbols?: Array<{ filename?: string; symbol?: string }>
-        completed_edit_count?: number
-        held_write_count?: number
-        message?: string
-      }) => void,
-      onPlan?: (event: any) => void,
+      onThinking?: SmartStreamHandlers['onThinking'] | SmartStreamHandlers,
+      onCompacting?: SmartStreamHandlers['onCompacting'],
+      onEditStart?: SmartStreamHandlers['onEditStart'],
+      onEditEnd?: SmartStreamHandlers['onEditEnd'],
+      onTask?: SmartStreamHandlers['onTask'],
+      onFileNeeded?: SmartStreamHandlers['onFileNeeded'],
+      onFileCleared?: SmartStreamHandlers['onFileCleared'],
+      onWebSearch?: SmartStreamHandlers['onWebSearch'],
+      onDoneSources?: SmartStreamHandlers['onDoneSources'],
+      onCreditPaused?: SmartStreamHandlers['onCreditPaused'],
+      onPlan?: SmartStreamHandlers['onPlan'],
     ): AbortController => {
+      // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
+      // historical positional optional callbacks (ChatPanel / mobile).
+      if (onThinking && typeof onThinking === 'object') {
+        ({
+          onThinking, onCompacting, onEditStart, onEditEnd, onTask,
+          onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
+          onCreditPaused, onPlan,
+        } = onThinking)
+      }
       const controller = new AbortController()
       const tokens: string[] = []
       let doneCalled = false
@@ -533,7 +541,8 @@ export const api = {
           else if (
             chunk.type === 'plan_ready' || chunk.type === 'plan_updated' ||
             chunk.type === 'plan_unchanged' || chunk.type === 'plan_locked' ||
-            chunk.type === 'plan_coverage'
+            chunk.type === 'plan_coverage' || chunk.type === 'plan_missing' ||
+            chunk.type === 'plan_failed'
           ) onPlan?.(chunk)
         } catch {}
       }
@@ -754,7 +763,8 @@ export const api = {
             else if (
               chunk.type === 'plan_ready' || chunk.type === 'plan_updated' ||
               chunk.type === 'plan_unchanged' || chunk.type === 'plan_locked' ||
-              chunk.type === 'plan_coverage'
+              chunk.type === 'plan_coverage' || chunk.type === 'plan_missing' ||
+              chunk.type === 'plan_failed'
             ) onPlan?.(chunk)
           } catch {}
         }

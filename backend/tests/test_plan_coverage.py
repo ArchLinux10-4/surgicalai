@@ -23,6 +23,7 @@ from services.plan_artifact import (  # noqa: E402
     latest_plan_run,
     mark_plan_implementing,
     forced_edit_plan_from_run,
+    revert_plan_after_implement_error,
 )
 from services.task_planner import create_tasks  # noqa: E402
 
@@ -362,3 +363,146 @@ def test_implement_and_persist_not_claude_gated():
     assert "plan_tasks" not in impl
     assert "_is_claude" not in persist
     assert "plan_tasks" not in persist
+
+
+def test_coverage_aliases_path_and_dotted_symbol():
+    planned = [{"filename": "src/Header.tsx", "symbol": "Header"}]
+    result = {
+        "changes_by_file": {
+            "Header.tsx": {
+                "filename": "Header.tsx",
+                "changes": [{"symbol": {"full_path": "App.Header"}}],
+            },
+        },
+        "skipped_changes": [],
+    }
+    cov = compute_plan_coverage(planned, result)
+    assert cov["ok"] is True
+    assert cov["missing"] == []
+
+
+def test_coverage_rejects_unrelated_qualified_symbols():
+    planned = [{"filename": "a.py", "symbol": "Widget.render"}]
+    result = {
+        "changes_by_file": {
+            "a.py": {"filename": "a.py", "changes": [{"symbol": "Header.render"}]},
+        },
+        "skipped_changes": [],
+    }
+    cov = compute_plan_coverage(planned, result)
+    assert cov["ok"] is False
+    assert cov["missing"] == [{"filename": "a.py", "symbol": "Widget.render"}]
+
+
+def test_revert_implement_error_unlocks_pending(plan_db):
+    sid = plan_db["sid"]
+    ev = persist_plan_from_assistant_text(sid, CLAUDE_STYLE)
+    mark_plan_implementing(sid, ev["run_id"])
+    updated = revert_plan_after_implement_error(sid, ev["run_id"], "pipeline exploded")
+    assert all(t["status"] == "pending" for t in updated)
+    assert latest_plan_run(sid)["phase"] == "ready"
+    assert "pipeline exploded" in (updated[0].get("result_summary") or "")
+
+
+def test_omitted_fence_retries_then_plan_ready(stream_env, monkeypatch):
+    import asyncio
+    chat_router = stream_env["chat"]
+    calls = stream_env["calls"]
+
+    async def _fake(messages, **kwargs):
+        calls["chat_stream"] += 1
+        if calls["chat_stream"] == 1:
+            yield 'data: {"type": "token", "content": "## Overview\\nNo fence."}\n\n'
+        else:
+            yield 'data: {"type": "token", "content": ' + json.dumps(CLAUDE_STYLE) + "}\n\n"
+        yield 'data: {"type": "done", "content": "", "model": "grok-4.6"}\n\n'
+
+    monkeypatch.setattr(chat_router, "run_chat_stream", _fake)
+    calls["chat_stream"] = 0
+
+    async def _drain(resp):
+        parts = []
+        async for p in resp.body_iterator:
+            parts.append(p.decode() if isinstance(p, (bytes, bytearray)) else p)
+        return "".join(parts)
+
+    resp = asyncio.run(chat_router.smart_stream(
+        {"session_id": stream_env["sid"], "message": "plan a banner", "mode": "plan"},
+        stream_env["req"],
+    ))
+    body = asyncio.run(_drain(resp))
+    assert '"type": "plan_ready"' in body
+    assert '"type": "plan_missing"' not in body
+    assert '"type": "task_plan"' not in body
+    assert calls["chat_stream"] == 2
+    assert calls["pipeline"] == 0
+    assert calls["plan_tasks"] == 0
+    assert latest_plan_run(stream_env["sid"])["tasks"][0]["symbol"] == "main"
+
+
+def test_omitted_fence_retry_empty_emits_plan_missing(stream_env, monkeypatch):
+    import asyncio
+    chat_router = stream_env["chat"]
+    calls = stream_env["calls"]
+
+    async def _fake(messages, **kwargs):
+        calls["chat_stream"] += 1
+        yield 'data: {"type": "token", "content": "just markdown, no fence"}\n\n'
+        yield 'data: {"type": "done", "content": "", "model": "gpt-4.1"}\n\n'
+
+    monkeypatch.setattr(chat_router, "run_chat_stream", _fake)
+    calls["chat_stream"] = 0
+
+    async def _drain(resp):
+        parts = []
+        async for p in resp.body_iterator:
+            parts.append(p.decode() if isinstance(p, (bytes, bytearray)) else p)
+        return "".join(parts)
+
+    resp = asyncio.run(chat_router.smart_stream(
+        {"session_id": stream_env["sid"], "message": "plan auth", "mode": "plan"},
+        stream_env["req"],
+    ))
+    body = asyncio.run(_drain(resp))
+    assert '"type": "plan_missing"' in body
+    assert '"type": "plan_ready"' not in body
+    assert '"type": "task_plan"' not in body
+    assert calls["chat_stream"] == 2
+    assert calls["pipeline"] == 0
+    assert latest_plan_run(stream_env["sid"]) is None
+
+
+def test_implement_exception_emits_plan_failed_not_coverage(stream_env, monkeypatch):
+    import asyncio
+    sid = stream_env["sid"]
+    ev = persist_plan_from_assistant_text(sid, CLAUDE_STYLE)
+    with stream_env["db"].get_db_ctx() as conn:
+        conn.execute(
+            "INSERT INTO session_files (id, session_id, filename, content, language) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), sid, "app.py", "def main():\n    pass\n", "python"),
+        )
+        conn.commit()
+
+    async def _boom(*a, **k):
+        raise RuntimeError("pipeline exploded")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr("services.pipeline.run_natural_pipeline_stream", _boom)
+
+    async def _drain(resp):
+        parts = []
+        async for p in resp.body_iterator:
+            parts.append(p.decode() if isinstance(p, (bytes, bytearray)) else p)
+        return "".join(parts)
+
+    resp = asyncio.run(stream_env["chat"].implement_plan(
+        {"session_id": sid, "run_id": ev["run_id"]},
+        stream_env["req"],
+    ))
+    body = asyncio.run(_drain(resp))
+    assert '"type": "plan_failed"' in body
+    assert '"type": "plan_coverage"' not in body
+    latest = latest_plan_run(sid)
+    assert latest["phase"] == "ready"
+    assert all(t["status"] == "pending" for t in latest["tasks"])
