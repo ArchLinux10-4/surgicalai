@@ -152,8 +152,11 @@ def _schema_write_surgical_edit():
                         "type": "string",
                         "description": (
                             "The exact original text you are replacing, copied "
-                            "verbatim. Your PRIMARY anchor — include it whenever "
-                            "you are not certain of exact line numbers."
+                            "verbatim. old_code and new_code must cover the SAME "
+                            "region (same net braces/tags). For a full-symbol "
+                            "rewrite, omit old_code or set it to the entire "
+                            "original symbol — never a short prefix of a large "
+                            "symbol paired with a complete replacement."
                         ),
                     },
                     "edit_start_line": {
