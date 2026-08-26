@@ -207,17 +207,29 @@ def _extract_json(text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def create_tasks(session_id: str, run_id: str, tasks: list) -> list:
-    """Persist a planned list of tasks. Returns rows as dicts (with ids/seq)."""
+    """Persist a planned list of tasks. Returns rows as dicts (with ids/seq).
+
+    Extra keys ``filename``, ``symbol``, ``source`` are optional so existing
+    Agent callers (title/detail/kind only) stay byte-compatible. Default
+    source is ``agent``.
+    """
     conn = get_db()
     created = []
     try:
         for i, t in enumerate(tasks):
             tid = str(uuid.uuid4())
             kind = "answer" if t.get("kind") == "answer" else "code"
+            filename = (t.get("filename") or "") if isinstance(t, dict) else ""
+            symbol = (t.get("symbol") or t.get("symbol_path") or "") if isinstance(t, dict) else ""
+            source = (t.get("source") or "agent") if isinstance(t, dict) else "agent"
+            if source not in ("plan", "agent"):
+                source = "agent"
             conn.execute(
-                "INSERT INTO agent_tasks (id, session_id, run_id, seq, title, detail, kind, status) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')",
-                (tid, session_id, run_id, i, t.get("title", ""), t.get("detail", ""), kind),
+                "INSERT INTO agent_tasks (id, session_id, run_id, seq, title, detail, kind, status, "
+                "filename, symbol, source) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)",
+                (tid, session_id, run_id, i, t.get("title", ""), t.get("detail", ""), kind,
+                 filename, symbol, source),
             )
             created.append({
                 "id": tid,
@@ -230,6 +242,9 @@ def create_tasks(session_id: str, run_id: str, tasks: list) -> list:
                 "status": "pending",
                 "qa_score": None,
                 "verdict": None,
+                "filename": filename,
+                "symbol": symbol,
+                "source": source,
             })
         conn.commit()
     finally:

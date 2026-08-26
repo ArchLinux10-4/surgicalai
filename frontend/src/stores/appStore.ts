@@ -131,6 +131,17 @@ interface AppState {
   agentPhase: 'idle' | 'planning' | 'executing' | 'complete'
   setAgentPhase: (phase: 'idle' | 'planning' | 'executing' | 'complete') => void
 
+  // Chat Plan tracker — separate from agentTasks so Agent auto-run/dismiss
+  // cannot clobber a Ready plan.
+  planTasks: import('../types').PlanTask[]
+  planRunId: string | null
+  planPhase: import('../types').PlanPhase
+  setPlanTasks: (tasks: import('../types').PlanTask[]) => void
+  setPlanRunId: (id: string | null) => void
+  setPlanPhase: (phase: import('../types').PlanPhase) => void
+  applyPlanEvent: (event: any) => void
+  clearPlanTracker: () => void
+
   // Pending chat input — set from sidebar components (e.g. deploy watcher)
   pendingChatInput: string | null
   setPendingChatInput: (msg: string | null) => void
@@ -316,6 +327,33 @@ export const useAppStore = create<AppState>((set) => ({
 
   agentPhase: 'idle',
   setAgentPhase: (agentPhase) => set({ agentPhase }),
+
+  planTasks: [],
+  planRunId: null,
+  planPhase: 'idle',
+  setPlanTasks: (planTasks) => set({ planTasks }),
+  setPlanRunId: (planRunId) => set({ planRunId }),
+  setPlanPhase: (planPhase) => set({ planPhase }),
+  clearPlanTracker: () => set({ planTasks: [], planRunId: null, planPhase: 'idle' }),
+  applyPlanEvent: (event) => {
+    if (!event || typeof event !== 'object') return
+    const t = event.type
+    if (t === 'plan_ready' || t === 'plan_updated' || t === 'plan_coverage') {
+      set({
+        planRunId: event.run_id || null,
+        planTasks: Array.isArray(event.tasks) ? event.tasks : [],
+        planPhase: event.phase || (t === 'plan_ready' ? 'ready' : 'ready'),
+      })
+      return
+    }
+    if (t === 'plan_unchanged' || t === 'plan_locked') {
+      set({
+        planRunId: event.run_id || null,
+        planTasks: Array.isArray(event.tasks) ? event.tasks : [],
+        planPhase: event.phase || (t === 'plan_locked' ? 'implementing' : 'ready'),
+      })
+    }
+  },
 
   pendingChatInput: null,
   setPendingChatInput: (pendingChatInput) => set({ pendingChatInput }),

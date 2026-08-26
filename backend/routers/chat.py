@@ -89,7 +89,21 @@ _PLAN_DIRECTIVE = (
     "## Overview\nBrief summary of the approach.\n\n"
     "## Steps\n1. **File: path** — what to change and why.\n2. ...\n\n"
     "## Risks & Considerations\nEdge cases and things to watch for.\n\n"
-    "Do NOT produce code edits, diffs, or <surgical_edit> tags — plan only."
+    "Do NOT produce code edits, diffs, or <surgical_edit> tags — plan only.\n\n"
+    "You MUST end your reply with a fenced JSON block using the language tag "
+    "implementation_plan (not generic json). Shape:\n"
+    "```implementation_plan\n"
+    "{\"steps\": [{\"filename\": \"exact file name\", \"symbol\": "
+    "\"function/class/component\", \"description\": \"what to change\"}]}\n"
+    "```\n"
+    "Every planned edit needs filename + symbol. No diffs. Stay in Plan and "
+    "the user can tell you what to change; emit a FULL replacement fence."
+)
+
+_PLAN_JSON_TRAILER = (
+    "\n\n[PLAN MODE — required] End with a ```implementation_plan JSON fence "
+    "listing every step as {\"filename\",\"symbol\",\"description\"}. "
+    "Do NOT produce <surgical_edit> tags."
 )
 
 
@@ -931,6 +945,184 @@ def rename_session(session_id: str, body: dict, request: Request):
     return {"ok": True}
 
 
+@router.get("/plans/active")
+def get_active_plan(session_id: str, request: Request):
+    """Latest source=plan run for the Plan tracker (reload / session switch)."""
+    require_session_access_from_request(session_id, request)
+    from services.plan_artifact import latest_plan_run, serialize_plan_task, plan_run_phase
+    latest = latest_plan_run(session_id)
+    if not latest:
+        return {"run_id": None, "phase": "idle", "tasks": []}
+    return {
+        "run_id": latest["run_id"],
+        "phase": latest["phase"] or plan_run_phase(latest["tasks"]),
+        "tasks": [serialize_plan_task(t) for t in latest["tasks"]],
+    }
+
+
+@router.post("/plans/implement")
+async def implement_plan(body: dict, request: Request):
+    """Execute a Ready Chat Plan via existing forced_edit_plan. Not Claude-only.
+
+    Plan stream itself never reaches this. Coverage runs after the pipeline
+    result — QA / credit-pause resume are unchanged.
+    """
+    from fastapi.responses import StreamingResponse
+    from services.pipeline import run_natural_pipeline_stream
+    from services.plan_artifact import (
+        latest_plan_run,
+        forced_edit_plan_from_run,
+        mark_plan_implementing,
+        compute_plan_coverage,
+        apply_coverage_to_run,
+        serialize_plan_task,
+        plan_run_phase,
+    )
+
+    session_id = (body or {}).get("session_id") or ""
+    run_id = (body or {}).get("run_id") or ""
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id required")
+    require_session_access_from_request(session_id, request)
+    current_user_id = get_request_user_id(request)
+
+    latest = latest_plan_run(session_id)
+    if not latest:
+        raise HTTPException(status_code=404, detail="No plan to implement")
+    if run_id and latest["run_id"] != run_id:
+        raise HTTPException(status_code=409, detail="Stale plan run")
+    run_id = latest["run_id"]
+    if latest["phase"] == "implementing":
+        raise HTTPException(status_code=409, detail="Plan is already implementing")
+    if latest["phase"] not in ("ready", "blocked"):
+        raise HTTPException(status_code=400, detail="Plan is not ready to implement")
+
+    plan_steps = forced_edit_plan_from_run(session_id, run_id)
+    if not plan_steps:
+        raise HTTPException(status_code=400, detail="Plan has no executable steps")
+
+    with get_db_ctx() as conn:
+        sess_row = conn.execute(
+            "SELECT session_summary FROM chat_sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        session_summary = (
+            (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "")
+            or ""
+        )
+        history = conn.execute(
+            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
+            "AND content NOT LIKE ? ORDER BY created_at ASC",
+            (session_id, "__COMPACTION_EVENT__:%"),
+        ).fetchall()
+        conversation_history = [
+            {"role": r["role"], "content": r["content"]} for r in history
+        ]
+        file_rows = conn.execute(
+            "SELECT id, filename, content, language, lines, symbol_count, "
+            "file_type, created_at, updated_at FROM session_files "
+            "WHERE session_id = ? ORDER BY created_at ASC",
+            (session_id,),
+        ).fetchall()
+        session_files = [dict(r) for r in file_rows]
+        project_memory = _load_effective_memory(conn, session_id)
+        conn.commit()
+
+    if not session_files:
+        raise HTTPException(status_code=400, detail="Session has no files to implement against")
+
+    mark_plan_implementing(session_id, run_id)
+    user_request = "Implement the attached implementation_plan steps exactly."
+
+    async def stream_implement():
+        import json as _json
+        collected_tokens = []
+        result_content = None
+        try:
+            yield "data: " + _json.dumps({
+                "type": "plan_updated",
+                "run_id": run_id,
+                "phase": "implementing",
+                "tasks": [serialize_plan_task(t) for t in mark_plan_implementing(session_id, run_id)],
+            }) + "\n\n"
+            async for chunk in _with_heartbeat(run_natural_pipeline_stream(
+                session_files=session_files,
+                user_request=user_request,
+                conversation_history=conversation_history,
+                session_id=session_id,
+                project_memory=project_memory,
+                session_summary=session_summary,
+                user_id=current_user_id,
+                client_inbox=getattr(request.state, "client_inbox", None),
+                forced_edit_plan=plan_steps,
+            )):
+                if chunk.startswith("data: "):
+                    try:
+                        data = _json.loads(chunk[6:])
+                        chunk_type = data.get("type", "")
+                        if chunk_type in ("token", "chat"):
+                            collected_tokens.append(data.get("content", ""))
+                        elif chunk_type == "smart_result":
+                            result_content = data.get("content", "")
+                    except Exception:
+                        pass
+                yield chunk
+
+            coverage = {"ok": False, "missing": [], "covered": [], "extra": [], "skipped": []}
+            if result_content:
+                try:
+                    parsed = _json.loads(result_content)
+                except Exception:
+                    parsed = {}
+                coverage = compute_plan_coverage(plan_steps, parsed if isinstance(parsed, dict) else {})
+                updated = apply_coverage_to_run(session_id, run_id, coverage)
+                phase = plan_run_phase(updated)
+                yield "data: " + _json.dumps({
+                    "type": "plan_coverage",
+                    "run_id": run_id,
+                    "phase": phase,
+                    "coverage": coverage,
+                    "tasks": [serialize_plan_task(t) for t in updated],
+                }) + "\n\n"
+
+            natural_text = "".join(collected_tokens).strip()
+            with get_db_ctx() as db:
+                resp_id = str(uuid.uuid4())
+                if result_content:
+                    try:
+                        _res_obj = _json.loads(result_content)
+                    except Exception:
+                        _res_obj = {"raw": result_content}
+                    content = (
+                        f"__NATURAL_AND_RESULT__:"
+                        f"{_json.dumps({'natural': natural_text, 'result': _res_obj})}"
+                    )
+                else:
+                    content = natural_text or "(plan implement finished)"
+                db.execute(
+                    "INSERT INTO chat_messages (id, session_id, role, content, metadata) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (resp_id, session_id, "assistant", content,
+                     json.dumps({"mode": "plan_implement", "plan_run_id": run_id})),
+                )
+                db.commit()
+        except Exception as e:
+            _dlog("plan_implement_error", session_id=session_id,
+                  user_id=current_user_id, run_id=run_id, error=str(e)[:300])
+            yield f"data: {_json.dumps({'type': 'error', 'content': str(e)[:300]})}\n\n"
+        yield "data: " + _json.dumps({"type": "done", "content": ""}) + "\n\n"
+
+    return StreamingResponse(
+        stream_implement(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @router.post("/smart-stream")
 async def smart_stream(req: dict, request: Request):
     """
@@ -1076,6 +1268,16 @@ async def smart_stream(req: dict, request: Request):
                   mode=_eff_mode)
 
             _directive = _mode_directive(_eff_mode)
+            # Plan-mode adherence: same model (Claude/Grok/OpenAI) revises
+            # the current Ready checklist. Recency trailer is model-agnostic
+            # so GPT/Gemini also emit the fence (Grok has its own extra copy).
+            if _eff_mode == "plan":
+                from services.plan_artifact import current_plan_json_for_prompt
+                _directive = (
+                    _directive
+                    + current_plan_json_for_prompt(session_id)
+                    + _PLAN_JSON_TRAILER
+                )
 
             # Build the file context string from session files (same shape the
             # single-pass path loads). run_chat_stream previews the first 300
@@ -1110,6 +1312,7 @@ async def smart_stream(req: dict, request: Request):
             _mode_error = False
             _mode_model = None  # captured from run_chat_stream's `done` event
             _mode_web_search_sources: list = []  # Claude-only (Ask/Plan) — see claude_web_search.py
+            _plan_event = None  # plan_ready / plan_updated — set once on done
             # Research-checkbox parity fix: the SAME per-session flag the
             # Edit/Agent "Research" checkbox writes above (top of this
             # function, unconditional on mode) now also drives Ask/Plan's web
@@ -1154,6 +1357,22 @@ async def smart_stream(req: dict, request: Request):
                                     _mode_model = _md.get("model")
                                 if _md.get("web_search_sources"):
                                     _mode_web_search_sources = _md.get("web_search_sources")
+                                # Emit plan_ready/updated BEFORE forwarding done
+                                # so the client tracker is populated when onDone runs.
+                                if _eff_mode == "plan" and not _mode_error:
+                                    _early = "".join(_mode_collected)
+                                    if _early:
+                                        try:
+                                            from services.plan_artifact import persist_plan_from_assistant_text
+                                            _plan_event = persist_plan_from_assistant_text(
+                                                session_id, _early
+                                            )
+                                        except Exception as _pe:
+                                            _dlog("sse_plan_persist_error", session_id=session_id,
+                                                  user_id=current_user_id, error=str(_pe))
+                                            _plan_event = None
+                                        if _plan_event:
+                                            yield "data: " + _json.dumps(_plan_event) + "\n\n"
                         except Exception:
                             pass
                     yield _mchunk
@@ -1166,6 +1385,7 @@ async def smart_stream(req: dict, request: Request):
                 yield "data: " + _json.dumps({"type": "done", "content": ""}) + "\n\n"
 
             # Persist the assistant answer (tagged with the mode for later replay).
+            # Plan rows were already written (once) when the `done` event arrived.
             _mode_text = "".join(_mode_collected)
             if _mode_text and not _mode_error:
                 try:
@@ -1173,6 +1393,10 @@ async def smart_stream(req: dict, request: Request):
                         _mode_metadata: dict = {"model": _mode_model or ""}
                         if _mode_web_search_sources:
                             _mode_metadata["web_search_sources"] = _mode_web_search_sources
+                        if _eff_mode == "plan":
+                            _mode_metadata["mode"] = "plan"
+                            if _plan_event and _plan_event.get("run_id"):
+                                _mode_metadata["plan_run_id"] = _plan_event["run_id"]
                         _mdb.execute(
                             "INSERT INTO chat_messages (id, session_id, role, content, metadata) "
                             "VALUES (?, ?, ?, ?, ?)",

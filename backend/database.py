@@ -561,6 +561,9 @@ def _init_sqlite():
             cancel_requested INTEGER DEFAULT 0,
             result_summary TEXT DEFAULT '',
             thinking TEXT DEFAULT '',
+            filename TEXT DEFAULT '',
+            symbol TEXT DEFAULT '',
+            source TEXT DEFAULT 'agent',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -570,6 +573,14 @@ def _init_sqlite():
     at_cols = [row[1] for row in cur.execute("PRAGMA table_info(agent_tasks)").fetchall()]
     if at_cols and "thinking" not in at_cols:
         cur.execute("ALTER TABLE agent_tasks ADD COLUMN thinking TEXT DEFAULT ''")
+    # Plan-mode adherence: structured keys + source so Chat Plan rows
+    # never collide with Agent runs. Additive; Agent inserts stay valid.
+    if at_cols and "filename" not in at_cols:
+        cur.execute("ALTER TABLE agent_tasks ADD COLUMN filename TEXT DEFAULT ''")
+    if at_cols and "symbol" not in at_cols:
+        cur.execute("ALTER TABLE agent_tasks ADD COLUMN symbol TEXT DEFAULT ''")
+    if at_cols and "source" not in at_cols:
+        cur.execute("ALTER TABLE agent_tasks ADD COLUMN source TEXT DEFAULT 'agent'")
 
     # debug_events — persistent pipeline debug log (survives deploys/restarts)
     cur.execute("""
@@ -901,6 +912,9 @@ def _init_postgres():
                 cancel_requested INTEGER DEFAULT 0,
                 result_summary TEXT DEFAULT '',
                 thinking TEXT DEFAULT '',
+                filename TEXT DEFAULT '',
+                symbol TEXT DEFAULT '',
+                source TEXT DEFAULT 'agent',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
@@ -908,6 +922,15 @@ def _init_postgres():
         # Migration: add thinking column for pre-existing deployments (idempotent on PG)
         conn.execute("""
             ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS thinking TEXT DEFAULT ''
+        """)
+        conn.execute("""
+            ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS filename TEXT DEFAULT ''
+        """)
+        conn.execute("""
+            ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS symbol TEXT DEFAULT ''
+        """)
+        conn.execute("""
+            ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'agent'
         """)
         # debug_events — persistent pipeline debug log (survives deploys/restarts)
         conn.execute("""

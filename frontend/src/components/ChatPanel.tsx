@@ -10,6 +10,7 @@ import { MarkdownCode } from './CodeBlock'
 import { SessionFilesTray } from './SessionFilesTray'
 import { PickedElementsTray } from './PickedElementsTray'
 import { AgentMissionControl } from './AgentMissionControl'
+import { PlanTracker } from './PlanTracker'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AdsClick, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Lock, Psychology, Search, Security, Send, Warning } from '@mui/icons-material';
@@ -68,11 +69,13 @@ function stripInternalTags(text: string, streaming = false): string {
   let result = text
     .replace(/<edit_plan>[\s\S]*?<\/edit_plan>/g, '')
     .replace(/<search_request>[\s\S]*?<\/search_request>/g, '')
+    .replace(/```(?:implementation_plan|plan-json)[\s\S]*?```/gi, '')
   if (streaming) {
     // During streaming: hide from start of any incomplete opening tag
     result = result
       .replace(/<edit_plan>[\s\S]*$/, '')
       .replace(/<search_request>[\s\S]*$/, '')
+      .replace(/```(?:implementation_plan|plan-json)[\s\S]*$/, '')
   }
   return result.trim()
 }
@@ -1272,6 +1275,7 @@ export function ChatPanel() {
     streamingSessions, setSessionStreaming, setSessionStreamingMessage, setSessionStreamProgress, clearSessionStream,
     sessionFiles, setSessionFiles, addSessionFile, removeSessionFile,
     agentTasks, setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble, setAgentPhase,
+    applyPlanEvent, clearPlanTracker, setPlanTasks, setPlanRunId, setPlanPhase,
     pendingChatInput, setPendingChatInput,
     pickedElements, clearPickedElements,
     availableModels, refreshModels,
@@ -1280,6 +1284,27 @@ export function ChatPanel() {
   // Keep the agentic task list in sync with Claude's DB-backed progress while a
   // run is active (resilient fallback if the live stream drops mid-run).
   useTaskPolling(activeSessions)
+
+  // Restore Chat Plan tracker on session switch / reload. Own slice — does
+  // not read or write agentTasks.
+  useEffect(() => {
+    if (!activeSessions) {
+      clearPlanTracker()
+      return
+    }
+    let cancelled = false
+    api.chat.getActivePlan(activeSessions).then((p) => {
+      if (cancelled) return
+      if (p?.run_id && p.tasks?.length) {
+        setPlanRunId(p.run_id)
+        setPlanTasks(p.tasks)
+        setPlanPhase((p.phase as any) || 'ready')
+      } else {
+        clearPlanTracker()
+      }
+    }).catch(() => { if (!cancelled) clearPlanTracker() })
+    return () => { cancelled = true }
+  }, [activeSessions, clearPlanTracker, setPlanRunId, setPlanTasks, setPlanPhase])
 
   const [input, setInput] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -2317,6 +2342,14 @@ export function ChatPanel() {
           probing: false,
         })
       },
+      // onPlan — Chat Plan tracker. Must NOT go through onTask / pendingRunRef.
+      (event) => {
+        if (useAppStore.getState().activeSessions !== sessionId) return
+        applyPlanEvent(event)
+        if (event?.type === 'plan_unchanged' && event.reason === 'invalid_json') {
+          toast.error('Plan not updated', 'The model did not emit a valid implementation_plan. Previous checklist kept.')
+        }
+      },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change
@@ -2966,6 +2999,7 @@ export function ChatPanel() {
               </div>
             )}
             <AgentMissionControl />
+            <PlanTracker />
             {isStreaming && (streamingMessage || streamProgress) && (
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} />
             )}
