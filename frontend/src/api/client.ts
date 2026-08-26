@@ -244,6 +244,12 @@ export const api = {
     getMessages: (sessionId: string) => request<any[]>(`/chat/sessions/${sessionId}/messages`),
     send: (data: any) => request<any>('/chat/send', { method: 'POST', body: JSON.stringify(data) }),
     deleteSession: (id: string) => request(`/chat/sessions/${id}`, { method: 'DELETE' }),
+    /** Sidebar multi-select: one round-trip instead of N sequential DELETEs. */
+    deleteSessions: (ids: string[]) =>
+      request<{ ok: boolean; deleted: string[]; errors: { id: string; status: number; detail: string }[] }>(
+        '/chat/sessions/bulk-delete',
+        { method: 'POST', body: JSON.stringify({ ids }) },
+      ),
     renameSession: (id: string, title: string) => request(`/chat/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
     search: (q: string) => request<any[]>(`/chat/search?q=${encodeURIComponent(q)}`),
     getCreditPause: (sessionId: string) =>

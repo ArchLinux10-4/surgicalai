@@ -1,4 +1,5 @@
 import React, { useEffect, useState, useRef } from 'react'
+import { createPortal } from 'react-dom'
 import { useAppStore } from '../stores/appStore'
 import { useAuthStore } from '../stores/authStore'
 import { api } from '../api/client'
@@ -181,7 +182,7 @@ function SessionItem({ session, active, isSessionStreaming, onLoad, onDelete, on
 
 // ── Session List ──────────────────────────────────────────────────────────────
 function SessionList() {
-  const { sessions, setSessions, activeSessions, setActiveSession, setMessages, streamingSessions } = useAppStore()
+  const { sessions, setSessions, activeSessions, setActiveSession, setMessages, streamingSessions, setSidebarPinned } = useAppStore()
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<any[]>([])
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
@@ -253,22 +254,24 @@ function SessionList() {
 
   const promptDeleteSession = async (id: string) => {
     const session = sessions.find((s: any) => s.id === id)
-    let files: SessionFile[] = []
-    try {
-      files = await api.sessionFiles.list(id)
-    } catch {
-      files = []
+    const cachedMsgs = Number(session?.message_count || 0)
+    const cachedFiles = Number(session?.file_count || 0)
+    // Fast path: list_sessions already carries counts — avoid a /files round
+    // trip for the common case. Only re-fetch when both look empty so a stale
+    // file_count after upload cannot silent-delete attached files.
+    let fileCount = cachedFiles
+    if (cachedMsgs === 0 && cachedFiles === 0) {
+      try {
+        fileCount = (await api.sessionFiles.list(id)).length
+      } catch {
+        fileCount = 0
+      }
     }
-    const hasHistory = !!session?.message_count
-    const hasFiles = files.length > 0
-    // Empty chats (no messages, no attached files) have nothing meaningful
-    // to lose, so skip the confirmation prompt. Sessions with history or
-    // files still go through the modal below.
-    if (!hasHistory && !hasFiles) {
+    if (cachedMsgs === 0 && fileCount === 0) {
       await deleteSessionById(id)
       return
     }
-    setPendingDeleteFileCount(files.length)
+    setPendingDeleteFileCount(fileCount)
     setPendingDeleteId(id)
   }
 
@@ -297,6 +300,12 @@ function SessionList() {
   const toggleSelectMode = () => {
     if (selectMode) {
       setSelectedIds(new Set())
+      setPendingBulkDelete(false)
+      setBulkDeleteFileCount(0)
+    } else {
+      // Pin the sidebar open so hover-collapse cannot unmount SessionList
+      // (and wipe selection / hide the confirm modal) mid multi-select.
+      setSidebarPinned(true)
     }
     setSelectMode(!selectMode)
   }
@@ -319,46 +328,70 @@ function SessionList() {
   }
 
   const deleteSessionsByIds = async (ids: string[]) => {
-    for (const id of ids) {
-      await api.chat.deleteSession(id)
-      if (activeSessions === id) { setActiveSession(null); setMessages([]) }
+    const result = await api.chat.deleteSessions(ids)
+    const deleted = new Set(result.deleted || [])
+    if (activeSessions && deleted.has(activeSessions)) {
+      setActiveSession(null)
+      setMessages([])
     }
     await loadSessions()
-    const count = ids.length
-    toast.success(`Deleted ${count} chat${count > 1 ? 's' : ''}`)
+    const count = deleted.size
+    if (count > 0) {
+      toast.success(`Deleted ${count} chat${count > 1 ? 's' : ''}`)
+    }
+    if (result.errors?.length) {
+      toast.error('Some chats could not be deleted', `${result.errors.length} failed`)
+    }
     setSelectedIds(new Set())
     setSelectMode(false)
   }
 
   const promptBulkDelete = async () => {
-    if (selectedIds.size === 0) return
-    let totalFiles = 0
-    let anyHasContent = false
-    for (const id of selectedIds) {
-      const session = sessions.find((s: any) => s.id === id)
-      if (session?.message_count) anyHasContent = true
-      try {
-        const files = await api.sessionFiles.list(id)
-        totalFiles += files.length
-        if (files.length > 0) anyHasContent = true
-      } catch { /* ignore */ }
-    }
-    // If every selected chat is empty (no history, no files), skip the
-    // confirmation modal. Any selected chat with history or files still
-    // prompts via the modal below, per the existing behavior.
-    if (!anyHasContent) {
-      setBulkDeleteLoading(true)
-      try {
-        await deleteSessionsByIds(Array.from(selectedIds))
-      } catch (e: any) {
-        toast.error('Bulk delete failed', e.message)
-      } finally {
-        setBulkDeleteLoading(false)
+    if (selectedIds.size === 0 || bulkDeleteLoading) return
+    // Immediate feedback — previously the button did nothing visible while
+    // N sequential /files calls ran, so delete looked broken.
+    setBulkDeleteLoading(true)
+    try {
+      const ids = Array.from(selectedIds)
+      let totalFiles = 0
+      let anyHasContent = false
+      const maybeEmpty: string[] = []
+
+      for (const id of ids) {
+        const session = sessions.find((s: any) => s.id === id)
+        const msgCount = Number(session?.message_count || 0)
+        const fileCount = Number(session?.file_count || 0)
+        if (msgCount > 0 || fileCount > 0) {
+          anyHasContent = true
+          totalFiles += fileCount
+        } else {
+          maybeEmpty.push(id)
+        }
       }
-      return
+
+      // Only network-check sessions that look empty in the cached list
+      // (stale file_count after upload). Parallel, not sequential.
+      if (maybeEmpty.length) {
+        const lists = await Promise.all(
+          maybeEmpty.map(id => api.sessionFiles.list(id).catch(() => [] as SessionFile[]))
+        )
+        for (const files of lists) {
+          totalFiles += files.length
+          if (files.length > 0) anyHasContent = true
+        }
+      }
+
+      if (!anyHasContent) {
+        await deleteSessionsByIds(ids)
+        return
+      }
+      setBulkDeleteFileCount(totalFiles)
+      setPendingBulkDelete(true)
+    } catch (e: any) {
+      toast.error('Bulk delete failed', e.message)
+    } finally {
+      setBulkDeleteLoading(false)
     }
-    setBulkDeleteFileCount(totalFiles)
-    setPendingBulkDelete(true)
   }
 
   const confirmBulkDelete = async () => {
@@ -389,6 +422,78 @@ function SessionList() {
   const filteredSessions = searchQuery.trim()
     ? sessions.filter(s => (s.title || '').toLowerCase().includes(searchQuery.toLowerCase()))
     : sessions
+
+  const deleteModal = pendingDeleteId ? createPortal(
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <div className="bg-surface border border-border rounded-2xl shadow-2xl shadow-black/40 p-6 w-full max-w-sm mx-4">
+        <div className="flex items-start gap-3 mb-4">
+          <div className="shrink-0 w-10 h-10 rounded-full bg-red-500/15 border border-red-500/25 flex items-center justify-center">
+            <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+          </div>
+          <div>
+            <h3 className="text-[15px] font-semibold text-ink mb-1">Delete this chat?</h3>
+            <p className="text-[13px] text-muted leading-relaxed">
+              This will permanently delete all chat history
+              {pendingDeleteFileCount > 0 && (
+                <> and <span className="text-red-400 font-medium">{pendingDeleteFileCount} file{pendingDeleteFileCount !== 1 ? 's' : ''}</span> attached to this session</>
+              )}.
+              {' '}This cannot be undone.
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-2 justify-end">
+          <button
+            onClick={() => { setPendingDeleteId(null); setPendingDeleteFileCount(0) }}
+            className="px-4 py-2 rounded-lg text-[13px] font-medium text-muted border border-border hover:bg-surface-alt transition-colors"
+          >Cancel</button>
+          <button
+            onClick={confirmDeleteSession}
+            disabled={deleteConfirmLoading}
+            className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-red-500/90 hover:bg-red-500 text-white border border-red-500/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >{deleteConfirmLoading ? 'Deleting…' : 'Delete Chat'}</button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  ) : null
+
+  const bulkDeleteModal = pendingBulkDelete ? createPortal(
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm">
+      <div className="bg-surface border border-border rounded-2xl shadow-2xl shadow-black/40 p-6 w-full max-w-sm mx-4">
+        <div className="flex items-start gap-3 mb-4">
+          <div className="shrink-0 w-10 h-10 rounded-full bg-red-500/15 border border-red-500/25 flex items-center justify-center">
+            <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+            </svg>
+          </div>
+          <div>
+            <h3 className="text-[15px] font-semibold text-ink mb-1">Delete {selectedIds.size} chat{selectedIds.size > 1 ? 's' : ''}?</h3>
+            <p className="text-[13px] text-muted leading-relaxed">
+              This will permanently delete all chat history
+              {bulkDeleteFileCount > 0 && (
+                <> and <span className="text-red-400 font-medium">{bulkDeleteFileCount} file{bulkDeleteFileCount !== 1 ? 's' : ''}</span> across {selectedIds.size} session{selectedIds.size > 1 ? 's' : ''}</>
+              )}{bulkDeleteFileCount === 0 && <> for {selectedIds.size} session{selectedIds.size > 1 ? 's' : ''}</>}.
+              {' '}This cannot be undone.
+            </p>
+          </div>
+        </div>
+        <div className="flex gap-2 justify-end">
+          <button
+            onClick={() => { setPendingBulkDelete(false); setBulkDeleteFileCount(0) }}
+            className="px-4 py-2 rounded-lg text-[13px] font-medium text-muted border border-border hover:bg-surface-alt transition-colors"
+          >Cancel</button>
+          <button
+            onClick={confirmBulkDelete}
+            disabled={bulkDeleteLoading}
+            className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-red-500/90 hover:bg-red-500 text-white border border-red-500/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          >{bulkDeleteLoading ? 'Deleting…' : `Delete ${selectedIds.size} Chat${selectedIds.size > 1 ? 's' : ''}`}</button>
+        </div>
+      </div>
+    </div>,
+    document.body,
+  ) : null
 
   return (
     <div className="flex flex-col h-full">
@@ -425,9 +530,10 @@ function SessionList() {
           {selectedIds.size > 0 && (
             <button
               onClick={promptBulkDelete}
-              className="flex items-center gap-1 text-[11px] font-semibold text-danger hover:bg-danger/10 px-2 py-1 rounded-md transition-colors"
+              disabled={bulkDeleteLoading}
+              className="flex items-center gap-1 text-[11px] font-semibold text-danger hover:bg-danger/10 px-2 py-1 rounded-md transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
-              <Delete sx={{ fontSize: 12 }} /> Delete
+              <Delete sx={{ fontSize: 12 }} /> {bulkDeleteLoading ? 'Working…' : 'Delete'}
             </button>
           )}
         </div>
@@ -499,77 +605,8 @@ function SessionList() {
         </div>
       )}
 
-      {/* Delete confirmation modal */}
-      {pendingDeleteId && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div className="bg-surface border border-border rounded-2xl shadow-2xl shadow-black/40 p-6 w-full max-w-sm mx-4">
-            <div className="flex items-start gap-3 mb-4">
-              <div className="shrink-0 w-10 h-10 rounded-full bg-red-500/15 border border-red-500/25 flex items-center justify-center">
-                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                </svg>
-              </div>
-              <div>
-                <h3 className="text-[15px] font-semibold text-ink mb-1">Delete this chat?</h3>
-                <p className="text-[13px] text-muted leading-relaxed">
-                  This will permanently delete all chat history
-                  {pendingDeleteFileCount > 0 && (
-                    <> and <span className="text-red-400 font-medium">{pendingDeleteFileCount} file{pendingDeleteFileCount !== 1 ? 's' : ''}</span> attached to this session</>
-                  )}.
-                  {' '}This cannot be undone.
-                </p>
-              </div>
-            </div>
-            <div className="flex gap-2 justify-end">
-              <button
-                onClick={() => { setPendingDeleteId(null); setPendingDeleteFileCount(0) }}
-                className="px-4 py-2 rounded-lg text-[13px] font-medium text-muted border border-border hover:bg-surface-alt transition-colors"
-              >Cancel</button>
-              <button
-                onClick={confirmDeleteSession}
-                disabled={deleteConfirmLoading}
-                className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-red-500/90 hover:bg-red-500 text-white border border-red-500/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >{deleteConfirmLoading ? 'Deleting…' : 'Delete Chat'}</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Bulk delete confirmation modal */}
-      {pendingBulkDelete && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-          <div className="bg-surface border border-border rounded-2xl shadow-2xl shadow-black/40 p-6 w-full max-w-sm mx-4">
-            <div className="flex items-start gap-3 mb-4">
-              <div className="shrink-0 w-10 h-10 rounded-full bg-red-500/15 border border-red-500/25 flex items-center justify-center">
-                <svg className="w-5 h-5 text-red-400" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                </svg>
-              </div>
-              <div>
-                <h3 className="text-[15px] font-semibold text-ink mb-1">Delete {selectedIds.size} chat{selectedIds.size > 1 ? 's' : ''}?</h3>
-                <p className="text-[13px] text-muted leading-relaxed">
-                  This will permanently delete all chat history
-                  {bulkDeleteFileCount > 0 && (
-                    <> and <span className="text-red-400 font-medium">{bulkDeleteFileCount} file{bulkDeleteFileCount !== 1 ? 's' : ''}</span> across {selectedIds.size} session{selectedIds.size > 1 ? 's' : ''}</>
-                  )}{bulkDeleteFileCount === 0 && <> for {selectedIds.size} session{selectedIds.size > 1 ? 's' : ''}</>}.
-                  {' '}This cannot be undone.
-                </p>
-              </div>
-            </div>
-            <div className="flex gap-2 justify-end">
-              <button
-                onClick={() => { setPendingBulkDelete(false); setBulkDeleteFileCount(0) }}
-                className="px-4 py-2 rounded-lg text-[13px] font-medium text-muted border border-border hover:bg-surface-alt transition-colors"
-              >Cancel</button>
-              <button
-                onClick={confirmBulkDelete}
-                disabled={bulkDeleteLoading}
-                className="px-4 py-2 rounded-lg text-[13px] font-semibold bg-red-500/90 hover:bg-red-500 text-white border border-red-500/50 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              >{bulkDeleteLoading ? 'Deleting…' : `Delete ${selectedIds.size} Chat${selectedIds.size > 1 ? 's' : ''}`}</button>
-            </div>
-          </div>
-        </div>
-      )}
+      {deleteModal}
+      {bulkDeleteModal}
     </div>
   )
 }
