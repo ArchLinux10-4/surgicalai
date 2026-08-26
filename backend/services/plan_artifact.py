@@ -159,7 +159,22 @@ def latest_plan_run(session_id: str) -> dict | None:
 
     live = [rid for rid, ts in by_run.items() if not _is_superseded(ts)]
     candidates = live or list(by_run.keys())
-    run_id = max(candidates, key=lambda rid: _stamp(by_run[rid]))
+    # Same-second SQLite CURRENT_TIMESTAMP: prefer an active checklist
+    # (implementing/ready/blocked) over a just-completed history run.
+    _phase_rank = {
+        "implementing": 4,
+        "ready": 3,
+        "blocked": 2,
+        "complete": 1,
+        "idle": 0,
+    }
+    run_id = max(
+        candidates,
+        key=lambda rid: (
+            _phase_rank.get(plan_run_phase(by_run[rid]), 0),
+            _stamp(by_run[rid]),
+        ),
+    )
     tasks = by_run[run_id]
     tasks.sort(key=lambda t: t.get("seq") or 0)
     return {"run_id": run_id, "tasks": tasks, "phase": plan_run_phase(tasks)}

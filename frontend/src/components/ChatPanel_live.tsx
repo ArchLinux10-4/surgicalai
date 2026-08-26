@@ -1070,6 +1070,9 @@ export function ChatPanel() {
       (event) => {
         if (useAppStore.getState().activeSessions !== sessionId) return
         applyPlanEvent(event)
+        if (event?.type === 'plan_unchanged' && event.reason === 'invalid_json') {
+          toast.error('Plan not updated', 'The model did not emit a valid implementation_plan. Previous checklist kept.')
+        }
       },
     )
     abortRef.current = ctrl

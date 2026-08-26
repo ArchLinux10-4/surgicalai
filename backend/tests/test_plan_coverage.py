@@ -301,3 +301,64 @@ def test_directive_still_has_required_mode_selector_strings():
     assert "PLAN mode" in plan
     assert "surgical_edit" in plan
     assert "implementation_plan" in plan
+
+
+def test_plan_and_agent_runs_stay_independent(plan_db):
+    sid = plan_db["sid"]
+    agent = create_tasks(sid, "run-agent-1", [{"title": "agent step", "detail": "d"}])
+    plan = persist_plan_from_assistant_text(sid, CLAUDE_STYLE)
+    assert plan["run_id"] != "run-agent-1"
+    from services.task_planner import list_tasks
+    agent_rows = list_tasks(sid, "run-agent-1")
+    plan_rows = list_tasks(sid, plan["run_id"])
+    assert [r["source"] for r in agent_rows] == ["agent"]
+    assert all(r["source"] == "plan" for r in plan_rows)
+    assert latest_plan_run(sid)["run_id"] == plan["run_id"]
+    assert agent[0]["id"] == agent_rows[0]["id"]
+
+
+def test_new_plan_after_complete(plan_db):
+    sid = plan_db["sid"]
+    first = persist_plan_from_assistant_text(sid, CLAUDE_STYLE)
+    planned = forced_edit_plan_from_run(sid, first["run_id"])
+    cov = compute_plan_coverage(planned, {
+        "changes_by_file": {
+            "app.py": {"filename": "app.py", "changes": [{"symbol": "main"}]},
+        },
+        "skipped_changes": [],
+    })
+    apply_coverage_to_run(sid, first["run_id"], cov)
+    assert latest_plan_run(sid)["phase"] == "complete"
+    second = persist_plan_from_assistant_text(sid, GROK_STYLE)
+    assert second["type"] == "plan_ready"
+    assert second["run_id"] != first["run_id"]
+    assert latest_plan_run(sid)["run_id"] == second["run_id"]
+
+
+def test_all_skipped_with_reason_marks_done(plan_db):
+    sid = plan_db["sid"]
+    ev = persist_plan_from_assistant_text(sid, GROK_STYLE)
+    planned = forced_edit_plan_from_run(sid, ev["run_id"])
+    cov = compute_plan_coverage(planned, {
+        "changes_by_file": {},
+        "skipped_changes": [
+            {"filename": "Header.tsx", "symbol": "Header", "reason": "already matches"},
+            {"filename": "App.tsx", "symbol": "App", "reason": "no-op"},
+        ],
+    })
+    assert cov["ok"] is True
+    updated = apply_coverage_to_run(sid, ev["run_id"], cov)
+    assert {t["status"] for t in updated} == {"done"}
+    assert latest_plan_run(sid)["phase"] == "complete"
+
+
+def test_implement_and_persist_not_claude_gated():
+    import inspect
+    from routers import chat as chat_router
+    from services import plan_artifact
+    impl = inspect.getsource(chat_router.implement_plan)
+    persist = inspect.getsource(plan_artifact.persist_plan_from_assistant_text)
+    assert "_is_claude" not in impl
+    assert "plan_tasks" not in impl
+    assert "_is_claude" not in persist
+    assert "plan_tasks" not in persist

@@ -1068,22 +1068,24 @@ async def implement_plan(body: dict, request: Request):
                         pass
                 yield chunk
 
-            coverage = {"ok": False, "missing": [], "covered": [], "extra": [], "skipped": []}
+            parsed = {}
             if result_content:
                 try:
                     parsed = _json.loads(result_content)
                 except Exception:
                     parsed = {}
-                coverage = compute_plan_coverage(plan_steps, parsed if isinstance(parsed, dict) else {})
-                updated = apply_coverage_to_run(session_id, run_id, coverage)
-                phase = plan_run_phase(updated)
-                yield "data: " + _json.dumps({
-                    "type": "plan_coverage",
-                    "run_id": run_id,
-                    "phase": phase,
-                    "coverage": coverage,
-                    "tasks": [serialize_plan_task(t) for t in updated],
-                }) + "\n\n"
+            coverage = compute_plan_coverage(
+                plan_steps, parsed if isinstance(parsed, dict) else {},
+            )
+            updated = apply_coverage_to_run(session_id, run_id, coverage)
+            phase = plan_run_phase(updated)
+            yield "data: " + _json.dumps({
+                "type": "plan_coverage",
+                "run_id": run_id,
+                "phase": phase,
+                "coverage": coverage,
+                "tasks": [serialize_plan_task(t) for t in updated],
+            }) + "\n\n"
 
             natural_text = "".join(collected_tokens).strip()
             with get_db_ctx() as db:
@@ -1109,6 +1111,18 @@ async def implement_plan(body: dict, request: Request):
         except Exception as e:
             _dlog("plan_implement_error", session_id=session_id,
                   user_id=current_user_id, run_id=run_id, error=str(e)[:300])
+            try:
+                coverage = compute_plan_coverage(plan_steps, {})
+                updated = apply_coverage_to_run(session_id, run_id, coverage)
+                yield "data: " + _json.dumps({
+                    "type": "plan_coverage",
+                    "run_id": run_id,
+                    "phase": plan_run_phase(updated),
+                    "coverage": coverage,
+                    "tasks": [serialize_plan_task(t) for t in updated],
+                }) + "\n\n"
+            except Exception:
+                pass
             yield f"data: {_json.dumps({'type': 'error', 'content': str(e)[:300]})}\n\n"
         yield "data: " + _json.dumps({"type": "done", "content": ""}) + "\n\n"
 
