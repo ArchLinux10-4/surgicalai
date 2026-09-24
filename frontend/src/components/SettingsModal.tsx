@@ -593,7 +593,7 @@ export function SettingsModal() {
                          onClick={() => clientLog('grok_console_link_clicked', {})}>
                         console.x.ai
                       </a>
-                      {' '}{'\u2014'} enables Grok 4.5 (500K context, reasoning-only)
+                      {' '}{'\u2014'} enables Grok 4.7 / 4.6 / 4.5 (500K context, reasoning)
                     </div>
                   </div>
                 </div>
@@ -612,7 +612,7 @@ export function SettingsModal() {
                   <Select value={form.architect_model} onChange={upd('architect_model')} options={models.filter((m) => m.role === 'architect').map((m) => ({ value: m.id, label: `${'$'.repeat(m.cost || 1)} — ${m.name} — ${m.description || ''}` }))} />
                 </Field>
 
-                {!form.architect_model.startsWith('claude-') && !form.architect_model.startsWith('gpt-5') && (
+                {!form.architect_model.startsWith('claude-') && !form.architect_model.startsWith('gpt-5') && !form.architect_model.startsWith('gpt-6') && (
                 <Field label={`Temperature: ${form.temperature_architect}`}>
                   <input type="range" min="0" max="1" step="0.1" value={form.temperature_architect}
                     onChange={(e) => upd('temperature_architect')(parseFloat(e.target.value))} className="w-full accent-accent" />

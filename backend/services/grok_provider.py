@@ -73,6 +73,7 @@ MODEL
 Confirmed shipping model ids (docs.x.ai/developers/models):
   * ``grok-4.5``
   * ``grok-4.6``  (dot, not hyphen — ``grok-4-6`` is rejected by xAI)
+  * ``grok-4.7``  (dot, not hyphen — ``grok-4-7`` is rejected by xAI)
 
 ``GROK_DEFAULT_MODEL`` stays ``grok-4.5``. The Settings picker lists both;
 runtime paths must use the user's selected architect model (any ``grok-*``
@@ -109,10 +110,11 @@ except Exception:  # pragma: no cover
 #: xAI OpenAI-compatible base URL (https://docs.x.ai/developers/quickstart).
 GROK_BASE_URL = "https://api.x.ai/v1"
 
-#: Confirmed shipping model ids (docs.x.ai/developers/models/grok-4.5 and
-#: docs.x.ai/developers/models/grok-4.6). Use a dot (``grok-4.6``), never a
-#: hyphen (``grok-4-6`` is rejected by xAI).
-GROK_CONFIRMED_MODELS = ("grok-4.5", "grok-4.6")
+#: Confirmed shipping model ids (docs.x.ai/developers/models/grok-4.5,
+#: grok-4.6, grok-4.7). Use a dot (``grok-4.7``), never a hyphen
+#: (``grok-4-7`` is rejected by xAI). Do not list ``grok-4.7-fast`` —
+#: Cursor / Grok Build only, not the public API.
+GROK_CONFIRMED_MODELS = ("grok-4.5", "grok-4.6", "grok-4.7")
 
 #: Default when a Grok path needs a model id but none was selected.
 GROK_DEFAULT_MODEL = "grok-4.5"

@@ -408,7 +408,8 @@ parser = ASTParser()
 # 128k-output models. Everything else falls back to 64000 (previous behavior).
 _MODEL_MAX_OUTPUT = {
     "claude-sonnet-5": 128000,
-    "claude-fable-5": 128000,
+    "claude-fable-5": 128000,       # also matches claude-fable-5-1 via prefix
+    "claude-opus-5": 128000,        # also matches claude-opus-5-5 via prefix
     "claude-opus-4-8": 128000,
     "claude-opus-4-7": 128000,
     "claude-opus-4-6": 128000,
@@ -507,10 +508,11 @@ NO_TEMPERATURE_MODELS = {
     "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
     "gpt-5.5", "gpt-5.5-pro",
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
     "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini",
 }
 
-# Models that support the reasoning_effort parameter (none/low/medium/high/xhigh).
+# Models that support the reasoning_effort parameter (none/low/medium/high/xhigh/max).
 # When set in settings, _chat_create will pass it automatically.
 REASONING_EFFORT_MODELS = {
     "gpt-5", "gpt-5-mini", "gpt-5-nano",
@@ -520,8 +522,13 @@ REASONING_EFFORT_MODELS = {
     "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
     "gpt-5.5", "gpt-5.5-pro",
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
     "o3", "o3-mini", "o4-mini",
 }
+
+# GPT-6 Sol/Luna: Chat Completions function calling only works with
+# reasoning_effort="none" (official model pages). Astra has no "none" level.
+_GPT6_TOOLS_REQUIRE_NONE_EFFORT = ("gpt-6-sol", "gpt-6-luna")
 
 # ── Prompt engineering constants ──────────────────────────────────────────────
 HISTORY_WINDOW       = 20   # turns of conversation history passed to every prompt
@@ -1429,7 +1436,17 @@ _THINKING_EXCLUDED_MODELS = ("claude-opus-4-7", "claude-opus-4-8")
 # Adaptive mode also auto-enables interleaved thinking (no beta header needed).
 # display defaults to "omitted" on these models — must set "summarized" explicitly
 # or thinking panel content will come back as empty strings (silent bug).
-_ADAPTIVE_THINKING_MODELS = ("claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-sonnet-5", "claude-fable-5")
+# claude-opus-5 also matches claude-opus-5-5 (substring). claude-fable-5
+# also matches claude-fable-5-1. Manual type:enabled is a 400 on all of these.
+_ADAPTIVE_THINKING_MODELS = (
+    "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
+    "claude-sonnet-4-6", "claude-sonnet-5", "claude-fable-5",
+)
+
+# Opus 5.5 and Fable 5.1 reject tool_choice type "any"/"tool" with a 400
+# (docs: Migrating to Claude Opus 5.5). Use auto + strict instead.
+# Opus 5 (without -5) still accepts forced tool choice.
+_NO_FORCED_TOOL_CHOICE_MODELS = ("claude-opus-5-5", "claude-fable-5-1")
 
 # 4-6 generation models support adaptive thinking and effort, but NOT 'xhigh'.
 # Supported levels: max, high, medium, low.  Sending effort='xhigh' returns 400.
@@ -1622,6 +1639,70 @@ def _uses_adaptive_thinking(model: str) -> bool:
     These models reject type:'enabled'/budget_tokens with a 400 error.
     """
     return _is_claude_model(model) and any(m in model for m in _ADAPTIVE_THINKING_MODELS)
+
+
+def _rejects_forced_tool_choice(model: str) -> bool:
+    """True when the model 400s on tool_choice type any/tool (Opus 5.5, Fable 5.1)."""
+    if not model:
+        return False
+    base = model.strip().lower()
+    return any(base == m or base.startswith(m + "-") for m in _NO_FORCED_TOOL_CHOICE_MODELS)
+
+
+def _claude_tool_choice_kwargs(model: str, forced_name: str, tools: list) -> dict:
+    """Return tool_choice (+ maybe strict tools) for a Claude call that wants one tool.
+
+    Opus 5.5 / Fable 5.1 reject forced tool_choice; use auto + strict instead.
+    Every other model keeps the historical forced shape.
+    """
+    if _rejects_forced_tool_choice(model):
+        strict_tools = []
+        for t in tools or []:
+            if not isinstance(t, dict):
+                strict_tools.append(t)
+                continue
+            patched = dict(t)
+            patched["strict"] = True
+            schema = patched.get("input_schema")
+            if isinstance(schema, dict):
+                schema = dict(schema)
+                schema["additionalProperties"] = False
+                # Nested objects in properties also need additionalProperties:false
+                # for Anthropic strict mode — patch top-level object schemas only
+                # here; tool schemas in this codebase are flat objects.
+                props = schema.get("properties")
+                if isinstance(props, dict):
+                    new_props = {}
+                    for pk, pv in props.items():
+                        if isinstance(pv, dict) and pv.get("type") == "object":
+                            nested = dict(pv)
+                            nested.setdefault("additionalProperties", False)
+                            new_props[pk] = nested
+                        elif isinstance(pv, dict) and pv.get("type") == "array":
+                            items = pv.get("items")
+                            if isinstance(items, dict) and items.get("type") == "object":
+                                nested_items = dict(items)
+                                nested_items.setdefault("additionalProperties", False)
+                                arr = dict(pv)
+                                arr["items"] = nested_items
+                                new_props[pk] = arr
+                            else:
+                                new_props[pk] = pv
+                        else:
+                            new_props[pk] = pv
+                    schema["properties"] = new_props
+                patched["input_schema"] = schema
+            strict_tools.append(patched)
+        _dlog("claude_forced_tool_downgraded_to_auto_strict",
+              model=model, tool_name=forced_name)
+        return {
+            "tools": strict_tools,
+            "tool_choice": {"type": "auto"},
+        }
+    return {
+        "tools": tools,
+        "tool_choice": {"type": "tool", "name": forced_name},
+    }
 
 
 def _get_thinking_kwargs(model: str, budget: int) -> dict:
@@ -2100,10 +2181,21 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
             # Grok-shaped id is ever added to that set.
             if base_model in REASONING_EFFORT_MODELS and "reasoning_effort" not in kwargs:
                 _re = get_setting("reasoning_effort", "")
-                if _re and _re.lower() in ("none", "low", "medium", "high", "xhigh"):
+                if _re and _re.lower() in ("none", "low", "medium", "high", "xhigh", "max"):
                     kwargs["reasoning_effort"] = _re.lower()
             if "max_completion_tokens" not in kwargs:
                 kwargs["max_completion_tokens"] = 16384
+        # GPT-6 Sol/Luna: Chat Completions function calling only works with
+        # reasoning_effort="none" (official model pages). Override after
+        # hardening so tools never ship with low/medium/high. Astra has no
+        # "none" level — leave it alone.
+        if (base_model in _GPT6_TOOLS_REQUIRE_NONE_EFFORT
+                and kwargs.get("tools")
+                and kwargs.get("reasoning_effort") != "none"):
+            _prev_re = kwargs.get("reasoning_effort")
+            kwargs["reasoning_effort"] = "none"
+            _dlog("gpt6_sol_luna_tools_force_none_effort",
+                  model=model, previous_effort=_prev_re)
         _dlog("chat_create_reasoning_model",
               model=model, base_model=base_model,
               reasoning_effort=kwargs.get("reasoning_effort", "<not set>"),
@@ -3740,10 +3832,18 @@ Return SEARCH/REPLACE blocks ONLY. No JSON, no explanations outside blocks."""
                     break
 
                 # ── Continue conversation ─────────────────────────────────────
-                # Convert response.content to serializable format for messages
+                # Convert response.content to serializable format for messages.
+                # Preserve thinking blocks + signatures in original order —
+                # Opus 5.5 / Fable 5.1 400 when a continued tool turn omits them.
                 _mt_assistant_content = []
                 for _blk in _mt_resp.content:
-                    if _blk.type == "tool_use":
+                    if _blk.type == "thinking":
+                        _mt_assistant_content.append({
+                            "type": "thinking",
+                            "thinking": _blk.thinking,
+                            "signature": getattr(_blk, "signature", ""),
+                        })
+                    elif _blk.type == "tool_use":
                         _mt_assistant_content.append({
                             "type": "tool_use",
                             "id": _blk.id,
@@ -11519,13 +11619,14 @@ async def _run_claude_direct_rewrite(
             # Thinking-config: explicit config for adaptive models
             _dr_think_kw = _get_thinking_kwargs(model, 4000)
             _dr_effort_kw = _get_effort_kwargs(model)
+            _dr_tc_kw = _claude_tool_choice_kwargs(
+                model, "submit_file_rewrite", _dr_tools)
             async with _da_client.messages.stream(
                 model=model,
                 max_tokens=_max_output_tokens(model),
                 system=_dr_system,
                 messages=[{"role": "user", "content": _dr_user}],
-                tools=_dr_tools,
-                tool_choice={"type": "tool", "name": "submit_file_rewrite"},
+                **_dr_tc_kw,
                 **_dr_think_kw,
                 **_dr_effort_kw,
             ) as _dr_stream:
@@ -14735,13 +14836,7 @@ USER REQUEST:
                                           model=_lint_surg_model,
                                           wrapper="safe_claude_call",
                                           session_id=session_id, user_id=user_id)
-                                    _lint_fix_resp = await _safe_claude_call(
-                                        _lint_fix_client,
-                                        model=_lint_surg_model,
-                                        desired_text_tokens=8192,
-                                        thinking_budget=4000,
-                                        retry_on_starve=True,
-                                        tools=[{
+                                    _lint_tools = [{
                                             "name": "fix_lint_errors",
                                             "description": "Return SEARCH/REPLACE pairs to eliminate TypeScript lint errors. Each find must match the file exactly.",
                                             "input_schema": {
@@ -14761,9 +14856,17 @@ USER REQUEST:
                                                 },
                                                 "required": ["fixes"]
                                             }
-                                        }],
-                                        tool_choice={"type": "tool", "name": "fix_lint_errors"},
+                                        }]
+                                    _lint_tc_kw = _claude_tool_choice_kwargs(
+                                        _lint_surg_model, "fix_lint_errors", _lint_tools)
+                                    _lint_fix_resp = await _safe_claude_call(
+                                        _lint_fix_client,
+                                        model=_lint_surg_model,
+                                        desired_text_tokens=8192,
+                                        thinking_budget=4000,
+                                        retry_on_starve=True,
                                         messages=[{"role": "user", "content": _lint_user_msg}],
+                                        **_lint_tc_kw,
                                     )
                                     for _lblock in _lint_fix_resp.content:
                                         if hasattr(_lblock, "type") and _lblock.type == "tool_use":
