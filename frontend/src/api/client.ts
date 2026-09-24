@@ -274,9 +274,33 @@ export const api = {
     send: (data: any) => request<any>('/chat/send', { method: 'POST', body: JSON.stringify(data) }),
     deleteSession: (id: string) => request(`/chat/sessions/${id}`, { method: 'DELETE' }),
     getActivePlan: (sessionId: string) =>
-      request<{ run_id: string | null; phase: string; tasks: import('../types').PlanTask[] }>(
+      request<{
+        run_id: string | null
+        phase: string
+        tasks: import('../types').PlanTask[]
+        markdown?: string
+        title?: string
+        version?: number | null
+      }>(
         `/chat/plans/active?session_id=${encodeURIComponent(sessionId)}`,
       ),
+    exportPlan: async (sessionId: string, filename = 'plan.md') => {
+      const res = await fetch(
+        `${BASE}/chat/plans/export?session_id=${encodeURIComponent(sessionId)}`,
+        { headers: { ...authHeaders() } },
+      )
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }))
+        throw new Error(err.detail || `HTTP ${res.status}`)
+      }
+      const blob = await res.blob()
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = filename
+      a.click()
+      URL.revokeObjectURL(url)
+    },
     /** Sidebar multi-select: one round-trip instead of N sequential DELETEs. */
     deleteSessions: (ids: string[]) =>
       request<{ ok: boolean; deleted: string[]; errors: { id: string; status: number; detail: string }[] }>(

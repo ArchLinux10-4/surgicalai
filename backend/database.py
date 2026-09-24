@@ -582,6 +582,40 @@ def _init_sqlite():
     if at_cols and "source" not in at_cols:
         cur.execute("ALTER TABLE agent_tasks ADD COLUMN source TEXT DEFAULT 'agent'")
 
+    # session_plans — full Plan-mode markdown beside the agent_tasks checklist.
+    # One living document per session; revisions keep prior bodies.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS session_plans (
+            id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL UNIQUE,
+            user_id TEXT,
+            title TEXT NOT NULL DEFAULT 'Plan',
+            markdown TEXT NOT NULL,
+            version INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS session_plan_revisions (
+            id TEXT PRIMARY KEY,
+            plan_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            markdown TEXT NOT NULL,
+            updated_by TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_plan_revisions_plan "
+        "ON session_plan_revisions(plan_id, version)"
+    )
+    cur.execute(
+        "CREATE INDEX IF NOT EXISTS idx_session_plans_user "
+        "ON session_plans(user_id, updated_at)"
+    )
+
     # debug_events — persistent pipeline debug log (survives deploys/restarts)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS debug_events (
@@ -931,6 +965,38 @@ def _init_postgres():
         """)
         conn.execute("""
             ALTER TABLE agent_tasks ADD COLUMN IF NOT EXISTS source TEXT DEFAULT 'agent'
+        """)
+        # session_plans — full Plan-mode markdown beside the agent_tasks checklist
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS session_plans (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL UNIQUE,
+                user_id TEXT,
+                title TEXT NOT NULL DEFAULT 'Plan',
+                markdown TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS session_plan_revisions (
+                id TEXT PRIMARY KEY,
+                plan_id TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                version INTEGER NOT NULL,
+                markdown TEXT NOT NULL,
+                updated_by TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_plan_revisions_plan
+            ON session_plan_revisions(plan_id, version)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_session_plans_user
+            ON session_plans(user_id, updated_at)
         """)
         # debug_events — persistent pipeline debug log (survives deploys/restarts)
         conn.execute("""

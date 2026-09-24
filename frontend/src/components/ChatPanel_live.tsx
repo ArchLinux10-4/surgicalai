@@ -671,14 +671,24 @@ export function ChatPanel() {
   useEffect(() => {
     if (!activeSessions) { clearPlanTracker(); return }
     let cancelled = false
+    const setPlanDocument = useAppStore.getState().setPlanDocument
     api.chat.getActivePlan(activeSessions).then((p) => {
       if (cancelled) return
+      setPlanDocument({
+        markdown: p?.markdown || '',
+        title: p?.title || 'Plan',
+        version: p?.version ?? null,
+      })
       if (p?.run_id && p.tasks?.length) {
         setPlanRunId(p.run_id)
         setPlanTasks(p.tasks)
         setPlanPhase((p.phase as any) || 'ready')
-      } else {
+      } else if (!(p?.markdown || '').trim()) {
         clearPlanTracker()
+      } else {
+        setPlanRunId(null)
+        setPlanTasks([])
+        setPlanPhase('idle')
       }
     }).catch(() => { if (!cancelled) clearPlanTracker() })
     return () => { cancelled = true }

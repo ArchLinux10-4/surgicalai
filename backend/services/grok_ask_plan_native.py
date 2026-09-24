@@ -92,12 +92,11 @@ class _FakeMatch:
 
 _GROK_ASK_PLAN_REINFORCEMENT_TMPL = (
     "\n\n[REMINDER — {label} MODE, read this last instruction carefully] "
-    "This is a discussion, not an implementation request. Do not write full "
-    "new code, diffs, or <surgical_edit>/<new_file> tags in your final "
-    "answer — explain, analyze, and cite the relevant code instead. A short "
-    "illustrative snippet is fine if the user needs it to follow the "
-    "explanation, but you are not implementing anything here. If the user "
-    "actually wants the change made, tell them to switch to Edit/Agent mode."
+    "This is a discussion, not an implementation request. Do not write "
+    "diffs or <surgical_edit>/<new_file> tags in your final answer — explain, "
+    "analyze, and cite the relevant code instead.{plan_extra} If the user "
+    "actually wants the change made, tell them to use Implement on the Plan "
+    "tracker or switch to Edit/Agent mode."
     "{plan_json}"
 )
 
@@ -112,13 +111,24 @@ def build_grok_ask_plan_reinforcement(mode: str) -> str:
     """
     label = "PLAN" if (mode or "").strip().lower() == "plan" else "ASK"
     plan_json = ""
+    plan_extra = (
+        " A short illustrative snippet is fine if the user needs it to follow "
+        "the explanation, but you are not implementing anything here."
+    )
     if label == "PLAN":
+        plan_extra = (
+            " Include ## Best practices and fenced code examples of the code "
+            "that should be written under each step (in the markdown body, "
+            "before the fence). Those examples are illustrative only."
+        )
         plan_json = (
             " You MUST end with a fenced ```implementation_plan JSON block "
             "listing every step as {\"filename\",\"symbol\",\"description\"}. "
             "No edits — the fence is the machine-readable plan only."
         )
-    return _GROK_ASK_PLAN_REINFORCEMENT_TMPL.format(label=label, plan_json=plan_json)
+    return _GROK_ASK_PLAN_REINFORCEMENT_TMPL.format(
+        label=label, plan_json=plan_json, plan_extra=plan_extra,
+    )
 
 
 def _sse(obj: dict) -> str:

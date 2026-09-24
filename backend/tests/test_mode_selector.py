@@ -63,6 +63,9 @@ def test_mode_directive_ask_and_plan_forbid_edits():
     assert "PLAN mode" in plan
     for d in (ask, plan):
         assert "surgical_edit" in d  # explicit "do NOT produce <surgical_edit>"
+    assert "implementation_plan" in plan
+    assert "Best practices" in plan
+    assert "code example" in plan.lower() or "fenced code" in plan.lower()
     assert chat_router._mode_directive("edit") == ""
     assert chat_router._mode_directive("agent") == ""
 

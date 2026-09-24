@@ -136,9 +136,13 @@ interface AppState {
   planTasks: import('../types').PlanTask[]
   planRunId: string | null
   planPhase: import('../types').PlanPhase
+  planMarkdown: string
+  planTitle: string
+  planVersion: number | null
   setPlanTasks: (tasks: import('../types').PlanTask[]) => void
   setPlanRunId: (id: string | null) => void
   setPlanPhase: (phase: import('../types').PlanPhase) => void
+  setPlanDocument: (doc: { markdown?: string; title?: string; version?: number | null }) => void
   applyPlanEvent: (event: any) => void
   clearPlanTracker: () => void
 
@@ -331,18 +335,40 @@ export const useAppStore = create<AppState>((set) => ({
   planTasks: [],
   planRunId: null,
   planPhase: 'idle',
+  planMarkdown: '',
+  planTitle: 'Plan',
+  planVersion: null,
   setPlanTasks: (planTasks) => set({ planTasks }),
   setPlanRunId: (planRunId) => set({ planRunId }),
   setPlanPhase: (planPhase) => set({ planPhase }),
-  clearPlanTracker: () => set({ planTasks: [], planRunId: null, planPhase: 'idle' }),
+  setPlanDocument: (doc) => set((s) => ({
+    planMarkdown: doc.markdown !== undefined ? (doc.markdown || '') : s.planMarkdown,
+    planTitle: doc.title !== undefined ? (doc.title || 'Plan') : s.planTitle,
+    planVersion: doc.version !== undefined ? (doc.version ?? null) : s.planVersion,
+  })),
+  clearPlanTracker: () => set({
+    planTasks: [],
+    planRunId: null,
+    planPhase: 'idle',
+    planMarkdown: '',
+    planTitle: 'Plan',
+    planVersion: null,
+  }),
   applyPlanEvent: (event) => {
     if (!event || typeof event !== 'object') return
     const t = event.type
+    const docPatch: Record<string, any> = {}
+    if (typeof event.markdown === 'string') docPatch.planMarkdown = event.markdown
+    if (typeof event.title === 'string' && event.title) docPatch.planTitle = event.title
+    if (event.version != null && Number.isFinite(Number(event.version))) {
+      docPatch.planVersion = Number(event.version)
+    }
     if (t === 'plan_ready' || t === 'plan_updated' || t === 'plan_coverage' || t === 'plan_failed') {
       set({
         planRunId: event.run_id || null,
         planTasks: Array.isArray(event.tasks) ? event.tasks : [],
         planPhase: event.phase || (t === 'plan_failed' ? 'ready' : 'ready'),
+        ...docPatch,
       })
       return
     }
@@ -351,6 +377,7 @@ export const useAppStore = create<AppState>((set) => ({
         planRunId: event.run_id || null,
         planTasks: Array.isArray(event.tasks) ? event.tasks : [],
         planPhase: event.phase || (t === 'plan_locked' ? 'implementing' : 'ready'),
+        ...docPatch,
       })
     }
     // plan_missing: leave the tracker empty / unchanged

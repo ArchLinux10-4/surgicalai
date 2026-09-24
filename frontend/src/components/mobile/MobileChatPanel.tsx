@@ -501,14 +501,24 @@ export function MobileChatPanel() {
   useEffect(() => {
     if (!activeSessions) { clearPlanTracker(); return }
     let cancelled = false
+    const setPlanDocument = useAppStore.getState().setPlanDocument
     api.chat.getActivePlan(activeSessions).then((p) => {
       if (cancelled) return
+      setPlanDocument({
+        markdown: p?.markdown || '',
+        title: p?.title || 'Plan',
+        version: p?.version ?? null,
+      })
       if (p?.run_id && p.tasks?.length) {
         setPlanRunId(p.run_id)
         setPlanTasks(p.tasks)
         setPlanPhase((p.phase as any) || 'ready')
-      } else {
+      } else if (!(p?.markdown || '').trim()) {
         clearPlanTracker()
+      } else {
+        setPlanRunId(null)
+        setPlanTasks([])
+        setPlanPhase('idle')
       }
     }).catch(() => { if (!cancelled) clearPlanTracker() })
     return () => { cancelled = true }
@@ -1492,7 +1502,7 @@ export function MobileChatPanel() {
               />
             ))}
             <AgentMissionControl />
-            <PlanTracker />
+            <PlanTracker emptyHint={effectiveMode === 'plan'} />
             {resumableRun && resumableRun.sid === activeSessions && !isStreaming && (
               <div className="mx-3 mb-2 flex items-center justify-between gap-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5">
                 <span className="text-[12px] text-ink leading-snug">
