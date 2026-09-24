@@ -218,9 +218,17 @@ def get_available_models(request: Request):
 
     # Verified against the live Anthropic key via /v1 probe — only IDs the
     # account actually accepts are listed (others 404 at request time).
+    # Newest first. Confirmed against docs.anthropic.com models overview
+    # (Fable 5.1, Opus 5.5, Opus 5, Sonnet 5, Haiku 4.5 + legacy 4.x).
     claude_models = [
+        {"id": "claude-fable-5-1", "name": "Claude Fable 5.1", "role": "architect",
+         "description": "Most capable — long-horizon agents — ⚠️ Premium ($10/$50 per M tokens)", "provider": "anthropic", "cost": 4},
+        {"id": "claude-opus-5-5", "name": "Claude Opus 5.5", "role": "architect",
+         "description": "Recommended for most work — long-running agentic coding ($4/$20)", "provider": "anthropic", "cost": 3},
+        {"id": "claude-opus-5", "name": "Claude Opus 5", "role": "architect",
+         "description": "Complex agentic coding — powerful for multi-file work", "provider": "anthropic", "cost": 4},
         {"id": "claude-fable-5", "name": "Claude Fable 5", "role": "architect",
-         "description": "Most capable model — ⚠️ Premium pricing ($10/$50 per M tokens)", "provider": "anthropic", "cost": 4},
+         "description": "Prior Fable — ⚠️ Premium pricing ($10/$50 per M tokens)", "provider": "anthropic", "cost": 4},
         {"id": "claude-opus-4-8", "name": "Claude Opus 4.8", "role": "architect",
          "description": "Complex agentic coding — powerful for multi-file work", "provider": "anthropic", "cost": 4},
         {"id": "claude-sonnet-5", "name": "Claude Sonnet 5", "role": "architect",
@@ -245,9 +253,17 @@ def get_available_models(request: Request):
     openai_models = []
     has_openai = bool(_resolve_api_key(user_id, "openai"))
     if has_openai:
+        # Newest first. GPT-6 ids from developers.openai.com/api/docs/models.
+        # Keep GPT-5.5 / 5.6 Sol·Terra·Luna selectable.
         openai_models = [
+            {"id": "gpt-6-astra", "name": "GPT-6 Astra", "role": "architect",
+             "description": "Most capable GPT — hardest end-to-end work ($10/$50)", "provider": "openai", "cost": 4},
+            {"id": "gpt-6-sol", "name": "GPT-6 Sol", "role": "architect",
+             "description": "Complex coding & agents — 1.05M context ($2/$10)", "provider": "openai", "cost": 2},
+            {"id": "gpt-6-luna", "name": "GPT-6 Luna", "role": "architect",
+             "description": "Efficient high-volume — 1.05M context ($0.10/$0.50)", "provider": "openai", "cost": 1},
             {"id": "gpt-5.5", "name": "GPT-5.5", "role": "architect",
-             "description": "Latest GPT — powerful general-purpose model", "provider": "openai", "cost": 2},
+             "description": "Prior GPT flagship — powerful general-purpose model", "provider": "openai", "cost": 2},
             {"id": "gpt-5.6-sol", "name": "GPT-5.6 Sol", "role": "architect",
              "description": "Frontier reasoning — hardest problems, 1M context", "provider": "openai", "cost": 3},
             {"id": "gpt-5.6-terra", "name": "GPT-5.6 Terra", "role": "architect",
@@ -262,22 +278,28 @@ def get_available_models(request: Request):
     # ChatPanel.tsx (`const isGpt = m.provider === 'openai'`) does not catch
     # these — Grok intentionally gets the same access GPT has today, no new
     # restriction.
-    # Pricing (docs.x.ai/developers/models, <200k prompt): both grok-4.5 and
-    # grok-4.6 are $2.00 input / $6.00 output per 1M tokens — same list price.
-    # Cached input differs slightly (4.5 $0.30 vs 4.6 $0.50). Relative to this
-    # app's cost scale: tier 2 (same as Sonnet / GPT-5.5 / Terra), well below
-    # Opus premium tier 4 ($10/$50). Keep both at cost=2.
+    # Pricing (docs.x.ai/developers/models, <200k prompt): grok-4.5 / 4.6 /
+    # 4.7 are $2.00 input / $6.00 output per 1M tokens — same list price.
+    # Cached input differs slightly (4.5 $0.30 vs 4.6/4.7 $0.50). Relative to
+    # this app's cost scale: tier 2 (same as Sonnet / GPT-5.5 / Terra), well
+    # below Opus premium tier 4 ($10/$50). Keep all at cost=2.
+    # Do NOT list grok-4.7-fast (Cursor/Grok Build only) or hyphenated
+    # grok-4-7 (rejected by xAI).
     grok_models = []
     has_grok = bool(_resolve_api_key(user_id, "grok"))
     if has_grok:
         grok_models = [
-            {"id": "grok-4.5", "name": "Grok 4.5", "role": "architect",
-             "description": "xAI reasoning — 500K context ($2/$6 per M tokens)",
+            # Confirmed shipping id: docs.x.ai/developers/models/grok-4.7
+            {"id": "grok-4.7", "name": "Grok 4.7", "role": "architect",
+             "description": "xAI recommended coding/agents — 500K context ($2/$6)",
              "provider": "grok", "cost": 2},
             # Confirmed shipping id: docs.x.ai/developers/models/grok-4.6
             # (dot, not hyphen — grok-4-6 is rejected by xAI).
             {"id": "grok-4.6", "name": "Grok 4.6", "role": "architect",
-             "description": "xAI frontier coding/agents — 500K context ($2/$6, same as 4.5)",
+             "description": "xAI frontier coding/agents — 500K context ($2/$6, same as 4.7)",
+             "provider": "grok", "cost": 2},
+            {"id": "grok-4.5", "name": "Grok 4.5", "role": "architect",
+             "description": "xAI reasoning — 500K context ($2/$6 per M tokens)",
              "provider": "grok", "cost": 2},
         ]
     _dlog("settings_models_grok_gate", user_id=user_id, has_grok=has_grok,

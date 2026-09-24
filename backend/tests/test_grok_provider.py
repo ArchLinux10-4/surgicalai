@@ -40,6 +40,7 @@ def _pipeline_src() -> str:
     "grok-4.5",
     "grok-4.5-latest",
     "grok-4.6",
+    "grok-4.7",
     "grok-4",   # only "grok-" prefixed ids match
     "grok-code-fast-1",
 ])
@@ -127,12 +128,15 @@ def test_grok_base_url_constant_is_xai():
 
 
 def test_grok_default_model_is_the_confirmed_shipping_id():
-    """Default stays 4.5; 4.6 is also a confirmed selectable id."""
+    """Default stays 4.5; 4.6 and 4.7 are also confirmed selectable ids."""
     assert gp.GROK_DEFAULT_MODEL == "grok-4.5"
     assert "grok-4.5" in gp.GROK_CONFIRMED_MODELS
     assert "grok-4.6" in gp.GROK_CONFIRMED_MODELS
+    assert "grok-4.7" in gp.GROK_CONFIRMED_MODELS
     # xAI rejects the hyphenated form (docs / migration notes).
     assert "grok-4-6" not in gp.GROK_CONFIRMED_MODELS
+    assert "grok-4-7" not in gp.GROK_CONFIRMED_MODELS
+    assert "grok-4.7-fast" not in gp.GROK_CONFIRMED_MODELS
 
 
 def test_get_grok_client_uses_xai_base_url(monkeypatch):
