@@ -10,6 +10,7 @@ import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import { clientLog } from '../../lib/clientLog'
 import { getApplyGate, provenanceEvidence } from '../../lib/qaApplyPolicy'
+import { appliedStorageKey } from '../../lib/diffChange'
 import type { SmartResult, SessionFile } from '../../types'
 import { useAppStore } from '../../stores/appStore'
 
@@ -21,7 +22,7 @@ interface Props {
 }
 
 // ── localStorage helpers — mirrors InlineDiffCard exactly ────────────────────
-const appliedKey  = (sid: string, cid: string) => `sai-applied:${sid}:${cid}`
+const appliedKey = appliedStorageKey
 const saveApplied = (sid: string, cid: string) => {
   try { localStorage.setItem(appliedKey(sid, cid), '1') } catch {}
 }
@@ -114,7 +115,8 @@ function FileCard({
           if (changeIds.includes(id)) fromDB[id] = true
         }
         if (Object.keys(fromDB).length > 0) {
-          setAppliedMap(prev => ({ ...fromDB, ...prev }))
+          // DB overrides localStorage so a later refresh cannot be overwritten by a stale local false
+          setAppliedMap(prev => ({ ...prev, ...fromDB }))
         }
       })
       .catch(() => {})

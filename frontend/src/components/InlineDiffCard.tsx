@@ -17,7 +17,12 @@ import type { ApplyProgress } from '../lib/applyProgress'
 import { applyStageLabel } from '../lib/applyProgress'
 import { clientLog } from '../lib/clientLog'
 import { getApplyGate, provenanceEvidence } from '../lib/qaApplyPolicy'
-import { parseServerUtc, relativeTimeFromServer } from '../lib/relativeTime';
+import { parseServerUtc, relativeTimeFromServer } from '../lib/relativeTime'
+import {
+  appliedStorageKey,
+  isRealDiffChange,
+  skippedStorageKey,
+} from '../lib/diffChange';
 interface Props {
   result: SmartResult
   sessionId: string
@@ -57,10 +62,8 @@ function buildQARetryReportText(filename: string, change: any): string {
 }
 
 // --- localStorage helpers for persisting applied/skipped state across refresh ---
-const appliedKey = (sessionId: string, changeId: string) =>
-  `sai-applied:${sessionId}:${changeId}`
-const skippedKey = (sessionId: string, changeId: string) =>
-  `sai-skipped:${sessionId}:${changeId}`
+const appliedKey = appliedStorageKey
+const skippedKey = skippedStorageKey
 
 const loadApplied = (sessionId: string, changeIds: string[]): Record<string, boolean> => {
   const out: Record<string, boolean> = {}
@@ -626,13 +629,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   onRetryWithQA?: (reportText: string) => void
 }) {
   // Filter ghost diffs first — do this before any state so IDs are stable
-  const realChanges = fileData.changes.filter((c: any) => {
-    if (!c.diff) return false
-    const lines = c.diff.split('\n')
-    const hasAdds = lines.some((l: string) => l.startsWith('+') && !l.startsWith('+++'))
-    const hasRemoves = lines.some((l: string) => l.startsWith('-') && !l.startsWith('---'))
-    return hasAdds || hasRemoves
-  })
+  const realChanges = fileData.changes.filter(isRealDiffChange)
 
   const changeIds = realChanges.map((c: any) => c.id)
 
@@ -709,7 +706,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           if (changeIds.includes(id)) fromDB[id] = true
         }
         if (Object.keys(fromDB).length > 0) {
-          setApplied(prev => ({ ...fromDB, ...prev }))
+          // DB overrides localStorage so a later refresh cannot be overwritten by a stale local false
+          setApplied(prev => ({ ...prev, ...fromDB }))
         }
       })
       .catch(() => {})
@@ -726,7 +724,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           for (const id of applied_ids) {
             if (changeIds.includes(id)) fromDB[id] = true
           }
-          if (Object.keys(fromDB).length > 0) setApplied(prev => ({ ...fromDB, ...prev }))
+          if (Object.keys(fromDB).length > 0) setApplied(prev => ({ ...prev, ...fromDB }))
         })
         .catch(() => {})
     }
