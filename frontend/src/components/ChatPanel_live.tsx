@@ -15,6 +15,7 @@ import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Psychology, Security, Send, Warning } from '@mui/icons-material';
 import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
+import { splitPendingChanges } from '../lib/diffChange'
 
 // ── Strip internal protocol tags from model output ────────────────────────────
 function stripInternalTags(text: string, streaming = false): string {
@@ -74,9 +75,9 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
 
   if (pendingMessages.length === 0) return null
 
-  // Count only UNAPPLIED changes — exclude already-applied ones. QA-blocked
-  // changes are NOT bulk-applyable (same gate the per-row checkbox enforces),
-  // so track clean vs flagged separately.
+  // Count only UNAPPLIED real diffs — same classifier as the click handler.
+  // QA-blocked changes are NOT bulk-applyable (same gate the per-row checkbox enforces),
+  // so track clean vs flagged separately. new_files are not edits (match desktop).
   let cleanChanges   = 0
   let flaggedChanges = 0
   let totalFiles     = 0
@@ -85,15 +86,15 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       const result: SmartResult = JSON.parse(msg.surgical_data)
       const files = Object.keys(result.changes_by_file || {})
       for (const f of files) {
-        const changes = result.changes_by_file[f]?.changes || []
-        const unapplied = changes.filter((c: any) => c?.id && !appliedIds.has(c.id))
-        const clean = unapplied.filter((c: any) => c.qa_result?.verdict !== 'blocked')
+        const { clean, flagged } = splitPendingChanges(
+          result.changes_by_file[f]?.changes || [],
+          appliedIds,
+          sessionId,
+        )
         if (clean.length > 0) totalFiles++
         cleanChanges   += clean.length
-        flaggedChanges += unapplied.length - clean.length
+        flaggedChanges += flagged.length
       }
-      const newFiles = (result.new_files || []).filter((nf: any) => nf?.id && !appliedIds.has(nf.id))
-      cleanChanges += newFiles.length
     } catch {}
   }
 
@@ -114,8 +115,12 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
         for (const [, fileData] of Object.entries(result.changes_by_file || {})) {
           const fd = fileData as any
           if (!fd?.file_id || !fd?.changes?.length) continue
-          // Only bulk-apply QA-clean changes; blocked ones require individual review.
-          const applyChanges = fd.changes.filter((c: any) => c?.qa_result?.verdict !== 'blocked')
+          // Only bulk-apply QA-clean real diffs not already applied/skipped.
+          const { clean: applyChanges } = splitPendingChanges(
+            fd.changes,
+            appliedIds,
+            sessionId,
+          )
           if (applyChanges.length === 0) continue
           try {
             const current = await api.sessionFiles.get(sessionId, fd.file_id)

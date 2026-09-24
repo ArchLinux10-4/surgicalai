@@ -22,6 +22,7 @@ import { clientLog } from '../lib/clientLog'
 import { ApplyProgressStrip } from './ApplyProgressStrip'
 import type { ApplyProgress } from '../lib/applyProgress'
 import { applyStageLabel } from '../lib/applyProgress'
+import { splitPendingChanges } from '../lib/diffChange'
 
 
 // ── Chat mode selector ────────────────────────────────────────────────────────
@@ -113,7 +114,8 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
 
   if (pendingMessages.length === 0) return null
 
-  // Count only UNAPPLIED changes — diff cards' applied state is source of truth.
+  // Count only UNAPPLIED real diffs — same classifier as the click handler
+  // (ghost/no-op diffs + local applied/skipped + DB applied are excluded).
   // QA-blocked changes are NOT bulk-applyable: the per-row checkbox disables them
   // (see InlineDiffCard), so Apply All must respect the same gate. We track clean
   // (applyable) vs flagged (QA-blocked) separately so the button can show the split.
@@ -124,11 +126,13 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
     try {
       const result: SmartResult = JSON.parse(msg.surgical_data)
       for (const [fname, fd] of Object.entries(result.changes_by_file || {})) {
-        const changes = (fd as any)?.changes || []
-        const unapplied = changes.filter((c: any) => c.id && !appliedIds.has(c.id))
-        const clean   = unapplied.filter((c: any) => c.qa_result?.verdict !== 'blocked')
+        const { clean, flagged } = splitPendingChanges(
+          (fd as any)?.changes || [],
+          appliedIds,
+          sessionId,
+        )
         cleanChanges   += clean.length
-        flaggedChanges += unapplied.length - clean.length
+        flaggedChanges += flagged.length
         if (clean.length > 0) fileSet.add(fname)
       }
       // new_files are not edits — don't count them as changes to apply
@@ -197,9 +201,13 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
             }
             continue
           }
-          // Only bulk-apply QA-clean changes. QA-blocked changes must be reviewed
-          // and applied individually — same gate the per-row checkbox enforces.
-          const applyChanges = fd.changes.filter((c: any) => c?.qa_result?.verdict !== 'blocked')
+          // Only bulk-apply QA-clean real diffs that are not already applied
+          // (DB or local) or skipped — same splitPendingChanges as the label.
+          const { clean: applyChanges } = splitPendingChanges(
+            fd.changes,
+            appliedIds,
+            sessionId,
+          )
           if (applyChanges.length === 0) continue
           // Mutual exclusion with individual diff-card Apply buttons — see
           // fileApplyLock.ts for the proven race this closes. If a diff card
