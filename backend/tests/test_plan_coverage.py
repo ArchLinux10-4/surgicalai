@@ -215,6 +215,88 @@ def test_grok_reinforcement_requires_json():
     assert "implementation_plan" in plan
     assert "implementation_plan" not in ask
     assert "PLAN MODE" in plan
+    assert "surgical_edit" in plan
+    assert "code examples" in plan or "Best practices" in plan
+
+
+def test_persist_stores_markdown_and_user_id(plan_db):
+    from services.plan_artifact import load_session_plan
+    sid = plan_db["sid"]
+    ev = persist_plan_from_assistant_text(sid, CLAUDE_STYLE, user_id="user-a")
+    assert ev["type"] == "plan_ready"
+    assert "markdown" in ev and "Add a banner" in ev["markdown"]
+    assert ev["version"] == 1
+    doc = load_session_plan(sid)
+    assert doc is not None
+    assert doc["user_id"] == "user-a"
+    assert doc["markdown"] == CLAUDE_STYLE.strip()
+    assert "## Overview" in doc["markdown"]
+
+
+def test_persist_revise_bumps_version_and_keeps_revision(plan_db):
+    from services.plan_artifact import load_session_plan
+    from database import get_db
+    sid = plan_db["sid"]
+    first = persist_plan_from_assistant_text(sid, CLAUDE_STYLE, user_id="user-a")
+    assert first["version"] == 1
+    second = persist_plan_from_assistant_text(sid, GROK_STYLE, user_id="user-a")
+    assert second["type"] == "plan_updated"
+    assert second["version"] == 2
+    assert "Header" in second["markdown"]
+    doc = load_session_plan(sid)
+    assert doc["version"] == 2
+    conn = get_db()
+    try:
+        revs = conn.execute(
+            "SELECT version, markdown FROM session_plan_revisions "
+            "WHERE session_id = ? ORDER BY version",
+            (sid,),
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(revs) == 1
+    assert revs[0]["version"] == 1
+    assert "Add a banner" in revs[0]["markdown"]
+
+
+def test_plan_markdown_injected_outside_history_cap(plan_db):
+    from services.plan_artifact import current_plan_markdown_for_prompt
+    sid = plan_db["sid"]
+    persist_plan_from_assistant_text(sid, CLAUDE_STYLE, user_id="user-a")
+    injected = current_plan_markdown_for_prompt(sid)
+    assert "Current session plan" in injected
+    assert "Add a banner" in injected
+    assert "implementation_plan" in injected
+
+
+def test_implement_request_includes_saved_markdown():
+    import inspect
+    from routers import chat as chat_router
+    src = inspect.getsource(chat_router.implement_plan)
+    assert "current_plan_markdown_for_prompt" in src
+    assert "Implement the attached implementation_plan steps exactly." in src
+
+
+def test_get_active_plan_foreign_user_forbidden(plan_db):
+    from fastapi import HTTPException
+    from routers import chat as chat_router
+
+    sid = plan_db["sid"]
+    persist_plan_from_assistant_text(sid, CLAUDE_STYLE, user_id="user-a")
+
+    class _Req:
+        def __init__(self, uid):
+            self.state = type("S", (), {"user_id": uid})()
+
+    # Owner can read
+    ok = chat_router.get_active_plan(sid, _Req("user-a"))
+    assert ok["markdown"]
+    assert ok["version"] == 1
+    assert ok["tasks"]
+
+    with pytest.raises(HTTPException) as ei:
+        chat_router.get_active_plan(sid, _Req("user-other"))
+    assert ei.value.status_code == 403
 
 
 # ── smart_stream integration: plan_ready, never task_plan / pipeline ─────────

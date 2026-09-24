@@ -95,6 +95,10 @@ def test_reinforcement_text_labels_ask_and_plan_correctly():
     # sandwich pattern: this is a distinct, standalone reinforcement string,
     # not a mutation of the shared CHAT_PERSONA/_ASK_DIRECTIVE text.
     assert "surgical_edit" in ask_text
+    assert "surgical_edit" in plan_text
+    assert "Best practices" in plan_text or "code examples" in plan_text
+    assert "implementation_plan" in plan_text
+    assert "implementation_plan" not in ask_text
 
 
 def test_dispatch_context_request_routes_search_kind_correctly():

@@ -13,12 +13,16 @@ import json
 import re
 import uuid
 
+from database import get_db
 from services.task_planner import create_tasks, list_tasks, update_task
 
 _FENCE_RE = re.compile(
     r"```(?:implementation_plan|plan-json)\s*([\s\S]*?)```",
     re.IGNORECASE,
 )
+
+# Cap so one huge plan cannot blow the prompt (outside the 4000-char history trim).
+PLAN_MARKDOWN_PROMPT_CAP = 48_000
 
 
 def parse_implementation_plan(text: str) -> list[dict] | None:
@@ -216,9 +220,14 @@ def latest_plan_run(session_id: str) -> dict | None:
 
 
 def current_plan_json_for_prompt(session_id: str) -> str:
-    """JSON the model should revise — only a Ready checklist."""
+    """JSON the model should revise — Ready / blocked / complete checklists.
+
+    Ready is the primary revise path. Blocked and complete still inject the
+    last step list so a follow-up Plan turn can see what was planned.
+    Implementing stays empty (checklist is locked).
+    """
     latest = latest_plan_run(session_id)
-    if not latest or latest["phase"] != "ready":
+    if not latest or latest["phase"] not in ("ready", "blocked", "complete"):
         return ""
     steps = []
     for t in latest["tasks"]:
@@ -238,6 +247,128 @@ def current_plan_json_for_prompt(session_id: str) -> str:
     )
 
 
+def _title_from_markdown(markdown: str) -> str:
+    for line in (markdown or "").splitlines():
+        s = line.strip()
+        if s.startswith("# "):
+            title = s[2:].strip()
+            if title:
+                return title[:200]
+    return "Plan"
+
+
+def load_session_plan(session_id: str) -> dict | None:
+    """Return the living session_plans row for this session, or None."""
+    if not session_id:
+        return None
+    conn = get_db()
+    try:
+        row = conn.execute(
+            "SELECT id, session_id, user_id, title, markdown, version, "
+            "created_at, updated_at FROM session_plans WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def upsert_session_plan(
+    session_id: str,
+    markdown: str,
+    user_id: str | None = None,
+) -> dict:
+    """Insert or replace the session plan markdown. Bumps version on change.
+
+    Previous body is copied into session_plan_revisions before overwrite.
+    """
+    body = (markdown or "").strip()
+    if not session_id or not body:
+        raise ValueError("session_id and markdown required")
+    title = _title_from_markdown(body)
+    conn = get_db()
+    try:
+        existing = conn.execute(
+            "SELECT id, markdown, version, user_id FROM session_plans "
+            "WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+        if existing:
+            plan_id = existing["id"]
+            prev_md = existing["markdown"] or ""
+            version = int(existing["version"] or 1)
+            if prev_md.strip() != body:
+                conn.execute(
+                    "INSERT INTO session_plan_revisions "
+                    "(id, plan_id, session_id, version, markdown, updated_by) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        str(uuid.uuid4()),
+                        plan_id,
+                        session_id,
+                        version,
+                        prev_md,
+                        user_id or existing["user_id"] or "",
+                    ),
+                )
+                version += 1
+            conn.execute(
+                "UPDATE session_plans SET title = ?, markdown = ?, version = ?, "
+                "user_id = COALESCE(?, user_id), "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (title, body, version, user_id or None, plan_id),
+            )
+            conn.commit()
+            return {
+                "id": plan_id,
+                "session_id": session_id,
+                "user_id": user_id or existing["user_id"],
+                "title": title,
+                "markdown": body,
+                "version": version,
+            }
+
+        plan_id = str(uuid.uuid4())
+        conn.execute(
+            "INSERT INTO session_plans "
+            "(id, session_id, user_id, title, markdown, version) "
+            "VALUES (?, ?, ?, ?, ?, 1)",
+            (plan_id, session_id, user_id or None, title, body),
+        )
+        conn.commit()
+        return {
+            "id": plan_id,
+            "session_id": session_id,
+            "user_id": user_id,
+            "title": title,
+            "markdown": body,
+            "version": 1,
+        }
+    finally:
+        conn.close()
+
+
+def current_plan_markdown_for_prompt(session_id: str) -> str:
+    """Full saved plan markdown for Plan / Implement injection (capped)."""
+    row = load_session_plan(session_id)
+    if not row:
+        return ""
+    md = (row.get("markdown") or "").strip()
+    if not md:
+        return ""
+    if len(md) > PLAN_MARKDOWN_PROMPT_CAP:
+        md = md[:PLAN_MARKDOWN_PROMPT_CAP] + "\n\n…(plan truncated for prompt size)"
+    ver = row.get("version") or 1
+    title = row.get("title") or "Plan"
+    return (
+        f"\n\n## Current session plan (v{ver}: {title})\n"
+        "This is the saved Plan document for this session. Revise it in full "
+        "when the approach changes; emit a FULL replacement "
+        "```implementation_plan JSON fence at the end.\n\n"
+        f"{md}"
+    )
+
+
 def supersede_plan_run(run_id: str, session_id: str) -> None:
     for t in list_tasks(session_id, run_id):
         if (t.get("source") or "") != "plan":
@@ -246,7 +377,11 @@ def supersede_plan_run(run_id: str, session_id: str) -> None:
             update_task(t["id"], status="cancelled", result_summary="superseded")
 
 
-def persist_plan_from_assistant_text(session_id: str, text: str) -> dict | None:
+def persist_plan_from_assistant_text(
+    session_id: str,
+    text: str,
+    user_id: str | None = None,
+) -> dict | None:
     """Parse + persist. Returns an SSE payload or None (no tracker).
 
     - Implementing: do not rewrite rows; emit ``plan_locked``.
@@ -254,26 +389,40 @@ def persist_plan_from_assistant_text(session_id: str, text: str) -> dict | None:
     - Invalid JSON + no Ready plan: None (first-plan fail-loud).
     - Valid JSON + Ready plan: supersede + ``plan_updated``.
     - Valid JSON otherwise (none / complete / blocked): new run ``plan_ready``.
+
+    On a valid fence, also upserts the full assistant text into session_plans.
     """
     latest = latest_plan_run(session_id)
     if latest and latest["phase"] == "implementing":
-        return {
+        doc = load_session_plan(session_id)
+        payload = {
             "type": "plan_locked",
             "run_id": latest["run_id"],
             "phase": "implementing",
             "tasks": [serialize_plan_task(t) for t in latest["tasks"]],
         }
+        if doc:
+            payload["markdown"] = doc.get("markdown") or ""
+            payload["title"] = doc.get("title") or "Plan"
+            payload["version"] = doc.get("version") or 1
+        return payload
 
     steps = parse_implementation_plan(text)
     if not steps:
         if latest and latest["phase"] == "ready":
-            return {
+            doc = load_session_plan(session_id)
+            payload = {
                 "type": "plan_unchanged",
                 "run_id": latest["run_id"],
                 "phase": "ready",
                 "reason": "invalid_json",
                 "tasks": [serialize_plan_task(t) for t in latest["tasks"]],
             }
+            if doc:
+                payload["markdown"] = doc.get("markdown") or ""
+                payload["title"] = doc.get("title") or "Plan"
+                payload["version"] = doc.get("version") or 1
+            return payload
         return None
 
     event = "plan_ready"
@@ -283,11 +432,15 @@ def persist_plan_from_assistant_text(session_id: str, text: str) -> dict | None:
 
     run_id = str(uuid.uuid4())
     created = create_tasks(session_id, run_id, steps_to_task_payloads(steps))
+    doc = upsert_session_plan(session_id, text or "", user_id=user_id)
     return {
         "type": event,
         "run_id": run_id,
         "phase": "ready",
         "tasks": [serialize_plan_task(t) for t in created],
+        "markdown": doc.get("markdown") or "",
+        "title": doc.get("title") or "Plan",
+        "version": doc.get("version") or 1,
     }
 
 

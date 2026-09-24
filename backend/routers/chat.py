@@ -127,7 +127,12 @@ _PLAN_DIRECTIVE = (
     "for the user's request. Reference specific files, functions, and line "
     "numbers from the provided code. Use this structure:\n"
     "## Overview\nBrief summary of the approach.\n\n"
-    "## Steps\n1. **File: path** — what to change and why.\n2. ...\n\n"
+    "## Best practices\nConventions, error handling, tests, and what not to touch.\n\n"
+    "## Steps\n"
+    "1. **File: path** — what to change and why.\n"
+    "   Include a fenced code example of the code that should be written for "
+    "that step (illustrative; not a diff or <surgical_edit>).\n"
+    "2. ...\n\n"
     "## Risks & Considerations\nEdge cases and things to watch for.\n\n"
     "Do NOT produce code edits, diffs, or <surgical_edit> tags — plan only.\n\n"
     "You MUST end your reply with a fenced JSON block using the language tag "
@@ -136,12 +141,15 @@ _PLAN_DIRECTIVE = (
     "{\"steps\": [{\"filename\": \"exact file name\", \"symbol\": "
     "\"function/class/component\", \"description\": \"what to change\"}]}\n"
     "```\n"
-    "Every planned edit needs filename + symbol. No diffs. Stay in Plan and "
-    "the user can tell you what to change; emit a FULL replacement fence."
+    "Every planned edit needs filename + symbol. Code examples in the Steps "
+    "section are prose illustrations for the Implement path — they are NOT "
+    "the machine fence. Stay in Plan and the user can tell you what to change; "
+    "emit a FULL replacement fence."
 )
 
 _PLAN_JSON_TRAILER = (
-    "\n\n[PLAN MODE — required] End with a ```implementation_plan JSON fence "
+    "\n\n[PLAN MODE — required] Include ## Best practices and a fenced code "
+    "example under each step. End with a ```implementation_plan JSON fence "
     "listing every step as {\"filename\",\"symbol\",\"description\"}. "
     "Do NOT produce <surgical_edit> tags."
 )
@@ -920,6 +928,8 @@ def _purge_session(conn, session_id: str) -> None:
     """
     conn.execute("DELETE FROM session_files WHERE session_id = ?", (session_id,))
     conn.execute("DELETE FROM chat_messages WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM session_plan_revisions WHERE session_id = ?", (session_id,))
+    conn.execute("DELETE FROM session_plans WHERE session_id = ?", (session_id,))
     conn.execute("DELETE FROM chat_sessions WHERE id = ?", (session_id,))
     conn.commit()
     for _tbl in _SESSION_AUX_TABLES:
@@ -995,15 +1005,51 @@ def rename_session(session_id: str, body: dict, request: Request):
 def get_active_plan(session_id: str, request: Request):
     """Latest source=plan run for the Plan tracker (reload / session switch)."""
     require_session_access_from_request(session_id, request)
-    from services.plan_artifact import latest_plan_run, serialize_plan_task, plan_run_phase
+    from services.plan_artifact import (
+        latest_plan_run,
+        serialize_plan_task,
+        plan_run_phase,
+        load_session_plan,
+    )
     latest = latest_plan_run(session_id)
+    doc = load_session_plan(session_id)
+    base = {
+        "run_id": None,
+        "phase": "idle",
+        "tasks": [],
+        "markdown": (doc.get("markdown") if doc else "") or "",
+        "title": (doc.get("title") if doc else "") or "Plan",
+        "version": (doc.get("version") if doc else None),
+    }
     if not latest:
-        return {"run_id": None, "phase": "idle", "tasks": []}
+        return base
     return {
         "run_id": latest["run_id"],
         "phase": latest["phase"] or plan_run_phase(latest["tasks"]),
         "tasks": [serialize_plan_task(t) for t in latest["tasks"]],
+        "markdown": (doc.get("markdown") if doc else "") or "",
+        "title": (doc.get("title") if doc else "") or "Plan",
+        "version": (doc.get("version") if doc else None),
     }
+
+
+@router.get("/plans/export")
+def export_plan(session_id: str, request: Request):
+    """Download the saved Plan markdown for this session."""
+    from fastapi.responses import Response
+    require_session_access_from_request(session_id, request)
+    from services.plan_artifact import load_session_plan
+    doc = load_session_plan(session_id)
+    if not doc or not (doc.get("markdown") or "").strip():
+        raise HTTPException(status_code=404, detail="No plan document")
+    title = (doc.get("title") or "plan").strip() or "plan"
+    safe = "".join(c if c.isalnum() or c in "-_ " else "_" for c in title)[:80]
+    filename = f"{safe or 'plan'}.md"
+    return Response(
+        content=doc["markdown"],
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/plans/implement")
@@ -1023,6 +1069,8 @@ async def implement_plan(body: dict, request: Request):
         apply_coverage_to_run,
         serialize_plan_task,
         plan_run_phase,
+        load_session_plan,
+        current_plan_markdown_for_prompt,
     )
 
     session_id = (body or {}).get("session_id") or ""
@@ -1078,7 +1126,15 @@ async def implement_plan(body: dict, request: Request):
         raise HTTPException(status_code=400, detail="Session has no files to implement against")
 
     mark_plan_implementing(session_id, run_id)
-    user_request = "Implement the attached implementation_plan steps exactly."
+    _plan_md = current_plan_markdown_for_prompt(session_id) or ""
+    if not _plan_md:
+        _doc = load_session_plan(session_id)
+        if _doc and (_doc.get("markdown") or "").strip():
+            _plan_md = "\n\n## Current session plan\n\n" + (_doc["markdown"] or "")
+    user_request = (
+        (_plan_md + "\n\n" if _plan_md else "")
+        + "Implement the attached implementation_plan steps exactly."
+    )
 
     async def stream_implement():
         import json as _json
@@ -1332,9 +1388,13 @@ async def smart_stream(req: dict, request: Request):
             # the current Ready checklist. Recency trailer is model-agnostic
             # so GPT/Gemini also emit the fence (Grok has its own extra copy).
             if _eff_mode == "plan":
-                from services.plan_artifact import current_plan_json_for_prompt
+                from services.plan_artifact import (
+                    current_plan_json_for_prompt,
+                    current_plan_markdown_for_prompt,
+                )
                 _directive = (
                     _directive
+                    + current_plan_markdown_for_prompt(session_id)
                     + current_plan_json_for_prompt(session_id)
                     + _PLAN_JSON_TRAILER
                 )
@@ -1392,7 +1452,9 @@ async def smart_stream(req: dict, request: Request):
             def _persist_plan_event(text: str):
                 try:
                     from services.plan_artifact import persist_plan_from_assistant_text
-                    return persist_plan_from_assistant_text(session_id, text)
+                    return persist_plan_from_assistant_text(
+                        session_id, text, user_id=current_user_id,
+                    )
                 except Exception as _pe:
                     _dlog("sse_plan_persist_error", session_id=session_id,
                           user_id=current_user_id, error=str(_pe))
