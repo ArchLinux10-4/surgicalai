@@ -135,8 +135,9 @@ _PLAN_DIRECTIVE = (
     "2. ...\n\n"
     "## Risks & Considerations\nEdge cases and things to watch for.\n\n"
     "Do NOT produce code edits, diffs, or <surgical_edit> tags — plan only.\n\n"
-    "You MUST end your reply with a fenced JSON block using the language tag "
-    "implementation_plan (not generic json). Shape:\n"
+    "Unless you are asking clarifying questions as allowed in the PLAN "
+    "QUESTIONS section, you MUST end your reply with a fenced JSON block "
+    "using the language tag implementation_plan (not generic json). Shape:\n"
     "```implementation_plan\n"
     "{\"steps\": [{\"filename\": \"exact file name\", \"symbol\": "
     "\"function/class/component\", \"description\": \"what to change\"}]}\n"
@@ -149,8 +150,9 @@ _PLAN_DIRECTIVE = (
 
 _PLAN_JSON_TRAILER = (
     "\n\n[PLAN MODE — required] Include ## Best practices and a fenced code "
-    "example under each step. End with a ```implementation_plan JSON fence "
-    "listing every step as {\"filename\",\"symbol\",\"description\"}. "
+    "example under each step. Unless you are asking clarifying questions as "
+    "allowed in the PLAN QUESTIONS section, end with a ```implementation_plan "
+    "JSON fence listing every step as {\"filename\",\"symbol\",\"description\"}. "
     "Do NOT produce <surgical_edit> tags."
 )
 
@@ -704,6 +706,11 @@ def get_messages(session_id: str, request: Request):
                 _wss = _meta.get("web_search_sources")
                 if _wss:
                     d["_sources"] = _wss
+                # Plan-mode clarifying questions (see services/plan_questions.py).
+                # Lets the question card survive a reload.
+                _pq_meta = _meta.get("plan_questions")
+                if isinstance(_pq_meta, list) and _pq_meta:
+                    d["_plan_questions"] = _pq_meta
             except Exception:
                 pass
         content = d.get("content", "")
@@ -1384,6 +1391,9 @@ async def smart_stream(req: dict, request: Request):
                   mode=_eff_mode)
 
             _directive = _mode_directive(_eff_mode)
+            # Clarifying questions: one round per prompt, decided server-side
+            # from the DB (never the client). See services/plan_questions.py.
+            _q_allowed = False
             # Plan-mode adherence: same model (Claude/Grok/OpenAI) revises
             # the current Ready checklist. Recency trailer is model-agnostic
             # so GPT/Gemini also emit the fence (Grok has its own extra copy).
@@ -1392,11 +1402,17 @@ async def smart_stream(req: dict, request: Request):
                     current_plan_json_for_prompt,
                     current_plan_markdown_for_prompt,
                 )
+                from services.plan_questions import (
+                    plan_questions_block,
+                    questions_allowed,
+                )
+                _q_allowed = questions_allowed(session_id)
                 _directive = (
                     _directive
                     + current_plan_markdown_for_prompt(session_id)
                     + current_plan_json_for_prompt(session_id)
                     + _PLAN_JSON_TRAILER
+                    + plan_questions_block(_q_allowed)
                 )
 
             # Build the file context string from session files (same shape the
@@ -1434,6 +1450,7 @@ async def smart_stream(req: dict, request: Request):
             _mode_web_search_sources: list = []  # Claude-only (Ask/Plan) — see claude_web_search.py
             _plan_event = None  # plan_ready / plan_updated — set once after persist
             _plan_needs_retry = False
+            _plan_questions = None  # validated clarifying questions, if this turn asked
             # Research-checkbox parity fix: the SAME per-session flag the
             # Edit/Agent "Research" checkbox writes above (top of this
             # function, unconditional on mode) now also drives Ask/Plan's web
@@ -1505,8 +1522,26 @@ async def smart_stream(req: dict, request: Request):
                                         if _plan_event:
                                             yield "data: " + _json.dumps(_plan_event) + "\n\n"
                                     elif parse_implementation_plan(_early) is None:
-                                        _plan_needs_retry = True
-                                        continue
+                                        from services.plan_questions import parse_plan_questions
+                                        _pq = parse_plan_questions(_early)
+                                        if _pq and _q_allowed:
+                                            _plan_questions = _pq
+                                            _dlog("plan_questions_emitted",
+                                                  session_id=session_id,
+                                                  user_id=current_user_id,
+                                                  count=len(_pq))
+                                            yield "data: " + _json.dumps({
+                                                "type": "plan_questions",
+                                                "questions": _pq,
+                                            }) + "\n\n"
+                                        else:
+                                            if _pq or "```plan_questions" in _early:
+                                                _dlog("plan_questions_ignored",
+                                                      session_id=session_id,
+                                                      user_id=current_user_id,
+                                                      reason=("not_allowed" if _pq else "invalid"))
+                                            _plan_needs_retry = True
+                                            continue
                                     else:
                                         _plan_event = _persist_plan_event(_early)
                                         if _plan_event:
@@ -1584,6 +1619,8 @@ async def smart_stream(req: dict, request: Request):
                             _mode_metadata["mode"] = "plan"
                             if _plan_event and _plan_event.get("run_id"):
                                 _mode_metadata["plan_run_id"] = _plan_event["run_id"]
+                            if _plan_questions:
+                                _mode_metadata["plan_questions"] = _plan_questions
                         _mdb.execute(
                             "INSERT INTO chat_messages (id, session_id, role, content, metadata) "
                             "VALUES (?, ?, ?, ?, ?)",

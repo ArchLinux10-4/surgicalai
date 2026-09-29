@@ -122,7 +122,9 @@ def build_grok_ask_plan_reinforcement(mode: str) -> str:
             "before the fence). Those examples are illustrative only."
         )
         plan_json = (
-            " You MUST end with a fenced ```implementation_plan JSON block "
+            " Unless you are asking clarifying questions as allowed in the "
+            "PLAN QUESTIONS section, you MUST end with a fenced "
+            "```implementation_plan JSON block "
             "listing every step as {\"filename\",\"symbol\",\"description\"}. "
             "No edits — the fence is the machine-readable plan only."
         )
