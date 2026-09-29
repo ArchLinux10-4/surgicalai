@@ -407,6 +407,7 @@ parser = ASTParser()
 # ── Per-model max output tokens (verified vs Anthropic docs) ─────────────────
 # 128k-output models. Everything else falls back to 64000 (previous behavior).
 _MODEL_MAX_OUTPUT = {
+    "claude-sonnet-5-5": 128000,
     "claude-sonnet-5": 128000,
     "claude-fable-5": 128000,       # also matches claude-fable-5-1 via prefix
     "claude-opus-5": 128000,        # also matches claude-opus-5-5 via prefix
@@ -1440,13 +1441,13 @@ _THINKING_EXCLUDED_MODELS = ("claude-opus-4-7", "claude-opus-4-8")
 # also matches claude-fable-5-1. Manual type:enabled is a 400 on all of these.
 _ADAPTIVE_THINKING_MODELS = (
     "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
-    "claude-sonnet-4-6", "claude-sonnet-5", "claude-fable-5",
+    "claude-sonnet-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-fable-5",
 )
 
-# Opus 5.5 and Fable 5.1 reject tool_choice type "any"/"tool" with a 400
-# (docs: Migrating to Claude Opus 5.5). Use auto + strict instead.
-# Opus 5 (without -5) still accepts forced tool choice.
-_NO_FORCED_TOOL_CHOICE_MODELS = ("claude-opus-5-5", "claude-fable-5-1")
+# Opus 5.5, Fable 5.1 and Sonnet 5.5 reject tool_choice type "any"/"tool" with
+# a 400 (docs: Migrating to Claude Opus 5.5 / Sonnet 5.5). Use auto + strict
+# instead. Opus 5 and Sonnet 5 (without -5) still accept forced tool choice.
+_NO_FORCED_TOOL_CHOICE_MODELS = ("claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5")
 
 # 4-6 generation models support adaptive thinking and effort, but NOT 'xhigh'.
 # Supported levels: max, high, medium, low.  Sending effort='xhigh' returns 400.
@@ -1641,8 +1642,13 @@ def _uses_adaptive_thinking(model: str) -> bool:
     return _is_claude_model(model) and any(m in model for m in _ADAPTIVE_THINKING_MODELS)
 
 
+_STRICT_UNSUPPORTED_SCHEMA_KEYS = (
+    "minimum", "maximum", "multipleOf", "minLength", "maxLength",
+)
+
+
 def _rejects_forced_tool_choice(model: str) -> bool:
-    """True when the model 400s on tool_choice type any/tool (Opus 5.5, Fable 5.1)."""
+    """True when the model 400s on tool_choice type any/tool (Opus 5.5, Fable 5.1, Sonnet 5.5)."""
     if not model:
         return False
     base = model.strip().lower()
@@ -1652,7 +1658,7 @@ def _rejects_forced_tool_choice(model: str) -> bool:
 def _claude_tool_choice_kwargs(model: str, forced_name: str, tools: list) -> dict:
     """Return tool_choice (+ maybe strict tools) for a Claude call that wants one tool.
 
-    Opus 5.5 / Fable 5.1 reject forced tool_choice; use auto + strict instead.
+    Opus 5.5 / Fable 5.1 / Sonnet 5.5 reject forced tool_choice; use auto + strict instead.
     Every other model keeps the historical forced shape.
     """
     if _rejects_forced_tool_choice(model):
@@ -1674,6 +1680,11 @@ def _claude_tool_choice_kwargs(model: str, forced_name: str, tools: list) -> dic
                 if isinstance(props, dict):
                     new_props = {}
                     for pk, pv in props.items():
+                        if isinstance(pv, dict):
+                            # Strict mode 400s on numeric/length constraints
+                            # (e.g. submit_file_rewrite.confidence min/max).
+                            pv = {k: v for k, v in pv.items()
+                                  if k not in _STRICT_UNSUPPORTED_SCHEMA_KEYS}
                         if isinstance(pv, dict) and pv.get("type") == "object":
                             nested = dict(pv)
                             nested.setdefault("additionalProperties", False)
@@ -10727,7 +10738,7 @@ async def run_qa_agent(
     try:
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _qa_use_claude = True
-        _qa_model = "claude-sonnet-5"  # QA upgraded to Sonnet 5 (better + cheaper than 4.6)
+        _qa_model = "claude-sonnet-5"  # QA upgraded to Sonnet 5
     except Exception as _qa_key_err:
         _qa_aclient = None
         _qa_use_claude = False
@@ -14859,13 +14870,17 @@ USER REQUEST:
                                         }]
                                     _lint_tc_kw = _claude_tool_choice_kwargs(
                                         _lint_surg_model, "fix_lint_errors", _lint_tools)
+                                    _lint_tool_hint = (
+                                        "\n\nReturn your fixes by calling the fix_lint_errors tool. Do not reply with plain text."
+                                        if _lint_tc_kw["tool_choice"]["type"] == "auto" else ""
+                                    )
                                     _lint_fix_resp = await _safe_claude_call(
                                         _lint_fix_client,
                                         model=_lint_surg_model,
                                         desired_text_tokens=8192,
                                         thinking_budget=4000,
                                         retry_on_starve=True,
-                                        messages=[{"role": "user", "content": _lint_user_msg}],
+                                        messages=[{"role": "user", "content": _lint_user_msg + _lint_tool_hint}],
                                         **_lint_tc_kw,
                                     )
                                     for _lblock in _lint_fix_resp.content:

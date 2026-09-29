@@ -54,6 +54,36 @@ def test_rejects_forced_tool_choice_only_for_55_and_fable_51():
     assert h["rejects"]("claude-opus-4-8") is False
     assert h["rejects"]("claude-fable-5") is False
     assert h["rejects"]("claude-sonnet-5") is False
+    assert h["rejects"]("claude-sonnet-5-5") is True
+    assert h["rejects"]("claude-sonnet-5-5-20261001") is True
+
+
+def test_sonnet_55_is_adaptive_128k_and_strict_schema_is_sanitised():
+    h = _load_helpers()
+    assert h["adaptive"]("claude-sonnet-5-5") is True
+    assert h["max_out"]("claude-sonnet-5-5") == 128000
+    tools = [{
+        "name": "submit_file_rewrite",
+        "description": "rewrite",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "new_file_content": {"type": "string"},
+                "confidence": {"type": "integer", "minimum": 1, "maximum": 10},
+            },
+            "required": ["new_file_content", "confidence"],
+        },
+    }]
+    kw = h["tool_kw"]("claude-sonnet-5-5", "submit_file_rewrite", tools)
+    assert kw["tool_choice"] == {"type": "auto"}
+    conf = kw["tools"][0]["input_schema"]["properties"]["confidence"]
+    assert "minimum" not in conf and "maximum" not in conf
+    assert conf["type"] == "integer"
+    # The caller's original tool list must not be mutated.
+    assert tools[0]["input_schema"]["properties"]["confidence"]["minimum"] == 1
+    # Forced models keep their constraints untouched.
+    kw_forced = h["tool_kw"]("claude-sonnet-5", "submit_file_rewrite", tools)
+    assert kw_forced["tools"][0]["input_schema"]["properties"]["confidence"]["minimum"] == 1
 
 
 def test_claude_tool_choice_kwargs_downgrades_to_auto_strict():

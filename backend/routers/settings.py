@@ -231,6 +231,8 @@ def get_available_models(request: Request):
          "description": "Prior Fable — ⚠️ Premium pricing ($10/$50 per M tokens)", "provider": "anthropic", "cost": 4},
         {"id": "claude-opus-4-8", "name": "Claude Opus 4.8", "role": "architect",
          "description": "Complex agentic coding — powerful for multi-file work", "provider": "anthropic", "cost": 4},
+        {"id": "claude-sonnet-5-5", "name": "Claude Sonnet 5.5", "role": "architect",
+         "description": "~30% faster and up to 30% fewer tokens per task than Sonnet 5 — same $2/$10 price", "provider": "anthropic", "cost": 2},
         {"id": "claude-sonnet-5", "name": "Claude Sonnet 5", "role": "architect",
          "description": "Best speed + intelligence balance — recommended for most tasks", "provider": "anthropic", "cost": 2},
         {"id": "claude-opus-4-7", "name": "Claude Opus 4.7", "role": "architect",
