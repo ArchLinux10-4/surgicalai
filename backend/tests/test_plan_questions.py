@@ -215,9 +215,11 @@ def test_malformed_metadata_treated_as_allowed(qdb):
     assert questions_allowed(sid) is True
 
 
-def test_closed_while_plan_implementing(qdb, monkeypatch):
-    monkeypatch.setattr("services.plan_artifact.latest_plan_run",
-                        lambda sid: {"phase": "implementing", "tasks": [], "run_id": "r"})
+def test_closed_while_plan_implementing(qdb):
+    from services.plan_artifact import mark_plan_implementing, persist_plan_from_assistant_text
+    ev = persist_plan_from_assistant_text(qdb["sid"], PLAN_TEXT)
+    assert questions_allowed(qdb["sid"]) is True
+    mark_plan_implementing(qdb["sid"], ev["run_id"])
     assert questions_allowed(qdb["sid"]) is False
 
 
@@ -258,7 +260,7 @@ def stream_env(monkeypatch, tmp_path):
 
     from routers import chat as chat_router
 
-    calls = {"chat_stream": 0, "pipeline": 0, "messages": []}
+    calls = {"chat_stream": 0, "messages": []}
     replies = {"texts": [PLAN_TEXT]}
 
     async def _fake_chat_stream(messages, **kwargs):
@@ -268,15 +270,9 @@ def stream_env(monkeypatch, tmp_path):
         yield 'data: {"type": "token", "content": ' + json.dumps(text) + "}\n\n"
         yield 'data: {"type": "done", "content": "", "model": "grok-4.6"}\n\n'
 
-    async def _fake_pipeline(*a, **k):
-        calls["pipeline"] += 1
-        yield 'data: {"type": "done", "content": ""}\n\n'
-
     monkeypatch.setattr(chat_router, "_resolve_chat_key", lambda uid, provider: "k")
     monkeypatch.setattr(chat_router, "run_chat_stream", _fake_chat_stream)
-    monkeypatch.setattr("services.pipeline.run_natural_pipeline_stream", _fake_pipeline)
-    monkeypatch.setattr("services.pipeline.run_smart_pipeline_stream", _fake_pipeline)
-    monkeypatch.setattr("database.get_setting",
+    monkeypatch.setattr(db, "get_setting",
                         lambda k, d=None: "grok-4.6" if k == "architect_model" else (d if d is not None else ""))
 
     class _Req:
