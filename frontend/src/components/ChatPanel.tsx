@@ -11,6 +11,8 @@ import { SessionFilesTray } from './SessionFilesTray'
 import { PickedElementsTray } from './PickedElementsTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker } from './PlanTracker'
+import { PlanQuestionsCard } from './PlanQuestionsCard'
+import { normalizeQuestions, stripPlanQuestionsFence } from '../lib/planQuestions'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AdsClick, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Lock, Psychology, Search, Security, Send, Warning } from '@mui/icons-material';
@@ -78,7 +80,7 @@ function stripInternalTags(text: string, streaming = false): string {
       .replace(/<search_request>[\s\S]*$/, '')
       .replace(/```(?:implementation_plan|plan-json)[\s\S]*$/, '')
   }
-  return result.trim()
+  return stripPlanQuestionsFence(result, streaming)
 }
 
 // ── Apply All Button — applies every unapplied change across all messages ─────
@@ -555,6 +557,13 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
   // "compaction happened" with no way to audit what it did.
   if (msg.message_type === 'compact_marker') {
     return <CompactMarkerChip msg={msg} />
+  }
+
+  // A clarifying-question turn is often just a fence: the card renders it, so
+  // don't leave an empty assistant bubble behind.
+  if (msg.role === 'assistant' && !msg.message_type && msg.content
+      && /```plan_questions/i.test(msg.content) && !stripInternalTags(msg.content)) {
+    return null
   }
 
   let surgicalResult: SmartResult | null = null
@@ -1284,6 +1293,7 @@ export function ChatPanel() {
     sessionFiles, setSessionFiles, addSessionFile, removeSessionFile,
     agentTasks, setAgentTasks, updateAgentTask, clearAgentTasks, setTaskRunId, setTaskPreamble, setAgentPhase,
     applyPlanEvent, clearPlanTracker, setPlanTasks, setPlanRunId, setPlanPhase,
+    pendingPlanQuestions,
     pendingChatInput, setPendingChatInput,
     pickedElements, clearPickedElements,
     availableModels, refreshModels,
@@ -1292,6 +1302,11 @@ export function ChatPanel() {
   // Keep the agentic task list in sync with Claude's DB-backed progress while a
   // run is active (resilient fallback if the live stream drops mid-run).
   useTaskPolling(activeSessions)
+
+  // A question card belongs to one session; never carry it across a switch.
+  useEffect(() => {
+    useAppStore.getState().clearPendingPlanQuestions()
+  }, [activeSessions])
 
   // Restore Chat Plan tracker on session switch / reload. Own slice — does
   // not read or write agentTasks.
@@ -2062,6 +2077,8 @@ export function ChatPanel() {
     isFirst: boolean,
     autoRename: () => void,
   ) => {
+    // Any send (answers card, typed reply, retry) supersedes an open question card.
+    useAppStore.getState().clearPendingPlanQuestions()
     let accumulated = ''
     let gotResult = false
     let streamModel = ''
@@ -2822,6 +2839,17 @@ export function ChatPanel() {
 
   const hasFiles = sessionFiles.length > 0
 
+  // Clarifying-question card: live SSE event first, else derived from the last
+  // saved message (reload). Plan mode only — answers go out as a Plan turn, so
+  // showing the card in another mode would send them to the wrong pipeline.
+  const lastMessage: any = messages[messages.length - 1]
+  const planQuestionsToShow = (
+    effectiveMode === 'plan' && !isStreaming
+      ? (pendingPlanQuestions
+          ?? (lastMessage?.role === 'assistant' ? normalizeQuestions(lastMessage._plan_questions) : null))
+      : null
+  )
+
   return (
     <div
       className="flex flex-col h-full relative"
@@ -3020,7 +3048,18 @@ export function ChatPanel() {
               </div>
             )}
             <AgentMissionControl />
-            <PlanTracker emptyHint={effectiveMode === 'plan'} />
+            {planQuestionsToShow && (
+              <PlanQuestionsCard
+                key={planQuestionsToShow.map(q => q.id + q.question).join('|')}
+                questions={planQuestionsToShow}
+                onSubmit={(text) => { void handleSend(text) }}
+                canAutoFocus={() => {
+                  const ta = textareaRef.current
+                  return !ta || (!ta.value && document.activeElement !== ta)
+                }}
+              />
+            )}
+            <PlanTracker emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
             {isStreaming && (streamingMessage || streamProgress) && (
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} />
             )}

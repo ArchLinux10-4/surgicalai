@@ -2,6 +2,8 @@ import { create } from 'zustand'
 import type { ChatSession, ChatMessage, FileContent, SurgicalAnalysis, AppSettings, FileNode, PromptTemplate, ImpactAnalysis } from '../types'
 import { api } from '../api/client'
 import { clientLog } from '../lib/clientLog'
+import { normalizeQuestions } from '../lib/planQuestions'
+import type { PlanQuestion } from '../lib/planQuestions'
 
 // Shared across ChatPanel (model picker) and SettingsModal (models tab) so
 // that verifying a new provider key (e.g. Grok) — which happens in
@@ -139,6 +141,11 @@ interface AppState {
   planMarkdown: string
   planTitle: string
   planVersion: number | null
+  // Clarifying questions the Plan agent asked on its last turn (live SSE
+  // event). Reloads derive the same card from the last message's
+  // `_plan_questions`, so this is only the live-stream half.
+  pendingPlanQuestions: PlanQuestion[] | null
+  clearPendingPlanQuestions: () => void
   setPlanTasks: (tasks: import('../types').PlanTask[]) => void
   setPlanRunId: (id: string | null) => void
   setPlanPhase: (phase: import('../types').PlanPhase) => void
@@ -338,6 +345,8 @@ export const useAppStore = create<AppState>((set) => ({
   planMarkdown: '',
   planTitle: 'Plan',
   planVersion: null,
+  pendingPlanQuestions: null,
+  clearPendingPlanQuestions: () => set({ pendingPlanQuestions: null }),
   setPlanTasks: (planTasks) => set({ planTasks }),
   setPlanRunId: (planRunId) => set({ planRunId }),
   setPlanPhase: (planPhase) => set({ planPhase }),
@@ -357,6 +366,10 @@ export const useAppStore = create<AppState>((set) => ({
   applyPlanEvent: (event) => {
     if (!event || typeof event !== 'object') return
     const t = event.type
+    if (t === 'plan_questions') {
+      set({ pendingPlanQuestions: normalizeQuestions(event.questions) })
+      return
+    }
     const docPatch: Record<string, any> = {}
     if (typeof event.markdown === 'string') docPatch.planMarkdown = event.markdown
     if (typeof event.title === 'string' && event.title) docPatch.planTitle = event.title

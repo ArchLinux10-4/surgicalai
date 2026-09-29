@@ -27,6 +27,8 @@ import {
 import { SessionFilesTray } from '../SessionFilesTray'
 import { AgentMissionControl } from '../AgentMissionControl'
 import { PlanTracker } from '../PlanTracker'
+import { PlanQuestionsCard } from '../PlanQuestionsCard'
+import { normalizeQuestions, stripPlanQuestionsFence } from '../../lib/planQuestions'
 import { useTaskPolling } from '../../hooks/useTaskPolling'
 import { VoiceButton } from '../VoiceButton'
 import { useCodeRain } from '../../hooks/useCodeRain'
@@ -107,12 +109,12 @@ function StreamingBubble({ text, progress, isBuildingEdit, thinkingText, isThink
             Preparing code change...
           </div>
         )}
-        {text && (
+        {stripPlanQuestionsFence(text || '', true) && (
           <div className="text-sm text-ink leading-relaxed whitespace-pre-wrap break-words">
-            {text}
+            {stripPlanQuestionsFence(text, true)}
           </div>
         )}
-        {!text && !isBuildingEdit && !thinkingText && !isThinking && (
+        {!stripPlanQuestionsFence(text || '', true) && !isBuildingEdit && !thinkingText && !isThinking && (
           <div className="flex gap-1">
             {[0, 1, 2].map(i => (
               <span key={i} className="w-1.5 h-1.5 rounded-full bg-muted/40 animate-bounce"
@@ -167,6 +169,12 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
     return <CompactMarkerChip msg={msg} />
   }
 
+  // Question-only assistant turn: the card renders it, so skip the empty bubble.
+  if (!isUser && !msg.message_type && msg.content
+      && /```plan_questions/i.test(msg.content) && !stripPlanQuestionsFence(msg.content)) {
+    return null
+  }
+
   let result: SmartResult | null = null
   if (isResult && msg.surgical_data) {
     try { result = JSON.parse(msg.surgical_data) } catch {}
@@ -175,7 +183,7 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
   if (isUser) {
     return (
       <div className="flex justify-end px-4 py-2">
-        <div className="max-w-[82%] bg-overlay/60 border border-border/40 rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm text-ink leading-relaxed">
+        <div className="max-w-[82%] bg-overlay/60 border border-border/40 rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm text-ink leading-relaxed whitespace-pre-wrap break-words">
           {msg.content}
         </div>
       </div>
@@ -200,9 +208,9 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
 
         {/* Natural text — collapse long narratives when Apply cards are present */}
         {msg.content && (() => {
-          const narrative = (msg.content as string)
-            .replace(/```(?:implementation_plan|plan-json)[\s\S]*?```/gi, '')
-            .trim()
+          const narrative = stripPlanQuestionsFence(
+            (msg.content as string).replace(/```(?:implementation_plan|plan-json)[\s\S]*?```/gi, ''),
+          )
           const hasCards = Boolean(result)
           const longNarrative = narrative.length > 280
           const collapseNarrative = hasCards && longNarrative && !narrativeOpen
@@ -490,6 +498,7 @@ export function MobileChatPanel() {
   const setAgentPhase = useAppStore(s => s.setAgentPhase)
   const applyPlanEvent = useAppStore(s => s.applyPlanEvent)
   const clearPlanTracker = useAppStore(s => s.clearPlanTracker)
+  const pendingPlanQuestions = useAppStore(s => s.pendingPlanQuestions)
   const setPlanTasks = useAppStore(s => s.setPlanTasks)
   const setPlanRunId = useAppStore(s => s.setPlanRunId)
   const setPlanPhase = useAppStore(s => s.setPlanPhase)
@@ -497,6 +506,11 @@ export function MobileChatPanel() {
   // Keep the task list in sync with the DB-backed source of truth while a run
   // is active (SSE is the instant channel; polling reconciles after drops).
   useTaskPolling(activeSessions)
+
+  // A question card belongs to one session; never carry it across a switch.
+  useEffect(() => {
+    useAppStore.getState().clearPendingPlanQuestions()
+  }, [activeSessions])
 
   useEffect(() => {
     if (!activeSessions) { clearPlanTracker(); return }
@@ -588,6 +602,15 @@ export function MobileChatPanel() {
   const offline = isOfflineSettings(settings)
   const availableModes: ChatMode[] = offline ? ['edit', 'ask'] : CHAT_MODES
   const effectiveMode = degradeModeForOffline(chatMode, offline)
+  // Clarifying-question card: live SSE event first, else derived from the last
+  // saved message (reload). Plan mode only — answers go out as a Plan turn.
+  const lastMessage: any = messages[messages.length - 1]
+  const planQuestionsToShow = (
+    effectiveMode === 'plan' && !isStreaming
+      ? (pendingPlanQuestions
+          ?? (lastMessage?.role === 'assistant' ? normalizeQuestions(lastMessage._plan_questions) : null))
+      : null
+  )
   const researchAvailable = webResearchAvailableFor(settings, offline)
   const selectChatMode = (m: ChatMode) => {
     setChatMode(m)
@@ -772,16 +795,22 @@ export function MobileChatPanel() {
     return s.id
   }, [activeSessions, setSessions, setActiveSession])
 
-  const handleSend = useCallback(async () => {
-    if (!input.trim() || isStreaming) return
+  const handleSend = useCallback(async (override?: unknown) => {
+    // onClick handlers pass the click event; only a string is answer text.
+    const overrideText = typeof override === 'string' ? override : undefined
+    const sourceText = overrideText ?? input
+    if (!sourceText.trim() || isStreaming) return
     if (!settings?.openai_api_key_set && !(settings as any)?.anthropic_api_key_set) {
       setError('Add an API key in Settings first.')
       return
     }
     setError(null)
-    const text = input.trim()
-    setInput('')
-    if (textareaRef.current) textareaRef.current.style.height = 'auto'
+    const text = sourceText.trim()
+    if (overrideText === undefined) {
+      setInput('')
+      if (textareaRef.current) textareaRef.current.style.height = 'auto'
+    }
+    useAppStore.getState().clearPendingPlanQuestions()
 
     const sessionId = await ensureSession()
     const isFirst   = messages.length === 0
@@ -1502,7 +1531,18 @@ export function MobileChatPanel() {
               />
             ))}
             <AgentMissionControl />
-            <PlanTracker emptyHint={effectiveMode === 'plan'} />
+            {planQuestionsToShow && (
+              <PlanQuestionsCard
+                key={planQuestionsToShow.map(q => q.id + q.question).join('|')}
+                questions={planQuestionsToShow}
+                onSubmit={(text) => { void handleSend(text) }}
+                canAutoFocus={() => {
+                  const ta = textareaRef.current
+                  return !ta || (!ta.value && document.activeElement !== ta)
+                }}
+              />
+            )}
+            <PlanTracker emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
             {resumableRun && resumableRun.sid === activeSessions && !isStreaming && (
               <div className="mx-3 mb-2 flex items-center justify-between gap-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5">
                 <span className="text-[12px] text-ink leading-snug">
