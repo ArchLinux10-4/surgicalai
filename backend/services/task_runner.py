@@ -491,16 +491,19 @@ async def _run_integration_qa(session_id: str, run_id: str, user_id: str):
                 lines.append(f"Result:\n{summary[:800]}")
         user_block = "\n".join(lines)
 
+        from services.pipeline import _safe_claude_call_refusal_fallback
         from services.task_planner import _get_anthropic_key
         from anthropic import AsyncAnthropic
         client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
-        resp = await client.messages.create(
+        # Sonnet 5.5 thinks by default and thinking shares max_tokens, so a raw
+        # messages.create can return zero text (proven in run dd543a3a) which
+        # would parse to {} and default to a false "pass". The safe wrapper
+        # budgets thinking headroom, retries starvation, and falls back to the
+        # previous Sonnet if the safeguard classifiers decline.
+        resp = await _safe_claude_call_refusal_fallback(
+            client,
             model="claude-sonnet-5-5",  # QA is always Sonnet 5.5 (matches pipeline QA sites)
-            # 1000 → 4000: proven in run dd543a3a (pipeline QA, same model) that
-            # a small budget can be fully consumed by a thinking block, leaving
-            # zero text blocks. Here that would have parsed to {} and defaulted
-            # the verdict to "pass" — a false green light.
-            max_tokens=4000,
+            desired_text_tokens=4000,
             system=_INTEGRATION_QA_SYSTEM,
             messages=[{"role": "user", "content": user_block}],
         )

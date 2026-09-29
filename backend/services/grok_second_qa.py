@@ -229,15 +229,28 @@ async def run_grok_second_qa_pass(
             f"FIRST-PASS QA SUMMARY: {qa_result.get('summary', '(none)')}"
         )
 
-        from services.pipeline import _get_anthropic_key  # reuse existing key resolver
+        from services.pipeline import (  # reuse existing key resolver + safe call
+            _get_anthropic_key,
+            _safe_claude_call_refusal_fallback,
+        )
 
         client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
-        resp = await client.messages.create(
+        # Thinking shares max_tokens on Sonnet 5.5; the safe wrapper budgets
+        # headroom for it, retries starvation, and falls back to the previous
+        # Sonnet on a safeguard refusal.
+        resp = await _safe_claude_call_refusal_fallback(
+            client,
             model=_SECOND_QA_MODEL,
-            max_tokens=2000,
+            desired_text_tokens=2000,
             system=_COVE_SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
         )
+        if getattr(resp, "stop_reason", None) == "refusal":
+            # Fail open, but don't record a "confirmed safe" the model never gave.
+            _dlog("grok_second_qa_refused",
+                  session_id=session_id, user_id=user_id, filename=filename,
+                  symbol_path=symbol_path)
+            return qa_result
         raw_text = "".join(
             block.text for block in resp.content if getattr(block, "type", "") == "text"
         )
