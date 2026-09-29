@@ -7903,7 +7903,7 @@ async def run_qa_for_changes(
         raw_text = ""
         try:
             aclient = AsyncAnthropic(api_key=anthropic_key)
-            _qa_model_legacy = "claude-sonnet-5"
+            _qa_model_legacy = "claude-sonnet-5-5"
             _dlog("qa_for_changes_call_config", model=_qa_model_legacy,
                   wrapper="safe_claude_call")
             response = await _safe_claude_call(
@@ -9924,7 +9924,7 @@ async def _run_qa_for_new_file(file_result: dict, codebase_context: str, user_id
     try:
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _use_claude = True
-        _model = "claude-sonnet-5"  # QA upgraded to Sonnet 5
+        _model = "claude-sonnet-5-5"  # QA runs on Sonnet 5.5 (faster, fewer tokens per task)
     except Exception as _qc_key_err:
         _qa_aclient = None
         _use_claude = False
@@ -10738,7 +10738,7 @@ async def run_qa_agent(
     try:
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _qa_use_claude = True
-        _qa_model = "claude-sonnet-5"  # QA upgraded to Sonnet 5
+        _qa_model = "claude-sonnet-5-5"  # QA runs on Sonnet 5.5 (faster, fewer tokens per task)
     except Exception as _qa_key_err:
         _qa_aclient = None
         _qa_use_claude = False

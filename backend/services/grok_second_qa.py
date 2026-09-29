@@ -52,7 +52,7 @@ def _dlog(event: str, **kwargs):
         pass  # Never let logging break this pass
 
 
-_SECOND_QA_MODEL = "claude-sonnet-5"
+_SECOND_QA_MODEL = "claude-sonnet-5-5"
 
 _COVE_SYSTEM_PROMPT = """You are a second, independent code-verification pass. \
 A first QA review already scored this change safe (8/10 or higher). Your job \

@@ -495,7 +495,7 @@ async def _run_integration_qa(session_id: str, run_id: str, user_id: str):
         from anthropic import AsyncAnthropic
         client = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         resp = await client.messages.create(
-            model="claude-sonnet-5",  # QA is always Sonnet (upgraded from 4.5, matches pipeline QA sites)
+            model="claude-sonnet-5-5",  # QA is always Sonnet 5.5 (matches pipeline QA sites)
             # 1000 → 4000: proven in run dd543a3a (pipeline QA, same model) that
             # a small budget can be fully consumed by a thinking block, leaving
             # zero text blocks. Here that would have parsed to {} and defaulted
