@@ -14,7 +14,7 @@ Surgical, AST-aware code edits, multi-step autonomous agent runs, a fully offlin
 - **Whole-file rewrite** — used automatically when Offline Mode is active (see below).
 
 ### Models
-- Cloud: Claude (Sonnet 5, Opus, Haiku) and OpenAI (GPT-5.x family, o-series, GPT-4.1) — bring your own API key, stored encrypted in your local database (never in a cloud secret store).
+- Cloud: Claude (Sonnet 5.5, Sonnet 5, Opus, Haiku) and OpenAI (GPT-5.x family, o-series, GPT-4.1) — bring your own API key, stored encrypted in your local database (never in a cloud secret store).
 - **Offline Mode** — run entirely without a cloud API key using **Ollama + Qwen2.5-Coder:7b**. Fully isolated codebase (`backend/services/offline/`) that never touches the Claude/OpenAI pipeline; falls back automatically only when no cloud key is configured. Scoped deliberately to **plain chat + whole-file rewrite** — agent mode, tool-calling, and diff-style edits are evidence-backed as unreliable at the 7B scale and are intentionally not attempted offline.
 
 ### Multi-language AST support

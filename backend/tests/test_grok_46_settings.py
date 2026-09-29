@@ -68,6 +68,9 @@ def test_settings_lists_all_grok_models_at_cost_tier_2():
     assert by_id["claude-opus-5"]["cost"] == 4
     assert by_id["claude-opus-4-8"]["cost"] == 4
     assert by_id["claude-sonnet-5"]["cost"] == 2
+    assert by_id["claude-sonnet-5-5"]["cost"] == 2
+    assert by_id["claude-sonnet-5-5"]["provider"] == "anthropic"
+    assert src.index('"id": "claude-sonnet-5-5"') < src.index('"id": "claude-sonnet-5"')
     assert by_id["claude-haiku-4-5"]["cost"] == 1
     assert "$2/$6" in src
     # Relative: Grok is cheaper than premium Opus (cost 4), same as Sonnet (2),
