@@ -366,6 +366,22 @@ export const useAppStore = create<AppState>((set) => ({
   applyPlanEvent: (event) => {
     if (!event || typeof event !== 'object') return
     const t = event.type
+    if (t === 'plan_step' && event.task_id) {
+      set((s) => {
+        const planTasks = s.planTasks.map((task) =>
+          task.id === event.task_id
+            ? { ...task, status: event.status || task.status }
+            : task,
+        )
+        const implementing = planTasks.some((task) => task.status === 'running')
+        return {
+          planTasks,
+          planRunId: event.run_id || s.planRunId,
+          planPhase: implementing ? 'implementing' : s.planPhase,
+        }
+      })
+      return
+    }
     if (t === 'plan_questions') {
       set({ pendingPlanQuestions: normalizeQuestions(event.questions) })
       return

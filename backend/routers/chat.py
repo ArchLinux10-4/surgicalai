@@ -1071,13 +1071,12 @@ async def implement_plan(body: dict, request: Request):
     from services.plan_artifact import (
         latest_plan_run,
         forced_edit_plan_from_run,
-        mark_plan_implementing,
         compute_plan_coverage,
         apply_coverage_to_run,
         serialize_plan_task,
         plan_run_phase,
-        load_session_plan,
-        current_plan_markdown_for_prompt,
+        plan_build_user_request,
+        activate_first_plan_step,
     )
 
     session_id = (body or {}).get("session_id") or ""
@@ -1132,16 +1131,8 @@ async def implement_plan(body: dict, request: Request):
     if not session_files:
         raise HTTPException(status_code=400, detail="Session has no files to implement against")
 
-    mark_plan_implementing(session_id, run_id)
-    _plan_md = current_plan_markdown_for_prompt(session_id) or ""
-    if not _plan_md:
-        _doc = load_session_plan(session_id)
-        if _doc and (_doc.get("markdown") or "").strip():
-            _plan_md = "\n\n## Current session plan\n\n" + (_doc["markdown"] or "")
-    user_request = (
-        (_plan_md + "\n\n" if _plan_md else "")
-        + "Implement the attached implementation_plan steps exactly."
-    )
+    user_request = plan_build_user_request(session_id, plan_steps)
+    _activated = activate_first_plan_step(session_id, run_id)
 
     async def stream_implement():
         import json as _json
@@ -1152,7 +1143,7 @@ async def implement_plan(body: dict, request: Request):
                 "type": "plan_updated",
                 "run_id": run_id,
                 "phase": "implementing",
-                "tasks": [serialize_plan_task(t) for t in mark_plan_implementing(session_id, run_id)],
+                "tasks": [serialize_plan_task(t) for t in _activated],
             }) + "\n\n"
             async for chunk in _with_heartbeat_propagate(run_natural_pipeline_stream(
                 session_files=session_files,
@@ -1164,6 +1155,7 @@ async def implement_plan(body: dict, request: Request):
                 user_id=current_user_id,
                 client_inbox=getattr(request.state, "client_inbox", None),
                 forced_edit_plan=plan_steps,
+                plan_run_id=run_id,
             )):
                 if chunk.startswith("data: "):
                     try:
@@ -1880,6 +1872,25 @@ async def smart_stream(req: dict, request: Request):
                 _dlog("single_pass_web_research_flag", session_id=session_id,
                       user_id=current_user_id,
                       web_search_enabled=_pipe_kwargs["web_search_enabled"])
+                from services.plan_artifact import (
+                    message_requests_plan_build,
+                    build_saved_plan,
+                    activate_first_plan_step,
+                    serialize_plan_task,
+                )
+                if mode == "edit" and message_requests_plan_build(message):
+                    _built = build_saved_plan(session_id)
+                    if _built:
+                        _pipe_kwargs["user_request"] = _built["user_request"]
+                        _pipe_kwargs["forced_edit_plan"] = _built["steps"]
+                        _pipe_kwargs["plan_run_id"] = _built["run_id"]
+                        _activated = activate_first_plan_step(session_id, _built["run_id"])
+                        yield "data: " + _json.dumps({
+                            "type": "plan_updated",
+                            "run_id": _built["run_id"],
+                            "phase": "implementing",
+                            "tasks": [serialize_plan_task(t) for t in _activated],
+                        }) + "\n\n"
             async for chunk in _with_heartbeat(_pipeline(**_pipe_kwargs)):
                 if chunk.startswith("data: "):
                     try:

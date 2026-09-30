@@ -271,10 +271,12 @@ def test_plan_markdown_injected_outside_history_cap(plan_db):
 
 def test_implement_request_includes_saved_markdown():
     import inspect
+    from services.plan_artifact import plan_build_user_request
     from routers import chat as chat_router
-    src = inspect.getsource(chat_router.implement_plan)
+    src = inspect.getsource(plan_build_user_request)
     assert "current_plan_markdown_for_prompt" in src
     assert "Implement the attached implementation_plan steps exactly." in src
+    assert "plan_build_user_request" in inspect.getsource(chat_router.implement_plan)
 
 
 def test_get_active_plan_foreign_user_forbidden(plan_db):
