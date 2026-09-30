@@ -1464,14 +1464,7 @@ export function ChatPanel() {
   const effectiveMode: ChatMode = isOffline
     ? (chatMode === 'agent' ? 'edit' : chatMode === 'plan' ? 'ask' : chatMode)
     : chatMode
-  // Ask/Plan file-search & lookup tools are Claude-only today (backend gate:
-  // `_ask_plan_tools_enabled = bool(session_files) and _is_claude_model(...)`
-  // in pipeline.py). If the current architect model is GPT while the user is
-  // in Ask or Plan mode, flag it — the run will still work but silently
-  // degrades to a 300-line file preview instead of real search/lookup.
   const currentModelProvider = availableModels.find(m => m.id === settings?.architect_model)?.provider
-  const searchToolsUnavailableForCurrentModel =
-    (effectiveMode === 'ask' || effectiveMode === 'plan') && currentModelProvider === 'openai'
   // Agent mode (multi-agent task pipeline) is Claude-only today (backend gate:
   // `_is_claude = _arch_model.startswith("claude-")` in chat.py). Unlike
   // Ask/Plan, GPT doesn't just lose a feature here — the whole run silently
@@ -2904,12 +2897,10 @@ export function ChatPanel() {
               title={
                 agentRequiresClaudeForCurrentModel
                   ? `${settings?.architect_model || 'claude-sonnet-4-6'} — Agent Mode requires a Claude model. This will silently run as a normal single-pass edit instead of multi-agent tasks.`
-                  : searchToolsUnavailableForCurrentModel
-                    ? `${settings?.architect_model || 'claude-sonnet-4-6'} — file search/lookup tools are Claude-only in ${MODE_META[effectiveMode].label} mode. This model will use a basic file preview instead.`
-                    : 'Change model'
+                  : 'Change model'
               }
             >
-              {(searchToolsUnavailableForCurrentModel || agentRequiresClaudeForCurrentModel) && (
+              {agentRequiresClaudeForCurrentModel && (
                 <Warning sx={{ fontSize: 11 }} className="text-warning" />
               )}
               {settings?.architect_model || 'claude-sonnet-4-6'}
@@ -2919,11 +2910,6 @@ export function ChatPanel() {
               <>
                 <div className="fixed inset-0 z-40" onClick={() => setModelPickerOpen(false)} />
                 <div className="absolute right-0 top-full mt-1 z-50 bg-surface border border-border rounded-lg shadow-xl py-1 min-w-[220px] max-h-[300px] overflow-y-auto">
-                  {(effectiveMode === 'ask' || effectiveMode === 'plan') && (
-                    <div className="px-3 py-1.5 mb-1 border-b border-border/60 text-[10px] text-muted/80 leading-snug">
-                      File search &amp; lookup tools work with Claude models only in {MODE_META[effectiveMode].label} mode.
-                    </div>
-                  )}
                   {effectiveMode === 'agent' && (
                     <div className="px-3 py-1.5 mb-1 border-b border-border/60 text-[10px] text-muted/80 leading-snug">
                       Agent Mode (multi-agent task breakdown) works with Claude models only.
@@ -2931,11 +2917,9 @@ export function ChatPanel() {
                   )}
                   {availableModels.filter(m => m.role === 'architect').map(m => {
                     const isGpt = m.provider === 'openai'
-                    const locked = isGpt && (effectiveMode === 'ask' || effectiveMode === 'plan' || effectiveMode === 'agent')
-                    const lockLabel = effectiveMode === 'agent' ? 'Needs Claude' : 'No search'
-                    const lockTitle = effectiveMode === 'agent'
-                      ? `Agent Mode requires a Claude model. Selecting ${m.id} would silently run as a normal single-pass edit instead of multi-agent tasks.`
-                      : `File search & lookup tools are Claude-only in ${MODE_META[effectiveMode].label} mode. ${m.id} would fall back to a basic file preview — not recommended.`
+                    const locked = isGpt && effectiveMode === 'agent'
+                    const lockLabel = 'Needs Claude'
+                    const lockTitle = `Agent Mode requires a Claude model. Selecting ${m.id} would silently run as a normal single-pass edit instead of multi-agent tasks.`
                     return (
                       <button
                         key={m.id}
