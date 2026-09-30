@@ -2,7 +2,7 @@
 Project memory, prompt templates, impact analysis, multi-file surgical.
 """
 import uuid
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from models.schemas import (
     ProjectMemory,
@@ -52,6 +52,57 @@ def save_memory(req: ProjectMemory):
             )
         conn.commit()
     return {"ok": True}
+
+# ─── Per-user memory (private; not the team global note) ──────────────────────
+
+def _memory_user_id(request: Request) -> str:
+    user_id = getattr(request.state, "user_id", "") or ""
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return user_id
+
+
+@router.get("/memory/user")
+def get_user_memory(request: Request):
+    user_id = _memory_user_id(request)
+    with get_db_ctx() as conn:
+        row = conn.execute(
+            "SELECT content, enabled FROM user_memory WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+    if not row:
+        return {"content": "", "enabled": True}
+    return {"content": row["content"] or "", "enabled": bool(row["enabled"])}
+
+
+@router.delete("/memory/user")
+def clear_user_memory(request: Request):
+    user_id = _memory_user_id(request)
+    with get_db_ctx() as conn:
+        conn.execute(
+            "UPDATE user_memory SET content = '', updated_at = CURRENT_TIMESTAMP WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.commit()
+    return {"ok": True}
+
+
+@router.post("/memory/user/enabled")
+async def set_user_memory_enabled(request: Request):
+    user_id = _memory_user_id(request)
+    payload = await request.json()
+    enabled = 1 if bool(payload.get("enabled")) else 0
+    with get_db_ctx() as conn:
+        conn.execute(
+            "INSERT INTO user_memory (user_id, content, enabled, updated_at) "
+            "VALUES (?, '', ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(user_id) DO UPDATE SET enabled = excluded.enabled, "
+            "updated_at = CURRENT_TIMESTAMP",
+            (user_id, enabled),
+        )
+        conn.commit()
+    return {"ok": True, "enabled": bool(enabled)}
+
 
 # ─── Global Project Memory (team-wide, injected into every prompt) ────────────
 

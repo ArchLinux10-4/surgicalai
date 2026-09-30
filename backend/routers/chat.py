@@ -793,6 +793,8 @@ def send_message(req: ChatRequest, request: Request):
 
         # Global (team-wide) memory + per-session memory, both injected every prompt
         project_memory = _load_effective_memory(conn, workspace)
+        from services.user_memory import attach_user_memory
+        project_memory = attach_user_memory(project_memory, user_id, workspace, req.message)
 
         conn.commit()
 
@@ -872,6 +874,8 @@ async def stream_message(req: ChatRequest, request: Request):
 
         # Global (team-wide) memory + per-session memory, both injected every prompt
         project_memory = _load_effective_memory(conn, workspace)
+        from services.user_memory import attach_user_memory
+        project_memory = attach_user_memory(project_memory, user_id, workspace, req.message)
 
         conn.commit()
 
@@ -1126,6 +1130,8 @@ async def implement_plan(body: dict, request: Request):
         ).fetchall()
         session_files = [dict(r) for r in file_rows]
         project_memory = _load_effective_memory(conn, session_id)
+        from services.user_memory import attach_user_memory
+        project_memory = attach_user_memory(project_memory, current_user_id, session_id, "")
         conn.commit()
 
     if not session_files:
@@ -1333,6 +1339,8 @@ async def smart_stream(req: dict, request: Request):
 
         # Project memory — GLOBAL team conventions (every prompt) + any per-session memory
         project_memory = _load_effective_memory(conn, session_id)
+        from services.user_memory import attach_user_memory
+        project_memory = attach_user_memory(project_memory, current_user_id, session_id, message)
 
         conn.commit()
 
@@ -1624,6 +1632,8 @@ async def smart_stream(req: dict, request: Request):
                             (session_id,)
                         )
                         _mdb.commit()
+                        from services.user_memory import schedule_memory_update
+                        schedule_memory_update(current_user_id, session_id, message, _mode_text)
                 except Exception as _se:
                     _dlog("sse_mode_save_error", session_id=session_id,
                           user_id=current_user_id, mode=mode, error=str(_se))
@@ -1971,6 +1981,9 @@ async def smart_stream(req: dict, request: Request):
                                 )
                                 db.commit()
                                 _saved = True
+                                if chunk_type == "done" and (natural_text or "").strip():
+                                    from services.user_memory import schedule_memory_update
+                                    schedule_memory_update(current_user_id, session_id, message, natural_text)
                     except Exception as _save_err:
                         print(f"[STREAM] DB save failed: {_save_err}")
                 yield chunk
@@ -2388,6 +2401,8 @@ async def execute_task(req: dict, request: Request):
         ).fetchall()
         session_files = [dict(r) for r in file_rows]
         project_memory = _load_effective_memory(conn, session_id)
+        from services.user_memory import attach_user_memory
+        project_memory = attach_user_memory(project_memory, current_user_id, session_id, "")
 
     async def stream_one_task():
         _t0 = time.time()
@@ -3155,6 +3170,8 @@ async def resume_credit_pause(pause_id: str, request: Request):
         ).fetchall()
         session_files = [dict(r) for r in file_rows]
         project_memory = _load_effective_memory(conn, session_id)
+        from services.user_memory import attach_user_memory
+        project_memory = attach_user_memory(project_memory, current_user_id, session_id, "")
         conn.commit()
 
     if not session_files:
