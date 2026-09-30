@@ -423,6 +423,14 @@ def _init_sqlite():
         )
     """)
     cur.execute("""
+        CREATE TABLE IF NOT EXISTS user_memory (
+            user_id TEXT PRIMARY KEY,
+            content TEXT NOT NULL DEFAULT '',
+            enabled INTEGER NOT NULL DEFAULT 1,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS prompt_templates (
             id TEXT PRIMARY KEY,
             name TEXT NOT NULL,
@@ -801,6 +809,14 @@ def _init_postgres():
                 id TEXT PRIMARY KEY,
                 workspace_path TEXT NOT NULL,
                 content TEXT NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_memory (
+                user_id TEXT PRIMARY KEY,
+                content TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)

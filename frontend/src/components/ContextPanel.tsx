@@ -10,6 +10,8 @@ export function ContextPanel() {
   const [saving, setSaving] = useState(false)
   const [saveDone, setSaveDone] = useState(false)
   const [presets, setPresets] = useState<MemoryPreset[]>([])
+  const [userMemory, setUserMemory] = useState('')
+  const [userMemoryEnabled, setUserMemoryEnabled] = useState(true)
 
   // Global memory + the shared preset library load once — they are team-wide,
   // not tied to any single chat session.
@@ -18,6 +20,10 @@ export function ContextPanel() {
       setMemory(m.content); setSavedMemory(m.content)
     }).catch(() => {})
     api.context.getMemoryPresets().then(setPresets).catch(() => {})
+    api.context.getUserMemory().then((m) => {
+      setUserMemory(m.content || '')
+      setUserMemoryEnabled(m.enabled !== false)
+    }).catch(() => {})
   }, [])
 
   const saveMemory = async () => {
@@ -108,6 +114,40 @@ export function ContextPanel() {
         >
           {saveDone ? <><Check sx={{ fontSize: 12 }} /> Saved!</> : <><Save sx={{ fontSize: 12 }} /> Save Memory</>}
         </button>
+        <div className="mt-3 rounded-lg border border-border p-2.5 flex flex-col gap-2">
+          <div className="text-[11px] font-semibold text-ink">Your memory</div>
+          <p className="text-[11px] text-muted leading-relaxed">
+            Private to this account. Built from your chats. Not shared with the team.
+          </p>
+          <label className="flex items-center gap-2 text-[11px] text-ink">
+            <input
+              type="checkbox"
+              checked={userMemoryEnabled}
+              onChange={(e) => {
+                const next = e.target.checked
+                setUserMemoryEnabled(next)
+                api.context.setUserMemoryEnabled(next).catch(() => setUserMemoryEnabled(!next))
+              }}
+            />
+            Use this memory in new chats
+          </label>
+          {userMemory.trim() ? (
+            <pre className="text-[11px] text-ink whitespace-pre-wrap font-mono leading-relaxed max-h-40 overflow-y-auto">{userMemory}</pre>
+          ) : (
+            <p className="text-[11px] text-muted">Nothing remembered yet.</p>
+          )}
+          <button
+            type="button"
+            onClick={() => {
+              api.context.clearUserMemory().then(() => setUserMemory('')).catch((e: any) => {
+                toast.error('Clear failed', e.message)
+              })
+            }}
+            className="self-start text-[11px] font-semibold px-2 py-1 rounded-lg border border-border text-muted hover:text-ink"
+          >
+            Clear
+          </button>
+        </div>
       </div>
     </div>
   )
