@@ -164,11 +164,13 @@ export function PlanTracker({ emptyHint = false }: { emptyHint?: boolean } = {})
           )}
           {canImplement && (
             <button
+              type="button"
               onClick={implement}
               disabled={busy}
-              className="text-[11px] font-semibold px-2.5 py-1 rounded-lg bg-accent/15 text-accent border border-accent/30 hover:bg-accent/25 disabled:opacity-50"
+              title="Build the saved plan in Edit mode"
+              className="text-[12px] font-semibold px-3 py-1.5 rounded-lg bg-accent/15 text-accent border border-accent/30 hover:bg-accent/25 disabled:opacity-50"
             >
-              {busy ? 'Implementing…' : 'Implement this plan'}
+              {busy ? 'Building…' : 'Build from plan'}
             </button>
           )}
         </div>
