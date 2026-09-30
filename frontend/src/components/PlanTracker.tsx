@@ -29,7 +29,7 @@ function StatusDot({ status }: { status: AgentTaskStatus }) {
 }
 
 function phaseLabel(phase: PlanPhase, done: number, total: number) {
-  if (phase === 'implementing') return `Implementing — ${done}/${total}`
+  if (phase === 'implementing') return `Working — ${done} of ${total} done`
   if (phase === 'complete') return `Complete — ${total} of ${total}`
   if (phase === 'blocked') return `Blocked — ${done}/${total} covered`
   if (phase === 'ready') return `Ready — ${total} step${total !== 1 ? 's' : ''}`
@@ -92,7 +92,6 @@ export function PlanTracker({ emptyHint = false }: { emptyHint?: boolean } = {})
   const implement = () => {
     if (!activeSessions || !planRunId || busy) return
     setBusy(true)
-    applyPlanEvent({ type: 'plan_updated', run_id: planRunId, phase: 'implementing', tasks: planTasks.map(t => ({ ...t, status: t.status === 'pending' ? 'running' : t.status })) })
     api.stream.implementPlan(
       activeSessions,
       planRunId,
@@ -213,6 +212,9 @@ export function PlanTracker({ emptyHint = false }: { emptyHint?: boolean } = {})
                   </div>
                   {t.detail && (
                     <div className="text-[11px] text-muted/80 mt-0.5 leading-snug">{t.detail}</div>
+                  )}
+                  {t.status === 'running' && (
+                    <div className="text-[11px] text-accent mt-0.5">Working on this</div>
                   )}
                   {t.status === 'blocked' && (
                     <div className="text-[11px] text-danger/90 mt-0.5">

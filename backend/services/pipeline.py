@@ -17251,6 +17251,7 @@ async def run_natural_pipeline_stream(
     resume_held_grok_writes: list = None,
     resume_file_content_snapshot: dict = None,
     resume_pause_id: str = None,
+    plan_run_id: str = None,
 ):
     """
     Natural conversation pipeline — Claude talks like Claude.
@@ -20547,6 +20548,39 @@ async def run_natural_pipeline_stream(
                       for k, v in _grouped_plan.items() if len(v) > 1
                   ],
                   pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
+
+            def _plan_step_event(filename: str, symbol: str, status: str):
+                if not plan_run_id or not filename or not symbol:
+                    return None
+                from services.plan_artifact import note_plan_step
+                task = note_plan_step(session_id, plan_run_id, filename, symbol, status)
+                if not task:
+                    return None
+                return sse({
+                    "type": "plan_step",
+                    "run_id": plan_run_id,
+                    "task_id": task["id"],
+                    "status": status,
+                    "filename": filename,
+                    "symbol": symbol,
+                })
+
+            def _advance_plan_step_event():
+                if not plan_run_id:
+                    return None
+                from services.plan_artifact import mark_next_plan_step_running
+                nxt = mark_next_plan_step_running(session_id, plan_run_id)
+                if not nxt:
+                    return None
+                return sse({
+                    "type": "plan_step",
+                    "run_id": plan_run_id,
+                    "task_id": nxt["id"],
+                    "status": "running",
+                    "filename": nxt.get("filename") or "",
+                    "symbol": nxt.get("symbol") or "",
+                })
+
             yield sse({"type": "progress",
                        "content": f"Executing {len(_effective_plan)} planned edit(s)..."})
             for plan_idx, plan_item in enumerate(_effective_plan):
@@ -20591,6 +20625,12 @@ async def run_natural_pipeline_stream(
                         "symbol": p_symbol,
                         "reason": f"File not found in session: {p_filename}",
                     })
+                    _ev = _plan_step_event(p_filename, p_symbol, "blocked")
+                    if _ev:
+                        yield _ev
+                    _adv = _advance_plan_step_event()
+                    if _adv:
+                        yield _adv
                     continue
 
                 p_smap = symbol_maps_by_name.get(p_filename, (None, None))[0]
@@ -20672,6 +20712,9 @@ async def run_natural_pipeline_stream(
 
                 yield sse({"type": "progress",
                            "content": f"Editing {p_symbol} in {p_filename} ({plan_idx+1}/{len(edit_plan_data)})..."})
+                _ev = _plan_step_event(p_filename, p_symbol, "running")
+                if _ev:
+                    yield _ev
 
                 try:
                     # Run the edit as a task so we can emit progress heartbeats
@@ -20741,6 +20784,12 @@ async def run_natural_pipeline_stream(
                         edit_blocks_raw.append(result_raw)
                         yield sse({"type": "progress",
                                    "content": f"✅ {p_symbol} complete"})
+                        _ev = _plan_step_event(p_filename, p_symbol, "done")
+                        if _ev:
+                            yield _ev
+                        _adv = _advance_plan_step_event()
+                        if _adv:
+                            yield _adv
 
                         # ── Chain same-file edits ──────────────────────
                         # When multiple edits target the same file, each
@@ -20881,6 +20930,12 @@ async def run_natural_pipeline_stream(
                         })
                         yield sse({"type": "progress",
                                    "content": f"⚠️ {p_symbol} — no edit produced"})
+                        _ev = _plan_step_event(p_filename, p_symbol, "blocked")
+                        if _ev:
+                            yield _ev
+                        _adv = _advance_plan_step_event()
+                        if _adv:
+                            yield _adv
 
                 except _AnthropicCreditExhaustedError as _cred_err:
                     # Session cb380321: pause + persist remaining work instead of

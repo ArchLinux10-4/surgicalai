@@ -487,6 +487,111 @@ def forced_edit_plan_from_run(session_id: str, run_id: str) -> list[dict]:
     return plan
 
 
+_BUILD_RE = re.compile(
+    r"\b(?:build|implement|execute|carry out)\b(?:\s+\w+){0,4}\s+\bplan\b",
+    re.IGNORECASE,
+)
+_BUILD_NEG_RE = re.compile(
+    r"\b(?:don't|do not|never)\b.{0,40}\b(?:build|implement|execute)\b",
+    re.IGNORECASE,
+)
+
+
+def message_requests_plan_build(text: str) -> bool:
+    """True for 'build the plan' / 'implement this plan' / 'build off the plan'.
+    Search, not full match: the Edit path prepends a file-attachment hint."""
+    raw = text or ""
+    if _BUILD_NEG_RE.search(raw):
+        return False
+    return _BUILD_RE.search(raw) is not None
+
+
+def plan_build_user_request(session_id: str, steps: list[dict]) -> str:
+    """Authoritative plan text. Not passed through the 4000-char history trim."""
+    md = current_plan_markdown_for_prompt(session_id)
+    checklist = json.dumps({"steps": steps}, indent=2)
+    return (
+        (md + "\n\n" if md else "")
+        + "Saved implementation checklist (execute every step; this list is authoritative):\n"
+        + checklist
+        + "\n\nImplement the attached implementation_plan steps exactly. "
+        + "Do not invent a different plan and do not emit an implementation_plan fence."
+    )
+
+
+def build_saved_plan(session_id: str) -> dict | None:
+    """None unless the latest plan phase is ready or blocked and has steps."""
+    latest = latest_plan_run(session_id)
+    if not latest or latest.get("phase") not in ("ready", "blocked"):
+        return None
+    steps = forced_edit_plan_from_run(session_id, latest["run_id"])
+    if not steps:
+        return None
+    return {
+        "run_id": latest["run_id"],
+        "steps": steps,
+        "user_request": plan_build_user_request(session_id, steps),
+    }
+
+
+def _plan_tasks(session_id: str, run_id: str) -> list[dict]:
+    tasks = [t for t in list_tasks(session_id, run_id) if (t.get("source") or "") == "plan"]
+    tasks.sort(key=lambda t: t.get("seq") or 0)
+    return tasks
+
+
+def _find_plan_task(session_id: str, run_id: str, filename: str, symbol: str) -> dict | None:
+    want = _norm_key(filename, symbol)
+    for t in _plan_tasks(session_id, run_id):
+        if _norm_key(t.get("filename") or "", t.get("symbol") or "") == want:
+            return t
+    return None
+
+
+def activate_first_plan_step(session_id: str, run_id: str) -> list[dict]:
+    """Mark only the first pending/blocked step running. Returns all plan tasks."""
+    tasks = _plan_tasks(session_id, run_id)
+    for t in tasks:
+        if (t.get("status") or "") in ("pending", "blocked"):
+            update_task(t["id"], status="running", result_summary="")
+            t["status"] = "running"
+            t["result_summary"] = ""
+            break
+    return tasks
+
+
+def note_plan_step(session_id: str, run_id: str, filename: str, symbol: str, status: str) -> dict | None:
+    """Set one plan task to running, done, or blocked. None if no matching row."""
+    if status not in ("running", "done", "blocked"):
+        return None
+    task = _find_plan_task(session_id, run_id, filename, symbol)
+    if not task:
+        return None
+    fields = {"status": status}
+    if status == "done":
+        fields["verdict"] = "edited"
+    elif status == "blocked":
+        fields["verdict"] = "edit_failed"
+        fields["result_summary"] = "This step did not produce an edit."
+    update_task(task["id"], **fields)
+    task.update(fields)
+    return task
+
+
+def mark_next_plan_step_running(session_id: str, run_id: str) -> dict | None:
+    """Keep phase 'implementing' between steps. No-op if one is already running."""
+    tasks = _plan_tasks(session_id, run_id)
+    if any((t.get("status") or "") == "running" for t in tasks):
+        return None
+    for t in tasks:
+        if (t.get("status") or "") in ("pending", "blocked"):
+            update_task(t["id"], status="running", result_summary="")
+            t["status"] = "running"
+            t["result_summary"] = ""
+            return t
+    return None
+
+
 def _keys_from_changes_by_file(changes_by_file) -> list[tuple[str, str]]:
     keys: list[tuple[str, str]] = []
     if not isinstance(changes_by_file, dict):
