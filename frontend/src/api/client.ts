@@ -33,6 +33,7 @@ export type SmartStreamHandlers = {
     message?: string
   }) => void
   onPlan?: (event: any) => void
+  onAwsCli?: (event: { command?: string; stdout?: string; stderr?: string; exit_code?: number }) => void
 }
 
 /** Fire-and-forget clientLog bridge for wrappers defined in this file.
@@ -486,6 +487,7 @@ export const api = {
       onDoneSources?: SmartStreamHandlers['onDoneSources'],
       onCreditPaused?: SmartStreamHandlers['onCreditPaused'],
       onPlan?: SmartStreamHandlers['onPlan'],
+      onAwsCli?: SmartStreamHandlers['onAwsCli'],
     ): AbortController => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -493,7 +495,7 @@ export const api = {
         ({
           onThinking, onCompacting, onEditStart, onEditEnd, onTask,
           onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
-          onCreditPaused, onPlan,
+          onCreditPaused, onPlan, onAwsCli,
         } = onThinking)
       }
       const controller = new AbortController()
@@ -553,6 +555,7 @@ export const api = {
               },
             )
           }
+          else if (chunk.type === 'aws_cli') onAwsCli?.(chunk)
           else if (chunk.type === 'file_needed_cleared') onFileCleared?.(chunk.filename)
           else if (
             chunk.type === 'planning_started' ||
@@ -1106,6 +1109,14 @@ export const api = {
     },
     deployment: (id: string) => request<any>(`/vercel/deployments/${id}`),
     logs: (id: string, limit = 200) => request<any>(`/vercel/deployments/${id}/logs?limit=${limit}`),
+  },
+
+  aws: {
+    status: () => request<any>('/aws/status'),
+    connect: (body: { access_key_id: string; secret_access_key: string; region: string; session_token?: string }) =>
+      request<any>('/aws/connect', { method: 'POST', body: JSON.stringify(body) }),
+    disconnect: () => request<any>('/aws/disconnect', { method: 'DELETE' }),
+    exec: (command: string) => request<any>('/aws/exec', { method: 'POST', body: JSON.stringify({ command }) }),
   },
   railway: {
     status: () => request<any>('/railway/status'),

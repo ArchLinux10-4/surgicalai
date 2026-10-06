@@ -195,6 +195,7 @@ async def run_grok_ask_plan_native_stream(
     user_id: str,
     dlog: Optional[Callable] = None,
     history_enabled: bool = False,
+    aws_enabled: bool = False,
 ):
     """Native-tool-calling Ask/Plan loop for Grok. Yields raw SSE strings.
 
@@ -217,6 +218,7 @@ async def run_grok_ask_plan_native_stream(
 
     tools = build_grok_agent_tools(
         mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
+        aws_enabled=aws_enabled,
         dlog=dlog, session_id=session_id, user_id=user_id,
     )
 
@@ -229,6 +231,7 @@ async def run_grok_ask_plan_native_stream(
         if m.get("role") == "system":
             suffix = build_grok_system_suffix(
                 mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
+                aws_enabled=aws_enabled,
                 dlog=dlog, session_id=session_id, user_id=user_id,
             )
             messages[i] = {**m, "content": (m.get("content") or "") + suffix}

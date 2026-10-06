@@ -4336,6 +4336,7 @@ _ASK_PLAN_GH_WRITE_TOOLS = frozenset({"push_files", "push_session_file"})
 
 def _ask_plan_build_tool_instructions(
     *, has_files: bool, gh_enabled: bool, gh_known_repos: list, max_rounds: int,
+    aws_enabled: bool = False,
 ) -> str:
     """
     Composes the Ask/Plan tool-instructions system-prompt block from
@@ -4412,6 +4413,14 @@ def _ask_plan_build_tool_instructions(
             "not write."
         )
 
+    if aws_enabled:
+        tag_blocks.append(
+            "You can run one AWS CLI command for the connected account. "
+            "Pass the full command, starting with aws. Read-only commands "
+            "are preferred. The user can see the command and its output.\n\n"
+            "<aws_cli>aws s3 ls</aws_cli>"
+        )
+
     parts.append("\n\n".join(tag_blocks))
     parts.append(
         "Emit ONLY ONE tag at a time, then STOP your response immediately — "
@@ -4431,12 +4440,13 @@ def _ask_plan_strip_tool_tags(text: str) -> str:
     text = re.sub(r'<file_request>.*?</file_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<github_request>.*?</github_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<history_request>.*?</history_request>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<aws_cli>.*?</aws_cli>', '', text, flags=re.DOTALL)
     return text.strip()
 
 
 def _ask_plan_execute_tool_round(
-    *, sr_match, fr_match, gr_match, hr_match=None, symbol_maps_by_name,
-    file_content_lookup, user_id, session_id, tool_round,
+    *, sr_match, fr_match, gr_match, hr_match=None, aws_match=None,
+    symbol_maps_by_name, file_content_lookup, user_id, session_id, tool_round,
 ):
     """
     Executes whichever tag(s) the model emitted this round, reusing the
@@ -4542,6 +4552,14 @@ def _ask_plan_execute_tool_round(
                 tool_parts.append(
                     f"Could not search file history for '{_hr_fn}': "
                     f"{str(_hr_err)[:150]}")
+    if aws_match:
+        from services.aws_cli import run_aws_cli
+        _aws_cmd = (aws_match.group(1) or "").strip()
+        _aws_out = run_aws_cli(user_id, _aws_cmd)
+        tool_parts.append(
+            f"AWS CLI exit {_aws_out['exit_code']}.\n"
+            f"stdout:\n{_aws_out['stdout']}\nstderr:\n{_aws_out['stderr']}"
+        )
     return tool_parts
 
 
@@ -4638,6 +4656,13 @@ async def run_chat_stream(
             _dlog("ask_plan_github_setup_error", session_id=session_id,
                   user_id=user_id, error=str(_gh_nat_err))
 
+    _aws_connected = False
+    try:
+        from services.aws_cli import aws_connected as _aws_connected_fn
+        _aws_connected = _aws_connected_fn(user_id)
+    except Exception:
+        _aws_connected = False
+
     # Tools (search/file tag loop) are enabled for every cloud backend
     # (Claude native tool-round loop below, GPT/Gemini share one
     # OpenAI-compatible tool-round loop) as soon as EITHER attached files
@@ -4649,7 +4674,7 @@ async def run_chat_stream(
     # legacy live-token streaming path (byte-identical to before this fix)
     # still runs for plain chat with nothing to search.
     _ask_plan_tools_enabled = (
-        (_ask_plan_has_files or _gh_nat_enabled) and not _ask_plan_is_ollama
+        (_ask_plan_has_files or _gh_nat_enabled or _aws_connected) and not _ask_plan_is_ollama
     )
     _dlog("ask_plan_tools_gate_evaluated", session_id=session_id, user_id=user_id,
           model=chat_model, has_files=_ask_plan_has_files,
@@ -4733,7 +4758,8 @@ async def run_chat_stream(
         # a single fixed string).
         system_parts.append(_ask_plan_build_tool_instructions(
             has_files=_ask_plan_has_files, gh_enabled=_gh_nat_enabled,
-            gh_known_repos=_gh_known_repos, max_rounds=_ASK_PLAN_MAX_ROUNDS))
+            gh_known_repos=_gh_known_repos, max_rounds=_ASK_PLAN_MAX_ROUNDS,
+            aws_enabled=_aws_connected))
         _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
               model=chat_model, num_files=len(file_content_lookup),
               github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
@@ -4774,6 +4800,7 @@ async def run_chat_stream(
                 # Gemini tag loop above (_ask_plan_build_tool_instructions) —
                 # not is_agent_task, this is Ask/Plan, not Edit/Agent.
                 history_enabled=_ask_plan_has_files,
+                aws_enabled=_aws_connected,
                 symbol_maps_by_name=symbol_maps_by_name,
                 file_content_lookup=file_content_lookup,
                 execute_tool_round_fn=_ask_plan_execute_tool_round,
@@ -4823,13 +4850,17 @@ async def run_chat_stream(
                     re.search(r'<history_request>\s*(.*?)\s*</history_request>', _round_text, re.DOTALL)
                     if _ask_plan_has_files else None
                 )
+                _aws_match = (
+                    re.search(r'<aws_cli>\s*(.*?)\s*</aws_cli>', _round_text, re.DOTALL)
+                    if _aws_connected else None
+                )
 
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
-                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match and not _hr_match
+                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match and not _hr_match and not _aws_match
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match or _aws_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -4847,11 +4878,20 @@ async def run_chat_stream(
                 yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 _tool_parts = _ask_plan_execute_tool_round(
                     sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
-                    hr_match=_hr_match,
+                    hr_match=_hr_match, aws_match=_aws_match,
                     symbol_maps_by_name=symbol_maps_by_name,
                     file_content_lookup=file_content_lookup,
                     user_id=user_id, session_id=session_id, tool_round=_tool_round,
                 )
+
+                if _aws_match and _tool_parts:
+                    yield sse({
+                        "type": "aws_cli",
+                        "command": (_aws_match.group(1) or "").strip()[:500],
+                        "stdout": _tool_parts[-1],
+                        "stderr": "",
+                        "exit_code": 0 if "AWS CLI exit 0." in _tool_parts[-1] else 1,
+                    })
 
                 if not _tool_parts:
                     yield sse({"type": "token", "content": _round_text})
@@ -5051,13 +5091,17 @@ async def run_chat_stream(
                     re.search(r'<history_request>\s*(.*?)\s*</history_request>', _round_text, re.DOTALL)
                     if _ask_plan_has_files else None
                 )
+                _aws_match = (
+                    re.search(r'<aws_cli>\s*(.*?)\s*</aws_cli>', _round_text, re.DOTALL)
+                    if _aws_connected else None
+                )
 
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
-                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match and not _hr_match
+                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match and not _hr_match and not _aws_match
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match or _aws_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5075,11 +5119,20 @@ async def run_chat_stream(
                 yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 _tool_parts = _ask_plan_execute_tool_round(
                     sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
-                    hr_match=_hr_match,
+                    hr_match=_hr_match, aws_match=_aws_match,
                     symbol_maps_by_name=symbol_maps_by_name,
                     file_content_lookup=file_content_lookup,
                     user_id=user_id, session_id=session_id, tool_round=_tool_round,
                 )
+
+                if _aws_match and _tool_parts:
+                    yield sse({
+                        "type": "aws_cli",
+                        "command": (_aws_match.group(1) or "").strip()[:500],
+                        "stdout": _tool_parts[-1],
+                        "stderr": "",
+                        "exit_code": 0 if "AWS CLI exit 0." in _tool_parts[-1] else 1,
+                    })
 
                 if not _tool_parts:
                     yield sse({"type": "token", "content": _round_text})
@@ -17669,6 +17722,15 @@ async def run_natural_pipeline_stream(
                   session_id=session_id, user_id=user_id,
                   error=str(_gh_nat_err))
 
+        _aws_connected = False
+        try:
+            from services.aws_cli import aws_connected as _aws_connected_fn
+            _aws_connected = _aws_connected_fn(user_id)
+        except Exception:
+            _aws_connected = False
+        if _aws_connected:
+            TAG_DEFS["aws"] = {"open": "<aws_cli>", "close": "</aws_cli>"}
+
         # ── History-search tag (Edit + Agent Mode) ──────────────────────────
         # Lets the agent/edit loop pull an OLDER/original version of a
         # session file from session_file_versions (already-existing,
@@ -18085,7 +18147,7 @@ async def run_natural_pipeline_stream(
         # wrapper (confirmed via an official botocore issue), and Agent Mode
         # is Claude-only already (`_is_claude` gate, chat.py), so Claude may
         # freely use all 5 stop tags (incl. "history") without affecting GPT.
-        _stop_tag_order = ["search", "filereq", "github", "plan", "history"]
+        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws"]
         _agent_stop_seqs = (
             [TAG_DEFS[t]["close"] for t in _stop_tag_order if t in TAG_DEFS]
             if _tag_stop_enabled else []
@@ -18105,6 +18167,8 @@ async def run_natural_pipeline_stream(
             if _kind == "history":
                 _hd = _parse_history_content(_block)
                 return ("history", _hd if _hd is not None else {"_invalid": _block[:500]})
+            if _kind == "aws":
+                return ("aws", (_block or "").strip())
             return None
 
         # ---- Unified instruction: every tool is legal on every turn, no phase wall ----
@@ -18118,6 +18182,7 @@ async def run_natural_pipeline_stream(
             "JSON array of exact filenames, e.g. "
             "<file_request>[\"file1.py\", \"file2.tsx\"]</file_request>.\n"
             + ("• <github_request> — read from the connected GitHub repository.\n" if _gh_nat_enabled else "")
+            + ("• <aws_cli> — one AWS CLI command starting with aws, only when AWS is connected.\n" if _aws_connected else "")
             + ("• <history_request>{\"filename\": \"...\", \"query\": \"optional keyword\"} — "
                "look up an OLDER/original version of a file from THIS session's edit "
                "history. Omit query for the very first (pre-edit) version; include a "
@@ -18399,7 +18464,7 @@ async def run_natural_pipeline_stream(
                                                 # own system prompt — anything else is prose, not
                                                 # a live request. Check once, as soon as the first
                                                 # non-whitespace char has arrived.
-                                                if (_tag_name in ("search", "filereq", "github", "history")
+                                                if (_tag_name in ("search", "filereq", "github", "history", "aws")
                                                         and not _ctx_shape_checked):
                                                     _ctx_stripped = tag_buf.lstrip()
                                                     if _ctx_stripped:
@@ -18430,7 +18495,7 @@ async def run_natural_pipeline_stream(
                                                 if _pd is not None:
                                                     edit_plan_data = _pd
                                                 _break_stream = True
-                                            elif _tag_name in ("search", "filereq", "github", "history"):
+                                            elif _tag_name in ("search", "filereq", "github", "history", "aws"):
                                                 pending_tool = _capture_request(_tag_name, _content)
                                                 _break_stream = True
 
@@ -18599,6 +18664,7 @@ async def run_natural_pipeline_stream(
                         mode=("agent" if is_agent_task else "edit"),
                         github_enabled=_gh_nat_enabled,
                         history_enabled=_history_enabled,
+                        aws_enabled=_aws_connected,
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
                     # Plan-first gate decides tool_choice: forced write_edit_plan
@@ -18767,7 +18833,7 @@ async def run_natural_pipeline_stream(
                                             # Claude branch above — same proven bug, session
                                             # 71737af0: a model quoting its own tag syntax in
                                             # prose must not trap the rest of its real text). ──
-                                            if (_tag_name in ("search", "filereq", "github", "history")
+                                            if (_tag_name in ("search", "filereq", "github", "history", "aws")
                                                     and not _ctx_shape_checked):
                                                 _ctx_stripped = tag_buf.lstrip()
                                                 if _ctx_stripped:
@@ -18797,7 +18863,7 @@ async def run_natural_pipeline_stream(
                                             if _pd is not None:
                                                 edit_plan_data = _pd
                                             _break_stream = True
-                                        elif _tag_name in ("search", "filereq", "github", "history"):
+                                        elif _tag_name in ("search", "filereq", "github", "history", "aws"):
                                             pending_tool = _capture_request(_tag_name, _content)
                                             _break_stream = True
                                         state = "normal"
@@ -18854,7 +18920,7 @@ async def run_natural_pipeline_stream(
             # ── Recover a context-request tag the stop_sequence halted before closing ──
             if pending_tool is None and state.startswith("in_"):
                 _uc = state[3:]
-                if _uc in ("search", "filereq", "github", "history"):
+                if _uc in ("search", "filereq", "github", "history", "aws"):
                     _ucm = re.search(
                         re.escape(TAG_DEFS[_uc]["open"]) + r"(.*)",
                         full_response, re.DOTALL)
@@ -19672,6 +19738,27 @@ async def run_natural_pipeline_stream(
                     ]
                     continue
 
+                if _kind == "aws":
+                    from services.aws_cli import run_aws_cli as _run_aws_cli
+                    _aws_cmd = _data if isinstance(_data, str) else str(_data or "")
+                    _aws_out = _run_aws_cli(user_id, _aws_cmd)
+                    yield sse({
+                        "type": "aws_cli",
+                        "command": _aws_cmd[:500],
+                        "stdout": _aws_out["stdout"],
+                        "stderr": _aws_out["stderr"],
+                        "exit_code": _aws_out["exit_code"],
+                    })
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": _assistant_echo},
+                        {"role": "user", "content":
+                            f"AWS CLI exit {_aws_out['exit_code']}.\n"
+                            f"stdout:\n{_aws_out['stdout']}\n"
+                            f"stderr:\n{_aws_out['stderr']}\n"
+                            "Continue the task."},
+                    ]
+                    continue
+
                 if _kind == "github":
                     _gh_req = _data if isinstance(_data, dict) else {"_invalid": str(_data)[:500]}
                     _github_attempts += 1
@@ -20126,7 +20213,7 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id,
                           plan_items=len(edit_plan_data) if edit_plan_data else 0)
 
-            elif state.startswith("in_") and state[3:] in ("search", "filereq", "github", "history"):
+            elif state.startswith("in_") and state[3:] in ("search", "filereq", "github", "history", "aws"):
                 # ── Safety net for a stuck context-request tag ──────────────
                 # PROVEN BUG (session 71737af0): unlike in_edit/in_file/in_plan
                 # above, this branch had NO recovery/surface path at all before

@@ -75,6 +75,7 @@ TOOL_WRITE_EDIT_PLAN = "write_edit_plan"
 TOOL_REQUEST_FILE = "request_file"
 TOOL_REQUEST_SEARCH = "request_search"
 TOOL_REQUEST_GITHUB = "request_github"
+TOOL_AWS_CLI = "aws_cli"
 TOOL_REQUEST_HISTORY = "request_history"
 TOOL_REPORT_BLOCKED = "report_blocked"
 
@@ -422,8 +423,31 @@ def _schema_report_blocked():
     }
 
 
+def _schema_aws_cli():
+    return {
+        "type": "function",
+        "function": {
+            "name": TOOL_AWS_CLI,
+            "description": (
+                "Run one AWS CLI command for the connected account. "
+                "The command must start with aws."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Full command, starting with aws.",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    }
+
+
 def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=False,
-                           dlog=None, session_id="", user_id=""):
+                           aws_enabled=False, dlog=None, session_id="", user_id=""):
     """Return the OpenAI-style tool schemas Grok should be offered for ``mode``.
 
     * ``edit`` / ``agent`` — full write + read toolset + report_blocked.
@@ -452,6 +476,8 @@ def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=Fa
         tools.append(_schema_request_github())
     if history_enabled:
         tools.append(_schema_request_history())
+    if aws_enabled:
+        tools.append(_schema_aws_cli())
 
     # report_blocked is meaningful in every mode as a clean terminal signal.
     tools.append(_schema_report_blocked())
@@ -801,6 +827,16 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
                  user_id=user_id, tool_call_id=cid,
                  reason_preview=res.blocked_reason[:200])
 
+        elif name == TOOL_AWS_CLI:
+            from services.aws_cli import run_aws_cli
+            _aws_out = run_aws_cli(user_id, str(args.get("command") or ""))
+            res.results_by_id[cid] = (
+                f"exit {_aws_out['exit_code']}\n"
+                f"stdout:\n{_aws_out['stdout']}\nstderr:\n{_aws_out['stderr']}"
+            )
+            _log(dlog, "grok_translate_aws_cli", session_id=session_id,
+                 user_id=user_id, tool_call_id=cid, exit_code=_aws_out["exit_code"])
+
         elif name in CONTEXT_TOOLS:
             # Only the FIRST context request is dispatched this turn.
             if res.context_request is not None:
@@ -993,8 +1029,8 @@ def normalize_dispatch_pair(current_messages, native_turn, dlog=None,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_grok_system_suffix(mode="edit", github_enabled=False,
-                             history_enabled=False, dlog=None,
-                             session_id="", user_id=""):
+                             history_enabled=False, aws_enabled=False,
+                             dlog=None, session_id="", user_id=""):
     """A short contract appended to Grok's system text telling it to USE the
     native function tools instead of the XML-tag protocol described earlier in
     the shared prompt (which targets Claude/GPT).
@@ -1035,6 +1071,8 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
         lines.append("• request_github — read from the connected GitHub repo.")
     if history_enabled:
         lines.append("• request_history — read an older version of a session file.")
+    if aws_enabled:
+        lines.append("• aws_cli — one AWS CLI command starting with aws.")
     lines.append(
         "• report_blocked — ONLY if you truly cannot proceed without context "
         "you cannot obtain.")

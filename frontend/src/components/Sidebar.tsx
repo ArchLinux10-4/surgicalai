@@ -10,6 +10,7 @@ import { GitHubPanel } from './GitHubPanel'
 import { LinearPanel } from './LinearPanel'
 import { VercelPanel } from './VercelPanel'
 import { RailwayPanel } from './RailwayPanel'
+import { AwsTerminalPanel } from './AwsTerminalPanel'
 import { useThemeStore } from '../stores/themeStore'
 import { Add, AdsClick, Chat, CloudOff, Close, Code, CreateNewFolder, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile, DiffStatsBadge } from '../lib/fileClassify'
@@ -829,13 +830,14 @@ function SessionFilesPanel() {
 }
 
 // ── Rail items config ─────────────────────────────────────────────────────────
-type TabId = 'sessions' | 'files' | 'github' | 'context' | 'linear' | 'vercel' | 'railway'
+type TabId = 'sessions' | 'files' | 'github' | 'context' | 'linear' | 'vercel' | 'aws' | 'railway'
 const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
   { id: 'sessions', icon: Chat, label: 'Chats',  tooltip: 'Chats' },
   { id: 'files',    icon: Code,      label: 'Files',  tooltip: 'Session Files' },
   { id: 'github',   icon: GitHub,        label: 'GitHub', tooltip: 'GitHub' },
   { id: 'linear',   icon: LinearIcon,    label: 'Linear', tooltip: 'Linear Issues' },
   { id: 'vercel',   icon: VercelIcon,         label: 'Vercel', tooltip: 'Vercel Deployments' },
+  { id: 'aws',      icon: VercelIcon,         label: 'AWS', tooltip: 'AWS CLI' },
   { id: 'railway',  icon: RailwayIcon,        label: 'Railway', tooltip: 'Railway Services' },
   { id: 'context',  icon: Psychology,         label: 'Memory', tooltip: 'Global Memory' },
 ]
@@ -910,7 +912,7 @@ export function Sidebar() {
   // cloud APIs by design — rather than let those panels spin/error against a
   // network that isn't there, disable them proactively with a clear message.
   const offlineModeActive = !!settings?.ollama_enabled
-  const CLOUD_ONLY_TABS: TabId[] = ['vercel', 'railway']
+  const CLOUD_ONLY_TABS: TabId[] = ['vercel', 'aws', 'railway']
   // Same is_hosted signal that already gates Import Folder (session file
   // panel) — a Chrome CDP connection can only ever reach localhost, so this
   // tile would be actively misleading on a hosted Vercel/Railway deploy.
@@ -1193,6 +1195,11 @@ export function Sidebar() {
             offlineModeActive
               ? <OfflineModeDisabledPanel name="Vercel" />
               : <VercelPanel onOpenSettings={() => { setSidebarTab('sessions'); setSettingsOpen(true) }} />
+          )}
+          {sidebarTab === 'aws' && (
+            offlineModeActive
+              ? <OfflineModeDisabledPanel name="AWS" />
+              : <AwsTerminalPanel />
           )}
           {sidebarTab === 'railway'  && (
             offlineModeActive

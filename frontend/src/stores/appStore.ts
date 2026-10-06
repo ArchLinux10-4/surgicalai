@@ -57,8 +57,10 @@ interface AppState {
   setSurgicalPanelOpen: (v: boolean) => void
 
   // UI
-  sidebarTab: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'railway'
-  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'railway') => void
+  sidebarTab: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'aws' | 'railway'
+  setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'aws' | 'railway') => void
+  awsTerminalLines: { sessionId: string; command: string; stdout: string; stderr: string; exit_code: number }[]
+  pushAwsTerminalLine: (line: { sessionId: string; command: string; stdout: string; stderr: string; exit_code: number }) => void
   sidebarPanelOpen: boolean
   setSidebarPanelOpen: (open: boolean) => void
   sidebarPinned: boolean
@@ -232,6 +234,10 @@ export const useAppStore = create<AppState>((set) => ({
   setSurgicalPanelOpen: (surgicalPanelOpen) => set({ surgicalPanelOpen }),
 
   sidebarTab: 'sessions',
+  awsTerminalLines: [],
+  pushAwsTerminalLine: (line) => set((s) => ({
+    awsTerminalLines: [...s.awsTerminalLines, line].slice(-40),
+  })),
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
   sidebarPanelOpen: false,
   setSidebarPanelOpen: (sidebarPanelOpen) => set({ sidebarPanelOpen }),

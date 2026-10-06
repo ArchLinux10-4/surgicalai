@@ -1195,6 +1195,16 @@ def set_user_api_key(user_id: str, key_type: str, encrypted_value: str):
         conn.commit()
 
 
+def delete_user_api_key(user_id: str, key_type: str) -> None:
+    """Remove one stored key. Other key types for this user stay."""
+    with get_db_ctx() as conn:
+        conn.execute(
+            "DELETE FROM user_api_keys WHERE user_id = ? AND key_type = ?",
+            (user_id, key_type),
+        )
+        conn.commit()
+
+
 def get_user_api_key(user_id: str, key_type: str) -> str:
     """Retrieve encrypted API key for a user. Returns empty string if not found."""
     with get_db_ctx() as conn:
