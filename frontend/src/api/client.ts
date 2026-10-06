@@ -34,6 +34,7 @@ export type SmartStreamHandlers = {
   }) => void
   onPlan?: (event: any) => void
   onAwsCli?: (event: { command?: string; stdout?: string; stderr?: string; exit_code?: number }) => void
+  onAwsApproval?: (command: string, reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean) => void
 }
 
 /** Fire-and-forget clientLog bridge for wrappers defined in this file.
@@ -488,6 +489,7 @@ export const api = {
       onCreditPaused?: SmartStreamHandlers['onCreditPaused'],
       onPlan?: SmartStreamHandlers['onPlan'],
       onAwsCli?: SmartStreamHandlers['onAwsCli'],
+      onAwsApproval?: SmartStreamHandlers['onAwsApproval'],
     ): AbortController => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -495,7 +497,7 @@ export const api = {
         ({
           onThinking, onCompacting, onEditStart, onEditEnd, onTask,
           onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
-          onCreditPaused, onPlan, onAwsCli,
+          onCreditPaused, onPlan, onAwsCli, onAwsApproval,
         } = onThinking)
       }
       const controller = new AbortController()
@@ -556,6 +558,13 @@ export const api = {
             )
           }
           else if (chunk.type === 'aws_cli') onAwsCli?.(chunk)
+          else if (chunk.type === 'aws_approval_needed') {
+            onAwsApproval?.(chunk.command || '', (resp) => {
+              if (!sendToServer) return false
+              sendToServer({ type: 'aws_cli_response', ...resp })
+              return true
+            })
+          }
           else if (chunk.type === 'file_needed_cleared') onFileCleared?.(chunk.filename)
           else if (
             chunk.type === 'planning_started' ||

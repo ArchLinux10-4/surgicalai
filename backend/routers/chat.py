@@ -1488,6 +1488,7 @@ async def smart_stream(req: dict, request: Request):
                     session_files=session_files,
                     mode=_eff_mode,
                     web_search_enabled=_ask_plan_web_search_enabled,
+                    client_inbox=getattr(request.state, "client_inbox", None),
                 ):
                     # run_chat_stream emits token / thinking_* / done / error —
                     # all already handled by the smart-stream frontend consumer.
@@ -1569,6 +1570,7 @@ async def smart_stream(req: dict, request: Request):
                             session_files=session_files,
                             mode=_eff_mode,
                             web_search_enabled=_ask_plan_web_search_enabled,
+                            client_inbox=getattr(request.state, "client_inbox", None),
                         ):
                             if _rchunk.startswith("data: "):
                                 try:
@@ -2953,7 +2955,7 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
                 msg_in = json.loads(raw_in)
             except Exception:
                 continue
-            if isinstance(msg_in, dict) and msg_in.get("type") == "file_response":
+            if isinstance(msg_in, dict) and msg_in.get("type") in ("file_response", "aws_cli_response"):
                 await inbox.put(msg_in)
 
     recv_task = asyncio.create_task(_client_receiver())

@@ -828,14 +828,17 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
                  reason_preview=res.blocked_reason[:200])
 
         elif name == TOOL_AWS_CLI:
-            from services.aws_cli import run_aws_cli
-            _aws_out = run_aws_cli(user_id, str(args.get("command") or ""))
-            res.results_by_id[cid] = (
-                f"exit {_aws_out['exit_code']}\n"
-                f"stdout:\n{_aws_out['stdout']}\nstderr:\n{_aws_out['stderr']}"
-            )
+            # Do not run yet. The pipeline pauses for user approval, then runs it.
+            _aws_cmd = str(args.get("command") or "").strip()
+            if res.context_request is None:
+                res.context_request = ("aws", _aws_cmd)
+                res.context_call_id = cid
+            else:
+                fb = "Only one AWS command is sent for approval per turn."
+                res.errors.append((cid, fb))
+                res.results_by_id[cid] = fb
             _log(dlog, "grok_translate_aws_cli", session_id=session_id,
-                 user_id=user_id, tool_call_id=cid, exit_code=_aws_out["exit_code"])
+                 user_id=user_id, tool_call_id=cid)
 
         elif name in CONTEXT_TOOLS:
             # Only the FIRST context request is dispatched this turn.
