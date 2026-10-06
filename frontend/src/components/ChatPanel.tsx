@@ -12,6 +12,7 @@ import { PickedElementsTray } from './PickedElementsTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker } from './PlanTracker'
 import { AwsCliFeed } from './AwsCliFeed'
+import { AwsApprovalCard } from './AwsApprovalCard'
 import { PlanQuestionsCard } from './PlanQuestionsCard'
 import { normalizeQuestions, stripPlanQuestionsFence } from '../lib/planQuestions'
 import { useTaskPolling } from '../hooks/useTaskPolling'
@@ -1560,6 +1561,11 @@ export function ChatPanel() {
   } | null>(null)
   const fileRequestInputRef = useRef<HTMLInputElement>(null)
   const [fileRequestBusy, setFileRequestBusy] = useState(false)
+  const [awsApproval, setAwsApproval] = useState<{
+    sessionId: string
+    command: string
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
+  } | null>(null)
 
   // If the stream that owns a pending file-request ends for ANY reason
   // (result / done / error) before the backend ever sends file_needed_cleared
@@ -2391,6 +2397,9 @@ export function ChatPanel() {
           exit_code: event?.exit_code ?? 1,
         })
       },
+      (command, reply) => {
+        setAwsApproval({ sessionId, command, reply })
+      },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change
@@ -3050,6 +3059,15 @@ export function ChatPanel() {
                 canAutoFocus={() => {
                   const ta = textareaRef.current
                   return !ta || (!ta.value && document.activeElement !== ta)
+                }}
+              />
+            )}
+            {awsApproval && awsApproval.sessionId === activeSessions && (
+              <AwsApprovalCard
+                command={awsApproval.command}
+                onDecide={(action, command) => {
+                  awsApproval.reply({ action, command })
+                  setAwsApproval(null)
                 }}
               />
             )}

@@ -28,6 +28,7 @@ import { SessionFilesTray } from '../SessionFilesTray'
 import { AgentMissionControl } from '../AgentMissionControl'
 import { PlanTracker } from '../PlanTracker'
 import { AwsCliFeed } from '../AwsCliFeed'
+import { AwsApprovalCard } from '../AwsApprovalCard'
 import { PlanQuestionsCard } from '../PlanQuestionsCard'
 import { normalizeQuestions, stripPlanQuestionsFence } from '../../lib/planQuestions'
 import { useTaskPolling } from '../../hooks/useTaskPolling'
@@ -599,6 +600,11 @@ export function MobileChatPanel() {
     retry?: boolean
   } | null>(null)
   const [fileRequestBusy, setFileRequestBusy] = useState(false)
+  const [awsApproval, setAwsApproval] = useState<{
+    sessionId: string
+    command: string
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
+  } | null>(null)
 
   const offline = isOfflineSettings(settings)
   const availableModes: ChatMode[] = offline ? ['edit', 'ask'] : CHAT_MODES
@@ -1234,6 +1240,9 @@ export function MobileChatPanel() {
           exit_code: event?.exit_code ?? 1,
         })
       },
+      (command, reply) => {
+        setAwsApproval({ sessionId, command, reply })
+      },
     )
     ctrlRef.current = ctrl
   }, [input, isStreaming, settings, ensureSession, messages.length, sessionFiles,
@@ -1549,6 +1558,15 @@ export function MobileChatPanel() {
                 canAutoFocus={() => {
                   const ta = textareaRef.current
                   return !ta || (!ta.value && document.activeElement !== ta)
+                }}
+              />
+            )}
+            {awsApproval && awsApproval.sessionId === activeSessions && (
+              <AwsApprovalCard
+                command={awsApproval.command}
+                onDecide={(action, command) => {
+                  awsApproval.reply({ action, command })
+                  setAwsApproval(null)
                 }}
               />
             )}

@@ -5,12 +5,14 @@ aws binary with shell=False. Secrets stay in the environment.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 
 from crypto_utils import decrypt_api_key
 from database import get_user_api_key
@@ -158,6 +160,36 @@ def run_aws_cli(user_id: str, command: str) -> dict:
     finally:
         import shutil as _sh
         _sh.rmtree(tmp, ignore_errors=True)
+
+
+async def wait_aws_decision(command: str, client_inbox, timeout: float = 180) -> str | None:
+    """Wait for the user to approve, edit, or reject an agent AWS command.
+
+    Returns the command to run, "" if rejected or timed out, or None when
+    there is no back-channel (plain HTTP) and the command must not run.
+    """
+    if client_inbox is None:
+        return None
+    try:
+        while True:
+            client_inbox.get_nowait()
+    except Exception:
+        pass
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            msg = await asyncio.wait_for(client_inbox.get(), timeout=5)
+        except asyncio.TimeoutError:
+            continue
+        if not isinstance(msg, dict) or msg.get("type") != "aws_cli_response":
+            continue
+        action = str(msg.get("action") or "").lower()
+        if action == "reject":
+            return ""
+        if action in ("approve", "edit"):
+            edited = str(msg.get("command") or command).strip()
+            return edited or command
+    return ""
 
 
 def mask_access_key_id(key_id: str) -> str:
