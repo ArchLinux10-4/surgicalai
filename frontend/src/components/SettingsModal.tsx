@@ -7,15 +7,17 @@ import { GitHubAppPanel } from './GitHubAppPanel'
 import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
 import { clientLog } from '../lib/clientLog'
+import { AwsConnectModal } from './AwsConnectModal'
 import { AttachMoney, BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
-type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'railway' | 'security' | 'debug'
+type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'aws' | 'railway' | 'security' | 'debug'
 
 const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'api',       icon: <VpnKey sx={{ fontSize: 14 }} />,       label: 'API Keys' },
   { id: 'models',    icon: <Psychology sx={{ fontSize: 14 }} />,      label: 'Models' },
   { id: 'github',    icon: <GitHub sx={{ fontSize: 14 }} />,     label: 'GitHub' },
   { id: 'vercel',    icon: <span style={{ fontSize: 12, fontWeight: 'bold' }}>▲</span>,     label: 'Vercel' },
+  { id: 'aws',       icon: <span style={{ fontSize: 11, fontWeight: 'bold' }}>aws</span>, label: 'AWS' },
   { id: 'railway',   icon: <span style={{ fontSize: 13, fontWeight: 'bold', color: '#dc2626' }}>⬡</span>,  label: 'Railway' },
   { id: 'workspace', icon: <FolderOpen sx={{ fontSize: 14 }} />, label: 'Workspace' },
   { id: 'editor',    icon: <Code sx={{ fontSize: 14 }} />,       label: 'Editor' },
@@ -57,6 +59,8 @@ export function SettingsModal() {
   const [vercelConnecting, setVercelConnecting] = useState(false)
   const [vercelStatus, setVercelStatus] = useState<any>(null)
   const [vercelStatusMsg, setVercelStatusMsg] = useState('')
+  const [awsStatus, setAwsStatus] = useState<any>(null)
+  const [awsConnectOpen, setAwsConnectOpen] = useState(false)
   const [railwayToken, setRailwayToken] = useState('')
   const [railwayConnecting, setRailwayConnecting] = useState(false)
   const [railwayStatus, setRailwayStatus] = useState<any>(null)
@@ -121,6 +125,7 @@ export function SettingsModal() {
     refreshModels()
     try { (api as any).github.status().then((s: any) => setGithubStatus(s)).catch(() => {}) } catch(_) {}
     try { (api as any).vercel.status().then((s: any) => setVercelStatus(s)).catch(() => {}) } catch(_) {}
+    try { api.aws.status().then((s) => setAwsStatus(s)).catch(() => {}) } catch(_) {}
     try { (api as any).railway.status().then((s: any) => setRailwayStatus(s)).catch(() => {}) } catch(_) {}
     try { api.settings.geminiStatus().then((s: any) => setGeminiConnected(s?.connected || false)).catch(() => {}) } catch(_) {}
     // /settings/grok-status returns both `configured` and `connected` (the
@@ -924,6 +929,35 @@ export function SettingsModal() {
               </div>
             )}
 
+            {tab === 'aws' && (
+              <div className="space-y-4">
+                <div>
+                  <div className="text-sm font-semibold text-ink">AWS CLI</div>
+                  <p className="text-[12px] text-muted mt-1">Connect an access key. Agents and the sidebar terminal use this account.</p>
+                </div>
+                {awsStatus?.connected ? (
+                  <div className="text-[12px] text-ink space-y-1">
+                    <div>Account {awsStatus.account}</div>
+                    <div className="text-muted break-all">{awsStatus.arn}</div>
+                    <div className="text-muted">{awsStatus.region} · {awsStatus.access_key_id}</div>
+                    <button
+                      type="button"
+                      className="btn-danger mt-2"
+                      onClick={() => { api.aws.disconnect().then(() => setAwsStatus({ connected: false })).catch(() => {}) }}
+                    >
+                      Disconnect
+                    </button>
+                  </div>
+                ) : (
+                  <button type="button" className="btn-primary" onClick={() => setAwsConnectOpen(true)}>Connect AWS</button>
+                )}
+                <AwsConnectModal
+                  open={awsConnectOpen}
+                  onClose={() => setAwsConnectOpen(false)}
+                  onConnected={() => { api.aws.status().then(setAwsStatus).catch(() => {}) }}
+                />
+              </div>
+            )}
             {tab === 'railway' && (
               <div className="space-y-5">
                 <SectionHeader

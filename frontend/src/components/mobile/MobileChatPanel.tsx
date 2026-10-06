@@ -27,6 +27,7 @@ import {
 import { SessionFilesTray } from '../SessionFilesTray'
 import { AgentMissionControl } from '../AgentMissionControl'
 import { PlanTracker } from '../PlanTracker'
+import { AwsCliFeed } from '../AwsCliFeed'
 import { PlanQuestionsCard } from '../PlanQuestionsCard'
 import { normalizeQuestions, stripPlanQuestionsFence } from '../../lib/planQuestions'
 import { useTaskPolling } from '../../hooks/useTaskPolling'
@@ -1224,6 +1225,15 @@ export function MobileChatPanel() {
           toast.error('No plan checklist', 'The model did not emit a valid implementation_plan. Stay in Plan and ask again.')
         }
       },
+      (event) => {
+        useAppStore.getState().pushAwsTerminalLine({
+          sessionId,
+          command: event?.command || 'aws',
+          stdout: event?.stdout || '',
+          stderr: event?.stderr || '',
+          exit_code: event?.exit_code ?? 1,
+        })
+      },
     )
     ctrlRef.current = ctrl
   }, [input, isStreaming, settings, ensureSession, messages.length, sessionFiles,
@@ -1542,6 +1552,7 @@ export function MobileChatPanel() {
                 }}
               />
             )}
+            <AwsCliFeed />
             <PlanTracker emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
             {resumableRun && resumableRun.sid === activeSessions && !isStreaming && (
               <div className="mx-3 mb-2 flex items-center justify-between gap-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5">

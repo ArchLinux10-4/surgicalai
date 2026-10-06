@@ -11,6 +11,7 @@ import { SessionFilesTray } from './SessionFilesTray'
 import { PickedElementsTray } from './PickedElementsTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker } from './PlanTracker'
+import { AwsCliFeed } from './AwsCliFeed'
 import { PlanQuestionsCard } from './PlanQuestionsCard'
 import { normalizeQuestions, stripPlanQuestionsFence } from '../lib/planQuestions'
 import { useTaskPolling } from '../hooks/useTaskPolling'
@@ -2381,6 +2382,15 @@ export function ChatPanel() {
           toast.error('No plan checklist', 'The model did not emit a valid implementation_plan. Stay in Plan and ask again.')
         }
       },
+      (event) => {
+        useAppStore.getState().pushAwsTerminalLine({
+          sessionId,
+          command: event?.command || 'aws',
+          stdout: event?.stdout || '',
+          stderr: event?.stderr || '',
+          exit_code: event?.exit_code ?? 1,
+        })
+      },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change
@@ -3043,6 +3053,7 @@ export function ChatPanel() {
                 }}
               />
             )}
+            <AwsCliFeed />
             <PlanTracker emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
             {isStreaming && (streamingMessage || streamProgress) && (
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} />
