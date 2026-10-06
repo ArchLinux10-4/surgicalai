@@ -4575,6 +4575,7 @@ async def run_chat_stream(
     session_files: Optional[list] = None,
     mode: Optional[str] = None,
     web_search_enabled: bool = False,
+    client_inbox=None,
 ):
     """
     Streaming version of run_chat. Yields SSE chunks.
@@ -4801,6 +4802,7 @@ async def run_chat_stream(
                 # not is_agent_task, this is Ask/Plan, not Edit/Agent.
                 history_enabled=_ask_plan_has_files,
                 aws_enabled=_aws_connected,
+                client_inbox=client_inbox,
                 symbol_maps_by_name=symbol_maps_by_name,
                 file_content_lookup=file_content_lookup,
                 execute_tool_round_fn=_ask_plan_execute_tool_round,
@@ -4876,13 +4878,32 @@ async def run_chat_stream(
                     break
 
                 yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
-                _tool_parts = _ask_plan_execute_tool_round(
-                    sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
-                    hr_match=_hr_match, aws_match=_aws_match,
-                    symbol_maps_by_name=symbol_maps_by_name,
-                    file_content_lookup=file_content_lookup,
-                    user_id=user_id, session_id=session_id, tool_round=_tool_round,
-                )
+                _tool_parts = None
+                if _aws_match:
+                    from services.aws_cli import wait_aws_decision as _wait_aws
+                    _proposed = (_aws_match.group(1) or "").strip()
+                    yield sse({"type": "aws_approval_needed", "command": _proposed[:500]})
+                    _approved = await _wait_aws(_proposed, client_inbox)
+                    if not _approved:
+                        _aws_match = None
+                        _tool_parts = [(
+                            "The user rejected this AWS command. Do not run it again unless they ask."
+                            if _approved == "" else
+                            "AWS command was not run because this connection cannot ask the user to approve it."
+                        )]
+                    else:
+                        class _Approved:
+                            def group(self, _n):
+                                return _approved
+                        _aws_match = _Approved()
+                if _tool_parts is None:
+                    _tool_parts = _ask_plan_execute_tool_round(
+                        sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
+                        hr_match=_hr_match, aws_match=_aws_match,
+                        symbol_maps_by_name=symbol_maps_by_name,
+                        file_content_lookup=file_content_lookup,
+                        user_id=user_id, session_id=session_id, tool_round=_tool_round,
+                    )
 
                 if _aws_match and _tool_parts:
                     yield sse({
@@ -5117,13 +5138,32 @@ async def run_chat_stream(
                     break
 
                 yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
-                _tool_parts = _ask_plan_execute_tool_round(
-                    sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
-                    hr_match=_hr_match, aws_match=_aws_match,
-                    symbol_maps_by_name=symbol_maps_by_name,
-                    file_content_lookup=file_content_lookup,
-                    user_id=user_id, session_id=session_id, tool_round=_tool_round,
-                )
+                _tool_parts = None
+                if _aws_match:
+                    from services.aws_cli import wait_aws_decision as _wait_aws
+                    _proposed = (_aws_match.group(1) or "").strip()
+                    yield sse({"type": "aws_approval_needed", "command": _proposed[:500]})
+                    _approved = await _wait_aws(_proposed, client_inbox)
+                    if not _approved:
+                        _aws_match = None
+                        _tool_parts = [(
+                            "The user rejected this AWS command. Do not run it again unless they ask."
+                            if _approved == "" else
+                            "AWS command was not run because this connection cannot ask the user to approve it."
+                        )]
+                    else:
+                        class _Approved:
+                            def group(self, _n):
+                                return _approved
+                        _aws_match = _Approved()
+                if _tool_parts is None:
+                    _tool_parts = _ask_plan_execute_tool_round(
+                        sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
+                        hr_match=_hr_match, aws_match=_aws_match,
+                        symbol_maps_by_name=symbol_maps_by_name,
+                        file_content_lookup=file_content_lookup,
+                        user_id=user_id, session_id=session_id, tool_round=_tool_round,
+                    )
 
                 if _aws_match and _tool_parts:
                     yield sse({
@@ -19739,12 +19779,28 @@ async def run_natural_pipeline_stream(
                     continue
 
                 if _kind == "aws":
-                    from services.aws_cli import run_aws_cli as _run_aws_cli
+                    from services.aws_cli import run_aws_cli as _run_aws_cli, wait_aws_decision
                     _aws_cmd = _data if isinstance(_data, str) else str(_data or "")
-                    _aws_out = _run_aws_cli(user_id, _aws_cmd)
+                    yield sse({
+                        "type": "aws_approval_needed",
+                        "command": _aws_cmd[:500],
+                    })
+                    _aws_final = await wait_aws_decision(_aws_cmd, client_inbox)
+                    if not _aws_final:
+                        _aws_note = (
+                            "The user rejected this AWS command."
+                            if _aws_final == "" else
+                            "AWS command was not run because this connection cannot ask the user to approve it."
+                        )
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content": _aws_note + " Do not run it again unless they ask."},
+                        ]
+                        continue
+                    _aws_out = _run_aws_cli(user_id, _aws_final)
                     yield sse({
                         "type": "aws_cli",
-                        "command": _aws_cmd[:500],
+                        "command": _aws_final[:500],
                         "stdout": _aws_out["stdout"],
                         "stderr": _aws_out["stderr"],
                         "exit_code": _aws_out["exit_code"],

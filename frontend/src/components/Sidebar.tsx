@@ -837,7 +837,7 @@ const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
   { id: 'github',   icon: GitHub,        label: 'GitHub', tooltip: 'GitHub' },
   { id: 'linear',   icon: LinearIcon,    label: 'Linear', tooltip: 'Linear Issues' },
   { id: 'vercel',   icon: VercelIcon,         label: 'Vercel', tooltip: 'Vercel Deployments' },
-  { id: 'aws',      icon: VercelIcon,         label: 'AWS', tooltip: 'AWS CLI' },
+  { id: 'aws',      icon: AwsIcon,            label: 'AWS', tooltip: 'AWS CLI' },
   { id: 'railway',  icon: RailwayIcon,        label: 'Railway', tooltip: 'Railway Services' },
   { id: 'context',  icon: Psychology,         label: 'Memory', tooltip: 'Global Memory' },
 ]
@@ -850,6 +850,16 @@ const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
 // `canImportFolder` gate).
 
 // ── Vercel icon (inline SVG) ──────────────────────────────────────────────────
+function AwsIcon({ size = 16 }: { size?: number }) {
+  return (
+    <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden>
+      <rect x="2" y="3" width="20" height="18" rx="3" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M6.5 15.5c1.8 1.3 3.5 1.8 5.5 1.8s3.7-.5 5.5-1.8" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      <path d="M8 8.5h1.6L11 13l1.4-4.5H14" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
 function VercelIcon({ size = 16 }: { size?: number }) {
   return (
     <svg width={size} height={size} viewBox="0 0 512 512" fill="currentColor">
