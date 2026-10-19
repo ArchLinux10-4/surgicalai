@@ -10,5 +10,6 @@
 # them), so the existing python venv + pip install phase is left completely
 # untouched. `nodePackages.typescript` provides the `tsc` binary on PATH; no
 # custom build commands are introduced, keeping the change minimal and additive.
+# `awscli2` is AWS CLI v2. The nixpkgs name `awscli` is v1 — do not substitute it.
 [phases.setup]
-nixPkgs = ["...", "nodejs_20", "nodePackages.typescript"]
+nixPkgs = ["...", "nodejs_20", "nodePackages.typescript", "awscli2"]

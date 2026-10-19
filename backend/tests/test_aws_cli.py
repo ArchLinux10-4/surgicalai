@@ -71,4 +71,6 @@ def test_run_passes_key_in_env_not_argv(monkeypatch):
     assert out["stdout"] == "ok"
     assert captured["shell"] is False
     assert captured["env"]["AWS_ACCESS_KEY_ID"] == "AKIAaaaaaaaaaaaaaaaa"
+    assert captured["env"]["AWS_PAGER"] == ""
+    assert captured["env"]["AWS_CLI_AUTO_PROMPT"] == "off"
     assert secret not in captured["argv"]
