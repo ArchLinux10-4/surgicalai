@@ -158,6 +158,89 @@ if [ -f requirements-local.txt ]; then
 fi
 echo ""
 
+# ── AWS CLI v2 ───────────────────────────────────────────────────────────────
+# The pip package named awscli is v1 and is not installed. The terminal and
+# agent tool need the official v2 binary. Railway gets it from nixpacks
+# (awscli2); this block is the local-machine equivalent.
+
+echo -e "${BOLD}Checking AWS CLI v2...${NC}"
+_aws_ver="$(aws --version 2>&1 || true)"
+_dlog "aws version before install: ${_aws_ver:-<none>}"
+if printf '%s' "$_aws_ver" | grep -q "aws-cli/2"; then
+  echo "  ✅ AWS CLI v2 already installed ($_aws_ver)"
+else
+  _aws_os="$(uname -s)"
+  _aws_arch="$(uname -m)"
+  _dlog "installing AWS CLI v2: os=$_aws_os arch=$_aws_arch"
+  AWS_SUDO=""
+  if [ "$(id -u)" -ne 0 ]; then
+    if command -v sudo >/dev/null 2>&1; then
+      AWS_SUDO="sudo"
+    else
+      _dlog "FAIL: AWS CLI v2 install needs root or sudo (uid=$(id -u))"
+      echo -e "  ${RED}❌ AWS CLI v2 install needs root or sudo.${NC}"
+      echo "     Full detail is in $LOGFILE"
+      exit 1
+    fi
+  fi
+  _aws_tmp="$(mktemp -d)"
+  _aws_ok=0
+  if [ "$_aws_os" = "Linux" ]; then
+    case "$_aws_arch" in
+      x86_64) _aws_url="https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" ;;
+      aarch64|arm64) _aws_url="https://awscli.amazonaws.com/awscli-exe-linux-aarch64.zip" ;;
+      *) _aws_url="" ;;
+    esac
+    if [ -z "$_aws_url" ]; then
+      _dlog "FAIL: unsupported Linux arch $_aws_arch"
+      echo -e "  ${RED}❌ AWS CLI v2 has no installer for Linux $_aws_arch.${NC}"
+      echo "     Full detail is in $LOGFILE"
+      rm -rf "$_aws_tmp"
+      exit 1
+    fi
+    if ! command -v curl >/dev/null 2>&1 || ! command -v unzip >/dev/null 2>&1; then
+      _dlog "FAIL: curl or unzip missing"
+      echo -e "  ${RED}❌ AWS CLI v2 install needs curl and unzip.${NC}"
+      echo "     Full detail is in $LOGFILE"
+      rm -rf "$_aws_tmp"
+      exit 1
+    fi
+    if curl -fsSL "$_aws_url" -o "$_aws_tmp/awscliv2.zip" \
+        && unzip -q "$_aws_tmp/awscliv2.zip" -d "$_aws_tmp" \
+        && $AWS_SUDO "$_aws_tmp/aws/install" --update; then
+      _aws_ok=1
+    fi
+  elif [ "$_aws_os" = "Darwin" ]; then
+    if ! command -v curl >/dev/null 2>&1; then
+      _dlog "FAIL: curl missing"
+      echo -e "  ${RED}❌ AWS CLI v2 install needs curl.${NC}"
+      echo "     Full detail is in $LOGFILE"
+      rm -rf "$_aws_tmp"
+      exit 1
+    fi
+    if curl -fsSL "https://awscli.amazonaws.com/AWSCLIV2.pkg" -o "$_aws_tmp/AWSCLIV2.pkg" \
+        && $AWS_SUDO installer -pkg "$_aws_tmp/AWSCLIV2.pkg" -target /; then
+      _aws_ok=1
+    fi
+  else
+    _dlog "FAIL: unsupported OS $_aws_os"
+    echo -e "  ${RED}❌ AWS CLI v2 install does not support $_aws_os.${NC}"
+    echo "     Full detail is in $LOGFILE"
+    rm -rf "$_aws_tmp"
+    exit 1
+  fi
+  rm -rf "$_aws_tmp"
+  _aws_ver="$(aws --version 2>&1 || true)"
+  _dlog "aws version after install: ${_aws_ver:-<none>} ok=$_aws_ok"
+  if [ "$_aws_ok" -ne 1 ] || ! printf '%s' "$_aws_ver" | grep -q "aws-cli/2"; then
+    echo -e "  ${RED}❌ AWS CLI v2 install failed.${NC}"
+    echo "     Full detail is in $LOGFILE"
+    exit 1
+  fi
+  echo "  ✅ AWS CLI v2 installed ($_aws_ver)"
+fi
+echo ""
+
 # ── Frontend ─────────────────────────────────────────────────────────────────
 
 echo -e "${BOLD}Installing frontend dependencies...${NC}"

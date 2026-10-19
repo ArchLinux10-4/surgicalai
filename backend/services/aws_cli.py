@@ -140,6 +140,10 @@ def run_aws_cli(user_id: str, command: str) -> dict:
         env["AWS_ACCESS_KEY_ID"] = creds.get("access_key_id") or ""
         env["AWS_SECRET_ACCESS_KEY"] = creds.get("secret_access_key") or ""
         env["AWS_DEFAULT_REGION"] = creds.get("region") or "us-east-1"
+        # v2 pages through less and can auto-prompt. Either one hangs this
+        # captured 30s run. Empty pager and auto-prompt off keep stdout here.
+        env["AWS_PAGER"] = ""
+        env["AWS_CLI_AUTO_PROMPT"] = "off"
         token = creds.get("session_token") or ""
         if token:
             env["AWS_SESSION_TOKEN"] = token
