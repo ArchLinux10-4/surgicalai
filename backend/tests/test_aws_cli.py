@@ -74,3 +74,51 @@ def test_run_passes_key_in_env_not_argv(monkeypatch):
     assert captured["env"]["AWS_PAGER"] == ""
     assert captured["env"]["AWS_CLI_AUTO_PROMPT"] == "off"
     assert secret not in captured["argv"]
+
+
+def test_pasted_line_continuations_become_one_command(monkeypatch):
+    monkeypatch.setattr(aws_cli, "_load_creds", lambda uid: {
+        "access_key_id": "AKIAaaaaaaaaaaaaaaaa",
+        "secret_access_key": "secretvalue123456",
+        "region": "us-east-1",
+    })
+    monkeypatch.setattr(aws_cli.shutil, "which", lambda name: "/usr/bin/aws")
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = "ok"
+        stderr = ""
+
+    def _run(argv, **kwargs):
+        captured["argv"] = argv
+        return _Proc()
+
+    monkeypatch.setattr(aws_cli.subprocess, "run", _run)
+    pasted = (
+        "aws lambda get-function-configuration \\ "
+        "--function-name delivery-tracker-api \\ "
+        "--region us-east-2 \\ "
+        "--query 'Environment.Variables.OPENAI_API_KEY' \\ "
+        "--output text"
+    )
+    out = aws_cli.run_aws_cli("user-a", pasted)
+    assert out["exit_code"] == 0
+    assert " " not in captured["argv"]
+    assert captured["argv"][1:] == [
+        "lambda", "get-function-configuration",
+        "--function-name", "delivery-tracker-api",
+        "--region", "us-east-2",
+        "--query", "Environment.Variables.OPENAI_API_KEY",
+        "--output", "text",
+    ]
+
+    multiline = "aws sts get-caller-identity \\\n  --output text"
+    aws_cli.run_aws_cli("user-a", multiline)
+    assert captured["argv"][1:] == ["sts", "get-caller-identity", "--output", "text"]
+
+    started = []
+    monkeypatch.setattr(aws_cli.subprocess, "run", lambda *a, **k: started.append(1))
+    rejected = aws_cli.run_aws_cli("user-a", "aws s3 ls\necho hi")
+    assert rejected["exit_code"] == 1
+    assert started == []
