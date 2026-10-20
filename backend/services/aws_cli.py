@@ -96,6 +96,45 @@ def sts_identity(access_key_id: str, secret: str, region: str, session_token: st
     return {"account": ident.get("Account") or "", "arn": ident.get("Arn") or ""}
 
 
+def normalize_aws_command(command: str) -> str:
+    """Join shell line continuations into one command.
+
+    A pasted multi-line command keeps the backslash and the newline becomes
+    a space, so shlex turns each ``\\`` into a blank argument. AWS CLI then
+    reports ``Unknown options: , , ,``. Continuations outside quotes are
+    removed. A real newline that is not a continuation stays, and
+    ``_reject_command`` still refuses it.
+    """
+    text = (command or "").replace("\r\n", "\n").replace("\r", "\n")
+    out: list[str] = []
+    i = 0
+    quote = ""
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            nxt = text[i + 1] if i + 1 < len(text) else ""
+            if nxt == "\n" or nxt == "" or nxt in " \t":
+                i += 1
+                while i < len(text) and text[i] in " \t\n":
+                    i += 1
+                out.append(" ")
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out).strip()
+
+
 def _reject_command(command: str) -> str | None:
     raw = command or ""
     if not raw.strip():
@@ -114,6 +153,7 @@ def _reject_command(command: str) -> str | None:
 
 
 def run_aws_cli(user_id: str, command: str) -> dict:
+    command = normalize_aws_command(command)
     reason = _reject_command(command)
     if reason:
         return {"exit_code": 1, "stdout": "", "stderr": reason}

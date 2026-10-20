@@ -3,6 +3,38 @@ import { api } from '../api/client'
 import { useAppStore } from '../stores/appStore'
 import { AwsConnectModal } from './AwsConnectModal'
 
+/** Join pasted shell continuations. Mirrors backend normalize_aws_command. */
+function normalizeAwsCommand(command: string): string {
+  const text = command.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  let out = ''
+  let quote = ''
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (quote) {
+      out += ch
+      if (ch === quote) quote = ''
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      out += ch
+      continue
+    }
+    if (ch === '\\') {
+      const nxt = i + 1 < text.length ? text[i + 1] : ''
+      if (nxt === '\n' || nxt === '' || nxt === ' ' || nxt === '\t') {
+        i += 1
+        while (i < text.length && (text[i] === ' ' || text[i] === '\t' || text[i] === '\n')) i += 1
+        i -= 1
+        out += ' '
+        continue
+      }
+    }
+    out += ch
+  }
+  return out.trim()
+}
+
 export function AwsTerminalPanel() {
   const activeSessions = useAppStore(s => s.activeSessions)
   const lines = useAppStore(s => s.awsTerminalLines)
@@ -20,7 +52,7 @@ export function AwsTerminalPanel() {
   const visible = lines.filter(l => !activeSessions || l.sessionId === activeSessions)
 
   const run = async () => {
-    const typed = draft.trim()
+    const typed = normalizeAwsCommand(draft)
     if (!typed || busy) return
     const command = typed.startsWith('aws ') ? typed : `aws ${typed}`
     setDraft('')
@@ -89,6 +121,15 @@ export function AwsTerminalPanel() {
           value={draft}
           disabled={busy}
           onChange={(e) => setDraft(e.target.value)}
+          onPaste={(e) => {
+            const text = e.clipboardData.getData('text')
+            if (!/[\n\r\\]/.test(text)) return
+            e.preventDefault()
+            const el = e.currentTarget
+            const start = el.selectionStart ?? draft.length
+            const end = el.selectionEnd ?? draft.length
+            setDraft(normalizeAwsCommand(draft.slice(0, start) + text + draft.slice(end)))
+          }}
         />
       </form>
     </div>
