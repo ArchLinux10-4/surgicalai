@@ -247,9 +247,12 @@ def _build_responses_kwargs(model: str, messages: list, kwargs: dict, dlog):
             dlog("gpt_responses_unmapped_tool_choice", tool_choice=str(tc)[:100])
             return None
 
+    if kwargs.get("prompt_cache_key"):
+        rk["prompt_cache_key"] = kwargs["prompt_cache_key"]
+
     # Any kwargs we don't explicitly map → fall back rather than guess.
     _handled = {"max_completion_tokens", "reasoning_effort", "response_format",
-                "tools", "tool_choice", "stream"}
+                "tools", "tool_choice", "stream", "prompt_cache_key"}
     _unmapped = [k for k in kwargs if k not in _handled]
     if _unmapped:
         dlog("gpt_responses_unmapped_kwargs", unmapped=_unmapped)

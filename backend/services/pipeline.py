@@ -1323,6 +1323,11 @@ def _is_gemini_model(model: str) -> bool:
 # gains no duplicated provider logic. Same call shape as the two matchers
 # above: _is_grok_model("grok-4.5") -> True.
 from services.grok_provider import _is_grok_model, get_grok_client, strip_unsupported_params  # noqa: E402
+from services.prompt_cache import (  # noqa: E402
+    claude_cache_control,
+    claude_system_blocks,
+    openai_prompt_cache_kwargs,
+)
 # Gap #2: pull in the already-built (previously orphaned) 429 classification
 # helpers so _friendly_error can surface the exact billing-cap copy. Additive
 # only — the import line above is untouched.
@@ -2147,13 +2152,15 @@ def _friendly_error(e: Exception) -> str:
     return f"Something went wrong. Please try again in a moment. *(Detail: {short})*"
 
 
-def _chat_create(client: OpenAI, model: str, messages: list, temperature: float = 0.3, **kwargs):
+def _chat_create(client: OpenAI, model: str, messages: list, temperature: float = 0.3, session_id: str = "", **kwargs):
     """Wrapper around client.chat.completions.create that drops temperature
     for reasoning models and injects reasoning_effort when configured.
     Also injects max_completion_tokens for reasoning models that require it.
     Retries automatically on transient API errors (429, 500, 503, overloaded)."""
     from services.api_retry import api_call_with_retry as _base_api_call_with_retry
     base_model = model.split(":")[0].lower()
+    for _ck, _cv in openai_prompt_cache_kwargs(model, session_id).items():
+        kwargs.setdefault(_ck, _cv)
     # Gap D: _chat_create is the single shared choke point (~24 call sites:
     # architect turns, corrections, QA, Surgeon, lint-fix, etc.) for every
     # provider that uses the OpenAI SDK shape. Plain api_call_with_retry
@@ -4832,6 +4839,7 @@ async def run_chat_stream(
                     _oai_client, model=chat_model, messages=_oai_msgs,
                     temperature=float(get_setting("temperature_architect", "0.0")),
                     stream=True,
+                    session_id=session_id or "",
                 )
                 _round_text = ""
                 for _chunk in _iter_openai_stream_chunks(_oai_stream, model=chat_model,
@@ -5050,8 +5058,11 @@ async def run_chat_stream(
                 _claude_kwargs = {
                     "model": chat_model,
                     "max_tokens": _max_output_tokens(chat_model),
-                    "system": _sys_text or "You are a helpful assistant.",
+                    "system": claude_system_blocks(
+                        _sys_text or "You are a helpful assistant."
+                    ),
                     "messages": _claude_msgs,
+                    "cache_control": claude_cache_control(),
                 }
                 _claude_kwargs.update(_get_thinking_kwargs(chat_model, 8000))
                 _claude_kwargs.update(_get_effort_kwargs(chat_model))
@@ -5197,7 +5208,8 @@ async def run_chat_stream(
                 model=chat_model,
                 messages=all_messages,
                 temperature=float(get_setting("temperature_architect", "0.0")),
-                stream=True
+                stream=True,
+                session_id=session_id or "",
             )
             for chunk in _iter_openai_stream_chunks(stream, model=chat_model,
                                                      session_id=session_id, user_id=user_id):
@@ -8207,7 +8219,7 @@ async def analyze_and_plan_stream(
             model_kwargs = {
                 "model": architect_model,
                 "max_tokens": _max_output_tokens(architect_model),
-                "system": CLAUDE_EDITOR_SYSTEM,
+                "system": claude_system_blocks(CLAUDE_EDITOR_SYSTEM),
                 "messages": messages,
             }
             model_kwargs.update(_get_thinking_kwargs(architect_model, 8000))
@@ -8263,7 +8275,7 @@ async def analyze_and_plan_stream(
                     _retry_kwargs = {
                         "model": architect_model,
                         "max_tokens": _retry_max,
-                        "system": CLAUDE_EDITOR_SYSTEM,
+                        "system": claude_system_blocks(CLAUDE_EDITOR_SYSTEM),
                         "messages": messages,
                     }
                     _retry_kwargs.update(
@@ -8331,6 +8343,7 @@ async def analyze_and_plan_stream(
                         _agent_oai_client, architect_model,
                         messages=_agent_gpt_messages,
                         response_format={"type": "json_object"},
+                        session_id=session_id or "",
                     )
                 )
                 full_text = _agent_oai_resp.choices[0].message.content or ""
@@ -8361,6 +8374,7 @@ async def analyze_and_plan_stream(
                         lambda: _chat_create(
                             _agent_oai_client, architect_model,
                             messages=_agent_gpt_messages,
+                            session_id=session_id or "",
                             **_gpt_retry_kwargs,
                         )
                     )
@@ -18380,6 +18394,7 @@ async def run_natural_pipeline_stream(
                     "max_tokens": _max_output_tokens(arch_model),
                     "system": system_prompt,
                     "messages": current_messages,
+                    "cache_control": claude_cache_control(),
                 }
                 stream_kwargs.update(_get_thinking_kwargs(arch_model, 10000))
                 stream_kwargs.update(_get_effort_kwargs(arch_model))
@@ -18739,6 +18754,7 @@ async def run_natural_pipeline_stream(
                         else:
                             _gpt_stream = _chat_create(
                                 _gpt_client, model=arch_model,
+                                session_id=session_id or "",
                                 **_gpt_call_kwargs,
                             )
                         for _gpt_chunk in _iter_openai_stream_chunks(_gpt_stream, model=arch_model,
