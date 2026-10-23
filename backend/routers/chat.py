@@ -122,10 +122,29 @@ _ASK_DIRECTIVE = (
     "produce code edits, diffs, or <surgical_edit> tags — respond in clear "
     "markdown prose only."
 )
+_PLAN_QUESTION_RULE = (
+    "Before planning, if a choice would change files, approach, or scope and the "
+    "user message plus the code do not already decide it, stop and ask. Emit ONLY "
+    "a ```clarifying_questions fence with 1 to 5 questions. Each question has "
+    "exactly 3 options and recommendedId set to the option you would pick. Do not "
+    "emit implementation_plan in that reply. If nothing material is ambiguous, do "
+    "not ask — emit the implementation_plan fence as usual. If the user message "
+    "contains \"Clarifying answers (Plan):\", do not ask again. Treat "
+    "\"Skipped — decide yourself\" as permission to choose, and emit the "
+    "implementation_plan fence. Example:\n"
+    "```clarifying_questions\n"
+    "{\"questions\":[{\"id\":\"q1\",\"prompt\":\"...\",\"recommendedId\":\"a\","
+    "\"options\":[{\"id\":\"a\",\"label\":\"...\"},{\"id\":\"b\",\"label\":\"...\"},"
+    "{\"id\":\"c\",\"label\":\"...\"}]}]}\n"
+    "```\n"
+)
+
 _PLAN_DIRECTIVE = (
     "You are in PLAN mode. Produce a detailed, step-by-step implementation plan "
     "for the user's request. Reference specific files, functions, and line "
-    "numbers from the provided code. Use this structure:\n"
+    "numbers from the provided code. "
+    + _PLAN_QUESTION_RULE
+    + "When you are writing the plan (not asking), use this structure:\n"
     "## Overview\nBrief summary of the approach.\n\n"
     "## Best practices\nConventions, error handling, tests, and what not to touch.\n\n"
     "## Steps\n"
@@ -148,7 +167,9 @@ _PLAN_DIRECTIVE = (
 )
 
 _PLAN_JSON_TRAILER = (
-    "\n\n[PLAN MODE — required] Include ## Best practices and a fenced code "
+    "\n\n[PLAN MODE — required] "
+    + _PLAN_QUESTION_RULE
+    + "When not asking: include ## Best practices and a fenced code "
     "example under each step. End with a ```implementation_plan JSON fence "
     "listing every step as {\"filename\",\"symbol\",\"description\"}. "
     "Do NOT produce <surgical_edit> tags."
@@ -1421,9 +1442,14 @@ async def smart_stream(req: dict, request: Request):
 
             # Prepend the mode directive to the current (last) user turn so every
             # backend — Anthropic, OpenAI, Gemini, Ollama — sees it identically.
+            # Keep the raw text: the Plan directive itself mentions the
+            # "Clarifying answers (Plan):" marker, so the answers-round check
+            # must not search the prepended copy.
+            _raw_user_text = ""
             if _mode_messages and _mode_messages[-1].get("role") == "user":
+                _raw_user_text = _mode_messages[-1].get("content") or ""
                 _mode_messages[-1]["content"] = (
-                    f"{_directive}\n\n{_mode_messages[-1]['content']}"
+                    f"{_directive}\n\n{_raw_user_text}"
                 )
             else:
                 _mode_messages.append({"role": "user", "content": _directive})
@@ -1495,6 +1521,7 @@ async def smart_stream(req: dict, request: Request):
                                 # Missing fence: swallow this done and retry once.
                                 if _eff_mode == "plan" and not _mode_error:
                                     from services.plan_artifact import (
+                                        parse_clarifying_questions,
                                         parse_implementation_plan,
                                         latest_plan_run,
                                     )
@@ -1504,13 +1531,23 @@ async def smart_stream(req: dict, request: Request):
                                         _plan_event = _persist_plan_event(_early)
                                         if _plan_event:
                                             yield "data: " + _json.dumps(_plan_event) + "\n\n"
-                                    elif parse_implementation_plan(_early) is None:
-                                        _plan_needs_retry = True
-                                        continue
                                     else:
-                                        _plan_event = _persist_plan_event(_early)
-                                        if _plan_event:
-                                            yield "data: " + _json.dumps(_plan_event) + "\n\n"
+                                        _answers_round = "Clarifying answers (Plan):" in _raw_user_text
+                                        _questions = None
+                                        if not _answers_round:
+                                            _questions = parse_clarifying_questions(_early)
+                                        if _questions:
+                                            yield "data: " + _json.dumps({
+                                                "type": "plan_questions",
+                                                "questions": _questions,
+                                            }) + "\n\n"
+                                        elif parse_implementation_plan(_early) is None:
+                                            _plan_needs_retry = True
+                                            continue
+                                        else:
+                                            _plan_event = _persist_plan_event(_early)
+                                            if _plan_event:
+                                                yield "data: " + _json.dumps(_plan_event) + "\n\n"
                         except Exception:
                             pass
                     yield _mchunk

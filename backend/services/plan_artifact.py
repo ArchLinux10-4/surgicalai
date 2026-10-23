@@ -21,6 +21,14 @@ _FENCE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_QUESTIONS_RE = re.compile(
+    r"```clarifying_questions\s*([\s\S]*?)```",
+    re.IGNORECASE,
+)
+_MAX_QUESTIONS = 5
+_PROMPT_CAP = 240
+_LABEL_CAP = 120
+
 # Cap so one huge plan cannot blow the prompt (outside the 4000-char history trim).
 PLAN_MARKDOWN_PROMPT_CAP = 48_000
 
@@ -72,6 +80,78 @@ def parse_implementation_plan(text: str) -> list[dict] | None:
             "description": description or f"Update {symbol} in {filename}",
         })
     return steps or None
+
+
+def parse_clarifying_questions(text: str) -> list[dict] | None:
+    """Normalized clarifying questions, or None if the fence is missing or empty.
+
+    Accepts only a ```clarifying_questions fence whose JSON is
+    ``{"questions": [...]}``. Each kept question has a non-empty id, a
+    prompt, and exactly three options. More than five questions are
+    truncated. A question that fails validation is dropped. If
+    ``recommendedId`` is missing or unknown, the first option is used and
+    moved to index 0.
+    """
+    if not (text or "").strip():
+        return None
+    m = _QUESTIONS_RE.search(text)
+    if not m:
+        return None
+    raw = (m.group(1) or "").strip()
+    if not raw:
+        return None
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    items = payload.get("questions")
+    if not isinstance(items, list) or not items:
+        return None
+
+    kept: list[dict] = []
+    seen_ids: set[str] = set()
+    for item in items:
+        if len(kept) >= _MAX_QUESTIONS:
+            break
+        if not isinstance(item, dict):
+            continue
+        qid = str(item.get("id") or "").strip()
+        prompt = str(item.get("prompt") or "").strip()[:_PROMPT_CAP]
+        options_raw = item.get("options")
+        if not qid or not prompt or qid in seen_ids:
+            continue
+        if not isinstance(options_raw, list) or len(options_raw) != 3:
+            continue
+        options: list[dict] = []
+        option_ids: set[str] = set()
+        bad = False
+        for opt in options_raw:
+            if not isinstance(opt, dict):
+                bad = True
+                break
+            oid = str(opt.get("id") or "").strip()
+            label = str(opt.get("label") or "").strip()[:_LABEL_CAP]
+            if not oid or not label or oid in option_ids:
+                bad = True
+                break
+            option_ids.add(oid)
+            options.append({"id": oid, "label": label})
+        if bad:
+            continue
+        recommended = str(item.get("recommendedId") or "").strip()
+        if recommended not in option_ids:
+            recommended = options[0]["id"]
+        options.sort(key=lambda o: 0 if o["id"] == recommended else 1)
+        seen_ids.add(qid)
+        kept.append({
+            "id": qid,
+            "prompt": prompt,
+            "recommendedId": recommended,
+            "options": options,
+        })
+    return kept or None
 
 
 def steps_to_task_payloads(steps: list[dict]) -> list[dict]:

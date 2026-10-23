@@ -16,6 +16,7 @@ _BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _BACKEND)
 
 from services.plan_artifact import (  # noqa: E402
+    parse_clarifying_questions,
     parse_implementation_plan,
     compute_plan_coverage,
     persist_plan_from_assistant_text,
@@ -79,6 +80,52 @@ def test_parse_missing_or_invalid_returns_none():
     assert parse_implementation_plan(
         "```implementation_plan\n{\"steps\": [{\"filename\": \"a.py\"}]}\n```"
     ) is None
+
+
+def _q(qid: str, recommended: str = "a") -> dict:
+    return {
+        "id": qid,
+        "prompt": f"Question {qid}?",
+        "recommendedId": recommended,
+        "options": [
+            {"id": "a", "label": "Alpha"},
+            {"id": "b", "label": "Beta"},
+            {"id": "c", "label": "Gamma"},
+        ],
+    }
+
+
+def _questions_fence(questions: list[dict]) -> str:
+    return "```clarifying_questions\n" + json.dumps({"questions": questions}) + "\n```"
+
+
+def test_parse_clarifying_questions_valid_moves_recommended_first():
+    parsed = parse_clarifying_questions(_questions_fence([_q("q1", "c")]))
+    assert parsed is not None and len(parsed) == 1
+    assert parsed[0]["recommendedId"] == "c"
+    assert parsed[0]["options"][0]["id"] == "c"
+    assert [o["id"] for o in parsed[0]["options"]] == ["c", "a", "b"]
+
+
+def test_parse_clarifying_questions_keeps_first_five():
+    parsed = parse_clarifying_questions(_questions_fence([_q(f"q{i}") for i in range(6)]))
+    assert parsed is not None
+    assert len(parsed) == 5
+    assert [q["id"] for q in parsed] == ["q0", "q1", "q2", "q3", "q4"]
+
+
+def test_parse_clarifying_questions_drops_short_option_list():
+    bad = _q("bad")
+    bad["options"] = bad["options"][:2]
+    parsed = parse_clarifying_questions(_questions_fence([bad, _q("good")]))
+    assert parsed is not None
+    assert [q["id"] for q in parsed] == ["good"]
+
+
+def test_parse_clarifying_questions_bad_json_is_none():
+    assert parse_clarifying_questions("```clarifying_questions\nnot-json\n```") is None
+    assert parse_clarifying_questions("just markdown") is None
+    assert parse_clarifying_questions("```json\n{\"questions\": []}\n```") is None
 
 
 def test_coverage_missing_and_skipped():

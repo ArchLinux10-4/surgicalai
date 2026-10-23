@@ -64,6 +64,8 @@ def test_mode_directive_ask_and_plan_forbid_edits():
     for d in (ask, plan):
         assert "surgical_edit" in d  # explicit "do NOT produce <surgical_edit>"
     assert "implementation_plan" in plan
+    assert "clarifying_questions" in plan
+    assert "clarifying_questions" not in ask
     assert "Best practices" in plan
     assert "code example" in plan.lower() or "fenced code" in plan.lower()
     assert chat_router._mode_directive("edit") == ""
@@ -159,6 +161,79 @@ def test_ask_plan_never_touch_edit_pipeline(_mock_backends, mode):
             (sid,),
         ).fetchall()
     assert any("ANSWER" in (r["content"] or "") for r in rows)
+
+
+_QUESTION_FENCE = (
+    "```clarifying_questions\n"
+    '{"questions":[{"id":"q1","prompt":"Where?","recommendedId":"a",'
+    '"options":[{"id":"a","label":"Here"},{"id":"b","label":"There"},'
+    '{"id":"c","label":"Both"}]}]}\n'
+    "```"
+)
+
+
+def test_plan_questions_skip_fence_retry(monkeypatch, _mock_backends):
+    """A valid clarifying_questions fence is one chat call and no checklist."""
+    async def _questions(messages, **kwargs):
+        _mock_backends["chat_stream"] += 1
+        yield 'data: {"type": "token", "content": ' + __import__("json").dumps(_QUESTION_FENCE) + '}\n\n'
+        yield 'data: {"type": "done", "content": "", "model": "claude-sonnet-4-20250514"}\n\n'
+
+    monkeypatch.setattr(chat_router, "run_chat_stream", _questions)
+    # Fixture already counted nothing yet; reset so this test's generator is the only increment.
+    _mock_backends["chat_stream"] = 0
+
+    sid = _seed_session()
+    resp = _run(chat_router.smart_stream(
+        {"session_id": sid, "message": "Add a banner somewhere", "mode": "plan"},
+        _FakeRequest(),
+    ))
+    body = _run(_drain(resp))
+
+    assert _mock_backends["chat_stream"] == 1
+    assert '"type": "plan_questions"' in body
+    assert "plan_missing" not in body
+    assert _mock_backends["pipeline"] == 0
+    assert '"type": "done"' in body
+    with database.get_db_ctx() as conn:
+        rows = conn.execute(
+            "SELECT content FROM chat_messages WHERE session_id = ? AND role = 'assistant'",
+            (sid,),
+        ).fetchall()
+        tasks = conn.execute(
+            "SELECT source FROM agent_tasks WHERE session_id = ?",
+            (sid,),
+        ).fetchall()
+    assert any("clarifying_questions" in (r["content"] or "") for r in rows)
+    assert not any((t["source"] or "") == "plan" for t in tasks)
+
+
+def test_plan_answers_round_does_not_accept_another_question_card(monkeypatch, _mock_backends):
+    """A second question fence after Clarifying answers takes the plan-fence retry."""
+    async def _questions(messages, **kwargs):
+        _mock_backends["chat_stream"] += 1
+        yield 'data: {"type": "token", "content": ' + __import__("json").dumps(_QUESTION_FENCE) + '}\n\n'
+        yield 'data: {"type": "done", "content": "", "model": "claude-sonnet-4-20250514"}\n\n'
+
+    monkeypatch.setattr(chat_router, "run_chat_stream", _questions)
+    _mock_backends["chat_stream"] = 0
+
+    sid = _seed_session()
+    resp = _run(chat_router.smart_stream(
+        {
+            "session_id": sid,
+            "message": (
+                "Clarifying answers (Plan):\n"
+                "1. [q1] Where?\n"
+                "   Answer: Skipped — decide yourself"
+            ),
+            "mode": "plan",
+        },
+        _FakeRequest(),
+    ))
+    _run(_drain(resp))
+    assert _mock_backends["chat_stream"] == 2
+    assert _mock_backends["pipeline"] == 0
 
 
 def test_ask_mode_error_path_is_graceful(monkeypatch, _mock_backends):

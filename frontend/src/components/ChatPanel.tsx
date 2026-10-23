@@ -11,6 +11,7 @@ import { SessionFilesTray } from './SessionFilesTray'
 import { PickedElementsTray } from './PickedElementsTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker } from './PlanTracker'
+import { PlanQuestionsCard } from './PlanQuestionsCard'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AdsClick, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Lock, Psychology, Search, Security, Send, Warning } from '@mui/icons-material';
@@ -70,13 +71,13 @@ function stripInternalTags(text: string, streaming = false): string {
   let result = text
     .replace(/<edit_plan>[\s\S]*?<\/edit_plan>/g, '')
     .replace(/<search_request>[\s\S]*?<\/search_request>/g, '')
-    .replace(/```(?:implementation_plan|plan-json)[\s\S]*?```/gi, '')
+    .replace(/```(?:implementation_plan|plan-json|clarifying_questions)[\s\S]*?```/gi, '')
   if (streaming) {
     // During streaming: hide from start of any incomplete opening tag
     result = result
       .replace(/<edit_plan>[\s\S]*$/, '')
       .replace(/<search_request>[\s\S]*$/, '')
-      .replace(/```(?:implementation_plan|plan-json)[\s\S]*$/, '')
+      .replace(/```(?:implementation_plan|plan-json|clarifying_questions)[\s\S]*$/, '')
   }
   return result.trim()
 }
@@ -531,7 +532,14 @@ function CompactMarkerChip({ msg }: { msg: any }) {
   )
 }
 
-function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: string; onRetryWithQA?: (reportText: string) => void }) {
+function Message({ msg, sessionId, onRetryWithQA, laterText, planAnswersDisabled, onSubmitPlanAnswers }: {
+  msg: any
+  sessionId: string
+  onRetryWithQA?: (reportText: string) => void
+  laterText?: string
+  planAnswersDisabled?: boolean
+  onSubmitPlanAnswers?: (body: string) => void
+}) {
   const isUser = msg.role === 'user'
   const isSurgical = msg.message_type === 'surgical_result'
   const isNaturalResult = msg.message_type === 'natural_result'
@@ -702,6 +710,15 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
               {stripInternalTags(msg.content)}
             </ReactMarkdown>
           </div>
+        )}
+
+        {onSubmitPlanAnswers && (
+          <PlanQuestionsCard
+            content={msg.content || ''}
+            laterText={laterText || ''}
+            disabled={!!planAnswersDisabled}
+            onContinue={onSubmitPlanAnswers}
+          />
         )}
 
         {/* Copy button — hover-reveal, bottom-right of AI bubble */}
@@ -2363,6 +2380,7 @@ export function ChatPanel() {
       // onPlan — Chat Plan tracker. Must NOT go through onTask / pendingRunRef.
       (event) => {
         if (useAppStore.getState().activeSessions !== sessionId) return
+        if (event?.type === 'plan_questions') return
         applyPlanEvent(event)
         if (event?.type === 'plan_unchanged' && event.reason === 'invalid_json') {
           toast.error('Plan not updated', 'The model did not emit a valid implementation_plan. Previous checklist kept.')
@@ -2962,7 +2980,18 @@ export function ChatPanel() {
         ) : (
           <div className="py-2">
             {messages.map((msg, i) => (
-              <Message key={msg.id || i} msg={msg} sessionId={msg.session_id || activeSessions || ''} onRetryWithQA={handleSend} />
+              <Message
+                key={msg.id || i}
+                msg={msg}
+                sessionId={msg.session_id || activeSessions || ''}
+                onRetryWithQA={handleSend}
+                laterText={messages.slice(i + 1).map(m => m.content || '').join('\n')}
+                planAnswersDisabled={isStreaming}
+                onSubmitPlanAnswers={(body) => {
+                  selectChatMode('plan')
+                  handleSend(body)
+                }}
+              />
             ))}
             {resumableRun && resumableRun.sid === activeSessions && !isStreaming && (
               <div className="mx-3 mb-2 flex items-center justify-between gap-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5 animate-slide-up">

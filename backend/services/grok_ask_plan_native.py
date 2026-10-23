@@ -122,7 +122,15 @@ def build_grok_ask_plan_reinforcement(mode: str) -> str:
             "before the fence). Those examples are illustrative only."
         )
         plan_json = (
-            " You MUST end with a fenced ```implementation_plan JSON block "
+            " Before planning, if a choice would change files, approach, or scope "
+            "and the user message plus the code do not already decide it, stop and "
+            "ask. Emit ONLY a ```clarifying_questions fence with 1 to 5 questions. "
+            "Each question has exactly 3 options and recommendedId set to the option "
+            "you would pick. Do not emit implementation_plan in that reply. If nothing "
+            "material is ambiguous, do not ask. If the user message contains "
+            "\"Clarifying answers (Plan):\", do not ask again. Treat "
+            "\"Skipped — decide yourself\" as permission to choose. "
+            "Otherwise you MUST end with a fenced ```implementation_plan JSON block "
             "listing every step as {\"filename\",\"symbol\",\"description\"}. "
             "No edits — the fence is the machine-readable plan only."
         )

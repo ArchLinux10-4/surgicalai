@@ -61,11 +61,16 @@ def _dlog(event: str, **kwargs):
         # guard — emit() writes via get_db_ctx(), whose open/close fires THIS
         # _dlog again; that inner call is detected as reentrant and degrades
         # to the /tmp line only, so we never recurse into a second DB write.
-        try:
-            import debug_events as _debug_events
-            _debug_events.emit(event, **kwargs)
-        except Exception:
-            pass  # forwarding must NEVER affect a real DB operation
+        # db_open / db_close fire from inside get_db(), which is what emit()
+        # uses. Forwarding those events opens a second connection while the
+        # first is still being constructed and deadlocks SQLite. The /tmp
+        # line above already recorded them.
+        if event not in ("db_open", "db_open_failed", "db_close_failed", "db_open_count_high_possible_leak"):
+            try:
+                import debug_events as _debug_events
+                _debug_events.emit(event, **kwargs)
+            except Exception:
+                pass  # forwarding must NEVER affect a real DB operation
     except Exception:
         pass  # logging must never break a DB call
 
@@ -218,7 +223,10 @@ def get_db():
             conn = CompatConn(DATABASE_URL)
         else:
             DB_DIR.mkdir(parents=True, exist_ok=True)
-            conn = sqlite3.connect(str(DB_PATH))
+            # Short busy wait so a nested debug-log write cannot stall the
+            # request thread. Callers that hit "database is locked" already
+            # catch it (debug logging) or surface it as a normal DB error.
+            conn = sqlite3.connect(str(DB_PATH), timeout=1.0)
             conn.row_factory = sqlite3.Row
     except Exception as e:
         _dlog("db_open_failed", driver=("postgres" if USE_POSTGRES else "sqlite"),

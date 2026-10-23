@@ -566,6 +566,7 @@ export const api = {
             chunk.type === 'plan_ready' || chunk.type === 'plan_updated' ||
             chunk.type === 'plan_unchanged' || chunk.type === 'plan_locked' ||
             chunk.type === 'plan_coverage' || chunk.type === 'plan_missing' ||
+            chunk.type === 'plan_questions' ||
             chunk.type === 'plan_failed'
           ) onPlan?.(chunk)
         } catch {}
@@ -788,6 +789,7 @@ export const api = {
               chunk.type === 'plan_ready' || chunk.type === 'plan_updated' ||
               chunk.type === 'plan_unchanged' || chunk.type === 'plan_locked' ||
               chunk.type === 'plan_coverage' || chunk.type === 'plan_missing' ||
+              chunk.type === 'plan_questions' ||
               chunk.type === 'plan_failed'
             ) onPlan?.(chunk)
           } catch {}
