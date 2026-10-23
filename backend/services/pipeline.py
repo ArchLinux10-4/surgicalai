@@ -4421,12 +4421,8 @@ def _ask_plan_build_tool_instructions(
         )
 
     if aws_enabled:
-        tag_blocks.append(
-            "You can run one AWS CLI command for the connected account. "
-            "Pass the full command, starting with aws. Read-only commands "
-            "are preferred. The user can see the command and its output.\n\n"
-            "<aws_cli>aws s3 ls</aws_cli>"
-        )
+        from services.aws_cli import aws_agent_guidance
+        tag_blocks.append(aws_agent_guidance())
 
     parts.append("\n\n".join(tag_blocks))
     parts.append(
@@ -18226,6 +18222,10 @@ async def run_natural_pipeline_stream(
             return None
 
         # ---- Unified instruction: every tool is legal on every turn, no phase wall ----
+        _aws_guidance = ""
+        if _aws_connected:
+            from services.aws_cli import aws_agent_guidance as _aws_agent_guidance
+            _aws_guidance = "\n" + _aws_agent_guidance() + "\n"
         _AGENT_INSTRUCTION = (
             "\n\n[AGENTIC EDIT MODE]\n"
             "Complete this task autonomously. You decide what you need and when.\n\n"
@@ -18236,7 +18236,7 @@ async def run_natural_pipeline_stream(
             "JSON array of exact filenames, e.g. "
             "<file_request>[\"file1.py\", \"file2.tsx\"]</file_request>.\n"
             + ("• <github_request> — read from the connected GitHub repository.\n" if _gh_nat_enabled else "")
-            + ("• <aws_cli> — one AWS CLI command starting with aws, only when AWS is connected.\n" if _aws_connected else "")
+            + _aws_guidance
             + ("• <history_request>{\"filename\": \"...\", \"query\": \"optional keyword\"} — "
                "look up an OLDER/original version of a file from THIS session's edit "
                "history. Omit query for the very first (pre-edit) version; include a "

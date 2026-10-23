@@ -424,14 +424,12 @@ def _schema_report_blocked():
 
 
 def _schema_aws_cli():
+    from services.aws_cli import aws_agent_guidance
     return {
         "type": "function",
         "function": {
             "name": TOOL_AWS_CLI,
-            "description": (
-                "Run one AWS CLI command for the connected account. "
-                "The command must start with aws."
-            ),
+            "description": aws_agent_guidance(),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1075,7 +1073,8 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     if history_enabled:
         lines.append("• request_history — read an older version of a session file.")
     if aws_enabled:
-        lines.append("• aws_cli — one AWS CLI command starting with aws.")
+        from services.aws_cli import aws_agent_guidance
+        lines.append("• aws_cli — " + aws_agent_guidance())
     lines.append(
         "• report_blocked — ONLY if you truly cannot proceed without context "
         "you cannot obtain.")

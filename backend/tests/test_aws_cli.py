@@ -122,3 +122,30 @@ def test_pasted_line_continuations_become_one_command(monkeypatch):
     rejected = aws_cli.run_aws_cli("user-a", "aws s3 ls\necho hi")
     assert rejected["exit_code"] == 1
     assert started == []
+
+
+def test_aws_agent_guidance_states_call_and_result_contract():
+    text = aws_cli.aws_agent_guidance()
+    for needle in (
+        "<aws_cli>",
+        '"command"',
+        "AWS CLI exit",
+        "stdout:",
+        "stderr:",
+        "254",
+        "--no-paginate",
+        "--query",
+        "aws <service> <operation>",
+        "aws configure",
+    ):
+        assert needle in text, needle
+
+
+def test_ask_plan_edit_agent_and_grok_use_shared_guidance():
+    services = os.path.join(_BACKEND, "services")
+    pipeline = open(os.path.join(services, "pipeline.py"), encoding="utf-8").read()
+    grok = open(os.path.join(services, "grok_agent_tools.py"), encoding="utf-8").read()
+    assert pipeline.count("aws_agent_guidance") >= 2
+    assert grok.count("aws_agent_guidance()") >= 2
+    assert "one AWS CLI command starting with aws" not in pipeline
+    assert "one AWS CLI command starting with aws" not in grok
