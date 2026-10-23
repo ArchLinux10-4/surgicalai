@@ -19,8 +19,8 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-MAX_QUESTIONS = 3
-MAX_OPTIONS = 2
+MAX_QUESTIONS = 5
+MAX_OPTIONS = 3
 MAX_QUESTION_CHARS = 200
 MAX_LABEL_CHARS = 60
 MAX_DESC_CHARS = 140
@@ -113,8 +113,6 @@ def parse_plan_questions(text: str) -> list[dict] | None:
         opt_seen: set[str] = set()
         has_recommended = False
         for opt in q.options:
-            if len(options) >= MAX_OPTIONS:
-                break
             if not opt.label or opt.label.casefold() in opt_seen:
                 continue
             opt_seen.add(opt.label.casefold())
@@ -125,6 +123,10 @@ def parse_plan_questions(text: str) -> list[dict] | None:
                 "description": opt.description,
                 "recommended": recommended,
             })
+        # Exactly three model-written choices. Skip and free text are UI controls.
+        if len(options) != MAX_OPTIONS:
+            continue
+        options.sort(key=lambda o: 0 if o["recommended"] else 1)
         out.append({
             "id": f"q{len(out) + 1}",
             "question": q.question,
@@ -185,8 +187,8 @@ _BLOCK_ALLOWED = (
     "3. A wrong guess would waste real work.\n"
     "Never ask about style, naming, whether to proceed, anything the user "
     "already stated, or anything you can decide yourself.\n"
-    "Limits: at most 3 questions (prefer 1). Each question is self-contained "
-    "and under 200 characters, with 1 or 2 mutually exclusive, concrete "
+    "Limits: at most 5 questions (prefer 1). Each question is self-contained "
+    "and under 200 characters, with exactly 3 mutually exclusive, concrete "
     "options; put the option you recommend first with \"recommended\": true. "
     "Do not add \"Other\" or \"Skip\" options — the UI provides free text and "
     "skip.\n"
@@ -204,7 +206,8 @@ _BLOCK_ALLOWED = (
     "[{\"label\": \"Extend /items\", \"description\": \"Touches "
     "routes/items.py only\", \"recommended\": true}, {\"label\": \"New "
     "/search endpoint\", \"description\": \"Adds routes/search.py and a "
-    "router entry\"}]}]}\n"
+    "router entry\"}, {\"label\": \"Client-side filter\", \"description\": "
+    "\"Filters the list already loaded\"}]}]}\n"
     "```\n"
     "Worth asking: two incompatible designs that change which files the plan "
     "edits. Not worth asking: variable naming or button colour — decide, then "

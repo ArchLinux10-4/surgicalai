@@ -65,10 +65,10 @@ export function normalizeQuestions(raw: unknown): PlanQuestion[] | null {
     out.push({
       id: typeof q.id === 'string' && q.id ? q.id : `q${out.length + 1}`,
       question,
-      options: options.slice(0, 2),
+      options: options.slice(0, 3),
     })
   }
-  return out.length ? out.slice(0, 3) : null
+  return out.length ? out.slice(0, 5) : null
 }
 
 /** Answers for every question, defaulting unanswered ones to skipped. */

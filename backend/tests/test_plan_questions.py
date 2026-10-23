@@ -34,6 +34,7 @@ def test_parse_valid_object_form():
         "options": [
             {"label": "Extend /items", "description": "routes/items.py", "recommended": True},
             {"label": "New /search"},
+            {"label": "Client filter"},
         ],
     }]})
     qs = parse_plan_questions(text)
@@ -43,25 +44,33 @@ def test_parse_valid_object_form():
         "options": [
             {"label": "Extend /items", "description": "routes/items.py", "recommended": True},
             {"label": "New /search", "description": "", "recommended": False},
+            {"label": "Client filter", "description": "", "recommended": False},
         ],
     }]
 
 
 def test_parse_bare_array_form():
-    qs = parse_plan_questions(_fence([{"question": "A?", "options": [{"label": "x"}]}]))
+    qs = parse_plan_questions(_fence([{"question": "A?", "options": [
+        {"label": "x"}, {"label": "y"}, {"label": "z"},
+    ]}]))
     assert qs and qs[0]["question"] == "A?"
 
 
 def test_parse_caps_questions_and_options_and_reassigns_ids():
     payload = {"questions": [
         {"id": "zzz", "question": f"Q{i}?",
-         "options": [{"label": f"o{j}"} for j in range(5)]}
+         "options": [{"label": f"o{j}"} for j in range(3)]}
         for i in range(6)
     ]}
+    payload["questions"].append({
+        "question": "Too few?",
+        "options": [{"label": "only"}, {"label": "two"}],
+    })
     qs = parse_plan_questions(_fence(payload))
-    assert len(qs) == MAX_QUESTIONS == 3
-    assert [q["id"] for q in qs] == ["q1", "q2", "q3"]
-    assert all(len(q["options"]) == MAX_OPTIONS == 2 for q in qs)
+    assert len(qs) == MAX_QUESTIONS == 5
+    assert [q["id"] for q in qs] == ["q1", "q2", "q3", "q4", "q5"]
+    assert all(len(q["options"]) == MAX_OPTIONS == 3 for q in qs)
+    assert all(q["question"] != "Too few?" for q in qs)
 
 
 def test_parse_only_first_recommended_kept():
@@ -70,15 +79,20 @@ def test_parse_only_first_recommended_kept():
         "options": [
             {"label": "a", "recommended": True},
             {"label": "b", "recommended": True},
+            {"label": "c"},
         ],
     }]}))
-    assert [o["recommended"] for o in qs[0]["options"]] == [True, False]
+    assert [o["recommended"] for o in qs[0]["options"]] == [True, False, False]
 
 
 def test_parse_truncates_long_strings_and_collapses_whitespace():
     qs = parse_plan_questions(_fence({"questions": [{
         "question": "x " * 400,
-        "options": [{"label": "L" * 300, "description": "d" * 500}],
+        "options": [
+            {"label": "L" * 300, "description": "d" * 500},
+            {"label": "b"},
+            {"label": "c"},
+        ],
     }]}))
     q = qs[0]
     assert len(q["question"]) <= 200
@@ -90,24 +104,35 @@ def test_parse_drops_empty_duplicate_and_non_dict_items():
     qs = parse_plan_questions(_fence({"questions": [
         {"question": "  "},
         "not a dict",
-        {"question": "Same?"},
-        {"question": "same?"},
-        {"question": "Other?", "options": [{"label": ""}, {"label": "k"}, {"label": "K"}]},
+        {"question": "Same?", "options": [{"label": "a"}, {"label": "b"}, {"label": "c"}]},
+        {"question": "same?", "options": [{"label": "a"}, {"label": "b"}, {"label": "c"}]},
+        {"question": "Other?", "options": [
+            {"label": ""}, {"label": "k"}, {"label": "K"}, {"label": "m"}, {"label": "n"},
+        ]},
     ]}))
     assert [q["question"] for q in qs] == ["Same?", "Other?"]
-    assert [o["label"] for o in qs[1]["options"]] == ["k"]
+    assert [o["label"] for o in qs[1]["options"]] == ["k", "m", "n"]
 
 
 def test_parse_recommended_must_be_literal_true():
     qs = parse_plan_questions(_fence({"questions": [{
-        "question": "Q?", "options": [{"label": "a", "recommended": "yes"}],
+        "question": "Q?", "options": [
+            {"label": "a", "recommended": "yes"},
+            {"label": "b"},
+            {"label": "c"},
+        ],
     }]}))
     assert qs[0]["options"][0]["recommended"] is False
 
 
-def test_parse_question_without_options_is_open_text():
-    qs = parse_plan_questions(_fence({"questions": [{"question": "Which DB?"}]}))
-    assert qs[0]["options"] == []
+def test_parse_question_without_three_options_is_dropped():
+    qs = parse_plan_questions(_fence({"questions": [
+        {"question": "Which DB?"},
+        {"question": "Keep?", "options": [
+            {"label": "a"}, {"label": "b"}, {"label": "c"},
+        ]},
+    ]}))
+    assert [q["question"] for q in qs] == ["Keep?"]
 
 
 @pytest.mark.parametrize("text", [
@@ -133,8 +158,8 @@ def test_block_allowed_has_gate_caps_and_exclusivity():
     b = plan_questions_block(True)
     assert "Default: do NOT ask" in b
     assert "ALL of these are true" in b
-    assert "at most 3 questions" in b
-    assert "1 or 2" in b
+    assert "at most 5 questions" in b
+    assert "exactly 3" in b
     assert "```plan_questions" in b
     assert "Never both" in b
 
@@ -245,7 +270,11 @@ Add a banner.
 
 QUESTION = {"questions": [{
     "question": "Extend /items or add /search?",
-    "options": [{"label": "Extend /items", "recommended": True}, {"label": "New /search"}],
+    "options": [
+        {"label": "Extend /items", "recommended": True},
+        {"label": "New /search"},
+        {"label": "Client filter"},
+    ],
 }]}
 
 

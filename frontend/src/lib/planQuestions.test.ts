@@ -46,15 +46,15 @@ describe('normalizeQuestions', () => {
     assert.equal(normalizeQuestions({}), null)
     assert.equal(normalizeQuestions([{ question: '  ' }, 'x']), null)
   })
-  it('caps to 3 questions and 2 options and fills ids', () => {
-    const raw = Array.from({ length: 5 }, (_, i) => ({
+  it('caps to 5 questions and 3 options and fills ids', () => {
+    const raw = Array.from({ length: 6 }, (_, i) => ({
       question: `Q${i}?`,
-      options: [{ label: 'a' }, { label: 'b' }, { label: 'c' }],
+      options: [{ label: 'a' }, { label: 'b' }, { label: 'c' }, { label: 'd' }],
     }))
     const out = normalizeQuestions(raw)!
-    assert.equal(out.length, 3)
-    assert.deepEqual(out.map((q) => q.id), ['q1', 'q2', 'q3'])
-    assert.ok(out.every((q) => q.options.length === 2))
+    assert.equal(out.length, 5)
+    assert.deepEqual(out.map((q) => q.id), ['q1', 'q2', 'q3', 'q4', 'q5'])
+    assert.ok(out.every((q) => q.options.length === 3))
   })
 })
 
