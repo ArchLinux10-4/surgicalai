@@ -33,8 +33,21 @@ export type SmartStreamHandlers = {
     message?: string
   }) => void
   onPlan?: (event: any) => void
-  onAwsCli?: (event: { command?: string; stdout?: string; stderr?: string; exit_code?: number }) => void
-  onAwsApproval?: (command: string, reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean) => void
+  onAwsCli?: (event: {
+    command?: string
+    stdout?: string
+    stderr?: string
+    exit_code?: number
+    level?: string
+    title?: string
+    target?: string
+    files?: { name: string; content: string }[]
+  }) => void
+  onAwsApproval?: (
+    command: string,
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean,
+    meta?: { level?: string; title?: string; target?: string },
+  ) => void
 }
 
 /** Fire-and-forget clientLog bridge for wrappers defined in this file.
@@ -563,7 +576,7 @@ export const api = {
               if (!sendToServer) return false
               sendToServer({ type: 'aws_cli_response', ...resp })
               return true
-            })
+            }, { level: chunk.level, title: chunk.title, target: chunk.target })
           }
           else if (chunk.type === 'file_needed_cleared') onFileCleared?.(chunk.filename)
           else if (

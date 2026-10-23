@@ -258,6 +258,7 @@ async def run_grok_ask_plan_native_stream(
          max_rounds=max_rounds, deadline_s=deadline_s)
 
     tool_round = 0
+    _aws_calls = 0
     while True:
         elapsed = time.time() - t0
         if elapsed >= deadline_s or tool_round >= max_rounds:
@@ -377,27 +378,20 @@ async def run_grok_ask_plan_native_stream(
         if translated.context_request is not None:
             tag_kind, body = translated.context_request
             if tag_kind == "aws":
-                from services.aws_cli import run_aws_cli, wait_aws_decision
-                yield _sse({"type": "aws_approval_needed", "command": str(body)[:500]})
-                approved = await wait_aws_decision(str(body), client_inbox)
-                if not approved:
-                    context_result = (
-                        "The user rejected this AWS command. Do not run it again unless they ask."
-                        if approved == "" else
-                        "AWS command was not run because this connection cannot ask the user to approve it."
-                    )
-                else:
-                    out = run_aws_cli(user_id, approved)
-                    yield _sse({
-                        "type": "aws_cli",
-                        "command": approved[:500],
-                        "stdout": out["stdout"],
-                        "stderr": out["stderr"],
-                        "exit_code": out["exit_code"],
-                    })
-                    context_result = (
-                        f"AWS CLI exit {out['exit_code']}.\nstdout:\n{out['stdout']}\nstderr:\n{out['stderr']}"
-                    )
+                from services.aws_cli import resolve_aws_call, split_intent
+                _aws_intent, _aws_cmd = split_intent(str(body))
+                _aws_done = {"note": "", "counted": False, "run": False}
+                async for _aws_ev in resolve_aws_call(
+                    _aws_cmd, _aws_intent, mode, _aws_calls, client_inbox,
+                    user_id=user_id, dlog=dlog, session_id=session_id or "",
+                ):
+                    if _aws_ev.get("type") == "aws_done":
+                        _aws_done = _aws_ev
+                    else:
+                        yield _sse(_aws_ev)
+                if _aws_done.get("counted"):
+                    _aws_calls += 1
+                context_result = _aws_done.get("note") or ""
             else:
                 yield _sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 context_result = _dispatch_context_request(
