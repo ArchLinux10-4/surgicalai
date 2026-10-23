@@ -59,8 +59,10 @@ def test_normalize_mode_accepts_known_modes_case_insensitive():
 def test_mode_directive_ask_and_plan_forbid_edits():
     ask = chat_router._mode_directive("ask")
     plan = chat_router._mode_directive("plan")
-    assert "ASK mode" in ask
-    assert "PLAN mode" in plan
+    assert "ASK mode" not in ask
+    assert "PLAN mode" not in plan
+    assert "which mode you are in" in ask
+    assert "which mode you are in" in plan
     for d in (ask, plan):
         assert "surgical_edit" in d  # explicit "do NOT produce <surgical_edit>"
     assert "implementation_plan" in plan

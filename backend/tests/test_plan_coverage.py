@@ -383,7 +383,8 @@ def test_plan_stream_emits_plan_ready_not_task_plan(stream_env):
 def test_directive_still_has_required_mode_selector_strings():
     from routers import chat as chat_router
     plan = chat_router._mode_directive("plan")
-    assert "PLAN mode" in plan
+    assert "PLAN mode" not in plan
+    assert "implementation plan" in plan.lower()
     assert "surgical_edit" in plan
     assert "implementation_plan" in plan
 
