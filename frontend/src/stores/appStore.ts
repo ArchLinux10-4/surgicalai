@@ -59,8 +59,28 @@ interface AppState {
   // UI
   sidebarTab: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'aws' | 'railway'
   setSidebarTab: (t: 'files' | 'sessions' | 'context' | 'github' | 'linear' | 'vercel' | 'aws' | 'railway') => void
-  awsTerminalLines: { sessionId: string; command: string; stdout: string; stderr: string; exit_code: number }[]
-  pushAwsTerminalLine: (line: { sessionId: string; command: string; stdout: string; stderr: string; exit_code: number }) => void
+  awsTerminalLines: {
+    sessionId: string
+    command: string
+    stdout: string
+    stderr: string
+    exit_code: number
+    level?: string
+    title?: string
+    target?: string
+    files?: { name: string; content: string }[]
+  }[]
+  pushAwsTerminalLine: (line: {
+    sessionId: string
+    command: string
+    stdout: string
+    stderr: string
+    exit_code: number
+    level?: string
+    title?: string
+    target?: string
+    files?: { name: string; content: string }[]
+  }) => void
   sidebarPanelOpen: boolean
   setSidebarPanelOpen: (open: boolean) => void
   sidebarPinned: boolean

@@ -8,6 +8,7 @@ const REGIONS = [
 ]
 
 const KEY_OK = /^(AKIA|ASIA)[A-Z0-9]{16}$/
+const REGION_OK = /^[a-z]{2}(-[a-z]+)+-\d$/
 
 export function AwsConnectModal({ open, onClose, onConnected }: {
   open: boolean
@@ -24,6 +25,7 @@ export function AwsConnectModal({ open, onClose, onConnected }: {
   const temporary = accessKeyId.trim().startsWith('ASIA')
   const canSubmit = KEY_OK.test(accessKeyId.trim())
     && secret.trim().length >= 16
+    && REGION_OK.test(region.trim())
     && (!temporary || sessionToken.trim().length > 0)
     && !busy
 
@@ -34,7 +36,7 @@ export function AwsConnectModal({ open, onClose, onConnected }: {
       await api.aws.connect({
         access_key_id: accessKeyId.trim(),
         secret_access_key: secret.trim(),
-        region,
+        region: region.trim(),
         session_token: temporary ? sessionToken.trim() : '',
       })
       setSecret('')
@@ -63,9 +65,18 @@ export function AwsConnectModal({ open, onClose, onConnected }: {
         <label className="mt-3 block text-[11px] text-muted">Secret access key</label>
         <input className="input mt-1 font-mono" type="password" value={secret} onChange={(e) => setSecret(e.target.value)} autoComplete="off" />
         <label className="mt-3 block text-[11px] text-muted">Region</label>
-        <select className="input mt-1" value={region} onChange={(e) => setRegion(e.target.value)}>
-          {REGIONS.map((r) => <option key={r} value={r}>{r}</option>)}
-        </select>
+        <input
+          className="input mt-1 font-mono"
+          value={region}
+          onChange={(e) => setRegion(e.target.value)}
+          placeholder="us-east-1"
+          list="aws-regions"
+          spellCheck={false}
+          autoComplete="off"
+        />
+        <datalist id="aws-regions">
+          {REGIONS.map((r) => <option key={r} value={r} />)}
+        </datalist>
         {temporary && (
           <>
             <label className="mt-3 block text-[11px] text-muted">Session token</label>

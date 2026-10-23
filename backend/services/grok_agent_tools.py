@@ -424,18 +424,28 @@ def _schema_report_blocked():
 
 
 def _schema_aws_cli():
-    from services.aws_cli import aws_agent_guidance
     return {
         "type": "function",
         "function": {
             "name": TOOL_AWS_CLI,
-            "description": aws_agent_guidance(),
+            "description": (
+                "Run one aws CLI command on the connected account. Follow the AWS rules in the system prompt.\n"
+                "command starts with aws. intent is on_task or side, and only matters for reads."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
                         "description": "Full command, starting with aws.",
+                    },
+                    "intent": {
+                        "type": "string",
+                        "enum": ["on_task", "side"],
+                        "description": (
+                            "on_task if this read is the next step for the user's question. "
+                            "side if it is an extra read. Ignored for changes, deletes, and secret reads."
+                        ),
                     },
                 },
                 "required": ["command"],
@@ -826,17 +836,22 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
                  reason_preview=res.blocked_reason[:200])
 
         elif name == TOOL_AWS_CLI:
-            # Do not run yet. The pipeline pauses for user approval, then runs it.
+            # Do not run yet. resolve_aws_call decides auto-run, refusal, or a card.
             _aws_cmd = str(args.get("command") or "").strip()
+            _aws_intent = str(args.get("intent") or "").strip()
+            if _aws_intent not in ("on_task", "side"):
+                _aws_intent = ""
+            _aws_body = f"intent: {_aws_intent}\n{_aws_cmd}" if _aws_intent else _aws_cmd
             if res.context_request is None:
-                res.context_request = ("aws", _aws_cmd)
+                res.context_request = ("aws", _aws_body)
                 res.context_call_id = cid
             else:
                 fb = "Only one AWS command is sent for approval per turn."
                 res.errors.append((cid, fb))
                 res.results_by_id[cid] = fb
             _log(dlog, "grok_translate_aws_cli", session_id=session_id,
-                 user_id=user_id, tool_call_id=cid)
+                 user_id=user_id, tool_call_id=cid,
+                 command=_aws_cmd[:180], intent=_aws_intent)
 
         elif name in CONTEXT_TOOLS:
             # Only the FIRST context request is dispatched this turn.

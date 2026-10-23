@@ -1564,6 +1564,9 @@ export function ChatPanel() {
   const [awsApproval, setAwsApproval] = useState<{
     sessionId: string
     command: string
+    level?: string
+    title?: string
+    target?: string
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
   } | null>(null)
 
@@ -1597,10 +1600,15 @@ export function ChatPanel() {
   }, [])
 
   useEffect(() => {
+    const approvalHere = awsApproval && awsApproval.sessionId === activeSessions
+    if (approvalHere) {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+      return
+    }
     if (!userScrolledUpRef.current) {
       bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
     }
-  }, [messages, streamingMessage])
+  }, [messages, streamingMessage, awsApproval, activeSessions])
 
   // Load session files when session changes
   useEffect(() => {
@@ -2395,10 +2403,21 @@ export function ChatPanel() {
           stdout: event?.stdout || '',
           stderr: event?.stderr || '',
           exit_code: event?.exit_code ?? 1,
+          level: event?.level,
+          title: event?.title,
+          target: event?.target,
+          files: event?.files,
         })
       },
-      (command, reply) => {
-        setAwsApproval({ sessionId, command, reply })
+      (command, reply, meta) => {
+        setAwsApproval({
+          sessionId,
+          command,
+          reply,
+          level: meta?.level,
+          title: meta?.title,
+          target: meta?.target,
+        })
       },
     )
     abortMapRef.current.set(sessionId, ctrl)
@@ -3062,15 +3081,6 @@ export function ChatPanel() {
                 }}
               />
             )}
-            {awsApproval && awsApproval.sessionId === activeSessions && (
-              <AwsApprovalCard
-                command={awsApproval.command}
-                onDecide={(action, command) => {
-                  awsApproval.reply({ action, command })
-                  setAwsApproval(null)
-                }}
-              />
-            )}
             <AwsCliFeed />
             <PlanTracker emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
             {isStreaming && (streamingMessage || streamProgress) && (
@@ -3132,6 +3142,19 @@ export function ChatPanel() {
               </div>
             )}
           </div>
+        )}
+        {awsApproval && awsApproval.sessionId === activeSessions && (
+          <AwsApprovalCard
+            key={`${awsApproval.command}\n${awsApproval.title || ''}`}
+            command={awsApproval.command}
+            level={awsApproval.level}
+            title={awsApproval.title}
+            target={awsApproval.target}
+            onDecide={(action, command) => {
+              awsApproval.reply({ action, command })
+              setAwsApproval(null)
+            }}
+          />
         )}
         <div ref={bottomRef} />
       </div>
