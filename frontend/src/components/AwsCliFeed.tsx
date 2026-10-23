@@ -2,6 +2,14 @@ import { useEffect, useRef, useState } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { AwsLevelPill } from './AwsApprovalCard'
 
+function deniedLine(stderr: string): string | null {
+  if (!/AccessDenied|UnauthorizedOperation|not authorized to perform/i.test(stderr)) return null
+  const action = stderr.match(/([a-z0-9-]+:[A-Za-z]+)/)
+  return action
+    ? `No permission for ${action[1]}. Skipped.`
+    : 'No permission for this call. Skipped.'
+}
+
 function AwsOutput({ stdout, stderr, files }: { stdout: string; stderr: string; files: string }) {
   const [open, setOpen] = useState(false)
   const ref = useRef<HTMLPreElement>(null)
@@ -50,13 +58,16 @@ export function AwsCliFeed() {
         const files = (line.files || [])
           .map(f => `${f.name}:\n${f.content}`)
           .join('\n')
+        const skipped = deniedLine(line.stderr || '')
         return (
           <div key={idx} className="rounded-lg border border-border bg-[#100808] px-3 py-2 font-mono text-[11px] text-[#d6d6d6]">
             <div className="flex items-start gap-2">
               <AwsLevelPill level={line.level} />
               <div className="text-accent break-all">$ {line.command}</div>
             </div>
-            <AwsOutput stdout={line.stdout || ''} stderr={line.stderr || ''} files={files} />
+            {skipped
+              ? <div className="mt-1 text-muted">{skipped}</div>
+              : <AwsOutput stdout={line.stdout || ''} stderr={line.stderr || ''} files={files} />}
           </div>
         )
       })}

@@ -263,7 +263,32 @@ def _parse_service_operation(argv: list[str]) -> tuple[str, str, int] | None:
     return service, operation, j
 
 
-def _is_sensitive(service: str, operation: str) -> bool:
+def _query_value(argv: list[str]) -> str:
+    for i, tok in enumerate(argv):
+        if tok == "--query" and i + 1 < len(argv):
+            return argv[i + 1]
+        if tok.startswith("--query="):
+            return tok.split("=", 1)[1]
+    return ""
+
+
+def _amplify_list_apps_exposes_env(argv: list[str]) -> bool:
+    """list-apps returns environmentVariables on every app unless --query drops them.
+
+    A multi-select hash ({name:name,repository:repository}) or a single field
+    such as apps[].repository is safe. No query, a bare apps list, or any
+    query that names environment variables is not.
+    """
+    query = _query_value(argv)
+    if not query or "environment" in query.lower():
+        return True
+    if "{" in query:
+        return False
+    compact = re.sub(r"\s+", "", query)
+    return re.fullmatch(r"apps\[\]\.(name|repository|appId|defaultDomain|platform)", compact) is None
+
+
+def _is_sensitive(service: str, operation: str, argv: list[str] | None = None) -> bool:
     if service == "secretsmanager" and operation == "get-secret-value":
         return True
     if service == "ssm" and operation in ("get-parameter", "get-parameters", "get-parameters-by-path"):
@@ -289,6 +314,10 @@ def _is_sensitive(service: str, operation: str) -> bool:
         return True
     if service == "s3" and operation == "presign":
         return True
+    if service == "amplify" and operation in ("get-app", "get-branch", "list-branches"):
+        return True
+    if service == "amplify" and operation == "list-apps":
+        return _amplify_list_apps_exposes_env(argv or [])
     return False
 
 
@@ -318,7 +347,7 @@ def aws_command_level(command: str, intent: str = "") -> str:
     if parsed is None:
         return "change"
     service, operation, _idx = parsed
-    if _is_sensitive(service, operation):
+    if _is_sensitive(service, operation, argv):
         return "sensitive"
     if _is_delete(service, operation, argv):
         return "deletes"
@@ -901,21 +930,40 @@ def aws_agent_guidance() -> str:
         "apigatewayv2, not aws apigateway. test-invoke-method simulates the "
         "method. It is not a call to the stage URL. It is not a read. Ask and "
         "Plan cannot call it.\n"
-        "Where source code lives. A where-is-this-codebase question is not a "
-        "tour of the account. Source on AWS is, in this order: CodeCommit "
-        "repositories, CodePipeline source actions, Amplify apps, CodeBuild "
-        "projects, Elastic Beanstalk applications. Stop at the first name "
-        "match and answer with that service, name, and region. S3 is object "
-        "storage and Lambda is a deployed function. List those only after the "
-        "source services miss, and only with --no-paginate plus a --query that "
-        "filters on the name the user gave. Do not dump every bucket or every "
-        "function. Set intent on_task only for the next command in that order. "
-        "Set side for anything else. In Ask and Plan, after three AWS commands "
-        "in one user question, stop calling the tool and answer from what you "
-        "have, including not found in CodeCommit, CodePipeline, or Amplify. "
-        "The server then returns: Do not call AWS again this turn. Answer the "
-        "user now. Edit and Agent are not capped at three, but they still "
-        "follow this order and stop when a name matches.\n"
+        "Where source code lives. A where-is-this-codebase question is one "
+        "lookup, not a tour. The first command is Amplify, because list-apps "
+        "returns the git URL on each app in the repository field. Filter to "
+        "the name the user gave and do not select environmentVariables, which "
+        "list-apps also returns:\n"
+        "aws amplify list-apps --no-paginate --output json --query "
+        "'apps[?contains(name, `NAME`)].{name:name,repository:repository,"
+        "defaultDomain:defaultDomain,platform:platform}'\n"
+        "If repository is set, stop. Answer with that git URL, the Amplify "
+        "app name, and the region. Do not call CodeCommit or CodePipeline "
+        "after a match. A list-apps with no --query is refused in Ask and "
+        "Plan because the full app includes environmentVariables.\n"
+        "Only if that list is empty, check CodeCommit list-repositories with "
+        "--no-paginate and a --query on the name. CodeCommit is AWS-hosted "
+        "git. It is not where a GitHub repo lives.\n"
+        "Do not call codepipeline list-pipelines to find a codebase. That "
+        "list returns name, version, created, and updated. It does not return "
+        "the git URL. The source action is on get-pipeline, a second call, "
+        "and ListPipelines is often missing from the key. If stderr says "
+        "AccessDenied or UnauthorizedOperation, this key cannot see that "
+        "action. Do not retry it and do not treat the denial as the "
+        "codebase being missing. Skip that service and answer from what you "
+        "already have.\n"
+        "S3 is object storage and Lambda is a deployed function. List those "
+        "only after Amplify and CodeCommit miss, and only with --no-paginate "
+        "plus a --query that filters on the name the user gave. Do not dump "
+        "every bucket or every function. Set intent on_task only for the "
+        "next command in that order. Set side for anything else. In Ask and "
+        "Plan, after three AWS commands in one user question, stop calling "
+        "the tool and answer from what you have, including not found in "
+        "Amplify or CodeCommit. The server then returns: Do not call AWS "
+        "again this turn. Answer the user now. Edit and Agent are not capped "
+        "at three, but they still start with Amplify and stop when a "
+        "repository matches.\n"
         "A create that supports a client token should send one. A timeout can "
         "mean the call succeeded and the response was killed. Do not fire a "
         "second create for the same resource.\n"
