@@ -19,7 +19,9 @@ default OFF). Zero effect on the legacy ReAct loop, single-pass path,
 Surgeon, QA, or correction handler — this module is not imported by any
 of them.
 """
+import difflib
 import itertools
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeoutError
@@ -29,160 +31,320 @@ from github import InputGitTreeElement
 
 from database import list_github_app_installations, _dlog as _db_dlog
 from services.github_app_auth import get_installation_client, is_github_app_configured
+from services.github_tool_spec import (
+    ALL_TOOL_NAMES,
+    anthropic_tool_schemas,
+    context_tool_names,
+    example_call_json,
+    tool_by_name,
+)
 
 
-GITHUB_CONTEXT_TOOLS_V2 = [
-    {
-        "name": "list_prs",
-        "description": "List open pull requests for a connected GitHub repo. Use when the user asks about open PRs, PR status, or 'what's in review'.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "owner": {"type": "string", "description": "Repo owner (user or org)"},
-                "repo": {"type": "string", "description": "Repo name"},
-                "state": {"type": "string", "enum": ["open", "closed", "all"], "description": "Defaults to open"},
-            },
-            "required": ["owner", "repo"],
-        },
-    },
-    {
-        "name": "get_pr_diff",
-        "description": "Get the file diff for a specific pull request number. Use when the user asks what changed in a PR.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "owner": {"type": "string"},
-                "repo": {"type": "string"},
-                "pr_number": {"type": "integer"},
-            },
-            "required": ["owner", "repo", "pr_number"],
-        },
-    },
-    {
-        "name": "get_pr_comments",
-        "description": "Get review comments and discussion on a specific pull request. Use when the user asks to read PR feedback or comments.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "owner": {"type": "string"},
-                "repo": {"type": "string"},
-                "pr_number": {"type": "integer"},
-            },
-            "required": ["owner", "repo", "pr_number"],
-        },
-    },
-    {
-        "name": "list_issues",
-        "description": "List open issues for a connected GitHub repo. Use when the user asks about open issues or bug reports.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "owner": {"type": "string"},
-                "repo": {"type": "string"},
-                "state": {"type": "string", "enum": ["open", "closed", "all"], "description": "Defaults to open"},
-            },
-            "required": ["owner", "repo"],
-        },
-    },
-    {
-        "name": "get_issue_comments",
-        "description": "Get comments on a specific issue number. Use when the user asks to read the discussion on an issue.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "owner": {"type": "string"},
-                "repo": {"type": "string"},
-                "issue_number": {"type": "integer"},
-            },
-            "required": ["owner", "repo", "issue_number"],
-        },
-    },
-    {
-        "name": "diff_branches",
-        "description": "Compare two branches and summarize what changed. Use when the user asks to diff branches or 'what's different between main and X'.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "owner": {"type": "string"},
-                "repo": {"type": "string"},
-                "base": {"type": "string", "description": "Base branch, e.g. main"},
-                "head": {"type": "string", "description": "Head branch to compare against base"},
-            },
-            "required": ["owner", "repo", "base", "head"],
-        },
-    },
-    {
-        "name": "list_files",
-        "description": "List every file in a repository branch (recursive). Optionally filter by path prefix.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "owner": {"type": "string"},
-                "repo": {"type": "string"},
-                "ref": {"type": "string", "description": "Branch or commit SHA. Defaults to the default branch."},
-                "path_prefix": {"type": "string", "description": "Only list files under this path, e.g. 'backend/services/'"},
-            },
-            "required": ["owner", "repo"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Read the content of one file from a repository. Large files are paged; call again with start_line to continue.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "owner": {"type": "string"},
-                "repo": {"type": "string"},
-                "path": {"type": "string", "description": "File path from repo root, e.g. 'backend/services/pipeline.py'"},
-                "ref": {"type": "string", "description": "Branch or commit SHA. Defaults to the default branch."},
-                "start_line": {"type": "integer", "description": "1-indexed line to start from (for paging large files)"},
-            },
-            "required": ["owner", "repo", "path"],
-        },
-    },
-    {
-        "name": "search_code",
-        "description": "Search file contents in a repository (GitHub code search; default branch only).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "owner": {"type": "string"},
-                "repo": {"type": "string"},
-                "query": {"type": "string", "description": "Search terms, e.g. 'run_natural_pipeline_stream' or 'dlog path:backend/services'"},
-            },
-            "required": ["owner", "repo", "query"],
-        },
-    },
-    {
-        "name": "push_files",
-        "description": "Create one commit with one or more file changes and push it to a branch. Creates the branch from the default branch if it does not exist.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "owner": {"type": "string"},
-                "repo": {"type": "string"},
-                "branch": {"type": "string", "description": "Branch to push to, e.g. 'main' or 'feature-x'. Created from the default branch if missing."},
-                "message": {"type": "string", "description": "Commit message"},
-                "files": {
-                    "type": "array",
-                    "description": "Files to write or delete in this commit",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "path": {"type": "string", "description": "File path from repo root"},
-                            "content": {"type": "string", "description": "Full new file content (omit when deleting)"},
-                            "delete": {"type": "boolean", "description": "Set true to delete this file"},
-                        },
-                        "required": ["path"],
-                    },
-                },
-            },
-            "required": ["owner", "repo", "branch", "message", "files"],
-        },
-    },
-]
+GITHUB_CONTEXT_TOOLS_V2 = anthropic_tool_schemas()
 
-_TOOL_NAMES = {"list_prs", "get_pr_diff", "get_pr_comments", "list_issues", "get_issue_comments", "diff_branches", "list_files", "read_file", "search_code", "push_files"}
+_TOOL_NAMES = set(context_tool_names())
+
+
+def gh_error(kind: str, **kw) -> str:
+    """Model-facing error text. Always bracketed, never raises.
+
+    A leading '[' tells the edit loop this is a failure, not a file to register.
+    """
+    try:
+        return _gh_error_text(kind, **kw)
+    except Exception as exc:
+        return f"[GitHub request failed: {exc}]"
+
+
+def _closest_tool(name: str) -> str:
+    names = list(ALL_TOOL_NAMES)
+    if not names:
+        return ""
+    match = difflib.get_close_matches(name or "", names, n=1, cutoff=0.3)
+    if match:
+        return match[0]
+    ranked = sorted(
+        names,
+        key=lambda candidate: difflib.SequenceMatcher(None, name or "", candidate).ratio(),
+        reverse=True,
+    )
+    return ranked[0]
+
+
+def _gh_error_text(kind: str, **kw) -> str:
+    if kind == "unknown_tool":
+        name = str(kw.get("name") or "")
+        closest = _closest_tool(name)
+        example = f"<github_request>{example_call_json(closest)}</github_request>"
+        listed = ", ".join(ALL_TOOL_NAMES)
+        return (
+            f"[Unknown GitHub tool '{name}'. Valid tools: {listed}. "
+            f"Did you mean '{closest}'? Resend with {example}]"
+        )
+    if kind == "bad_json":
+        reason = kw.get("reason") or "the body was not valid JSON"
+        example = kw.get("example") or example_call_json("list_prs")
+        return (
+            f"[Your <github_request> could not be parsed ({reason}). "
+            f"The body must be ONE JSON object, for example: {example}]"
+        )
+    if kind == "missing_arg":
+        tool = kw.get("tool") or "this tool"
+        arg = kw.get("arg") or "arg"
+        spec = tool_by_name(str(tool))
+        example = kw.get("example") or (
+            example_call_json(spec.name) if spec else example_call_json("list_prs")
+        )
+        return f"[{tool} needs '{arg}'. Example: {example}]"
+    if kind == "repo_inaccessible":
+        owner = kw.get("owner") or "?"
+        repo = kw.get("repo") or "?"
+        repos = [r for r in (kw.get("repos") or []) if r][:10]
+        if not repos:
+            return (
+                f"[{owner}/{repo} is not accessible via any of your connected "
+                "GitHub App installations. Call list_repos to see what you can use.]"
+            )
+        shown = ", ".join(repos)
+        return (
+            f"[{owner}/{repo} is not available through the connected GitHub App. "
+            f"Repos you CAN use: {shown}. Use one of these exactly, or call list_repos.]"
+        )
+    if kind == "not_found":
+        return _not_found_text(**kw)
+    if kind == "rate_limited":
+        return (
+            "[GitHub rate limit reached. Do not retry now; answer from what you "
+            "already have and tell the user.]"
+        )
+    if kind == "auth":
+        return (
+            "[GitHub rejected the connection (permissions). Tell the user to "
+            "reconnect GitHub in Settings.]"
+        )
+    if kind == "placeholder_repo":
+        return (
+            "[Repo name "
+            f"'{kw.get('repo') or ''}' is a placeholder. Call list_repos, then "
+            "use an owner/repo from that list exactly.]"
+        )
+    message = re.sub(r"[{}]", "", str(kw.get("message") or "unknown error"))
+    message = " ".join(message.split())[:160]
+    tool = kw.get("tool") or "the request"
+    return (
+        f"[GitHub could not complete {tool}: {message}. "
+        "Try a different request or answer from what you have.]"
+    )
+
+
+def _not_found_text(**kw) -> str:
+    tool = kw.get("tool") or ""
+    repo = f"{kw.get('owner') or '?'}/{kw.get('repo') or '?'}"
+    if tool in ("get_pr", "get_pr_diff", "get_pr_comments"):
+        number = kw.get("number")
+        return (
+            f"[PR #{number} was not found in {repo}. "
+            'Call list_prs (state "all") to see valid numbers.]'
+        )
+    if tool in ("get_issue", "get_issue_comments"):
+        number = kw.get("number")
+        return (
+            f"[Issue #{number} was not found in {repo}. "
+            'Call list_issues (state "all") to see valid numbers.]'
+        )
+    if tool == "read_file":
+        path = kw.get("path") or ""
+        ref = kw.get("ref") or "the default branch"
+        directory = path.rsplit("/", 1)[0] if "/" in path else ""
+        prefix = directory or ""
+        extra = ""
+        matches = kw.get("matches") or []
+        if matches:
+            extra = " Close paths: " + ", ".join(matches[:5]) + "."
+        return (
+            f"['{path}' does not exist on {ref}. Call list_files with "
+            f'path_prefix "{prefix}" or search_code to find it.{extra}]'
+        )
+    if kw.get("branch") or tool in ("list_commits", "diff_branches", "list_files", "list_branches"):
+        branch = kw.get("branch") or kw.get("ref") or ""
+        if branch:
+            return f"[Branch '{branch}' not found. Call list_branches.]"
+    return (
+        f"[GitHub could not find that {tool or 'object'} in {repo}. "
+        "Call list_repos or list_files and use a value from the result.]"
+    )
+
+
+def _clamp_limit(raw, default: int, lo: int, hi: int) -> int:
+    try:
+        number = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, number))
+
+
+def _ymd(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value[:10]
+    formatter = getattr(value, "strftime", None)
+    if formatter is None:
+        return ""
+    try:
+        return value.strftime("%Y-%m-%d")
+    except Exception:
+        return ""
+
+
+def _login(user) -> str:
+    if user is None:
+        return "unknown"
+    if isinstance(user, str):
+        return user or "unknown"
+    return getattr(user, "login", None) or getattr(user, "name", None) or "unknown"
+
+
+def _label_names(obj) -> list:
+    names = []
+    for label in getattr(obj, "labels", None) or []:
+        if isinstance(label, str) and label:
+            names.append(label)
+        else:
+            name = getattr(label, "name", None)
+            if name:
+                names.append(str(name))
+    return names
+
+
+def _total_count(seq, shown: int) -> int:
+    try:
+        return int(seq.totalCount)
+    except Exception:
+        try:
+            return len(seq)
+        except Exception:
+            return shown
+
+
+def _more_footer(shown: int, total: int, noun: str) -> str:
+    if total <= shown:
+        return ""
+    wider = min(50, max(shown * 3, shown + 10))
+    return f'\nShowing {shown} of {total}. Call again with "limit": {wider} for more {noun}.'
+
+
+def _change_summary(count: int, additions: int, deletions: int) -> str:
+    noun = "file" if count == 1 else "files"
+    return f"{count} {noun} changed, +{additions}/-{deletions}"
+
+
+def _clip_patch(patch) -> str:
+    if not patch:
+        return ""
+    if len(patch) <= 4000:
+        return patch
+    return patch[:4000] + "\n[patch truncated]"
+
+
+def _suggest_accessible_repos(user_id: str, limit: int = 10) -> list:
+    try:
+        from services.github_natural_tag import _list_repos
+        text = _list_repos(user_id, None)
+        names = []
+        for line in (text or "").splitlines():
+            token = line.split()[0] if line.split() else ""
+            if "/" in token and not token.startswith("["):
+                names.append(token)
+            if len(names) >= limit:
+                break
+        return names
+    except Exception:
+        return []
+
+
+def _file_suggestions(repo_obj, ref, path, owner, repo, _log) -> list:
+    try:
+        tree = _get_cached_tree(
+            repo_obj, ref or getattr(repo_obj, "default_branch", "main"),
+            owner, repo, _log,
+        )
+    except Exception:
+        return []
+    paths = []
+    for entry in getattr(tree, "tree", None) or []:
+        if getattr(entry, "type", None) == "blob" and getattr(entry, "path", None):
+            paths.append(entry.path)
+    if not paths or not path:
+        return []
+    hits = difflib.get_close_matches(path, paths, n=5, cutoff=0.5)
+    if hits:
+        return hits
+    base = path.rsplit("/", 1)[-1]
+    same_name = [item for item in paths if item.rsplit("/", 1)[-1] == base]
+    if same_name:
+        return same_name[:5]
+    return difflib.get_close_matches(base, paths, n=5, cutoff=0.4)
+
+
+def _exc_status(exc) -> Optional[int]:
+    status = getattr(exc, "status", None)
+    if isinstance(status, int):
+        return status
+    msg = str(exc)
+    for code in (429, 404, 422, 403, 401):
+        if str(code) in msg:
+            return code
+    return None
+
+
+def _classify_github_exception(tool_name, tool_input, exc, repo_obj=None, _log=None) -> str:
+    status = _exc_status(exc)
+    message = str(exc)
+    lowered = message.lower()
+    tool_input = tool_input or {}
+    if "rate limit" in lowered or status == 429:
+        return gh_error("rate_limited")
+    if status in (401, 403):
+        return gh_error("auth")
+    owner = tool_input.get("owner") or ""
+    repo = tool_input.get("repo") or ""
+    if status == 404 or "not found" in lowered:
+        ref = (tool_input.get("ref") or tool_input.get("branch") or "").strip()
+        if tool_name == "read_file":
+            path = (tool_input.get("path") or "").strip().lstrip("/")
+            matches = []
+            if repo_obj is not None and _log is not None:
+                matches = _file_suggestions(
+                    repo_obj, ref or getattr(repo_obj, "default_branch", "main"),
+                    path, owner, repo, _log,
+                )
+            return gh_error(
+                "not_found", tool=tool_name, owner=owner, repo=repo,
+                path=path, ref=ref or getattr(repo_obj, "default_branch", "the default branch"),
+                matches=matches,
+            )
+        if tool_name in ("get_pr", "get_pr_diff", "get_pr_comments"):
+            return gh_error(
+                "not_found", tool=tool_name, owner=owner, repo=repo,
+                number=tool_input.get("pr_number"),
+            )
+        if tool_name in ("get_issue", "get_issue_comments"):
+            return gh_error(
+                "not_found", tool=tool_name, owner=owner, repo=repo,
+                number=tool_input.get("issue_number"),
+            )
+        branch = (
+            tool_input.get("branch") or tool_input.get("base")
+            or tool_input.get("head") or ref
+        )
+        if branch or tool_name in ("list_commits", "diff_branches", "list_files"):
+            return gh_error(
+                "not_found", tool=tool_name, owner=owner, repo=repo, branch=branch,
+            )
+        return gh_error("not_found", tool=tool_name, owner=owner, repo=repo)
+    return gh_error("generic", tool=tool_name, message=message)
+
 
 # read_file paging: serve at most this many characters of file content per call.
 _READ_FILE_MAX_CHARS = 14000
@@ -552,6 +714,102 @@ def _search_code_fallback_scan(r, ref: str, query: str, _log, owner: str = "", r
     return "\n".join(lines)
 
 
+def _work_item_line(item) -> str:
+    labels = _label_names(item)
+    updated = _ymd(getattr(item, "updated_at", None))
+    bits = [f"by @{_login(getattr(item, 'user', None))}"]
+    if updated:
+        bits.append(f"updated {updated}")
+    if labels:
+        bits.append("labels: " + ", ".join(labels))
+    url = getattr(item, "html_url", None) or ""
+    link = f" {url}" if url else ""
+    title = getattr(item, "title", "") or ""
+    state = getattr(item, "state", "") or ""
+    number = getattr(item, "number", "?")
+    return f"#{number} [{state}] {title} ({', '.join(bits)}){link}"
+
+
+def _format_pr_detail(pr, number, owner, repo) -> str:
+    state = "merged" if getattr(pr, "merged", False) else (getattr(pr, "state", None) or "open")
+    base = getattr(getattr(pr, "base", None), "ref", "?")
+    head = getattr(getattr(pr, "head", None), "ref", "?")
+    additions = getattr(pr, "additions", None)
+    deletions = getattr(pr, "deletions", None)
+    changed = getattr(pr, "changed_files", None)
+    stats = ""
+    if additions is not None and deletions is not None:
+        nfiles = changed if changed is not None else "?"
+        stats = f", +{additions}/-{deletions} in {nfiles} files"
+    updated = _ymd(getattr(pr, "updated_at", None))
+    updated_bit = f", updated {updated}" if updated else ""
+    title = getattr(pr, "title", "") or ""
+    header = (
+        f'PR #{number} [{state}] "{title}" by @{_login(getattr(pr, "user", None))}, '
+        f"{base} <- {head}{stats}{updated_bit}"
+    )
+    body = (getattr(pr, "body", None) or "").strip() or "(no description)"
+    if len(body) > 1500:
+        body = body[:1500] + "\n[body truncated]"
+    url = getattr(pr, "html_url", None) or f"https://github.com/{owner}/{repo}/pull/{number}"
+    return f"{header}\n\nBody:\n{body}\n\nLink: {url}"
+
+
+def _format_issue_detail(issue, number, owner, repo) -> str:
+    title = getattr(issue, "title", "") or ""
+    state = getattr(issue, "state", None) or "open"
+    labels = _label_names(issue)
+    label_bit = f", labels: {', '.join(labels)}" if labels else ""
+    updated = _ymd(getattr(issue, "updated_at", None))
+    updated_bit = f", updated {updated}" if updated else ""
+    header = (
+        f'Issue #{number} [{state}] "{title}" by @{_login(getattr(issue, "user", None))}'
+        f"{label_bit}{updated_bit}"
+    )
+    body = (getattr(issue, "body", None) or "").strip() or "(no description)"
+    if len(body) > 1500:
+        body = body[:1500] + "\n[body truncated]"
+    url = getattr(issue, "html_url", None) or f"https://github.com/{owner}/{repo}/issues/{number}"
+    return f"{header}\n\nBody:\n{body}\n\nLink: {url}"
+
+
+def _comment_lines(comments, located=False):
+    collected = []
+    for comment in itertools.islice(comments, 200):
+        body = (getattr(comment, "body", "") or "").strip()
+        if len(body) > 1200:
+            body = body[:1200] + "…"
+        who = _login(getattr(comment, "user", None))
+        if located:
+            path = getattr(comment, "path", "") or ""
+            line_no = getattr(comment, "line", None) or getattr(comment, "original_line", None) or "?"
+            collected.append(f"{who} (on {path}:{line_no}): {body}")
+        else:
+            collected.append(f"{who}: {body}")
+    hidden = 0
+    if len(collected) > 30:
+        hidden = len(collected) - 30
+        collected = collected[-30:]
+    return collected, hidden
+
+
+def _commit_line(commit) -> str:
+    sha = (getattr(commit, "sha", "") or "")[:7]
+    inner = getattr(commit, "commit", None)
+    subject = ""
+    date = ""
+    if inner is not None:
+        subject = ((getattr(inner, "message", "") or "").splitlines() or [""])[0][:120]
+        author = getattr(inner, "author", None)
+        date = _ymd(getattr(author, "date", None))
+    user = _login(getattr(commit, "author", None))
+    if user == "unknown" and inner is not None:
+        named = getattr(getattr(inner, "author", None), "name", None)
+        if named:
+            user = str(named)
+    return f"{sha} {date} @{user}: {subject}".strip()
+
+
 def _find_client_for_repo(user_id: str, owner: str, repo: str, dlog: Callable):
     """Find whichever of this user's installations grants access to owner/repo.
     Returns (client, installation_dict, None) on success or
@@ -562,7 +820,10 @@ def _find_client_for_repo(user_id: str, owner: str, repo: str, dlog: Callable):
     dlog("github_context_tool_find_client", user_id=user_id, owner=owner, repo=repo, installation_count=len(installations))
     if not installations:
         dlog("github_context_tool_no_installations", user_id=user_id)
-        return None, None, "GitHub App is not connected for this user. Connect it in Settings first."
+        return None, None, (
+            "[GitHub App is not connected for this user. Tell the user to "
+            "connect GitHub in Settings.]"
+        )
     for inst in installations:
         installation_id = inst["installation_id"]
         try:
@@ -574,7 +835,10 @@ def _find_client_for_repo(user_id: str, owner: str, repo: str, dlog: Callable):
             dlog("github_context_tool_client_no_access", installation_id=installation_id, error=str(e))
             continue
     dlog("github_context_tool_repo_not_accessible", user_id=user_id, owner=owner, repo=repo)
-    return None, None, f"{owner}/{repo} is not accessible via any of your connected GitHub App installations."
+    return None, None, gh_error(
+        "repo_inaccessible", owner=owner, repo=repo,
+        repos=_suggest_accessible_repos(user_id),
+    )
 
 
 def execute_github_context_tool(
@@ -615,17 +879,21 @@ def execute_github_context_tool(
 
     if not is_github_context_tool(tool_name):
         _log("github_context_tool_unknown", tool_name=tool_name)
-        return f"Unknown GitHub context tool: {tool_name}"
+        return gh_error("unknown_tool", name=tool_name)
 
     if not is_github_app_configured():
         _log("github_context_tool_app_not_configured", tool_name=tool_name)
-        return "GitHub App is not configured on this server yet."
+        return (
+            "[GitHub App is not configured on this server yet. Tell the user "
+            "an admin must configure the GitHub App.]"
+        )
 
     owner = tool_input.get("owner", "")
     repo = tool_input.get("repo", "")
     if not owner or not repo:
         _log("github_context_tool_missing_owner_repo", tool_name=tool_name)
-        return "Missing owner/repo for this GitHub tool call."
+        missing = "owner" if not owner else "repo"
+        return gh_error("missing_arg", tool=tool_name, arg=missing)
 
     g, inst, err = _find_client_for_repo(user_id, owner, repo, _log)
     if err:
@@ -635,49 +903,153 @@ def execute_github_context_tool(
         r = g.get_repo(f"{owner}/{repo}")
 
         if tool_name == "list_prs":
-            state = tool_input.get("state", "open")
-            prs = r.get_pulls(state=state)
-            lines = []
-            for pr in prs[:30]:
-                lines.append(f"#{pr.number} [{pr.state}] {pr.title} (by {pr.user.login}, base={pr.base.ref} <- head={pr.head.ref})")
-            result = "\n".join(lines) if lines else f"No {state} pull requests found."
+            state = tool_input.get("state") or "open"
+            limit = _clamp_limit(tool_input.get("limit"), 10, 1, 50)
+            prs = r.get_pulls(state=state, sort="updated", direction="desc")
+            shown = list(itertools.islice(prs, limit))
+            if not shown:
+                if state == "all":
+                    result = "No pull requests found."
+                else:
+                    result = (
+                        f'No {state} pull requests. Call list_prs with '
+                        '"state": "all" to include closed and merged.'
+                    )
+            else:
+                lines = []
+                for pr in shown:
+                    lines.append(_work_item_line(pr))
+                total = _total_count(prs, len(shown))
+                result = "\n".join(lines) + _more_footer(len(shown), total, "pull requests")
+
+        elif tool_name == "get_pr":
+            pr_number = int(tool_input.get("pr_number"))
+            pr = r.get_pull(pr_number)
+            result = _format_pr_detail(pr, pr_number, owner, repo)
 
         elif tool_name == "get_pr_diff":
-            pr_number = tool_input.get("pr_number")
-            pr = r.get_pull(int(pr_number))
-            files = pr.get_files()
-            lines = [f"PR #{pr_number}: {pr.title}", ""]
-            for f in files[:50]:
-                lines.append(f"--- {f.filename} (+{f.additions}/-{f.deletions}) ---")
-                if f.patch:
-                    lines.append(f.patch[:4000])
+            pr_number = int(tool_input.get("pr_number"))
+            pr = r.get_pull(pr_number)
+            files = list(itertools.islice(pr.get_files(), 50))
+            additions = sum(getattr(f, "additions", 0) or 0 for f in files)
+            deletions = sum(getattr(f, "deletions", 0) or 0 for f in files)
+            lines = [
+                f"PR #{pr_number}: {pr.title}",
+                _change_summary(len(files), additions, deletions),
+                "",
+                "Files:",
+            ]
+            for f in files:
+                lines.append(f"- {f.filename} (+{getattr(f, 'additions', 0)}/-{getattr(f, 'deletions', 0)})")
+            lines.append("")
+            for f in files:
+                lines.append(f"--- {f.filename} (+{getattr(f, 'additions', 0)}/-{getattr(f, 'deletions', 0)}) ---")
+                patch = _clip_patch(getattr(f, "patch", None))
+                if patch:
+                    lines.append(patch)
             result = "\n".join(lines)
 
         elif tool_name == "get_pr_comments":
-            pr_number = tool_input.get("pr_number")
-            pr = r.get_pull(int(pr_number))
-            lines = []
-            for c in pr.get_issue_comments():
-                lines.append(f"{c.user.login}: {c.body}")
-            for c in pr.get_review_comments():
-                lines.append(f"{c.user.login} (on {c.path}:{c.line}): {c.body}")
-            result = "\n\n".join(lines) if lines else f"No comments on PR #{pr_number}."
+            pr_number = int(tool_input.get("pr_number"))
+            pr = r.get_pull(pr_number)
+            issue_lines, hidden_issue = _comment_lines(pr.get_issue_comments(), located=False)
+            review_lines, hidden_review = _comment_lines(pr.get_review_comments(), located=True)
+            # Cap the combined list at 30, keeping the newest (end) of each source.
+            combined = issue_lines + review_lines
+            hidden = hidden_issue + hidden_review
+            if len(combined) > 30:
+                hidden += len(combined) - 30
+                combined = combined[-30:]
+            if not combined:
+                result = (
+                    f"No comments on PR #{pr_number}. The description may still "
+                    "be on the PR — call get_pr."
+                )
+            else:
+                note = f"\n\n({hidden} older comments not shown)" if hidden else ""
+                result = "\n\n".join(combined) + note
 
         elif tool_name == "list_issues":
-            state = tool_input.get("state", "open")
-            issues = r.get_issues(state=state)
-            lines = []
-            for issue in issues[:30]:
-                if issue.pull_request:  # GitHub API returns PRs as issues too — skip
+            state = tool_input.get("state") or "open"
+            limit = _clamp_limit(tool_input.get("limit"), 10, 1, 50)
+            issues = r.get_issues(state=state, sort="updated", direction="desc")
+            shown = []
+            scanned = 0
+            for issue in issues:
+                scanned += 1
+                if getattr(issue, "pull_request", None):
                     continue
-                lines.append(f"#{issue.number} [{issue.state}] {issue.title} (by {issue.user.login})")
-            result = "\n".join(lines) if lines else f"No {state} issues found."
+                shown.append(issue)
+                if len(shown) >= limit or scanned >= 200:
+                    break
+            if not shown:
+                if state == "all":
+                    result = "No issues found."
+                else:
+                    result = (
+                        f'No {state} issues. Call list_issues with "state": "all" '
+                        "to include closed issues."
+                    )
+            else:
+                lines = [_work_item_line(issue) for issue in shown]
+                total = _total_count(issues, len(shown))
+                # totalCount includes pull requests, so only advertise a remainder
+                # when the source itself reports more rows than we returned.
+                result = "\n".join(lines) + _more_footer(len(shown), total, "issues")
+
+        elif tool_name == "get_issue":
+            issue_number = int(tool_input.get("issue_number"))
+            issue = r.get_issue(issue_number)
+            result = _format_issue_detail(issue, issue_number, owner, repo)
 
         elif tool_name == "get_issue_comments":
-            issue_number = tool_input.get("issue_number")
-            issue = r.get_issue(int(issue_number))
-            lines = [f"{c.user.login}: {c.body}" for c in issue.get_comments()]
-            result = "\n\n".join(lines) if lines else f"No comments on issue #{issue_number}."
+            issue_number = int(tool_input.get("issue_number"))
+            issue = r.get_issue(issue_number)
+            lines, hidden = _comment_lines(issue.get_comments(), located=False)
+            if not lines:
+                result = (
+                    f"No comments on issue #{issue_number}. The description may "
+                    "still be on the issue — call get_issue."
+                )
+            else:
+                note = f"\n\n({hidden} older comments not shown)" if hidden else ""
+                result = "\n\n".join(lines) + note
+
+        elif tool_name == "list_branches":
+            limit = _clamp_limit(tool_input.get("limit"), 30, 1, 100)
+            default_branch = r.default_branch
+            branches = r.get_branches()
+            shown = list(itertools.islice(branches, limit))
+            if not shown:
+                result = "No branches found. Call list_repos to confirm the repository."
+            else:
+                lines = [f"Branches in {owner}/{repo}:", ""]
+                for branch in shown:
+                    name = getattr(branch, "name", None) or str(branch)
+                    mark = " (default)" if name == default_branch else ""
+                    lines.append(f"{name}{mark}")
+                total = _total_count(branches, len(shown))
+                result = "\n".join(lines) + _more_footer(len(shown), total, "branches")
+
+        elif tool_name == "list_commits":
+            limit = _clamp_limit(tool_input.get("limit"), 10, 1, 30)
+            branch = (tool_input.get("branch") or "").strip() or r.default_branch
+            path = (tool_input.get("path") or "").strip().lstrip("/")
+            kwargs = {"sha": branch}
+            if path:
+                kwargs["path"] = path
+            commits = r.get_commits(**kwargs)
+            shown = list(itertools.islice(commits, limit))
+            if not shown:
+                result = (
+                    f"No commits on '{branch}'. Call list_branches to see valid branch names."
+                )
+            else:
+                lines = [f"Commits on {branch} in {owner}/{repo}:", ""]
+                for commit in shown:
+                    lines.append(_commit_line(commit))
+                total = _total_count(commits, len(shown))
+                result = "\n".join(lines) + _more_footer(len(shown), total, "commits")
 
         elif tool_name == "list_files":
             ref = tool_input.get("ref") or r.default_branch
@@ -694,14 +1066,16 @@ def execute_github_context_tool(
             if total > _LIST_FILES_MAX_ENTRIES:
                 lines.append(f"... {total - _LIST_FILES_MAX_ENTRIES} more files not shown. Call list_files again with a narrower path_prefix.")
             if total == 0:
-                lines.append("(no files matched)")
+                lines.append(
+                    "(no files matched). Try a shorter path_prefix, or omit it to list the repo."
+                )
             result = "\n".join(lines)
 
         elif tool_name == "read_file":
             path = (tool_input.get("path") or "").strip().lstrip("/")
             if not path:
                 _log("github_context_read_file_missing_path")
-                return "Missing 'path' for read_file."
+                return gh_error("missing_arg", tool="read_file", arg="path")
             ref = tool_input.get("ref") or r.default_branch
             try:
                 start_line = max(1, int(tool_input.get("start_line") or 1))
@@ -736,16 +1110,21 @@ def execute_github_context_tool(
                         end_line = start_line - 1
                         for i in range(start_line - 1, total_lines):
                             line = all_lines[i]
-                            if used + len(line) + 1 > _READ_FILE_MAX_CHARS and chunk_lines:
+                            numbered = f"{i + 1:>5}| {line}"
+                            if used + len(numbered) + 1 > _READ_FILE_MAX_CHARS and chunk_lines:
                                 break
-                            chunk_lines.append(line)
-                            used += len(line) + 1
+                            chunk_lines.append(numbered)
+                            used += len(numbered) + 1
                             end_line = i + 1
                         header = f"File: {path} @ {ref} ({total_lines} lines, {contents.size} bytes) — showing lines {start_line}-{end_line}"
                         body = "\n".join(chunk_lines)
                         footer = ""
                         if end_line < total_lines:
-                            footer = f"\n\n[TRUNCATED — {total_lines - end_line} more lines. Call read_file again with start_line={end_line + 1} to continue.]"
+                            footer = (
+                                f"\n\n[TRUNCATED — {total_lines - end_line} more lines. "
+                                f"Call read_file again with start_line={end_line + 1} to continue. "
+                                f'Next: read_file with {{"path": "{path}", "start_line": {end_line + 1}}}]'
+                            )
                         _log("github_context_read_file_ok", path=path, total_lines=total_lines, shown_from=start_line, shown_to=end_line)
                         result = f"{header}\n\n{body}{footer}"
 
@@ -753,7 +1132,7 @@ def execute_github_context_tool(
             query = (tool_input.get("query") or "").strip()
             if not query:
                 _log("github_context_search_code_missing_query")
-                return "Missing 'query' for search_code."
+                return gh_error("missing_arg", tool="search_code", arg="query")
             full_query = f"repo:{owner}/{repo} {query}"
             _log("github_context_search_code", query=full_query)
             hits = g.search_code(query=full_query)
@@ -795,13 +1174,13 @@ def execute_github_context_tool(
             _log("github_context_push_files_start", branch=branch, message=message, file_count=len(files))
             if not branch:
                 _log("github_context_push_files_missing_branch")
-                return "Missing 'branch' for push_files."
+                return gh_error("missing_arg", tool="push_files", arg="branch")
             if not message:
                 _log("github_context_push_files_missing_message")
-                return "Missing commit 'message' for push_files."
+                return gh_error("missing_arg", tool="push_files", arg="message")
             if not files or not isinstance(files, list):
                 _log("github_context_push_files_no_files")
-                return "push_files needs a non-empty 'files' array."
+                return gh_error("missing_arg", tool="push_files", arg="files")
 
             # Validate every file BEFORE touching the repo — all-or-nothing.
             for f in files:
@@ -854,20 +1233,36 @@ def execute_github_context_tool(
         elif tool_name == "diff_branches":
             base = tool_input.get("base", "")
             head = tool_input.get("head", "")
+            if not base or not head:
+                return gh_error("missing_arg", tool="diff_branches", arg="base" if not base else "head")
             comparison = r.compare(base, head)
-            lines = [f"Comparing {base}...{head}: {comparison.ahead_by} ahead, {comparison.behind_by} behind", ""]
-            for f in comparison.files[:50]:
-                lines.append(f"--- {f.filename} (+{f.additions}/-{f.deletions}) ---")
-                if f.patch:
-                    lines.append(f.patch[:4000])
+            files = list(itertools.islice(getattr(comparison, "files", None) or [], 50))
+            additions = sum(getattr(f, "additions", 0) or 0 for f in files)
+            deletions = sum(getattr(f, "deletions", 0) or 0 for f in files)
+            lines = [
+                f"Comparing {base}...{head}: {comparison.ahead_by} ahead, {comparison.behind_by} behind",
+                _change_summary(len(files), additions, deletions),
+                "",
+                "Files:",
+            ]
+            for f in files:
+                lines.append(f"- {f.filename} (+{getattr(f, 'additions', 0)}/-{getattr(f, 'deletions', 0)})")
+            lines.append("")
+            for f in files:
+                lines.append(f"--- {f.filename} (+{getattr(f, 'additions', 0)}/-{getattr(f, 'deletions', 0)}) ---")
+                patch = _clip_patch(getattr(f, "patch", None))
+                if patch:
+                    lines.append(patch)
             result = "\n".join(lines)
 
         else:
-            result = f"Unhandled GitHub tool: {tool_name}"
+            result = gh_error("unknown_tool", name=tool_name)
 
         _log("github_context_tool_ok", tool_name=tool_name, result_len=len(result))
-        return result[:16000]
+        from services.github_natural_tag import shape_github_result
+        return shape_github_result(result, 16000)
 
     except Exception as e:
         _log("github_context_tool_error", tool_name=tool_name, error=str(e))
-        return f"[GitHub tool failed for {tool_name}: {e}]"
+        repo_obj = locals().get("r")
+        return _classify_github_exception(tool_name, tool_input, e, repo_obj=repo_obj, _log=_log)
