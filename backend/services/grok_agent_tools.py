@@ -323,7 +323,31 @@ def _schema_request_history():
                         "type": "string",
                         "description": (
                             "Optional keyword to search across saved versions. "
-                            "Omit for the very first (pre-edit) version."
+                            "Each hit names its version number."
+                        ),
+                    },
+                    "view": {
+                        "type": "string",
+                        "enum": ["list", "diff"],
+                        "description": (
+                            "list numbers the saved versions. "
+                            "diff compares a version with the current file. "
+                            "Omit to show one version's content."
+                        ),
+                    },
+                    "version": {
+                        "type": "string",
+                        "description": (
+                            "A version number, or first, or last. "
+                            "last is the file right before the most recent edit. "
+                            "first is the file before any edit in this chat."
+                        ),
+                    },
+                    "compare_to": {
+                        "type": "integer",
+                        "description": (
+                            "With view diff, the other version number. "
+                            "Omit to compare with the current file."
                         ),
                     },
                 },
@@ -1013,6 +1037,23 @@ def _context_body(name, args):
         payload = {"filename": args.get("filename", "")}
         if args.get("query"):
             payload["query"] = args.get("query")
+        # Only when the model sent them, so a filename-only call keeps its
+        # old payload exactly.
+        view = args.get("view")
+        if isinstance(view, str) and view.strip():
+            payload["view"] = view.strip().lower()
+        version = args.get("version")
+        if isinstance(version, bool):
+            version = None
+        elif isinstance(version, int):
+            payload["version"] = str(version)
+        elif isinstance(version, str) and version.strip():
+            payload["version"] = version.strip()[:40]
+        compare = args.get("compare_to")
+        if isinstance(compare, str) and compare.strip().isdigit():
+            compare = int(compare.strip())
+        if isinstance(compare, int) and not isinstance(compare, bool) and compare > 0:
+            payload["compare_to"] = compare
         return "history", _json.dumps(payload)
     if name == TOOL_REQUEST_PREVIEW:
         files = args.get("files") or []

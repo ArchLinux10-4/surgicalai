@@ -176,13 +176,40 @@ def blocked_text(form="tag") -> str:
 
 def history_text(form="tag") -> str:
     n = _names(form)
-    return (
-        f"{n['history']} looks up an OLDER version of a file from this chat's edit history. "
+    body = (
+        f"{n['history']} shows how a file in this chat looked before an edit that was saved here. "
+        "Use it when the user asks how the code used to look, what an edit changed, "
+        "or to go back toward an older version. "
         "The result is marked HISTORICAL. It is NOT the current file. "
         "Never use it as what the code is now. "
-        "Omit query for the first version before any edit. "
-        "Include query to search across saved versions."
+        "It covers the edits made in this chat, including a file opened from a folder "
+        "once that edit is saved here. It does not see a change made on disk outside this chat. "
+        "Use git_diff for the open folder's git history and uncommitted changes. "
+        "Use GitHub diff_branches for two branches on GitHub. "
+        "This is read only. You cannot restore a version. The user restores one from "
+        "the file's version history in the app. You can show the old code and write a "
+        "normal edit that brings it back. "
+        "filename is required. "
+        "view list numbers the saved versions, oldest first. "
+        "Omit view to show one version's content. version last is the file right before "
+        "the most recent edit. version first is the file before any edit in this chat. "
+        "view diff compares that version with the current file, or with compare_to, "
+        "another version number. "
+        "query searches the saved text and names the version each hit came from."
     )
+    if form == "tag":
+        examples = (
+            '<history_request>{"filename":"app.py","version":"last"}</history_request>\n'
+            '<history_request>{"filename":"app.py","version":"last","view":"diff"}</history_request>'
+        )
+    else:
+        examples = (
+            'Example: request_history with filename "app.py" and version "last", '
+            "for how the file looked before the most recent edit. "
+            'Example: request_history with filename "app.py", version "last", and view "diff", '
+            "for what that edit changed."
+        )
+    return body + "\n" + examples
 
 
 def file_request_example(form="tag") -> str:

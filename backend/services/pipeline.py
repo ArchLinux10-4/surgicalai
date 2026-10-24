@@ -991,13 +991,39 @@ def _parse_search_content(raw: str):
         return None
 
 
+def _clean_history_version(value):
+    """A version selector, or None when the field was absent or not usable.
+
+    Kept out of the result unless it is valid, so a call that only names a
+    file still parses to exactly {"filename", "query"}.
+    """
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return str(value) if value > 0 else None
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text or len(text) > 40:
+        return None
+    if text.lower() in ("first", "last"):
+        return text.lower()
+    if text.isdigit() and int(text) > 0:
+        return str(int(text))
+    return None
+
+
 def _parse_history_content(raw: str):
     """Parse history_request tag content — JSON dict {"filename": ..., "query": ...
     (optional)}. Returns a dict with at least "filename", or None if the tag
     body was not valid JSON / had no usable filename (mirrors
     _parse_search_content's fail-quiet-to-None style; the caller wraps a
     None return into an {"_invalid": ...} recovery message, same as search/
-    filereq/github)."""
+    filereq/github).
+
+    view, version, and compare_to are added only when they are valid, so a
+    body that does not send them stays exactly {"filename", "query"}.
+    """
     try:
         parsed = json.loads(raw.strip())
     except Exception:
@@ -1009,7 +1035,19 @@ def _parse_history_content(raw: str):
         return None
     query = parsed.get("query")
     query = str(query).strip() if query else None
-    return {"filename": filename, "query": query}
+    result = {"filename": filename, "query": query}
+    view = parsed.get("view")
+    if isinstance(view, str) and view.strip().lower() in ("list", "diff"):
+        result["view"] = view.strip().lower()
+    version = _clean_history_version(parsed.get("version"))
+    if version:
+        result["version"] = version
+    compare = parsed.get("compare_to")
+    if isinstance(compare, str) and compare.strip().isdigit():
+        compare = int(compare.strip())
+    if isinstance(compare, int) and not isinstance(compare, bool) and compare > 0:
+        result["compare_to"] = compare
+    return result
 
 
 def pick_no_edits_notice(
@@ -4618,17 +4656,22 @@ def _ask_plan_execute_tool_round(
                   raw_preview=hr_match.group(1)[:200])
             tool_parts.append(
                 "Your <history_request> was not valid JSON (needs at least "
-                '{"filename": "..."}). Emit a corrected <history_request>, '
+                '{"filename": "..."}). Optional: "view" (list or diff), '
+                '"version" (a number, first, or last), "compare_to" (a version '
+                "number), and \"query\". Emit a corrected <history_request>, "
                 "or answer with what you already know.")
         else:
             _hr_fn = _hd.get("filename", "")
             _hr_query = _hd.get("query")
             _dlog("ask_plan_history_requested", session_id=session_id,
                   user_id=user_id, tool_round=tool_round,
-                  filename=_hr_fn, query=_hr_query)
+                  filename=_hr_fn, query=_hr_query, view=_hd.get("view"),
+                  version=_hd.get("version"))
             try:
                 _hr_result = search_file_version_history(
-                    session_id, _hr_fn, query=_hr_query, dlog=_dlog)
+                    session_id, _hr_fn, query=_hr_query, dlog=_dlog,
+                    view=_hd.get("view"), version=_hd.get("version"),
+                    compare_to=_hd.get("compare_to"))
                 if _hr_result.get("found"):
                     _hr_body = ("\n\n".join(_hr_result["matches"])
                                 if "matches" in _hr_result
@@ -20965,21 +21008,26 @@ async def run_natural_pipeline_stream(
                             {"role": "assistant", "content": _assistant_echo},
                             {"role": "user", "content":
                                 "Your <history_request> was not valid JSON (needs at least "
-                                "{\"filename\": \"...\"}). Emit a corrected <history_request>, "
-                                "or write your edits."},
+                                "{\"filename\": \"...\"}). Optional: \"view\" (list or diff), "
+                                "\"version\" (a number, first, or last), \"compare_to\" "
+                                "(a version number), and \"query\". Emit a corrected "
+                                "<history_request>, or write your edits."},
                         ]
                         continue
                     _hist_fn = _hist_req.get("filename", "")
                     _hist_query = _hist_req.get("query")
                     _dlog("agent_history_requested",
                           session_id=session_id, user_id=user_id, turn=_turn,
-                          filename=_hist_fn, query=_hist_query)
+                          filename=_hist_fn, query=_hist_query,
+                          view=_hist_req.get("view"), version=_hist_req.get("version"))
                     yield sse({"type": "progress",
                                "content": f"Checking history: {_hist_fn}..."})
                     try:
                         from routers.session_files import search_file_version_history
                         _hist_result = search_file_version_history(
-                            session_id, _hist_fn, query=_hist_query, dlog=_dlog)
+                            session_id, _hist_fn, query=_hist_query, dlog=_dlog,
+                            view=_hist_req.get("view"), version=_hist_req.get("version"),
+                            compare_to=_hist_req.get("compare_to"))
                         if _hist_result.get("found"):
                             if "matches" in _hist_result:
                                 _hist_body = "\n\n".join(_hist_result["matches"])

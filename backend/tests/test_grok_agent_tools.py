@@ -303,6 +303,24 @@ def test_translate_request_history_context_tuple():
     assert payload["query"] == "old"
 
 
+def test_request_history_schema_forwards_new_fields_only_when_sent():
+    schema = gat._schema_request_history()["function"]["parameters"]
+    assert schema["required"] == ["filename"]
+    props = schema["properties"]
+    assert props["view"]["enum"] == ["list", "diff"]
+    assert "version" in props and "compare_to" in props
+    assert props["compare_to"]["type"] == "integer"
+    kind, body = gat._context_body("request_history", {
+        "filename": "a.py", "view": "diff", "version": "last", "compare_to": 2,
+    })
+    assert kind == "history"
+    assert json.loads(body) == {
+        "filename": "a.py", "view": "diff", "version": "last", "compare_to": 2,
+    }
+    kind, plain = gat._context_body("request_history", {"filename": "a.py", "query": "old"})
+    assert json.loads(plain) == {"filename": "a.py", "query": "old"}
+
+
 def test_translate_report_blocked_terminal():
     res = gat.translate_tool_calls([_call("report_blocked", {"reason": "need file X"})])
     assert res.blocked_reason == "need file X"
