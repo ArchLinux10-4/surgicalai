@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/appStore'
-import { AwsConnectModal } from './AwsConnectModal'
+import { AwsConnectModal, shortAwsCli } from './AwsConnectModal'
 
 /** Join pasted shell continuations. Mirrors backend normalize_aws_command. */
 function normalizeAwsCommand(command: string): string {
@@ -37,7 +37,6 @@ function normalizeAwsCommand(command: string): string {
 
 export function AwsTerminalPanel() {
   const activeSessions = useAppStore(s => s.activeSessions)
-  const lines = useAppStore(s => s.awsTerminalLines)
   const push = useAppStore(s => s.pushAwsTerminalLine)
   const [status, setStatus] = useState<any>(null)
   const [open, setOpen] = useState(false)
@@ -48,8 +47,6 @@ export function AwsTerminalPanel() {
     api.aws.status().then(setStatus).catch(() => setStatus({ connected: false }))
   }
   useEffect(() => { refresh() }, [])
-
-  const visible = lines.filter(l => !activeSessions || l.sessionId === activeSessions)
 
   const run = async () => {
     const typed = normalizeAwsCommand(draft)
@@ -84,6 +81,7 @@ export function AwsTerminalPanel() {
       <div className="flex flex-col items-center justify-center h-full gap-3 px-5 text-center">
         <div className="text-sm font-semibold text-ink">AWS CLI</div>
         <p className="text-[12px] text-muted leading-snug">Connect an access key to run AWS CLI commands and let agents use the same account.</p>
+        {status?.error && <p className="text-[12px] text-danger">{status.error}</p>}
         <button type="button" className="btn-primary" onClick={() => setOpen(true)}>Connect AWS</button>
         <AwsConnectModal open={open} onClose={() => setOpen(false)} onConnected={refresh} />
       </div>
@@ -93,28 +91,27 @@ export function AwsTerminalPanel() {
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="px-3 py-2 border-b border-border text-[11px] text-muted">
-        <div className="text-ink font-semibold">AWS CLI</div>
+        <div className="flex items-center justify-between gap-2">
+          <div className="text-ink font-semibold">AWS CLI</div>
+          <button
+            type="button"
+            className="text-[11px] font-semibold text-accent hover:underline"
+            onClick={() => setOpen(true)}
+          >
+            Account
+          </button>
+        </div>
         <div className="truncate">Account {status.account} · {status.region}</div>
         <div className="truncate">{status.arn}</div>
-        <button
-          type="button"
-          className="mt-1 text-danger"
-          onClick={() => { api.aws.disconnect().then(refresh).catch(() => {}) }}
-        >
-          Disconnect
-        </button>
+        {status.cli_version && (
+          <div className="truncate" title={status.cli_version}>{shortAwsCli(status.cli_version)}</div>
+        )}
+        <AwsConnectModal open={open} onClose={() => setOpen(false)} onConnected={refresh} />
       </div>
-      <div className="flex-1 overflow-y-auto bg-[#100808] px-3 py-2 font-mono text-[11px] text-[#d6d6d6]">
-        {visible.length === 0 && <div className="text-faint">aws&gt;</div>}
-        {visible.map((line, i) => (
-          <div key={i} className="mb-2">
-            <div className="text-accent">$ {line.command}</div>
-            {line.stdout && <pre className="whitespace-pre-wrap">{line.stdout}</pre>}
-            {line.stderr && <pre className="whitespace-pre-wrap text-danger">{line.stderr}</pre>}
-          </div>
-        ))}
-      </div>
-      <form className="border-t border-border p-2" onSubmit={(e) => { e.preventDefault(); void run() }}>
+      <p className="px-3 py-2 text-[12px] text-muted leading-snug">
+        Output opens in the terminal along the bottom.
+      </p>
+      <form className="border-t border-border p-2 mt-auto" onSubmit={(e) => { e.preventDefault(); void run() }}>
         <input
           className="input font-mono text-[12px]"
           placeholder="s3 ls"

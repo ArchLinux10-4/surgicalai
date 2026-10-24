@@ -9,6 +9,7 @@ from database import delete_user_api_key, set_user_api_key
 from services.aws_cli import (
     AWS_REGIONS,
     _load_creds,
+    aws_cli_version,
     check_connect_fields,
     mask_access_key_id,
     run_aws_cli,
@@ -58,7 +59,10 @@ def aws_connect(body: ConnectBody, request: Request):
         "ok": True,
         "account": ident["account"],
         "arn": ident["arn"],
+        "user_id": ident.get("user_id") or "",
         "region": fields["region"],
+        "access_key_id": mask_access_key_id(fields["access_key_id"]),
+        "cli_version": aws_cli_version(),
     }
 
 
@@ -69,23 +73,34 @@ def aws_status(request: Request):
         creds = _load_creds(user_id)
     except Exception:
         return {"connected": False}
+    version = aws_cli_version()
     if not creds:
-        return {"connected": False}
+        return {"connected": False, "cli_version": version}
+    region = creds.get("region") or "us-east-1"
+    masked = mask_access_key_id(creds.get("access_key_id") or "")
     try:
         ident = sts_identity(
             creds.get("access_key_id") or "",
             creds.get("secret_access_key") or "",
-            creds.get("region") or "us-east-1",
+            region,
             creds.get("session_token") or "",
         )
     except Exception:
-        return {"connected": False}
+        return {
+            "connected": False,
+            "error": "The saved key was rejected, or AWS could not be reached.",
+            "region": region,
+            "access_key_id": masked,
+            "cli_version": version,
+        }
     return {
         "connected": True,
         "account": ident["account"],
         "arn": ident["arn"],
-        "region": creds.get("region") or "us-east-1",
-        "access_key_id": mask_access_key_id(creds.get("access_key_id") or ""),
+        "user_id": ident.get("user_id") or "",
+        "region": region,
+        "access_key_id": masked,
+        "cli_version": version,
         "regions": list(AWS_REGIONS),
     }
 

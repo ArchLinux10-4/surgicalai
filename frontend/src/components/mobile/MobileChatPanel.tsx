@@ -27,8 +27,8 @@ import {
 import { SessionFilesTray } from '../SessionFilesTray'
 import { AgentMissionControl } from '../AgentMissionControl'
 import { PlanTracker } from '../PlanTracker'
-import { AwsCliFeed } from '../AwsCliFeed'
-import { AwsApprovalCard } from '../AwsApprovalCard'
+import { PlanPane } from '../PlanPane'
+import { AwsTerminalDock } from '../AwsTerminalDock'
 import { PlanQuestionsCard } from '../PlanQuestionsCard'
 import { normalizeQuestions, stripPlanQuestionsFence } from '../../lib/planQuestions'
 import { useTaskPolling } from '../../hooks/useTaskPolling'
@@ -600,14 +600,7 @@ export function MobileChatPanel() {
     retry?: boolean
   } | null>(null)
   const [fileRequestBusy, setFileRequestBusy] = useState(false)
-  const [awsApproval, setAwsApproval] = useState<{
-    sessionId: string
-    command: string
-    level?: string
-    title?: string
-    target?: string
-    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
-  } | null>(null)
+  const setAwsApproval = useAppStore(s => s.setAwsApproval)
 
   const offline = isOfflineSettings(settings)
   const availableModes: ChatMode[] = offline ? ['edit', 'ask'] : CHAT_MODES
@@ -649,11 +642,6 @@ export function MobileChatPanel() {
   }, [])
 
   useEffect(() => {
-    const approvalHere = awsApproval && awsApproval.sessionId === activeSessions
-    if (approvalHere) {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-      return
-    }
     if (userScrolledUpRef.current) return
     if (streamingMsg) {
       const el = scrollContainerRef.current
@@ -662,7 +650,7 @@ export function MobileChatPanel() {
       return
     }
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, streamingMsg, awsApproval, activeSessions])
+  }, [messages, streamingMsg])
 
   // Load session files when active session changes
   useEffect(() => {
@@ -1554,7 +1542,7 @@ export function MobileChatPanel() {
   return (
     <div className="flex flex-col h-full bg-base">
       {/* Messages */}
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
+      <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto">
         {messages.length === 0 && !isStreaming ? (
           <EmptyHomeScreen />
         ) : (
@@ -1580,8 +1568,7 @@ export function MobileChatPanel() {
                 }}
               />
             )}
-            <AwsCliFeed />
-            <PlanTracker emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
+            <PlanTracker hintOnly emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
             {resumableRun && resumableRun.sid === activeSessions && !isStreaming && (
               <div className="mx-3 mb-2 flex items-center justify-between gap-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5">
                 <span className="text-[12px] text-ink leading-snug">
@@ -1691,21 +1678,10 @@ export function MobileChatPanel() {
             )}
           </div>
         )}
-        {awsApproval && awsApproval.sessionId === activeSessions && (
-          <AwsApprovalCard
-            key={`${awsApproval.command}\n${awsApproval.title || ''}`}
-            command={awsApproval.command}
-            level={awsApproval.level}
-            title={awsApproval.title}
-            target={awsApproval.target}
-            onDecide={(action, command) => {
-              awsApproval.reply({ action, command })
-              setAwsApproval(null)
-            }}
-          />
-        )}
         <div ref={bottomRef} />
       </div>
+
+      <PlanPane compact />
 
       {/* Session file drawer — single docked source of truth atop the composer */}
       {activeSessions && hasFiles && (
@@ -1887,6 +1863,7 @@ export function MobileChatPanel() {
           onClose={() => setModeSheetOpen(false)}
         />
       </div>
+      <AwsTerminalDock compact />
     </div>
   )
 }

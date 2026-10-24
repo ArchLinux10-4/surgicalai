@@ -68,8 +68,11 @@ def test_real_prose_no_max_turns_gets_plan_only_message():
         agent_max_turns=24,
     )
     assert event == "no_edits_text_only_notice"
-    assert "didn't change any code" in msg
-    assert "Tell me to go ahead" in msg
+    assert "No code was changed" in msg
+    assert "ask for them directly" in msg
+    assert "start with a plan" in msg
+    assert "Tell me to go ahead" not in msg
+    assert "apply the edits" not in msg
     assert "⚠️" not in msg
     assert "Please try again" not in msg
 

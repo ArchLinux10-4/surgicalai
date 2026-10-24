@@ -671,3 +671,31 @@ def test_approve_runs_the_server_command_not_the_client_string(monkeypatch):
 
     _collect(go())
     assert calls == [stored]
+
+
+def test_cli_version_reads_the_aws_version_line(monkeypatch):
+    monkeypatch.setattr(aws_cli, "_CLI_VERSION", None)
+    monkeypatch.setattr(aws_cli.shutil, "which", lambda name: "/usr/bin/aws")
+
+    class _Proc:
+        stdout = ""
+        stderr = "aws-cli/2.15.30 Python/3.11.6 Linux/6.1 source/x86_64"
+        returncode = 0
+
+    monkeypatch.setattr(aws_cli.subprocess, "run", lambda *a, **k: _Proc())
+    try:
+        assert aws_cli.aws_cli_version().startswith("aws-cli/2.15.30")
+        # Cached: a later miss does not call which again.
+        monkeypatch.setattr(aws_cli.shutil, "which", lambda name: None)
+        assert aws_cli.aws_cli_version().startswith("aws-cli/2.15.30")
+    finally:
+        aws_cli._CLI_VERSION = None
+
+
+def test_cli_version_is_empty_when_aws_is_missing(monkeypatch):
+    monkeypatch.setattr(aws_cli, "_CLI_VERSION", None)
+    monkeypatch.setattr(aws_cli.shutil, "which", lambda name: None)
+    try:
+        assert aws_cli.aws_cli_version() == ""
+    finally:
+        aws_cli._CLI_VERSION = None
