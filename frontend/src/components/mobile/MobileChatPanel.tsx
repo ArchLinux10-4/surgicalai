@@ -7,8 +7,15 @@ import React, { useState, useRef, useEffect, useCallback, memo } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAppStore } from '../../stores/appStore'
-import { api } from '../../api/client'
+import { api, type SteerStream } from '../../api/client'
 import { toast } from '../../lib/toast'
+import { CollapseHint, ComposerPastedTray, UserMessageBody } from '../PastedBlocks'
+import { QueuedMessagesTray } from '../QueuedMessagesTray'
+import { messageTitle, newPastedId, parsePastedBlocks, serializePastedBlocks, shouldPillPaste, pastedTotalChars, PASTE_WARN_CHARS, type PastedBlock } from '../../lib/pastedBlocks'
+import type { SteerQueueItem } from '../../stores/appStore'
+
+const NO_PASTED: PastedBlock[] = []
+const NO_QUEUE: SteerQueueItem[] = []
 import { MobileDiffCard } from './MobileDiffCard'
 import { MobileModeSheet } from './MobileModeSheet'
 import {
@@ -187,8 +194,12 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
   if (isUser) {
     return (
       <div className="flex justify-end px-4 py-2">
-        <div className="max-w-[82%] bg-overlay/60 border border-border/40 rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm text-ink leading-relaxed whitespace-pre-wrap break-words">
-          {msg.content}
+        <div className="max-w-[82%]">
+          <UserMessageBody
+            content={msg.content || ''}
+            steered={!!msg._steered || msg._steerStatus === 'applied'}
+            sending={msg._steerStatus === 'sending'}
+          />
         </div>
       </div>
     )
@@ -347,10 +358,10 @@ function MobileComposeSheet({ value, onChange, onSend, onClose, isStreaming, dis
         <span className="text-[13px] font-medium text-ink/60">Compose</span>
         <button
           onClick={handleSend}
-          disabled={!value.trim() || disabled || isStreaming}
+          disabled={!value.trim() || disabled}
           className="text-sm font-semibold text-[#4ade80] disabled:text-muted/40 transition-colors px-1 py-1"
         >
-          Send
+          {isStreaming ? 'Queue' : 'Send'}
         </button>
       </div>
 
@@ -555,6 +566,13 @@ export function MobileChatPanel() {
   // does not paint a step history during stream).
   const progressHistoryRef = useRef<string[]>([])
   const ctrlRef            = useRef<AbortController | null>(null)
+  const streamOutcomeRef   = useRef<'clean' | 'error' | 'stopped'>('clean')
+  const pendingImmediateRef = useRef<string | null>(null)
+  const [pasteUndo, setPasteUndo] = useState<PastedBlock | null>(null)
+  const draftKey = activeSessions || 'draft'
+  const pastedBlocks = useAppStore((s) => s.pastedBySession[draftKey] ?? NO_PASTED)
+  const steerQueue = useAppStore((s) => (activeSessions ? s.steerQueues[activeSessions] ?? NO_QUEUE : NO_QUEUE))
+  const steerPaused = useAppStore((s) => !!(activeSessions && s.steerPaused[activeSessions]))
   // Bridge refs so a manual Stop (outside the streaming closure) can still see
   // what was accumulated and save it instead of discarding it. Long-term fix:
   // nothing streamed is ever silently dropped on user-initiated stop.
@@ -773,6 +791,11 @@ export function MobileChatPanel() {
   // instead of discarding it. Long-term fix: nothing streamed is ever silently
   // dropped on user-initiated stop.
   const handleStopClick = useCallback(() => {
+    const sid = streamingSessionIdRef.current || activeSessions
+    if (sid) {
+      streamOutcomeRef.current = 'stopped'
+      useAppStore.getState().setSteerPaused(sid, true)
+    }
     if (!gotResultRef.current && (accumulatedRef.current.trim() || thinkingTextRef.current.trim()) && streamingSessionIdRef.current) {
       addMessage({
         id: Date.now().toString() + '_ai_aborted',
@@ -789,7 +812,7 @@ export function MobileChatPanel() {
     thinkingTextRef.current = ''
     setThinkingText('')
     stopStream()
-  }, [addMessage, stopStream])
+  }, [addMessage, stopStream, activeSessions])
 
   const ensureSession = useCallback(async (): Promise<string> => {
     if (activeSessions) return activeSessions
@@ -800,19 +823,67 @@ export function MobileChatPanel() {
     return s.id
   }, [activeSessions, setSessions, setActiveSession])
 
-  const handleSend = useCallback(async (override?: unknown) => {
+  const handleSend = useCallback(async (override?: unknown, mode: 'auto' | 'queue' | 'now' = 'auto') => {
     // onClick handlers pass the click event; only a string is answer text.
     const overrideText = typeof override === 'string' ? override : undefined
-    const sourceText = overrideText ?? input
-    if (!sourceText.trim() || isStreaming) return
+    const typed = (overrideText ?? input).trim()
+    const blocks = overrideText !== undefined ? [] : pastedBlocks
+    if (!typed && blocks.length === 0) return
+    const payload = serializePastedBlocks(typed, blocks)
+    if (isStreaming) {
+      const sid = activeSessions
+      if (!sid) return
+      const ctrl = ctrlRef.current as SteerStream | null
+      const canSteer = payload.length <= 4000 && !!ctrl?.isSteerLive?.()
+      if (mode === 'now' && canSteer) {
+        const id = `steer${Date.now().toString(36)}`
+        addMessage({
+          id, session_id: sid, role: 'user', content: payload,
+          created_at: new Date().toISOString(), _steerStatus: 'sending',
+        })
+        if (ctrl?.sendSteer(id, payload)) {
+          if (overrideText === undefined) {
+            setInput('')
+            useAppStore.getState().clearPastedBlocks(draftKey)
+          }
+          return
+        }
+        useAppStore.getState().removeMessage(id)
+      }
+      if (mode === 'now' && !canSteer) {
+        pendingImmediateRef.current = payload
+        streamOutcomeRef.current = 'stopped'
+        useAppStore.getState().setSteerPaused(sid, true)
+        handleStopClick()
+        if (overrideText === undefined) {
+          setInput('')
+          useAppStore.getState().clearPastedBlocks(draftKey)
+        }
+        return
+      }
+      useAppStore.getState().enqueueSteer(sid, {
+        id: `q${Date.now().toString(36)}`,
+        text: typed,
+        pasted: blocks,
+        status: 'queued',
+      })
+      if (overrideText === undefined) {
+        setInput('')
+        useAppStore.getState().clearPastedBlocks(draftKey)
+      }
+      return
+    }
     if (!settings?.openai_api_key_set && !(settings as any)?.anthropic_api_key_set) {
       setError('Add an API key in Settings first.')
       return
     }
     setError(null)
-    const text = sourceText.trim()
+    const text = payload
+    streamOutcomeRef.current = 'clean'
     if (overrideText === undefined) {
       setInput('')
+      setPasteUndo(null)
+      useAppStore.getState().clearPastedBlocks(draftKey)
       if (textareaRef.current) textareaRef.current.style.height = 'auto'
     }
     useAppStore.getState().clearPendingPlanQuestions()
@@ -821,7 +892,7 @@ export function MobileChatPanel() {
     const isFirst   = messages.length === 0
 
     const autoName = () => {
-      const title = text.slice(0, 55) || 'New Chat'
+      const title = messageTitle(text)
       api.chat.renameSession(sessionId, title)
         .then(() => api.chat.getSessions().then(setSessions).catch(() => {}))
         .catch(() => {})
@@ -1104,6 +1175,10 @@ export function MobileChatPanel() {
         }
         thinkingTextRef.current = ''
         setThinkingText('')
+        if (streamOutcomeRef.current !== 'stopped') {
+          streamOutcomeRef.current = 'error'
+          useAppStore.getState().setSteerPaused(sessionId, true)
+        }
         setError(err); stopStream(); setBuildEdit(false)
       },
       // onThinking — do not wipe on every start (multi-round within one turn).
@@ -1274,11 +1349,37 @@ export function MobileChatPanel() {
           text: event?.text || '',
         })
       },
+      (event) => { useAppStore.getState().applySteerFrame(sessionId, event) },
     )
     ctrlRef.current = ctrl
-  }, [input, isStreaming, settings, ensureSession, messages.length, sessionFiles,
+  }, [input, pastedBlocks, draftKey, isStreaming, settings, ensureSession, messages.length, sessionFiles,
       addMessage, setSessions, stopStream, updateAgentTask, setAgentPhase, setTaskRunId,
-      setTaskPreamble, setAgentTasks, setSessionFiles])
+      setTaskPreamble, setAgentTasks, setSessionFiles, activeSessions, handleStopClick])
+
+  const wasStreamingRef = useRef(false)
+  useEffect(() => {
+    const was = wasStreamingRef.current
+    wasStreamingRef.current = isStreaming
+    if (!was || isStreaming) return
+    const sid = activeSessions
+    if (!sid) return
+    const immediate = pendingImmediateRef.current
+    if (immediate) {
+      pendingImmediateRef.current = null
+      void handleSend(immediate)
+      return
+    }
+    const outcome = streamOutcomeRef.current
+    streamOutcomeRef.current = 'clean'
+    const store = useAppStore.getState()
+    if (outcome !== 'clean') {
+      store.setSteerPaused(sid, true)
+      return
+    }
+    if (store.steerPaused[sid]) return
+    const next = store.takeFirstQueued(sid)
+    if (next) void handleSend(serializePastedBlocks(next.text, next.pasted))
+  }, [isStreaming, activeSessions, handleSend])
 
   const resumeInterruptedRun = useCallback(() => {
     if (!resumableRun || isStreaming) return
@@ -1561,7 +1662,7 @@ export function MobileChatPanel() {
   }
 
   const hasFiles    = sessionFiles.length > 0
-  const canSend     = input.trim().length > 0 && !isStreaming
+  const canSend     = (input.trim().length > 0 || pastedBlocks.length > 0) && !isCompacting
 
   return (
     <div className="flex flex-col h-full bg-base">
@@ -1721,11 +1822,78 @@ export function MobileChatPanel() {
 
       {/* ── Input bar ── */}
       <div className="flex-shrink-0 bg-base px-3 pt-2 pb-3 border-t border-border/60">
+        <QueuedMessagesTray
+          items={steerQueue}
+          paused={steerPaused}
+          layout="mobile"
+          onSendNow={(item) => {
+            if (!activeSessions) return
+            useAppStore.getState().removeSteer(activeSessions, item.id)
+            const payload = serializePastedBlocks(item.text, item.pasted)
+            if (isStreaming) void handleSend(payload, 'now')
+            else void handleSend(payload)
+          }}
+          onEdit={(item) => {
+            if (!activeSessions) return
+            useAppStore.getState().removeSteer(activeSessions, item.id)
+            setInput((cur) => [cur.trim(), item.text].filter(Boolean).join('\n\n'))
+            for (const block of item.pasted) useAppStore.getState().addPastedBlock(draftKey, block)
+          }}
+          onDelete={(id) => { if (activeSessions) useAppStore.getState().removeSteer(activeSessions, id) }}
+          onMove={(id, dir) => { if (activeSessions) useAppStore.getState().moveSteer(activeSessions, id, dir) }}
+          onReorder={(fromId, toId) => { if (activeSessions) useAppStore.getState().reorderSteer(activeSessions, fromId, toId) }}
+          onResume={() => {
+            if (!activeSessions) return
+            useAppStore.getState().setSteerPaused(activeSessions, false)
+            if (!isStreaming) {
+              const next = useAppStore.getState().takeFirstQueued(activeSessions)
+              if (next) void handleSend(serializePastedBlocks(next.text, next.pasted))
+            }
+          }}
+          onClear={() => { if (activeSessions) useAppStore.getState().clearSteerQueue(activeSessions) }}
+        />
+        {shouldPillPaste(input) && (
+          <CollapseHint onCollapse={() => {
+            const ta = textareaRef.current
+            const start = ta?.selectionStart ?? 0
+            const end = ta?.selectionEnd ?? 0
+            const selected = !!ta && start !== end
+            const chunk = selected ? input.slice(start, end) : input
+            if (!chunk.trim() || (!selected && !shouldPillPaste(chunk))) return
+            useAppStore.getState().addPastedBlock(draftKey, { id: newPastedId(), text: chunk })
+            setInput(selected ? input.slice(0, start) + input.slice(end) : '')
+          }} />
+        )}
 
         {/* Unified pill — contains textarea + all actions */}
         <div className="flex flex-col bg-surface border border-border/80 rounded-2xl
           overflow-hidden shadow-sm focus-within:border-[rgba(74,222,128,0.35)] transition-colors">
 
+          <div className="px-3 pt-2">
+            <ComposerPastedTray
+              blocks={pastedBlocks}
+              warn={pastedTotalChars(pastedBlocks) >= PASTE_WARN_CHARS}
+              presentation="sheet"
+              undo={pasteUndo}
+              onUndo={() => {
+                if (!pasteUndo) return
+                useAppStore.getState().addPastedBlock(draftKey, pasteUndo)
+                setInput((cur) => cur.replace(pasteUndo.text, ''))
+                setPasteUndo(null)
+              }}
+              onDismissUndo={() => setPasteUndo(null)}
+              onRemove={(id) => useAppStore.getState().removePastedBlock(draftKey, id)}
+              onSave={(id, text) => useAppStore.getState().updatePastedBlock(draftKey, id, text)}
+              onConvert={(block) => {
+                const ta = textareaRef.current
+                const start = ta?.selectionStart ?? input.length
+                const end = ta?.selectionEnd ?? input.length
+                setInput(input.slice(0, start) + block.text + input.slice(end))
+                useAppStore.getState().removePastedBlock(draftKey, block.id)
+                setPasteUndo(block)
+              }}
+            />
+          </div>
           {/* Textarea row */}
           <textarea
             ref={textareaRef}
@@ -1735,10 +1903,20 @@ export function MobileChatPanel() {
               e.target.style.height = 'auto'
               e.target.style.height = Math.min(e.target.scrollHeight, 160) + 'px'
             }}
-            onKeyDown={e => {
-              if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend() }
+            onPaste={(e) => {
+              if (e.clipboardData.files?.length) return
+              const text = e.clipboardData.getData('text')
+              if (!text || !shouldPillPaste(text)) return
+              e.preventDefault()
+              useAppStore.getState().addPastedBlock(draftKey, { id: newPastedId(), text })
             }}
-            placeholder={isCompacting ? 'Compacting history…' : 'Ready when you are…'}
+            onKeyDown={e => {
+              if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault()
+                void handleSend(undefined, isStreaming ? 'queue' : 'auto')
+              }
+            }}
+            placeholder={isCompacting ? 'Compacting history…' : isStreaming ? 'Add a follow-up to the queue…' : 'Ready when you are…'}
             rows={1}
             disabled={isCompacting}
             className="w-full resize-none bg-transparent px-4 pt-3 pb-1 text-[15px]
@@ -1837,33 +2015,38 @@ export function MobileChatPanel() {
               </button>
             </div>
 
-            {/* Right: send / stop */}
-            {isStreaming ? (
+            {/* Right: send / queue / stop */}
+            {isStreaming && (
               <button
                 onClick={handleStopClick}
                 className="w-9 h-9 flex items-center justify-center rounded-xl
                   bg-danger/15 text-danger hover:bg-danger/25 active:scale-95 transition-all"
+                title="Stop"
               >
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor">
                   <rect x="4" y="4" width="16" height="16" rx="3"/>
                 </svg>
               </button>
-            ) : (
+            )}
+            {(!isStreaming || input.trim() || pastedBlocks.length > 0) && (
               <button
-                onClick={handleSend}
-                disabled={!canSend}
-                className={`w-9 h-9 flex items-center justify-center rounded-xl
+                onClick={() => void handleSend(undefined, isStreaming ? 'queue' : 'auto')}
+                disabled={!canSend && !isStreaming}
+                title={isStreaming ? 'Queue' : 'Send'}
+                className={`${isStreaming ? 'h-9 px-2.5 text-[11px] font-semibold' : 'w-9 h-9'} flex items-center justify-center rounded-xl
                   transition-all active:scale-95
                   ${canSend
                     ? 'bg-[#4ade80] text-white shadow-sm shadow-[rgba(74,222,128,0.2)] hover:bg-[#4ade80]/90'
                     : 'text-muted/30 cursor-not-allowed'
                   }`}
               >
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none"
-                  stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
-                  <line x1="12" y1="19" x2="12" y2="5"/>
-                  <polyline points="5 12 12 5 19 12"/>
-                </svg>
+                {isStreaming ? 'Queue' : (
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                    <line x1="12" y1="19" x2="12" y2="5"/>
+                    <polyline points="5 12 12 5 19 12"/>
+                  </svg>
+                )}
               </button>
             )}
           </div>

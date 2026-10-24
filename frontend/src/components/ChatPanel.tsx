@@ -2,7 +2,7 @@ import React, { useState, useRef, useEffect, useCallback, Component } from 'reac
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { useAppStore, type PickedElementRef, type LiveEditCardState } from '../stores/appStore'
-import { api } from '../api/client'
+import { api, type SteerStream } from '../api/client'
 import { toast } from '../lib/toast'
 import { InlineDiffCard } from './InlineDiffCard'
 import { LiveEditCard } from './LiveEditCard'
@@ -11,6 +11,13 @@ import { MarkdownCode } from './CodeBlock'
 import { SessionFilesTray } from './SessionFilesTray'
 import { GitHubBranchChip } from './GitHubBranchChip'
 import { PickedElementsTray } from './PickedElementsTray'
+import { CollapseHint, ComposerPastedTray, UserMessageBody } from './PastedBlocks'
+import { QueuedMessagesTray } from './QueuedMessagesTray'
+import { messageTitle, newPastedId, parsePastedBlocks, serializePastedBlocks, shouldPillPaste, stripPastedMarkers, pastedTotalChars, PASTE_WARN_CHARS, type PastedBlock } from '../lib/pastedBlocks'
+import type { SteerQueueItem } from '../stores/appStore'
+
+const NO_PASTED: PastedBlock[] = []
+const NO_QUEUE: SteerQueueItem[] = []
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker } from './PlanTracker'
 import { PlanPane } from './PlanPane'
@@ -547,7 +554,7 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
   // Dense chat: long agent markdown above Apply cards starts collapsed.
   const [narrativeOpen, setNarrativeOpen] = useState(false)
   const handleCopy = () => {
-    const text = stripInternalTags(msg.content || '')
+    const text = stripPastedMarkers(stripInternalTags(msg.content || ''))
     navigator.clipboard.writeText(text).then(() => {
       setCopied(true)
       setTimeout(() => setCopied(false), 2000)
@@ -584,11 +591,11 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
             <span className="text-[10px] text-faint opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
             <span className="text-[11px] font-medium text-muted/70">You</span>
           </div>
-          {visibleText.trim() && (
-            <div className="bg-overlay/60 border border-border/40 rounded-2xl rounded-tr-sm px-4 py-2.5 text-sm text-ink leading-relaxed whitespace-pre-wrap shadow-sm">
-              {visibleText}
-            </div>
-          )}
+          <UserMessageBody
+            content={visibleText}
+            steered={!!msg._steered || msg._steerStatus === 'applied'}
+            sending={msg._steerStatus === 'sending'}
+          />
           <PickedElementsInMessage elements={pickedCtx} />
         </div>
       </div>
@@ -1552,15 +1559,18 @@ export function ChatPanel() {
     clearSessionStream(sid)
   }
 
-  // Mid-thought injection state
-  const [injectionInput, setInjectionInput] = useState('')
-  const [injectionQueued, setInjectionQueued] = useState(false)
-  const pendingInjectionRef = useRef<string>('')
   const sentMessageRef = useRef<string>('')
+  // 'clean' auto-sends the queue. Stop and errors pause it.
+  const streamOutcomeRef = useRef<Record<string, 'clean' | 'error' | 'stopped'>>({})
+  const pendingImmediateRef = useRef<{ sid: string; text: string } | null>(null)
+  const [pasteUndo, setPasteUndo] = useState<PastedBlock | null>(null)
   // v1.4: holds the planned run while the planning stream closes, so the
   // per-task execution queue can start once /smart-stream returns.
   const pendingRunRef = useRef<{ runId: string; tasks: any[]; serverRun?: boolean } | null>(null)
-  const [restartSignal, setRestartSignal] = useState<{ msg: string; sid: string } | null>(null)
+  const draftKey = activeSessions || 'draft'
+  const pastedBlocks = useAppStore((s) => s.pastedBySession[draftKey] ?? NO_PASTED)
+  const steerQueue = useAppStore((s) => (activeSessions ? s.steerQueues[activeSessions] ?? NO_QUEUE : NO_QUEUE))
+  const steerPaused = useAppStore((s) => (activeSessions ? !!s.steerPaused[activeSessions] : false))
 
   // ── Human-in-the-loop file request ──────────────────────────────────────
   // The agent paused mid-run because it needs a file that isn't in the
@@ -1738,7 +1748,11 @@ export function ChatPanel() {
       if ((e.ctrlKey || e.metaKey) && e.key === 'p') { e.preventDefault(); fileInputRef.current?.click() }
       if (e.key === 'Escape' && isStreaming) {
         const sid = useAppStore.getState().activeSessions
-        if (sid) { abortMapRef.current.get(sid)?.abort(); abortMapRef.current.delete(sid); saveAbortedMessage(sid) }
+        if (sid) {
+          streamOutcomeRef.current[sid] = 'stopped'
+          useAppStore.getState().setSteerPaused(sid, true)
+          abortMapRef.current.get(sid)?.abort(); abortMapRef.current.delete(sid); saveAbortedMessage(sid)
+        }
         else { setIsStreaming(false); setStreamingMessage(''); setStreamProgress('') }
       }
     }
@@ -1806,7 +1820,11 @@ export function ChatPanel() {
     }
   }
 
-  const finishTaskRun = (sid: string, onFinish?: () => void) => {
+  const finishTaskRun = (sid: string, onFinish?: () => void, failed = false) => {
+    if (failed && streamOutcomeRef.current[sid] !== 'stopped') {
+      streamOutcomeRef.current[sid] = 'error'
+      useAppStore.getState().setSteerPaused(sid, true)
+    }
     clearSessionStream(sid)
     if (useAppStore.getState().activeSessions === sid) {
       setIsBuildingEdit(false)
@@ -1856,7 +1874,7 @@ export function ChatPanel() {
                   streamErr
                   || 'Connection dropped mid-task. Recovered edits are ready to review — apply them, then Resume remaining tasks.',
                 )
-                finishTaskRun(sid, onFinish)
+                finishTaskRun(sid, onFinish, true)
                 return
               }
               // Backend finished the task but the task_done event was lost
@@ -1864,23 +1882,23 @@ export function ChatPanel() {
               runNext()
             } else if (status === 'blocked' || status === 'cancelled') {
               updateAgentTask(t.id, { status, qa_score: row?.qa_score, verdict: row?.verdict })
-              finishTaskRun(sid, onFinish)
+              finishTaskRun(sid, onFinish, true)
             } else if (status === 'pending') {
               // The backend disconnect guard reset the orphaned task after
               // the drop — pause the run and offer a one-click Resume.
               updateAgentTask(t.id, { status: 'pending', progress: undefined })
               setResumableRun({ sid, runId, tasks: tasks.slice(idx - 1) })
               setError(streamErr || 'Connection dropped mid-task. The run is paused — click Resume to continue.')
-              finishTaskRun(sid, onFinish)
+              finishTaskRun(sid, onFinish, true)
             } else {
               // running / unknown — we cannot safely continue.
               setError(streamErr || 'Connection dropped mid-task. Task status is unresolved — reopen the session to check progress.')
-              finishTaskRun(sid, onFinish)
+              finishTaskRun(sid, onFinish, true)
             }
           })
           .catch(() => {
             setError(streamErr || 'Connection dropped and task status could not be verified.')
-            finishTaskRun(sid, onFinish)
+            finishTaskRun(sid, onFinish, true)
           })
       }
       const ctrl = api.stream.executeTask(
@@ -1905,7 +1923,7 @@ export function ChatPanel() {
                 setResumableRun({ sid, runId, tasks: remaining })
               }
             }
-            finishTaskRun(sid, onFinish)
+            finishTaskRun(sid, onFinish, true)
           }
         },
         // Mid-task Anthropic credit pause — same banner as single-pass smart().
@@ -1923,6 +1941,7 @@ export function ChatPanel() {
             probing: false,
           })
         },
+        (event) => { useAppStore.getState().applySteerFrame(sid, event) },
       )
       abortMapRef.current.set(sid, ctrl)
     }
@@ -2077,7 +2096,7 @@ export function ChatPanel() {
         if (useAppStore.getState().activeSessions === sid && saved?.length) setMessages(saved)
       })
       .catch(() => {})
-    finishTaskRun(sid, onFinish)
+    finishTaskRun(sid, onFinish, agentTasks.some(t => t.status !== 'done'))
   }, [agentTasks, serverRun])
 
   // ── Core stream launcher — shared by handleSend and injection restart ─────
@@ -2087,6 +2106,7 @@ export function ChatPanel() {
     isFirst: boolean,
     autoRename: () => void,
   ) => {
+    streamOutcomeRef.current[sessionId] = 'clean'
     // Any send (answers card, typed reply, retry) supersedes an open question card.
     useAppStore.getState().clearPendingPlanQuestions()
     let accumulated = ''
@@ -2223,6 +2243,10 @@ export function ChatPanel() {
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
       },
       (err) => {
+        if (streamOutcomeRef.current[sessionId] !== 'stopped') {
+          streamOutcomeRef.current[sessionId] = 'error'
+          useAppStore.getState().setSteerPaused(sessionId, true)
+        }
         clearStaleFileRequest(sessionId)
         if ((accumulated.trim() || thinkingTextRef.current.trim()) && !gotResult) {
           addMessage({
@@ -2462,29 +2486,43 @@ export function ChatPanel() {
           text: event?.text || '',
         })
       },
+      (event) => {
+        useAppStore.getState().applySteerFrame(sessionId, event)
+      },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change
 
-  // Restart stream when an injection was queued — fires once isStreaming settles to false
+  const prevStreamingRef = useRef<Record<string, boolean>>({})
+  const beginStreamRef = useRef<(sid: string, text: string) => void>(() => {})
   useEffect(() => {
-    if (!restartSignal || isStreaming) return
-    const { msg, sid } = restartSignal
-    setRestartSignal(null)
-    setSessionStreaming(sid, true)
-    setSessionStreamProgress(sid, 'Applying your context...')
-    setSessionStreamingMessage(sid, '')
-    setProgressHistory(['Applying your context...'])
-    setThinkingText('')
-    setIsThinking(false)
-    thinkingTextRef.current = ''
-    webSearchSourcesRef.current = []
-    setWebSearchLive(null)
-    progressHistoryRef.current = ['Applying your context...']
-    doStream(sid, msg, false, () => {
-      api.chat.getSessions().then(setSessions).catch(() => {})
-    })
-  }, [restartSignal, isStreaming, doStream])
+    const prev = prevStreamingRef.current
+    const now: Record<string, boolean> = {}
+    const ids = new Set([...Object.keys(prev), ...Object.keys(streamingSessions)])
+    for (const sid of ids) {
+      const live = !!streamingSessions[sid]?.isStreaming
+      now[sid] = live
+      if (!prev[sid] || live) continue
+      const immediate = pendingImmediateRef.current
+      if (immediate && immediate.sid === sid) {
+        pendingImmediateRef.current = null
+        beginStreamRef.current(sid, immediate.text)
+        continue
+      }
+      const outcome = streamOutcomeRef.current[sid] || 'clean'
+      delete streamOutcomeRef.current[sid]
+      const store = useAppStore.getState()
+      if (outcome !== 'clean') {
+        store.setSteerPaused(sid, true)
+        continue
+      }
+      if (store.steerPaused[sid]) continue
+      const next = store.takeFirstQueued(sid)
+      if (!next) continue
+      beginStreamRef.current(sid, serializePastedBlocks(next.text, next.pasted))
+    }
+    prevStreamingRef.current = now
+  }, [streamingSessions])
 
   // ── Human-in-the-loop file request handlers ────────────────────────────
   const handleFileRequestUpload = () => fileRequestInputRef.current?.click()
@@ -2801,100 +2839,24 @@ export function ChatPanel() {
   // user was already using by hand (copy/paste a QA report into the box),
   // just automated behind a button. `input` is only read/cleared when no
   // override is given, so it never clobbers whatever the user was mid-typing.
-  const handleSend = useCallback(async (overrideText?: string) => {
-    const sourceText = overrideText !== undefined ? overrideText : input
-    if (!sourceText.trim()) return
-    clientLog('chat_handle_send_invoked', { isOverride: overrideText !== undefined, isStreaming, length: sourceText.length }, activeSessions || '')
-    // Steer: if Claude is streaming (thinking or generating), inject the user's
-    // context immediately — abort current stream and restart with combined message.
-    // User sees their message bubble + Claude reacting, just like Tasklet.
-    if (isStreaming && sourceText.trim()) {
-      const sid = activeSessions
-      if (!sid) return                       // no session — nothing to inject into
-      // The agent is paused waiting on a file-request back-channel for this
-      // session. Steering here would abort that WebSocket and permanently
-      // strand the pause (no file_response can ever be delivered afterwards)
-      // — that was the root cause of the "File needed" banner getting stuck.
-      // Force resolution via the banner's own Upload/Skip buttons instead.
-      if (fileRequest && fileRequest.sessionId === sid) {
-        setError('The agent is waiting for a file — use Upload file or Skip above before sending a new message.')
-        return
-      }
-      const inj = sourceText.trim()
-      if (overrideText === undefined) {
-        setInput('')
-        if (textareaRef.current) textareaRef.current.style.height = 'auto'
-      }
-      // Show user bubble so the injected message is visible in chat
-      addMessage({
-        id: Date.now().toString() + '_inj',
-        session_id: sid,
-        role: 'user',
-        content: inj,
-        created_at: new Date().toISOString(),
-      })
-      // Build combined message and update sentMessageRef so chained injections
-      // accumulate correctly (inject #2 includes inject #1's context)
-      const lastMsg = sentMessageMapRef.current.get(sid) || sentMessageRef.current
-      const combined = lastMsg + '\n\n[Context added mid-stream]: ' + inj
-      sentMessageRef.current = combined
-      sentMessageMapRef.current.set(sid, combined)
-      // Abort current stream and restart with combined context
-      pendingInjectionRef.current = ''
-      setInjectionQueued(false)
-      abortMapRef.current.get(sid)?.abort()
-      abortMapRef.current.delete(sid)
-      clearSessionStream(sid)
-      setRestartSignal({ msg: combined, sid })
-      return
-    }
-    if (isStreaming) return
-    if (!settings?.openai_api_key_set && !(settings as any)?.anthropic_api_key_set) {
-      setError('Add your API key (OpenAI or Anthropic) in Settings first.')
-      return
-    }
-    setError(null)
-    // Picked-element chips are additive context shown above the composer —
-    // never part of the visible draft — so they're folded into the outgoing
-    // text only at send time, then cleared (mirrors how sessionFiles attach
-    // without living inside the textarea).
-    const text = overrideText !== undefined
-      ? overrideText.trim()
-      : appendPickedElementsContext(input.trim(), pickedElements)
-    sentMessageRef.current = text
-    if (overrideText === undefined) {
-      setInput('')
-      if (pickedElements.length > 0) clearPickedElements()
-      if (textareaRef.current) textareaRef.current.style.height = 'auto'
-    }
-    userScrolledUpRef.current = false  // snap to bottom on user's own send
-
-    const sessionId = await ensureSession()
-    sentMessageMapRef.current.set(sessionId, text)
-
-    // Capture whether this is the first message so we can auto-name the session
-    const isFirstMessage = messages.length === 0
-
-    // Helper: auto-rename session from first user message (removes technical noise)
+  const launchFresh = useCallback((sid: string, text: string, isFirst = false) => {
     const autoNameSession = () => {
-      const title = text.replace(/\s+/g, ' ').trim().slice(0, 55) || 'New Chat'
-      api.chat.renameSession(sessionId, title)
+      api.chat.renameSession(sid, messageTitle(text))
         .then(() => api.chat.getSessions().then(setSessions).catch(() => {}))
         .catch(() => {})
     }
-
-    // Add user message to UI immediately
     addMessage({
       id: Date.now().toString(),
-      session_id: sessionId,
+      session_id: sid,
       role: 'user',
       content: text,
       created_at: new Date().toISOString(),
     })
-
-    setSessionStreaming(sessionId, true)
-    setSessionStreamProgress(sessionId, 'Thinking...')
-    setSessionStreamingMessage(sessionId, '')
+    sentMessageRef.current = text
+    sentMessageMapRef.current.set(sid, text)
+    setSessionStreaming(sid, true)
+    setSessionStreamProgress(sid, 'Thinking...')
+    setSessionStreamingMessage(sid, '')
     setProgressHistory(['Thinking...'])
     setThinkingText('')
     setIsThinking(false)
@@ -2903,12 +2865,124 @@ export function ChatPanel() {
     webSearchSourcesRef.current = []
     setWebSearchLive(null)
     progressHistoryRef.current = ['Thinking...']
+    doStream(sid, text, isFirst, autoNameSession)
+  }, [doStream, addMessage, setSessions, setSessionStreaming, setSessionStreamProgress, setSessionStreamingMessage])
+  beginStreamRef.current = (sid, text) => { launchFresh(sid, text, false) }
 
-    doStream(sessionId, text, isFirstMessage, autoNameSession)
-  }, [input, isStreaming, isThinking, settings, activeSessions, sessionFiles, doStream, fileRequest])
+  const clearDraft = () => {
+    setInput('')
+    setPasteUndo(null)
+    useAppStore.getState().clearPastedBlocks(draftKey)
+    if (pickedElements.length > 0) clearPickedElements()
+    if (textareaRef.current) textareaRef.current.style.height = 'auto'
+  }
+
+  // `mode` while a run is active: queue waits, now steers at the next tool
+  // boundary. A plain send (plan answers, QA retry) uses 'auto'.
+  const handleSend = useCallback(async (overrideText?: string, mode: 'auto' | 'queue' | 'now' = 'auto') => {
+    const typed = (overrideText !== undefined ? overrideText : input).trim()
+    const blocks = overrideText !== undefined ? [] : pastedBlocks
+    if (!typed && blocks.length === 0) return
+    const storedText = overrideText !== undefined ? typed : appendPickedElementsContext(typed, pickedElements)
+    const payload = serializePastedBlocks(storedText, blocks)
+    clientLog('chat_handle_send_invoked', { isOverride: overrideText !== undefined, isStreaming, mode, length: payload.length }, activeSessions || '')
+
+    if (isStreaming) {
+      const sid = activeSessions
+      if (!sid) return
+      const waitingOnFile = !!(fileRequest && fileRequest.sessionId === sid)
+      const ctrl = abortMapRef.current.get(sid) as SteerStream | undefined
+      const canSteer = !waitingOnFile && payload.length <= 4000 && !!ctrl?.isSteerLive?.()
+      if (mode === 'now' && canSteer) {
+        const id = `steer${Date.now().toString(36)}`
+        addMessage({
+          id,
+          session_id: sid,
+          role: 'user',
+          content: payload,
+          created_at: new Date().toISOString(),
+          _steerStatus: 'sending',
+        })
+        if (ctrl?.sendSteer(id, payload)) {
+          if (overrideText === undefined) clearDraft()
+          return
+        }
+        useAppStore.getState().removeMessage(id)
+      }
+      if (mode === 'now' && !waitingOnFile && !canSteer) {
+        pendingImmediateRef.current = { sid, text: payload }
+        streamOutcomeRef.current[sid] = 'stopped'
+        useAppStore.getState().setSteerPaused(sid, true)
+        abortMapRef.current.get(sid)?.abort()
+        abortMapRef.current.delete(sid)
+        saveAbortedMessage(sid)
+        if (overrideText === undefined) clearDraft()
+        return
+      }
+      useAppStore.getState().enqueueSteer(sid, {
+        id: `q${Date.now().toString(36)}`,
+        text: storedText,
+        pasted: blocks,
+        status: 'queued',
+      })
+      if (overrideText === undefined) clearDraft()
+      return
+    }
+
+    if (!settings?.openai_api_key_set && !(settings as any)?.anthropic_api_key_set) {
+      setError('Add your API key (OpenAI or Anthropic) in Settings first.')
+      return
+    }
+    setError(null)
+    if (overrideText === undefined) clearDraft()
+    userScrolledUpRef.current = false
+    const sessionId = await ensureSession()
+    launchFresh(sessionId, payload, messages.length === 0)
+  }, [input, isStreaming, settings, activeSessions, pastedBlocks, pickedElements, doStream, fileRequest, draftKey, messages.length, launchFresh])
 
   const handleKey = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); handleSend() }
+    if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return
+    e.preventDefault()
+    if (isStreaming && e.shiftKey) void handleSend(undefined, 'now')
+    else if (isStreaming) void handleSend(undefined, 'queue')
+    else void handleSend()
+  }
+
+  const onComposerPaste = (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    if (e.clipboardData.files?.length) return
+    const text = e.clipboardData.getData('text')
+    if (!text || !shouldPillPaste(text)) return
+    e.preventDefault()
+    useAppStore.getState().addPastedBlock(draftKey, { id: newPastedId(), text })
+  }
+
+  const collapseToPill = () => {
+    const ta = textareaRef.current
+    const start = ta?.selectionStart ?? 0
+    const end = ta?.selectionEnd ?? 0
+    const selected = ta ? start !== end : false
+    const chunk = selected ? input.slice(start, end) : input
+    if (!chunk.trim()) return
+    if (!selected && !shouldPillPaste(chunk)) return
+    useAppStore.getState().addPastedBlock(draftKey, { id: newPastedId(), text: chunk })
+    setInput(selected ? input.slice(0, start) + input.slice(end) : '')
+    if (ta) ta.style.height = 'auto'
+  }
+
+  const convertPastedToText = (block: PastedBlock) => {
+    const ta = textareaRef.current
+    const start = ta?.selectionStart ?? input.length
+    const end = ta?.selectionEnd ?? input.length
+    const next = input.slice(0, start) + block.text + input.slice(end)
+    setInput(next)
+    useAppStore.getState().removePastedBlock(draftKey, block.id)
+    setPasteUndo(block)
+    requestAnimationFrame(() => {
+      if (!textareaRef.current) return
+      const caret = start + block.text.length
+      textareaRef.current.focus()
+      textareaRef.current.setSelectionRange(caret, caret)
+    })
   }
 
   const hasFiles = sessionFiles.length > 0
@@ -3167,13 +3241,6 @@ export function ChatPanel() {
                 />
               </div>
             )}
-            {/* Steer queued indicator — brief flash while injection restarts stream */}
-            {injectionQueued && isStreaming && (
-              <div className="mx-4 mt-1.5 flex items-center gap-1.5 text-[11px] text-purple/60">
-                <span className="w-1.5 h-1.5 rounded-full bg-purple/50 animate-pulse flex-shrink-0" />
-                Injecting your context...
-              </div>
-            )}
             {error && (
               <div className="mx-4 my-3 flex items-start gap-2.5 px-3.5 py-3 bg-danger/10 border border-danger/30 rounded-xl text-sm text-danger">
                 <Warning sx={{ fontSize: 15 }} className="flex-shrink-0 mt-0.5" />
@@ -3220,6 +3287,39 @@ export function ChatPanel() {
         )}
 
         <PickedElementsTray />
+        <QueuedMessagesTray
+          items={steerQueue}
+          paused={steerPaused}
+          layout="desktop"
+          onSendNow={(item) => {
+            const store = useAppStore.getState()
+            store.removeSteer(activeSessions || '', item.id)
+            const payload = serializePastedBlocks(item.text, item.pasted)
+            if (isStreaming) void handleSend(payload, 'now')
+            else if (activeSessions) launchFresh(activeSessions, payload, false)
+          }}
+          onEdit={(item) => {
+            useAppStore.getState().removeSteer(activeSessions || '', item.id)
+            const parsed = parsePastedBlocks(item.text)
+            setInput((cur) => [cur.trim(), parsed.visibleText || item.text].filter(Boolean).join('\n\n'))
+            for (const block of [...parsed.blocks, ...item.pasted]) {
+              useAppStore.getState().addPastedBlock(draftKey, block)
+            }
+          }}
+          onDelete={(id) => useAppStore.getState().removeSteer(activeSessions || '', id)}
+          onMove={(id, dir) => useAppStore.getState().moveSteer(activeSessions || '', id, dir)}
+          onReorder={(fromId, toId) => useAppStore.getState().reorderSteer(activeSessions || '', fromId, toId)}
+          onResume={() => {
+            if (!activeSessions) return
+            useAppStore.getState().setSteerPaused(activeSessions, false)
+            if (!isStreaming) {
+              const next = useAppStore.getState().takeFirstQueued(activeSessions)
+              if (next) launchFresh(activeSessions, serializePastedBlocks(next.text, next.pasted), false)
+            }
+          }}
+          onClear={() => { if (activeSessions) useAppStore.getState().clearSteerQueue(activeSessions) }}
+        />
+        {shouldPillPaste(input) && <CollapseHint onCollapse={collapseToPill} />}
 
         {/* Prompt templates — quick-start chips */}
         {!isStreaming && (
@@ -3281,16 +3381,35 @@ export function ChatPanel() {
           >
             {isComposerExpanded ? '⤡ Collapse' : '⤢ Expand'}
           </button>
+          <ComposerPastedTray
+            blocks={pastedBlocks}
+            warn={pastedTotalChars(pastedBlocks) >= PASTE_WARN_CHARS}
+            presentation="popover"
+            undo={pasteUndo}
+            onUndo={() => {
+              if (!pasteUndo) return
+              useAppStore.getState().addPastedBlock(draftKey, pasteUndo)
+              setInput((cur) => cur.replace(pasteUndo.text, ''))
+              setPasteUndo(null)
+            }}
+            onDismissUndo={() => setPasteUndo(null)}
+            onRemove={(id) => useAppStore.getState().removePastedBlock(draftKey, id)}
+            onSave={(id, text) => useAppStore.getState().updatePastedBlock(draftKey, id, text)}
+            onConvert={convertPastedToText}
+          />
           <textarea
             ref={textareaRef}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={handleKey}
+            onPaste={onComposerPaste}
             disabled={isCompacting}
             placeholder={
               isCompacting
                 ? 'Compacting history, please wait…'
-                : hasFiles
+                : isStreaming
+                  ? 'Add a follow-up. ⌘↵ to queue, ⌘⇧↵ to send now'
+                  : hasFiles
                   ? `Ask about your ${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} — "Add X", "Fix Y", "Explain Z"…`
                   : 'Ask anything, or drop files here to edit code…'
             }
@@ -3442,7 +3561,11 @@ export function ChatPanel() {
                 <button
                   onClick={() => {
                     const sid = useAppStore.getState().activeSessions
-                    if (sid) { abortMapRef.current.get(sid)?.abort(); abortMapRef.current.delete(sid); saveAbortedMessage(sid) }
+                    if (sid) {
+                      streamOutcomeRef.current[sid] = 'stopped'
+                      useAppStore.getState().setSteerPaused(sid, true)
+                      abortMapRef.current.get(sid)?.abort(); abortMapRef.current.delete(sid); saveAbortedMessage(sid)
+                    }
                     else stopStream(undefined)
                   }}
                   className="h-8 px-3 rounded-lg bg-danger/15 text-danger text-xs font-semibold flex items-center gap-1.5 hover:bg-danger/25 transition-colors"
@@ -3450,19 +3573,38 @@ export function ChatPanel() {
                   <Close sx={{ fontSize: 13 }} /> Stop
                 </button>
               )}
-              {/* Send button: always visible. During thinking, acts as Steer (queues context). */}
-              {(!isStreaming || isThinking) && (
+              {isStreaming && (input.trim() || pastedBlocks.length > 0) && (
+                <div className="flex items-stretch h-8 rounded-lg overflow-hidden shadow-sm shadow-accent/25">
+                  <button
+                    type="button"
+                    onClick={() => void handleSend(undefined, 'queue')}
+                    disabled={isCompacting}
+                    title="Queue for after this run (⌘↵)"
+                    className="px-2.5 bg-accent text-white text-[11px] font-semibold hover:bg-accent/90 disabled:opacity-50"
+                  >
+                    Queue
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleSend(undefined, 'now')}
+                    disabled={isCompacting}
+                    title="Send now, at the next tool step (⌘⇧↵)"
+                    className="px-2 bg-accent/80 text-white text-[11px] font-semibold border-l border-white/20 hover:bg-accent disabled:opacity-50"
+                  >
+                    Now
+                  </button>
+                </div>
+              )}
+              {!isStreaming && (
                 <button
                   onClick={() => handleSend()}
-                  disabled={!input.trim() || isCompacting}
+                  disabled={(!input.trim() && pastedBlocks.length === 0) || isCompacting}
                   className={`h-8 w-8 rounded-lg flex items-center justify-center transition-all ${
-                    !input.trim() || isCompacting
+                    (!input.trim() && pastedBlocks.length === 0) || isCompacting
                       ? 'text-faint cursor-not-allowed'
-                      : isThinking
-                        ? 'bg-purple/80 text-white hover:bg-purple active:scale-95 shadow-sm shadow-purple/25'
-                        : 'bg-accent text-white hover:bg-accent active:scale-95 shadow-sm shadow-accent/25'
+                      : 'bg-accent text-white hover:bg-accent active:scale-95 shadow-sm shadow-accent/25'
                   }`}
-                  title={isThinking ? 'Send as steering context' : 'Send message'}
+                  title="Send message"
                 >
                   <Send sx={{ fontSize: 14 }} />
                 </button>

@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { Check, ContentCopy } from '@mui/icons-material'
 import { api } from '../api/client'
 
 export function shortAwsCli(version?: string): string {
@@ -29,12 +30,32 @@ type AwsStatus = {
   error?: string
 }
 
-function Detail({ label, value, title }: { label: string; value?: string; title?: string }) {
+function Detail({ label, value, title, copyable }: { label: string; value?: string; title?: string; copyable?: boolean }) {
+  const [copied, setCopied] = useState(false)
   if (!value) return null
+  const copy = () => {
+    navigator.clipboard.writeText(value).then(() => {
+      setCopied(true)
+      window.setTimeout(() => setCopied(false), 1500)
+    }).catch(() => {})
+  }
   return (
     <div className="flex items-baseline justify-between gap-3 py-1.5 border-b border-border/60 last:border-0">
       <span className="shrink-0 text-[11px] text-muted">{label}</span>
-      <span title={title || value} className="min-w-0 text-right font-mono text-[12px] text-ink break-all">{value}</span>
+      <span className="flex min-w-0 items-baseline justify-end gap-1.5">
+        <span title={title || value} className="min-w-0 text-right font-mono text-[12px] text-ink break-all">{value}</span>
+        {copyable && (
+          <button
+            type="button"
+            onClick={copy}
+            className="shrink-0 rounded p-0.5 text-muted hover:text-ink hover:bg-overlay/60 transition-colors"
+            title={copied ? 'Copied' : `Copy ${label.toLowerCase()}`}
+            aria-label={copied ? `Copied ${label.toLowerCase()}` : `Copy ${label.toLowerCase()}`}
+          >
+            {copied ? <Check sx={{ fontSize: 13 }} className="text-success" /> : <ContentCopy sx={{ fontSize: 13 }} />}
+          </button>
+        )}
+      </span>
     </div>
   )
 }
@@ -46,7 +67,7 @@ function AccountDetails({ status }: { status: AwsStatus }) {
       <Detail label="User" value={status.user_id} />
       <Detail label="ARN" value={status.arn} />
       <Detail label="Region" value={status.region} />
-      <Detail label="Access key" value={status.access_key_id} />
+      <Detail label="Access key" value={status.access_key_id} copyable />
       <Detail
         label="CLI"
         value={shortAwsCli(status.cli_version) || 'Not installed'}

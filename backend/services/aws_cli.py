@@ -1020,9 +1020,3 @@ def aws_agent_guidance() -> str:
         "no dry run. Do not invent one."
     )
 
-
-def mask_access_key_id(key_id: str) -> str:
-    key = key_id or ""
-    if len(key) < 8:
-        return "****"
-    return f"{key[:4]}…{key[-4:]}"

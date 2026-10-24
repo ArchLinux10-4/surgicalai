@@ -10,6 +10,8 @@ export interface ChatMessage {
   _steps?: string[]
   _model?: string
   _aborted?: boolean
+  _steered?: boolean
+  _steerStatus?: 'sending' | 'applied'
   compact_summary?: string
   compact_count?: number
   compact_kept?: number

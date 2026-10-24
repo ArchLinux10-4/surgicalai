@@ -62,6 +62,7 @@ export type SmartStreamHandlers = {
     reply: (resp: { action: 'approve' | 'reject' }) => boolean,
   ) => void
   onMcpCall?: (event: { server?: string; tool?: string; ok?: boolean; error?: string; text?: string }) => void
+  onSteer?: (event: { type: string; id?: string; text?: string }) => void
 }
 
 export type EditLiveEvent = {
@@ -150,6 +151,32 @@ function wsUrl(path: string): string {
  * fall back — it just ends the stream, and the backend safety-net persists any
  * partial work.  Abort (session switch) mirrors the fetch path: no onDone.
  */
+export interface SteerStream extends AbortController {
+  sendSteer: (id: string, text: string) => boolean
+  isSteerLive: () => boolean
+}
+
+const STEER_LIVE_LIMIT = 4000
+
+function attachSteer(controller: AbortController, getSend: () => ((msg: unknown) => void) | null): SteerStream {
+  const steer = controller as SteerStream
+  let live = false
+  steer.sendSteer = (id, text) => {
+    const send = getSend()
+    if (!live || !send || !text.trim() || text.length > STEER_LIVE_LIMIT) return false
+    send({ type: 'steer', id, text })
+    return true
+  }
+  steer.isSteerLive = () => live && !!getSend()
+  ;(steer as SteerStream & { _setSteerLive?: (v: boolean) => void })._setSteerLive = (v: boolean) => { live = v }
+  return steer
+}
+
+function setSteerLive(controller: SteerStream, live: boolean) {
+  const flag = (controller as SteerStream & { _setSteerLive?: (v: boolean) => void })._setSteerLive
+  flag?.(live)
+}
+
 function streamViaWS(
   path: string,
   data: unknown,
@@ -546,7 +573,8 @@ export const api = {
       onEditLive?: SmartStreamHandlers['onEditLive'],
       onMcpApproval?: SmartStreamHandlers['onMcpApproval'],
       onMcpCall?: SmartStreamHandlers['onMcpCall'],
-    ): AbortController => {
+      onSteer?: (event: { type: string; id?: string; text?: string }) => void,
+    ): SteerStream => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
       if (onThinking && typeof onThinking === 'object') {
@@ -554,10 +582,10 @@ export const api = {
           onThinking, onCompacting, onEditStart, onEditEnd, onTask,
           onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
           onCreditPaused, onPlan, onAwsCli, onAwsApproval, onPreviewCheck,
-          onEditLive, onMcpApproval, onMcpCall,
+          onEditLive, onMcpApproval, onMcpCall, onSteer,
         } = onThinking)
       }
-      const controller = new AbortController()
+      const controller = attachSteer(new AbortController(), () => sendToServer)
       const tokens: string[] = []
       let doneCalled = false
       let _modelUsed = ''
@@ -645,6 +673,9 @@ export const api = {
             })
           }
           else if (chunk.type === 'mcp_call') onMcpCall?.(chunk)
+          else if (chunk.type === 'steer_ready') { setSteerLive(controller, true); onSteer?.(chunk) }
+          else if (chunk.type === 'steer_closed') { setSteerLive(controller, false); onSteer?.(chunk) }
+          else if (chunk.type === 'steer_applied' || chunk.type === 'steer_unapplied') onSteer?.(chunk)
           else if (chunk.type === 'file_needed_cleared') onFileCleared?.(chunk.filename)
           else if (
             chunk.type === 'planning_started' ||
@@ -721,8 +752,10 @@ export const api = {
       onTask: (event: any) => void,
       // Anthropic credit exhaustion mid agent task (parity with smart()).
       onCreditPaused?: (info: any) => void,
-    ): AbortController => {
-      const controller = new AbortController()
+      onSteer?: (event: { type: string; id?: string; text?: string }) => void,
+    ): SteerStream => {
+      let sendToServer: ((msg: unknown) => void) | null = null
+      const controller = attachSteer(new AbortController(), () => sendToServer)
       let doneCalled = false
       const fireDone = () => { if (!doneCalled) { doneCalled = true; onDone() } }
 
@@ -742,6 +775,9 @@ export const api = {
                   : chunk)
             onCreditPaused?.(info)
           }
+          else if (chunk.type === 'steer_ready') { setSteerLive(controller, true); onSteer?.(chunk) }
+          else if (chunk.type === 'steer_closed') { setSteerLive(controller, false); onSteer?.(chunk) }
+          else if (chunk.type === 'steer_applied' || chunk.type === 'steer_unapplied') onSteer?.(chunk)
           else if (
             chunk.type === 'task_start' || chunk.type === 'task_progress' ||
             chunk.type === 'task_thinking' ||
@@ -788,7 +824,8 @@ export const api = {
       // WebSocket-first (removes Railway's 15-min transport wall); on a
       // connect-time failure only, transparently fall back to HTTP/SSE.
       if (typeof WebSocket !== 'undefined') {
-        streamViaWS('/chat/ws/execute-task', data, controller, processLine, fireDone, runViaFetch)
+        streamViaWS('/chat/ws/execute-task', data, controller, processLine, fireDone, runViaFetch,
+          (send) => { sendToServer = send })
       } else {
         runViaFetch()
       }

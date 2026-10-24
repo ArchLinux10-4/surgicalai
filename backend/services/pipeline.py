@@ -4648,6 +4648,7 @@ async def run_chat_stream(
     mode: Optional[str] = None,
     web_search_enabled: bool = False,
     client_inbox=None,
+    steer_inbox=None,
 ):
     """
     Streaming version of run_chat. Yields SSE chunks.
@@ -4993,6 +4994,7 @@ async def run_chat_stream(
                 openai_client=_oa_search_client,
                 web_search_sources=_web_search_sources_final,
                 client_inbox=client_inbox,
+                steer_inbox=steer_inbox,
                 symbol_maps_by_name=symbol_maps_by_name,
                 file_content_lookup=file_content_lookup,
                 execute_tool_round_fn=_ask_plan_execute_tool_round,
@@ -5020,7 +5022,15 @@ async def run_chat_stream(
             if _ask_plan_websearch:
                 from services.openai_web_search import SearchBudget as _OaSearchBudget
                 _oa_budget = _OaSearchBudget()
+            if steer_inbox is not None:
+                yield sse({"type": "steer_ready"})
             while True:
+                if _tool_round > 0 and steer_inbox is not None:
+                    from services.steering import apply_steer_at_boundary as _apply_steer
+                    _oai_msgs, _steer_evs = _apply_steer(
+                        _oai_msgs, steer_inbox, session_id or "")
+                    for _sev in _steer_evs:
+                        yield sse(_sev)
                 _dlog("run_chat_stream_openai_compat", model=chat_model, user_id=user_id,
                       session_id=session_id, tool_round=_tool_round,
                       tools_enabled=_ask_plan_tools_enabled)
@@ -5204,6 +5214,11 @@ async def run_chat_stream(
                 _oai_msgs.append({"role": "assistant", "content": _round_text})
                 _oai_msgs.append({"role": "user", "content": "\n\n".join(_tool_parts)})
                 _tool_round += 1
+            if steer_inbox is not None:
+                yield sse({"type": "steer_closed"})
+                from services.steering import flush_unapplied as _flush_steer
+                for _uev in _flush_steer(steer_inbox):
+                    yield sse(_uev)
         elif _is_gemini_model(chat_model) and HAS_GOOGLE_GENAI:
             # ── Gemini streaming with native thinking blocks ──
             gemini_key = _get_gemini_key(user_id)
@@ -5331,7 +5346,15 @@ async def run_chat_stream(
             _tool_round = 0
             _aws_calls = 0
             _mcp_calls = 0
+            if steer_inbox is not None:
+                yield sse({"type": "steer_ready"})
             while True:
+                if _tool_round > 0 and steer_inbox is not None:
+                    from services.steering import apply_steer_at_boundary as _apply_steer
+                    _claude_msgs, _steer_evs = _apply_steer(
+                        _claude_msgs, steer_inbox, session_id or "")
+                    for _sev in _steer_evs:
+                        yield sse(_sev)
                 _claude_kwargs = {
                     "model": chat_model,
                     "max_tokens": _max_output_tokens(chat_model),
@@ -5493,6 +5516,11 @@ async def run_chat_stream(
                 _claude_msgs.append({"role": "assistant", "content": _round_text})
                 _claude_msgs.append({"role": "user", "content": "\n\n".join(_tool_parts)})
                 _tool_round += 1
+            if steer_inbox is not None:
+                yield sse({"type": "steer_closed"})
+                from services.steering import flush_unapplied as _flush_steer
+                for _uev in _flush_steer(steer_inbox):
+                    yield sse(_uev)
         else:
             # ── OpenAI / GPT / Grok streaming ──
             # NOTE (Grok): this non-Claude branch fires for any GPT- or Grok-
@@ -12260,6 +12288,7 @@ async def run_smart_pipeline_stream(
     project_memory: str = None,
     session_summary: str = "",
     user_id: str = "",
+    steer_inbox=None,
 ):
     """
     v1.3 Smart pipeline: given uploaded session files + a request,
@@ -12722,9 +12751,17 @@ USER REQUEST:
                     _dlog("architect_search_tools_import_failed",
                           error=str(_e_ast_imp), session_id=session_id)
 
+                if steer_inbox is not None:
+                    yield sse({"type": "steer_ready"})
                 while _tu_round < _TU_MAX_ROUNDS:
                     _tu_round += 1
                     _tu_abs_round += 1
+                    if _tu_round > 1 and steer_inbox is not None:
+                        from services.steering import apply_steer_at_boundary as _apply_steer
+                        _tu_messages, _steer_evs = _apply_steer(
+                            _tu_messages, steer_inbox, session_id or "")
+                        for _sev in _steer_evs:
+                            yield sse(_sev)
                     print(f"[AGENTIC][TOOL_USE] Round {_tu_round}/{_TU_MAX_ROUNDS} (abs={_tu_abs_round})")
 
                     # Inject budget warning on final round
@@ -13302,6 +13339,11 @@ USER REQUEST:
                     print(f"[AGENTIC][TOOL_USE] Round {_tu_round} done: {len(_tu_search)} tools, {len(_tu_results)} results (abs={_tu_abs_round}, seen={len(_tu_seen_across)})")
 
                 # End of tool_use while loop
+                if steer_inbox is not None:
+                    yield sse({"type": "steer_closed"})
+                    from services.steering import flush_unapplied as _flush_steer
+                    for _uev in _flush_steer(steer_inbox):
+                        yield sse(_uev)
                 if plan is None:
                     plan = {"intent": "chat", "chat_response": "".join(_tu_text) or "I couldn't determine what to do."}
                 _agentic_plan_set = True
@@ -13916,9 +13958,17 @@ USER REQUEST:
 
             _OAI_ARCH_TIMEOUT = 120
 
+            if steer_inbox is not None:
+                yield sse({"type": "steer_ready"})
             while _oai_round < _OAI_REACT_MAX:
                 _oai_round += 1
                 _oai_abs_round += 1
+                if _oai_round > 1 and steer_inbox is not None:
+                    from services.steering import apply_steer_at_boundary as _apply_steer
+                    _oai_messages, _steer_evs = _apply_steer(
+                        _oai_messages, steer_inbox, session_id or "")
+                    for _sev in _steer_evs:
+                        yield sse(_sev)
                 print(f"[OAI_TOOL_USE] Round {_oai_round}/{_OAI_REACT_MAX} (abs={_oai_abs_round})")
 
                 # Inject budget warning on final round
@@ -14380,6 +14430,11 @@ USER REQUEST:
                 print(f"[OAI_TOOL_USE] Round {_oai_round} done (abs={_oai_abs_round}, seen={len(_oai_seen_across)})")
 
             # End of OpenAI tool-use while loop
+            if steer_inbox is not None:
+                yield sse({"type": "steer_closed"})
+                from services.steering import flush_unapplied as _flush_steer
+                for _uev in _flush_steer(steer_inbox):
+                    yield sse(_uev)
             if plan is None:
                 plan = {"intent": "chat", "chat_response": "I couldn't determine what to do."}
             _oai_intent = plan.get("intent", "unknown")
@@ -17653,6 +17708,7 @@ async def run_natural_pipeline_stream(
     session_summary: str = "",
     user_id: str = "",
     client_inbox=None,
+    steer_inbox=None,
     is_agent_task: bool = False,
     web_search_enabled: bool = False,
     forced_edit_plan: list = None,
@@ -18878,6 +18934,11 @@ async def run_natural_pipeline_stream(
                       error=str(_pg_exc)[:200])
                 _grok_plan_gate = None
 
+        _steer_open = False
+        if steer_inbox is not None and not _skip_agent_loop_for_credit_resume:
+            _steer_open = True
+            yield sse({"type": "steer_ready"})
+
         while True:
             if _skip_agent_loop_for_credit_resume:
                 break
@@ -18950,6 +19011,13 @@ async def run_natural_pipeline_stream(
                            "content": f"Continuing… turn {_turn}"})
                 _dlog("grok_agent_turn_progress",
                       session_id=session_id, user_id=user_id, turn=_turn)
+
+            if _turn > 1 and steer_inbox is not None:
+                from services.steering import apply_steer_at_boundary as _apply_steer
+                current_messages, _steer_evs = _apply_steer(
+                    current_messages, steer_inbox, session_id or "")
+                for _sev in _steer_evs:
+                    yield sse(_sev)
 
             if _natural_use_claude:
                 stream_kwargs = {
@@ -21083,6 +21151,14 @@ async def run_natural_pipeline_stream(
                   has_plan=edit_plan_data is not None,
                   response_len=len(full_response))
             break
+
+        if _steer_open:
+            _steer_open = False
+            yield sse({"type": "steer_closed"})
+        if steer_inbox is not None:
+            from services.steering import flush_unapplied as _flush_steer
+            for _uev in _flush_steer(steer_inbox):
+                yield sse(_uev)
 
         if _preflight_stash:
             from services.preflight import restore_stash as _restore_preflight_stash

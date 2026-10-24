@@ -201,6 +201,7 @@ async def run_grok_ask_plan_native_stream(
     openai_client=None,
     web_search_sources: Optional[list] = None,
     client_inbox=None,
+    steer_inbox=None,
 ):
     """Native-tool-calling Ask/Plan loop for Grok. Yields raw SSE strings.
 
@@ -266,6 +267,8 @@ async def run_grok_ask_plan_native_stream(
     tool_round = 0
     _aws_calls = 0
     _mcp_calls = 0
+    if steer_inbox is not None:
+        yield _sse({"type": "steer_ready"})
     _ws_budget = None
     if websearch_enabled:
         from services.openai_web_search import SearchBudget as _WsBudget
@@ -282,6 +285,12 @@ async def run_grok_ask_plan_native_stream(
                 "my lookup budget — try asking about a more specific file or function."
             )})
             break
+
+        if tool_round > 0 and steer_inbox is not None:
+            from services.steering import apply_steer_at_boundary as _apply_steer
+            messages, _steer_evs = _apply_steer(messages, steer_inbox, session_id or "")
+            for _sev in _steer_evs:
+                yield _sse(_sev)
 
         dlog("grok_ask_plan_native_round_start", session_id=session_id,
              user_id=user_id, model=chat_model, mode=mode, tool_round=tool_round)
@@ -488,3 +497,8 @@ async def run_grok_ask_plan_native_stream(
         )
         messages.extend(followup)
         tool_round += 1
+    if steer_inbox is not None:
+        yield _sse({"type": "steer_closed"})
+        from services.steering import flush_unapplied as _flush_steer
+        for _uev in _flush_steer(steer_inbox):
+            yield _sse(_uev)
