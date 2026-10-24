@@ -2406,6 +2406,24 @@ export function ChatPanel() {
           target: meta?.target,
         })
       },
+      (event, reply) => {
+        if (event?.session_id && event.session_id !== sessionId) return
+        if (useAppStore.getState().activeSessions !== sessionId) return
+        const bundle = event?.bundle
+        if (!bundle || typeof bundle !== 'object') {
+          reply({ status: 'unreachable', proposed_runs: [] })
+          return
+        }
+        useAppStore.getState().setPreviewCheck({
+          sessionId,
+          checkId: event.check_id,
+          entry: event.entry,
+          bundle: bundle as any,
+          baselineBundle: (event.baseline_bundle as any) || null,
+          unresolved: event.unresolved || [],
+          reply,
+        })
+      },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change

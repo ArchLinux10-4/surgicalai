@@ -19,6 +19,15 @@ export interface AvailableModel {
   provider?: string
 }
 
+export interface PreviewBundlePayload {
+  entry?: string
+  entryImport?: string
+  files: Record<string, string>
+  dependencies?: Record<string, string>
+  unresolved?: string[]
+  component?: string
+}
+
 interface AppState {
   // Settings
   settings: AppSettings | null
@@ -92,6 +101,16 @@ interface AppState {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
   } | null
   setAwsApproval: (value: AppState['awsApproval']) => void
+  previewCheck: {
+    sessionId: string
+    checkId: string
+    entry?: string
+    bundle: PreviewBundlePayload
+    baselineBundle?: PreviewBundlePayload | null
+    unresolved?: string[]
+    reply: (payload: Record<string, unknown>) => boolean
+  } | null
+  setPreviewCheck: (value: AppState['previewCheck']) => void
   sidebarPanelOpen: boolean
   setSidebarPanelOpen: (open: boolean) => void
   sidebarPinned: boolean
@@ -271,6 +290,8 @@ export const useAppStore = create<AppState>((set) => ({
   })),
   awsApproval: null,
   setAwsApproval: (awsApproval) => set({ awsApproval }),
+  previewCheck: null,
+  setPreviewCheck: (previewCheck) => set({ previewCheck }),
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
   sidebarPanelOpen: false,
   setSidebarPanelOpen: (sidebarPanelOpen) => set({ sidebarPanelOpen }),

@@ -4,6 +4,7 @@ import { ChatPanel } from './ChatPanel'
 import { CodePanel } from './CodePanel'
 import { ElementPickerPanel } from './ElementPickerPanel'
 import { AwsTerminalDock } from './AwsTerminalDock'
+import { PreviewProbe } from './PreviewProbe'
 import { useAppStore } from '../stores/appStore'
 import { useAuthStore } from '../stores/authStore'
 import { LoginPage } from '../pages/LoginPage'
@@ -161,6 +162,7 @@ export function Layout() {
         style={(activeFile || elementPickerOpen) ? { width: chatWidth } : undefined}
       >
         <ChatPanel />
+        <PreviewProbe />
       </section>
 
       {/* Drag handle — boundary between chat and whichever third pane is

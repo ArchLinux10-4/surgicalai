@@ -48,6 +48,14 @@ export type SmartStreamHandlers = {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean,
     meta?: { level?: string; title?: string; target?: string },
   ) => void
+  onPreviewCheck?: (event: {
+    check_id: string
+    session_id?: string
+    entry?: string
+    bundle: Record<string, unknown>
+    baseline_bundle?: Record<string, unknown> | null
+    unresolved?: string[]
+  }, reply: (payload: Record<string, unknown>) => boolean) => void
 }
 
 /** Fire-and-forget clientLog bridge for wrappers defined in this file.
@@ -503,6 +511,7 @@ export const api = {
       onPlan?: SmartStreamHandlers['onPlan'],
       onAwsCli?: SmartStreamHandlers['onAwsCli'],
       onAwsApproval?: SmartStreamHandlers['onAwsApproval'],
+      onPreviewCheck?: SmartStreamHandlers['onPreviewCheck'],
     ): AbortController => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -510,7 +519,7 @@ export const api = {
         ({
           onThinking, onCompacting, onEditStart, onEditEnd, onTask,
           onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
-          onCreditPaused, onPlan, onAwsCli, onAwsApproval,
+          onCreditPaused, onPlan, onAwsCli, onAwsApproval, onPreviewCheck,
         } = onThinking)
       }
       const controller = new AbortController()
@@ -577,6 +586,15 @@ export const api = {
               sendToServer({ type: 'aws_cli_response', ...resp })
               return true
             }, { level: chunk.level, title: chunk.title, target: chunk.target })
+          }
+          else if (chunk.type === 'preview_check_needed') {
+            onPreviewCheck?.(chunk, (payload) => {
+              if (!sendToServer) return false
+              const body = JSON.stringify({ type: 'preview_check_response', check_id: chunk.check_id, ...payload })
+              if (body.length > 6000) return false
+              sendToServer({ type: 'preview_check_response', check_id: chunk.check_id, ...payload })
+              return true
+            })
           }
           else if (chunk.type === 'file_needed_cleared') onFileCleared?.(chunk.filename)
           else if (

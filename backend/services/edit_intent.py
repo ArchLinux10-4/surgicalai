@@ -137,7 +137,8 @@ def message_wants_edit(text, has_saved_plan=False, is_agent_task=False) -> bool:
 
 
 def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
-                                history_enabled=False, aws_guidance=""):
+                                history_enabled=False, aws_guidance="",
+                                preview_enabled=False, preflight_enabled=False):
     """Suffix appended to the latest user turn for Claude and GPT.
 
     ``wants_edit`` True is the existing edit contract, unchanged.
@@ -159,6 +160,12 @@ def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
             "marked HISTORICAL — it is NOT the current file, never use it as ground "
             "truth for what exists now.\n"
             if history_enabled else ""
+        )
+        + (
+            "• <preview_request>{\"files\": [\"Widget.tsx\"]} — render the pending "
+            "edit in the live preview and read compile or runtime errors. "
+            "Only .tsx and .jsx. Call it after you edit. unobserved is not a pass.\n"
+            if preview_enabled else ""
         )
     )
     if wants_edit:
@@ -182,6 +189,13 @@ def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
             "   explain exactly what you need inside <blocked>…</blocked> rather than\n"
             "   guessing.\n"
             "4. When your edits are complete, simply stop.\n"
+            + (
+                "5. A preflight check may reject an edit that introduces a syntax "
+                "error, a duplicate definition, or a missing import. If you see "
+                "[PREFLIGHT], that edit was NOT applied. Fix it and send a "
+                "corrected edit. Do not resend the same edit.\n"
+                if preflight_enabled else ""
+            )
         )
     return (
         "\n\nAnswer the user's message directly.\n\n"
