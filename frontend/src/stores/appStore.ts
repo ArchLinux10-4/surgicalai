@@ -5,6 +5,7 @@ import type { EditLiveEvent } from '../api/client'
 import { clientLog } from '../lib/clientLog'
 import { normalizeQuestions } from '../lib/planQuestions'
 import type { PlanQuestion } from '../lib/planQuestions'
+import { parsePastedBlocks, type PastedBlock } from '../lib/pastedBlocks'
 
 export type LiveEditMode = 'symbol' | 'lines' | 'snippet' | 'new_file' | 'unresolved'
 
@@ -270,6 +271,33 @@ interface AppState {
   addPickedElement: (el: PickedElementRef) => void
   removePickedElement: (id: string) => void
   clearPickedElements: () => void
+
+  pastedBySession: Record<string, PastedBlock[]>
+  addPastedBlock: (sessionKey: string, block: PastedBlock) => void
+  updatePastedBlock: (sessionKey: string, id: string, text: string) => void
+  removePastedBlock: (sessionKey: string, id: string) => void
+  clearPastedBlocks: (sessionKey: string) => void
+
+  steerQueues: Record<string, SteerQueueItem[]>
+  steerPaused: Record<string, boolean>
+  enqueueSteer: (sessionId: string, item: SteerQueueItem) => void
+  unshiftSteer: (sessionId: string, item: SteerQueueItem) => void
+  removeSteer: (sessionId: string, id: string) => void
+  moveSteer: (sessionId: string, id: string, dir: -1 | 1) => void
+  reorderSteer: (sessionId: string, fromId: string, toId: string) => void
+  setSteerPaused: (sessionId: string, paused: boolean) => void
+  clearSteerQueue: (sessionId: string) => void
+  takeFirstQueued: (sessionId: string) => SteerQueueItem | null
+  patchMessage: (id: string, patch: Partial<ChatMessage>) => void
+  removeMessage: (id: string) => void
+  applySteerFrame: (sessionId: string, frame: { type: string; id?: string; text?: string }) => void
+}
+
+export interface SteerQueueItem {
+  id: string
+  text: string
+  pasted: PastedBlock[]
+  status: 'queued' | 'sending'
 }
 
 export interface PickedElementRef {
@@ -606,4 +634,109 @@ export const useAppStore = create<AppState>((set) => ({
   )),
   removePickedElement: (id) => set((s) => ({ pickedElements: s.pickedElements.filter(p => p.id !== id) })),
   clearPickedElements: () => set({ pickedElements: [] }),
+
+  pastedBySession: {},
+  addPastedBlock: (sessionKey, block) => set((s) => {
+    const cur = s.pastedBySession[sessionKey] || []
+    return { pastedBySession: { ...s.pastedBySession, [sessionKey]: [...cur, block] } }
+  }),
+  updatePastedBlock: (sessionKey, id, text) => set((s) => ({
+    pastedBySession: {
+      ...s.pastedBySession,
+      [sessionKey]: (s.pastedBySession[sessionKey] || []).map((b) => b.id === id ? { ...b, text } : b),
+    },
+  })),
+  removePastedBlock: (sessionKey, id) => set((s) => ({
+    pastedBySession: {
+      ...s.pastedBySession,
+      [sessionKey]: (s.pastedBySession[sessionKey] || []).filter((b) => b.id !== id),
+    },
+  })),
+  clearPastedBlocks: (sessionKey) => set((s) => ({
+    pastedBySession: { ...s.pastedBySession, [sessionKey]: [] },
+  })),
+
+  steerQueues: {},
+  steerPaused: {},
+  enqueueSteer: (sessionId, item) => set((s) => ({
+    steerQueues: { ...s.steerQueues, [sessionId]: [...(s.steerQueues[sessionId] || []), item] },
+  })),
+  unshiftSteer: (sessionId, item) => set((s) => {
+    const cur = (s.steerQueues[sessionId] || []).filter((row) => row.id !== item.id)
+    return { steerQueues: { ...s.steerQueues, [sessionId]: [item, ...cur] } }
+  }),
+  removeSteer: (sessionId, id) => set((s) => ({
+    steerQueues: { ...s.steerQueues, [sessionId]: (s.steerQueues[sessionId] || []).filter((row) => row.id !== id) },
+  })),
+  moveSteer: (sessionId, id, dir) => set((s) => {
+    const list = [...(s.steerQueues[sessionId] || [])]
+    const index = list.findIndex((row) => row.id === id)
+    const next = index + dir
+    if (index < 0 || next < 0 || next >= list.length) return s
+    const [row] = list.splice(index, 1)
+    list.splice(next, 0, row)
+    return { steerQueues: { ...s.steerQueues, [sessionId]: list } }
+  }),
+  reorderSteer: (sessionId, fromId, toId) => set((s) => {
+    const list = [...(s.steerQueues[sessionId] || [])]
+    const from = list.findIndex((row) => row.id === fromId)
+    const to = list.findIndex((row) => row.id === toId)
+    if (from < 0 || to < 0 || from === to) return s
+    const [row] = list.splice(from, 1)
+    list.splice(to, 0, row)
+    return { steerQueues: { ...s.steerQueues, [sessionId]: list } }
+  }),
+  setSteerPaused: (sessionId, paused) => set((s) => ({
+    steerPaused: { ...s.steerPaused, [sessionId]: paused },
+  })),
+  clearSteerQueue: (sessionId) => set((s) => ({
+    steerQueues: { ...s.steerQueues, [sessionId]: [] },
+    steerPaused: { ...s.steerPaused, [sessionId]: false },
+  })),
+  takeFirstQueued: (sessionId) => {
+    let taken: SteerQueueItem | null = null
+    set((s) => {
+      if (s.steerPaused[sessionId]) return s
+      const list = s.steerQueues[sessionId] || []
+      const index = list.findIndex((row) => row.status === 'queued')
+      if (index < 0) return s
+      taken = list[index]
+      return {
+        steerQueues: {
+          ...s.steerQueues,
+          [sessionId]: list.filter((_, i) => i !== index),
+        },
+      }
+    })
+    return taken
+  },
+  patchMessage: (id, patch) => set((s) => ({
+    messages: s.messages.map((m) => m.id === id ? { ...m, ...patch } : m),
+  })),
+  removeMessage: (id) => set((s) => ({
+    messages: s.messages.filter((m) => m.id !== id),
+  })),
+  applySteerFrame: (sessionId, frame) => set((s) => {
+    if (frame.type === 'steer_applied' && frame.id) {
+      return {
+        messages: s.messages.map((m) => m.id === frame.id ? { ...m, _steered: true, _steerStatus: 'applied' as const } : m),
+      }
+    }
+    if (frame.type === 'steer_unapplied' && frame.id) {
+      const msg = s.messages.find((m) => m.id === frame.id)
+      const parsed = parsePastedBlocks(msg?.content || frame.text || '')
+      const item: SteerQueueItem = {
+        id: frame.id,
+        text: parsed.blocks.length ? parsed.visibleText : (msg?.content || frame.text || ''),
+        pasted: parsed.blocks,
+        status: 'queued',
+      }
+      const cur = (s.steerQueues[sessionId] || []).filter((row) => row.id !== item.id)
+      return {
+        messages: s.messages.filter((m) => m.id !== frame.id),
+        steerQueues: { ...s.steerQueues, [sessionId]: [item, ...cur] },
+      }
+    }
+    return s
+  }),
 }))

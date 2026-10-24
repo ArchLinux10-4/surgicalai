@@ -701,6 +701,8 @@ def get_messages(session_id: str, request: Request):
                 _mdl = _meta.get("model")
                 if _mdl:
                     d["_model"] = _mdl
+                if _meta.get("steered"):
+                    d["_steered"] = True
                 # Web research sources (Claude, GPT, or Grok). Absent when the
                 # turn did not search; the frontend renders Sources only when set.
                 _wss = _meta.get("web_search_sources")
@@ -1235,6 +1237,7 @@ async def implement_plan(body: dict, request: Request):
                 session_summary=session_summary,
                 user_id=current_user_id,
                 client_inbox=getattr(request.state, "client_inbox", None),
+                steer_inbox=getattr(request.state, "steer_inbox", None),
                 forced_edit_plan=plan_steps,
                 plan_run_id=run_id,
             )):
@@ -1564,6 +1567,7 @@ async def smart_stream(req: dict, request: Request):
                     mode=_eff_mode,
                     web_search_enabled=_ask_plan_web_search_enabled,
                     client_inbox=getattr(request.state, "client_inbox", None),
+                    steer_inbox=getattr(request.state, "steer_inbox", None),
                 ):
                     # run_chat_stream emits token / thinking_* / done / error —
                     # all already handled by the smart-stream frontend consumer.
@@ -1646,6 +1650,7 @@ async def smart_stream(req: dict, request: Request):
                             mode=_eff_mode,
                             web_search_enabled=_ask_plan_web_search_enabled,
                             client_inbox=getattr(request.state, "client_inbox", None),
+                            steer_inbox=getattr(request.state, "steer_inbox", None),
                         ):
                             if _rchunk.startswith("data: "):
                                 try:
@@ -1950,6 +1955,8 @@ async def smart_stream(req: dict, request: Request):
             if _pipeline is run_natural_pipeline_stream:
                 _pipe_kwargs["client_inbox"] = getattr(
                     request.state, "client_inbox", None)
+                _pipe_kwargs["steer_inbox"] = getattr(
+                    request.state, "steer_inbox", None)
                 # v1.7 research checkbox — see smart_stream's top-of-function
                 # comment. Read fresh per-turn (not cached) so toggling it off
                 # mid-session takes effect on the very next message.
@@ -1978,6 +1985,9 @@ async def smart_stream(req: dict, request: Request):
                             "phase": "implementing",
                             "tasks": [serialize_plan_task(t) for t in _activated],
                         }) + "\n\n"
+            elif _pipeline is run_smart_pipeline_stream:
+                _pipe_kwargs["steer_inbox"] = getattr(
+                    request.state, "steer_inbox", None)
             async for chunk in _with_heartbeat(_pipeline(**_pipe_kwargs)):
                 if chunk.startswith("data: "):
                     try:
@@ -2597,6 +2607,7 @@ async def execute_task(req: dict, request: Request):
                 session_summary=session_summary,
                 user_id=current_user_id,
                 client_inbox=getattr(request.state, "client_inbox", None),
+                steer_inbox=getattr(request.state, "steer_inbox", None),
                 is_agent_task=True,
                 web_search_enabled=_task_web_search_enabled,
             )):
@@ -2929,15 +2940,18 @@ class _WSRequestShim:
     """
 
     def __init__(self, user_id: str, username: str = "", is_admin: bool = False,
-                 client_inbox=None):
+                 client_inbox=None, steer_inbox=None):
         from types import SimpleNamespace
         # client_inbox: bidirectional back-channel (asyncio.Queue) unique to the
         # WebSocket transport. The natural pipeline reads it to pause and ask the
         # user for a missing file (human-in-the-loop). HTTP/SSE has no shim and
         # thus no inbox → pipeline degrades gracefully.
+        # steer_inbox is a second queue. Approval waiters drain client_inbox
+        # before they block, so a follow-up sent mid-run must not live there.
         self.state = SimpleNamespace(
             user_id=user_id, username=username, is_admin=is_admin,
             client_inbox=client_inbox,
+            steer_inbox=steer_inbox,
         )
 
 
@@ -3006,14 +3020,21 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
     # queue the pipeline can await on. HTTP/SSE clients have no shim/inbox, so
     # the pipeline transparently falls back to non-interactive behaviour.
     inbox: asyncio.Queue = asyncio.Queue()
-    shim = _WSRequestShim(user_id, username, is_admin, client_inbox=inbox)
+    steer_inbox: asyncio.Queue = asyncio.Queue()
+    shim = _WSRequestShim(
+        user_id, username, is_admin,
+        client_inbox=inbox, steer_inbox=steer_inbox,
+    )
 
     async def _client_receiver():
-        """Forward client→server messages to the inbox for the duration of the
-        stream. `file_response`, `aws_cli_response`, `preview_check_response`
-        and `mcp_call_response` are consumed; unknown
-        shapes are ignored so the channel stays forward-compatible. Any receive
-        error (disconnect / closed socket) ends the receiver cleanly."""
+        """Forward client→server messages for the duration of the stream.
+
+        Approvals (`file_response`, `aws_cli_response`, `preview_check_response`,
+        `mcp_call_response`) go to `client_inbox`. A `steer` follow-up goes to
+        `steer_inbox` so an approval drain cannot drop it. Unknown shapes are
+        ignored. Any receive error (disconnect / closed socket) ends the
+        receiver cleanly."""
+        from services.steering import route_ws_message
         while True:
             try:
                 raw_in = await websocket.receive_text()
@@ -3031,10 +3052,10 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
                 msg_in = json.loads(raw_in)
             except Exception:
                 continue
-            if isinstance(msg_in, dict) and msg_in.get("type") in (
-                "file_response", "aws_cli_response", "preview_check_response",
-                "mcp_call_response",
-            ):
+            route = route_ws_message(msg_in)
+            if route == "steer":
+                await steer_inbox.put(msg_in)
+            elif route == "client":
                 await inbox.put(msg_in)
 
     recv_task = asyncio.create_task(_client_receiver())
@@ -3280,6 +3301,7 @@ async def resume_credit_pause(pause_id: str, request: Request):
                 session_summary=session_summary,
                 user_id=current_user_id,
                 client_inbox=getattr(request.state, "client_inbox", None),
+                steer_inbox=getattr(request.state, "steer_inbox", None),
                 forced_edit_plan=remaining or [],
                 resume_completed_edit_blocks=completed,
                 resume_completed_new_file_blocks=pause.get("completed_new_file_blocks") or [],
