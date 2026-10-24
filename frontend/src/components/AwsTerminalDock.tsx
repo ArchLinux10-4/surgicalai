@@ -1,6 +1,39 @@
 import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
+import { api } from '../api/client'
 import { useAppStore } from '../stores/appStore'
 import { AwsApprovalCard, AwsLevelPill } from './AwsApprovalCard'
+
+/** Join pasted shell continuations. Mirrors backend normalize_aws_command. */
+function normalizeAwsCommand(command: string): string {
+  const text = command.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  let out = ''
+  let quote = ''
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]
+    if (quote) {
+      out += ch
+      if (ch === quote) quote = ''
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch
+      out += ch
+      continue
+    }
+    if (ch === '\\') {
+      const nxt = i + 1 < text.length ? text[i + 1] : ''
+      if (nxt === '\n' || nxt === '' || nxt === ' ' || nxt === '\t') {
+        i += 1
+        while (i < text.length && (text[i] === ' ' || text[i] === '\t' || text[i] === '\n')) i += 1
+        i -= 1
+        out += ' '
+        continue
+      }
+    }
+    out += ch
+  }
+  return out.trim()
+}
 
 const HEIGHT_KEY = 'surgicalai:awsTerminalHeight'
 const COLLAPSED_KEY = 'surgicalai:awsTerminalCollapsed'
@@ -40,9 +73,14 @@ function deniedLine(stderr: string): string | null {
 
 export function AwsTerminalDock({ compact = false }: { compact?: boolean }) {
   const activeSessions = useAppStore(s => s.activeSessions)
+  const sidebarTab = useAppStore(s => s.sidebarTab)
   const lines = useAppStore(s => s.awsTerminalLines)
+  const push = useAppStore(s => s.pushAwsTerminalLine)
   const awsApproval = useAppStore(s => s.awsApproval)
   const setAwsApproval = useAppStore(s => s.setAwsApproval)
+  const awsOpen = sidebarTab === 'aws'
+  const [draft, setDraft] = useState('')
+  const [busy, setBusy] = useState(false)
   const visible = lines.filter(l => !activeSessions || l.sessionId === activeSessions)
   const approval = awsApproval && (!activeSessions || awsApproval.sessionId === activeSessions)
     ? awsApproval
@@ -59,9 +97,44 @@ export function AwsTerminalDock({ compact = false }: { compact?: boolean }) {
     prevLen.current = visible.length
   }, [visible.length])
 
+  const prevTab = useRef(sidebarTab)
+  useEffect(() => {
+    if (sidebarTab === 'aws' && prevTab.current !== 'aws') setCollapsed(false)
+    prevTab.current = sidebarTab
+  }, [sidebarTab])
+
   useEffect(() => {
     if (approval) setCollapsed(false)
   }, [approval])
+
+  const run = async () => {
+    const typed = normalizeAwsCommand(draft)
+    if (!typed || busy) return
+    const command = typed.startsWith('aws ') ? typed : `aws ${typed}`
+    setDraft('')
+    setCollapsed(false)
+    setBusy(true)
+    try {
+      const out = await api.aws.exec(command)
+      push({
+        sessionId: activeSessions || '',
+        command,
+        stdout: out.stdout || '',
+        stderr: out.stderr || '',
+        exit_code: out.exit_code ?? 1,
+      })
+    } catch (e: any) {
+      push({
+        sessionId: activeSessions || '',
+        command,
+        stdout: '',
+        stderr: e?.message || 'Command failed',
+        exit_code: 1,
+      })
+    } finally {
+      setBusy(false)
+    }
+  }
 
   useEffect(() => {
     const parentH = rootRef.current?.parentElement?.clientHeight || window.innerHeight
@@ -84,7 +157,7 @@ export function AwsTerminalDock({ compact = false }: { compact?: boolean }) {
     el.scrollTop = el.scrollHeight
   }, [visible, collapsed])
 
-  if (!visible.length && !approval) return null
+  if (!visible.length && !approval && !awsOpen) return null
 
   const persistCollapsed = (next: boolean) => {
     setCollapsed(next)
@@ -170,6 +243,11 @@ export function AwsTerminalDock({ compact = false }: { compact?: boolean }) {
         ref={scrollerRef}
         className="flex-1 min-h-[120px] overflow-auto overscroll-contain font-mono text-[12px] text-[#d6d6d6]"
       >
+        {!visible.length && (
+          <div className="px-3 py-2 text-[12px] text-muted">
+            Output scrolls sideways. Type a command on the line below.
+          </div>
+        )}
         {visible.map((line, i) => {
           const skipped = deniedLine(line.stderr || '')
           const files = (line.files || []).map(f => `${f.name}:\n${f.content}`).join('\n')
@@ -205,6 +283,28 @@ export function AwsTerminalDock({ compact = false }: { compact?: boolean }) {
           }}
         />
       )}
+      <form
+        className="flex items-center gap-2 h-9 shrink-0 border-t border-white/10 px-3"
+        onSubmit={(e) => { e.preventDefault(); void run() }}
+      >
+        <span className="text-accent font-mono text-[12px]">$</span>
+        <input
+          className="flex-1 min-w-0 bg-transparent font-mono text-[12px] text-[#d6d6d6] outline-none placeholder:text-muted"
+          placeholder="s3 ls"
+          value={draft}
+          disabled={busy}
+          onChange={(e) => setDraft(e.target.value)}
+          onPaste={(e) => {
+            const text = e.clipboardData.getData('text')
+            if (!/[\n\r\\]/.test(text)) return
+            e.preventDefault()
+            const el = e.currentTarget
+            const start = el.selectionStart ?? draft.length
+            const end = el.selectionEnd ?? draft.length
+            setDraft(normalizeAwsCommand(draft.slice(0, start) + text + draft.slice(end)))
+          }}
+        />
+      </form>
     </div>
   )
 }
