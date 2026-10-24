@@ -1,0 +1,14 @@
+[
+  {"id": "latest-pr", "prompt": "what's in my latest PR?", "tool": "list_prs", "args": {"state": "all", "limit": 5}, "expect": "Fix login"},
+  {"id": "pr-detail", "prompt": "show me pull request 12", "tool": "get_pr", "args": {"pr_number": 12}, "expect": "Body:"},
+  {"id": "pr-diff", "prompt": "what changed in PR 12?", "tool": "get_pr_diff", "args": {"pr_number": 12}, "expect": "files changed"},
+  {"id": "pr-comments", "prompt": "what did reviewers say on PR 12?", "tool": "get_pr_comments", "args": {"pr_number": 12}, "expect": "Looks good"},
+  {"id": "where-defined", "prompt": "where is run_app defined?", "tool": "search_code", "args": {"query": "run_app"}, "expect": "backend/app.py"},
+  {"id": "show-file", "prompt": "show me backend/app.py", "tool": "read_file", "args": {"path": "backend/app.py"}, "expect": "showing lines"},
+  {"id": "list-files", "prompt": "what files exist under backend?", "tool": "list_files", "args": {"path_prefix": "backend/"}, "expect": "backend/app.py"},
+  {"id": "branches", "prompt": "which branches exist?", "tool": "list_branches", "args": {}, "expect": "main (default)"},
+  {"id": "commits", "prompt": "what are the recent commits?", "tool": "list_commits", "args": {"limit": 5}, "expect": "Fix login"},
+  {"id": "issues", "prompt": "are there open issues?", "tool": "list_issues", "args": {"state": "open"}, "expect": "Crash on save"},
+  {"id": "issue-detail", "prompt": "what is issue 9 about?", "tool": "get_issue", "args": {"issue_number": 9}, "expect": "Stack trace"},
+  {"id": "deploy", "prompt": "did it deploy?", "tool": "check_deploy", "args": {"provider": "both"}, "expect": "READY"}
+]

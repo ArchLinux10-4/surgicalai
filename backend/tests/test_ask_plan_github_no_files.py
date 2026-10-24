@@ -80,6 +80,16 @@ class _FakeClient:
         self.messages = _FakeMessages(rounds)
 
 
+def _system_text(call):
+    system = call["system"]
+    if isinstance(system, list):
+        return "\n".join(
+            block.get("text", "") if isinstance(block, dict) else str(block)
+            for block in system
+        )
+    return system
+
+
 async def _collect(agen):
     out = []
     async for chunk in agen:
@@ -104,7 +114,7 @@ async def test_github_tools_available_with_zero_session_files(monkeypatch):
                          lambda user_id, dlog=None: (True, [{"account_login": "acme"}]))
     monkeypatch.setattr(gh_tag, "get_known_repos", lambda user_id, session_id, dlog=None: ["acme/repo"])
     monkeypatch.setattr(gh_tag, "execute_github_request",
-                         lambda parsed, user_id, dlog=None: "Repo has 1 open PR.")
+                         lambda parsed, user_id, dlog=None, **kw: "Repo has 1 open PR.")
 
     round1 = '<github_request>{"tool": "list_prs", "args": {"owner": "acme", "repo": "repo"}}</github_request>'
     round2 = "Yes, your GitHub is connected — there is 1 open PR."
@@ -128,7 +138,8 @@ async def test_github_tools_available_with_zero_session_files(monkeypatch):
     # index (there are no files), but MUST include the github tag docs.
     # Anthropic's API takes `system` as its own kwarg, not a role="system"
     # message inside `messages` — so it's read straight off the call kwargs.
-    system_msg = fake_client.messages.calls[0]["system"]
+    # Claude may send system as a string or as a list of text blocks.
+    system_msg = _system_text(fake_client.messages.calls[0])
     assert "Session Files (index only)" not in system_msg
     assert "search_request" not in system_msg
     assert "file_request" not in system_msg
@@ -164,7 +175,7 @@ async def test_no_tools_and_no_github_falls_back_to_legacy_streaming(monkeypatch
     ))
 
     assert len(fake_client.messages.calls) == 1
-    system_msg = fake_client.messages.calls[0]["system"]
+    system_msg = _system_text(fake_client.messages.calls[0])
     assert "Tools available in this conversation" not in system_msg
     assert "Session Files (index only)" not in system_msg
 

@@ -99,7 +99,7 @@ async def test_github_read_tool_executes_and_feeds_back(monkeypatch):
                          lambda user_id, dlog=None: (True, [{"account_login": "acme"}]))
     monkeypatch.setattr(gh_tag, "get_known_repos", lambda user_id, session_id, dlog=None: ["acme/repo"])
     monkeypatch.setattr(gh_tag, "execute_github_request",
-                         lambda parsed, user_id, dlog=None: "PR #1: fix bug (open)")
+                         lambda parsed, user_id, dlog=None, **kw: "PR #1: fix bug (open)")
 
     round1 = '<github_request>{"tool": "list_prs", "args": {"owner": "acme", "repo": "repo"}}</github_request>'
     round2 = "There is one open PR: fix bug."
@@ -200,3 +200,80 @@ async def test_round_budget_raised_to_eight(monkeypatch):
     final_text = "".join(e["content"] for e in events if e.get("type") == "token")
     assert "final answer after 8 rounds" in final_text
     print("PASS: round budget is 8, not 3")
+
+
+@pytest.mark.asyncio
+async def test_new_read_tool_reaches_executor_in_ask_plan(monkeypatch):
+    seen = {}
+
+    def _exec(parsed, user_id, dlog=None, **kw):
+        seen["tool"] = parsed.get("tool")
+        return "PR #12 [open] Fix login"
+
+    monkeypatch.setattr(gh_tag, "natural_github_availability",
+                         lambda user_id, dlog=None: (True, [{"account_login": "acme"}]))
+    monkeypatch.setattr(gh_tag, "get_known_repos", lambda user_id, session_id, dlog=None, **kw: ["acme/repo"])
+    monkeypatch.setattr(gh_tag, "execute_github_request", _exec)
+    round1 = '<github_request>{"tool": "get_pr", "args": {"owner": "acme", "repo": "repo", "pr_number": 12}}</github_request>'
+    fake_client = _FakeClient([_text_events(round1), _text_events("PR 12 fixes login.")])
+    _common_monkeypatch(monkeypatch, fake_client)
+    await _collect(pipeline.run_chat_stream(
+        messages=[{"role": "user", "content": "what is PR 12?"}],
+        model="claude-fake-model", user_id="u1", session_id="s1",
+        session_files=SESSION_FILES,
+    ))
+    assert seen["tool"] == "get_pr"
+
+
+@pytest.mark.asyncio
+async def test_unknown_github_tool_suggests_a_real_one(monkeypatch):
+    called = {"n": 0}
+
+    def _exec(*a, **k):
+        called["n"] += 1
+        return "should not run"
+
+    monkeypatch.setattr(gh_tag, "natural_github_availability",
+                         lambda user_id, dlog=None: (True, [{"account_login": "acme"}]))
+    monkeypatch.setattr(gh_tag, "get_known_repos", lambda user_id, session_id, dlog=None, **kw: [])
+    monkeypatch.setattr(gh_tag, "execute_github_request", _exec)
+    round1 = '<github_request>{"tool": "list_pull_requests", "args": {}}</github_request>'
+    fake_client = _FakeClient([_text_events(round1), _text_events("I need the right tool.")])
+    _common_monkeypatch(monkeypatch, fake_client)
+    await _collect(pipeline.run_chat_stream(
+        messages=[{"role": "user", "content": "any open PRs?"}],
+        model="claude-fake-model", user_id="u1", session_id="s1",
+        session_files=SESSION_FILES,
+    ))
+    assert called["n"] == 0
+    second = json.dumps(fake_client.messages.calls[1]["messages"])
+    assert "Did you mean" in second
+
+
+@pytest.mark.asyncio
+async def test_repeated_github_read_is_not_run_twice(monkeypatch):
+    called = {"n": 0}
+
+    def _exec(*a, **k):
+        called["n"] += 1
+        return "PR #1 [open] Fix login"
+
+    monkeypatch.setattr(gh_tag, "natural_github_availability",
+                         lambda user_id, dlog=None: (True, [{"account_login": "acme"}]))
+    monkeypatch.setattr(gh_tag, "get_known_repos", lambda user_id, session_id, dlog=None, **kw: ["acme/repo"])
+    monkeypatch.setattr(gh_tag, "execute_github_request", _exec)
+    tag = '<github_request>{"tool": "list_prs", "args": {"owner": "acme", "repo": "repo"}}</github_request>'
+    fake_client = _FakeClient([
+        _text_events(tag),
+        _text_events(tag),
+        _text_events("There is one open PR."),
+    ])
+    _common_monkeypatch(monkeypatch, fake_client)
+    await _collect(pipeline.run_chat_stream(
+        messages=[{"role": "user", "content": "any open PRs?"}],
+        model="claude-fake-model", user_id="u1", session_id="s1",
+        session_files=SESSION_FILES,
+    ))
+    assert called["n"] == 1
+    third = json.dumps(fake_client.messages.calls[2]["messages"])
+    assert "already have this result" in third
