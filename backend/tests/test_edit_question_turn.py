@@ -161,7 +161,7 @@ def test_question_in_edit_mode_answers_once_without_a_banner(monkeypatch):
 
     text = _tokens(events)
     assert "dependency array" in text
-    assert "didn't change any code" not in text
+    assert "No code was changed" not in text
     assert "No code changes were produced" not in text
     assert "ran out of steps" not in text
     assert "⚠️" not in text
@@ -185,8 +185,8 @@ def test_edit_request_still_nudges_and_shows_the_notice(monkeypatch):
     assert "MUST produce edits" in second
 
     text = _tokens(events)
-    assert "didn't change any code" in text
-    assert "Tell me to go ahead" in text
+    assert "No code was changed" in text
+    assert "start with a plan" in text
     assert "No code changes were produced" not in text
     assert "⚠️" not in text
     assert "Please try again" not in text
@@ -208,4 +208,4 @@ def test_agent_task_question_stays_on_the_strict_edit_loop(monkeypatch):
     assert "[AGENTIC EDIT MODE]" in first
     assert "write the edits now" in first
     assert "MUST produce edits" in _user_text(client.messages.calls[1])
-    assert "didn't change any code" in _tokens(events)
+    assert "No code was changed" in _tokens(events)

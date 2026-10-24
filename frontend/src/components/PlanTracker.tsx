@@ -49,7 +49,19 @@ function displayMarkdown(raw: string): string {
     .trim()
 }
 
-export function PlanTracker({ emptyHint = false }: { emptyHint?: boolean } = {}) {
+export function PlanTracker({
+  emptyHint = false,
+  hintOnly = false,
+  docked = false,
+  collapsed = false,
+  onToggleCollapsed,
+}: {
+  emptyHint?: boolean
+  hintOnly?: boolean
+  docked?: boolean
+  collapsed?: boolean
+  onToggleCollapsed?: () => void
+} = {}) {
   const planTasks = useAppStore(s => s.planTasks)
   const planRunId = useAppStore(s => s.planRunId)
   const planPhase = useAppStore(s => s.planPhase)
@@ -66,6 +78,10 @@ export function PlanTracker({ emptyHint = false }: { emptyHint?: boolean } = {})
 
   const hasDoc = !!(planMarkdown || '').trim()
   const hasTasks = planPhase !== 'idle' && planTasks.length > 0
+
+  if (hintOnly) {
+    if (hasTasks || hasDoc || !emptyHint) return null
+  }
 
   if (!hasTasks && !hasDoc) {
     if (!emptyHint) return null
@@ -133,8 +149,10 @@ export function PlanTracker({ emptyHint = false }: { emptyHint?: boolean } = {})
   }
 
   return (
-    <div className="mx-3 mb-2 rounded-xl border border-purple/40 bg-surface/70 backdrop-blur-sm overflow-hidden">
-      <div className="flex items-center justify-between px-3 py-2.5 border-b border-border/60 bg-purple/10">
+    <div className={docked
+      ? `flex flex-col min-h-0 overflow-hidden bg-surface/70 ${collapsed ? '' : 'flex-1'}`
+      : 'mx-3 mb-2 rounded-xl border border-purple/40 bg-surface/70 backdrop-blur-sm overflow-hidden'}>
+      <div className="flex items-center justify-between px-3 py-2.5 border-b border-border/60 bg-purple/10 shrink-0">
         <div className="flex items-center gap-2 min-w-0">
           <span className="text-[11px] font-bold uppercase tracking-wide text-purple">Plan</span>
           {planVersion != null && (
@@ -173,9 +191,20 @@ export function PlanTracker({ emptyHint = false }: { emptyHint?: boolean } = {})
               {busy ? 'Building…' : 'Build from plan'}
             </button>
           )}
+          {onToggleCollapsed && (
+            <button
+              type="button"
+              onClick={onToggleCollapsed}
+              className="text-[11px] font-semibold px-2 py-1 rounded-lg text-muted hover:text-ink hover:bg-overlay/60"
+            >
+              {collapsed ? 'Show' : 'Hide'}
+            </button>
+          )}
         </div>
       </div>
 
+      {collapsed ? null : (
+      <div className={docked ? 'flex-1 min-h-0 overflow-y-auto overscroll-contain' : ''}>
       {hasDoc && body && (
         <div className="border-b border-border/60">
           <button
@@ -186,10 +215,10 @@ export function PlanTracker({ emptyHint = false }: { emptyHint?: boolean } = {})
             <span className="text-[11px] font-semibold text-ink truncate">
               {planTitle || 'Plan document'}
             </span>
-            <span className="text-[10px] text-muted">{docOpen ? 'Hide' : 'Show'}</span>
+            <span className="text-[10px] text-muted">{docOpen ? 'Collapse' : 'Expand'}</span>
           </button>
           {docOpen && (
-            <div className="px-3 pb-3 max-h-64 overflow-y-auto prose-ai text-[12px]">
+            <div className="px-3 pb-3 prose-ai text-[12px]">
               <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
                 {body}
               </ReactMarkdown>
@@ -251,6 +280,8 @@ export function PlanTracker({ emptyHint = false }: { emptyHint?: boolean } = {})
             </div>
           )}
         </>
+      )}
+      </div>
       )}
     </div>
   )

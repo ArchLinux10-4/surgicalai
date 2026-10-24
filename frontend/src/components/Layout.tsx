@@ -3,6 +3,7 @@ import { Sidebar } from './Sidebar'
 import { ChatPanel } from './ChatPanel'
 import { CodePanel } from './CodePanel'
 import { ElementPickerPanel } from './ElementPickerPanel'
+import { AwsTerminalDock } from './AwsTerminalDock'
 import { useAppStore } from '../stores/appStore'
 import { useAuthStore } from '../stores/authStore'
 import { LoginPage } from '../pages/LoginPage'
@@ -141,6 +142,8 @@ export function Layout() {
         )}
       </aside>
 
+      <div className="flex flex-col flex-1 min-w-0 min-h-0">
+      <div className="flex flex-1 min-h-0 min-w-0">
       {/* Chat — expands to fill all space when no file/picker pane is docked.
           Width comes from the drag-resizable `chatWidth` state (not a fixed
           Tailwind width) whenever a third pane is docked, same idea as the
@@ -150,7 +153,7 @@ export function Layout() {
           keeping the transition off during active drags avoids the resize
           feeling laggy/rubber-banded behind the mouse). */}
       <section
-        className={`flex flex-col bg-base overflow-hidden ${
+        className={`flex flex-col min-h-0 bg-base overflow-hidden ${
           (activeFile || elementPickerOpen)
             ? 'flex-shrink-0 border-r border-border'
             : 'flex-1 transition-all duration-200'
@@ -183,10 +186,13 @@ export function Layout() {
       {elementPickerOpen ? (
         <ElementPickerPanel />
       ) : activeFile ? (
-        <section className="flex-1 flex flex-col bg-base min-w-0">
+        <section className="flex-1 flex flex-col bg-base min-w-0 min-h-0">
           <CodePanel />
         </section>
       ) : null}
+      </div>
+      <AwsTerminalDock />
+      </div>
     </div>
   )
 }

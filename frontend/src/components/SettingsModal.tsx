@@ -7,7 +7,7 @@ import { GitHubAppPanel } from './GitHubAppPanel'
 import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
 import { clientLog } from '../lib/clientLog'
-import { AwsConnectModal } from './AwsConnectModal'
+import { AwsConnectModal, shortAwsCli } from './AwsConnectModal'
 import { AttachMoney, BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
 type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'aws' | 'railway' | 'security' | 'debug'
@@ -940,12 +940,15 @@ export function SettingsModal() {
                     <div>Account {awsStatus.account}</div>
                     <div className="text-muted break-all">{awsStatus.arn}</div>
                     <div className="text-muted">{awsStatus.region} · {awsStatus.access_key_id}</div>
+                    {awsStatus.cli_version && (
+                      <div className="text-muted truncate" title={awsStatus.cli_version}>{shortAwsCli(awsStatus.cli_version)}</div>
+                    )}
                     <button
                       type="button"
-                      className="btn-danger mt-2"
-                      onClick={() => { api.aws.disconnect().then(() => setAwsStatus({ connected: false })).catch(() => {}) }}
+                      className="btn-ghost mt-2"
+                      onClick={() => setAwsConnectOpen(true)}
                     >
-                      Disconnect
+                      Manage account
                     </button>
                   </div>
                 ) : (

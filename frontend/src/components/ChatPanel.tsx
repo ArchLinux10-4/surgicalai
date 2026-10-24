@@ -11,8 +11,7 @@ import { SessionFilesTray } from './SessionFilesTray'
 import { PickedElementsTray } from './PickedElementsTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker } from './PlanTracker'
-import { AwsCliFeed } from './AwsCliFeed'
-import { AwsApprovalCard } from './AwsApprovalCard'
+import { PlanPane } from './PlanPane'
 import { PlanQuestionsCard } from './PlanQuestionsCard'
 import { normalizeQuestions, stripPlanQuestionsFence } from '../lib/planQuestions'
 import { useTaskPolling } from '../hooks/useTaskPolling'
@@ -1561,14 +1560,7 @@ export function ChatPanel() {
   } | null>(null)
   const fileRequestInputRef = useRef<HTMLInputElement>(null)
   const [fileRequestBusy, setFileRequestBusy] = useState(false)
-  const [awsApproval, setAwsApproval] = useState<{
-    sessionId: string
-    command: string
-    level?: string
-    title?: string
-    target?: string
-    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
-  } | null>(null)
+  const setAwsApproval = useAppStore(s => s.setAwsApproval)
 
   // If the stream that owns a pending file-request ends for ANY reason
   // (result / done / error) before the backend ever sends file_needed_cleared
@@ -1600,15 +1592,10 @@ export function ChatPanel() {
   }, [])
 
   useEffect(() => {
-    const approvalHere = awsApproval && awsApproval.sessionId === activeSessions
-    if (approvalHere) {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-      return
-    }
     if (!userScrolledUpRef.current) {
       bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
     }
-  }, [messages, streamingMessage, awsApproval, activeSessions])
+  }, [messages, streamingMessage])
 
   // Load session files when session changes
   useEffect(() => {
@@ -3006,7 +2993,7 @@ export function ChatPanel() {
       )}
 
       {/* Messages */}
-      <div ref={scrollContainerRef} className="flex-1 overflow-y-auto">
+      <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto">
         {messages.length === 0 && !isStreaming ? (
           <EmptyState onUpload={() => fileInputRef.current?.click()} />
         ) : (
@@ -3081,8 +3068,7 @@ export function ChatPanel() {
                 }}
               />
             )}
-            <AwsCliFeed />
-            <PlanTracker emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
+            <PlanTracker hintOnly emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
             {isStreaming && (streamingMessage || streamProgress) && (
               <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} />
             )}
@@ -3143,21 +3129,10 @@ export function ChatPanel() {
             )}
           </div>
         )}
-        {awsApproval && awsApproval.sessionId === activeSessions && (
-          <AwsApprovalCard
-            key={`${awsApproval.command}\n${awsApproval.title || ''}`}
-            command={awsApproval.command}
-            level={awsApproval.level}
-            title={awsApproval.title}
-            target={awsApproval.target}
-            onDecide={(action, command) => {
-              awsApproval.reply({ action, command })
-              setAwsApproval(null)
-            }}
-          />
-        )}
         <div ref={bottomRef} />
       </div>
+
+      <PlanPane />
 
       {/* Apply All — single click to apply every pending change across all files */}
       {activeSessions && !isStreaming && (

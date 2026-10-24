@@ -136,6 +136,39 @@ def check_connect_fields(access_key_id: str, secret: str, region: str, session_t
     }
 
 
+_CLI_VERSION: str | None = None
+
+
+def aws_cli_version() -> str:
+    """First line of ``aws --version``, or empty when the CLI is not installed.
+
+    The result is cached for the process. ``aws --version`` writes to stderr.
+    """
+    global _CLI_VERSION
+    if _CLI_VERSION is not None:
+        return _CLI_VERSION
+    aws_bin = shutil.which("aws")
+    if not aws_bin:
+        _CLI_VERSION = ""
+        return ""
+    try:
+        proc = subprocess.run(
+            [aws_bin, "--version"],
+            shell=False,
+            timeout=5,
+            capture_output=True,
+            text=True,
+            env={"PATH": os.environ.get("PATH", ""), "AWS_PAGER": ""},
+        )
+    except Exception:
+        _CLI_VERSION = ""
+        return ""
+    text = ((proc.stdout or "") + "\n" + (proc.stderr or "")).strip()
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    _CLI_VERSION = line[:160]
+    return _CLI_VERSION
+
+
 def sts_identity(access_key_id: str, secret: str, region: str, session_token: str) -> dict:
     import boto3
     from botocore.exceptions import ClientError
@@ -155,7 +188,11 @@ def sts_identity(access_key_id: str, secret: str, region: str, session_token: st
         if code in ("InvalidClientTokenId", "SignatureDoesNotMatch", "ExpiredToken"):
             raise ValueError("Access key was rejected by AWS.") from exc
         raise
-    return {"account": ident.get("Account") or "", "arn": ident.get("Arn") or ""}
+    return {
+        "account": ident.get("Account") or "",
+        "arn": ident.get("Arn") or "",
+        "user_id": ident.get("UserId") or "",
+    }
 
 
 def normalize_aws_command(command: str) -> str:

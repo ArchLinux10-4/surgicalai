@@ -81,6 +81,17 @@ interface AppState {
     target?: string
     files?: { name: string; content: string }[]
   }) => void
+  // Live SSE reply. Not persisted and not cloned — the closure belongs to the
+  // stream that asked for approval.
+  awsApproval: {
+    sessionId: string
+    command: string
+    level?: string
+    title?: string
+    target?: string
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
+  } | null
+  setAwsApproval: (value: AppState['awsApproval']) => void
   sidebarPanelOpen: boolean
   setSidebarPanelOpen: (open: boolean) => void
   sidebarPinned: boolean
@@ -258,6 +269,8 @@ export const useAppStore = create<AppState>((set) => ({
   pushAwsTerminalLine: (line) => set((s) => ({
     awsTerminalLines: [...s.awsTerminalLines, line].slice(-40),
   })),
+  awsApproval: null,
+  setAwsApproval: (awsApproval) => set({ awsApproval }),
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
   sidebarPanelOpen: false,
   setSidebarPanelOpen: (sidebarPanelOpen) => set({ sidebarPanelOpen }),

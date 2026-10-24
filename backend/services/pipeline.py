@@ -1049,8 +1049,8 @@ def pick_no_edits_notice(
         )
     if normal_buf.strip():
         return "no_edits_text_only_notice", (
-            "\n\nI explained the approach but didn't change any code. "
-            "Tell me to go ahead and I'll make the edits."
+            "\n\nNo code was changed. If you want code changes, ask for "
+            "them directly, or start with a plan first."
         )
     if full_response.strip():
         return "no_edits_notext_notice", (
