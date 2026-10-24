@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
+import { CheckCircle, ErrorOutline } from '@mui/icons-material'
 import { api } from '../api/client'
-import { AwsConnectModal, shortAwsCli } from './AwsConnectModal'
+import { AwsConnectModal } from './AwsConnectModal'
 
 export function AwsTerminalPanel() {
   const [status, setStatus] = useState<any>(null)
@@ -11,40 +12,47 @@ export function AwsTerminalPanel() {
   }
   useEffect(() => { refresh() }, [])
 
-  if (!status?.connected) {
-    return (
-      <div className="flex flex-col items-center justify-center h-full gap-3 px-5 text-center">
-        <div className="text-sm font-semibold text-ink">AWS CLI</div>
-        <p className="text-[12px] text-muted leading-snug">Connect an access key to run AWS CLI commands and let agents use the same account.</p>
-        {status?.error && <p className="text-[12px] text-danger">{status.error}</p>}
-        <button type="button" className="btn-primary" onClick={() => setOpen(true)}>Connect AWS</button>
-        <AwsConnectModal open={open} onClose={() => setOpen(false)} onConnected={refresh} />
-      </div>
-    )
-  }
+  const connected = !!status?.connected
 
   return (
     <div className="flex flex-col h-full min-h-0">
       <div className="px-3 py-2 border-b border-border text-[11px] text-muted">
         <div className="flex items-center justify-between gap-2">
-          <div className="text-ink font-semibold">AWS CLI</div>
+          <div className="flex items-center gap-1.5 min-w-0">
+            {status == null ? (
+              <span className="h-4 w-4 rounded-full bg-overlay/70 animate-pulse shrink-0" />
+            ) : (
+              <span
+                className={`inline-flex h-4 w-4 items-center justify-center rounded-full shrink-0 ${
+                  connected ? 'bg-success/15 text-success' : 'bg-danger/15 text-danger'
+                }`}
+                title={connected ? 'Connected' : 'Not connected'}
+              >
+                {connected
+                  ? <CheckCircle sx={{ fontSize: 12 }} />
+                  : <ErrorOutline sx={{ fontSize: 12 }} />}
+              </span>
+            )}
+            <span className="text-ink font-semibold">AWS CLI</span>
+          </div>
           <button
             type="button"
-            className="text-[11px] font-semibold text-accent hover:underline"
+            className="text-[11px] font-semibold text-accent hover:underline disabled:opacity-40"
             onClick={() => setOpen(true)}
+            disabled={status == null}
           >
             Account
           </button>
         </div>
-        <div className="truncate">Account {status.account} · {status.region}</div>
-        <div className="truncate">{status.arn}</div>
-        {status.cli_version && (
-          <div className="truncate" title={status.cli_version}>{shortAwsCli(status.cli_version)}</div>
-        )}
         <AwsConnectModal open={open} onClose={() => setOpen(false)} onConnected={refresh} />
       </div>
+      {status?.error && !connected && (
+        <p className="px-3 pt-2 text-[12px] text-danger leading-snug">{status.error}</p>
+      )}
       <p className="px-3 py-2 text-[12px] text-muted leading-snug">
-        The terminal is the wide bar under the chat. Commands and output stay there.
+        {connected
+          ? 'The terminal is the wide bar under the chat. Commands and output stay there.'
+          : 'Open Account to connect an access key. Agents and the terminal use that account.'}
       </p>
     </div>
   )
