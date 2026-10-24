@@ -127,6 +127,24 @@ interface AppState {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
   } | null
   setAwsApproval: (value: AppState['awsApproval']) => void
+  mcpApproval: {
+    sessionId: string
+    server: string
+    serverName?: string
+    tool: string
+    arguments: Record<string, unknown>
+    reply: (resp: { action: 'approve' | 'reject' }) => boolean
+  } | null
+  setMcpApproval: (value: AppState['mcpApproval']) => void
+  mcpCalls: {
+    sessionId: string
+    server: string
+    tool: string
+    ok: boolean
+    error?: string
+    text?: string
+  }[]
+  pushMcpCall: (line: AppState['mcpCalls'][number]) => void
   previewCheck: {
     sessionId: string
     checkId: string
@@ -319,6 +337,10 @@ export const useAppStore = create<AppState>((set) => ({
   })),
   awsApproval: null,
   setAwsApproval: (awsApproval) => set({ awsApproval }),
+  mcpApproval: null,
+  setMcpApproval: (mcpApproval) => set({ mcpApproval }),
+  mcpCalls: [],
+  pushMcpCall: (line) => set((s) => ({ mcpCalls: [...s.mcpCalls, line].slice(-12) })),
   previewCheck: null,
   setPreviewCheck: (previewCheck) => set({ previewCheck }),
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),

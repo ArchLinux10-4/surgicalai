@@ -30,6 +30,7 @@ from routers import images as images_router
 from routers import runs as runs_router
 from routers import github_app as github_app_router
 from routers import element_picker as element_picker_router
+from routers import mcp as mcp_router
 
 app = FastAPI(
     title="SurgicalAI",
@@ -167,6 +168,7 @@ app.include_router(images_router.router, prefix="/api/images", tags=["images"])
 app.include_router(runs_router.router, prefix="/api/runs", tags=["runs"])
 app.include_router(datalab_router.router, prefix="/api/datalab", tags=["datalab"])
 app.include_router(element_picker_router.router, prefix="/api/element-picker", tags=["element-picker"])
+app.include_router(mcp_router.router, prefix="/api/mcp", tags=["mcp"])
 app.include_router(debug_router.router)
 
 

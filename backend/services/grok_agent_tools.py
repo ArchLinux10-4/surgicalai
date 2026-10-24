@@ -79,6 +79,7 @@ TOOL_AWS_CLI = "aws_cli"
 TOOL_REQUEST_HISTORY = "request_history"
 TOOL_REQUEST_PREVIEW = "request_preview"
 TOOL_REQUEST_WEB_SEARCH = "request_web_search"
+TOOL_REQUEST_MCP = "request_mcp"
 TOOL_REPORT_BLOCKED = "report_blocked"
 
 WRITE_TOOLS = frozenset({
@@ -87,6 +88,7 @@ WRITE_TOOLS = frozenset({
 CONTEXT_TOOLS = frozenset({
     TOOL_REQUEST_FILE, TOOL_REQUEST_SEARCH, TOOL_REQUEST_GITHUB,
     TOOL_REQUEST_HISTORY, TOOL_REQUEST_PREVIEW, TOOL_REQUEST_WEB_SEARCH,
+    TOOL_REQUEST_MCP,
 })
 
 _EDIT_MODES = frozenset({"edit", "agent"})
@@ -414,15 +416,51 @@ def _schema_request_preview():
     }
 
 
+def _schema_request_mcp(user_id=""):
+    catalog = ""
+    if user_id:
+        try:
+            from services.mcp_client import prompt_catalog
+            catalog = prompt_catalog(user_id, native=True)
+        except Exception:
+            catalog = ""
+    description = (
+        "Call a tool on a connected MCP server. The user approves the call "
+        "unless that tool is set to always allow. Pass the server id, the "
+        "tool name, and arguments."
+    )
+    if catalog:
+        description = description + "\n" + catalog
+    return {
+        "type": "function",
+        "function": {
+            "name": TOOL_REQUEST_MCP,
+            "description": description,
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "Connected server id."},
+                    "tool": {"type": "string", "description": "Tool name on that server."},
+                    "arguments": {
+                        "type": "object",
+                        "description": "Arguments for the tool.",
+                    },
+                },
+                "required": ["server", "tool"],
+            },
+        },
+    }
+
+
 def _schema_request_web_search():
     return {
         "type": "function",
         "function": {
             "name": TOOL_REQUEST_WEB_SEARCH,
             "description": (
-                "Search the public web for current documentation, versions, or "
-                "error messages. The query is sent to a search engine: do not "
-                "include code, file names, or secrets."
+                "Searches the public internet for current information. "
+                "The query is sent to a search engine: do not include code, "
+                "file names, or secrets."
             ),
             "parameters": {
                 "type": "object",
@@ -444,7 +482,7 @@ def _schema_request_web_search():
 
 def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=False,
                            aws_enabled=False, preview_enabled=False,
-                           websearch_enabled=False, dlog=None,
+                           websearch_enabled=False, mcp_enabled=False, dlog=None,
                            session_id="", user_id=""):
     """Return the OpenAI-style tool schemas Grok should be offered for ``mode``.
 
@@ -480,6 +518,8 @@ def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=Fa
         tools.append(_schema_request_preview())
     if websearch_enabled:
         tools.append(_schema_request_web_search())
+    if mcp_enabled:
+        tools.append(_schema_request_mcp(user_id))
 
     # report_blocked is meaningful in every mode as a clean terminal signal.
     tools.append(_schema_report_blocked())
@@ -505,6 +545,7 @@ TOOL_PROGRESS_LABELS = {
     TOOL_REQUEST_HISTORY: "Calling request_history…",
     TOOL_REQUEST_PREVIEW: "Checking the preview…",
     TOOL_REQUEST_WEB_SEARCH: "Searching the web…",
+    TOOL_REQUEST_MCP: "Calling MCP…",
     TOOL_REPORT_BLOCKED: "Reporting blocked…",
 }
 
@@ -938,6 +979,14 @@ def _context_body(name, args):
         if args.get("reason"):
             payload["reason"] = args.get("reason")
         return "websearch", _json.dumps(payload)
+    if name == TOOL_REQUEST_MCP:
+        args_obj = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
+        payload = {
+            "server": args.get("server", ""),
+            "tool": args.get("tool", ""),
+            "arguments": args_obj,
+        }
+        return "mcp", _json.dumps(payload)
     # unreachable given the CONTEXT_TOOLS gate
     return name, _json.dumps(args)
 
@@ -1074,7 +1123,8 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
                              history_enabled=False, aws_enabled=False,
                              dlog=None, session_id="", user_id="",
                              wants_edit=True, preview_enabled=False,
-                             preflight_enabled=False, websearch_enabled=False):
+                             preflight_enabled=False, websearch_enabled=False,
+                             mcp_enabled=False):
     """A short contract appended to Grok's system text telling it to USE the
     native function tools instead of the XML-tag protocol described earlier in
     the shared prompt (which targets Claude/GPT).
@@ -1125,9 +1175,14 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
         )
     if websearch_enabled:
         lines.append(
-            "• request_web_search — search the public web for current docs, "
-            "versions, or errors. The query is sent to a search engine: do not "
-            "include code, file names, or secrets."
+            "• request_web_search — searches the public internet for current "
+            "information. The query is sent to a search engine: do not include "
+            "code, file names, or secrets."
+        )
+    if mcp_enabled:
+        lines.append(
+            "• request_mcp — call a tool on a connected MCP server. The user "
+            "approves each call unless that tool is set to always allow."
         )
     if preflight_enabled and m in _EDIT_MODES and wants_edit:
         lines.append(
@@ -1171,7 +1226,8 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
                                  history_enabled=False, dlog=None,
                                  session_id="", user_id="",
                                  wants_edit=True, preview_enabled=False,
-                                 preflight_enabled=False, websearch_enabled=False):
+                                 preflight_enabled=False, websearch_enabled=False,
+                                 mcp_enabled=False):
     """Native-tool replacement for the pipeline's XML turn suffix.
 
     ``wants_edit`` False is a plain question on an Edit/Agent turn: same
@@ -1233,9 +1289,14 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
                 "enough context. Do not emit edits in this mode.")
     if websearch_enabled:
         parts.append(
-            "Call request_web_search for current documentation, versions, or "
-            "errors. The query is sent to a search engine: do not include "
+            "Call request_web_search to search the public internet for current "
+            "information. The query is sent to a search engine: do not include "
             "code, file names, or secrets."
+        )
+    if mcp_enabled:
+        parts.append(
+            "Call request_mcp to use a connected MCP server. The user approves "
+            "each call unless that tool is set to always allow."
         )
     text = "\n".join(parts)
     _log(dlog, "grok_agent_instruction_built", session_id=session_id,

@@ -23,3 +23,12 @@
 # but this pin is the actual fix — reinstall via
 # `pip install -r backend/requirements-local.txt` to pick it up.
 playwright>=1.60
+
+# Official MCP client (https://github.com/modelcontextprotocol/python-sdk).
+# Local installs only. Do not add this to requirements.txt: mcp 2.x requires
+# pydantic>=2.12 and sse-starlette>=3, and requirements.txt pins
+# pydantic==2.10.3 and sse-starlette==2.1.3. A local install therefore runs
+# a newer pydantic than Railway. The app imports mcp lazily and still boots
+# when this package is missing.
+# Not the mcp[cli] extra.
+mcp>=2,<3

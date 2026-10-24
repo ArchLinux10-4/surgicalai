@@ -4377,6 +4377,7 @@ def _gh_prompt_bits(known_repos) -> str:
 def _ask_plan_build_tool_instructions(
     *, has_files: bool, gh_enabled: bool, gh_known_repos: list, max_rounds: int,
     aws_enabled: bool = False, websearch_enabled: bool = False,
+    mcp_guidance: str = "",
 ) -> str:
     """
     Composes the Ask/Plan tool-instructions system-prompt block from
@@ -4447,10 +4448,13 @@ def _ask_plan_build_tool_instructions(
         tag_blocks.append(
             '<web_search_request>{"query": "what to look up", "reason": "why"}'
             "</web_search_request>\n"
-            "Use to search the public web for current documentation, versions, "
-            "or error messages. Put only the question in query. Do not include "
-            "code, file names, or secrets."
+            "Live web search is available. This tag searches the public internet. "
+            "It is not a code edit. <search_request> only searches attached files. "
+            "Put only the question in query. Do not include code, file names, or secrets."
         )
+
+    if mcp_guidance:
+        tag_blocks.append(mcp_guidance)
 
     parts.append("\n\n".join(tag_blocks))
     parts.append(
@@ -4473,6 +4477,7 @@ def _ask_plan_strip_tool_tags(text: str) -> str:
     text = re.sub(r'<history_request>.*?</history_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<aws_cli>.*?</aws_cli>', '', text, flags=re.DOTALL)
     text = re.sub(r'<web_search_request>.*?</web_search_request>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<mcp_request>.*?</mcp_request>', '', text, flags=re.DOTALL)
     return text.strip()
 
 
@@ -4758,8 +4763,25 @@ async def run_chat_stream(
     _dlog("openai_web_search_gate", session_id=session_id, user_id=user_id,
           model=chat_model, requested=web_search_enabled,
           enabled=_oa_search_enabled, tag_tool=_ask_plan_websearch)
+    _ask_plan_mcp = False
+    _ask_plan_mcp_guidance = ""
+    try:
+        from services.mcp_client import (
+            mcp_offered as _mcp_offered,
+            prompt_catalog as _mcp_catalog,
+        )
+        if not _ask_plan_is_ollama and _mcp_offered(user_id):
+            _ask_plan_mcp = True
+            if not _is_grok_model(chat_model):
+                _ask_plan_mcp_guidance = _mcp_catalog(user_id, native=False)
+    except Exception as _mcp_gate_err:
+        _ask_plan_mcp = False
+        _ask_plan_mcp_guidance = ""
+        _dlog("mcp_gate_error", session_id=session_id, user_id=user_id,
+              error=str(_mcp_gate_err)[:200])
     _ask_plan_tools_enabled = (
-        (_ask_plan_has_files or _gh_nat_enabled or _aws_connected or _oa_search_enabled)
+        (_ask_plan_has_files or _gh_nat_enabled or _aws_connected
+         or _oa_search_enabled or _ask_plan_mcp)
         and not _ask_plan_is_ollama
     )
     _dlog("ask_plan_tools_gate_evaluated", session_id=session_id, user_id=user_id,
@@ -4845,7 +4867,8 @@ async def run_chat_stream(
         system_parts.append(_ask_plan_build_tool_instructions(
             has_files=_ask_plan_has_files, gh_enabled=_gh_nat_enabled,
             gh_known_repos=_gh_known_repos, max_rounds=_ASK_PLAN_MAX_ROUNDS,
-            aws_enabled=_aws_connected, websearch_enabled=_ask_plan_websearch))
+            aws_enabled=_aws_connected, websearch_enabled=_ask_plan_websearch,
+            mcp_guidance=_ask_plan_mcp_guidance))
         _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
               model=chat_model, num_files=len(file_content_lookup),
               github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
@@ -4891,6 +4914,31 @@ async def run_chat_stream(
     if _research_hint:
         system_parts.append("\n" + _research_hint)
 
+    # Live web search is on for this turn. Say so in plain language. Off,
+    # Gemini, and Ollama add nothing, so those prompts stay unchanged.
+    _ws_on_block = ""
+    try:
+        from services.openai_web_search import web_search_on_block as _ws_on_block_fn
+        _legacy_ws = str(get_setting("web_search_enabled", "false")).lower() == "true"
+        if _is_claude_model(chat_model) and (bool(web_search_enabled) or _legacy_ws):
+            _ws_provider = "claude"
+        elif _is_grok_model(chat_model) and _oa_search_enabled:
+            _ws_provider = "grok"
+        elif _ask_plan_websearch:
+            _ws_provider = "gpt"
+        else:
+            _ws_provider = ""
+        _ws_on_block = _ws_on_block_fn(_ws_provider)
+        if _ws_on_block:
+            _dlog("web_search_block_added", session_id=session_id, user_id=user_id,
+                  provider=_ws_provider, mode="ask_plan")
+    except Exception as _ws_on_err:
+        _ws_on_block = ""
+        _dlog("web_search_block_error", session_id=session_id, user_id=user_id,
+              error=str(_ws_on_err)[:200])
+    if _ws_on_block:
+        system_parts.append("\n" + _ws_on_block)
+
     if symbol_context:
         system_parts.append(f"\nFocused symbol context:\n```\n{symbol_context}\n```")
 
@@ -4929,6 +4977,7 @@ async def run_chat_stream(
                 history_enabled=_ask_plan_has_files,
                 aws_enabled=_aws_connected,
                 websearch_enabled=_oa_search_enabled,
+                mcp_enabled=_ask_plan_mcp,
                 openai_client=_oa_search_client,
                 web_search_sources=_web_search_sources_final,
                 client_inbox=client_inbox,
@@ -4954,6 +5003,7 @@ async def run_chat_stream(
             _oai_msgs = list(all_messages)
             _tool_round = 0
             _aws_calls = 0
+            _mcp_calls = 0
             _oa_budget = None
             if _ask_plan_websearch:
                 from services.openai_web_search import SearchBudget as _OaSearchBudget
@@ -4997,16 +5047,23 @@ async def run_chat_stream(
                         _round_text, re.DOTALL)
                     if _ask_plan_websearch else None
                 )
+                _mcp_match = (
+                    re.search(
+                        r'<mcp_request>\s*(.*?)\s*</mcp_request>',
+                        _round_text, re.DOTALL)
+                    if _ask_plan_mcp else None
+                )
 
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
                 _ask_plan_no_more_tools = (
                     not _sr_match and not _fr_match and not _gr_match
                     and not _hr_match and not _aws_match and not _wr_match
+                    and not _mcp_match
                 )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match or _aws_match or _wr_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match or _aws_match or _wr_match or _mcp_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5071,6 +5128,8 @@ async def run_chat_stream(
                             _dlog("ask_plan_web_search_requested",
                                   session_id=session_id, user_id=user_id,
                                   query=_ws_query[:200])
+                            _dlog("web_search_emitted", session_id=session_id,
+                                  user_id=user_id, provider="gpt", mode="ask_plan")
                             for _ws_ev in _ws_events(_ws_query, {"sources": [], "error": None})[:2]:
                                 yield sse(_ws_ev)
                             try:
@@ -5096,6 +5155,24 @@ async def run_chat_stream(
                                   source_count=len(_ws_result.get("sources") or []),
                                   error=(_ws_result.get("error") or "")[:200])
                             _tool_parts = [_ws_feedback(_ws_query, _ws_result)]
+                elif _mcp_match:
+                    from services.mcp_client import resolve_mcp_call as _resolve_mcp
+                    _mcp_done = {"note": "", "counted": False}
+                    async for _mcp_ev in _resolve_mcp(
+                        (_mcp_match.group(1) or "").strip(),
+                        user_id=user_id,
+                        client_inbox=client_inbox,
+                        calls_so_far=_mcp_calls,
+                        dlog=_dlog,
+                        session_id=session_id or "",
+                    ):
+                        if _mcp_ev.get("type") == "mcp_done":
+                            _mcp_done = _mcp_ev
+                        else:
+                            yield sse(_mcp_ev)
+                    if _mcp_done.get("counted"):
+                        _mcp_calls += 1
+                    _tool_parts = [_mcp_done.get("note") or ""]
                 else:
                     yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 if _tool_parts is None:
@@ -5241,6 +5318,7 @@ async def run_chat_stream(
 
             _tool_round = 0
             _aws_calls = 0
+            _mcp_calls = 0
             while True:
                 _claude_kwargs = {
                     "model": chat_model,
@@ -5314,13 +5392,22 @@ async def run_chat_stream(
                     re.search(r'<aws_cli>\s*(.*?)\s*</aws_cli>', _round_text, re.DOTALL)
                     if _aws_connected else None
                 )
+                _mcp_match = (
+                    re.search(
+                        r'<mcp_request>\s*(.*?)\s*</mcp_request>',
+                        _round_text, re.DOTALL)
+                    if _ask_plan_mcp else None
+                )
 
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
-                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match and not _hr_match and not _aws_match
+                _ask_plan_no_more_tools = (
+                    not _sr_match and not _fr_match and not _gr_match
+                    and not _hr_match and not _aws_match and not _mcp_match
+                )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match or _aws_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match or _aws_match or _mcp_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5357,6 +5444,24 @@ async def run_chat_stream(
                     if _aws_done.get("counted"):
                         _aws_calls += 1
                     _tool_parts = [_aws_done.get("note") or ""]
+                elif _mcp_match:
+                    from services.mcp_client import resolve_mcp_call as _resolve_mcp
+                    _mcp_done = {"note": "", "counted": False}
+                    async for _mcp_ev in _resolve_mcp(
+                        (_mcp_match.group(1) or "").strip(),
+                        user_id=user_id,
+                        client_inbox=client_inbox,
+                        calls_so_far=_mcp_calls,
+                        dlog=_dlog,
+                        session_id=session_id or "",
+                    ):
+                        if _mcp_ev.get("type") == "mcp_done":
+                            _mcp_done = _mcp_ev
+                        else:
+                            yield sse(_mcp_ev)
+                    if _mcp_done.get("counted"):
+                        _mcp_calls += 1
+                    _tool_parts = [_mcp_done.get("note") or ""]
                 else:
                     yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 if _tool_parts is None:
@@ -18083,6 +18188,29 @@ async def run_natural_pipeline_stream(
             _dlog("natural_websearch_tag_registered",
                   session_id=session_id, user_id=user_id, model=arch_model)
 
+        _natural_mcp = False
+        _natural_mcp_guidance = ""
+        try:
+            from services.mcp_client import (
+                mcp_offered as _mcp_offered,
+                prompt_catalog as _mcp_catalog,
+            )
+            if not str(arch_model or "").startswith("ollama:") and _mcp_offered(user_id):
+                _natural_mcp = True
+                if not _is_grok_model(arch_model):
+                    _natural_mcp_guidance = _mcp_catalog(user_id, native=False)
+                    TAG_DEFS["mcp"] = {
+                        "open": "<mcp_request>",
+                        "close": "</mcp_request>",
+                    }
+                    _dlog("natural_mcp_tag_registered",
+                          session_id=session_id, user_id=user_id, model=arch_model)
+        except Exception as _mcp_gate_err:
+            _natural_mcp = False
+            _natural_mcp_guidance = ""
+            _dlog("mcp_gate_error", session_id=session_id, user_id=user_id,
+                  error=str(_mcp_gate_err)[:200])
+
         # Preflight defaults to shadow: it logs, and does not reject edits,
         # until the setting is switched to enforce. Preview stays off until
         # preview_tool=on, and then only on Agent turns over the WebSocket.
@@ -18178,6 +18306,7 @@ async def run_natural_pipeline_stream(
                     preview_enabled=_preview_enabled,
                     preflight_enabled=(_preflight_mode == "enforce"),
                     websearch_enabled=_oa_search_enabled,
+                    mcp_enabled=_natural_mcp,
                     dlog=_dlog, session_id=session_id, user_id=user_id)
                 _gpt_system_text += _grok_sys_suffix
                 _dlog("natural_grok_system_suffix_appended",
@@ -18480,6 +18609,7 @@ async def run_natural_pipeline_stream(
         _github_reads_used = 0
         _github_writes_used = 0
         _github_attempts = 0
+        _mcp_calls = 0
         _gh_seen: dict = {}
         _gh_read_streak = 0
         # Grok-only deterministic pagination backstop (proven root cause,
@@ -18545,6 +18675,10 @@ async def run_natural_pipeline_stream(
                 from services.openai_web_search import parse_web_search_request as _parse_ws
                 _wd = _parse_ws(_block)
                 return ("websearch", _wd if _wd is not None else {"_invalid": (_block or "")[:500]})
+            if _kind == "mcp":
+                from services.mcp_client import parse_mcp_request as _parse_mcp
+                _md = _parse_mcp(_block)
+                return ("mcp", _md if _md is not None else {"_invalid": (_block or "")[:500]})
             return None
 
         # ---- Unified instruction: every tool is legal on every turn, no phase wall ----
@@ -18565,6 +18699,7 @@ async def run_natural_pipeline_stream(
             preview_enabled=_preview_enabled,
             preflight_enabled=(_preflight_mode == "enforce"),
             websearch_enabled=_oa_search_enabled and not _is_grok_model(arch_model),
+            mcp_guidance=(("\n" + _natural_mcp_guidance + "\n") if _natural_mcp_guidance else ""),
         )
 
         # ── Grok-only: native-tool agent instruction (Claude/GPT keep the
@@ -18578,6 +18713,7 @@ async def run_natural_pipeline_stream(
                 preview_enabled=_preview_enabled,
                 preflight_enabled=(_preflight_mode == "enforce"),
                 websearch_enabled=_oa_search_enabled,
+                mcp_enabled=_natural_mcp,
                 dlog=_dlog, session_id=session_id, user_id=user_id)
 
         # Research is off, but the user clearly asked for a web search.
@@ -18604,6 +18740,28 @@ async def run_natural_pipeline_stream(
                   error=str(_hint_err)[:200])
         if _research_hint:
             _active_agent_instruction = _active_agent_instruction + "\n\n" + _research_hint
+
+        _ws_on_block = ""
+        try:
+            from services.openai_web_search import web_search_on_block as _ws_on_block_fn
+            if _natural_web_search_enabled:
+                _ws_provider = "claude"
+            elif _is_grok_model(arch_model) and _oa_search_enabled:
+                _ws_provider = "grok"
+            elif _oa_search_enabled and not _is_grok_model(arch_model):
+                _ws_provider = "gpt"
+            else:
+                _ws_provider = ""
+            _ws_on_block = _ws_on_block_fn(_ws_provider)
+            if _ws_on_block:
+                _dlog("web_search_block_added", session_id=session_id, user_id=user_id,
+                      provider=_ws_provider, mode="edit")
+        except Exception as _ws_on_err:
+            _ws_on_block = ""
+            _dlog("web_search_block_error", session_id=session_id, user_id=user_id,
+                  error=str(_ws_on_err)[:200])
+        if _ws_on_block:
+            _active_agent_instruction = _active_agent_instruction + "\n\n" + _ws_on_block
 
         current_messages = list(messages)
         _last_cm = current_messages[-1] if current_messages else None
@@ -18920,7 +19078,7 @@ async def run_natural_pipeline_stream(
                                                 # starts with JSON ('[' or '{'). An AWS command
                                                 # starts with "aws" or "intent". context_tag_looks_real
                                                 # is that check. Anything else is prose.
-                                                if (_tag_name in ("search", "filereq", "github", "history", "aws")
+                                                if (_tag_name in ("search", "filereq", "github", "history", "aws", "mcp")
                                                         and not _ctx_shape_checked):
                                                     _ctx_stripped = tag_buf.lstrip()
                                                     if _ctx_stripped:
@@ -18956,7 +19114,7 @@ async def run_natural_pipeline_stream(
                                                 if _pd is not None:
                                                     edit_plan_data = _pd
                                                 _break_stream = True
-                                            elif _tag_name in ("search", "filereq", "github", "history", "aws"):
+                                            elif _tag_name in ("search", "filereq", "github", "history", "aws", "mcp"):
                                                 pending_tool = _capture_request(_tag_name, _content)
                                                 _break_stream = True
 
@@ -19128,6 +19286,7 @@ async def run_natural_pipeline_stream(
                         aws_enabled=_aws_connected,
                         preview_enabled=_preview_enabled,
                         websearch_enabled=_oa_search_enabled,
+                        mcp_enabled=_natural_mcp,
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
                     # Plan-first gate decides tool_choice: forced write_edit_plan
@@ -19311,7 +19470,7 @@ async def run_natural_pipeline_stream(
                                             # Claude branch above — same proven bug, session
                                             # 71737af0: a model quoting its own tag syntax in
                                             # prose must not trap the rest of its real text). ──
-                                            if (_tag_name in ("search", "filereq", "github", "history", "aws", "websearch")
+                                            if (_tag_name in ("search", "filereq", "github", "history", "aws", "websearch", "mcp")
                                                     and not _ctx_shape_checked):
                                                 _ctx_stripped = tag_buf.lstrip()
                                                 if _ctx_stripped:
@@ -19346,7 +19505,7 @@ async def run_natural_pipeline_stream(
                                             if _pd is not None:
                                                 edit_plan_data = _pd
                                             _break_stream = True
-                                        elif _tag_name in ("search", "filereq", "github", "history", "aws", "websearch"):
+                                        elif _tag_name in ("search", "filereq", "github", "history", "aws", "websearch", "mcp"):
                                             pending_tool = _capture_request(_tag_name, _content)
                                             _break_stream = True
                                         state = "normal"
@@ -19412,7 +19571,7 @@ async def run_natural_pipeline_stream(
             # ── Recover a context-request tag the stop_sequence halted before closing ──
             if pending_tool is None and state.startswith("in_"):
                 _uc = state[3:]
-                if _uc in ("search", "filereq", "github", "history", "aws", "websearch"):
+                if _uc in ("search", "filereq", "github", "history", "aws", "websearch", "mcp"):
                     _ucm = re.search(
                         re.escape(TAG_DEFS[_uc]["open"]) + r"(.*)",
                         full_response, re.DOTALL)
@@ -19639,6 +19798,10 @@ async def run_natural_pipeline_stream(
                     _dlog("agent_web_search_requested",
                           session_id=session_id, user_id=user_id, turn=_turn,
                           query=_ws_query[:200])
+                    _dlog("web_search_emitted", session_id=session_id,
+                          user_id=user_id, turn=_turn,
+                          provider=("grok" if _is_grok_model(arch_model) else "gpt"),
+                          mode="edit")
                     for _ws_ev in _ws_events(_ws_query, {"sources": [], "error": None})[:2]:
                         yield sse(_ws_ev)
                     try:
@@ -19670,6 +19833,34 @@ async def run_natural_pipeline_stream(
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
                         {"role": "user", "content": _ws_feedback(_ws_query, _ws_result)},
+                    ]
+                    continue
+
+                if _kind == "mcp":
+                    from services.mcp_client import resolve_mcp_call as _resolve_mcp
+                    _mcp_raw = _data if isinstance(_data, dict) else {"_invalid": str(_data)[:500]}
+                    if _mcp_raw.get("_invalid"):
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content":
+                                "That MCP request was not valid. "
+                                'Send {"server": "server-id", "tool": "tool-name", "arguments": {}}.'},
+                        ]
+                        continue
+                    _mcp_done = {"note": "", "counted": False}
+                    async for _mcp_ev in _resolve_mcp(
+                        _mcp_raw, user_id=user_id, client_inbox=client_inbox,
+                        calls_so_far=_mcp_calls, dlog=_dlog, session_id=session_id or "",
+                    ):
+                        if _mcp_ev.get("type") == "mcp_done":
+                            _mcp_done = _mcp_ev
+                        else:
+                            yield sse(_mcp_ev)
+                    if _mcp_done.get("counted"):
+                        _mcp_calls += 1
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": _assistant_echo},
+                        {"role": "user", "content": _mcp_done.get("note") or ""},
                     ]
                     continue
 
@@ -21012,7 +21203,7 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id,
                           plan_items=len(edit_plan_data) if edit_plan_data else 0)
 
-            elif state.startswith("in_") and state[3:] in ("search", "filereq", "github", "history", "aws", "websearch"):
+            elif state.startswith("in_") and state[3:] in ("search", "filereq", "github", "history", "aws", "websearch", "mcp"):
                 # ── Safety net for a stuck context-request tag ──────────────
                 # PROVEN BUG (session 71737af0): unlike in_edit/in_file/in_plan
                 # above, this branch had NO recovery/surface path at all before

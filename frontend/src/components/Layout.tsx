@@ -4,6 +4,7 @@ import { ChatPanel } from './ChatPanel'
 import { CodePanel } from './CodePanel'
 import { ElementPickerPanel } from './ElementPickerPanel'
 import { AwsTerminalDock } from './AwsTerminalDock'
+import { McpApprovalCard } from './McpApprovalCard'
 import { PreviewProbe } from './PreviewProbe'
 import { useAppStore } from '../stores/appStore'
 import { useAuthStore } from '../stores/authStore'
@@ -193,6 +194,7 @@ export function Layout() {
         </section>
       ) : null}
       </div>
+      <McpApprovalCard />
       <AwsTerminalDock />
       </div>
     </div>

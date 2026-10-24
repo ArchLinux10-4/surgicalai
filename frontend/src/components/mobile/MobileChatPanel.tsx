@@ -29,6 +29,7 @@ import { AgentMissionControl } from '../AgentMissionControl'
 import { PlanTracker } from '../PlanTracker'
 import { PlanPane } from '../PlanPane'
 import { AwsTerminalDock } from '../AwsTerminalDock'
+import { McpApprovalCard } from '../McpApprovalCard'
 import { PlanQuestionsCard } from '../PlanQuestionsCard'
 import { normalizeQuestions, stripPlanQuestionsFence } from '../../lib/planQuestions'
 import { useTaskPolling } from '../../hooks/useTaskPolling'
@@ -1250,6 +1251,28 @@ export function MobileChatPanel() {
           target: meta?.target,
         })
       },
+      undefined,
+      undefined,
+      (info, reply) => {
+        useAppStore.getState().setMcpApproval({
+          sessionId,
+          server: info.server,
+          serverName: info.server_name,
+          tool: info.tool,
+          arguments: info.arguments || {},
+          reply,
+        })
+      },
+      (event) => {
+        useAppStore.getState().pushMcpCall({
+          sessionId,
+          server: event?.server || '',
+          tool: event?.tool || '',
+          ok: !!event?.ok,
+          error: event?.error || '',
+          text: event?.text || '',
+        })
+      },
     )
     ctrlRef.current = ctrl
   }, [input, isStreaming, settings, ensureSession, messages.length, sessionFiles,
@@ -1863,6 +1886,7 @@ export function MobileChatPanel() {
           onClose={() => setModeSheetOpen(false)}
         />
       </div>
+      <McpApprovalCard />
       <AwsTerminalDock compact />
     </div>
   )

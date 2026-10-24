@@ -197,6 +197,7 @@ async def run_grok_ask_plan_native_stream(
     history_enabled: bool = False,
     aws_enabled: bool = False,
     websearch_enabled: bool = False,
+    mcp_enabled: bool = False,
     openai_client=None,
     web_search_sources: Optional[list] = None,
     client_inbox=None,
@@ -223,6 +224,7 @@ async def run_grok_ask_plan_native_stream(
     tools = build_grok_agent_tools(
         mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
         aws_enabled=aws_enabled, websearch_enabled=websearch_enabled,
+        mcp_enabled=mcp_enabled,
         dlog=dlog, session_id=session_id, user_id=user_id,
     )
 
@@ -236,6 +238,7 @@ async def run_grok_ask_plan_native_stream(
             suffix = build_grok_system_suffix(
                 mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
                 aws_enabled=aws_enabled, websearch_enabled=websearch_enabled,
+                mcp_enabled=mcp_enabled,
                 dlog=dlog, session_id=session_id, user_id=user_id,
             )
             messages[i] = {**m, "content": (m.get("content") or "") + suffix}
@@ -262,6 +265,7 @@ async def run_grok_ask_plan_native_stream(
 
     tool_round = 0
     _aws_calls = 0
+    _mcp_calls = 0
     _ws_budget = None
     if websearch_enabled:
         from services.openai_web_search import SearchBudget as _WsBudget
@@ -410,6 +414,8 @@ async def run_grok_ask_plan_native_stream(
                     else:
                         dlog("grok_ask_plan_web_search_requested", session_id=session_id,
                              user_id=user_id, tool_round=tool_round, query=_ws_query[:200])
+                        dlog("web_search_emitted", session_id=session_id, user_id=user_id,
+                             provider="grok", mode="ask_plan", tool_round=tool_round)
                         for _ws_ev in _ws_events(_ws_query, {"sources": [], "error": None})[:2]:
                             yield _sse(_ws_ev)
                         try:
@@ -433,6 +439,20 @@ async def run_grok_ask_plan_native_stream(
                              user_id=user_id, tool_round=tool_round,
                              source_count=len(_ws_result.get("sources") or []),
                              error=(_ws_result.get("error") or "")[:200])
+            elif tag_kind == "mcp":
+                from services.mcp_client import resolve_mcp_call
+                _mcp_done = {"note": "", "counted": False}
+                async for _mcp_ev in resolve_mcp_call(
+                    body, user_id=user_id, client_inbox=client_inbox,
+                    calls_so_far=_mcp_calls, dlog=dlog, session_id=session_id or "",
+                ):
+                    if _mcp_ev.get("type") == "mcp_done":
+                        _mcp_done = _mcp_ev
+                    else:
+                        yield _sse(_mcp_ev)
+                if _mcp_done.get("counted"):
+                    _mcp_calls += 1
+                context_result = _mcp_done.get("note") or ""
             elif tag_kind == "aws":
                 from services.aws_cli import resolve_aws_call, split_intent
                 _aws_intent, _aws_cmd = split_intent(str(body))

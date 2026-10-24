@@ -18,6 +18,7 @@ from services.openai_web_search import (
     format_result,
     merge_sources,
     model_uses_openai_web_search,
+    web_search_on_block,
     parse_web_search_request,
     perform_search,
     run_search,
@@ -312,3 +313,33 @@ def test_pipeline_and_grok_wiring_guards():
     # The tag is registered only for the OpenAI-search gate, not for every model.
     assert "_oa_search_enabled and not _is_grok_model(arch_model)" in pipeline
     assert 'if _kind == "websearch"' in pipeline
+    assert "web_search_block_added" in pipeline
+    assert "web_search_emitted" in pipeline
+    schema = next(
+        t for t in gat.build_grok_agent_tools("ask", websearch_enabled=True)
+        if t["function"]["name"] == "request_web_search"
+    )
+    assert schema["function"]["description"].startswith(
+        "Searches the public internet for current information."
+    )
+    assert "Research" not in schema["function"]["description"]
+
+
+def test_web_search_on_block_says_internet_and_not_research():
+    gpt = web_search_on_block("gpt")
+    assert "public internet" in gpt
+    assert "web search" in gpt.lower()
+    assert "Research" not in gpt
+    assert "<web_search_request>" in gpt
+    assert "<search_request>" in gpt
+    claude = web_search_on_block("claude")
+    assert "web search" in claude.lower()
+    assert "<web_search_request>" not in claude
+    assert "Research" not in claude
+    grok = web_search_on_block("grok")
+    assert "request_web_search" in grok
+    assert "public internet" in grok
+    assert "<web_search_request>" not in grok
+    assert "Research" not in grok
+    assert web_search_on_block("") == ""
+    assert web_search_on_block("gemini") == ""

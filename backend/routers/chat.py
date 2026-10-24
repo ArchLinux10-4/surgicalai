@@ -2935,8 +2935,8 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
 
     async def _client_receiver():
         """Forward client→server messages to the inbox for the duration of the
-        stream. `file_response`, `aws_cli_response` and `preview_check_response`
-        are consumed; unknown
+        stream. `file_response`, `aws_cli_response`, `preview_check_response`
+        and `mcp_call_response` are consumed; unknown
         shapes are ignored so the channel stays forward-compatible. Any receive
         error (disconnect / closed socket) ends the receiver cleanly."""
         while True:
@@ -2958,6 +2958,7 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
                 continue
             if isinstance(msg_in, dict) and msg_in.get("type") in (
                 "file_response", "aws_cli_response", "preview_check_response",
+                "mcp_call_response",
             ):
                 await inbox.put(msg_in)
 
