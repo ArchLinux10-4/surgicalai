@@ -34,6 +34,45 @@ INVALID_NOTE = (
     "with only the question in query. Do not include code, file names, or secrets."
 )
 
+# Shown only when live web search is actually on for this turn. The UI
+# checkbox is labelled Research; agents are told the capability instead.
+GPT_WEB_SEARCH_ON = (
+    "Live web search is available for this message. "
+    "<web_search_request> searches the public internet and is allowed in this mode. "
+    "It is not a code edit. <search_request> only searches attached files. "
+    "If the answer depends on anything current (versions, docs, news, prices, "
+    "or the user asked you to look something up), emit <web_search_request> "
+    "first with only the question in query, then stop and wait. "
+    "Do not present a current fact from memory as if you had looked it up."
+)
+CLAUDE_WEB_SEARCH_ON = (
+    "Live web search is available for this message. "
+    "Use web search for current public facts. Do not guess them."
+)
+GROK_WEB_SEARCH_ON = (
+    "Live web search is available for this message. "
+    "Call request_web_search to search the public internet. It is allowed in this mode. "
+    "request_search only searches attached files. "
+    "If the answer depends on anything current (versions, docs, news, prices, "
+    "or the user asked you to look something up), call request_web_search first. "
+    "Do not present a current fact from memory as if you had looked it up."
+)
+
+
+def web_search_on_block(provider: str) -> str:
+    """Prompt text for a turn where live web search can actually run.
+
+    ``provider`` is ``gpt``, ``claude``, or ``grok``. Anything else is empty,
+    so Gemini, Ollama, and a missing key add no line.
+    """
+    if provider == "gpt":
+        return GPT_WEB_SEARCH_ON
+    if provider == "claude":
+        return CLAUDE_WEB_SEARCH_ON
+    if provider == "grok":
+        return GROK_WEB_SEARCH_ON
+    return ""
+
 _SYSTEM = (
     "You are a web research assistant. Answer the question using web search. "
     "Be concise and factual. Cite the pages you used. "

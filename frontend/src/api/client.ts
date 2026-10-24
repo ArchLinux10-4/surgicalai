@@ -57,6 +57,11 @@ export type SmartStreamHandlers = {
     unresolved?: string[]
   }, reply: (payload: Record<string, unknown>) => boolean) => void
   onEditLive?: (ev: EditLiveEvent) => void
+  onMcpApproval?: (
+    info: { server: string; server_name?: string; tool: string; arguments?: Record<string, unknown> },
+    reply: (resp: { action: 'approve' | 'reject' }) => boolean,
+  ) => void
+  onMcpCall?: (event: { server?: string; tool?: string; ok?: boolean; error?: string; text?: string }) => void
 }
 
 export type EditLiveEvent = {
@@ -532,6 +537,8 @@ export const api = {
       onAwsApproval?: SmartStreamHandlers['onAwsApproval'],
       onPreviewCheck?: SmartStreamHandlers['onPreviewCheck'],
       onEditLive?: SmartStreamHandlers['onEditLive'],
+      onMcpApproval?: SmartStreamHandlers['onMcpApproval'],
+      onMcpCall?: SmartStreamHandlers['onMcpCall'],
     ): AbortController => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -540,7 +547,7 @@ export const api = {
           onThinking, onCompacting, onEditStart, onEditEnd, onTask,
           onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
           onCreditPaused, onPlan, onAwsCli, onAwsApproval, onPreviewCheck,
-          onEditLive,
+          onEditLive, onMcpApproval, onMcpCall,
         } = onThinking)
       }
       const controller = new AbortController()
@@ -618,6 +625,19 @@ export const api = {
               return true
             })
           }
+          else if (chunk.type === 'mcp_approval_needed') {
+            onMcpApproval?.({
+              server: chunk.server || '',
+              server_name: chunk.server_name,
+              tool: chunk.tool || '',
+              arguments: chunk.arguments || {},
+            }, (resp) => {
+              if (!sendToServer) return false
+              sendToServer({ type: 'mcp_call_response', action: resp.action })
+              return true
+            })
+          }
+          else if (chunk.type === 'mcp_call') onMcpCall?.(chunk)
           else if (chunk.type === 'file_needed_cleared') onFileCleared?.(chunk.filename)
           else if (
             chunk.type === 'planning_started' ||
@@ -1171,6 +1191,23 @@ export const api = {
     },
     deployment: (id: string) => request<any>(`/vercel/deployments/${id}`),
     logs: (id: string, limit = 200) => request<any>(`/vercel/deployments/${id}/logs?limit=${limit}`),
+  },
+
+  mcp: {
+    status: () => request<{
+      available: boolean
+      installed: boolean
+      install_command: string
+      connections: any[]
+    }>('/mcp/status'),
+    test: (body: Record<string, unknown>) =>
+      request<{ ok: boolean; tools: { name: string; description: string }[]; error: string }>('/mcp/test', { method: 'POST', body: JSON.stringify(body) }),
+    save: (body: Record<string, unknown>) =>
+      request<any>('/mcp/connections', { method: 'POST', body: JSON.stringify(body) }),
+    patch: (id: string, body: Record<string, unknown>) =>
+      request<any>(`/mcp/connections/${encodeURIComponent(id)}`, { method: 'PATCH', body: JSON.stringify(body) }),
+    remove: (id: string) =>
+      request<any>(`/mcp/connections/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   },
 
   aws: {

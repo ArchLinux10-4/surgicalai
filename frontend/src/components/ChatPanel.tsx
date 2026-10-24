@@ -2441,6 +2441,26 @@ export function ChatPanel() {
       (ev) => {
         useAppStore.getState().applyLiveEdit(sessionId, ev)
       },
+      (info, reply) => {
+        useAppStore.getState().setMcpApproval({
+          sessionId,
+          server: info.server,
+          serverName: info.server_name,
+          tool: info.tool,
+          arguments: info.arguments || {},
+          reply,
+        })
+      },
+      (event) => {
+        useAppStore.getState().pushMcpCall({
+          sessionId,
+          server: event?.server || '',
+          tool: event?.tool || '',
+          ok: !!event?.ok,
+          error: event?.error || '',
+          text: event?.text || '',
+        })
+      },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change

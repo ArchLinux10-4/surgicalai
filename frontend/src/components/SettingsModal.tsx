@@ -8,9 +8,10 @@ import { useAuthStore } from '../stores/authStore'
 import { useThemeStore } from '../stores/themeStore'
 import { clientLog } from '../lib/clientLog'
 import { AwsConnectModal, shortAwsCli } from './AwsConnectModal'
+import { McpPanel } from './McpPanel'
 import { AttachMoney, BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
-type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'aws' | 'railway' | 'security' | 'debug'
+type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'aws' | 'railway' | 'mcp' | 'security' | 'debug'
 
 const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'api',       icon: <VpnKey sx={{ fontSize: 14 }} />,       label: 'API Keys' },
@@ -19,6 +20,7 @@ const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'vercel',    icon: <span style={{ fontSize: 12, fontWeight: 'bold' }}>▲</span>,     label: 'Vercel' },
   { id: 'aws',       icon: <span style={{ fontSize: 11, fontWeight: 'bold' }}>aws</span>, label: 'AWS' },
   { id: 'railway',   icon: <span style={{ fontSize: 13, fontWeight: 'bold', color: '#dc2626' }}>⬡</span>,  label: 'Railway' },
+  { id: 'mcp',       icon: <span style={{ fontSize: 11, fontWeight: 'bold' }}>mcp</span>, label: 'MCP' },
   { id: 'workspace', icon: <FolderOpen sx={{ fontSize: 14 }} />, label: 'Workspace' },
   { id: 'editor',    icon: <Code sx={{ fontSize: 14 }} />,       label: 'Editor' },
   { id: 'users',     icon: <Group sx={{ fontSize: 14 }} />,      label: 'Users' },
@@ -1023,6 +1025,10 @@ export function SettingsModal() {
               </div>
             )}
 
+            {tab === 'mcp' && (
+              <McpPanel />
+            )}
+
             {tab === 'debug' && (
               <DebugLogsPanel />
             )}
@@ -1050,7 +1056,7 @@ export function SettingsModal() {
         {/* Footer */}
         <div className="flex items-center justify-end gap-3 px-6 py-4 border-t border-border flex-shrink-0">
           <button onClick={() => setSettingsOpen(false)} className="btn-ghost border border-border px-5 py-2 text-sm">Cancel</button>
-          {tab !== 'users' && tab !== 'security' && tab !== 'debug' && <button onClick={handleSave} className="btn-primary px-6">Save Settings</button>}
+          {tab !== 'users' && tab !== 'security' && tab !== 'debug' && tab !== 'mcp' && <button onClick={handleSave} className="btn-primary px-6">Save Settings</button>}
         </div>
       </div>
     </div>
