@@ -54,6 +54,7 @@ convention, and essential here since this is a brand-new code path.
 """
 import json
 import os
+import re
 import time
 from typing import Callable, Optional
 
@@ -137,6 +138,22 @@ def _sse(obj: dict) -> str:
     return f"data: {json.dumps(obj)}\n\n"
 
 
+_LOOKUP_PROMISE = re.compile(
+    r"\b(i can|i'll|i will|let me)\b.{0,48}\b(check|look|search|find)\b",
+    re.IGNORECASE,
+)
+
+
+def is_lookup_promise(text: str) -> bool:
+    """A short reply that only promises to look, with no file or answer in it."""
+    cleaned = (text or "").strip()
+    if not cleaned or len(cleaned) > 240:
+        return False
+    if "/" in cleaned or cleaned.endswith(".py") or ".tsx" in cleaned or ".jsx" in cleaned:
+        return False
+    return _LOOKUP_PROMISE.search(cleaned) is not None
+
+
 def _dispatch_context_request(
     tag_kind: str,
     body: str,
@@ -164,9 +181,10 @@ def _dispatch_context_request(
     fr_match = match if tag_kind == "filereq" else None
     gr_match = match if tag_kind == "github" else None
     hr_match = match if tag_kind == "history" else None
+    rr_match = match if tag_kind == "repo" else None
     tool_parts = execute_tool_round_fn(
         sr_match=sr_match, fr_match=fr_match, gr_match=gr_match,
-        hr_match=hr_match,
+        hr_match=hr_match, rr_match=rr_match,
         symbol_maps_by_name=symbol_maps_by_name,
         file_content_lookup=file_content_lookup,
         user_id=user_id, session_id=session_id, tool_round=tool_round,
@@ -198,6 +216,7 @@ async def run_grok_ask_plan_native_stream(
     aws_enabled: bool = False,
     websearch_enabled: bool = False,
     mcp_enabled: bool = False,
+    repo_enabled: bool = False,
     openai_client=None,
     web_search_sources: Optional[list] = None,
     client_inbox=None,
@@ -225,7 +244,7 @@ async def run_grok_ask_plan_native_stream(
     tools = build_grok_agent_tools(
         mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
         aws_enabled=aws_enabled, websearch_enabled=websearch_enabled,
-        mcp_enabled=mcp_enabled,
+        mcp_enabled=mcp_enabled, repo_enabled=repo_enabled,
         dlog=dlog, session_id=session_id, user_id=user_id,
     )
 
@@ -239,7 +258,7 @@ async def run_grok_ask_plan_native_stream(
             suffix = build_grok_system_suffix(
                 mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
                 aws_enabled=aws_enabled, websearch_enabled=websearch_enabled,
-                mcp_enabled=mcp_enabled,
+                mcp_enabled=mcp_enabled, repo_enabled=repo_enabled,
                 dlog=dlog, session_id=session_id, user_id=user_id,
             )
             messages[i] = {**m, "content": (m.get("content") or "") + suffix}
@@ -267,6 +286,7 @@ async def run_grok_ask_plan_native_stream(
     tool_round = 0
     _aws_calls = 0
     _mcp_calls = 0
+    _promise_nudged = False
     if steer_inbox is not None:
         yield _sse({"type": "steer_ready"})
     _ws_budget = None
@@ -362,10 +382,25 @@ async def run_grok_ask_plan_native_stream(
             yield _sse({"type": "thinking_end", "content": ""})
 
         if not acc.has_calls():
-            # Plain-text answer, no tool calls this round — done.
+            # Plain-text answer, no tool calls this round — done, unless the
+            # model only promised to look. Session dff697c8: gpt-6-luna said
+            # "I can check" and the tag loop treated that as the answer.
             final_text = round_text.strip() or (
                 "I don't have anything more to add — try rephrasing your question."
             )
+            if (not _promise_nudged and (gh_nat_enabled or repo_enabled)
+                    and is_lookup_promise(final_text)):
+                _promise_nudged = True
+                from services.github_natural_tag import LOOKUP_BEFORE_ANSWER
+                dlog("ask_plan_lookup_promise_rejected", session_id=session_id,
+                     user_id=user_id, tool_round=tool_round, chars=len(final_text))
+                yield _sse({"type": "progress", "content": "Looking it up…"})
+                messages.append({"role": "assistant", "content": final_text})
+                messages.append({
+                    "role": "user",
+                    "content": "That is not an answer. " + LOOKUP_BEFORE_ANSWER,
+                })
+                continue
             dlog("grok_ask_plan_native_final_answer", session_id=session_id,
                  user_id=user_id, tool_round=tool_round, chars=len(final_text),
                  thinking_deltas=thinking_deltas)

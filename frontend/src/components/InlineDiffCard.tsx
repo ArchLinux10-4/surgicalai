@@ -1074,7 +1074,13 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       // Sync originalCode to reverted content — replicates refresh behavior
       if (result.content) setOriginalCode(result.content)
       onApplied?.(filename, result.content)
-      toast.success(`↩ Reverted ${filename} to previous version`)
+      toast.success(
+        result.disk === 'written'
+          ? `Reverted ${filename} in the chat and on disk`
+          : result.disk === 'conflict'
+            ? `Reverted ${filename} in the chat. The file on disk has other changes, so it was left alone.`
+            : `Reverted ${filename} to the previous version`
+      )
       onChangeApplied?.(-1)
     } catch (e: any) {
       toast.error(e.message || 'Undo failed')

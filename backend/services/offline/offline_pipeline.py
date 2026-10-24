@@ -247,6 +247,11 @@ async def _run_offline_edit(
                     )
                     conn.commit()
                     saved = True
+                    try:
+                        from services.repo_apply import maybe_auto_apply
+                        maybe_auto_apply(session_id, file_id)
+                    except Exception:
+                        pass
                     _dlog("offline_edit_saved", session_id=session_id, user_id=user_id,
                           filename=filename, file_id=file_id, new_lines=new_lines)
         except Exception as exc:

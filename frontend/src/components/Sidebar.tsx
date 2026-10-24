@@ -3,7 +3,7 @@ import { createPortal } from 'react-dom'
 import { useAppStore } from '../stores/appStore'
 import { useAuthStore } from '../stores/authStore'
 import { api } from '../api/client'
-import { FileNode, SessionFile } from '../types'
+import { ChatSession, FileNode, Repository, SessionFile } from '../types'
 import { toast } from '../lib/toast'
 import { ContextPanel } from './ContextPanel'
 import { GitHubPanel } from './GitHubPanel'
@@ -12,9 +12,10 @@ import { VercelPanel } from './VercelPanel'
 import { RailwayPanel } from './RailwayPanel'
 import { AwsTerminalPanel } from './AwsTerminalPanel'
 import { useThemeStore } from '../stores/themeStore'
-import { Add, AdsClick, Chat, CloudOff, Close, Code, CreateNewFolder, DarkMode, Delete, Description, Download, Edit, FileUpload, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
+import { Add, AdsClick, Chat, CloudOff, Close, Code, CreateNewFolder, DarkMode, Delete, Description, Download, Edit, FileUpload, FolderOpen, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, MoreHoriz, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile, DiffStatsBadge } from '../lib/fileClassify'
 import { DownloadSessionButton } from './DownloadSessionButton'
+import { AddFromRepo, OpenFolderModal } from './Repositories'
 
 // ── File icon helper ─────────────────────────────────────────────────────────
 const FILE_ICONS: Record<string, string> = {
@@ -182,8 +183,146 @@ function SessionItem({ session, active, isSessionStreaming, onLoad, onDelete, on
 }
 
 // ── Session List ──────────────────────────────────────────────────────────────
+function SessionGroups({
+  sessions, repositories, collapsed, menuRepoId, setMenuRepoId, toggleCollapsed, onNewChat, onChanged, renderSession,
+}: {
+  sessions: ChatSession[]
+  repositories: Repository[]
+  collapsed: Set<string>
+  menuRepoId: string | null
+  setMenuRepoId: (id: string | null) => void
+  toggleCollapsed: (id: string) => void
+  onNewChat: (id: string) => void
+  onChanged: () => void
+  renderSession: (s: ChatSession) => React.ReactNode
+}) {
+  const activeRepos = repositories.filter(r => !r.removed)
+  const removedRepos = repositories.filter(r => r.removed)
+  const known = new Set(repositories.map(r => r.id))
+  const loose = sessions.filter(s => !s.repository_id || !known.has(s.repository_id))
+  const orphans = new Map<string, ChatSession[]>()
+  const plain: ChatSession[] = []
+  for (const session of loose) {
+    if (session.repository_id && !known.has(session.repository_id)) {
+      const list = orphans.get(session.repository_id) || []
+      list.push(session)
+      orphans.set(session.repository_id, list)
+    } else {
+      plain.push(session)
+    }
+  }
+  const rename = async (repo: Repository) => {
+    const name = window.prompt('Folder name', repo.name)
+    if (!name || name.trim() === repo.name) return
+    try {
+      await api.repositories.update(repo.id, { name: name.trim() })
+      onChanged()
+    } catch (e: any) {
+      toast.error('Could not rename', e.message)
+    }
+  }
+  const linkSuggested = async (repo: Repository) => {
+    const suggestion = repo.suggested_github
+    if (!suggestion) return
+    try {
+      await api.repositories.update(repo.id, { github_owner: suggestion.owner, github_repo: suggestion.repo })
+      onChanged()
+      toast.success('GitHub linked', `${suggestion.owner}/${suggestion.repo}`)
+    } catch (e: any) {
+      toast.error('Could not link GitHub', e.message)
+    }
+  }
+  return (
+    <div>
+      {activeRepos.map((repo) => {
+        const items = sessions.filter(s => s.repository_id === repo.id)
+        const closed = collapsed.has(repo.id)
+        return (
+          <div key={repo.id} className="mb-1">
+            <div className="group flex items-center gap-1 px-2 py-1">
+              <button type="button" className="flex min-w-0 flex-1 items-center gap-1.5 text-left" onClick={() => toggleCollapsed(repo.id)}>
+                <span className="text-[10px] text-faint">{closed ? '▸' : '▾'}</span>
+                <FolderOpen sx={{ fontSize: 13 }} className={repo.missing ? 'text-danger' : 'text-muted'} />
+                <span className="truncate text-[12px] font-semibold text-ink">{repo.name}</span>
+                {repo.default_branch && <span className="truncate text-[10px] text-faint">{repo.default_branch}</span>}
+                {repo.github_linked && <GitHub sx={{ fontSize: 11 }} className="text-muted" />}
+                {repo.missing && <span className="text-[10px] text-danger">Missing</span>}
+              </button>
+              <button type="button" className="btn-icon h-6 w-6 opacity-0 group-hover:opacity-100" title="New chat in this folder" onClick={() => onNewChat(repo.id)}>
+                <Add sx={{ fontSize: 13 }} />
+              </button>
+              <button type="button" className="btn-icon h-6 w-6" title="Folder actions" aria-expanded={menuRepoId === repo.id} onClick={() => setMenuRepoId(menuRepoId === repo.id ? null : repo.id)}>
+                <MoreHoriz sx={{ fontSize: 14 }} />
+              </button>
+            </div>
+            {menuRepoId === repo.id && (
+              <div className="mx-2 mb-1 rounded-lg border border-border bg-surface p-1 text-[12px] shadow-modal">
+                <button type="button" className="block w-full rounded px-2 py-1 text-left hover:bg-overlay" onClick={() => { setMenuRepoId(null); rename(repo) }}>Rename</button>
+                {repo.suggested_github && !repo.github_linked && (
+                  <button type="button" className="block w-full rounded px-2 py-1 text-left hover:bg-overlay" onClick={() => { setMenuRepoId(null); linkSuggested(repo) }}>
+                    Link {repo.suggested_github.owner}/{repo.suggested_github.repo}
+                  </button>
+                )}
+                {repo.github_linked && (
+                  <button type="button" className="block w-full rounded px-2 py-1 text-left hover:bg-overlay" onClick={async () => { setMenuRepoId(null); await api.repositories.update(repo.id, { unlink_github: true }); onChanged() }}>Unlink GitHub</button>
+                )}
+                <button type="button" className="block w-full rounded px-2 py-1 text-left hover:bg-overlay" onClick={async () => { setMenuRepoId(null); await api.repositories.update(repo.id, { auto_apply: !repo.auto_apply }); onChanged() }}>
+                  {repo.auto_apply ? 'Turn off auto-apply' : 'Turn on auto-apply'}
+                </button>
+                <button type="button" className="block w-full rounded px-2 py-1 text-left text-danger hover:bg-danger/10" onClick={async () => { setMenuRepoId(null); await api.repositories.remove(repo.id); onChanged() }}>Remove from sidebar</button>
+              </div>
+            )}
+            {!closed && items.map(renderSession)}
+            {!closed && items.length === 0 && <p className="px-7 pb-1 text-[11px] text-faint">No chats in this folder yet</p>}
+          </div>
+        )
+      })}
+      {removedRepos.map((repo) => {
+        const items = sessions.filter(s => s.repository_id === repo.id)
+        if (!items.length) return null
+        return (
+          <div key={repo.id} className="mb-1">
+            <div className="flex items-center gap-1 px-2 py-1">
+              <FolderOpen sx={{ fontSize: 13 }} className="text-faint" />
+              <span className="min-w-0 flex-1 truncate text-[12px] font-semibold text-muted">{repo.name}</span>
+              <button
+                type="button"
+                className="text-[11px] font-semibold text-accent"
+                onClick={async () => {
+                  await api.repositories.update(repo.id, { restore: true })
+                  onChanged()
+                }}
+              >
+                Restore
+              </button>
+            </div>
+            {items.map(renderSession)}
+          </div>
+        )
+      })}
+      {[...orphans.entries()].map(([id, items]) => (
+        <div key={id} className="mb-1">
+          <div className="px-2 py-1 text-[11px] font-semibold text-danger">Folder removed</div>
+          {items.map(renderSession)}
+        </div>
+      ))}
+      {plain.length > 0 && (
+        <div>
+          {(activeRepos.length > 0 || removedRepos.length > 0 || orphans.size > 0) && (
+            <div className="px-3 py-1 text-[10px] font-semibold uppercase tracking-wide text-faint">Chats</div>
+          )}
+          {plain.map(renderSession)}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function SessionList() {
-  const { sessions, setSessions, activeSessions, setActiveSession, setMessages, streamingSessions, setSidebarPinned } = useAppStore()
+  const { sessions, setSessions, activeSessions, setActiveSession, setMessages, streamingSessions, setSidebarPinned, settings, repositories, setRepositories, setOpenFolderOpen, setSettingsOpen, setSettingsInitialTab } = useAppStore()
+  const [collapsedRepos, setCollapsedRepos] = useState<Set<string>>(new Set())
+  const [menuRepoId, setMenuRepoId] = useState<string | null>(null)
+  const localInstall = !!settings && !settings.is_hosted
   const [searchQuery, setSearchQuery] = useState('')
   const [searchResults, setSearchResults] = useState<any[]>([])
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null)
@@ -223,9 +362,18 @@ function SessionList() {
     })()
   }, [])
 
-  const newSession = async () => {
+  useEffect(() => {
+    if (!localInstall) return
+    api.repositories.list(true).then(setRepositories).catch(() => {})
+  }, [localInstall])
+
+  const newSession = async (repositoryId?: string | null) => {
     try {
-      const s = await api.chat.createSession({ title: 'New Chat' })
+      const explicit = typeof repositoryId === 'string' || repositoryId === null
+      const inherited = explicit
+        ? repositoryId
+        : sessions.find(s => s.id === activeSessions)?.repository_id
+      const s = await api.chat.createSession({ title: 'New Chat', repository_id: inherited || undefined })
       await loadSessions()
       setActiveSession(s.id)
       setMessages([])
@@ -499,7 +647,7 @@ function SessionList() {
   return (
     <div className="flex flex-col h-full">
       <div className="p-2 border-b border-border flex gap-2">
-        <button onClick={newSession} className="btn-primary flex-1 gap-2">
+        <button onClick={() => newSession()} className="btn-primary flex-1 gap-2">
           <Add sx={{ fontSize: 14 }} /> New Chat
           <kbd className="ml-auto text-[10px] opacity-50 font-mono bg-accent-dark/30 px-1 rounded">⌘N</kbd>
         </button>
@@ -515,6 +663,24 @@ function SessionList() {
           {selectMode ? 'Done' : 'Select'}
         </button>
       </div>
+      {localInstall ? (
+        <div className="px-2 py-2 border-b border-border">
+          <button
+            type="button"
+            onClick={() => setOpenFolderOpen(true)}
+            className="flex w-full items-center justify-center gap-1.5 rounded-lg border border-border bg-overlay px-2 py-1.5 text-[12px] font-semibold text-ink hover:border-accent/40 hover:text-accent transition-colors"
+          >
+            <FolderOpen sx={{ fontSize: 14 }} /> Open Folder
+          </button>
+        </div>
+      ) : settings?.is_hosted ? (
+        <div className="px-3 py-2 border-b border-border text-[11px] text-muted leading-snug">
+          Open Folder is available when SurgicalAI is installed on your computer.{' '}
+          <button type="button" className="text-accent font-semibold" onClick={() => { setSettingsInitialTab('github'); setSettingsOpen(true) }}>
+            Connect GitHub
+          </button>
+        </div>
+      ) : null}
 
       {/* Multi-select action bar */}
       {selectMode && (
@@ -565,26 +731,41 @@ function SessionList() {
           <div className="flex flex-col items-center justify-center h-20 gap-2 text-faint">
             <span className="text-xs">No matches</span>
           </div>
-        ) : filteredSessions.length === 0 ? (
+        ) : filteredSessions.length === 0 && repositories.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-32 gap-2 text-faint">
             <Chat sx={{ fontSize: 24 }} className="opacity-40" />
             <span className="text-xs">No chats yet</span>
           </div>
         ) : (
-          filteredSessions.map((s) => (
-            <SessionItem
-              key={s.id}
-              session={s}
-              active={activeSessions === s.id}
-              isSessionStreaming={!!streamingSessions[s.id]?.isStreaming}
-              onLoad={() => loadSession(s.id)}
-              onDelete={() => promptDeleteSession(s.id)}
-              onRename={(title) => renameSession(s.id, title)}
-              selectMode={selectMode}
-              selected={selectedIds.has(s.id)}
-              onToggleSelect={() => toggleSelect(s.id)}
-            />
-          ))
+          <SessionGroups
+            sessions={filteredSessions}
+            repositories={localInstall ? repositories : []}
+            collapsed={collapsedRepos}
+            menuRepoId={menuRepoId}
+            setMenuRepoId={setMenuRepoId}
+            toggleCollapsed={(id) => setCollapsedRepos(prev => {
+              const next = new Set(prev)
+              if (next.has(id)) next.delete(id)
+              else next.add(id)
+              return next
+            })}
+            onNewChat={(id) => newSession(id)}
+            onChanged={() => api.repositories.list(true).then(setRepositories).catch(() => {})}
+            renderSession={(s) => (
+              <SessionItem
+                key={s.id}
+                session={s}
+                active={activeSessions === s.id}
+                isSessionStreaming={!!streamingSessions[s.id]?.isStreaming}
+                onLoad={() => loadSession(s.id)}
+                onDelete={() => promptDeleteSession(s.id)}
+                onRename={(title) => renameSession(s.id, title)}
+                selectMode={selectMode}
+                selected={selectedIds.has(s.id)}
+                onToggleSelect={() => toggleSelect(s.id)}
+              />
+            )}
+          />
         )}
       </div>
       {searchResults.length > 0 && (
@@ -625,9 +806,15 @@ function getFileIcon(filename: string) {
 }
 
 function SessionFilesPanel() {
-  const { sessionFiles, setSessionFiles, removeSessionFile, addSessionFile, fileFilter, activeSessions, settings } = useAppStore()
+  const { sessionFiles, setSessionFiles, removeSessionFile, addSessionFile, fileFilter, activeSessions, settings, sessions, repositories } = useAppStore()
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [importing, setImporting] = useState(false)
+  const [applying, setApplying] = useState(false)
+  const [conflicts, setConflicts] = useState<{ id: string; filename: string; reason: string }[]>([])
+  const activeRepoId = sessions.find(s => s.id === activeSessions)?.repository_id || ''
+  const activeRepo = repositories.find(r => r.id === activeRepoId) || null
+  const repoMode = !!settings && !settings.is_hosted && !!activeRepo
+  const staged = sessionFiles.filter(f => f.disk_state === 'pending' || f.disk_state === 'conflict' || f.disk_state === 'missing')
   // Import Folder reads from a path on the *server's* disk (see
   // routers/files.py:_get_workspace_root). On a local install the server IS
   // the user's machine, so this is a real "open my project" action. On a
@@ -635,7 +822,34 @@ function SessionFilesPanel() {
   // this path can never reach the user's laptop — surfacing the button there
   // would be actively misleading, so it's hidden entirely (server tells us
   // via settings.is_hosted, same signal that gates workspace_path editing).
-  const canImportFolder = !settings?.is_hosted
+  const canImportFolder = !settings?.is_hosted && !repoMode
+
+  const refreshFiles = async () => {
+    if (!activeSessions) return
+    const files = await api.sessionFiles.list(activeSessions)
+    setSessionFiles(files)
+  }
+
+  const applyDisk = async (force: boolean) => {
+    if (!activeSessions) return
+    setApplying(true)
+    try {
+      const result = await api.sessionFiles.apply(activeSessions, undefined, force)
+      if (result.conflicts?.length && !force) {
+        setConflicts(result.conflicts)
+      } else {
+        setConflicts([])
+        const n = result.applied?.length || 0
+        if (n) toast.success(`Applied ${n} file${n === 1 ? '' : 's'} to disk`)
+        else toast.info('Nothing to apply')
+      }
+      await refreshFiles()
+    } catch (e: any) {
+      toast.error('Apply failed', e.message)
+    } finally {
+      setApplying(false)
+    }
+  }
   const counts = fileCounts(sessionFiles)
   const visibleFiles = sessionFiles.filter(f => matchesFileFilter(f, fileFilter))
 
@@ -717,6 +931,9 @@ function SessionFilesPanel() {
               sessionId={activeSessions}
               sessionFiles={sessionFiles}
             />
+          )}
+          {repoMode && activeSessions && activeRepo && (
+            <AddFromRepo sessionId={activeSessions} repoId={activeRepo.id} onAdded={() => { refreshFiles().catch(() => {}) }} />
           )}
           {canImportFolder && (
             <button
@@ -804,6 +1021,9 @@ function SessionFilesPanel() {
                         <span className="w-1.5 h-1.5 rounded-full bg-success inline-block" /> Edited
                       </span>
                     )}
+                    {file.disk_state === 'pending' && <span className="text-[9px] font-medium px-1.5 py-0.5 rounded-md bg-accent/10 text-accent shrink-0">Staged</span>}
+                    {file.disk_state === 'applied' && <span className="text-[9px] font-medium px-1.5 py-0.5 rounded-md bg-overlay text-faint shrink-0">On disk</span>}
+                    {(file.disk_state === 'conflict' || file.disk_state === 'missing') && <span className="text-[9px] font-medium px-1.5 py-0.5 rounded-md bg-danger/10 text-danger shrink-0">Conflict</span>}
                     <DiffStatsBadge fileId={file.id} />
                   </div>
                   {file.lines > 0 && (
@@ -825,6 +1045,29 @@ function SessionFilesPanel() {
           </div>
         )}
       </div>
+      {repoMode && staged.length > 0 && (
+        <div className="border-t border-border px-3 py-2 flex items-center gap-2">
+          <span className="text-[11px] text-muted flex-1">{staged.length} change{staged.length === 1 ? '' : 's'} staged</span>
+          <button type="button" disabled={applying} className="btn-primary px-2 py-1 text-[11px] disabled:opacity-50" onClick={() => applyDisk(false)}>
+            {applying ? 'Applying…' : 'Apply to disk'}
+          </button>
+        </div>
+      )}
+      {conflicts.length > 0 && (
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-4" onClick={() => setConflicts([])}>
+          <div role="dialog" aria-modal="true" aria-labelledby="disk-drift-title" className="w-full max-w-sm rounded-xl border border-border bg-surface p-4 shadow-modal" onClick={(e) => e.stopPropagation()}>
+            <h2 id="disk-drift-title" className="text-sm font-semibold text-ink">Disk changed since this file was loaded</h2>
+            <p className="mt-1 text-[12px] text-muted">Applying will overwrite what is on disk. A backup is kept when backups are on.</p>
+            <ul className="mt-2 max-h-32 overflow-y-auto text-[12px] text-ink">
+              {conflicts.map(c => <li key={c.id} className="truncate">{c.filename}</li>)}
+            </ul>
+            <div className="mt-3 flex justify-end gap-2">
+              <button type="button" className="btn-ghost px-3 text-[12px]" onClick={() => setConflicts([])}>Keep disk</button>
+              <button type="button" className="btn-primary px-3 text-[12px]" onClick={() => applyDisk(true)}>Overwrite</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -1026,6 +1269,7 @@ export function Sidebar() {
 
   return (
     <div className="flex h-full relative" onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
+      <OpenFolderModal />
 
       {/* ── Rail (always 44px) ── */}
       <div className="flex flex-col items-center pt-3 pb-3 gap-1 w-[44px] bg-surface border-r border-border flex-shrink-0 z-10">

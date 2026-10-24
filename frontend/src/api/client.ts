@@ -476,6 +476,17 @@ export const api = {
       return controller
     },
   },
+  repositories: {
+    list: (includeRemoved = false) => request<import('../types').Repository[]>(`/repositories${includeRemoved ? '?include_removed=true' : ''}`),
+    preview: (path: string) => request<import('../types').RepoPreview>(`/repositories/preview?path=${encodeURIComponent(path)}`),
+    browseFs: (path: string) => request<{ path: string; parent: string; entries: { name: string; path: string }[] }>(`/repositories/fs?path=${encodeURIComponent(path)}`),
+    browseNative: () => request<{ path: string }>('/repositories/browse', { method: 'POST' }),
+    open: (path: string, name?: string) => request<import('../types').Repository>('/repositories/open', { method: 'POST', body: JSON.stringify({ path, name }) }),
+    update: (id: string, body: Record<string, unknown>) => request<import('../types').Repository>(`/repositories/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
+    remove: (id: string) => request(`/repositories/${id}`, { method: 'DELETE' }),
+    tree: (id: string) => request<import('../types').FileNode>(`/repositories/${id}/tree`),
+    stage: (id: string, sessionId: string, path: string) => request<{ id: string; filename: string; kept_edits: boolean }>(`/repositories/${id}/stage`, { method: 'POST', body: JSON.stringify({ session_id: sessionId, path }) }),
+  },
   files: {
     getTree: (root?: string) => request<any>(`/files/tree${root ? `?root=${encodeURIComponent(root)}` : ''}`),
     read: (path: string) => request<any>(`/files/read?path=${encodeURIComponent(path)}`),
@@ -991,6 +1002,11 @@ export const api = {
       }>(`/chat/${sessionId}/files/import-folder`, {
         method: 'POST',
         body: JSON.stringify(path ? { path } : {}),
+      }),
+    apply: (sessionId: string, fileIds?: string[], force = false) =>
+      request<import('../types').RepoApplyResult>(`/chat/${sessionId}/files/apply`, {
+        method: 'POST',
+        body: JSON.stringify({ file_ids: fileIds ?? null, force }),
       }),
     list: (sessionId: string) =>
       request<any[]>(`/chat/${sessionId}/files`),

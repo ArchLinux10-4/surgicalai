@@ -75,6 +75,7 @@ class NewSessionRequest(BaseModel):
     title: str = "New Chat"
     file_path: Optional[str] = None
     model: Optional[str] = None
+    repository_id: Optional[str] = None
 
 
 # ─── Files ────────────────────────────────────────────────────────────────────

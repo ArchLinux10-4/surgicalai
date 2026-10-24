@@ -16,6 +16,7 @@ import { useAuthStore } from '../../stores/authStore'
 import { useAppStore } from '../../stores/appStore'
 import { useThemeStore } from '../../stores/themeStore'
 import { LoginPage } from '../../pages/LoginPage'
+import { OpenFolderModal } from '../Repositories'
 
 type Tab = 'chat' | 'sessions' | 'files'
 
@@ -310,6 +311,7 @@ export function MobileLayout() {
         onClose={() => setGithubOpen(false)}
         onOpenSettings={() => { setMenuOpen(true) }}
       />
+      <OpenFolderModal />
     </div>
   )
 }

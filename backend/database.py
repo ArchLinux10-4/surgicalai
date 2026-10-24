@@ -505,6 +505,8 @@ def _init_sqlite():
     for _gh_col in ("github_owner", "github_repo", "github_branch"):
         if _gh_col not in existing_cols:
             cur.execute(f"ALTER TABLE chat_sessions ADD COLUMN {_gh_col} TEXT")
+    if "repository_id" not in existing_cols:
+        cur.execute("ALTER TABLE chat_sessions ADD COLUMN repository_id TEXT")
 
     # Migration: add is_compacted to chat_messages if missing
     cm_cols = [row[1] for row in cur.execute("PRAGMA table_info(chat_messages)").fetchall()]
@@ -528,6 +530,10 @@ def _init_sqlite():
         cur.execute("ALTER TABLE session_files ADD COLUMN github_meta TEXT")
     if "github_pushed_at" not in sf_cols:
         cur.execute("ALTER TABLE session_files ADD COLUMN github_pushed_at TIMESTAMP")
+    if "repo_path" not in sf_cols:
+        cur.execute("ALTER TABLE session_files ADD COLUMN repo_path TEXT")
+    if "base_sha" not in sf_cols:
+        cur.execute("ALTER TABLE session_files ADD COLUMN base_sha TEXT")
 
     # Migration: add QA log + compliance log tables
     cur.execute("""
@@ -680,6 +686,26 @@ def _init_sqlite():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(user_id, installation_id)
         )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS repositories (
+            id TEXT PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            root_path TEXT NOT NULL,
+            git_remote_url TEXT,
+            github_owner TEXT,
+            github_repo TEXT,
+            default_branch TEXT,
+            auto_apply INTEGER NOT NULL DEFAULT 0,
+            last_opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            removed_at TIMESTAMP
+        )
+    """)
+    cur.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_repositories_user_root
+        ON repositories(user_id, root_path)
     """)
 
     _seed_defaults_sqlite(cur)
@@ -917,6 +943,9 @@ def _init_postgres():
             ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS github_branch TEXT
         """)
         conn.execute("""
+            ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS repository_id TEXT
+        """)
+        conn.execute("""
             ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS is_compacted INTEGER DEFAULT 0
         """)
         conn.execute("""
@@ -930,6 +959,12 @@ def _init_postgres():
         """)
         conn.execute("""
             ALTER TABLE session_files ADD COLUMN IF NOT EXISTS edited INTEGER DEFAULT 0
+        """)
+        conn.execute("""
+            ALTER TABLE session_files ADD COLUMN IF NOT EXISTS repo_path TEXT
+        """)
+        conn.execute("""
+            ALTER TABLE session_files ADD COLUMN IF NOT EXISTS base_sha TEXT
         """)
         # qa_log — proof QA ran on every Surgeon run (was missing on Postgres,
         # so the audit trail was silently empty in production)
@@ -1083,6 +1118,26 @@ def _init_postgres():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, installation_id)
             )
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS repositories (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                root_path TEXT NOT NULL,
+                git_remote_url TEXT,
+                github_owner TEXT,
+                github_repo TEXT,
+                default_branch TEXT,
+                auto_apply INTEGER NOT NULL DEFAULT 0,
+                last_opened_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                removed_at TIMESTAMP
+            )
+        """)
+        conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_repositories_user_root
+            ON repositories(user_id, root_path)
         """)
         conn.commit()
 

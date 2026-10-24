@@ -10,6 +10,7 @@ import { NewFileCard } from './NewFileCard'
 import { MarkdownCode } from './CodeBlock'
 import { SessionFilesTray } from './SessionFilesTray'
 import { GitHubBranchChip } from './GitHubBranchChip'
+import { RepoChip } from './Repositories'
 import { PickedElementsTray } from './PickedElementsTray'
 import { CollapseHint, ComposerPastedTray, UserMessageBody } from './PastedBlocks'
 import { QueuedMessagesTray } from './QueuedMessagesTray'
@@ -2575,7 +2576,8 @@ export function ChatPanel() {
   const newChat = async () => {
     // Concurrent sessions: don't abort background streams
     try {
-      const s = await api.chat.createSession({ title: 'New Chat' })
+      const inherited = sessions.find(s => s.id === activeSessions)?.repository_id
+      const s = await api.chat.createSession({ title: 'New Chat', repository_id: inherited || undefined })
       const updated = await api.chat.getSessions()
       setSessions(updated)
       setActiveSession(s.id)
@@ -2588,7 +2590,8 @@ export function ChatPanel() {
 
   const ensureSession = async () => {
     if (activeSessions) return activeSessions
-    const s = await api.chat.createSession({ title: input.slice(0, 40) || 'New Chat' })
+    const inherited = sessions.find(s => s.id === activeSessions)?.repository_id
+    const s = await api.chat.createSession({ title: input.slice(0, 40) || 'New Chat', repository_id: inherited || undefined })
     const updated = await api.chat.getSessions()
     setSessions(updated)
     setActiveSession(s.id)
@@ -3460,6 +3463,7 @@ export function ChatPanel() {
                   <span className="hidden sm:inline">Research</span>
                 </button>
               )}
+              <RepoChip sessionId={activeSessions} variant="desktop" />
               <GitHubBranchChip
                 sessionId={activeSessions}
                 disabled={isStreaming || isCompacting}

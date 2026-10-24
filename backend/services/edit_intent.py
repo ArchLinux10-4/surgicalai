@@ -139,7 +139,8 @@ def message_wants_edit(text, has_saved_plan=False, is_agent_task=False) -> bool:
 def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
                                 history_enabled=False, aws_guidance="",
                                 preview_enabled=False, preflight_enabled=False,
-                                websearch_enabled=False, mcp_guidance=""):
+                                websearch_enabled=False, mcp_guidance="",
+                                repo_guidance=""):
     """Suffix appended to the latest user turn for Claude and GPT.
 
     ``wants_edit`` True is the existing edit contract, unchanged.
@@ -176,6 +177,7 @@ def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
             if websearch_enabled else ""
         )
         + (mcp_guidance if mcp_guidance else "")
+        + (repo_guidance if repo_guidance else "")
     )
     if wants_edit:
         return (

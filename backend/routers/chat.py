@@ -255,6 +255,13 @@ def _load_effective_memory(conn, session_id):
         ).fetchone()
         if s and (s["content"] or "").strip():
             parts.append(s["content"].strip())
+    try:
+        from services.environment_context import environment_block
+        env = environment_block(conn, session_id)
+    except Exception:
+        env = ""
+    if env:
+        parts.append(env)
     return "\n\n".join(parts) if parts else None
 
 
@@ -262,13 +269,27 @@ def _load_effective_memory(conn, session_id):
 def create_session(req: NewSessionRequest, request: Request):
     session_id = str(uuid.uuid4())
     user_id = getattr(request.state, "user_id", None)
+    repo_id = (req.repository_id or "").strip() or None
+    repo = None
+    if repo_id:
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        from services.repositories import get_owned
+        repo = get_owned(user_id, repo_id)
+        if not repo:
+            raise HTTPException(status_code=404, detail="Repository not found")
     with get_db_ctx() as conn:
         conn.execute(
-            "INSERT INTO chat_sessions (id, title, file_path, model, user_id) VALUES (?, ?, ?, ?, ?)",
-            (session_id, req.title, req.file_path, req.model or get_setting("architect_model", "gpt-4.1"), user_id)
+            "INSERT INTO chat_sessions (id, title, file_path, model, user_id, repository_id) VALUES (?, ?, ?, ?, ?, ?)",
+            (session_id, req.title, req.file_path, req.model or get_setting("architect_model", "gpt-4.1"), user_id, repo_id)
         )
         conn.commit()
-    return {"id": session_id, "title": req.title}
+    if repo and repo.get("github_owner") and repo.get("github_repo") and repo.get("default_branch"):
+        from services.github_natural_tag import set_session_target_if_empty
+        set_session_target_if_empty(
+            session_id, repo["github_owner"], repo["github_repo"], repo["default_branch"],
+        )
+    return {"id": session_id, "title": req.title, "repository_id": repo_id}
 
 @router.get("/search")
 def search_chats(request: Request, q: str):

@@ -687,12 +687,21 @@ def list_session_files(session_id: str, request: Request):
     """List files attached to a session (metadata only, no content)."""
     require_session_access_from_request(session_id, request)
     with get_db_ctx() as conn:
-        rows = conn.execute(
-            """SELECT id, session_id, filename, language, lines, symbol_count, file_type, origin, github_meta, created_at, updated_at, github_pushed_at, edited
+        rows = [dict(r) for r in conn.execute(
+            """SELECT id, session_id, filename, language, lines, symbol_count, file_type, origin, github_meta, created_at, updated_at, github_pushed_at, edited, content, repo_path, base_sha
                FROM session_files WHERE session_id = ? ORDER BY created_at ASC""",
             (session_id,)
-        ).fetchall()
-    return [dict(r) for r in rows]
+        ).fetchall()]
+    try:
+        from services.repo_apply import annotate_disk_state
+        annotated = annotate_disk_state(session_id, rows)
+    except Exception:
+        annotated = rows
+        for item in annotated:
+            item["disk_state"] = None
+    for item in annotated:
+        item.pop("content", None)
+    return annotated
 
 
 @router.get("/{session_id}/files/")
@@ -798,6 +807,11 @@ def update_session_file(session_id: str, file_id: str, body: dict, request: Requ
             _dlog("session_file_update_conflict", session_id=session_id[:8] if session_id else None, file_id=file_id)
             raise HTTPException(status_code=409, detail="File was modified concurrently — please retry with fresh content")
         conn.commit()
+    try:
+        from services.repo_apply import maybe_auto_apply
+        maybe_auto_apply(session_id, file_id)
+    except Exception:
+        pass
     return {"id": file_id, "lines": lines, "symbol_count": symbol_count, "ok": True}
 
 
@@ -1058,9 +1072,15 @@ def restore_session_file_version(session_id: str, file_id: str, version_id: str,
             row_updated_at, restore_label="Before restore"
         )
         conn.commit()
+    disk = "skipped"
+    try:
+        from services.repo_apply import sync_undo_to_disk
+        disk = sync_undo_to_disk(session_id, file_id, current_content)
+    except Exception:
+        disk = "skipped"
     _dlog("session_file_version_restored", session_id=session_id[:8] if session_id else None,
           file_id=file_id, version_id=version_id, lines=lines)
-    return {"id": file_id, "content": target_content, "lines": lines, "symbol_count": symbol_count, "ok": True}
+    return {"id": file_id, "content": target_content, "lines": lines, "symbol_count": symbol_count, "ok": True, "disk": disk}
 
 
 @router.post("/{session_id}/files/{file_id}/undo")
@@ -1106,8 +1126,14 @@ def undo_session_file(session_id: str, file_id: str, request: Request):
             row_updated_at, restore_label="Before undo"
         )
         conn.commit()
+    disk = "skipped"
+    try:
+        from services.repo_apply import sync_undo_to_disk
+        disk = sync_undo_to_disk(session_id, file_id, current_content)
+    except Exception:
+        disk = "skipped"
     _dlog("session_file_undo_ok", session_id=session_id[:8] if session_id else None, file_id=file_id, lines=lines)
-    return {"id": file_id, "content": target_content, "lines": lines, "symbol_count": symbol_count, "ok": True}
+    return {"id": file_id, "content": target_content, "lines": lines, "symbol_count": symbol_count, "ok": True, "disk": disk}
 
 
 @router.delete("/{session_id}/files/{file_id}")
@@ -1121,6 +1147,19 @@ def delete_session_file(session_id: str, file_id: str, request: Request):
         )
         conn.commit()
     return {"ok": True}
+
+
+@router.post("/{session_id}/files/apply")
+def apply_repo_files(session_id: str, request: Request, body: dict = None):
+    """Write staged session files to the open folder. Drift returns a conflict."""
+    require_session_access_from_request(session_id, request)
+    body = body or {}
+    file_ids = body.get("file_ids")
+    if file_ids is not None and not isinstance(file_ids, list):
+        raise HTTPException(status_code=400, detail="file_ids must be a list")
+    from services.repo_apply import apply_files
+    user_id = getattr(request.state, "user_id", "") or ""
+    return apply_files(session_id, user_id, file_ids, force=bool(body.get("force")))
 
 
 @router.post("/{session_id}/files/import-folder")
@@ -1147,14 +1186,22 @@ def import_folder(session_id: str, request: Request, body: dict = None):
     """
     require_session_access_from_request(session_id, request)
     from routers.files import IGNORED_DIRS, IGNORED_EXTS, _get_workspace_root, _safe_path
+    from services.repositories import repository_for_session, resolve_inside
+    from services.repo_apply import content_sha
 
     MAX_IMPORT_FILES = 500
 
     body = body or {}
     requested_path = (body.get("path") or "").strip()
-    workspace = _get_workspace_root()
-
-    target = _safe_path(requested_path) if requested_path else Path(workspace)
+    session_repo = repository_for_session(session_id)
+    repo_root = ""
+    if session_repo and session_repo.get("root_path") and not session_repo.get("missing"):
+        repo_root = os.path.realpath(session_repo["root_path"])
+        workspace = repo_root
+        target = resolve_inside(repo_root, requested_path) if requested_path else Path(repo_root)
+    else:
+        workspace = _get_workspace_root()
+        target = _safe_path(requested_path) if requested_path else Path(workspace)
     if not target.exists() or not target.is_dir():
         raise HTTPException(status_code=404, detail=f"Folder not found: {target}")
 
@@ -1234,19 +1281,29 @@ def import_folder(session_id: str, request: Request, body: dict = None):
             language = _get_language(rel_name)
             session_total += len(raw_bytes)
 
+            tracked_path = rel_name if repo_root else None
+            tracked_sha = content_sha(content) if repo_root else None
             if rel_name in existing_rows:
                 file_id = existing_rows[rel_name][0]
-                conn.execute(
-                    "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, "
-                    "file_type = 'code', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                    (content, language, lines, symbol_count, file_id)
-                )
+                if repo_root:
+                    conn.execute(
+                        "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, "
+                        "file_type = 'code', repo_path = ?, base_sha = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (content, language, lines, symbol_count, tracked_path, tracked_sha, file_id)
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE session_files SET content = ?, language = ?, lines = ?, symbol_count = ?, "
+                        "file_type = 'code', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (content, language, lines, symbol_count, file_id)
+                    )
             else:
                 file_id = str(uuid.uuid4())
                 conn.execute(
                     "INSERT INTO session_files (id, session_id, filename, content, language, lines, "
-                    "symbol_count, file_type, origin, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'code', 'uploaded', CURRENT_TIMESTAMP)",
-                    (file_id, session_id, rel_name, content, language, lines, symbol_count)
+                    "symbol_count, file_type, origin, repo_path, base_sha, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, 'code', 'uploaded', ?, ?, CURRENT_TIMESTAMP)",
+                    (file_id, session_id, rel_name, content, language, lines, symbol_count, tracked_path, tracked_sha)
                 )
             imported.append(rel_name)
 
