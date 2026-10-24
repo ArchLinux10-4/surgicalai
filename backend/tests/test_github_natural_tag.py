@@ -125,10 +125,14 @@ def test_push_and_deploy_intent():
     assert not message_mentions_deploy("what is in my last PR?")
 
 
-def test_prompt_without_a_known_repo_says_to_list_repos_first():
+def test_prompt_without_a_known_repo_uses_the_name_the_user_gave():
+    from services.github_natural_tag import LOOKUP_BEFORE_ANSWER
     text = build_github_prompt_section([{"account_login": "acme"}])
     assert "list_repos" in text
     assert "<repo name>" in text
+    assert "Do not invent a repo name" not in text
+    assert LOOKUP_BEFORE_ANSWER in text
+    assert "use that name with list_files or search_code" in text
 
 
 def test_parse_tolerates_a_json_fence():

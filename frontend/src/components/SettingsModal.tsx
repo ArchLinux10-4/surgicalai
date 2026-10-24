@@ -9,6 +9,7 @@ import { useThemeStore } from '../stores/themeStore'
 import { clientLog } from '../lib/clientLog'
 import { AwsConnectModal, shortAwsCli } from './AwsConnectModal'
 import { McpPanel } from './McpPanel'
+import { RepositoryManager } from './Repositories'
 import { AttachMoney, BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
 type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'aws' | 'railway' | 'mcp' | 'security' | 'debug'
@@ -21,7 +22,7 @@ const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
   { id: 'aws',       icon: <span style={{ fontSize: 11, fontWeight: 'bold' }}>aws</span>, label: 'AWS' },
   { id: 'railway',   icon: <span style={{ fontSize: 13, fontWeight: 'bold', color: '#dc2626' }}>⬡</span>,  label: 'Railway' },
   { id: 'mcp',       icon: <span style={{ fontSize: 11, fontWeight: 'bold' }}>mcp</span>, label: 'MCP' },
-  { id: 'workspace', icon: <FolderOpen sx={{ fontSize: 14 }} />, label: 'Workspace' },
+  { id: 'workspace', icon: <FolderOpen sx={{ fontSize: 14 }} />, label: 'Repositories' },
   { id: 'editor',    icon: <Code sx={{ fontSize: 14 }} />,       label: 'Editor' },
   { id: 'users',     icon: <Group sx={{ fontSize: 14 }} />,      label: 'Users' },
   { id: 'security',  icon: <Lock sx={{ fontSize: 14 }} />,       label: 'Security' },
@@ -716,8 +717,9 @@ export function SettingsModal() {
                   </>
                 ) : (
                   <>
-                    <SectionHeader title="Workspace" subtitle="Default project folder for the file browser" />
-                    <Field label="Default workspace path">
+                    <SectionHeader title="Repositories" subtitle="Folders on this computer, and the chats inside them" />
+                    <RepositoryManager />
+                    <Field label="File browser fallback">
                       <div className="flex gap-2">
                         <input
                           value={form.workspace_path}

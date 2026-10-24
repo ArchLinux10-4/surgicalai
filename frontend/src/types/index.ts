@@ -27,6 +27,50 @@ export interface ChatSession {
   message_count: number
   /** Attached session_files count from list_sessions (sidebar bulk-delete). */
   file_count?: number
+  /** Local folder this chat belongs to. Empty on hosted and on older chats. */
+  repository_id?: string | null
+}
+
+export interface GitHubSuggestion {
+  owner: string
+  repo: string
+}
+
+/** A folder opened on this machine. Only present on a local install. */
+export interface Repository {
+  id: string
+  name: string
+  root_path: string
+  git_remote_url: string
+  github_owner: string
+  github_repo: string
+  github_linked: boolean
+  default_branch: string
+  auto_apply: boolean
+  last_opened_at?: string | null
+  created_at?: string | null
+  removed: boolean
+  missing: boolean
+  is_git: boolean
+  dirty: boolean
+  suggested_github: GitHubSuggestion | null
+}
+
+export interface RepoPreview {
+  path: string
+  name: string
+  is_git: boolean
+  branch: string
+  remote: string
+  dirty: boolean
+  suggested_github: GitHubSuggestion | null
+  github_match: boolean
+}
+
+export interface RepoApplyResult {
+  applied: { id: string; filename: string; repo_path: string }[]
+  conflicts: { id: string; filename: string; repo_path: string; reason: string }[]
+  skipped: { id: string; filename: string; reason: string }[]
 }
 
 /** Repo and branch this chat is working on. Not read from the session list. */
@@ -245,6 +289,10 @@ export interface SessionFile {
   edited?: number  // 1 if AI/user has modified content since import/upload (0/1 from SQLite), 0 = pristine
   github_meta?: string  // JSON string with owner/repo/branch/path/sha
   github_pushed_at?: string  // timestamp of last push to GitHub
+  repo_path?: string | null
+  base_sha?: string | null
+  /** pending = staged edit, applied = matches disk, conflict/missing = disk changed */
+  disk_state?: 'pending' | 'applied' | 'conflict' | 'missing' | null
 }
 
 export interface NewFile {

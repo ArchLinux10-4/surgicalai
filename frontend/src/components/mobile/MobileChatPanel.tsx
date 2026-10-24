@@ -33,6 +33,7 @@ import {
 } from './chatMode'
 import { SessionFilesTray } from '../SessionFilesTray'
 import { GitHubBranchChip } from '../GitHubBranchChip'
+import { RepoChip } from '../Repositories'
 import { AgentMissionControl } from '../AgentMissionControl'
 import { PlanTracker } from '../PlanTracker'
 import { PlanPane } from '../PlanPane'
@@ -1990,6 +1991,7 @@ export function MobileChatPanel() {
                 </button>
               )}
 
+              <RepoChip sessionId={activeSessions} variant="mobile" />
               <GitHubBranchChip
                 sessionId={activeSessions}
                 disabled={isStreaming || isCompacting}

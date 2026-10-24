@@ -6,7 +6,7 @@ Path traversal (../) and symlink escapes are blocked.
 import os
 import mimetypes
 from pathlib import Path
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from models.schemas import FileNode, FileContent, SaveFileRequest
 from database import get_setting, _dlog
 from services.ast_parser import ASTParser
@@ -22,10 +22,21 @@ MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
 
 # ─── Path Security ────────────────────────────────────────────────────────────
 
-def _get_workspace_root() -> str:
-    """Return the resolved (absolute) workspace root directory."""
+def _get_workspace_root(repo_id: str = None, user_id: str = None) -> str:
+    """Return the resolved workspace root.
+
+    Without repo_id this is the configured workspace_path, unchanged.
+    With repo_id it is that user's open folder.
+    """
+    if repo_id:
+        from services.repositories import require_root
+        return require_root(user_id or "", repo_id)
     raw = get_setting("workspace_path", str(Path.home()))
     return os.path.realpath(raw)
+
+
+def _request_user(request: Request) -> str:
+    return getattr(request.state, "user_id", "") or ""
 
 
 def _safe_path(requested: str) -> Path:
@@ -118,8 +129,8 @@ def _build_tree(path: Path, workspace: str, max_depth: int = 6, depth: int = 0) 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.get("/tree")
-def get_file_tree(root: str = None):
-    workspace = _get_workspace_root()
+def get_file_tree(request: Request, root: str = None, repo_id: str = None):
+    workspace = _get_workspace_root(repo_id, _request_user(request))
 
     if root:
         # Validate that any client-supplied root is within the workspace
@@ -137,8 +148,12 @@ def get_file_tree(root: str = None):
 
 
 @router.get("/read")
-def read_file(path: str):
-    p = _safe_path(path)
+def read_file(path: str, request: Request, repo_id: str = None):
+    if repo_id:
+        from services.repositories import resolve_inside
+        p = resolve_inside(_get_workspace_root(repo_id, _request_user(request)), path)
+    else:
+        p = _safe_path(path)
     if not p.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if not p.is_file():

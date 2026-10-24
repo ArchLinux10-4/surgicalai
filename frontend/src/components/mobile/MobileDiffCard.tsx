@@ -233,7 +233,7 @@ function FileCard({
     if (undoing) return
     setUndoing(true)
     try {
-      await api.sessionFiles.undo(sessionId, effectiveFileId)
+      const undone = await api.sessionFiles.undo(sessionId, effectiveFileId)
       // Unmark all changes for this file
       for (const ch of changes) {
         if (ch?.id) {
@@ -242,7 +242,13 @@ function FileCard({
         }
       }
       setAppliedMap({})
-      toast.success(`Undone changes to ${filename}`)
+      toast.success(
+        undone?.disk === 'written'
+          ? `Undid ${filename} in the chat and on disk`
+          : undone?.disk === 'conflict'
+            ? `Undid ${filename} in the chat. The file on disk was left alone.`
+            : `Undid changes to ${filename}`
+      )
       onApplied()
     } catch (e: any) {
       toast.error(e?.message || 'Undo failed')

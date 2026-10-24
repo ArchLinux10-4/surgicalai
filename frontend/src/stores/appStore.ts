@@ -172,6 +172,10 @@ interface AppState {
   setRightTab: (t: 'editor' | 'diff' | 'git') => void
   workspacePath: string
   setWorkspacePath: (p: string) => void
+  repositories: import('../types').Repository[]
+  setRepositories: (repos: import('../types').Repository[]) => void
+  openFolderOpen: boolean
+  setOpenFolderOpen: (open: boolean) => void
 
 
 
@@ -411,6 +415,10 @@ export const useAppStore = create<AppState>((set) => ({
   setRightTab: (rightTab) => set({ rightTab }),
   workspacePath: '',
   setWorkspacePath: (workspacePath) => set({ workspacePath }),
+  repositories: [],
+  setRepositories: (repositories) => set({ repositories }),
+  openFolderOpen: false,
+  setOpenFolderOpen: (openFolderOpen) => set({ openFolderOpen }),
 
 
 

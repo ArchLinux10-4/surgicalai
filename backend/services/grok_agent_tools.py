@@ -80,6 +80,7 @@ TOOL_REQUEST_HISTORY = "request_history"
 TOOL_REQUEST_PREVIEW = "request_preview"
 TOOL_REQUEST_WEB_SEARCH = "request_web_search"
 TOOL_REQUEST_MCP = "request_mcp"
+TOOL_REQUEST_REPO = "request_repo"
 TOOL_REPORT_BLOCKED = "report_blocked"
 
 WRITE_TOOLS = frozenset({
@@ -88,7 +89,7 @@ WRITE_TOOLS = frozenset({
 CONTEXT_TOOLS = frozenset({
     TOOL_REQUEST_FILE, TOOL_REQUEST_SEARCH, TOOL_REQUEST_GITHUB,
     TOOL_REQUEST_HISTORY, TOOL_REQUEST_PREVIEW, TOOL_REQUEST_WEB_SEARCH,
-    TOOL_REQUEST_MCP,
+    TOOL_REQUEST_MCP, TOOL_REQUEST_REPO,
 })
 
 _EDIT_MODES = frozenset({"edit", "agent"})
@@ -480,9 +481,41 @@ def _schema_request_web_search():
     }
 
 
+def _schema_request_repo():
+    return {
+        "type": "function",
+        "function": {
+            "name": TOOL_REQUEST_REPO,
+            "description": (
+                "Read the open local repository. tool is list_repo_files, "
+                "read_repo_file, search_repo, or git_status. read_repo_file "
+                "needs path. search_repo needs terms. Edits stay staged until "
+                "the user applies them. This does not run shell commands."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tool": {
+                        "type": "string",
+                        "enum": ["list_repo_files", "read_repo_file", "search_repo", "git_status"],
+                    },
+                    "path": {"type": "string", "description": "Repo-relative path."},
+                    "terms": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Search strings for search_repo.",
+                    },
+                },
+                "required": ["tool"],
+            },
+        },
+    }
+
+
 def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=False,
                            aws_enabled=False, preview_enabled=False,
-                           websearch_enabled=False, mcp_enabled=False, dlog=None,
+                           websearch_enabled=False, mcp_enabled=False,
+                           repo_enabled=False, dlog=None,
                            session_id="", user_id=""):
     """Return the OpenAI-style tool schemas Grok should be offered for ``mode``.
 
@@ -520,6 +553,8 @@ def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=Fa
         tools.append(_schema_request_web_search())
     if mcp_enabled:
         tools.append(_schema_request_mcp(user_id))
+    if repo_enabled:
+        tools.append(_schema_request_repo())
 
     # report_blocked is meaningful in every mode as a clean terminal signal.
     tools.append(_schema_report_blocked())
@@ -546,6 +581,7 @@ TOOL_PROGRESS_LABELS = {
     TOOL_REQUEST_PREVIEW: "Checking the preview…",
     TOOL_REQUEST_WEB_SEARCH: "Searching the web…",
     TOOL_REQUEST_MCP: "Calling MCP…",
+    TOOL_REQUEST_REPO: "Reading the repository…",
     TOOL_REPORT_BLOCKED: "Reporting blocked…",
 }
 
@@ -987,6 +1023,13 @@ def _context_body(name, args):
             "arguments": args_obj,
         }
         return "mcp", _json.dumps(payload)
+    if name == TOOL_REQUEST_REPO:
+        payload = {
+            "tool": args.get("tool", ""),
+            "path": args.get("path", "") or "",
+            "terms": args.get("terms") or [],
+        }
+        return "repo", _json.dumps(payload)
     # unreachable given the CONTEXT_TOOLS gate
     return name, _json.dumps(args)
 
@@ -1124,7 +1167,7 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
                              dlog=None, session_id="", user_id="",
                              wants_edit=True, preview_enabled=False,
                              preflight_enabled=False, websearch_enabled=False,
-                             mcp_enabled=False):
+                             mcp_enabled=False, repo_enabled=False):
     """A short contract appended to Grok's system text telling it to USE the
     native function tools instead of the XML-tag protocol described earlier in
     the shared prompt (which targets Claude/GPT).
@@ -1163,6 +1206,12 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
         lines += ["", _mega_rules(native_tools=True)]
     if github_enabled:
         lines.append("• request_github — read from the connected GitHub repo.")
+    if repo_enabled:
+        lines.append(
+            "• request_repo — read the open local folder (list_repo_files, "
+            "read_repo_file, search_repo, git_status). Edits stay staged until "
+            "the user applies them. Do not claim you ran a shell command."
+        )
     if history_enabled:
         lines.append("• request_history — read an older version of a session file.")
     if aws_enabled:
@@ -1215,6 +1264,9 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
             "Use request_file / request_search to gather what you need, then "
             "answer in plain text. Do not call any write/edit tools in this mode.",
         ]
+    if github_enabled or repo_enabled:
+        from services.github_natural_tag import LOOKUP_BEFORE_ANSWER
+        lines.append(LOOKUP_BEFORE_ANSWER)
     suffix = "\n".join(lines)
     _log(dlog, "grok_system_suffix_built", session_id=session_id, user_id=user_id,
          mode=m, length=len(suffix), github_enabled=bool(github_enabled),
@@ -1227,7 +1279,7 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
                                  session_id="", user_id="",
                                  wants_edit=True, preview_enabled=False,
                                  preflight_enabled=False, websearch_enabled=False,
-                                 mcp_enabled=False):
+                                 mcp_enabled=False, repo_enabled=False):
     """Native-tool replacement for the pipeline's XML turn suffix.
 
     ``wants_edit`` False is a plain question on an Edit/Agent turn: same
@@ -1243,6 +1295,7 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
             "Use request_file when you know the target file; use request_search"
             + (" / request_github" if github_enabled else "")
             + (" / request_history" if history_enabled else "")
+            + (" / request_repo" if repo_enabled else "")
             + " only if the answer depends on code you have not seen.",
             "Answer in plain text. Call write_surgical_edit, write_new_file, "
             "or write_edit_plan only if the user asked you to change code. "
@@ -1258,6 +1311,7 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
             "use request_search"
             + (" / request_github" if github_enabled else "")
             + (" / request_history" if history_enabled else "")
+            + (" / request_repo" if repo_enabled else "")
             + " only to find unknowns.",
         ]
         if m in _EDIT_MODES:

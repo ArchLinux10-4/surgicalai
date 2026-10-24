@@ -1313,6 +1313,14 @@ def _is_gemini_model(model: str) -> bool:
     return bool(model and (model.startswith("gemini-") or model.startswith("models/gemini")))
 
 
+def _is_gpt_model(model: str) -> bool:
+    """OpenAI chat models. Ask/Plan gives these native lookup tools, like Grok."""
+    if not model:
+        return False
+    base = model.split(":")[0].lower()
+    return base.startswith("gpt-") or base.startswith(("o1", "o3", "o4"))
+
+
 # Grok/xAI model matcher. Deliberately NOT redefined here: it lives in
 # services/grok_provider.py alongside every xAI-specific request-shaping
 # mitigation (strict message-content rule, disallowed penalty/stop params,
@@ -4354,7 +4362,8 @@ def _gh_prompt_bits(known_repos, working_branch=None) -> str:
             known += f"Default repo: {repos[0]} (you may omit owner and repo).\n"
     else:
         owner, repo = "OWNER", "<repo name>"
-        known = "Call list_repos first if you do not know owner/repo.\n"
+        from services.github_natural_tag import LOOKUP_BEFORE_ANSWER
+        known = LOOKUP_BEFORE_ANSWER + "\n"
     example = (
         '{"tool": "list_prs", "args": {"owner": "%s", "repo": "%s", "state": "all", "limit": 5}}'
         % (owner, repo)
@@ -4385,6 +4394,7 @@ def _ask_plan_build_tool_instructions(
     aws_enabled: bool = False, websearch_enabled: bool = False,
     mcp_guidance: str = "",
     working_branch=None,
+    repo_enabled: bool = False,
 ) -> str:
     """
     Composes the Ask/Plan tool-instructions system-prompt block from
@@ -4463,6 +4473,18 @@ def _ask_plan_build_tool_instructions(
     if mcp_guidance:
         tag_blocks.append(mcp_guidance)
 
+    if repo_enabled:
+        tag_blocks.append(
+            "You can read the open local repository.\n"
+            '<repo_request>{"tool":"list_repo_files"}</repo_request>\n'
+            '<repo_request>{"tool":"read_repo_file","path":"src/app.py"}</repo_request>\n'
+            '<repo_request>{"tool":"search_repo","terms":["symbol"]}</repo_request>\n'
+            '<repo_request>{"tool":"git_status"}</repo_request>\n'
+            "read_repo_file loads the file into this chat. Edits stay staged "
+            "until the user applies them to disk. You cannot run shell commands "
+            "and you cannot write to disk."
+        )
+
     parts.append("\n\n".join(tag_blocks))
     parts.append(
         "Emit ONLY ONE tag at a time, then STOP your response immediately — "
@@ -4471,6 +4493,9 @@ def _ask_plan_build_tool_instructions(
         f"{max_rounds} rounds) before giving your final answer in plain "
         "prose (no tags in your final answer)."
     )
+    if gh_enabled or repo_enabled:
+        from services.github_natural_tag import LOOKUP_BEFORE_ANSWER
+        parts.append(LOOKUP_BEFORE_ANSWER)
     return "\n" + "\n\n".join(parts) + "\n"
 
 
@@ -4485,11 +4510,12 @@ def _ask_plan_strip_tool_tags(text: str) -> str:
     text = re.sub(r'<aws_cli>.*?</aws_cli>', '', text, flags=re.DOTALL)
     text = re.sub(r'<web_search_request>.*?</web_search_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<mcp_request>.*?</mcp_request>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<repo_request>.*?</repo_request>', '', text, flags=re.DOTALL)
     return text.strip()
 
 
 def _ask_plan_execute_tool_round(
-    *, sr_match, fr_match, gr_match, hr_match=None, aws_match=None,
+    *, sr_match, fr_match, gr_match, hr_match=None, aws_match=None, rr_match=None,
     symbol_maps_by_name, file_content_lookup, user_id, session_id, tool_round,
     known_repos=None, gh_seen=None,
 ):
@@ -4630,6 +4656,19 @@ def _ask_plan_execute_tool_round(
                 tool_parts.append(
                     f"Could not search file history for '{_hr_fn}': "
                     f"{str(_hr_err)[:150]}")
+    if rr_match:
+        from services.repo_tools import parse_repo_request, execute_repo_tool
+        parsed = parse_repo_request(rr_match.group(1))
+        if not parsed:
+            tool_parts.append(
+                'The <repo_request> body was not valid JSON. Use {"tool":"git_status"}.'
+            )
+        else:
+            tool_parts.append(execute_repo_tool(
+                session_id, user_id, parsed, content_lookup=file_content_lookup,
+            ))
+            _dlog("ask_plan_repo_executed", session_id=session_id, user_id=user_id,
+                  tool_round=tool_round, tool=(parsed.get("tool") if isinstance(parsed, dict) else ""))
     # AWS is not run here. Ask/Plan loops call resolve_aws_call, which
     # applies the read-only gate, the three-command stop, and file capture.
     return tool_parts
@@ -4791,15 +4830,25 @@ async def run_chat_stream(
         _ask_plan_mcp_guidance = ""
         _dlog("mcp_gate_error", session_id=session_id, user_id=user_id,
               error=str(_mcp_gate_err)[:200])
+    _repo_ctx = None
+    if not _ask_plan_is_ollama:
+        try:
+            from services.repo_tools import session_repo as _session_repo
+            _repo_ctx = _session_repo(session_id)
+        except Exception as _repo_gate_err:
+            _repo_ctx = None
+            _dlog("ask_plan_repo_gate_error", session_id=session_id, user_id=user_id,
+                  error=str(_repo_gate_err)[:200])
+    _repo_tools = _repo_ctx is not None
     _ask_plan_tools_enabled = (
         (_ask_plan_has_files or _gh_nat_enabled or _aws_connected
-         or _oa_search_enabled or _ask_plan_mcp)
+         or _oa_search_enabled or _ask_plan_mcp or _repo_tools)
         and not _ask_plan_is_ollama
     )
     _dlog("ask_plan_tools_gate_evaluated", session_id=session_id, user_id=user_id,
           model=chat_model, has_files=_ask_plan_has_files,
           github_enabled=_gh_nat_enabled, is_ollama=_ask_plan_is_ollama,
-          tools_enabled=_ask_plan_tools_enabled)
+          tools_enabled=_ask_plan_tools_enabled, repo_enabled=_repo_tools)
     # Same knob Edit mode's agent_loop reads (services/pipeline.py ~14904),
     # so Ask/Plan and Edit share one source of truth instead of two
     # independently-hardcoded budgets.
@@ -4881,7 +4930,8 @@ async def run_chat_stream(
             gh_known_repos=_gh_known_repos, max_rounds=_ASK_PLAN_MAX_ROUNDS,
             aws_enabled=_aws_connected, websearch_enabled=_ask_plan_websearch,
             mcp_guidance=_ask_plan_mcp_guidance,
-            working_branch=_gh_session_target))
+            working_branch=_gh_session_target,
+            repo_enabled=_repo_tools))
         _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
               model=chat_model, num_files=len(file_content_lookup),
               github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
@@ -4962,20 +5012,19 @@ async def run_chat_stream(
         def sse(obj):
             return f"data: {json.dumps(obj)}\n\n"
 
-        if _ask_plan_tools_enabled and _is_grok_model(chat_model):
-            # ── Grok native tool-calling loop (new file: grok_ask_plan_native.py) ──
-            # Same root cause PR #116 fixed for Edit/Agent mode: Grok narrates
-            # instead of emitting the <search_request>/<file_request>/
-            # <github_request> tags the GPT/Gemini branch below relies on, so
-            # it gets diverted here to the proven native tools=[...] path
-            # instead of falling into that shared tag loop. Does not touch the
-            # Claude-native branch above or the GPT/Gemini branch below.
+        if _ask_plan_tools_enabled and (_is_grok_model(chat_model) or _is_gpt_model(chat_model)):
+            # Native tools for Grok and GPT. Both narrate an XML tag instead of
+            # emitting one (session dff697c8: gpt-6-luna said "I can check" and
+            # stopped). Gemini and Claude stay on the tag loop below.
             _grok_ask_plan_effective_mode = (mode or "ask").strip().lower()
             if _grok_ask_plan_effective_mode not in ("ask", "plan"):
                 _grok_ask_plan_effective_mode = "ask"
-            _dlog("run_chat_stream_grok_ask_plan_native", session_id=session_id,
-                  model=chat_model, user_id=user_id,
-                  mode=_grok_ask_plan_effective_mode)
+            _dlog(
+                "run_chat_stream_grok_ask_plan_native" if _is_grok_model(chat_model)
+                else "run_chat_stream_gpt_ask_plan_native",
+                session_id=session_id, model=chat_model, user_id=user_id,
+                mode=_grok_ask_plan_effective_mode,
+            )
             _grok_client = _get_client_for_model(chat_model, user_id, session_id=session_id)
             async for _gchunk in _grok_run_ask_plan_native_stream(
                 client=_grok_client,
@@ -4991,6 +5040,7 @@ async def run_chat_stream(
                 aws_enabled=_aws_connected,
                 websearch_enabled=_oa_search_enabled,
                 mcp_enabled=_ask_plan_mcp,
+                repo_enabled=_repo_tools,
                 openai_client=_oa_search_client,
                 web_search_sources=_web_search_sources_final,
                 client_inbox=client_inbox,
@@ -5053,6 +5103,10 @@ async def run_chat_stream(
                     re.search(r'<github_request>\s*(.*?)\s*</github_request>', _round_text, re.DOTALL)
                     if _gh_nat_enabled else None
                 )
+                _rr_match = (
+                    re.search(r'<repo_request>\s*(.*?)\s*</repo_request>', _round_text, re.DOTALL)
+                    if _repo_tools else None
+                )
                 # All-modes rollout: gated on _ask_plan_has_files, same condition
                 # search/file use above — see _ask_plan_build_tool_instructions.
                 _hr_match = (
@@ -5078,14 +5132,14 @@ async def run_chat_stream(
 
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
                 _ask_plan_no_more_tools = (
-                    not _sr_match and not _fr_match and not _gr_match
+                    not _sr_match and not _fr_match and not _gr_match and not _rr_match
                     and not _hr_match and not _aws_match and not _wr_match
                     and not _mcp_match
                 )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match or _aws_match or _wr_match or _mcp_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _wr_match or _mcp_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5200,7 +5254,7 @@ async def run_chat_stream(
                 if _tool_parts is None:
                     _tool_parts = _ask_plan_execute_tool_round(
                         sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
-                        hr_match=_hr_match, aws_match=None,
+                        hr_match=_hr_match, aws_match=None, rr_match=_rr_match,
                         symbol_maps_by_name=symbol_maps_by_name,
                         file_content_lookup=file_content_lookup,
                         user_id=user_id, session_id=session_id, tool_round=_tool_round,
@@ -5417,6 +5471,10 @@ async def run_chat_stream(
                     re.search(r'<github_request>\s*(.*?)\s*</github_request>', _round_text, re.DOTALL)
                     if _gh_nat_enabled else None
                 )
+                _rr_match = (
+                    re.search(r'<repo_request>\s*(.*?)\s*</repo_request>', _round_text, re.DOTALL)
+                    if _repo_tools else None
+                )
                 # All-modes rollout: gated on _ask_plan_has_files, same condition
                 # search/file use above — see _ask_plan_build_tool_instructions.
                 _hr_match = (
@@ -5436,13 +5494,13 @@ async def run_chat_stream(
 
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
                 _ask_plan_no_more_tools = (
-                    not _sr_match and not _fr_match and not _gr_match
+                    not _sr_match and not _fr_match and not _gr_match and not _rr_match
                     and not _hr_match and not _aws_match and not _mcp_match
                 )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match or _aws_match or _mcp_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _mcp_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5502,7 +5560,7 @@ async def run_chat_stream(
                 if _tool_parts is None:
                     _tool_parts = _ask_plan_execute_tool_round(
                         sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
-                        hr_match=_hr_match, aws_match=None,
+                        hr_match=_hr_match, aws_match=None, rr_match=_rr_match,
                         symbol_maps_by_name=symbol_maps_by_name,
                         file_content_lookup=file_content_lookup,
                         user_id=user_id, session_id=session_id, tool_round=_tool_round,
@@ -18217,6 +18275,24 @@ async def run_natural_pipeline_stream(
                   session_id=session_id, user_id=user_id,
                   error=str(_gh_nat_err))
 
+        _repo_ctx = None
+        _repo_guidance = ""
+        try:
+            from services.repo_tools import session_repo as _session_repo, prompt_section as _repo_prompt
+            if not str(arch_model or "").startswith("ollama:"):
+                _repo_ctx = _session_repo(session_id)
+            if _repo_ctx:
+                _repo_guidance = _repo_prompt(_repo_ctx)
+                TAG_DEFS["repo"] = {"open": "<repo_request>", "close": "</repo_request>"}
+                system_prompt.append({"type": "text", "text": _repo_guidance})
+                _dlog("natural_repo_tag_registered", session_id=session_id, user_id=user_id,
+                      repo=_repo_ctx.get("name"))
+        except Exception as _repo_nat_err:
+            _repo_ctx = None
+            _repo_guidance = ""
+            _dlog("natural_repo_setup_error", session_id=session_id, user_id=user_id,
+                  error=str(_repo_nat_err)[:200])
+
         _aws_connected = False
         try:
             from services.aws_cli import aws_connected as _aws_connected_fn
@@ -18380,6 +18456,7 @@ async def run_natural_pipeline_stream(
                     preflight_enabled=(_preflight_mode == "enforce"),
                     websearch_enabled=_oa_search_enabled,
                     mcp_enabled=_natural_mcp,
+                    repo_enabled=bool(_repo_ctx),
                     dlog=_dlog, session_id=session_id, user_id=user_id)
                 _gpt_system_text += _grok_sys_suffix
                 _dlog("natural_grok_system_suffix_appended",
@@ -18717,7 +18794,7 @@ async def run_natural_pipeline_stream(
         # freely use every stop tag. GPT's API only accepts the first four
         # (_agent_stop_seqs[:4] below). "preview" is last, so GPT captures it
         # in the stream parser instead of via a stop sequence, same as aws.
-        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "preview"]
+        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "preview", "repo"]
         _agent_stop_seqs = (
             [TAG_DEFS[t]["close"] for t in _stop_tag_order if t in TAG_DEFS]
             if _tag_stop_enabled else []
@@ -18752,6 +18829,10 @@ async def run_natural_pipeline_stream(
                 from services.mcp_client import parse_mcp_request as _parse_mcp
                 _md = _parse_mcp(_block)
                 return ("mcp", _md if _md is not None else {"_invalid": (_block or "")[:500]})
+            if _kind == "repo":
+                from services.repo_tools import parse_repo_request as _parse_repo
+                _rd = _parse_repo(_block)
+                return ("repo", _rd if _rd is not None else {"_invalid": (_block or "")[:500]})
             return None
 
         # ---- Unified instruction: every tool is legal on every turn, no phase wall ----
@@ -18773,6 +18854,12 @@ async def run_natural_pipeline_stream(
             preflight_enabled=(_preflight_mode == "enforce"),
             websearch_enabled=_oa_search_enabled and not _is_grok_model(arch_model),
             mcp_guidance=(("\n" + _natural_mcp_guidance + "\n") if _natural_mcp_guidance else ""),
+            repo_guidance=(
+                "• <repo_request> — read the open local folder "
+                "(list_repo_files, read_repo_file, search_repo, git_status). "
+                "Edits stay staged until the user applies them.\n"
+                if _repo_ctx else ""
+            ),
         )
 
         # ── Grok-only: native-tool agent instruction (Claude/GPT keep the
@@ -18787,6 +18874,7 @@ async def run_natural_pipeline_stream(
                 preflight_enabled=(_preflight_mode == "enforce"),
                 websearch_enabled=_oa_search_enabled,
                 mcp_enabled=_natural_mcp,
+                repo_enabled=bool(_repo_ctx),
                 dlog=_dlog, session_id=session_id, user_id=user_id)
 
         # Research is off, but the user clearly asked for a web search.
@@ -19372,6 +19460,7 @@ async def run_natural_pipeline_stream(
                         preview_enabled=_preview_enabled,
                         websearch_enabled=_oa_search_enabled,
                         mcp_enabled=_natural_mcp,
+                        repo_enabled=bool(_repo_ctx),
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
                     # Plan-first gate decides tool_choice: forced write_edit_plan
@@ -19849,6 +19938,22 @@ async def run_natural_pipeline_stream(
                 _consecutive_empty_turns = 0
                 _assistant_echo = full_response or "(working…)"
                 _kind, _data = pending_tool
+
+                if _kind == "repo":
+                    from services.repo_tools import execute_repo_tool as _exec_repo
+                    _repo_note = _exec_repo(
+                        session_id, user_id,
+                        _data if isinstance(_data, dict) else {"_invalid": str(_data)[:500]},
+                        session_files=session_files,
+                        content_lookup=file_content_lookup_stream,
+                    )
+                    _dlog("agent_repo_executed", session_id=session_id, user_id=user_id,
+                          turn=_turn, note_len=len(_repo_note or ""))
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": _assistant_echo},
+                        {"role": "user", "content": _repo_note or "No repository result."},
+                    ]
+                    continue
 
                 if _kind == "websearch":
                     from services.openai_web_search import (

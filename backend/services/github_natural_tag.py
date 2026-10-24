@@ -556,6 +556,14 @@ def get_known_repos(user_id: str, session_id: str,
         return []
 
 
+LOOKUP_BEFORE_ANSWER = (
+    "If the user asks whether a file exists, where a page lives, or to find code, "
+    "call the lookup tool before you answer. A sentence that only promises to check "
+    "is not an answer. If they name a repository, use that name with list_files or "
+    "search_code. Call list_repos only to learn the owner."
+)
+
+
 def build_github_prompt_section(installations: list,
                                 known_repos: Optional[list] = None,
                                 tier: str = "read_only",
@@ -585,8 +593,7 @@ def build_github_prompt_section(installations: list,
             owner = accounts[0].strip() if accounts else "OWNER"
             repo = "<repo name>"
             repo_note = (
-                "No repo has been used in this session yet. Call list_repos first, "
-                "then copy owner and repo from that list. Do not invent a repo name."
+                "No repo has been used in this session yet. " + LOOKUP_BEFORE_ANSWER
             )
         list_example = json.dumps(
             {"tool": "list_prs", "args": {"owner": owner, "repo": repo, "state": "all", "limit": 5}},
