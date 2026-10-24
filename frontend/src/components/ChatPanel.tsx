@@ -1,10 +1,11 @@
 import React, { useState, useRef, useEffect, useCallback, Component } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-import { useAppStore, type PickedElementRef } from '../stores/appStore'
+import { useAppStore, type PickedElementRef, type LiveEditCardState } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import { InlineDiffCard } from './InlineDiffCard'
+import { LiveEditCard } from './LiveEditCard'
 import { NewFileCard } from './NewFileCard'
 import { MarkdownCode } from './CodeBlock'
 import { SessionFilesTray } from './SessionFilesTray'
@@ -996,6 +997,13 @@ function PipelineTimeline({ steps, isLive = false }: { steps: string[]; isLive?:
 
 function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit, webSearchLive, sessionId }: { content: string; progress: string; progressHistory: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean; webSearchLive?: { searching: boolean; query?: string } | null; sessionId?: string }) {
   const [elapsed, setElapsed] = useState(0)
+  const liveOrder = useAppStore((s) => (sessionId ? s.liveEditOrder[sessionId] : undefined))
+  const liveMap = useAppStore((s) => (sessionId ? s.liveEdits[sessionId] : undefined))
+  const liveCards: LiveEditCardState[] = []
+  for (const id of liveOrder || []) {
+    const card = liveMap?.[id]
+    if (card) liveCards.push(card)
+  }
 
   // Elapsed timer — ticks every second while streaming
   useEffect(() => {
@@ -1078,12 +1086,18 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
         )}
 
         {/* Building edit indicator — shown while parsing a <surgical_edit> block */}
-        {isBuildingEdit && (
+        {liveCards.length > 0 ? (
+          <div className="flex flex-col">
+            {liveCards.map((card) => (
+              <LiveEditCard key={card.id} card={card} />
+            ))}
+          </div>
+        ) : isBuildingEdit ? (
           <div className="flex items-center gap-2 my-2 px-3 py-2 bg-warning/10 border border-warning/25 rounded-lg text-[12px] text-warning/90">
             <span className="w-2 h-2 rounded-full bg-warning animate-pulse flex-shrink-0" />
             Preparing code change...
           </div>
-        )}
+        ) : null}
 
         {content ? (
           <div className="prose-ai">
@@ -2423,6 +2437,9 @@ export function ChatPanel() {
           unresolved: event.unresolved || [],
           reply,
         })
+      },
+      (ev) => {
+        useAppStore.getState().applyLiveEdit(sessionId, ev)
       },
     )
     abortMapRef.current.set(sessionId, ctrl)

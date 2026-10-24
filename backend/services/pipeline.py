@@ -17458,6 +17458,7 @@ async def run_natural_pipeline_stream(
       thinking_*  — Claude extended thinking blocks
       edit_start  — entering an edit block (show indicator)
       edit_end    — edit block complete
+      edit_live   — partial code while an edit or new file is still being written
       smart_result — structured edit result (diff cards)
       done        — stream complete
       error       — error message
@@ -18429,6 +18430,46 @@ async def run_natural_pipeline_stream(
         _preflight_baseline = {}
         _preview_state = {"rounds": 0, "last_fp": None, "edit_hash": None}
 
+        # Live edit cards. Off restores the spinner-only behavior. A failed
+        # init must not take down the turn, so the fallback object is silent.
+        try:
+            from services.live_edit_stream import LiveEditStreamer as _LiveEditStreamer
+            try:
+                _live_on = (get_setting("live_edit_view", "on") or "on").strip().lower() != "off"
+            except Exception:
+                _live_on = True
+            _live = _LiveEditStreamer(
+                symbol_maps_by_name,
+                file_content_lookup_stream,
+                enabled=_live_on,
+                dlog=_dlog,
+            )
+        except Exception as _live_exc:
+            _dlog(
+                "live_edit_init_error",
+                session_id=session_id, user_id=user_id,
+                error=str(_live_exc)[:200],
+            )
+
+            class _LiveOff:
+                def feed(self, *_a, **_k):
+                    return []
+
+                def close(self, *_a, **_k):
+                    return []
+
+                def discard(self, *_a, **_k):
+                    return []
+
+                def discard_all(self, *_a, **_k):
+                    return []
+
+                def set_turn(self, *_a, **_k):
+                    return None
+
+            _live = _LiveOff()
+        _live_key = 0
+
         # ── Grok-only plan-first reliability gate (compound-request detection +
         #    forced write_edit_plan before any shallow single edit). No-op for
         #    Claude/GPT and for non-compound requests; see
@@ -18455,6 +18496,8 @@ async def run_natural_pipeline_stream(
             if _skip_agent_loop_for_credit_resume:
                 break
             _turn += 1
+            _live.set_turn(_turn)
+            _live_key = 0
             _grok_plan_held_writes = False  # plan gate held writes this turn (force-plan next)
 
             # grok: rewrite prior dispatch echo into native tool messages
@@ -18596,6 +18639,12 @@ async def run_natural_pipeline_stream(
                                                         "type": "progress",
                                                         "content": f"✍️ Writing code changes… {_edit_hb_bytes/1024:.1f} KB",
                                                     })
+                                                for _lev in _live.feed(
+                                                    _live_key,
+                                                    "edit" if state == "in_edit" else "new_file",
+                                                    tag_buf,
+                                                ):
+                                                    yield sse(_lev)
 
                                         # ── Tag parser (all tags legal every turn) ──
                                         while True:
@@ -18624,6 +18673,14 @@ async def run_natural_pipeline_stream(
                                                     normal_buf = ""
                                                     _found_open = True
                                                     _ctx_shape_checked = False
+                                                    if first_tag in ("edit", "file"):
+                                                        _live_key += 1
+                                                        for _lev in _live.feed(
+                                                            _live_key,
+                                                            "edit" if first_tag == "edit" else "new_file",
+                                                            tag_buf,
+                                                        ):
+                                                            yield sse(_lev)
                                                     _dlog("tag_opened",
                                                           session_id=session_id, user_id=user_id,
                                                           tag_type=first_tag, state=state, turn=_turn)
@@ -18676,9 +18733,13 @@ async def run_natural_pipeline_stream(
                                             if _tag_name == "edit":
                                                 edit_blocks_raw.append(_content)
                                                 yield sse({"type": "edit_end", "content": ""})
+                                                for _lev in _live.close(_live_key, _content, kind="edit"):
+                                                    yield sse(_lev)
                                             elif _tag_name == "file":
                                                 new_file_blocks_raw.append(_content)
                                                 yield sse({"type": "edit_end", "content": ""})
+                                                for _lev in _live.close(_live_key, _content, kind="new_file"):
+                                                    yield sse(_lev)
                                             elif _tag_name == "plan":
                                                 _pd = _parse_plan_content(_content)
                                                 if _pd is not None:
@@ -18988,6 +19049,12 @@ async def run_natural_pipeline_stream(
                                             _edit_hb_last = _edit_hb_bytes
                                             yield sse({"type": "progress",
                                                        "content": f"✍️ Writing code changes… {_edit_hb_bytes/1024:.1f} KB"})
+                                        for _lev in _live.feed(
+                                            _live_key,
+                                            "edit" if state == "in_edit" else "new_file",
+                                            tag_buf,
+                                        ):
+                                            yield sse(_lev)
 
                                 # ── Tag parser — same tag set as the Claude branch ──
                                 while True:
@@ -19013,6 +19080,14 @@ async def run_natural_pipeline_stream(
                                         tag_buf = normal_buf[first_idx + len(TAG_DEFS[first_tag]["open"]):]
                                         normal_buf = ""
                                         _ctx_shape_checked = False
+                                        if first_tag in ("edit", "file"):
+                                            _live_key += 1
+                                            for _lev in _live.feed(
+                                                _live_key,
+                                                "edit" if first_tag == "edit" else "new_file",
+                                                tag_buf,
+                                            ):
+                                                yield sse(_lev)
                                     else:
                                         _tag_name = state[3:]
                                         if _tag_name not in TAG_DEFS:
@@ -19047,9 +19122,13 @@ async def run_natural_pipeline_stream(
                                         if _tag_name == "edit":
                                             edit_blocks_raw.append(_content)
                                             yield sse({"type": "edit_end", "content": ""})
+                                            for _lev in _live.close(_live_key, _content, kind="edit"):
+                                                yield sse(_lev)
                                         elif _tag_name == "file":
                                             new_file_blocks_raw.append(_content)
                                             yield sse({"type": "edit_end", "content": ""})
+                                            for _lev in _live.close(_live_key, _content, kind="new_file"):
+                                                yield sse(_lev)
                                         elif _tag_name == "plan":
                                             _pd = _parse_plan_content(_content)
                                             if _pd is not None:
@@ -19087,6 +19166,15 @@ async def run_natural_pipeline_stream(
                                             _dlog("grok_agent_tool_named",
                                                   session_id=session_id, user_id=user_id,
                                                   turn=_turn, tool_name=_tn)
+                                    for _gidx, _gname, _gargs in _grok_tc_acc.peek():
+                                        if _gname == "write_surgical_edit":
+                                            _gkind = "edit"
+                                        elif _gname == "write_new_file":
+                                            _gkind = "new_file"
+                                        else:
+                                            continue
+                                        for _lev in _live.feed(("grok", _gidx), _gkind, _gargs):
+                                            yield sse(_lev)
 
                             if pending_tool is not None or edit_plan_data is not None:
                                 break
@@ -19163,6 +19251,8 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id, turn=_turn,
                           repeat_count=len(_grok_loop_history),
                           tool_names=[c.get("name") for c in _grok_calls])
+                    for _lev in _live.discard_all("Repeated tool call stopped"):
+                        yield sse(_lev)
                 else:
                     _grok_tr = _grok_translate_tool_calls(
                         _grok_calls, dlog=_dlog, session_id=session_id, user_id=user_id)
@@ -19188,6 +19278,18 @@ async def run_natural_pipeline_stream(
                                         "last_held_edit_json_strings", []) or [])
                             if _stashed:
                                 _held_grok_writes_for_resume = _stashed
+                    for _gidx, _gname, _gargs in _grok_tc_acc.peek():
+                        if _gname == "write_surgical_edit":
+                            _gkind = "edit"
+                        elif _gname == "write_new_file":
+                            _gkind = "new_file"
+                        else:
+                            continue
+                        for _lev in _live.close(("grok", _gidx), _gargs, kind=_gkind):
+                            yield sse(_lev)
+                    if _grok_plan_held_writes:
+                        for _lev in _live.discard_all("Held until a plan exists"):
+                            yield sse(_lev)
                     if _grok_tr.edit_json_strings:
                         edit_blocks_raw.extend(_grok_tr.edit_json_strings)
                     if _grok_tr.new_file_json_strings:
@@ -20456,6 +20558,10 @@ async def run_natural_pipeline_stream(
                         edit_blocks_raw = _pf_decision["edit_blocks"]
                         new_file_blocks_raw = _pf_decision["new_files"]
                         _preflight_stash = _pf_decision["stash"]
+                        for _lev in _live.discard_all(
+                            f"Preflight found {_pf_decision['problems']} problem(s), asking for a fix"
+                        ):
+                            yield sse(_lev)
                         if _is_grok_model(arch_model) and _grok_native_turn is not None:
                             _stamp_grok_preflight(
                                 _grok_native_turn,
@@ -20524,6 +20630,13 @@ async def run_natural_pipeline_stream(
             _ss_tag = state[3:]
             _ss_content = tag_buf
             try:
+                if _ss_tag in ("edit", "file"):
+                    for _lev in _live.close(
+                        _live_key,
+                        _ss_content,
+                        kind="edit" if _ss_tag == "edit" else "new_file",
+                    ):
+                        yield sse(_lev)
                 if _ss_tag == "plan":
                     _pd = _parse_plan_content(_ss_content)
                     if _pd is not None:
@@ -20547,8 +20660,15 @@ async def run_natural_pipeline_stream(
                   full_response_len=len(full_response))
 
             if state == "in_edit":
+                _live_tail = tag_buf
                 _new_count, _partial_kept, _had_matches, _rejected_prose = _eos_recover_blocks(
                     EDIT_OPEN, EDIT_CLOSE, full_response, tag_buf, edit_blocks_raw)
+                if _rejected_prose:
+                    for _lev in _live.discard(_live_key, "Not a code edit"):
+                        yield sse(_lev)
+                else:
+                    for _lev in _live.close(_live_key, _live_tail, kind="edit"):
+                        yield sse(_lev)
                 if _had_matches:
                     state = "normal"
                     tag_buf = ""
@@ -20572,8 +20692,15 @@ async def run_natural_pipeline_stream(
                     yield sse({"type": "token", "content": _rejected_prose})
 
             elif state == "in_file":
+                _live_tail = tag_buf
                 _new_count, _partial_kept, _had_matches, _rejected_prose = _eos_recover_blocks(
                     FILE_OPEN, FILE_CLOSE, full_response, tag_buf, new_file_blocks_raw)
+                if _rejected_prose:
+                    for _lev in _live.discard(_live_key, "Not a code edit"):
+                        yield sse(_lev)
+                else:
+                    for _lev in _live.close(_live_key, _live_tail, kind="new_file"):
+                        yield sse(_lev)
                 if _had_matches:
                     state = "normal"
                     tag_buf = ""

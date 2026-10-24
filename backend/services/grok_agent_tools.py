@@ -608,6 +608,24 @@ class StreamedToolCallAccumulator:
                      error_type=type(e).__name__, error=str(e)[:200])
         return newly_named
 
+    def peek(self):
+        """``[(index, name, arguments_so_far)]`` in arrival order.
+
+        Read-only. ``name`` is None until the first fragment that carries one.
+        Never raises. Safe to call before ``finalize``.
+        """
+        try:
+            out = []
+            for idx in self._order:
+                entry = self._by_index.get(idx) or {}
+                out.append((idx, entry.get("name"), entry.get("arguments") or ""))
+            return out
+        except Exception as exc:  # pragma: no cover - defensive
+            _log(self._dlog, "grok_tc_peek_error",
+                 session_id=self._session_id, user_id=self._user_id,
+                 error_type=type(exc).__name__, error=str(exc)[:200])
+            return []
+
     def has_calls(self):
         return bool(self._by_index)
 

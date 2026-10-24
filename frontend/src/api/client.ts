@@ -56,6 +56,25 @@ export type SmartStreamHandlers = {
     baseline_bundle?: Record<string, unknown> | null
     unresolved?: string[]
   }, reply: (payload: Record<string, unknown>) => boolean) => void
+  onEditLive?: (ev: EditLiveEvent) => void
+}
+
+export type EditLiveEvent = {
+  type: 'edit_live'
+  op: 'open' | 'delta' | 'close' | 'discard'
+  id: string
+  kind?: 'edit' | 'new_file'
+  filename?: string
+  symbol?: string
+  mode?: 'symbol' | 'lines' | 'snippet' | 'new_file' | 'unresolved'
+  start_line?: number | null
+  end_line?: number | null
+  original?: string | null
+  original_truncated?: boolean
+  field?: 'new_code' | 'old_code' | 'content'
+  text?: string
+  reason?: string
+  capped?: boolean
 }
 
 /** Fire-and-forget clientLog bridge for wrappers defined in this file.
@@ -512,6 +531,7 @@ export const api = {
       onAwsCli?: SmartStreamHandlers['onAwsCli'],
       onAwsApproval?: SmartStreamHandlers['onAwsApproval'],
       onPreviewCheck?: SmartStreamHandlers['onPreviewCheck'],
+      onEditLive?: SmartStreamHandlers['onEditLive'],
     ): AbortController => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -520,6 +540,7 @@ export const api = {
           onThinking, onCompacting, onEditStart, onEditEnd, onTask,
           onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
           onCreditPaused, onPlan, onAwsCli, onAwsApproval, onPreviewCheck,
+          onEditLive,
         } = onThinking)
       }
       const controller = new AbortController()
@@ -569,6 +590,7 @@ export const api = {
           else if (chunk.type === 'compacting_done') onCompacting?.('done', { summary: chunk.summary, compacted_count: chunk.compacted_count })
           else if (chunk.type === 'edit_start') onEditStart?.()
           else if (chunk.type === 'edit_end') onEditEnd?.()
+          else if (chunk.type === 'edit_live') onEditLive?.(chunk as EditLiveEvent)
           else if (chunk.type === 'file_needed') {
             onFileNeeded?.(
               { filename: chunk.filename, message: chunk.content, retry: chunk.retry },
