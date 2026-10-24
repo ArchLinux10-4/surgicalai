@@ -30,9 +30,12 @@ from services.mcp_client import (
 )
 from services.pipeline import _ask_plan_build_tool_instructions
 
-_XML_EDIT = "92fda38c32bc2653f97354dd96af9fd30e62ce26cae3326d07d66d9e63647df8"
-_XML_ANSWER = "03cb24805b67ea596b47c83f542f23fc4226c838fce582cd20f3723688966fbb"
-_ASK_FILES = "42e1f5794d9e11169616793f470a1f990bde2655df495b707f09ca10f3ee3bb3"
+# Shared tool wording changed in the clarity audit. These hashes are the
+# MCP-off prompts after that change. The test above still checks that
+# <mcp_request> is absent when MCP is off.
+_XML_EDIT = "cb7b4271eab5b3afa1d84926e41ead53c585622ff482f2e8bcc1eceb2f76acec"
+_XML_ANSWER = "01df953ddac78c68df1e4fd354282a4a2778b701f9c183b3edd94348c6e1f49c"
+_ASK_FILES = "7013dd4c6937d8394bee78ab3c6fe4a507737f940f3a9c293339af9ff19dff0c"
 
 
 def _sha(text: str) -> str:
@@ -176,7 +179,7 @@ def test_prompts_match_the_pre_mcp_output_when_mcp_is_off():
     assert _sha(xml_answer) == _XML_ANSWER
     assert _sha(ask_files) == _ASK_FILES
     pipeline = Path("services/pipeline.py").read_text()
-    assert '_stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "preview"]' in pipeline
+    assert '_stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "preview", "repo"]' in pipeline
     assert "mcp>=" not in Path("requirements.txt").read_text()
     assert "mcp>=2,<3" in Path("requirements-local.txt").read_text()
     assert INSTALL_HINT.startswith("cd backend")

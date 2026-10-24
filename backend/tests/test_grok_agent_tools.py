@@ -421,8 +421,11 @@ def test_system_suffix_edit_mentions_native_tools_not_tags():
     suffix = gat.build_grok_system_suffix("edit")
     assert "write_surgical_edit" in suffix
     assert "NATIVE TOOL" in suffix
-    # explicitly tells the model to NOT emit XML tags as text
-    assert "<surgical_edit>" in suffix and "do NOT" in suffix
+    # Grok is told to call functions. The suffix no longer shows tag syntax
+    # or tells the model to ignore an earlier tag protocol.
+    assert "<surgical_edit>" not in suffix
+    assert "IGNORE" not in suffix
+    assert "Do not write XML tags." in suffix
 
 
 def test_system_suffix_ask_has_no_write_tools():
