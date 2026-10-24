@@ -298,7 +298,7 @@ def test_pipeline_and_grok_wiring_guards():
     pipeline = Path("services/pipeline.py").read_text()
     assert 'if _kind == "websearch"' in pipeline
     assert 'TAG_DEFS["websearch"]' in pipeline
-    assert '_stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "preview"]' in pipeline
+    assert '_stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "preview", "repo"]' in pipeline
     assert "request_web_search" in gat.CONTEXT_TOOLS
     off = {t["function"]["name"] for t in gat.build_grok_agent_tools("agent", websearch_enabled=False)}
     on = {t["function"]["name"] for t in gat.build_grok_agent_tools("agent", websearch_enabled=True)}

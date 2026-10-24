@@ -36,18 +36,8 @@ def session_repo(session_id: str):
 
 
 def prompt_section(repo: dict) -> str:
-    name = repo.get("name") or "repository"
-    root = repo.get("root_path") or ""
-    return (
-        f"You can read the open local repository \"{name}\" at {root}.\n"
-        '<repo_request>{"tool":"list_repo_files"}</repo_request>\n'
-        '<repo_request>{"tool":"read_repo_file","path":"src/app.py"}</repo_request>\n'
-        '<repo_request>{"tool":"search_repo","terms":["symbol"]}</repo_request>\n'
-        '<repo_request>{"tool":"git_status"}</repo_request>\n'
-        "read_repo_file loads the file into this chat. Edits stay staged until "
-        "the user applies them to disk. You cannot run shell commands and you "
-        "cannot write to disk."
-    )
+    from services.agent_tool_spec import repo_text
+    return repo_text("tag", repo)
 
 
 def parse_repo_request(raw: str):

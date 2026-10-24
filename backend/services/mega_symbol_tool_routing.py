@@ -189,20 +189,6 @@ def build_mega_symbol_reroute_instruction(
 
 def prompt_mega_symbol_tool_routing_rules(*, native_tools: bool = False) -> str:
     """Short rules block for system / tool-schema guidance."""
-    if native_tools:
-        return (
-            "MEGA-SYMBOL RULE: When several coordinated changes land inside ONE "
-            "large component/function (hundreds of lines), do NOT call "
-            "write_edit_plan with multiple steps for that same symbol. Call "
-            "request_file, then multiple write_surgical_edit snippets "
-            "(old_code/new_code) covering every site. write_edit_plan is only "
-            "for distinct files or distinct symbols (one step per symbol)."
-        )
-    return (
-        "MEGA-SYMBOL RULE: When several coordinated changes land inside ONE "
-        "large component/function (hundreds of lines), do NOT emit an "
-        "<edit_plan> with multiple steps for that same symbol. Emit "
-        "<file_request> if needed, then multiple <surgical_edit> blocks "
-        "(old_code/new_code) covering every site. <edit_plan> is only for "
-        "distinct files or distinct symbols (one step per symbol)."
-    )
+    from services.agent_tool_spec import plan_text
+    form = "function" if native_tools else "tag"
+    return "MEGA-SYMBOL RULE: " + plan_text(form)

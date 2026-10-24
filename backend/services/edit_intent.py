@@ -140,29 +140,37 @@ def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
                                 history_enabled=False, aws_guidance="",
                                 preview_enabled=False, preflight_enabled=False,
                                 websearch_enabled=False, mcp_guidance="",
-                                repo_guidance=""):
+                                repo_guidance="", max_rounds=None):
     """Suffix appended to the latest user turn for Claude and GPT.
 
     ``wants_edit`` True is the existing edit contract, unchanged.
     ``wants_edit`` False keeps the same context tools and tells the model
     to answer. It may still emit an edit tag if the user asked for a change.
     """
+    from services.agent_tool_spec import (
+        blocked_text as _blocked_text,
+        file_blurb as _file_blurb,
+        history_text as _history_text,
+        limits_block as _limits_block,
+        plan_text as _plan_text,
+        scope_block as _scope_block,
+        search_blurb as _search_blurb,
+    )
+    scope = _scope_block(
+        session_files=True,
+        repo=bool(repo_guidance),
+        github=bool(github_enabled),
+        web=bool(websearch_enabled),
+        form="tag",
+    )
     tools = (
-        "• <search_request> — grep the codebase for symbols or text you need to see.\n"
-        "• <file_request> — pull the FULL contents of specific file(s). Body is a "
-        "JSON array of exact filenames, e.g. "
-        "<file_request>[\"file1.py\", \"file2.tsx\"]</file_request>.\n"
+        ((scope + "\n") if scope else "")
+        + _limits_block("tag", max_rounds) + "\n"
+        + "• " + _search_blurb("tag") + "\n"
+        + "• " + _file_blurb("tag") + "\n"
         + ("• <github_request> — read from the connected GitHub repository.\n" if github_enabled else "")
         + (aws_guidance or "")
-        + (
-            "• <history_request>{\"filename\": \"...\", \"query\": \"optional keyword\"} — "
-            "look up an OLDER/original version of a file from THIS session's edit "
-            "history. Omit query for the very first (pre-edit) version; include a "
-            "query to search across all saved versions. Returned content is clearly "
-            "marked HISTORICAL — it is NOT the current file, never use it as ground "
-            "truth for what exists now.\n"
-            if history_enabled else ""
-        )
+        + (("• " + _history_text("tag") + "\n") if history_enabled else "")
         + (
             "• <preview_request>{\"files\": [\"Widget.tsx\"]} — render the pending "
             "edit in the live preview and read compile or runtime errors. "
@@ -191,14 +199,12 @@ def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
             "OUTPUT — emit when (and only when) you have the context to be correct:\n"
             "• <surgical_edit> — a precise edit to an existing file.\n"
             "• <new_file> — a brand-new file.\n"
-            "• <edit_plan> — a symbol-level plan for large or multi-part changes.\n\n"
+            "• <edit_plan> — " + _plan_text("tag") + "\n\n"
             "RULES:\n"
             "1. If you already have enough context, write the edits now.\n"
             "2. If you need code you don't have, request it — never guess at code,\n"
             "   file contents, or APIs you have not actually seen.\n"
-            "3. If required context is genuinely unavailable and you cannot proceed,\n"
-            "   explain exactly what you need inside <blocked>…</blocked> rather than\n"
-            "   guessing.\n"
+            "3. " + _blocked_text("tag") + " Do not guess.\n"
             "4. When your edits are complete, simply stop.\n"
             + (
                 "5. A preflight check may reject an edit that introduces a syntax "
@@ -221,6 +227,6 @@ def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
         "asked you to change code.\n"
         "3. If you need code you don't have, request it — never guess at code,\n"
         "   file contents, or APIs you have not actually seen.\n"
-        "4. If you cannot proceed, explain what you need inside <blocked>…</blocked>.\n"
+        "4. " + _blocked_text("tag") + "\n"
         "5. When you have answered, stop. Do not say that no code changes were produced.\n"
     )

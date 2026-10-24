@@ -67,6 +67,37 @@ except Exception:  # pragma: no cover
     except Exception:  # pragma: no cover
         _parse_tc_args = None
 
+try:  # pragma: no cover
+    from services.agent_tool_spec import (
+        blocked_text as _blocked_text,
+        edit_ladder as _edit_ladder,
+        file_blurb as _file_blurb,
+        history_text as _history_text,
+        limits_block as _limits_block,
+        new_code_description as _new_code_description,
+        old_code_description as _old_code_description,
+        plan_text as _plan_text,
+        repo_text as _repo_text,
+        scope_block as _scope_block,
+        search_blurb as _search_blurb,
+        symbol_description as _symbol_description,
+    )
+except Exception:  # pragma: no cover
+    from agent_tool_spec import (  # type: ignore
+        blocked_text as _blocked_text,
+        edit_ladder as _edit_ladder,
+        file_blurb as _file_blurb,
+        history_text as _history_text,
+        limits_block as _limits_block,
+        new_code_description as _new_code_description,
+        old_code_description as _old_code_description,
+        plan_text as _plan_text,
+        repo_text as _repo_text,
+        scope_block as _scope_block,
+        search_blurb as _search_blurb,
+        symbol_description as _symbol_description,
+    )
+
 
 # ── Tool name constants (single source of truth; used by tests too) ──────────
 TOOL_WRITE_SURGICAL_EDIT = "write_surgical_edit"
@@ -124,10 +155,8 @@ def _schema_write_surgical_edit():
         "function": {
             "name": TOOL_WRITE_SURGICAL_EDIT,
             "description": (
-                "Emit ONE precise edit to an EXISTING file. Call this once per "
-                "symbol you are changing; you may call it multiple times in a "
-                "single turn. Provide the COMPLETE replacement code for the "
-                "symbol/region — never a diff or an ellipsis."
+                "Edit one existing file. Call once per site. "
+                + _edit_ladder("function", "grok")
             ),
             "parameters": {
                 "type": "object",
@@ -138,10 +167,7 @@ def _schema_write_surgical_edit():
                     },
                     "symbol": {
                         "type": "string",
-                        "description": (
-                            "Exact symbol name from the SYMBOL INDEX "
-                            "(e.g. LoginPage, handleSubmit, process_order)."
-                        ),
+                        "description": _symbol_description(),
                     },
                     "description": {
                         "type": "string",
@@ -149,21 +175,11 @@ def _schema_write_surgical_edit():
                     },
                     "new_code": {
                         "type": "string",
-                        "description": (
-                            "The COMPLETE new code for the symbol/region — every "
-                            "line, nothing omitted."
-                        ),
+                        "description": _new_code_description(),
                     },
                     "old_code": {
                         "type": "string",
-                        "description": (
-                            "The exact original text you are replacing, copied "
-                            "verbatim. old_code and new_code must cover the SAME "
-                            "region (same net braces/tags). For a full-symbol "
-                            "rewrite, omit old_code or set it to the entire "
-                            "original symbol — never a short prefix of a large "
-                            "symbol paired with a complete replacement."
-                        ),
+                        "description": _old_code_description(),
                     },
                     "edit_start_line": {
                         "type": "integer",
@@ -211,13 +227,7 @@ def _schema_write_edit_plan():
         "type": "function",
         "function": {
             "name": TOOL_WRITE_EDIT_PLAN,
-            "description": (
-                "For multi-part changes that span DISTINCT files or DISTINCT "
-                "symbols (3+ symbols): emit a symbol-level plan. One step per "
-                "symbol — NEVER multiple steps for the same large component. "
-                "For several coordinated sites inside ONE mega-symbol, call "
-                "request_file then multiple write_surgical_edit snippets instead."
-            ),
+            "description": _plan_text("function"),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -249,10 +259,7 @@ def _schema_request_file():
         "type": "function",
         "function": {
             "name": TOOL_REQUEST_FILE,
-            "description": (
-                "Pull the FULL contents of specific file(s) you need to see "
-                "before editing. Up to 5 files per call."
-            ),
+            "description": _file_blurb("function"),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -273,10 +280,7 @@ def _schema_request_search():
         "type": "function",
         "function": {
             "name": TOOL_REQUEST_SEARCH,
-            "description": (
-                "Grep the codebase for symbols or text you need to find. Returns "
-                "matching snippets with file/line context."
-            ),
+            "description": _search_blurb("function"),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -310,11 +314,7 @@ def _schema_request_history():
         "type": "function",
         "function": {
             "name": TOOL_REQUEST_HISTORY,
-            "description": (
-                "Look up an OLDER/original version of a file from THIS session's "
-                "edit history. Returned content is HISTORICAL — never treat it as "
-                "the current file."
-            ),
+            "description": _history_text("function"),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -338,11 +338,7 @@ def _schema_report_blocked():
         "type": "function",
         "function": {
             "name": TOOL_REPORT_BLOCKED,
-            "description": (
-                "Call this ONLY when required context is genuinely unavailable "
-                "and you cannot proceed. Explain exactly what you need. This "
-                "ends the turn."
-            ),
+            "description": _blocked_text("function"),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -486,12 +482,7 @@ def _schema_request_repo():
         "type": "function",
         "function": {
             "name": TOOL_REQUEST_REPO,
-            "description": (
-                "Read the open local repository. tool is list_repo_files, "
-                "read_repo_file, search_repo, or git_status. read_repo_file "
-                "needs path. search_repo needs terms. Edits stay staged until "
-                "the user applies them. This does not run shell commands."
-            ),
+            "description": _repo_text("function"),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1168,36 +1159,34 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
                              wants_edit=True, preview_enabled=False,
                              preflight_enabled=False, websearch_enabled=False,
                              mcp_enabled=False, repo_enabled=False):
-    """A short contract appended to Grok's system text telling it to USE the
-    native function tools instead of the XML-tag protocol described earlier in
-    the shared prompt (which targets Claude/GPT).
+    """Function-tool contract for Grok. No XML tag names, and no instruction to ignore them.
 
-    We do NOT edit the shared ``NATURAL_SYSTEM`` constant (that would change the
-    Claude/GPT paths); this suffix explicitly overrides the tag instructions for
-    Grok only.
+    The main system text Grok receives is the tag-free head plus the code-quality
+    rules. This suffix is the one place Grok reads how to edit.
     """
     m = (mode or "edit").strip().lower()
     lines = [
         "\n\n━━━ NATIVE TOOL PROTOCOL (THIS MODEL) ━━━",
-        "You have been given real FUNCTION TOOLS. IGNORE any instructions above "
-        "about emitting XML tags such as <surgical_edit>, <new_file>, "
-        "<edit_plan>, <search_request>, or <file_request> — do NOT write those "
-        "tags as text. Instead, CALL the corresponding tool:",
+        "You have real FUNCTION TOOLS. Call them. Do not write XML tags.",
     ]
-    if m in _EDIT_MODES:
-        lines += [
-            "• write_surgical_edit — make a precise edit to an existing file "
-            "(call once per site with old_code + new_code; for several sites "
-            "inside one large component, call this tool multiple times).",
-            "• write_new_file — create a brand-new file.",
-            "• write_edit_plan — ONLY when steps target different files or "
-            "different symbols (one step per symbol). Do NOT plan-split one "
-            "mega-component into many steps.",
-        ]
+    scope = _scope_block(
+        session_files=True, repo=bool(repo_enabled), github=bool(github_enabled),
+        web=bool(websearch_enabled), form="function",
+    )
+    if scope:
+        lines.append(scope)
+    lines.append(_limits_block("function"))
+    if m in _EDIT_MODES and wants_edit:
+        lines.append(_edit_ladder("function", "grok"))
+    elif m in _EDIT_MODES:
+        lines.append(
+            "• write_surgical_edit — edit an existing file. "
+            "• write_new_file — create a brand-new file. "
+            "• write_edit_plan — only for 3 or more distinct files or symbols."
+        )
     lines += [
-        "• request_file — load full file contents you need before editing "
-        "(prefer this over repeated request_search when you already know the file).",
-        "• request_search — grep the codebase for symbols/keywords.",
+        "• request_file — load a file already in this chat when you know its name.",
+        "• request_search — grep files already in this chat.",
     ]
     if m in _EDIT_MODES and wants_edit:
         from services.mega_symbol_tool_routing import (  # local import: avoid cycles
@@ -1207,17 +1196,13 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     if github_enabled:
         lines.append("• request_github — read from the connected GitHub repo.")
     if repo_enabled:
-        lines.append(
-            "• request_repo — read the open local folder (list_repo_files, "
-            "read_repo_file, search_repo, git_status). Edits stay staged until "
-            "the user applies them. Do not claim you ran a shell command."
-        )
+        lines.append(_repo_text("function"))
     if history_enabled:
-        lines.append("• request_history — read an older version of a session file.")
+        lines.append(_history_text("function"))
     if aws_enabled:
         from services.aws_cli import aws_agent_guidance
         lines.append("• aws_cli — " + aws_agent_guidance())
-    if preview_enabled:
+    if preview_enabled and m in _EDIT_MODES:
         lines.append(
             "• request_preview — render a pending .tsx/.jsx edit and read "
             "preview errors. unobserved is not a pass."
@@ -1239,9 +1224,7 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
             "with [PREFLIGHT], that edit was NOT applied. Fix it. Do not "
             "resend the same edit."
         )
-    lines.append(
-        "• report_blocked — ONLY if you truly cannot proceed without context "
-        "you cannot obtain.")
+    lines.append("• " + _blocked_text("function"))
     if m in _EDIT_MODES and wants_edit:
         lines += [
             "",

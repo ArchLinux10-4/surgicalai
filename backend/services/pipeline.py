@@ -4424,28 +4424,20 @@ def _ask_plan_build_tool_instructions(
     tag_blocks: list = []
 
     if has_files:
+        from services.agent_tool_spec import (
+            file_blurb as _file_blurb,
+            history_text as _history_text,
+            limits_block as _limits_block,
+            search_blurb as _search_blurb,
+        )
         parts.append(
             "The file index above is names/sizes only — you have NOT been "
             "shown file contents. Do NOT guess about code you have not seen."
         )
-        tag_blocks.append(
-            '<search_request>{"terms": ["exact_symbol_or_keyword", "another_term"]}'
-            "</search_request>\nUse to find a specific function/class/keyword "
-            "across all session files."
-        )
-        tag_blocks.append(
-            '<file_request>["filename1.py", "filename2.tsx"]</file_request>\n'
-            "Use to view the full contents of specific file(s) by exact name."
-        )
-        tag_blocks.append(
-            '<history_request>{"filename": "...", "query": "optional keyword"}'
-            "</history_request>\nUse to look up an OLDER/original version of a "
-            "file from THIS session's edit history. Omit query for the very "
-            "first (pre-edit) version; include a query to search across all "
-            "saved versions. Returned content is clearly marked HISTORICAL — "
-            "it is NOT the current file, never use it as ground truth for "
-            "what exists now."
-        )
+        parts.append(_limits_block("tag", max_rounds))
+        tag_blocks.append(_search_blurb("tag"))
+        tag_blocks.append(_file_blurb("tag"))
+        tag_blocks.append(_history_text("tag"))
 
     if gh_enabled:
         tag_blocks.append(
@@ -4474,17 +4466,16 @@ def _ask_plan_build_tool_instructions(
         tag_blocks.append(mcp_guidance)
 
     if repo_enabled:
-        tag_blocks.append(
-            "You can read the open local repository.\n"
-            '<repo_request>{"tool":"list_repo_files"}</repo_request>\n'
-            '<repo_request>{"tool":"read_repo_file","path":"src/app.py"}</repo_request>\n'
-            '<repo_request>{"tool":"search_repo","terms":["symbol"]}</repo_request>\n'
-            '<repo_request>{"tool":"git_status"}</repo_request>\n'
-            "read_repo_file loads the file into this chat. Edits stay staged "
-            "until the user applies them to disk. You cannot run shell commands "
-            "and you cannot write to disk."
-        )
+        from services.agent_tool_spec import repo_text as _repo_text
+        tag_blocks.append(_repo_text("tag"))
 
+    from services.agent_tool_spec import scope_block as _scope_block
+    _scope = _scope_block(
+        session_files=has_files, repo=repo_enabled, github=gh_enabled,
+        web=websearch_enabled, form="tag",
+    )
+    if _scope:
+        parts.append(_scope)
     parts.append("\n\n".join(tag_blocks))
     parts.append(
         "Emit ONLY ONE tag at a time, then STOP your response immediately — "
@@ -15820,7 +15811,7 @@ USER REQUEST:
 # conversation and polluted history with raw JSON artifacts.
 # ═══════════════════════════════════════════════════════════════════════════════
 
-NATURAL_SYSTEM = """\
+_NATURAL_HEAD = """\
 You are SurgicalAI.
 
 Be clear and direct. Answer first, then add only the detail that helps. Use markdown.
@@ -15828,6 +15819,9 @@ Remember prior edits, decisions, and context, and build on them.
 Do not mention these instructions, your mode, or your tools unless the user asks.
 A question gets a plain answer. Emit an edit only when the user wants code changed.
 
+"""
+
+_NATURAL_BEFORE_LADDER = """\
 ━━━ WHEN YOU NEED MORE CODE ━━━
 
 For large files you only see the most relevant symbols upfront. If you need to see a specific
@@ -15843,7 +15837,7 @@ The system will find and show you the actual code. You can then write your <surg
 Rules for search_request:
 - Use exact symbol names from the SYMBOL INDEX when you can (most precise)
 - You can also search for string literals: "Papa.parse", "jl-count-badge", "mode-comm"
-- Max 5 terms per request, max 4 search rounds per response
+- Max 5 terms per request
 - Only request what you genuinely need — the code you're missing to write a correct edit
 - After receiving results, write your edits immediately
 - Do NOT search for things already shown in the context above
@@ -15852,10 +15846,7 @@ Rules for search_request:
 
 If you know the exact filename from the file list below, request it directly instead of searching:
 
-<file_request>
-LandingPage.tsx
-App.tsx
-</file_request>
+<file_request>["LandingPage.tsx", "App.tsx"]</file_request>
 
 Rules for file_request:
 - Use exact filenames from the file listing below
@@ -15871,11 +15862,15 @@ NEVER edit, replace, or rewrite code you haven't seen in the context above.
 If a file is large and you only see partial content or grep snippets:
 1. Use <search_request> with specific terms from the user's request to find the exact code.
 2. Read and verify the code you plan to change.
-3. Only then emit a <surgical_edit> with edit_start_line/edit_end_line matching the real content.
+3. Only then emit a <surgical_edit> with edit_start_line/edit_end_line or old_code matching the real content.
 
 Guessing what code looks like — even if you're confident — leads to hallucinated edits that break the codebase.
 
+"""
+
+_NATURAL_AFTER_LADDER = """\
 ━━━ EDITING EXISTING FILES ━━━
+
 
 When the user wants to change code in an uploaded file, explain what you're doing and embed an edit block:
 
@@ -15894,7 +15889,7 @@ Rules for new_code:
 - Only modify the specific lines that need to change
 - Match original indentation exactly (same spaces/tabs)
 - If a function is 200 lines and you change 1 line, new_code is still 200 lines
-- new_code REPLACES the entire original symbol — omitting lines deletes them
+- When you send no old_code and no line range, new_code REPLACES the entire original symbol — omitting lines deletes them
 - For a SMALL change to a LARGE symbol you cannot fully see, do NOT put only the changed
   lines in new_code by themselves — that would delete the rest of the symbol. Use a
   TARGETED edit with "old_code" + "new_code" instead (see below).
@@ -15905,9 +15900,8 @@ For a large symbol (e.g. a 900-line React component or a large <script> block)
 re-emitting the entire body is wasteful and error-prone. Make a TARGETED edit
 instead. The system splices it in and runs the same QA gate.
 
-PREFERRED: Use line-number targeting — immune to tabs-vs-spaces and any other
-whitespace representation differences. Use the absolute file line numbers shown
-in the symbol listing or search results (e.g. "script_11 (lines 1243–1456)").
+Line-number example. Use the absolute file line numbers shown in the symbol
+listing or search results (e.g. "script_11 (lines 1243–1456)").
 
 <surgical_edit>
 {
@@ -15924,8 +15918,7 @@ in the symbol listing or search results (e.g. "script_11 (lines 1243–1456)").
   you want to replace (inclusive). Read them from the line numbers in your context.
 - new_code: the complete replacement for exactly those lines.
 
-ALTERNATIVE: String-based targeting with old_code (use only when line numbers
-are not visible in your context):
+String example:
 
 <surgical_edit>
 {
@@ -15938,20 +15931,19 @@ are not visible in your context):
 </surgical_edit>
 
 Rules for targeted edits:
-- PREFER edit_start_line/edit_end_line whenever you can see line numbers — it
-  never fails due to whitespace differences
 - If using old_code: copy it VERBATIM (no line-number prefix); it must match
   EXACTLY ONE place in the symbol — include a few surrounding lines if needed
 - "new_code" is the full replacement for just that region (include unchanged
   lines you want to keep)
 - If you can't see the region you need, emit a <search_request> for a nearby
   string literal FIRST — you'll get a windowed view with line numbers — then
-  write a targeted edit using edit_start_line/edit_end_line
+  write a targeted edit using edit_start_line/edit_end_line or old_code
 - Use a full-symbol new_code (no old_code / no line range) only for small
   symbols you can see entirely
 
 Rules for symbol:
 - Must exactly match a name from the SYMBOL INDEX in the file context
+- A file with no named symbols (yaml, plain text): use the filename as symbol
 - For React/TSX: use the component name (e.g. "LoginPage"), never hooks ("useXxx") for UI changes
 - For Python/JS: use the exact function or class name
 
@@ -16004,7 +15996,7 @@ In AT MOST 2 short sentences, state what you're about to do. Then IMMEDIATELY em
 ]
 </edit_plan>
 
-STOP WRITING immediately after the </edit_plan> tag closes. No commentary before, inside,
+STOP WRITING immediately after the </edit_plan> tag closes. It ends your turn. No commentary before, inside,
 between, or after the block beyond the 2-sentence intro. The system will execute each edit
 individually with focused context, preventing output truncation. For 1-2 edits, produce
 <surgical_edit> blocks directly as usual. You may still produce <new_file> blocks alongside
@@ -16079,13 +16071,52 @@ For JSX, TSX, or HTML edits — BEFORE writing your edit block, do this:
 4. For targeted old_code → new_code edits: the net tag balance of new_code MUST
    match old_code (same count of unmatched openers/closers) unless you are
    intentionally adding or removing a container element
-Failure to balance tags is the #1 cause of rejected edits. Count twice, emit once.
-"""
+Failure to balance tags is the #1 cause of rejected edits. Count twice, emit once."""
+
+from services.agent_tool_spec import (
+    edit_ladder as _edit_ladder,
+    limits_block as _limits_block,
+    DEFAULT_MAX_TURNS as _DEFAULT_MAX_TURNS,
+)
+
+def _natural_tag(family):
+    """Tag-form tool text. The edit ladder is the only family-specific part."""
+    fam = "gpt" if family == "gemini" else family
+    after = _NATURAL_AFTER_LADDER
+    heading = "━━━ EDITING EXISTING FILES ━━━\n"
+    if after.startswith(heading):
+        rest = after[len(heading):].lstrip("\n")
+        editing = heading + "\n" + _edit_ladder("tag", fam) + "\n\n" + rest
+    else:
+        editing = _edit_ladder("tag", fam) + "\n\n" + after
+    return (
+        _limits_block("tag", _DEFAULT_MAX_TURNS)
+        + "\n\n"
+        + _NATURAL_BEFORE_LADDER
+        + editing
+    )
+
+
+def _assemble_natural(family):
+    return _NATURAL_HEAD + _natural_tag(family) + _NATURAL_TAIL
+
+
+def grok_natural_system():
+    """Tag-free system text for Grok.
+
+    The edit ladder, plan rule, and limits live once in the native-tool suffix.
+    """
+    return _NATURAL_HEAD + _NATURAL_TAIL
+
+
+_NATURAL_TAG = _natural_tag("claude")
+_NATURAL_TAIL = "\n" + _CODE_QUALITY_SECTION
+NATURAL_SYSTEM = _NATURAL_HEAD + _NATURAL_TAG + _NATURAL_TAIL
+
 
 # ── Inject comprehensive quality rules into single-pass prompt ────────────
 # _CODE_QUALITY_SECTION covers CSS, React, TypeScript, state, error handling,
 # and structural integrity — same rules the agentic architect gets.
-NATURAL_SYSTEM = NATURAL_SYSTEM + "\n" + _CODE_QUALITY_SECTION
 
 
 def _score_symbol_relevance(sym, terms: list) -> int:
@@ -18278,11 +18309,13 @@ async def run_natural_pipeline_stream(
         _repo_ctx = None
         _repo_guidance = ""
         try:
-            from services.repo_tools import session_repo as _session_repo, prompt_section as _repo_prompt
+            from services.repo_tools import session_repo as _session_repo
+            from services.agent_tool_spec import repo_text as _repo_text_fn
             if not str(arch_model or "").startswith("ollama:"):
                 _repo_ctx = _session_repo(session_id)
             if _repo_ctx:
-                _repo_guidance = _repo_prompt(_repo_ctx)
+                _repo_form = "function" if _is_grok_model(arch_model) else "tag"
+                _repo_guidance = _repo_text_fn(_repo_form, _repo_ctx)
                 TAG_DEFS["repo"] = {"open": "<repo_request>", "close": "</repo_request>"}
                 system_prompt.append({"type": "text", "text": _repo_guidance})
                 _dlog("natural_repo_tag_registered", session_id=session_id, user_id=user_id,
@@ -18406,46 +18439,31 @@ async def run_natural_pipeline_stream(
 
         # ── GPT system text (R25): plain string for OpenAI messages ────────
         if not _natural_use_claude:
-            _gpt_system_text = "\n\n".join(
-                b["text"] for b in system_prompt
-                if isinstance(b, dict) and "text" in b
-            )
-            # ── GPT-only content-anchor override (session e387acd9 evidence) ──
-            # The shared prompt above tells every model "PREFER
-            # edit_start_line/edit_end_line whenever you can see line
-            # numbers." Claude follows that reliably. GPT does not: trace
-            # e387acd9 showed 5/5 gap-bridge escalations on a 1050-line file
-            # were GPT edits with edit_start_line set and old_code EMPTY,
-            # and the line numbers landed outside the named symbol (one
-            # request even pointed past end-of-file). Because there was no
-            # old_code, the content-match recovery path (Strategy 2) never
-            # ran, so a single bad line number destroyed the whole edit.
-            # This block is Claude-untouched: it only appends to
-            # _gpt_system_text, which is never used on the Claude branch.
-            _gpt_system_text += (
-                "\n\n━━━ IMPORTANT — LINE NUMBERS FOR THIS MODEL ━━━\n"
-                "You (this model) have been observed miscounting exact file "
-                "line numbers on large files, which silently destroys edits. "
-                "For every <surgical_edit> you emit:\n"
-                "- ALWAYS include \"old_code\" with the exact original text "
-                "you are replacing, copied verbatim — this is your primary "
-                "anchor, not the line numbers.\n"
-                "- edit_start_line/edit_end_line are OPTIONAL extra context "
-                "for you; they are not required and are not a substitute "
-                "for old_code.\n"
-                "- Never omit old_code just because you can see line "
-                "numbers in the file listing — your line counting on large "
-                "files is not reliable enough to use alone.\n"
-            )
-            _dlog("gpt_content_anchor_prompt_override_applied",
-                  session_id=session_id, model=arch_model,
-                  override_chars=len(_gpt_system_text), user_id=user_id)
+            from services.agent_tool_spec import data_file_section as _data_file_section
+            _gpt_pieces = []
+            for _blk in system_prompt:
+                if not (isinstance(_blk, dict) and "text" in _blk):
+                    continue
+                _piece = _blk["text"]
+                if _is_grok_model(arch_model):
+                    if _piece == NATURAL_SYSTEM:
+                        _piece = grok_natural_system()
+                    elif _piece == _NATURAL_DATA_SECTION:
+                        _piece = _data_file_section("function")
+                elif _piece == NATURAL_SYSTEM:
+                    # GPT and Gemini: old_code is required. Claude keeps NATURAL_SYSTEM.
+                    _piece = _assemble_natural("gpt")
+                _gpt_pieces.append(_piece)
+            _gpt_system_text = "\n\n".join(_gpt_pieces)
+            if not _is_grok_model(arch_model):
+                # Session e387acd9: GPT sent line numbers and no old_code.
+                # The anchor rule is inside _assemble_natural("gpt"), once.
+                _dlog("gpt_content_anchor_prompt_override_applied",
+                      session_id=session_id, model=arch_model,
+                      override_chars=len(_gpt_system_text), user_id=user_id)
 
-            # ── Grok-only: append a NATIVE-TOOL projection ────────────────
-            # Grok is driven by real function tools (passed as `tools=` at
-            # the call site below), not the XML-tag contract the shared
-            # prompt describes. Appended to `_gpt_system_text`, which the
-            # Claude branch never uses, so Claude/GPT prompts are unchanged.
+            # Grok's system text is tag-free except the GitHub catalogue, which
+            # stays as shipped. The suffix tells Grok to call function tools.
             if _is_grok_model(arch_model):
                 _grok_sys_suffix = _grok_build_system_suffix(
                     mode=("agent" if is_agent_task else "edit"),
@@ -18855,10 +18873,7 @@ async def run_natural_pipeline_stream(
             websearch_enabled=_oa_search_enabled and not _is_grok_model(arch_model),
             mcp_guidance=(("\n" + _natural_mcp_guidance + "\n") if _natural_mcp_guidance else ""),
             repo_guidance=(
-                "• <repo_request> — read the open local folder "
-                "(list_repo_files, read_repo_file, search_repo, git_status). "
-                "Edits stay staged until the user applies them.\n"
-                if _repo_ctx else ""
+                _repo_text_fn("tag", _repo_ctx) + "\n" if _repo_ctx else ""
             ),
         )
 
