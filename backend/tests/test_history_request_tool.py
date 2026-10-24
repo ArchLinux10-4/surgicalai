@@ -192,6 +192,173 @@ def test_parse_history_content_requires_filename():
     assert _parse_history_content('[]') is None
 
 
+def _three_versions(database, session_files):
+    session_id, file_id = "hist-views", "hist-file"
+    _seed_file(database, session_id, file_id, "app.py", "print('v1 ORIGINAL')")
+    session_files.update_session_file(
+        session_id, file_id,
+        {"content": "print('v2 MIDDLE')", "label": "Edit A"},
+        request=fake_request(),
+    )
+    session_files.update_session_file(
+        session_id, file_id,
+        {"content": "print('v3 CURRENT')", "label": "Edit B"},
+        request=fake_request(),
+    )
+    return session_id
+
+
+def test_version_list_numbers_oldest_first_with_labels(isolated_db):
+    database, session_files = isolated_db
+    session_id = _three_versions(database, session_files)
+    result = session_files.search_file_version_history(session_id, "app.py", view="list")
+    assert result["found"] is True
+    text = result["content"]
+    assert "1. before \"Edit A\"" in text
+    assert "2. before \"Edit B\"" in text
+    assert text.index("Edit A") < text.index("Edit B")
+    assert "v3 CURRENT" not in text
+    assert "Not the current file" in text
+
+
+def test_version_last_is_the_state_before_the_latest_edit(isolated_db):
+    database, session_files = isolated_db
+    session_id = _three_versions(database, session_files)
+    result = session_files.search_file_version_history(session_id, "app.py", version="last")
+    assert result["found"] is True
+    assert "v2 MIDDLE" in result["content"]
+    assert "v3 CURRENT" not in result["content"]
+    assert "before the edit labelled \"Edit B\"" in result["content"]
+    assert "HISTORICAL" in result["content"] and "NOT the current file" in result["content"]
+
+
+def test_version_first_matches_the_call_with_no_extra_fields(isolated_db):
+    database, session_files = isolated_db
+    session_id = _three_versions(database, session_files)
+    plain = session_files.search_file_version_history(session_id, "app.py")
+    first = session_files.search_file_version_history(session_id, "app.py", version="first")
+    assert plain["content"] == first["content"]
+    assert "v1 ORIGINAL" in plain["content"]
+    assert "v3 CURRENT" not in plain["content"]
+
+
+def test_version_out_of_range_reports_the_count(isolated_db):
+    database, session_files = isolated_db
+    session_id = _three_versions(database, session_files)
+    result = session_files.search_file_version_history(session_id, "app.py", version=9)
+    assert result["found"] is False
+    assert "has 2 saved version(s)" in result["message"]
+    assert "Version 9" in result["message"]
+
+
+def test_diff_against_current_shows_the_removed_and_added_lines(isolated_db):
+    database, session_files = isolated_db
+    session_id = _three_versions(database, session_files)
+    result = session_files.search_file_version_history(
+        session_id, "app.py", version="last", view="diff")
+    assert result["found"] is True
+    text = result["content"]
+    assert "compared with the current file" in text
+    assert "-print('v2 MIDDLE')" in text
+    assert "+print('v3 CURRENT')" in text
+
+
+def test_diff_between_two_versions_excludes_the_current_file(isolated_db):
+    database, session_files = isolated_db
+    session_id = _three_versions(database, session_files)
+    result = session_files.search_file_version_history(
+        session_id, "app.py", version="1", view="diff", compare_to=2)
+    assert result["found"] is True
+    text = result["content"]
+    assert "v1 ORIGINAL" in text and "v2 MIDDLE" in text
+    assert "v3 CURRENT" not in text
+    assert "compared with version 2" in text
+
+
+def test_list_of_an_unedited_file_says_the_current_file_is_the_original(isolated_db):
+    database, session_files = isolated_db
+    _seed_file(database, "plain", "f", "app.py", "print('only')")
+    result = session_files.search_file_version_history("plain", "app.py", view="list")
+    assert result["found"] is False
+    assert "CURRENT file IS the original" in result["message"]
+
+
+def test_search_hit_names_its_version_number(isolated_db):
+    database, session_files = isolated_db
+    session_id, file_id = "search-n", "f"
+    _seed_file(database, session_id, file_id, "app.py", "def old_helper():\n    return 1\n")
+    session_files.update_session_file(
+        session_id, file_id,
+        {"content": "def new_helper():\n    return 2\n", "label": "Rename"},
+        request=fake_request(),
+    )
+    result = session_files.search_file_version_history(session_id, "app.py", query="old_helper")
+    assert result["found"] is True
+    assert "version 1" in result["matches"][0]
+
+
+def test_version_list_stays_inside_the_session(isolated_db):
+    database, session_files = isolated_db
+    _seed_file(database, "session-A", "fA", "shared.py", "print('session A v1')")
+    session_files.update_session_file(
+        "session-A", "fA",
+        {"content": "print('session A v2')", "label": "Edit A"},
+        request=fake_request(),
+    )
+    _seed_file(database, "session-B", "fB", "shared.py", "print('session B v1')")
+    session_files.update_session_file(
+        "session-B", "fB",
+        {"content": "print('session B v2')", "label": "Edit B"},
+        request=fake_request(),
+    )
+    listed = session_files.search_file_version_history("session-A", "shared.py", view="list")
+    assert "Edit A" in listed["content"]
+    assert "Edit B" not in listed["content"]
+    assert "session B" not in listed["content"]
+
+
+def test_version_list_keeps_real_numbers_when_it_is_cut(isolated_db, monkeypatch):
+    database, session_files = isolated_db
+    assert session_files._HISTORY_LIST_CAP == 50
+    monkeypatch.setattr(session_files, "_HISTORY_LIST_CAP", 2)
+    session_id, file_id = "capped", "f"
+    _seed_file(database, session_id, file_id, "app.py", "print('v0')")
+    for i in range(1, 4):
+        session_files.update_session_file(
+            session_id, file_id,
+            {"content": f"print('v{i}')", "label": f"Edit {i}"},
+            request=fake_request(),
+        )
+    result = session_files.search_file_version_history(session_id, "app.py", view="list")
+    text = result["content"]
+    assert "were left out" in text
+    assert "\n2. before \"Edit 2\"" in text
+    assert "\n3. before \"Edit 3\"" in text
+    assert "\n1. before" not in text
+
+
+def test_history_diff_is_cut_with_a_footer(isolated_db, monkeypatch):
+    database, session_files = isolated_db
+    monkeypatch.setattr(session_files, "_HISTORY_DIFF_LINES", 2)
+    session_id = _three_versions(database, session_files)
+    result = session_files.search_file_version_history(
+        session_id, "app.py", version="last", view="diff")
+    assert "Output cut at 2 lines." in result["content"]
+
+
+def test_parse_history_content_keeps_new_fields_only_when_valid():
+    from services.pipeline import _parse_history_content
+    assert _parse_history_content(
+        '{"filename": "app.py", "view": "Diff", "version": "Last", "compare_to": 2}'
+    ) == {
+        "filename": "app.py", "query": None,
+        "view": "diff", "version": "last", "compare_to": 2,
+    }
+    assert _parse_history_content(
+        '{"filename": "app.py", "view": "patch", "version": "soon", "compare_to": 0}'
+    ) == {"filename": "app.py", "query": None}
+
+
 def test_history_tag_only_registered_for_agent_task():
     """Structural gate: TAG_DEFS must only ever contain "history" for
     Agent Mode calls (is_agent_task=True) — never for single-pass chat/edit,

@@ -7,6 +7,7 @@ from services.agent_tool_spec import (
     DEFAULT_MAX_TURNS,
     MAX_FILES_PER_REQUEST,
     MAX_SEARCH_TERMS,
+    history_text,
     limits_block,
     repo_text,
     scope_block,
@@ -289,6 +290,20 @@ def test_git_diff_is_described_for_both_forms():
     }
     _kind, plain = _context_body("request_repo", {"tool": "git_status"})
     assert json.loads(plain) == {"tool": "git_status", "path": "", "terms": []}
+
+
+def test_history_text_names_the_three_views():
+    for form in ("tag", "function"):
+        text = history_text(form)
+        assert "view list" in text
+        assert "one version's content" in text
+        assert "view diff" in text
+        assert "read only" in text
+        assert "git_diff" in text
+        assert "HISTORICAL" in text
+        assert "diff_branches" in text
+    assert "<history_request>" in history_text("tag")
+    assert "<" not in history_text("function")
 
 
 def test_limits_use_the_real_constants():
