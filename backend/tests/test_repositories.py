@@ -256,6 +256,27 @@ def test_stage_apply_drift_undo_and_auto_apply(env):
     assert (folder / "app.py").read_text(encoding="utf-8") == "print('auto')\n"
 
 
+def test_list_directories_uses_browse_root(env, monkeypatch):
+    root = env["tmp"] / "mac-home"
+    root.mkdir()
+    (root / "projects").mkdir()
+    monkeypatch.setenv("SURGICALAI_BROWSE_ROOT", str(root))
+    res = env["client"].get("/api/repositories/fs")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["path"] == os.path.realpath(str(root))
+    assert body["entries"] == [{
+        "name": "projects",
+        "path": os.path.realpath(str(root / "projects")),
+    }]
+
+    other = env["tmp"] / "other"
+    other.mkdir()
+    chosen = env["client"].get("/api/repositories/fs", params={"path": str(other)})
+    assert chosen.status_code == 200
+    assert chosen.json()["path"] == os.path.realpath(str(other))
+
+
 def test_repo_tools_are_opt_in():
     from services.grok_agent_tools import TOOL_REQUEST_REPO, build_grok_agent_tools
     from services.repo_tools import execute_repo_tool, prompt_section

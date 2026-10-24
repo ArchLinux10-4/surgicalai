@@ -1,0 +1,26 @@
+services:
+  surgicalai:
+    build: .
+    image: surgicalai:latest
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${SURGICALAI_PORT:-8000}:8000"
+    environment:
+      SURGICALAI_BROWSE_ROOT: /Users/pm
+      # Do not set DATABASE_URL. That switches the app to hosted mode and turns Open Folder off.
+      # Do not set JWT_SECRET. Saved API keys and AWS credentials decrypt with the secret stored in the database.
+    volumes:
+      - surgicalai-data:/root/.surgicalai
+      - /Users/pm:/Users/pm
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  surgicalai-data:
+    name: surgicalai-data
+    external: true
