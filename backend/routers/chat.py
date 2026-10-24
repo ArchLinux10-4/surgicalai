@@ -701,9 +701,8 @@ def get_messages(session_id: str, request: Request):
                 _mdl = _meta.get("model")
                 if _mdl:
                     d["_model"] = _mdl
-                # Claude-only web research (Ask/Plan mode) — see
-                # services/claude_web_search.py. Absent for every other
-                # message; frontend only renders the Sources card when set.
+                # Web research sources (Claude, GPT, or Grok). Absent when the
+                # turn did not search; the frontend renders Sources only when set.
                 _wss = _meta.get("web_search_sources")
                 if _wss:
                     d["_sources"] = _wss
@@ -1266,14 +1265,14 @@ async def smart_stream(req: dict, request: Request):
     mode = _normalize_mode(req.get("mode"))
     current_user_id = getattr(request.state, "user_id", "") or ""
 
-    # v1.7: "research before editing" checkbox — Claude-only, Edit/Agent mode.
+    # v1.7: "research before editing" checkbox. Claude, GPT, and Grok, all modes.
     # Distinct from the global Ask/Plan `web_search_enabled` Settings toggle:
     # this is a one-shot, per-message opt-in the frontend sends only when the
     # user has checked the box for this request. Persisted per-session (not
     # global) so tasks spawned from this message (execute_task / task_runner)
     # keep the capability for the life of the task run, without ever
-    # affecting other sessions or Ask/Plan's separate toggle. See
-    # services/claude_web_search.py for the underlying tool.
+    # affecting other sessions or Ask/Plan's separate toggle. Claude uses
+    # services/claude_web_search.py. GPT and Grok use services/openai_web_search.py.
     _enable_web_research = bool(req.get("enable_web_research", False))
     if session_id:
         set_setting(f"web_search_research_session_{session_id}",
@@ -1448,7 +1447,7 @@ async def smart_stream(req: dict, request: Request):
             _mode_collected = []
             _mode_error = False
             _mode_model = None  # captured from run_chat_stream's `done` event
-            _mode_web_search_sources: list = []  # Claude-only (Ask/Plan) — see claude_web_search.py
+            _mode_web_search_sources: list = []  # Ask/Plan sources — Claude, GPT, or Grok
             _plan_event = None  # plan_ready / plan_updated — set once after persist
             _plan_needs_retry = False
             _plan_questions = None  # validated clarifying questions, if this turn asked

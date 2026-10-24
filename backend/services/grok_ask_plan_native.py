@@ -196,6 +196,9 @@ async def run_grok_ask_plan_native_stream(
     dlog: Optional[Callable] = None,
     history_enabled: bool = False,
     aws_enabled: bool = False,
+    websearch_enabled: bool = False,
+    openai_client=None,
+    web_search_sources: Optional[list] = None,
     client_inbox=None,
 ):
     """Native-tool-calling Ask/Plan loop for Grok. Yields raw SSE strings.
@@ -219,7 +222,7 @@ async def run_grok_ask_plan_native_stream(
 
     tools = build_grok_agent_tools(
         mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
-        aws_enabled=aws_enabled,
+        aws_enabled=aws_enabled, websearch_enabled=websearch_enabled,
         dlog=dlog, session_id=session_id, user_id=user_id,
     )
 
@@ -232,7 +235,7 @@ async def run_grok_ask_plan_native_stream(
         if m.get("role") == "system":
             suffix = build_grok_system_suffix(
                 mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
-                aws_enabled=aws_enabled,
+                aws_enabled=aws_enabled, websearch_enabled=websearch_enabled,
                 dlog=dlog, session_id=session_id, user_id=user_id,
             )
             messages[i] = {**m, "content": (m.get("content") or "") + suffix}
@@ -259,6 +262,10 @@ async def run_grok_ask_plan_native_stream(
 
     tool_round = 0
     _aws_calls = 0
+    _ws_budget = None
+    if websearch_enabled:
+        from services.openai_web_search import SearchBudget as _WsBudget
+        _ws_budget = _WsBudget()
     while True:
         elapsed = time.time() - t0
         if elapsed >= deadline_s or tool_round >= max_rounds:
@@ -377,7 +384,56 @@ async def run_grok_ask_plan_native_stream(
         context_result = None
         if translated.context_request is not None:
             tag_kind, body = translated.context_request
-            if tag_kind == "aws":
+            if tag_kind == "websearch":
+                import asyncio
+                from services.openai_web_search import (
+                    INVALID_NOTE as _ws_invalid,
+                    feedback_text as _ws_feedback,
+                    merge_sources as _ws_merge,
+                    parse_web_search_request as _parse_ws,
+                    perform_search as _ws_perform,
+                    sse_events as _ws_events,
+                )
+                _ws_parsed = _parse_ws(body if isinstance(body, str) else "")
+                if not _ws_parsed:
+                    context_result = _ws_invalid
+                elif openai_client is None or _ws_budget is None:
+                    context_result = "Web search is not available."
+                else:
+                    _ws_query = _ws_parsed["query"]
+                    _ws_status, _ws_note = _ws_budget.check(_ws_query)
+                    if _ws_status != "ok":
+                        context_result = _ws_note or "Web search was not run."
+                        dlog("grok_ask_plan_web_search_skipped", session_id=session_id,
+                             user_id=user_id, tool_round=tool_round, status=_ws_status,
+                             query=_ws_query[:200])
+                    else:
+                        dlog("grok_ask_plan_web_search_requested", session_id=session_id,
+                             user_id=user_id, tool_round=tool_round, query=_ws_query[:200])
+                        for _ws_ev in _ws_events(_ws_query, {"sources": [], "error": None})[:2]:
+                            yield _sse(_ws_ev)
+                        try:
+                            _ws_result = await asyncio.to_thread(
+                                _ws_perform, openai_client, _ws_query, _ws_budget)
+                        except Exception as _ws_err:
+                            _ws_result = {
+                                "text": "", "queries": [], "sources": [],
+                                "error": str(_ws_err)[:200],
+                            }
+                            _ws_budget.record(False, _ws_query)
+                            dlog("grok_ask_plan_web_search_error", session_id=session_id,
+                                 user_id=user_id, error=str(_ws_err)[:200])
+                        for _ws_ev in _ws_events(_ws_query, _ws_result)[2:]:
+                            yield _sse(_ws_ev)
+                        if isinstance(web_search_sources, list):
+                            web_search_sources[:] = _ws_merge(
+                                web_search_sources, _ws_result.get("sources") or [])
+                        context_result = _ws_feedback(_ws_query, _ws_result)
+                        dlog("grok_ask_plan_web_search_done", session_id=session_id,
+                             user_id=user_id, tool_round=tool_round,
+                             source_count=len(_ws_result.get("sources") or []),
+                             error=(_ws_result.get("error") or "")[:200])
+            elif tag_kind == "aws":
                 from services.aws_cli import resolve_aws_call, split_intent
                 _aws_intent, _aws_cmd = split_intent(str(body))
                 _aws_done = {"note": "", "counted": False, "run": False}

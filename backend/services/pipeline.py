@@ -4376,7 +4376,7 @@ def _gh_prompt_bits(known_repos) -> str:
 
 def _ask_plan_build_tool_instructions(
     *, has_files: bool, gh_enabled: bool, gh_known_repos: list, max_rounds: int,
-    aws_enabled: bool = False,
+    aws_enabled: bool = False, websearch_enabled: bool = False,
 ) -> str:
     """
     Composes the Ask/Plan tool-instructions system-prompt block from
@@ -4443,6 +4443,15 @@ def _ask_plan_build_tool_instructions(
         from services.aws_cli import aws_agent_guidance
         tag_blocks.append(aws_agent_guidance())
 
+    if websearch_enabled:
+        tag_blocks.append(
+            '<web_search_request>{"query": "what to look up", "reason": "why"}'
+            "</web_search_request>\n"
+            "Use to search the public web for current documentation, versions, "
+            "or error messages. Put only the question in query. Do not include "
+            "code, file names, or secrets."
+        )
+
     parts.append("\n\n".join(tag_blocks))
     parts.append(
         "Emit ONLY ONE tag at a time, then STOP your response immediately — "
@@ -4463,6 +4472,7 @@ def _ask_plan_strip_tool_tags(text: str) -> str:
     text = re.sub(r'<github_request>.*?</github_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<history_request>.*?</history_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<aws_cli>.*?</aws_cli>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<web_search_request>.*?</web_search_request>', '', text, flags=re.DOTALL)
     return text.strip()
 
 
@@ -4725,8 +4735,32 @@ async def run_chat_stream(
     # neither files nor GitHub are available, the loop stays off so the
     # legacy live-token streaming path (byte-identical to before this fix)
     # still runs for plain chat with nothing to search.
+    # GPT and Grok can search the web when Research is on. This alone is
+    # enough to enter the tool loop, so a question with no files still searches.
+    # Gemini and Ollama are excluded by model_uses_openai_web_search.
+    _oa_search_enabled = False
+    _oa_search_client = None
+    try:
+        from services.openai_web_search import (
+            model_uses_openai_web_search as _oa_model_ok,
+            search_available as _oa_search_available,
+        )
+        if web_search_enabled and _oa_model_ok(chat_model) and not _ask_plan_is_ollama:
+            _oa_search_enabled = bool(_oa_search_available(user_id))
+        if _oa_search_enabled:
+            _oa_search_client = _get_client(user_id)
+    except Exception as _oa_gate_err:
+        _oa_search_enabled = False
+        _oa_search_client = None
+        _dlog("openai_web_search_gate_error", session_id=session_id,
+              user_id=user_id, error=str(_oa_gate_err)[:200])
+    _ask_plan_websearch = _oa_search_enabled and not _is_grok_model(chat_model)
+    _dlog("openai_web_search_gate", session_id=session_id, user_id=user_id,
+          model=chat_model, requested=web_search_enabled,
+          enabled=_oa_search_enabled, tag_tool=_ask_plan_websearch)
     _ask_plan_tools_enabled = (
-        (_ask_plan_has_files or _gh_nat_enabled or _aws_connected) and not _ask_plan_is_ollama
+        (_ask_plan_has_files or _gh_nat_enabled or _aws_connected or _oa_search_enabled)
+        and not _ask_plan_is_ollama
     )
     _dlog("ask_plan_tools_gate_evaluated", session_id=session_id, user_id=user_id,
           model=chat_model, has_files=_ask_plan_has_files,
@@ -4811,10 +4845,51 @@ async def run_chat_stream(
         system_parts.append(_ask_plan_build_tool_instructions(
             has_files=_ask_plan_has_files, gh_enabled=_gh_nat_enabled,
             gh_known_repos=_gh_known_repos, max_rounds=_ASK_PLAN_MAX_ROUNDS,
-            aws_enabled=_aws_connected))
+            aws_enabled=_aws_connected, websearch_enabled=_ask_plan_websearch))
         _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
               model=chat_model, num_files=len(file_content_lookup),
               github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
+
+    # Research is off, but the user clearly asked for a web search. Tell the
+    # model to say so. Appended here, not inside the tool-instruction builder,
+    # so a turn with no hint is unchanged. Ask/Plan also honors the legacy
+    # global web_search_enabled toggle, so that counts as "on".
+    try:
+        from services.research_intent import (
+            message_requests_web_research as _asks_research,
+            research_off_hint as _research_off_hint,
+        )
+        _ask_plan_research_on = bool(web_search_enabled) or (
+            str(get_setting("web_search_enabled", "false")).lower() == "true"
+        )
+        _ask_user_text = ""
+        for _um in reversed(messages or []):
+            if isinstance(_um, dict) and _um.get("role") == "user":
+                _uc = _um.get("content")
+                if isinstance(_uc, str):
+                    _ask_user_text = _uc
+                elif isinstance(_uc, list):
+                    _ask_user_text = " ".join(
+                        p.get("text", "") for p in _uc
+                        if isinstance(p, dict) and isinstance(p.get("text"), str)
+                    )
+                break
+        _research_hint = ""
+        # Key lookup only when a hint is possible. Ordinary messages skip it.
+        if not _ask_plan_research_on and _asks_research(_ask_user_text):
+            from services.openai_web_search import research_offered as _research_offered
+            _research_hint = _research_off_hint(
+                _ask_user_text,
+                flag_on=False,
+                offered=_research_offered(chat_model, user_id),
+                is_agent_task=False,
+            )
+    except Exception as _hint_err:
+        _research_hint = ""
+        _dlog("research_off_hint_error", session_id=session_id, user_id=user_id,
+              error=str(_hint_err)[:200])
+    if _research_hint:
+        system_parts.append("\n" + _research_hint)
 
     if symbol_context:
         system_parts.append(f"\nFocused symbol context:\n```\n{symbol_context}\n```")
@@ -4853,6 +4928,9 @@ async def run_chat_stream(
                 # not is_agent_task, this is Ask/Plan, not Edit/Agent.
                 history_enabled=_ask_plan_has_files,
                 aws_enabled=_aws_connected,
+                websearch_enabled=_oa_search_enabled,
+                openai_client=_oa_search_client,
+                web_search_sources=_web_search_sources_final,
                 client_inbox=client_inbox,
                 symbol_maps_by_name=symbol_maps_by_name,
                 file_content_lookup=file_content_lookup,
@@ -4876,6 +4954,10 @@ async def run_chat_stream(
             _oai_msgs = list(all_messages)
             _tool_round = 0
             _aws_calls = 0
+            _oa_budget = None
+            if _ask_plan_websearch:
+                from services.openai_web_search import SearchBudget as _OaSearchBudget
+                _oa_budget = _OaSearchBudget()
             while True:
                 _dlog("run_chat_stream_openai_compat", model=chat_model, user_id=user_id,
                       session_id=session_id, tool_round=_tool_round,
@@ -4909,13 +4991,22 @@ async def run_chat_stream(
                     re.search(r'<aws_cli>\s*(.*?)\s*</aws_cli>', _round_text, re.DOTALL)
                     if _aws_connected else None
                 )
+                _wr_match = (
+                    re.search(
+                        r'<web_search_request>\s*(.*?)\s*</web_search_request>',
+                        _round_text, re.DOTALL)
+                    if _ask_plan_websearch else None
+                )
 
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
-                _ask_plan_no_more_tools = not _sr_match and not _fr_match and not _gr_match and not _hr_match and not _aws_match
+                _ask_plan_no_more_tools = (
+                    not _sr_match and not _fr_match and not _gr_match
+                    and not _hr_match and not _aws_match and not _wr_match
+                )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match or _aws_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _hr_match or _aws_match or _wr_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -4952,6 +5043,59 @@ async def run_chat_stream(
                     if _aws_done.get("counted"):
                         _aws_calls += 1
                     _tool_parts = [_aws_done.get("note") or ""]
+                elif _wr_match:
+                    import asyncio as _ws_asyncio
+                    from services.openai_web_search import (
+                        INVALID_NOTE as _ws_invalid,
+                        feedback_text as _ws_feedback,
+                        merge_sources as _ws_merge,
+                        parse_web_search_request as _parse_ws,
+                        perform_search as _ws_perform,
+                        sse_events as _ws_events,
+                    )
+                    _ws_parsed = _parse_ws(_wr_match.group(1) or "")
+                    if not _ws_parsed:
+                        _tool_parts = [_ws_invalid]
+                    else:
+                        _ws_query = _ws_parsed["query"]
+                        if _oa_budget is None:
+                            _ws_status, _ws_note = ("disabled", "Web search is not available.")
+                        else:
+                            _ws_status, _ws_note = _oa_budget.check(_ws_query)
+                        if _ws_status != "ok":
+                            _dlog("ask_plan_web_search_skipped",
+                                  session_id=session_id, user_id=user_id,
+                                  status=_ws_status, query=_ws_query[:200])
+                            _tool_parts = [_ws_note or "Web search was not run."]
+                        else:
+                            _dlog("ask_plan_web_search_requested",
+                                  session_id=session_id, user_id=user_id,
+                                  query=_ws_query[:200])
+                            for _ws_ev in _ws_events(_ws_query, {"sources": [], "error": None})[:2]:
+                                yield sse(_ws_ev)
+                            try:
+                                _ws_result = await _ws_asyncio.to_thread(
+                                    _ws_perform, _oai_client, _ws_query, _oa_budget)
+                            except Exception as _ws_err:
+                                _ws_result = {
+                                    "text": "", "queries": [], "sources": [],
+                                    "error": str(_ws_err)[:200],
+                                }
+                                if _oa_budget is not None:
+                                    _oa_budget.record(False, _ws_query)
+                                _dlog("ask_plan_web_search_error",
+                                      session_id=session_id, user_id=user_id,
+                                      error=str(_ws_err)[:200])
+                            for _ws_ev in _ws_events(_ws_query, _ws_result)[2:]:
+                                yield sse(_ws_ev)
+                            _web_search_sources_final = _ws_merge(
+                                _web_search_sources_final, _ws_result.get("sources") or [])
+                            _dlog("ask_plan_web_search_done",
+                                  session_id=session_id, user_id=user_id,
+                                  query=_ws_query[:200],
+                                  source_count=len(_ws_result.get("sources") or []),
+                                  error=(_ws_result.get("error") or "")[:200])
+                            _tool_parts = [_ws_feedback(_ws_query, _ws_result)]
                 else:
                     yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 if _tool_parts is None:
@@ -17660,6 +17804,29 @@ async def run_natural_pipeline_stream(
         _natural_web_search_enabled = web_search_enabled and _natural_use_claude
         _natural_ws_tracker = None
         _natural_ws_sources: list = []
+        # GPT and Grok search through a separate OpenAI Responses sub-call.
+        # Claude's gate above is unchanged. Off unless the checkbox, the
+        # kill switch, and an OpenAI key all say yes.
+        _oa_search_enabled = False
+        _oa_budget = None
+        try:
+            from services.openai_web_search import (
+                model_uses_openai_web_search as _oa_model_ok,
+                search_available as _oa_search_available,
+                SearchBudget as _OaSearchBudget,
+            )
+            if web_search_enabled and _oa_model_ok(arch_model):
+                _oa_search_enabled = bool(_oa_search_available(user_id))
+            if _oa_search_enabled:
+                _oa_budget = _OaSearchBudget()
+        except Exception as _oa_gate_err:
+            _oa_search_enabled = False
+            _oa_budget = None
+            _dlog("openai_web_search_gate_error", session_id=session_id,
+                  user_id=user_id, error=str(_oa_gate_err)[:200])
+        _dlog("openai_web_search_gate", session_id=session_id, user_id=user_id,
+              requested=web_search_enabled, model=arch_model,
+              enabled=_oa_search_enabled)
         if _natural_web_search_enabled:
             from services.claude_web_search import (
                 build_web_search_tool as _build_natural_web_search_tool,
@@ -17904,6 +18071,18 @@ async def run_natural_pipeline_stream(
                   session_id=session_id, user_id=user_id,
                   mode=("agent" if is_agent_task else "edit"))
 
+        # GPT only. Grok uses the native request_web_search tool, and Claude
+        # keeps its own server-side search. Not added to _stop_tag_order:
+        # GPT only accepts four stop sequences, so the stream parser captures
+        # this tag the same way it captures aws and preview.
+        if _oa_search_enabled and not _is_grok_model(arch_model):
+            TAG_DEFS["websearch"] = {
+                "open": "<web_search_request>",
+                "close": "</web_search_request>",
+            }
+            _dlog("natural_websearch_tag_registered",
+                  session_id=session_id, user_id=user_id, model=arch_model)
+
         # Preflight defaults to shadow: it logs, and does not reject edits,
         # until the setting is switched to enforce. Preview stays off until
         # preview_tool=on, and then only on Agent turns over the WebSocket.
@@ -17998,6 +18177,7 @@ async def run_natural_pipeline_stream(
                     wants_edit=_wants_edit,
                     preview_enabled=_preview_enabled,
                     preflight_enabled=(_preflight_mode == "enforce"),
+                    websearch_enabled=_oa_search_enabled,
                     dlog=_dlog, session_id=session_id, user_id=user_id)
                 _gpt_system_text += _grok_sys_suffix
                 _dlog("natural_grok_system_suffix_appended",
@@ -18361,6 +18541,10 @@ async def run_natural_pipeline_stream(
                 return ("aws", (_block or "").strip())
             if _kind == "preview":
                 return ("preview", (_block or "").strip())
+            if _kind == "websearch":
+                from services.openai_web_search import parse_web_search_request as _parse_ws
+                _wd = _parse_ws(_block)
+                return ("websearch", _wd if _wd is not None else {"_invalid": (_block or "")[:500]})
             return None
 
         # ---- Unified instruction: every tool is legal on every turn, no phase wall ----
@@ -18380,6 +18564,7 @@ async def run_natural_pipeline_stream(
             aws_guidance=_aws_guidance,
             preview_enabled=_preview_enabled,
             preflight_enabled=(_preflight_mode == "enforce"),
+            websearch_enabled=_oa_search_enabled and not _is_grok_model(arch_model),
         )
 
         # ── Grok-only: native-tool agent instruction (Claude/GPT keep the
@@ -18392,7 +18577,33 @@ async def run_natural_pipeline_stream(
                 wants_edit=_wants_edit,
                 preview_enabled=_preview_enabled,
                 preflight_enabled=(_preflight_mode == "enforce"),
+                websearch_enabled=_oa_search_enabled,
                 dlog=_dlog, session_id=session_id, user_id=user_id)
+
+        # Research is off, but the user clearly asked for a web search.
+        # One append covers Claude, GPT, and Grok, because each of them uses
+        # _active_agent_instruction. Task-runner prompts are skipped.
+        try:
+            from services.research_intent import (
+                message_requests_web_research as _asks_research,
+                research_off_hint as _research_off_hint,
+            )
+            _research_hint = ""
+            if (not is_agent_task and not web_search_enabled
+                    and _asks_research(user_request)):
+                from services.openai_web_search import research_offered as _research_offered
+                _research_hint = _research_off_hint(
+                    user_request,
+                    flag_on=False,
+                    offered=_research_offered(arch_model, user_id),
+                    is_agent_task=False,
+                )
+        except Exception as _hint_err:
+            _research_hint = ""
+            _dlog("research_off_hint_error", session_id=session_id, user_id=user_id,
+                  error=str(_hint_err)[:200])
+        if _research_hint:
+            _active_agent_instruction = _active_agent_instruction + "\n\n" + _research_hint
 
         current_messages = list(messages)
         _last_cm = current_messages[-1] if current_messages else None
@@ -18916,6 +19127,7 @@ async def run_natural_pipeline_stream(
                         history_enabled=_history_enabled,
                         aws_enabled=_aws_connected,
                         preview_enabled=_preview_enabled,
+                        websearch_enabled=_oa_search_enabled,
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
                     # Plan-first gate decides tool_choice: forced write_edit_plan
@@ -19099,7 +19311,7 @@ async def run_natural_pipeline_stream(
                                             # Claude branch above — same proven bug, session
                                             # 71737af0: a model quoting its own tag syntax in
                                             # prose must not trap the rest of its real text). ──
-                                            if (_tag_name in ("search", "filereq", "github", "history", "aws")
+                                            if (_tag_name in ("search", "filereq", "github", "history", "aws", "websearch")
                                                     and not _ctx_shape_checked):
                                                 _ctx_stripped = tag_buf.lstrip()
                                                 if _ctx_stripped:
@@ -19134,7 +19346,7 @@ async def run_natural_pipeline_stream(
                                             if _pd is not None:
                                                 edit_plan_data = _pd
                                             _break_stream = True
-                                        elif _tag_name in ("search", "filereq", "github", "history", "aws"):
+                                        elif _tag_name in ("search", "filereq", "github", "history", "aws", "websearch"):
                                             pending_tool = _capture_request(_tag_name, _content)
                                             _break_stream = True
                                         state = "normal"
@@ -19200,7 +19412,7 @@ async def run_natural_pipeline_stream(
             # ── Recover a context-request tag the stop_sequence halted before closing ──
             if pending_tool is None and state.startswith("in_"):
                 _uc = state[3:]
-                if _uc in ("search", "filereq", "github", "history", "aws"):
+                if _uc in ("search", "filereq", "github", "history", "aws", "websearch"):
                     _ucm = re.search(
                         re.escape(TAG_DEFS[_uc]["open"]) + r"(.*)",
                         full_response, re.DOTALL)
@@ -19393,6 +19605,73 @@ async def run_natural_pipeline_stream(
                 _consecutive_empty_turns = 0
                 _assistant_echo = full_response or "(working…)"
                 _kind, _data = pending_tool
+
+                if _kind == "websearch":
+                    from services.openai_web_search import (
+                        INVALID_NOTE as _ws_invalid,
+                        feedback_text as _ws_feedback,
+                        merge_sources as _ws_merge,
+                        perform_search as _ws_perform,
+                        sse_events as _ws_events,
+                    )
+                    _ws_req = _data if isinstance(_data, dict) else {"_invalid": str(_data)[:500]}
+                    _ws_query = _ws_req.get("query") if isinstance(_ws_req.get("query"), str) else ""
+                    if "_invalid" in _ws_req or not _ws_query:
+                        _dlog("agent_web_search_parse_failed",
+                              session_id=session_id, user_id=user_id, turn=_turn)
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content": _ws_invalid},
+                        ]
+                        continue
+                    _ws_status, _ws_note = ("disabled", "Web search is not available.")
+                    if _oa_budget is not None:
+                        _ws_status, _ws_note = _oa_budget.check(_ws_query)
+                    if _ws_status != "ok":
+                        _dlog("agent_web_search_skipped",
+                              session_id=session_id, user_id=user_id, turn=_turn,
+                              status=_ws_status, query=_ws_query[:200])
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content": _ws_note or "Web search was not run."},
+                        ]
+                        continue
+                    _dlog("agent_web_search_requested",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          query=_ws_query[:200])
+                    for _ws_ev in _ws_events(_ws_query, {"sources": [], "error": None})[:2]:
+                        yield sse(_ws_ev)
+                    try:
+                        _ws_client = _get_client(user_id)
+                        _ws_result = await asyncio.to_thread(
+                            _ws_perform, _ws_client, _ws_query, _oa_budget)
+                    except Exception as _ws_err:
+                        _ws_result = {
+                            "text": "", "queries": [], "sources": [],
+                            "error": str(_ws_err)[:200],
+                        }
+                        if _oa_budget is not None:
+                            _oa_budget.record(False, _ws_query)
+                        _dlog("agent_web_search_error",
+                              session_id=session_id, user_id=user_id, turn=_turn,
+                              error=str(_ws_err)[:200])
+                    for _ws_ev in _ws_events(_ws_query, _ws_result)[2:]:
+                        yield sse(_ws_ev)
+                    try:
+                        _natural_ws_sources = _ws_merge(
+                            _natural_ws_sources, _ws_result.get("sources") or [])
+                    except Exception:
+                        pass
+                    _dlog("agent_web_search_done",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          query=_ws_query[:200],
+                          source_count=len(_ws_result.get("sources") or []),
+                          error=(_ws_result.get("error") or "")[:200])
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": _assistant_echo},
+                        {"role": "user", "content": _ws_feedback(_ws_query, _ws_result)},
+                    ]
+                    continue
 
                 if _kind == "search":
                     raw_terms = _data.get("terms", []) if isinstance(_data, dict) else []
@@ -20733,7 +21012,7 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id,
                           plan_items=len(edit_plan_data) if edit_plan_data else 0)
 
-            elif state.startswith("in_") and state[3:] in ("search", "filereq", "github", "history", "aws"):
+            elif state.startswith("in_") and state[3:] in ("search", "filereq", "github", "history", "aws", "websearch"):
                 # ── Safety net for a stuck context-request tag ──────────────
                 # PROVEN BUG (session 71737af0): unlike in_edit/in_file/in_plan
                 # above, this branch had NO recovery/surface path at all before
