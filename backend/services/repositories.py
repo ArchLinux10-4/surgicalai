@@ -420,7 +420,7 @@ def list_directories(path: str) -> dict:
     """In-app folder browser. Local installs only; the router is 404 when hosted."""
     raw = (path or "").strip()
     if not raw:
-        raw = str(Path.home())
+        raw = os.environ.get("SURGICALAI_BROWSE_ROOT") or str(Path.home())
     real = validate_directory(raw)
     parent = str(Path(real).parent)
     if os.path.realpath(parent) == real:
