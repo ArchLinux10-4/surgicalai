@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 
@@ -11,7 +12,7 @@ from fastapi import HTTPException
 _BACKEND = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _BACKEND)
 
-from routers.aws import ConnectBody, aws_connect  # noqa: E402
+from routers.aws import ConnectBody, aws_connect, aws_status  # noqa: E402
 from services import aws_cli  # noqa: E402
 
 
@@ -690,6 +691,65 @@ def test_cli_version_reads_the_aws_version_line(monkeypatch):
         assert aws_cli.aws_cli_version().startswith("aws-cli/2.15.30")
     finally:
         aws_cli._CLI_VERSION = None
+
+
+def test_status_returns_the_full_access_key_and_hides_the_secret(monkeypatch):
+    secret = "secretvalue123456"
+    token = "session-token-should-stay-on-the-server"
+    key = "AKIAaaaaaaaaaaaaaaaa"
+    monkeypatch.setattr("routers.aws._load_creds", lambda uid: {
+        "access_key_id": key,
+        "secret_access_key": secret,
+        "region": "us-east-2",
+        "session_token": token,
+    })
+    monkeypatch.setattr("routers.aws.aws_cli_version", lambda: "aws-cli/2.19.0")
+    monkeypatch.setattr("routers.aws.sts_identity", lambda *a, **k: {
+        "account": "123456789012",
+        "arn": "arn:aws:iam::123456789012:user/me",
+        "user_id": "AIDAEXAMPLE",
+    })
+
+    body = aws_status(_Req())
+    assert body["connected"] is True
+    assert body["access_key_id"] == key
+    dumped = json.dumps(body)
+    assert secret not in dumped
+    assert token not in dumped
+
+    def _reject(*_a, **_k):
+        raise ValueError("rejected")
+
+    monkeypatch.setattr("routers.aws.sts_identity", _reject)
+    err = aws_status(_Req())
+    assert err["connected"] is False
+    assert err["access_key_id"] == key
+    dumped_err = json.dumps(err)
+    assert secret not in dumped_err
+    assert token not in dumped_err
+
+
+def test_connect_returns_the_full_access_key_and_hides_the_secret(monkeypatch):
+    secret = "secretvalue123456"
+    key = "AKIAEXAMPLEKEY123456"
+    monkeypatch.setattr("routers.aws.sts_identity", lambda *a, **k: {
+        "account": "123456789012",
+        "arn": "arn:aws:iam::123456789012:user/me",
+        "user_id": "AIDAEXAMPLE",
+    })
+    monkeypatch.setattr("routers.aws.aws_cli_version", lambda: "aws-cli/2.19.0")
+    monkeypatch.setattr("routers.aws.encrypt_api_key", lambda raw: raw)
+    monkeypatch.setattr("routers.aws.set_user_api_key", lambda *a, **k: None)
+
+    body = aws_connect(ConnectBody(
+        access_key_id=key,
+        secret_access_key=secret,
+        region="us-east-1",
+    ), _Req())
+    assert body["access_key_id"] == key
+    dumped = json.dumps(body)
+    assert secret not in dumped
+    assert "session_token" not in body
 
 
 def test_cli_version_is_empty_when_aws_is_missing(monkeypatch):
