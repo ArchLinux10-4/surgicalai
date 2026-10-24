@@ -488,13 +488,33 @@ def _schema_request_repo():
                 "properties": {
                     "tool": {
                         "type": "string",
-                        "enum": ["list_repo_files", "read_repo_file", "search_repo", "git_status"],
+                        "enum": [
+                            "list_repo_files", "read_repo_file", "search_repo",
+                            "git_status", "git_diff",
+                        ],
                     },
                     "path": {"type": "string", "description": "Repo-relative path."},
                     "terms": {
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "Search strings for search_repo.",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["unstaged", "staged", "worktree", "range"],
+                        "description": "git_diff only. Omit to compare local HEAD against the repository.",
+                    },
+                    "view": {
+                        "type": "string",
+                        "enum": ["stat", "patch"],
+                        "description": "git_diff only. stat is the default. patch is the unified diff.",
+                    },
+                    "base": {"type": "string", "description": "git_diff range only. The start ref."},
+                    "head": {"type": "string", "description": "git_diff range only. The end ref. Defaults to HEAD."},
+                    "dots": {
+                        "type": "string",
+                        "enum": ["two", "three"],
+                        "description": "git_diff range only. three (the default) is since the two refs diverged.",
                     },
                 },
                 "required": ["tool"],
@@ -1020,6 +1040,12 @@ def _context_body(name, args):
             "path": args.get("path", "") or "",
             "terms": args.get("terms") or [],
         }
+        # Only git_diff reads these, and only when the model sent them, so a
+        # call to the other repo tools keeps its old payload exactly.
+        for field in ("scope", "base", "head", "view", "dots"):
+            sent = args.get(field)
+            if isinstance(sent, str) and sent.strip():
+                payload[field] = sent.strip()
         return "repo", _json.dumps(payload)
     # unreachable given the CONTEXT_TOOLS gate
     return name, _json.dumps(args)

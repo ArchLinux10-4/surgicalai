@@ -8,6 +8,7 @@ from services.agent_tool_spec import (
     MAX_FILES_PER_REQUEST,
     MAX_SEARCH_TERMS,
     limits_block,
+    repo_text,
     scope_block,
 )
 from services.edit_intent import build_xml_agent_instruction
@@ -25,6 +26,7 @@ from services.grok_agent_tools import (
     TOOL_WRITE_EDIT_PLAN,
     TOOL_WRITE_NEW_FILE,
     TOOL_WRITE_SURGICAL_EDIT,
+    _context_body,
     build_grok_agent_instruction,
     build_grok_agent_tools,
     build_grok_system_suffix,
@@ -255,6 +257,38 @@ def test_grok_prompt_has_no_tool_tags_and_no_ignore():
     # Grok to call the function instead. Every other tool tag stays out.
     leaked = _tags(text) - {"aws_cli"}
     assert leaked == set(), leaked
+
+
+def test_git_diff_is_described_for_both_forms():
+    tag = repo_text("tag")
+    function = repo_text("function")
+    for text in (tag, function):
+        assert "git_diff" in text
+        assert "diff_branches" in text
+        assert "does not fetch" in text.lower()
+    assert '<repo_request>{"tool":"git_diff"}</repo_request>' in tag
+    assert "<repo_request>" not in function
+
+    from services.grok_agent_tools import _schema_request_repo
+    enum = _schema_request_repo()["function"]["parameters"]["properties"]["tool"]["enum"]
+    assert "git_diff" in enum
+    props = _schema_request_repo()["function"]["parameters"]["properties"]
+    for field in ("scope", "base", "head", "view", "dots"):
+        assert field in props
+    assert _schema_request_repo()["function"]["parameters"]["required"] == ["tool"]
+
+    _kind, body = _context_body("request_repo", {
+        "tool": "git_diff", "scope": "range", "base": "origin/main",
+        "head": "HEAD", "view": "patch", "dots": "two",
+    })
+    assert _kind == "repo"
+    assert json.loads(body) == {
+        "tool": "git_diff", "path": "", "terms": [],
+        "scope": "range", "base": "origin/main", "head": "HEAD",
+        "view": "patch", "dots": "two",
+    }
+    _kind, plain = _context_body("request_repo", {"tool": "git_status"})
+    assert json.loads(plain) == {"tool": "git_status", "path": "", "terms": []}
 
 
 def test_limits_use_the_real_constants():

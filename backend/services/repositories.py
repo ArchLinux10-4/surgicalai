@@ -77,6 +77,22 @@ def _git(root: str, args: list, timeout: int = 8):
         return 1, "", str(exc)
 
 
+def _git_raw(root: str, args: list, timeout: int = 20):
+    """Like _git, but keeps stdout intact. Diffs need their blank lines and a
+    longer timeout than the 8 seconds _git allows. Never raises."""
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=root,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout or "", (proc.stderr or "").strip()
+    except Exception as exc:
+        return 1, "", str(exc)
+
+
 def detect_git(root: str) -> dict:
     """Branch, origin URL, and whether this folder has uncommitted changes."""
     info = {
@@ -470,6 +486,293 @@ def assert_git_path_allowed(user_id: str, repo_path: str) -> str:
         if resolved == root or resolved.startswith(root + os.sep):
             return resolved
     raise HTTPException(status_code=403, detail="Access denied")
+
+
+# Refs the model may name. Allow-list, so a value can never smuggle a flag
+# or a shell metacharacter. ".." is excluded on purpose: a range is built
+# here from base and head, never taken as one string.
+_REF_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9/._\-~^@{}]*$")
+
+# A patch with no path is only returned whole when it is this short.
+# Anything bigger comes back as a stat plus a note to name the file.
+_PATCH_LINE_CAP = 200
+_DIFF_LINE_CAP = 400
+
+_DIFF_SCOPES = ("unstaged", "staged", "worktree", "range")
+_DIFF_VIEWS = ("stat", "patch")
+
+# Stops a user's git config from coloring output, running an external diff,
+# or applying a textconv filter. quotepath keeps non-ASCII names readable.
+_DIFF_CONFIG = [
+    "-c", "core.quotepath=false",
+    "-c", "diff.external=",
+    # Without a hint, git prints NUL bytes from an untracked file as text.
+    "-c", "diff.attributes.binary=true",
+    "--no-pager",
+]
+
+
+def _safe_ref(value):
+    """(ref, error). Empty means the caller did not give one."""
+    if value is None:
+        return "", ""
+    text = str(value)
+    if text != text.strip() or not text:
+        return "", "" if not text.strip() else "A ref cannot have spaces or newlines."
+    if len(text) > 200 or ".." in text or not _REF_RE.match(text):
+        return "", f"'{text[:60]}' is not a valid git ref."
+    return text, ""
+
+
+def _ref_exists(root: str, ref: str) -> bool:
+    code, _out, _err = _git(root, ["rev-parse", "--verify", "--quiet", ref + "^{commit}"])
+    return code == 0
+
+
+def _resolve_base(root: str):
+    """The ref local HEAD is compared against. Never fetches.
+
+    origin/main first, then whatever origin/HEAD points at, then main.
+    None when the folder has none of them.
+    """
+    if _ref_exists(root, "origin/main"):
+        return "origin/main"
+    code, out, _err = _git(root, ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+    if code == 0 and out and _ref_exists(root, out):
+        return out
+    if _ref_exists(root, "main"):
+        return "main"
+    return None
+
+
+def _diff_args(root: str, git_args: list, rel_path: str):
+    """git_args is the diff verb and its flags. A path goes after --."""
+    args = [*_DIFF_CONFIG, *git_args]
+    if rel_path:
+        args += ["--", rel_path]
+    return _git_raw(root, args)
+
+
+def _cap_lines(text: str, limit: int, footer: str) -> str:
+    lines = text.splitlines()
+    if len(lines) <= limit:
+        return text.rstrip("\n")
+    kept = "\n".join(lines[:limit])
+    return f"{kept}\n{footer.format(n=limit)}"
+
+
+def _rel_inside(root: str, path: str):
+    """(relative posix path, error). Empty path means the whole folder."""
+    if not path:
+        return "", ""
+    try:
+        resolved = resolve_inside(root, path)
+    except HTTPException as exc:
+        return "", str(exc.detail or "Access denied")
+    if not resolved.exists():
+        return "", f"No file named '{path}' in this folder."
+    real_root = os.path.realpath(root)
+    if os.path.realpath(str(resolved)) == real_root:
+        return "", ""
+    rel = str(resolved.relative_to(real_root)).replace(os.sep, "/")
+    return rel, ""
+
+
+def _intent_to_add(root: str, rel_path: str):
+    """Untracked files are invisible to git diff. Mark them intent-to-add for
+    this one command so they show up, then put the index back.
+
+    Returns the paths that were marked, so the caller can unmark them.
+    """
+    code, out, _err = _git(root, ["ls-files", "--others", "--exclude-standard", "--", rel_path or "."])
+    rows = [ln for ln in out.splitlines() if ln.strip()] if code == 0 else []
+    marked = []
+    for name in rows:
+        add_code, _o, _e = _git(root, ["add", "-N", "--", name])
+        if add_code == 0:
+            marked.append(name)
+    return marked
+
+
+def _clear_intent(root: str, marked: list) -> None:
+    if marked:
+        _git(root, ["reset", "-q", "--"] + marked)
+
+
+def _section(root: str, heading: str, git_args: list, rel_path: str, view: str, empty: str) -> str:
+    code, out, err = _diff_args(root, git_args, rel_path)
+    body = out.strip("\n")
+    if code != 0:
+        detail = err or "git diff failed."
+        return f"{heading}\n{detail}"
+    if not body.strip():
+        return f"{heading}\n{empty}"
+    if view == "patch":
+        body = _cap_lines(
+            body, _DIFF_LINE_CAP,
+            "Output cut at {n} lines. Narrow with path, or use view stat for the file list.",
+        )
+    return f"{heading}\n{body}"
+
+
+def git_diff_text(root: str, scope: str = "", base: str = "", head: str = "",
+                  view: str = "", path: str = "", dots: str = "") -> str:
+    """Read-only diff of the open folder. Always returns text, never raises.
+
+    No scope and no refs: committed changes on HEAD since it split from the
+    repo base (three-dot), then uncommitted changes versus HEAD. The base is
+    origin/main, else origin's default branch, else main. Nothing is fetched.
+    """
+    try:
+        return _git_diff_text(root, scope, base, head, view, path, dots)
+    except Exception as exc:
+        return f"git diff failed: {exc}"
+
+
+def _git_diff_text(root: str, scope: str, base: str, head: str, view: str, path: str, dots: str) -> str:
+    git = detect_git(root)
+    if not git["is_git"]:
+        return "This folder is not a git repository."
+
+    scope = (scope or "").strip().lower()
+    view = (view or "").strip().lower() or "stat"
+    if scope and scope not in _DIFF_SCOPES:
+        return f"Unknown diff scope '{scope}'. Use one of: {', '.join(_DIFF_SCOPES)}."
+    if view not in _DIFF_VIEWS:
+        return "Unknown diff view. Use stat or patch."
+    if dots and dots not in ("two", "three"):
+        return "Unknown diff dots. Use two or three."
+
+    rel_path, path_err = _rel_inside(root, (path or "").strip())
+    if path_err:
+        return path_err
+
+    base_ref, base_err = _safe_ref(base)
+    if base_err:
+        return base_err
+    head_ref, head_err = _safe_ref(head)
+    if head_err:
+        return head_err
+
+    if scope in ("unstaged", "staged", "worktree"):
+        return _scoped_diff(root, scope, view, rel_path)
+
+    if scope == "range" or base_ref or head_ref:
+        return _range_diff(root, base_ref, head_ref, view, rel_path, dots or "three")
+
+    return _default_diff(root, view, rel_path)
+
+
+def _stat_or_patch(view: str, rel_path: str):
+    """Flags for one diff, and whether the patch is being withheld for size."""
+    if view == "stat":
+        return ["--stat=200,200", "--no-color"], False
+    if rel_path:
+        return ["--no-color", "--no-ext-diff", "--no-textconv"], False
+    return ["--no-color", "--no-ext-diff", "--no-textconv"], True
+
+
+def _patch_gate(root: str, git_args: list, rel_path: str, heading: str) -> str:
+    """A patch with no path comes back whole only while it stays short."""
+    code, out, err = _diff_args(root, git_args, "")
+    if code != 0:
+        return ""
+    if len(out.splitlines()) <= _PATCH_LINE_CAP:
+        return ""
+    stat_code, stat_out, _stat_err = _diff_args(
+        root, ["diff", "--stat=200,200", "--no-color", *git_args[1:]], "")
+    listing = stat_out.strip("\n") if stat_code == 0 else ""
+    note = "That patch is long. Pass path to see one file."
+    return f"{heading}\n{listing}\n{note}".rstrip()
+
+
+def _scoped_diff(root: str, scope: str, view: str, rel_path: str) -> str:
+    flags, gated = _stat_or_patch(view, rel_path)
+    if scope == "unstaged":
+        label, extra, empty = "Unstaged changes (not yet staged)", [], "No unstaged changes."
+    elif scope == "staged":
+        label, extra, empty = "Staged changes (in the index)", ["--cached"], "No staged changes."
+    else:
+        label, extra, empty = "Uncommitted changes versus HEAD", ["HEAD"], "No uncommitted changes."
+    # Staged changes are already in the index. The other two scopes also
+    # cover files that have never been committed, which git diff hides.
+    marked = [] if scope == "staged" else _intent_to_add(root, rel_path)
+    try:
+        heading = f"{label} ({view})."
+        if gated:
+            withheld = _patch_gate(root, ["diff", *extra, *flags], rel_path, heading)
+            if withheld:
+                return withheld
+        return _section(root, heading, ["diff", *extra, *flags], rel_path, view, empty)
+    finally:
+        _clear_intent(root, marked)
+
+
+def _range_diff(root: str, base_ref: str, head_ref: str, view: str, rel_path: str, dots: str) -> str:
+    if not base_ref:
+        base_ref = _resolve_base(root) or ""
+    if not base_ref:
+        return "No base ref to compare against. This folder has no origin/main and no main."
+    head_ref = head_ref or "HEAD"
+    for ref in (base_ref, head_ref):
+        if ref != "HEAD" and not _ref_exists(root, ref):
+            return f"No ref named '{ref}' in this folder. The remote was not fetched."
+    joiner = "..." if dots == "three" else ".."
+    kind = "since they diverged" if dots == "three" else "between the two tips"
+    heading = f"Changes {kind}: {base_ref}{joiner}{head_ref} ({view}). The remote was not fetched."
+    flags, gated = _stat_or_patch(view, rel_path)
+    spec = f"{base_ref}{joiner}{head_ref}"
+    if gated:
+        withheld = _patch_gate(root, ["diff", spec, *flags], rel_path, heading)
+        if withheld:
+            return withheld
+    return _section(root, heading, ["diff", spec, *flags], rel_path, view, "No changes in that range.")
+
+
+def _default_diff(root: str, view: str, rel_path: str) -> str:
+    base = _resolve_base(root)
+    flags = ["--stat=200,200", "--no-color"] if view == "stat" else ["--no-color", "--no-ext-diff", "--no-textconv"]
+    parts = []
+
+    code, head_out, _err = _git(root, ["rev-parse", "--verify", "--quiet", "HEAD"])
+    has_head = code == 0 and bool(head_out)
+
+    if base and has_head:
+        heading = (
+            f"Local HEAD since it split from {base} ({view}). "
+            "The remote was not fetched, so this is the origin already stored in this folder."
+        )
+        if view == "patch" and not rel_path:
+            withheld = _patch_gate(root, ["diff", f"{base}...HEAD", *flags], "", heading)
+            parts.append(withheld or _section(
+                root, heading, ["diff", f"{base}...HEAD", *flags], "", view,
+                "No committed changes since the base."))
+        else:
+            parts.append(_section(
+                root, heading, ["diff", f"{base}...HEAD", *flags], rel_path, view,
+                "No committed changes since the base."))
+    elif not has_head:
+        parts.append("This folder has no commits yet, so there is nothing to compare against a base.")
+    else:
+        parts.append(
+            "No base ref found. This folder has no origin/main and no main, "
+            "so committed changes cannot be compared. The remote was not fetched."
+        )
+
+    if has_head:
+        heading = f"Uncommitted changes versus HEAD ({view})."
+        marked = _intent_to_add(root, rel_path)
+        try:
+            if view == "patch" and not rel_path:
+                withheld = _patch_gate(root, ["diff", "HEAD", *flags], "", heading)
+                parts.append(withheld or _section(
+                    root, heading, ["diff", "HEAD", *flags], "", view, "No uncommitted changes."))
+            else:
+                parts.append(_section(
+                    root, heading, ["diff", "HEAD", *flags], rel_path, view, "No uncommitted changes."))
+        finally:
+            _clear_intent(root, marked)
+    return "\n\n".join(parts)
 
 
 def git_status_text(root: str) -> str:

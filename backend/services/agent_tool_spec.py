@@ -257,20 +257,32 @@ def repo_text(form="tag", repo=None) -> str:
     else:
         where = "You can read the open local repository."
     when = "Use this for files on disk that are not in this chat yet."
+    diff = (
+        "git_diff shows what changed. With no extra fields it compares your "
+        "local HEAD to the repository (origin/main, or the repo's default "
+        "branch, or main) and also shows uncommitted changes. It does not "
+        "fetch. scope is unstaged, staged, worktree, or range. view is stat "
+        "(the default) or patch. path limits it to one file. base and head "
+        "name the two refs for a range, and dots is two or three. Use "
+        "git_status for just the file list, and GitHub diff_branches only "
+        "for two branches on GitHub."
+    )
     if form == "tag":
         examples = "\n".join([
             '<repo_request>{"tool":"list_repo_files"}</repo_request>',
             '<repo_request>{"tool":"read_repo_file","path":"src/app.py"}</repo_request>',
             '<repo_request>{"tool":"search_repo","terms":["symbol"]}</repo_request>',
             '<repo_request>{"tool":"git_status"}</repo_request>',
+            '<repo_request>{"tool":"git_diff"}</repo_request>',
+            '<repo_request>{"tool":"git_diff","scope":"worktree","view":"patch","path":"backend/app.py"}</repo_request>',
         ])
     else:
         examples = (
             f"Call {n['repo']} with tool list_repo_files, read_repo_file (needs path), "
-            "search_repo (needs terms), or git_status."
+            "search_repo (needs terms), git_status, or git_diff."
         )
     return (
-        f"{where}\n{when}\n{examples}\n"
+        f"{where}\n{when}\n{examples}\n{diff}\n"
         "read_repo_file loads the file into this chat. Edits stay staged until "
         "the user applies them to disk. You cannot run shell commands and you "
         "cannot write to disk."

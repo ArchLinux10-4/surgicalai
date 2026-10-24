@@ -12,6 +12,7 @@ from pathlib import Path
 from database import _dlog
 from services.repositories import (
     detect_git,
+    git_diff_text,
     git_status_text,
     repository_for_session,
     resolve_inside,
@@ -19,7 +20,9 @@ from services.repositories import (
 )
 from services.repo_apply import stage_path
 
-_TOOLS = ("list_repo_files", "read_repo_file", "search_repo", "git_status")
+_TOOLS = ("list_repo_files", "read_repo_file", "search_repo", "git_status", "git_diff")
+_DIFF_FIELDS = ("scope", "base", "head", "view", "dots")
+_DIFF_FIELD_MAX = 200
 _MAX_LIST = 200
 _MAX_HITS = 40
 _MAX_RETURN = 80_000
@@ -55,11 +58,19 @@ def parse_repo_request(raw: str):
         terms = [terms]
     if not isinstance(terms, list):
         terms = []
-    return {
+    parsed = {
         "tool": tool,
         "path": str(data.get("path") or "").strip(),
         "terms": [str(t) for t in terms if str(t).strip()][:8],
     }
+    # Only git_diff reads these, and only when the model actually sent them,
+    # so the parsed shape of the other tools stays exactly as it was.
+    if tool == "git_diff":
+        for field in _DIFF_FIELDS:
+            raw = data.get(field)
+            if isinstance(raw, str) and raw.strip():
+                parsed[field] = raw.strip()[:_DIFF_FIELD_MAX]
+    return parsed
 
 
 def _ignored_walk(root: str, prefix: str):
@@ -151,6 +162,16 @@ def execute_repo_tool(session_id: str, user_id: str, data: dict, session_files=N
         root = repo["root_path"]
         if tool == "git_status":
             return git_status_text(root)
+        if tool == "git_diff":
+            return git_diff_text(
+                root,
+                scope=data.get("scope") or "",
+                base=data.get("base") or "",
+                head=data.get("head") or "",
+                view=data.get("view") or "",
+                path=data.get("path") or "",
+                dots=data.get("dots") or "",
+            )
         if tool == "list_repo_files":
             return _list_files(root, data.get("path") or "")
         if tool == "search_repo":

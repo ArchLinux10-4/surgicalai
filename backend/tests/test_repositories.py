@@ -277,6 +277,26 @@ def test_list_directories_uses_browse_root(env, monkeypatch):
     assert chosen.json()["path"] == os.path.realpath(str(other))
 
 
+def _diff_repo(path):
+    """Two commits plus one dirty line, with origin/main on the first commit."""
+    path.mkdir()
+    _git(path, "init", "-b", "main")
+    _git(path, "config", "user.email", "t@example.com")
+    _git(path, "config", "user.name", "Test")
+    (path / "app.py").write_text("print('base')\n", encoding="utf-8")
+    _git(path, "add", "app.py")
+    _git(path, "commit", "-m", "base")
+    base = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=path, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    _git(path, "update-ref", "refs/remotes/origin/main", base)
+    (path / "app.py").write_text("print('committed')\n", encoding="utf-8")
+    _git(path, "add", "app.py")
+    _git(path, "commit", "-m", "second")
+    (path / "app.py").write_text("print('dirty')\n", encoding="utf-8")
+    return path
+
+
 def test_repo_tools_are_opt_in():
     from services.grok_agent_tools import TOOL_REQUEST_REPO, build_grok_agent_tools
     from services.repo_tools import execute_repo_tool, prompt_section
@@ -290,3 +310,154 @@ def test_repo_tools_are_opt_in():
     assert "cannot run shell commands" in text
     assert "no open folder" in execute_repo_tool("", "", {"tool": "git_status"}).lower() or \
         "no open folder" in execute_repo_tool("missing", "u", {"tool": "git_status"}).lower()
+
+
+def test_git_diff_default_splits_committed_and_uncommitted(tmp_path):
+    from services.repositories import git_diff_text
+    repo = _diff_repo(tmp_path / "repo")
+    text = git_diff_text(str(repo))
+    assert "origin/main" in text.splitlines()[0]
+    assert "not fetched" in text.lower()
+    committed, _, uncommitted = text.partition("\n\n")
+    assert "app.py" in committed and "1 insertion" in committed and "1 deletion" in committed
+    assert "app.py" in uncommitted
+    assert "Uncommitted changes versus HEAD" in uncommitted
+
+
+def test_git_diff_falls_back_to_main_when_origin_is_missing(tmp_path):
+    from services.repositories import git_diff_text
+    repo = _diff_repo(tmp_path / "repo")
+    _git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+    text = git_diff_text(str(repo))
+    assert "split from main " in text
+    assert "origin/main" not in text
+
+
+def test_git_diff_says_when_no_base_exists(tmp_path):
+    from services.repositories import git_diff_text
+    repo = _diff_repo(tmp_path / "repo")
+    _git(repo, "update-ref", "-d", "refs/remotes/origin/main")
+    _git(repo, "branch", "-m", "main", "feature")
+    text = git_diff_text(str(repo))
+    assert "No base ref found" in text
+    assert "Uncommitted changes versus HEAD" in text
+
+
+def test_git_diff_worktree_patch_and_stat(tmp_path):
+    from services.repositories import git_diff_text
+    repo = _diff_repo(tmp_path / "repo")
+    patch = git_diff_text(str(repo), scope="worktree", view="patch", path="app.py")
+    assert "print('dirty')" in patch and "print('committed')" in patch
+    stat = git_diff_text(str(repo), scope="worktree", view="stat")
+    assert "app.py" in stat and "Uncommitted changes versus HEAD (stat)" in stat
+
+
+def test_git_diff_staged_and_unstaged_stay_separate(tmp_path):
+    from services.repositories import git_diff_text
+    repo = _diff_repo(tmp_path / "repo")
+    (repo / "other.py").write_text("print('staged')\n", encoding="utf-8")
+    _git(repo, "add", "other.py")
+    unstaged = git_diff_text(str(repo), scope="unstaged")
+    staged = git_diff_text(str(repo), scope="staged")
+    assert "app.py" in unstaged and "other.py" not in unstaged
+    assert "other.py" in staged and "app.py" not in staged
+
+
+def test_git_diff_range_shows_only_what_is_between(tmp_path):
+    from services.repositories import git_diff_text
+    repo = _diff_repo(tmp_path / "repo")
+    text = git_diff_text(str(repo), scope="range", base="origin/main", head="HEAD")
+    assert "origin/main...HEAD" in text
+    assert "app.py" in text
+    assert "No uncommitted" not in text
+    two = git_diff_text(str(repo), scope="range", base="HEAD", head="HEAD", dots="two")
+    assert "HEAD..HEAD" in two
+    assert "No changes in that range." in two
+
+
+def test_git_diff_rejects_a_path_outside_the_folder(tmp_path):
+    from services.repositories import git_diff_text
+    repo = _diff_repo(tmp_path / "repo")
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret", encoding="utf-8")
+    for bad in ("../elsewhere/secret.txt", str(outside / "secret.txt")):
+        text = git_diff_text(str(repo), path=bad)
+        assert "Access denied" in text
+        assert "secret" not in text
+        assert str(outside) not in text
+
+
+def test_git_diff_rejects_bad_refs_without_running_git(tmp_path, monkeypatch):
+    import services.repositories as repositories
+    repo = _diff_repo(tmp_path / "repo")
+    calls = []
+    real = repositories._git_raw
+
+    def spy(root, args, timeout=20):
+        calls.append(args)
+        return real(root, args, timeout)
+
+    monkeypatch.setattr(repositories, "_git_raw", spy)
+    for bad in ("-p", "origin/main;id", "a b", "main\n--output=/tmp/x"):
+        calls.clear()
+        text = repositories.git_diff_text(str(repo), scope="range", base=bad)
+        assert "not a valid git ref" in text or "cannot have spaces" in text
+        assert calls == []
+
+
+def test_git_diff_non_git_folder_and_detached_head(tmp_path):
+    from services.repositories import git_diff_text
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    assert git_diff_text(str(plain)) == "This folder is not a git repository."
+
+    repo = _diff_repo(tmp_path / "repo")
+    _git(repo, "checkout", "--detach", "HEAD")
+    text = git_diff_text(str(repo))
+    assert "origin/main" in text
+    assert "failed" not in text.lower()
+
+
+def test_git_diff_caps_a_long_patch(tmp_path, monkeypatch):
+    import services.repositories as repositories
+    repo = _diff_repo(tmp_path / "repo")
+    monkeypatch.setattr(repositories, "_PATCH_LINE_CAP", 3)
+    monkeypatch.setattr(repositories, "_DIFF_LINE_CAP", 3)
+    text = repositories.git_diff_text(str(repo), scope="worktree", view="patch", path="app.py")
+    assert "Output cut at 3 lines." in text
+    assert "Narrow with path" in text
+
+
+def test_git_diff_reports_a_binary_file(tmp_path):
+    from services.repositories import git_diff_text
+    repo = _diff_repo(tmp_path / "repo")
+    (repo / "blob.bin").write_bytes(b"\x00\x01\x02")
+    stat = git_diff_text(str(repo), scope="unstaged", view="stat")
+    assert "Bin" in stat and "blob.bin" in stat
+    patch = git_diff_text(str(repo), scope="unstaged", view="patch", path="blob.bin")
+    assert "Binary files" in patch and "differ" in patch
+    assert "\x00" not in patch
+
+
+def test_git_diff_needs_an_open_folder():
+    from services.repo_tools import execute_repo_tool
+    text = execute_repo_tool("missing", "u", {"tool": "git_diff"})
+    assert "no open folder" in text.lower()
+
+
+def test_parse_repo_request_keeps_diff_fields_and_drops_unknown_ones():
+    from services.repo_tools import parse_repo_request
+    parsed = parse_repo_request(
+        '{"tool":"git_diff","scope":"range","base":"origin/main","head":"HEAD",'
+        '"view":"patch","dots":"two","path":"a.py","extra":"ignored"}'
+    )
+    assert parsed == {
+        "tool": "git_diff", "path": "a.py", "terms": [],
+        "scope": "range", "base": "origin/main", "head": "HEAD",
+        "view": "patch", "dots": "two",
+    }
+    other = parse_repo_request('{"tool":"git_status","scope":"range"}')
+    assert other == {"tool": "git_status", "path": "", "terms": []}
+    bad = parse_repo_request('{"tool":"rm"}')
+    assert "git_diff" in bad["_error"]
