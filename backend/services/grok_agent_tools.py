@@ -78,6 +78,7 @@ TOOL_REQUEST_GITHUB = "request_github"
 TOOL_AWS_CLI = "aws_cli"
 TOOL_REQUEST_HISTORY = "request_history"
 TOOL_REQUEST_PREVIEW = "request_preview"
+TOOL_REQUEST_WEB_SEARCH = "request_web_search"
 TOOL_REPORT_BLOCKED = "report_blocked"
 
 WRITE_TOOLS = frozenset({
@@ -85,7 +86,7 @@ WRITE_TOOLS = frozenset({
 })
 CONTEXT_TOOLS = frozenset({
     TOOL_REQUEST_FILE, TOOL_REQUEST_SEARCH, TOOL_REQUEST_GITHUB,
-    TOOL_REQUEST_HISTORY, TOOL_REQUEST_PREVIEW,
+    TOOL_REQUEST_HISTORY, TOOL_REQUEST_PREVIEW, TOOL_REQUEST_WEB_SEARCH,
 })
 
 _EDIT_MODES = frozenset({"edit", "agent"})
@@ -413,8 +414,37 @@ def _schema_request_preview():
     }
 
 
+def _schema_request_web_search():
+    return {
+        "type": "function",
+        "function": {
+            "name": TOOL_REQUEST_WEB_SEARCH,
+            "description": (
+                "Search the public web for current documentation, versions, or "
+                "error messages. The query is sent to a search engine: do not "
+                "include code, file names, or secrets."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The question to look up. No code or secrets.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Why this search is needed.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    }
+
+
 def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=False,
-                           aws_enabled=False, preview_enabled=False, dlog=None,
+                           aws_enabled=False, preview_enabled=False,
+                           websearch_enabled=False, dlog=None,
                            session_id="", user_id=""):
     """Return the OpenAI-style tool schemas Grok should be offered for ``mode``.
 
@@ -448,6 +478,8 @@ def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=Fa
         tools.append(_schema_aws_cli())
     if preview_enabled and m in _EDIT_MODES:
         tools.append(_schema_request_preview())
+    if websearch_enabled:
+        tools.append(_schema_request_web_search())
 
     # report_blocked is meaningful in every mode as a clean terminal signal.
     tools.append(_schema_report_blocked())
@@ -472,6 +504,7 @@ TOOL_PROGRESS_LABELS = {
     TOOL_REQUEST_GITHUB: "Calling request_github…",
     TOOL_REQUEST_HISTORY: "Calling request_history…",
     TOOL_REQUEST_PREVIEW: "Checking the preview…",
+    TOOL_REQUEST_WEB_SEARCH: "Searching the web…",
     TOOL_REPORT_BLOCKED: "Reporting blocked…",
 }
 
@@ -900,6 +933,11 @@ def _context_body(name, args):
         if not isinstance(files, list):
             files = []
         return "preview", _json.dumps({"files": files})
+    if name == TOOL_REQUEST_WEB_SEARCH:
+        payload = {"query": args.get("query", "")}
+        if args.get("reason"):
+            payload["reason"] = args.get("reason")
+        return "websearch", _json.dumps(payload)
     # unreachable given the CONTEXT_TOOLS gate
     return name, _json.dumps(args)
 
@@ -1036,7 +1074,7 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
                              history_enabled=False, aws_enabled=False,
                              dlog=None, session_id="", user_id="",
                              wants_edit=True, preview_enabled=False,
-                             preflight_enabled=False):
+                             preflight_enabled=False, websearch_enabled=False):
     """A short contract appended to Grok's system text telling it to USE the
     native function tools instead of the XML-tag protocol described earlier in
     the shared prompt (which targets Claude/GPT).
@@ -1085,6 +1123,12 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
             "• request_preview — render a pending .tsx/.jsx edit and read "
             "preview errors. unobserved is not a pass."
         )
+    if websearch_enabled:
+        lines.append(
+            "• request_web_search — search the public web for current docs, "
+            "versions, or errors. The query is sent to a search engine: do not "
+            "include code, file names, or secrets."
+        )
     if preflight_enabled and m in _EDIT_MODES and wants_edit:
         lines.append(
             "A preflight check may reject an edit. If a tool result starts "
@@ -1127,7 +1171,7 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
                                  history_enabled=False, dlog=None,
                                  session_id="", user_id="",
                                  wants_edit=True, preview_enabled=False,
-                                 preflight_enabled=False):
+                                 preflight_enabled=False, websearch_enabled=False):
     """Native-tool replacement for the pipeline's XML turn suffix.
 
     ``wants_edit`` False is a plain question on an Edit/Agent turn: same
@@ -1187,6 +1231,12 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
             parts.append(
                 "Answer the user's question in plain text once you have gathered "
                 "enough context. Do not emit edits in this mode.")
+    if websearch_enabled:
+        parts.append(
+            "Call request_web_search for current documentation, versions, or "
+            "errors. The query is sent to a search engine: do not include "
+            "code, file names, or secrets."
+        )
     text = "\n".join(parts)
     _log(dlog, "grok_agent_instruction_built", session_id=session_id,
          user_id=user_id, mode=m, length=len(text), wants_edit=bool(wants_edit))

@@ -138,7 +138,8 @@ def message_wants_edit(text, has_saved_plan=False, is_agent_task=False) -> bool:
 
 def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
                                 history_enabled=False, aws_guidance="",
-                                preview_enabled=False, preflight_enabled=False):
+                                preview_enabled=False, preflight_enabled=False,
+                                websearch_enabled=False):
     """Suffix appended to the latest user turn for Claude and GPT.
 
     ``wants_edit`` True is the existing edit contract, unchanged.
@@ -166,6 +167,12 @@ def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
             "edit in the live preview and read compile or runtime errors. "
             "Only .tsx and .jsx. Call it after you edit. unobserved is not a pass.\n"
             if preview_enabled else ""
+        )
+        + (
+            "• <web_search_request>{\"query\": \"...\", \"reason\": \"...\"} — search the "
+            "public web for current documentation, versions, or error messages. "
+            "Put only the question in query. Do not include code, file names, or secrets.\n"
+            if websearch_enabled else ""
         )
     )
     if wants_edit:

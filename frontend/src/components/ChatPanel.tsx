@@ -1486,17 +1486,17 @@ export function ChatPanel() {
   // downgrades to a normal single-pass edit instead of multi-agent tasks.
   const agentRequiresClaudeForCurrentModel =
     effectiveMode === 'agent' && currentModelProvider === 'openai'
-  // "Research" checkbox — Claude-only, all four modes (Edit, Agent, Ask,
-  // Plan). Ask/Plan still also honor the legacy global Settings-level web
-  // search toggle (OR'd server-side, see pipeline.py run_chat_stream) for
-  // anyone who already turned that on, but this checkbox is now the primary,
-  // per-message way to enable it everywhere. Not offered offline either: the
-  // local Qwen model never reaches the Claude branch that wires this tool in
-  // (services/pipeline.py `_natural_web_search_enabled` / `_web_search_enabled` gates).
+  // "Research" checkbox — all four modes. Claude uses its own web search.
+  // GPT and Grok use OpenAI web search, so they need an OpenAI key. Ask/Plan
+  // still also honors the legacy global Settings toggle (OR'd server-side).
+  // Hidden offline: the local model never reaches either search path.
   const webResearchAvailable =
-    !isOffline && currentModelProvider === 'anthropic' &&
+    !isOffline &&
     (effectiveMode === 'edit' || effectiveMode === 'agent' ||
-     effectiveMode === 'ask' || effectiveMode === 'plan')
+     effectiveMode === 'ask' || effectiveMode === 'plan') &&
+    (currentModelProvider === 'anthropic' ||
+      ((currentModelProvider === 'openai' || currentModelProvider === 'grok') &&
+        !!settings?.openai_api_key_set))
   // Re-arm the dismissible banner whenever the condition it warns about
   // changes — a dismissal only applies to the specific mode/model pairing
   // the user saw it for, never silently suppressed going forward.
@@ -3298,19 +3298,18 @@ export function ChatPanel() {
                 lastResponse={messages.filter(m => m.role === 'assistant' && m.content).slice(-1)[0]?.content}
                 disabled={isStreaming || isCompacting}
               />
-              {/* "Research" checkbox — Claude-only, all four modes.
-                  See webResearchAvailable comment above. */}
+              {/* "Research" checkbox. See webResearchAvailable comment above. */}
               {webResearchAvailable && (
                 <button
                   onClick={toggleWebResearch}
                   disabled={isStreaming || isCompacting}
                   title={webResearchEnabled
                     ? (effectiveMode === 'ask' || effectiveMode === 'plan'
-                        ? 'Web research is ON for the next message — Claude may search the web before answering.'
-                        : 'Web research is ON for the next message — Claude may search the web before editing.')
+                        ? 'Web research is ON for the next message — the model may search the web before answering.'
+                        : 'Web research is ON for the next message — the model may search the web before editing.')
                     : (effectiveMode === 'ask' || effectiveMode === 'plan'
-                        ? 'Let Claude research the web before answering, if it needs to.'
-                        : 'Let Claude research the web before making this edit, if it needs to.')}
+                        ? 'Let the model research the web before answering, if it needs to.'
+                        : 'Let the model research the web before making this edit, if it needs to.')}
                   className={`h-8 px-2.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors disabled:opacity-40 ${
                     webResearchEnabled
                       ? 'bg-sky-500/15 text-sky-400 hover:brightness-110'
