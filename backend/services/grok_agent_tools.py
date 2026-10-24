@@ -77,6 +77,7 @@ TOOL_REQUEST_SEARCH = "request_search"
 TOOL_REQUEST_GITHUB = "request_github"
 TOOL_AWS_CLI = "aws_cli"
 TOOL_REQUEST_HISTORY = "request_history"
+TOOL_REQUEST_PREVIEW = "request_preview"
 TOOL_REPORT_BLOCKED = "report_blocked"
 
 WRITE_TOOLS = frozenset({
@@ -84,7 +85,7 @@ WRITE_TOOLS = frozenset({
 })
 CONTEXT_TOOLS = frozenset({
     TOOL_REQUEST_FILE, TOOL_REQUEST_SEARCH, TOOL_REQUEST_GITHUB,
-    TOOL_REQUEST_HISTORY,
+    TOOL_REQUEST_HISTORY, TOOL_REQUEST_PREVIEW,
 })
 
 _EDIT_MODES = frozenset({"edit", "agent"})
@@ -383,8 +384,38 @@ def _schema_aws_cli():
     }
 
 
+def _schema_request_preview():
+    return {
+        "type": "function",
+        "function": {
+            "name": TOOL_REQUEST_PREVIEW,
+            "description": (
+                "Render a pending .tsx or .jsx edit in the user's live preview "
+                "and return compile or runtime errors. Call this after you edit, "
+                "not before. unobserved means the preview produced no evidence, "
+                "not that the edit passed. Do not call it for .html files."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "files": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Component filenames to render. Omit to render the "
+                            "component you just edited."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+        },
+    }
+
+
 def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=False,
-                           aws_enabled=False, dlog=None, session_id="", user_id=""):
+                           aws_enabled=False, preview_enabled=False, dlog=None,
+                           session_id="", user_id=""):
     """Return the OpenAI-style tool schemas Grok should be offered for ``mode``.
 
     * ``edit`` / ``agent`` — full write + read toolset + report_blocked.
@@ -415,6 +446,8 @@ def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=Fa
         tools.append(_schema_request_history())
     if aws_enabled:
         tools.append(_schema_aws_cli())
+    if preview_enabled and m in _EDIT_MODES:
+        tools.append(_schema_request_preview())
 
     # report_blocked is meaningful in every mode as a clean terminal signal.
     tools.append(_schema_report_blocked())
@@ -438,6 +471,7 @@ TOOL_PROGRESS_LABELS = {
     TOOL_REQUEST_SEARCH: "Calling request_search…",
     TOOL_REQUEST_GITHUB: "Calling request_github…",
     TOOL_REQUEST_HISTORY: "Calling request_history…",
+    TOOL_REQUEST_PREVIEW: "Checking the preview…",
     TOOL_REPORT_BLOCKED: "Reporting blocked…",
 }
 
@@ -573,6 +607,24 @@ class StreamedToolCallAccumulator:
                      session_id=self._session_id, user_id=self._user_id,
                      error_type=type(e).__name__, error=str(e)[:200])
         return newly_named
+
+    def peek(self):
+        """``[(index, name, arguments_so_far)]`` in arrival order.
+
+        Read-only. ``name`` is None until the first fragment that carries one.
+        Never raises. Safe to call before ``finalize``.
+        """
+        try:
+            out = []
+            for idx in self._order:
+                entry = self._by_index.get(idx) or {}
+                out.append((idx, entry.get("name"), entry.get("arguments") or ""))
+            return out
+        except Exception as exc:  # pragma: no cover - defensive
+            _log(self._dlog, "grok_tc_peek_error",
+                 session_id=self._session_id, user_id=self._user_id,
+                 error_type=type(exc).__name__, error=str(exc)[:200])
+            return []
 
     def has_calls(self):
         return bool(self._by_index)
@@ -841,6 +893,13 @@ def _context_body(name, args):
         if args.get("query"):
             payload["query"] = args.get("query")
         return "history", _json.dumps(payload)
+    if name == TOOL_REQUEST_PREVIEW:
+        files = args.get("files") or []
+        if isinstance(files, str):
+            files = [files]
+        if not isinstance(files, list):
+            files = []
+        return "preview", _json.dumps({"files": files})
     # unreachable given the CONTEXT_TOOLS gate
     return name, _json.dumps(args)
 
@@ -976,7 +1035,8 @@ def normalize_dispatch_pair(current_messages, native_turn, dlog=None,
 def build_grok_system_suffix(mode="edit", github_enabled=False,
                              history_enabled=False, aws_enabled=False,
                              dlog=None, session_id="", user_id="",
-                             wants_edit=True):
+                             wants_edit=True, preview_enabled=False,
+                             preflight_enabled=False):
     """A short contract appended to Grok's system text telling it to USE the
     native function tools instead of the XML-tag protocol described earlier in
     the shared prompt (which targets Claude/GPT).
@@ -1020,6 +1080,17 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     if aws_enabled:
         from services.aws_cli import aws_agent_guidance
         lines.append("• aws_cli — " + aws_agent_guidance())
+    if preview_enabled:
+        lines.append(
+            "• request_preview — render a pending .tsx/.jsx edit and read "
+            "preview errors. unobserved is not a pass."
+        )
+    if preflight_enabled and m in _EDIT_MODES and wants_edit:
+        lines.append(
+            "A preflight check may reject an edit. If a tool result starts "
+            "with [PREFLIGHT], that edit was NOT applied. Fix it. Do not "
+            "resend the same edit."
+        )
     lines.append(
         "• report_blocked — ONLY if you truly cannot proceed without context "
         "you cannot obtain.")
@@ -1055,7 +1126,8 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
 def build_grok_agent_instruction(mode="edit", github_enabled=False,
                                  history_enabled=False, dlog=None,
                                  session_id="", user_id="",
-                                 wants_edit=True):
+                                 wants_edit=True, preview_enabled=False,
+                                 preflight_enabled=False):
     """Native-tool replacement for the pipeline's XML turn suffix.
 
     ``wants_edit`` False is a plain question on an Edit/Agent turn: same
@@ -1100,6 +1172,17 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
                 "already have enough context, write the edits now; never guess "
                 "at code you have not seen. If you truly cannot proceed, call "
                 "report_blocked. When your edits are complete, stop.")
+            if preview_enabled:
+                parts.append(
+                    "After editing a .tsx or .jsx component, you may call "
+                    "request_preview. unobserved is not a pass."
+                )
+            if preflight_enabled:
+                parts.append(
+                    "A preflight check may reject an edit. If a tool result "
+                    "starts with [PREFLIGHT], that edit was NOT applied. Fix "
+                    "it and send a corrected edit. Do not resend the same edit."
+                )
         else:
             parts.append(
                 "Answer the user's question in plain text once you have gathered "

@@ -48,6 +48,33 @@ export type SmartStreamHandlers = {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean,
     meta?: { level?: string; title?: string; target?: string },
   ) => void
+  onPreviewCheck?: (event: {
+    check_id: string
+    session_id?: string
+    entry?: string
+    bundle: Record<string, unknown>
+    baseline_bundle?: Record<string, unknown> | null
+    unresolved?: string[]
+  }, reply: (payload: Record<string, unknown>) => boolean) => void
+  onEditLive?: (ev: EditLiveEvent) => void
+}
+
+export type EditLiveEvent = {
+  type: 'edit_live'
+  op: 'open' | 'delta' | 'close' | 'discard'
+  id: string
+  kind?: 'edit' | 'new_file'
+  filename?: string
+  symbol?: string
+  mode?: 'symbol' | 'lines' | 'snippet' | 'new_file' | 'unresolved'
+  start_line?: number | null
+  end_line?: number | null
+  original?: string | null
+  original_truncated?: boolean
+  field?: 'new_code' | 'old_code' | 'content'
+  text?: string
+  reason?: string
+  capped?: boolean
 }
 
 /** Fire-and-forget clientLog bridge for wrappers defined in this file.
@@ -503,6 +530,8 @@ export const api = {
       onPlan?: SmartStreamHandlers['onPlan'],
       onAwsCli?: SmartStreamHandlers['onAwsCli'],
       onAwsApproval?: SmartStreamHandlers['onAwsApproval'],
+      onPreviewCheck?: SmartStreamHandlers['onPreviewCheck'],
+      onEditLive?: SmartStreamHandlers['onEditLive'],
     ): AbortController => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -510,7 +539,8 @@ export const api = {
         ({
           onThinking, onCompacting, onEditStart, onEditEnd, onTask,
           onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
-          onCreditPaused, onPlan, onAwsCli, onAwsApproval,
+          onCreditPaused, onPlan, onAwsCli, onAwsApproval, onPreviewCheck,
+          onEditLive,
         } = onThinking)
       }
       const controller = new AbortController()
@@ -560,6 +590,7 @@ export const api = {
           else if (chunk.type === 'compacting_done') onCompacting?.('done', { summary: chunk.summary, compacted_count: chunk.compacted_count })
           else if (chunk.type === 'edit_start') onEditStart?.()
           else if (chunk.type === 'edit_end') onEditEnd?.()
+          else if (chunk.type === 'edit_live') onEditLive?.(chunk as EditLiveEvent)
           else if (chunk.type === 'file_needed') {
             onFileNeeded?.(
               { filename: chunk.filename, message: chunk.content, retry: chunk.retry },
@@ -577,6 +608,15 @@ export const api = {
               sendToServer({ type: 'aws_cli_response', ...resp })
               return true
             }, { level: chunk.level, title: chunk.title, target: chunk.target })
+          }
+          else if (chunk.type === 'preview_check_needed') {
+            onPreviewCheck?.(chunk, (payload) => {
+              if (!sendToServer) return false
+              const body = JSON.stringify({ type: 'preview_check_response', check_id: chunk.check_id, ...payload })
+              if (body.length > 6000) return false
+              sendToServer({ type: 'preview_check_response', check_id: chunk.check_id, ...payload })
+              return true
+            })
           }
           else if (chunk.type === 'file_needed_cleared') onFileCleared?.(chunk.filename)
           else if (

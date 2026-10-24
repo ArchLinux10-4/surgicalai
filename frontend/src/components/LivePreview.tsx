@@ -1,8 +1,9 @@
-import React, { useState, useCallback, useEffect, Component } from 'react'
+import React, { useState, useCallback, useEffect, useRef, Component } from 'react'
 import { SandpackProvider, SandpackPreview } from '@codesandbox/sandpack-react'
 import { useThemeStore } from '../stores/themeStore'
 import { Fullscreen, FullscreenExit, Refresh } from '@mui/icons-material'
 import { api } from '../api/client'
+import { clientLog } from '../lib/clientLog'
 
 /* ─── Public API ───────────────────────────────────────────────── */
 export function isVisualFile(filename: string): boolean {
@@ -135,6 +136,7 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
   const [expanded, setExpanded] = useState(false)
   const [refreshKey, setRefreshKey] = useState(0)
   const [sandpackError, setSandpackError] = useState<string | null>(null)
+  const loggedPreviewError = useRef('')
   const [bundle, setBundle] = useState<PreviewBundle | null>(null)
   const [bundleLoading, setBundleLoading] = useState(false)
 
@@ -145,6 +147,22 @@ export function LivePreview({ code, filename, modifiedCode, sessionId, fileId }:
 
   const src = modifiedCode ?? code
   const isHtml = /\.html?$/i.test(filename)
+
+  // The preview crash used to stay in component state, so we could not tell
+  // how often a rendered edit actually broke. This event is the base rate.
+  useEffect(() => {
+    if (!sandpackError) {
+      loggedPreviewError.current = ''
+      return
+    }
+    if (loggedPreviewError.current === sandpackError) return
+    loggedPreviewError.current = sandpackError
+    clientLog('preview_runtime_error', {
+      filename,
+      message: sandpackError.slice(0, 300),
+      bundled: Boolean(bundle),
+    }, sessionId)
+  }, [sandpackError, filename, sessionId, bundle])
   const apiBase = (import.meta as any).env?.VITE_API_URL || ''
 
   /* ── Resolve the full import graph from the session (components + CSS + deps) ── */

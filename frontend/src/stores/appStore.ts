@@ -1,9 +1,35 @@
 import { create } from 'zustand'
 import type { ChatSession, ChatMessage, FileContent, SurgicalAnalysis, AppSettings, FileNode, PromptTemplate, ImpactAnalysis } from '../types'
 import { api } from '../api/client'
+import type { EditLiveEvent } from '../api/client'
 import { clientLog } from '../lib/clientLog'
 import { normalizeQuestions } from '../lib/planQuestions'
 import type { PlanQuestion } from '../lib/planQuestions'
+
+export type LiveEditMode = 'symbol' | 'lines' | 'snippet' | 'new_file' | 'unresolved'
+
+export interface LiveEditCardState {
+  id: string
+  kind: 'edit' | 'new_file'
+  filename: string
+  symbol: string
+  mode: LiveEditMode
+  original: string | null
+  originalTruncated: boolean
+  oldCode: string
+  newCode: string
+  status: 'writing' | 'done' | 'dropped'
+  reason?: string
+  capped: boolean
+  startLine: number | null
+  endLine: number | null
+}
+
+const LIVE_EDIT_MODES = new Set<LiveEditMode>(['symbol', 'lines', 'snippet', 'new_file', 'unresolved'])
+
+function liveEditMode(value: string | undefined): LiveEditMode {
+  return value && LIVE_EDIT_MODES.has(value as LiveEditMode) ? value as LiveEditMode : 'unresolved'
+}
 
 // Shared across ChatPanel (model picker) and SettingsModal (models tab) so
 // that verifying a new provider key (e.g. Grok) — which happens in
@@ -17,6 +43,15 @@ export interface AvailableModel {
   description?: string
   cost?: number
   provider?: string
+}
+
+export interface PreviewBundlePayload {
+  entry?: string
+  entryImport?: string
+  files: Record<string, string>
+  dependencies?: Record<string, string>
+  unresolved?: string[]
+  component?: string
 }
 
 interface AppState {
@@ -92,6 +127,16 @@ interface AppState {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
   } | null
   setAwsApproval: (value: AppState['awsApproval']) => void
+  previewCheck: {
+    sessionId: string
+    checkId: string
+    entry?: string
+    bundle: PreviewBundlePayload
+    baselineBundle?: PreviewBundlePayload | null
+    unresolved?: string[]
+    reply: (payload: Record<string, unknown>) => boolean
+  } | null
+  setPreviewCheck: (value: AppState['previewCheck']) => void
   sidebarPanelOpen: boolean
   setSidebarPanelOpen: (open: boolean) => void
   sidebarPinned: boolean
@@ -131,6 +176,9 @@ interface AppState {
   setSessionStreamingMessage: (sessionId: string, msg: string) => void
   setSessionStreamProgress: (sessionId: string, progress: string) => void
   clearSessionStream: (sessionId: string) => void
+  liveEdits: Record<string, Record<string, LiveEditCardState>>
+  liveEditOrder: Record<string, string[]>
+  applyLiveEdit: (sessionId: string, ev: EditLiveEvent) => void
 
   // Multi-file
   multiFileMode: boolean
@@ -271,6 +319,8 @@ export const useAppStore = create<AppState>((set) => ({
   })),
   awsApproval: null,
   setAwsApproval: (awsApproval) => set({ awsApproval }),
+  previewCheck: null,
+  setPreviewCheck: (previewCheck) => set({ previewCheck }),
   setSidebarTab: (sidebarTab) => set({ sidebarTab }),
   sidebarPanelOpen: false,
   setSidebarPanelOpen: (sidebarPanelOpen) => set({ sidebarPanelOpen }),
@@ -338,10 +388,67 @@ export const useAppStore = create<AppState>((set) => ({
   }),
   clearSessionStream: (sessionId) => set((state) => {
     const { [sessionId]: _, ...rest } = state.streamingSessions
+    const { [sessionId]: _edits, ...liveRest } = state.liveEdits
+    const { [sessionId]: _order, ...orderRest } = state.liveEditOrder
     const display = state.activeSessions === sessionId
       ? { isStreaming: false, streamingMessage: '', streamProgress: '' }
       : {}
-    return { streamingSessions: rest, ...display }
+    return { streamingSessions: rest, liveEdits: liveRest, liveEditOrder: orderRest, ...display }
+  }),
+
+  liveEdits: {},
+  liveEditOrder: {},
+  applyLiveEdit: (sessionId, ev) => set((state) => {
+    if (!sessionId || !ev?.id) return state
+    const prev = state.liveEdits[sessionId] || {}
+    const order = state.liveEditOrder[sessionId] || []
+    const existing = prev[ev.id]
+    if (ev.op !== 'open' && !existing) return state
+
+    let card: LiveEditCardState
+    let nextOrder = order
+    if (ev.op === 'open') {
+      card = {
+        id: ev.id,
+        kind: ev.kind === 'new_file' ? 'new_file' : 'edit',
+        filename: ev.filename || 'file',
+        symbol: ev.symbol || '',
+        mode: liveEditMode(ev.mode),
+        original: ev.original ?? null,
+        originalTruncated: !!ev.original_truncated,
+        oldCode: '',
+        newCode: '',
+        status: 'writing',
+        capped: false,
+        startLine: ev.start_line ?? null,
+        endLine: ev.end_line ?? null,
+      }
+      if (!order.includes(ev.id)) nextOrder = [...order, ev.id]
+    } else {
+      card = { ...existing }
+      if (ev.symbol) card.symbol = ev.symbol
+      if (ev.op === 'delta') {
+        const text = ev.text || ''
+        if (ev.field === 'old_code') card.oldCode += text
+        else card.newCode += text
+        if (ev.capped) card.capped = true
+      } else if (ev.op === 'close') {
+        if (card.status !== 'dropped') card.status = 'done'
+        if (ev.mode) card.mode = liveEditMode(ev.mode)
+        if ('original' in ev) card.original = ev.original ?? null
+        card.originalTruncated = !!ev.original_truncated
+        if (ev.filename) card.filename = ev.filename
+        if (ev.start_line != null) card.startLine = ev.start_line
+        if (ev.end_line != null) card.endLine = ev.end_line
+      } else if (ev.op === 'discard') {
+        card.status = 'dropped'
+        card.reason = ev.reason || 'Dropped'
+      }
+    }
+    return {
+      liveEdits: { ...state.liveEdits, [sessionId]: { ...prev, [ev.id]: card } },
+      liveEditOrder: { ...state.liveEditOrder, [sessionId]: nextOrder },
+    }
   }),
 
   multiFileMode: false,

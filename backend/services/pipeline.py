@@ -17458,6 +17458,7 @@ async def run_natural_pipeline_stream(
       thinking_*  — Claude extended thinking blocks
       edit_start  — entering an edit block (show indicator)
       edit_end    — edit block complete
+      edit_live   — partial code while an edit or new file is still being written
       smart_result — structured edit result (diff cards)
       done        — stream complete
       error       — error message
@@ -17903,6 +17904,36 @@ async def run_natural_pipeline_stream(
                   session_id=session_id, user_id=user_id,
                   mode=("agent" if is_agent_task else "edit"))
 
+        # Preflight defaults to shadow: it logs, and does not reject edits,
+        # until the setting is switched to enforce. Preview stays off until
+        # preview_tool=on, and then only on Agent turns over the WebSocket.
+        try:
+            _preflight_mode = (get_setting("preflight_gate", "shadow") or "shadow").strip().lower()
+        except Exception:
+            _preflight_mode = "off"
+        if _preflight_mode not in ("off", "shadow", "enforce"):
+            _preflight_mode = "shadow"
+        _preview_enabled = False
+        try:
+            _preview_setting = (get_setting("preview_tool", "off") or "off").strip().lower()
+        except Exception:
+            _preview_setting = "off"
+        if _preview_setting == "on" and is_agent_task and client_inbox is not None:
+            from services.preview_check import (
+                PREVIEW_TAG_CLOSE as _PREVIEW_CLOSE,
+                PREVIEW_TAG_OPEN as _PREVIEW_OPEN,
+                session_has_previewable as _previewable,
+            )
+            _preview_names = [
+                (sf.get("filename") if isinstance(sf, dict) else "")
+                for sf in (session_files or [])
+            ]
+            if _previewable(_preview_names):
+                TAG_DEFS["preview"] = {"open": _PREVIEW_OPEN, "close": _PREVIEW_CLOSE}
+                _preview_enabled = True
+                _dlog("natural_preview_tag_registered",
+                      session_id=session_id, user_id=user_id)
+
         # ── Debug: confirm quality rules and project memory reached the prompt ──
         _total_sys_chars = sum(b.get("text", "") if isinstance(b, dict) else b for b in system_prompt if isinstance(b, dict)) if False else sum(len(b["text"]) for b in system_prompt if isinstance(b, dict) and "text" in b)
         _has_quality = "CODE QUALITY RULES" in NATURAL_SYSTEM
@@ -17965,6 +17996,8 @@ async def run_natural_pipeline_stream(
                     github_enabled=_gh_nat_enabled,
                     history_enabled=_history_enabled,
                     wants_edit=_wants_edit,
+                    preview_enabled=_preview_enabled,
+                    preflight_enabled=(_preflight_mode == "enforce"),
                     dlog=_dlog, session_id=session_id, user_id=user_id)
                 _gpt_system_text += _grok_sys_suffix
                 _dlog("natural_grok_system_suffix_appended",
@@ -18298,8 +18331,10 @@ async def run_natural_pipeline_stream(
         # calls) has no such cap — the 4-limit only exists on Bedrock's
         # wrapper (confirmed via an official botocore issue), and Agent Mode
         # is Claude-only already (`_is_claude` gate, chat.py), so Claude may
-        # freely use all 5 stop tags (incl. "history") without affecting GPT.
-        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws"]
+        # freely use every stop tag. GPT's API only accepts the first four
+        # (_agent_stop_seqs[:4] below). "preview" is last, so GPT captures it
+        # in the stream parser instead of via a stop sequence, same as aws.
+        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "preview"]
         _agent_stop_seqs = (
             [TAG_DEFS[t]["close"] for t in _stop_tag_order if t in TAG_DEFS]
             if _tag_stop_enabled else []
@@ -18324,6 +18359,8 @@ async def run_natural_pipeline_stream(
                 return ("history", _hd if _hd is not None else {"_invalid": _block[:500]})
             if _kind == "aws":
                 return ("aws", (_block or "").strip())
+            if _kind == "preview":
+                return ("preview", (_block or "").strip())
             return None
 
         # ---- Unified instruction: every tool is legal on every turn, no phase wall ----
@@ -18341,6 +18378,8 @@ async def run_natural_pipeline_stream(
             github_enabled=_gh_nat_enabled,
             history_enabled=_history_enabled,
             aws_guidance=_aws_guidance,
+            preview_enabled=_preview_enabled,
+            preflight_enabled=(_preflight_mode == "enforce"),
         )
 
         # ── Grok-only: native-tool agent instruction (Claude/GPT keep the
@@ -18351,6 +18390,8 @@ async def run_natural_pipeline_stream(
                 mode=("agent" if is_agent_task else "edit"),
                 github_enabled=_gh_nat_enabled, history_enabled=_history_enabled,
                 wants_edit=_wants_edit,
+                preview_enabled=_preview_enabled,
+                preflight_enabled=(_preflight_mode == "enforce"),
                 dlog=_dlog, session_id=session_id, user_id=user_id)
 
         current_messages = list(messages)
@@ -18384,6 +18425,50 @@ async def run_natural_pipeline_stream(
         _turn = 0
         _consecutive_empty_turns = 0
         _consecutive_text_only_turns = 0
+        _preflight_rounds = 0
+        _preflight_stash = {}
+        _preflight_baseline = {}
+        _preview_state = {"rounds": 0, "last_fp": None, "edit_hash": None}
+
+        # Live edit cards. Off restores the spinner-only behavior. A failed
+        # init must not take down the turn, so the fallback object is silent.
+        try:
+            from services.live_edit_stream import LiveEditStreamer as _LiveEditStreamer
+            try:
+                _live_on = (get_setting("live_edit_view", "on") or "on").strip().lower() != "off"
+            except Exception:
+                _live_on = True
+            _live = _LiveEditStreamer(
+                symbol_maps_by_name,
+                file_content_lookup_stream,
+                enabled=_live_on,
+                dlog=_dlog,
+            )
+        except Exception as _live_exc:
+            _dlog(
+                "live_edit_init_error",
+                session_id=session_id, user_id=user_id,
+                error=str(_live_exc)[:200],
+            )
+
+            class _LiveOff:
+                def feed(self, *_a, **_k):
+                    return []
+
+                def close(self, *_a, **_k):
+                    return []
+
+                def discard(self, *_a, **_k):
+                    return []
+
+                def discard_all(self, *_a, **_k):
+                    return []
+
+                def set_turn(self, *_a, **_k):
+                    return None
+
+            _live = _LiveOff()
+        _live_key = 0
 
         # ── Grok-only plan-first reliability gate (compound-request detection +
         #    forced write_edit_plan before any shallow single edit). No-op for
@@ -18411,6 +18496,8 @@ async def run_natural_pipeline_stream(
             if _skip_agent_loop_for_credit_resume:
                 break
             _turn += 1
+            _live.set_turn(_turn)
+            _live_key = 0
             _grok_plan_held_writes = False  # plan gate held writes this turn (force-plan next)
 
             # grok: rewrite prior dispatch echo into native tool messages
@@ -18552,6 +18639,12 @@ async def run_natural_pipeline_stream(
                                                         "type": "progress",
                                                         "content": f"✍️ Writing code changes… {_edit_hb_bytes/1024:.1f} KB",
                                                     })
+                                                for _lev in _live.feed(
+                                                    _live_key,
+                                                    "edit" if state == "in_edit" else "new_file",
+                                                    tag_buf,
+                                                ):
+                                                    yield sse(_lev)
 
                                         # ── Tag parser (all tags legal every turn) ──
                                         while True:
@@ -18580,6 +18673,14 @@ async def run_natural_pipeline_stream(
                                                     normal_buf = ""
                                                     _found_open = True
                                                     _ctx_shape_checked = False
+                                                    if first_tag in ("edit", "file"):
+                                                        _live_key += 1
+                                                        for _lev in _live.feed(
+                                                            _live_key,
+                                                            "edit" if first_tag == "edit" else "new_file",
+                                                            tag_buf,
+                                                        ):
+                                                            yield sse(_lev)
                                                     _dlog("tag_opened",
                                                           session_id=session_id, user_id=user_id,
                                                           tag_type=first_tag, state=state, turn=_turn)
@@ -18632,9 +18733,13 @@ async def run_natural_pipeline_stream(
                                             if _tag_name == "edit":
                                                 edit_blocks_raw.append(_content)
                                                 yield sse({"type": "edit_end", "content": ""})
+                                                for _lev in _live.close(_live_key, _content, kind="edit"):
+                                                    yield sse(_lev)
                                             elif _tag_name == "file":
                                                 new_file_blocks_raw.append(_content)
                                                 yield sse({"type": "edit_end", "content": ""})
+                                                for _lev in _live.close(_live_key, _content, kind="new_file"):
+                                                    yield sse(_lev)
                                             elif _tag_name == "plan":
                                                 _pd = _parse_plan_content(_content)
                                                 if _pd is not None:
@@ -18810,6 +18915,7 @@ async def run_natural_pipeline_stream(
                         github_enabled=_gh_nat_enabled,
                         history_enabled=_history_enabled,
                         aws_enabled=_aws_connected,
+                        preview_enabled=_preview_enabled,
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
                     # Plan-first gate decides tool_choice: forced write_edit_plan
@@ -18943,6 +19049,12 @@ async def run_natural_pipeline_stream(
                                             _edit_hb_last = _edit_hb_bytes
                                             yield sse({"type": "progress",
                                                        "content": f"✍️ Writing code changes… {_edit_hb_bytes/1024:.1f} KB"})
+                                        for _lev in _live.feed(
+                                            _live_key,
+                                            "edit" if state == "in_edit" else "new_file",
+                                            tag_buf,
+                                        ):
+                                            yield sse(_lev)
 
                                 # ── Tag parser — same tag set as the Claude branch ──
                                 while True:
@@ -18968,6 +19080,14 @@ async def run_natural_pipeline_stream(
                                         tag_buf = normal_buf[first_idx + len(TAG_DEFS[first_tag]["open"]):]
                                         normal_buf = ""
                                         _ctx_shape_checked = False
+                                        if first_tag in ("edit", "file"):
+                                            _live_key += 1
+                                            for _lev in _live.feed(
+                                                _live_key,
+                                                "edit" if first_tag == "edit" else "new_file",
+                                                tag_buf,
+                                            ):
+                                                yield sse(_lev)
                                     else:
                                         _tag_name = state[3:]
                                         if _tag_name not in TAG_DEFS:
@@ -19002,9 +19122,13 @@ async def run_natural_pipeline_stream(
                                         if _tag_name == "edit":
                                             edit_blocks_raw.append(_content)
                                             yield sse({"type": "edit_end", "content": ""})
+                                            for _lev in _live.close(_live_key, _content, kind="edit"):
+                                                yield sse(_lev)
                                         elif _tag_name == "file":
                                             new_file_blocks_raw.append(_content)
                                             yield sse({"type": "edit_end", "content": ""})
+                                            for _lev in _live.close(_live_key, _content, kind="new_file"):
+                                                yield sse(_lev)
                                         elif _tag_name == "plan":
                                             _pd = _parse_plan_content(_content)
                                             if _pd is not None:
@@ -19042,6 +19166,15 @@ async def run_natural_pipeline_stream(
                                             _dlog("grok_agent_tool_named",
                                                   session_id=session_id, user_id=user_id,
                                                   turn=_turn, tool_name=_tn)
+                                    for _gidx, _gname, _gargs in _grok_tc_acc.peek():
+                                        if _gname == "write_surgical_edit":
+                                            _gkind = "edit"
+                                        elif _gname == "write_new_file":
+                                            _gkind = "new_file"
+                                        else:
+                                            continue
+                                        for _lev in _live.feed(("grok", _gidx), _gkind, _gargs):
+                                            yield sse(_lev)
 
                             if pending_tool is not None or edit_plan_data is not None:
                                 break
@@ -19118,6 +19251,8 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id, turn=_turn,
                           repeat_count=len(_grok_loop_history),
                           tool_names=[c.get("name") for c in _grok_calls])
+                    for _lev in _live.discard_all("Repeated tool call stopped"):
+                        yield sse(_lev)
                 else:
                     _grok_tr = _grok_translate_tool_calls(
                         _grok_calls, dlog=_dlog, session_id=session_id, user_id=user_id)
@@ -19143,6 +19278,18 @@ async def run_natural_pipeline_stream(
                                         "last_held_edit_json_strings", []) or [])
                             if _stashed:
                                 _held_grok_writes_for_resume = _stashed
+                    for _gidx, _gname, _gargs in _grok_tc_acc.peek():
+                        if _gname == "write_surgical_edit":
+                            _gkind = "edit"
+                        elif _gname == "write_new_file":
+                            _gkind = "new_file"
+                        else:
+                            continue
+                        for _lev in _live.close(("grok", _gidx), _gargs, kind=_gkind):
+                            yield sse(_lev)
+                    if _grok_plan_held_writes:
+                        for _lev in _live.discard_all("Held until a plan exists"):
+                            yield sse(_lev)
                     if _grok_tr.edit_json_strings:
                         edit_blocks_raw.extend(_grok_tr.edit_json_strings)
                     if _grok_tr.new_file_json_strings:
@@ -19914,6 +20061,35 @@ async def run_natural_pipeline_stream(
                     ]
                     continue
 
+                if _kind == "preview":
+                    from services.preview_check import iter_preview_check as _iter_preview
+                    _pv_note = ""
+                    async for _pv_ev in _iter_preview(
+                        raw=_data if isinstance(_data, str) else str(_data or ""),
+                        edit_raws=edit_blocks_raw,
+                        new_file_raws=new_file_blocks_raw,
+                        symbol_maps=symbol_maps_by_name,
+                        file_contents=file_content_lookup_stream,
+                        client_inbox=client_inbox,
+                        session_id=session_id or "",
+                        over_budget=_pipeline_over_budget,
+                        state=_preview_state,
+                    ):
+                        if _pv_ev.get("_internal"):
+                            _pv_note = _pv_ev.get("note") or ""
+                        else:
+                            yield sse(_pv_ev)
+                    _dlog(
+                        "preview_check_done",
+                        session_id=session_id, user_id=user_id, turn=_turn,
+                        note_len=len(_pv_note), rounds=_preview_state.get("rounds"),
+                    )
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": _assistant_echo},
+                        {"role": "user", "content": _pv_note or "[PREVIEW] unobserved"},
+                    ]
+                    continue
+
                 if _kind == "github":
                     _gh_req = _data if isinstance(_data, dict) else {"_invalid": str(_data)[:500]}
                     _github_attempts += 1
@@ -20324,6 +20500,95 @@ async def run_natural_pipeline_stream(
                 full_response = ""
                 continue
 
+            # ── Preflight gate ────────────────────────────────────────────
+            # Runs only when the model is done requesting tools and has edits.
+            # Shadow logs the findings. Enforce holds failing blocks and asks
+            # for a corrected edit, up to two rounds. The stash is restored
+            # on every loop exit so a dropped block is never lost.
+            _pf_near_deadline = (time.time() - _streaming_t0) >= (STREAMING_PHASE_DEADLINE_S - 30)
+            if (
+                _wants_edit
+                and _preflight_mode != "off"
+                and (edit_blocks_raw or new_file_blocks_raw)
+                and not _pipeline_over_budget()
+                and not _pf_near_deadline
+            ):
+                try:
+                    from services.preflight import (
+                        decide_preflight as _decide_preflight,
+                        dedupe_latest as _dedupe_preflight,
+                        run_preflight as _run_preflight,
+                        stamp_grok_preflight as _stamp_grok_preflight,
+                    )
+                    if _preflight_mode == "enforce":
+                        edit_blocks_raw = _dedupe_preflight(edit_blocks_raw)
+                        new_file_blocks_raw = _dedupe_preflight(new_file_blocks_raw)
+                    _pf_report = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            _run_preflight,
+                            list(edit_blocks_raw),
+                            list(new_file_blocks_raw),
+                            symbol_maps_by_name,
+                            dict(file_content_lookup_stream),
+                            _preflight_baseline,
+                        ),
+                        timeout=12,
+                    )
+                    _pf_decision = _decide_preflight(
+                        _pf_report,
+                        mode=_preflight_mode,
+                        rounds=_preflight_rounds,
+                        over_budget=False,
+                        wants_edit=True,
+                        edit_blocks=edit_blocks_raw,
+                        new_files=new_file_blocks_raw,
+                        stash=_preflight_stash,
+                    )
+                    _dlog(
+                        "preflight_gate",
+                        session_id=session_id, user_id=user_id, turn=_turn,
+                        mode=_preflight_mode, action=_pf_decision["action"],
+                        problems=_pf_decision["problems"],
+                        elapsed_ms=(_pf_report or {}).get("elapsed_ms"),
+                        rounds=_preflight_rounds,
+                        skipped=len((_pf_report or {}).get("skipped") or []),
+                    )
+                    if _pf_decision["action"] == "reject":
+                        _preflight_rounds += 1
+                        edit_blocks_raw = _pf_decision["edit_blocks"]
+                        new_file_blocks_raw = _pf_decision["new_files"]
+                        _preflight_stash = _pf_decision["stash"]
+                        for _lev in _live.discard_all(
+                            f"Preflight found {_pf_decision['problems']} problem(s), asking for a fix"
+                        ):
+                            yield sse(_lev)
+                        if _is_grok_model(arch_model) and _grok_native_turn is not None:
+                            _stamp_grok_preflight(
+                                _grok_native_turn,
+                                _pf_decision["dropped"],
+                                _pf_decision["message"],
+                            )
+                        yield sse({
+                            "type": "progress",
+                            "content": (
+                                f"Preflight found {_pf_decision['problems']} problem(s) "
+                                f"— asking for a fix ({_preflight_rounds}/2)..."
+                            ),
+                        })
+                        _assistant_echo = (full_response or "").strip() or "(preflight)"
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content": _pf_decision["message"]},
+                        ]
+                        full_response = ""
+                        continue
+                except Exception as _pf_exc:
+                    _dlog(
+                        "preflight_gate_error",
+                        session_id=session_id, user_id=user_id, turn=_turn,
+                        error=str(_pf_exc)[:300],
+                    )
+
             _dlog("agent_loop_done",
                   session_id=session_id, user_id=user_id, turn=_turn,
                   edit_blocks=len(edit_blocks_raw),
@@ -20331,6 +20596,20 @@ async def run_natural_pipeline_stream(
                   has_plan=edit_plan_data is not None,
                   response_len=len(full_response))
             break
+
+        if _preflight_stash:
+            from services.preflight import restore_stash as _restore_preflight_stash
+            _before_edits = len(edit_blocks_raw)
+            _before_files = len(new_file_blocks_raw)
+            edit_blocks_raw, new_file_blocks_raw = _restore_preflight_stash(
+                edit_blocks_raw, new_file_blocks_raw, _preflight_stash)
+            _dlog(
+                "preflight_stash_restored",
+                session_id=session_id, user_id=user_id,
+                restored_edits=len(edit_blocks_raw) - _before_edits,
+                restored_files=len(new_file_blocks_raw) - _before_files,
+            )
+            _preflight_stash = {}
 
         # ── Post-streaming cleanup ────────────────────────────────────
         if _streaming_starvation_abort:
@@ -20351,6 +20630,13 @@ async def run_natural_pipeline_stream(
             _ss_tag = state[3:]
             _ss_content = tag_buf
             try:
+                if _ss_tag in ("edit", "file"):
+                    for _lev in _live.close(
+                        _live_key,
+                        _ss_content,
+                        kind="edit" if _ss_tag == "edit" else "new_file",
+                    ):
+                        yield sse(_lev)
                 if _ss_tag == "plan":
                     _pd = _parse_plan_content(_ss_content)
                     if _pd is not None:
@@ -20374,8 +20660,15 @@ async def run_natural_pipeline_stream(
                   full_response_len=len(full_response))
 
             if state == "in_edit":
+                _live_tail = tag_buf
                 _new_count, _partial_kept, _had_matches, _rejected_prose = _eos_recover_blocks(
                     EDIT_OPEN, EDIT_CLOSE, full_response, tag_buf, edit_blocks_raw)
+                if _rejected_prose:
+                    for _lev in _live.discard(_live_key, "Not a code edit"):
+                        yield sse(_lev)
+                else:
+                    for _lev in _live.close(_live_key, _live_tail, kind="edit"):
+                        yield sse(_lev)
                 if _had_matches:
                     state = "normal"
                     tag_buf = ""
@@ -20399,8 +20692,15 @@ async def run_natural_pipeline_stream(
                     yield sse({"type": "token", "content": _rejected_prose})
 
             elif state == "in_file":
+                _live_tail = tag_buf
                 _new_count, _partial_kept, _had_matches, _rejected_prose = _eos_recover_blocks(
                     FILE_OPEN, FILE_CLOSE, full_response, tag_buf, new_file_blocks_raw)
+                if _rejected_prose:
+                    for _lev in _live.discard(_live_key, "Not a code edit"):
+                        yield sse(_lev)
+                else:
+                    for _lev in _live.close(_live_key, _live_tail, kind="new_file"):
+                        yield sse(_lev)
                 if _had_matches:
                     state = "normal"
                     tag_buf = ""
