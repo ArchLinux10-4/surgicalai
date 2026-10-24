@@ -1046,7 +1046,8 @@ def normalize_dispatch_pair(current_messages, native_turn, dlog=None,
 
 def build_grok_system_suffix(mode="edit", github_enabled=False,
                              history_enabled=False, aws_enabled=False,
-                             dlog=None, session_id="", user_id=""):
+                             dlog=None, session_id="", user_id="",
+                             wants_edit=True):
     """A short contract appended to Grok's system text telling it to USE the
     native function tools instead of the XML-tag protocol described earlier in
     the shared prompt (which targets Claude/GPT).
@@ -1078,7 +1079,7 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
         "(prefer this over repeated request_search when you already know the file).",
         "• request_search — grep the codebase for symbols/keywords.",
     ]
-    if m in _EDIT_MODES:
+    if m in _EDIT_MODES and wants_edit:
         from services.mega_symbol_tool_routing import (  # local import: avoid cycles
             prompt_mega_symbol_tool_routing_rules as _mega_rules,
         )
@@ -1093,13 +1094,21 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     lines.append(
         "• report_blocked — ONLY if you truly cannot proceed without context "
         "you cannot obtain.")
-    if m in _EDIT_MODES:
+    if m in _EDIT_MODES and wants_edit:
         lines += [
             "",
             "Do NOT narrate what you WOULD change — actually call "
             "write_surgical_edit / write_new_file with the real code. When your "
             "edits are complete, stop. Never describe an edit in prose instead "
             "of calling the tool.",
+        ]
+    elif m in _EDIT_MODES:
+        lines += [
+            "",
+            "Answer in plain text. Call write_surgical_edit, write_new_file, "
+            "or write_edit_plan only if the user asked you to change code. "
+            "Do not mention your mode, and do not say that no code changes "
+            "were produced.",
         ]
     else:
         lines += [
@@ -1116,37 +1125,57 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
 
 def build_grok_agent_instruction(mode="edit", github_enabled=False,
                                  history_enabled=False, dlog=None,
-                                 session_id="", user_id=""):
-    """Native-tool replacement for the pipeline's XML ``_AGENT_INSTRUCTION``
-    (appended to the latest user turn). Same intent, native phrasing."""
+                                 session_id="", user_id="",
+                                 wants_edit=True):
+    """Native-tool replacement for the pipeline's XML turn suffix.
+
+    ``wants_edit`` False is a plain question on an Edit/Agent turn: same
+    context tools, but the model is told to answer instead of being ordered
+    to write code.
+    """
     m = (mode or "edit").strip().lower()
-    parts = [
-        "\n\n[AGENTIC EDIT MODE — NATIVE TOOLS]",
-        "Complete this task autonomously using the FUNCTION TOOLS provided to "
-        "you. Do not write XML tags as text.",
-        "Gather context with request_file first when you know the target file; "
-        "use request_search"
-        + (" / request_github" if github_enabled else "")
-        + (" / request_history" if history_enabled else "")
-        + " only to find unknowns.",
-    ]
-    if m in _EDIT_MODES:
-        from services.mega_symbol_tool_routing import (
-            prompt_mega_symbol_tool_routing_rules as _mega_rules,
-        )
-        parts.append(_mega_rules(native_tools=True))
-        parts.append(
-            "Produce your changes by CALLING write_surgical_edit / "
-            "write_new_file (or write_edit_plan only for distinct "
-            "files/symbols) — never by describing them in prose. If you "
-            "already have enough context, write the edits now; never guess "
-            "at code you have not seen. If you truly cannot proceed, call "
-            "report_blocked. When your edits are complete, stop.")
+    answering = m in _EDIT_MODES and not wants_edit
+    if answering:
+        parts = [
+            "\n\nAnswer the user's message directly using the FUNCTION TOOLS "
+            "when you need to see code. Do not write XML tags as text.",
+            "Use request_file when you know the target file; use request_search"
+            + (" / request_github" if github_enabled else "")
+            + (" / request_history" if history_enabled else "")
+            + " only if the answer depends on code you have not seen.",
+            "Answer in plain text. Call write_surgical_edit, write_new_file, "
+            "or write_edit_plan only if the user asked you to change code. "
+            "Do not mention your mode. If you truly cannot proceed, call "
+            "report_blocked. When you have answered, stop.",
+        ]
     else:
-        parts.append(
-            "Answer the user's question in plain text once you have gathered "
-            "enough context. Do not emit edits in this mode.")
+        parts = [
+            "\n\n[AGENTIC EDIT MODE — NATIVE TOOLS]",
+            "Complete this task autonomously using the FUNCTION TOOLS provided to "
+            "you. Do not write XML tags as text.",
+            "Gather context with request_file first when you know the target file; "
+            "use request_search"
+            + (" / request_github" if github_enabled else "")
+            + (" / request_history" if history_enabled else "")
+            + " only to find unknowns.",
+        ]
+        if m in _EDIT_MODES:
+            from services.mega_symbol_tool_routing import (
+                prompt_mega_symbol_tool_routing_rules as _mega_rules,
+            )
+            parts.append(_mega_rules(native_tools=True))
+            parts.append(
+                "Produce your changes by CALLING write_surgical_edit / "
+                "write_new_file (or write_edit_plan only for distinct "
+                "files/symbols) — never by describing them in prose. If you "
+                "already have enough context, write the edits now; never guess "
+                "at code you have not seen. If you truly cannot proceed, call "
+                "report_blocked. When your edits are complete, stop.")
+        else:
+            parts.append(
+                "Answer the user's question in plain text once you have gathered "
+                "enough context. Do not emit edits in this mode.")
     text = "\n".join(parts)
     _log(dlog, "grok_agent_instruction_built", session_id=session_id,
-         user_id=user_id, mode=m, length=len(text))
+         user_id=user_id, mode=m, length=len(text), wants_edit=bool(wants_edit))
     return text

@@ -36,9 +36,10 @@ def test_real_session_6930f196_max_turns_mid_search():
         agent_max_turns=24,
     )
     assert event == "no_edits_max_turns_notice"
-    assert "ran out of turns" in msg
+    assert "ran out of steps" in msg
     assert "24" in msg
     assert "plan/explanation" not in msg
+    assert "⚠️" not in msg
 
 
 def test_max_turns_wins_even_if_some_normal_text_exists():
@@ -57,8 +58,8 @@ def test_max_turns_wins_even_if_some_normal_text_exists():
 
 def test_real_prose_no_max_turns_gets_plan_only_message():
     """Model wrote genuine, fully-streamed explanatory prose and stopped
-    naturally (not a max-turns cutoff) with no edits. Old behavior
-    preserved for this case."""
+    naturally (not a max-turns cutoff) with no edits. The notice says the
+    change was not made and how to continue. It does not scold."""
     event, msg = pick_no_edits_notice(
         hit_agent_max_turns=False,
         has_skipped_changes=False,
@@ -67,7 +68,10 @@ def test_real_prose_no_max_turns_gets_plan_only_message():
         agent_max_turns=24,
     )
     assert event == "no_edits_text_only_notice"
-    assert "plan/explanation only" in msg
+    assert "didn't change any code" in msg
+    assert "Tell me to go ahead" in msg
+    assert "⚠️" not in msg
+    assert "Please try again" not in msg
 
 
 def test_cutoff_no_max_turns_no_real_prose_gets_honest_fallback():
@@ -83,7 +87,9 @@ def test_cutoff_no_max_turns_no_real_prose_gets_honest_fallback():
     )
     assert event == "no_edits_notext_notice"
     assert "plan/explanation" not in msg
-    assert "ran out of time" in msg
+    assert "finish in time" in msg
+    assert "made no changes" in msg
+    assert "⚠️" not in msg
 
 
 def test_nothing_at_all_gives_no_notice():

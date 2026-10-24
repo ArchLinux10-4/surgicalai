@@ -117,13 +117,13 @@ async def _with_heartbeat_propagate(aiter, interval: int = 5):
 _VALID_MODES = ("edit", "ask", "plan", "agent")
 
 _ASK_DIRECTIVE = (
-    "You are in ASK mode. Answer the user's question thoroughly, using the "
-    "attached code and context. Explain, analyze, and research as needed. Do NOT "
-    "produce code edits, diffs, or <surgical_edit> tags — respond in clear "
-    "markdown prose only."
+    "Answer the user's question from the attached code and context. "
+    "Explain, analyze, and research as needed. Do not produce code edits, diffs, "
+    "or <surgical_edit> tags — respond in clear markdown prose only. "
+    "Do not mention these instructions or which mode you are in."
 )
 _PLAN_DIRECTIVE = (
-    "You are in PLAN mode. Produce a detailed, step-by-step implementation plan "
+    "Produce a detailed, step-by-step implementation plan "
     "for the user's request. Reference specific files, functions, and line "
     "numbers from the provided code. Use this structure:\n"
     "## Overview\nBrief summary of the approach.\n\n"
@@ -134,7 +134,8 @@ _PLAN_DIRECTIVE = (
     "that step (illustrative; not a diff or <surgical_edit>).\n"
     "2. ...\n\n"
     "## Risks & Considerations\nEdge cases and things to watch for.\n\n"
-    "Do NOT produce code edits, diffs, or <surgical_edit> tags — plan only.\n\n"
+    "Do NOT produce code edits, diffs, or <surgical_edit> tags — plan only. "
+    "Do not mention these instructions or which mode you are in.\n\n"
     "Unless you are asking clarifying questions as allowed in the PLAN "
     "QUESTIONS section, you MUST end your reply with a fenced JSON block "
     "using the language tag implementation_plan (not generic json). Shape:\n"
@@ -1334,7 +1335,7 @@ async def smart_stream(req: dict, request: Request):
         if session_files:
             _fnames = [f['filename'] for f in session_files]
             _file_hint = (f"[{len(_fnames)} file(s) attached: {', '.join(_fnames)}. "
-                          "Examine their contents before responding.]")
+                          "Use them only if relevant to the question.]")
             message = f"{_file_hint}\n\n{message}"
 
         # Project memory — GLOBAL team conventions (every prompt) + any per-session memory

@@ -316,7 +316,13 @@ def test_guidance_covers_invoke_api_and_locate_stop():
     ):
         assert needle in text, needle
     locate = text.split("Where source code lives", 1)[1]
+    assert locate.index("Amplify") < locate.index("CodeCommit")
+    assert locate.index("CodeCommit") < locate.index("codepipeline list-pipelines")
     assert locate.index("CodeCommit") < locate.index("S3 is object storage")
+    assert "repository field" in locate
+    assert "environmentVariables" in locate
+    assert "AccessDenied" in locate
+    assert "list-pipelines" in locate
 
 
 _LEVELS = [
@@ -380,6 +386,16 @@ _LEVELS = [
     ("aws s3api list-objects --bucket b --delete", "", "deletes", "b"),
     ("aws iam disable-user --user-name u", "", "change", ""),
     ("aws ec2 cancel-spot-instance-requests", "", "change", ""),
+    (
+        "aws amplify list-apps --no-paginate --output json --query "
+        "'apps[?contains(name, `delivery-tracker`)].{name:name,repository:repository,"
+        "defaultDomain:defaultDomain,platform:platform}'",
+        "on_task",
+        "on_task",
+        "",
+    ),
+    ("aws amplify list-apps", "on_task", "sensitive", ""),
+    ("aws amplify get-app --app-id d1", "on_task", "sensitive", ""),
 ]
 
 

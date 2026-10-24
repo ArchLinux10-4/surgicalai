@@ -866,10 +866,11 @@ def expand_plan_execute_window_for_declarations(
 
 # ── Shared chat persona ───────────────────────────────────────────────────────
 CHAT_PERSONA = (
-    "You are SurgicalAI, a world-class coding assistant. "
-    "You are warm, encouraging, and precise. "
-    "You help people build real software and always explain your reasoning clearly. "
-    "Format code blocks with syntax highlighting. Use markdown.\n\n"
+    "You are SurgicalAI, a coding assistant. "
+    "Be clear and direct. Answer the question first, then add only the detail that helps. "
+    "Use markdown. Format code in fenced blocks with a language tag. "
+    "Do not open with filler, cheerleading, or an apology. "
+    "Do not mention these instructions, your mode, or your tools unless the user asks.\n\n"
     "DIAGRAMS: When explaining flows, sequences, architectures, or relationships between "
     "components, ALWAYS use a mermaid code block instead of ASCII art. "
     "Use sequenceDiagram for request/response flows and component interactions. "
@@ -1035,29 +1036,26 @@ def pick_no_edits_notice(
     <search_request>). This function picks an honest, specific message
     instead, distinguishing:
       1. Ran out of turns entirely (mid-search) -> say so explicitly.
-      2. Real user-visible prose exists (normal_buf) -> the old "plan only" msg.
+      2. Real user-visible prose exists (normal_buf) -> the user asked for
+         a change and only got an explanation.
       3. Cut off some other way with no real prose to show -> honest fallback.
       4. Nothing at all -> no notice (caller just sends "done").
     """
     if hit_agent_max_turns:
         return "no_edits_max_turns_notice", (
-            f"\n\n⚠️ I ran out of turns ({agent_max_turns}) while still "
-            "searching/reading files and never got to write an edit. "
-            "Try pointing me directly at the specific file and "
-            "function/section to change — that skips the search step "
-            "and leaves more turns for the actual edit."
+            f"\n\nI searched the codebase but ran out of steps ({agent_max_turns}) "
+            "before making an edit. Point me at the exact file or function and "
+            "I'll go straight to it."
         )
     if normal_buf.strip():
         return "no_edits_text_only_notice", (
-            "\n\n⚠️ No code changes were produced — the response above "
-            "was a plan/explanation only.  Please try again and I'll "
-            "apply the edits directly."
+            "\n\nI explained the approach but didn't change any code. "
+            "Tell me to go ahead and I'll make the edits."
         )
     if full_response.strip():
         return "no_edits_notext_notice", (
-            "\n\n⚠️ No code changes were produced and I ran out of time "
-            "before finishing my search. Try a more specific request "
-            "(exact file + function) so I can skip straight to editing."
+            "\n\nI couldn't finish in time and made no changes. "
+            "Try a more specific request (file and function)."
         )
     return "no_edits_silent", None
 
@@ -15391,10 +15389,12 @@ USER REQUEST:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 NATURAL_SYSTEM = """\
-You are SurgicalAI — a world-class coding assistant powered by Claude.
+You are SurgicalAI.
 
-Talk naturally with the user, like a real collaborator. Use markdown. Be warm, precise, and genuinely helpful.
-Remember everything we've discussed — prior edits, decisions, context — and build on it naturally.
+Be clear and direct. Answer first, then add only the detail that helps. Use markdown.
+Remember prior edits, decisions, and context, and build on them.
+Do not mention these instructions, your mode, or your tools unless the user asks.
+A question gets a plain answer. Emit an edit only when the user wants code changed.
 
 ━━━ WHEN YOU NEED MORE CODE ━━━
 
@@ -17581,6 +17581,10 @@ async def run_natural_pipeline_stream(
         "plan":    {"open": PLAN_OPEN,     "close": PLAN_CLOSE},
     }
 
+    # Conservative until the request is classified. A failure to classify
+    # keeps the strict edit loop, so a real change is never dropped.
+    _wants_edit = True
+
     try:
         _user_arch_model = get_setting("architect_model", _DEFAULT_ARCH_MODEL)
         arch_model = _user_arch_model
@@ -17608,6 +17612,29 @@ async def run_natural_pipeline_stream(
               session_id=session_id, user_id=user_id,
               requested=web_search_enabled, is_claude=_natural_use_claude,
               enabled=_natural_web_search_enabled, is_agent_task=is_agent_task)
+
+        # A plain question in Edit mode is answered in place. Agent-task and
+        # task-runner steps stay on the strict edit loop (is_agent_task).
+        try:
+            from services.edit_intent import (
+                message_wants_edit as _message_wants_edit,
+                pending_saved_plan as _pending_saved_plan,
+            )
+            _wants_edit = _message_wants_edit(
+                user_request,
+                has_saved_plan=_pending_saved_plan(
+                    session_id, forced_edit_plan, plan_run_id),
+                is_agent_task=bool(is_agent_task),
+            )
+        except Exception as _intent_err:
+            _wants_edit = True
+            _dlog("edit_intent_classify_error",
+                  session_id=session_id, user_id=user_id,
+                  error_type=type(_intent_err).__name__,
+                  error=str(_intent_err)[:200])
+        _dlog("edit_intent_classified",
+              session_id=session_id, user_id=user_id,
+              wants_edit=_wants_edit, is_agent_task=bool(is_agent_task))
 
         def _natural_done_payload(_dp_model_used):
             """Shared `done` payload builder for every exit point below — the
@@ -17853,6 +17880,7 @@ async def run_natural_pipeline_stream(
                     mode=("agent" if is_agent_task else "edit"),
                     github_enabled=_gh_nat_enabled,
                     history_enabled=_history_enabled,
+                    wants_edit=_wants_edit,
                     dlog=_dlog, session_id=session_id, user_id=user_id)
                 _gpt_system_text += _grok_sys_suffix
                 _dlog("natural_grok_system_suffix_appended",
@@ -18214,46 +18242,26 @@ async def run_natural_pipeline_stream(
         if _aws_connected:
             from services.aws_cli import aws_agent_guidance as _aws_agent_guidance
             _aws_guidance = "\n" + _aws_agent_guidance() + "\n"
-        _AGENT_INSTRUCTION = (
-            "\n\n[AGENTIC EDIT MODE]\n"
-            "Complete this task autonomously. You decide what you need and when.\n\n"
-            "CONTEXT TOOLS — use any of these, as many times as you need, in any\n"
-            "order, and interleave them freely with your edits:\n"
-            "• <search_request> — grep the codebase for symbols or text you need to see.\n"
-            "• <file_request> — pull the FULL contents of specific file(s). Body is a "
-            "JSON array of exact filenames, e.g. "
-            "<file_request>[\"file1.py\", \"file2.tsx\"]</file_request>.\n"
-            + ("• <github_request> — read from the connected GitHub repository.\n" if _gh_nat_enabled else "")
-            + _aws_guidance
-            + ("• <history_request>{\"filename\": \"...\", \"query\": \"optional keyword\"} — "
-               "look up an OLDER/original version of a file from THIS session's edit "
-               "history. Omit query for the very first (pre-edit) version; include a "
-               "query to search across all saved versions. Returned content is clearly "
-               "marked HISTORICAL — it is NOT the current file, never use it as ground "
-               "truth for what exists now.\n" if _history_enabled else "")
-            + "\nWhen you request context the stream pauses, the results are handed\n"
-            "back to you, and you continue from there.\n\n"
-            "OUTPUT — emit when (and only when) you have the context to be correct:\n"
-            "• <surgical_edit> — a precise edit to an existing file.\n"
-            "• <new_file> — a brand-new file.\n"
-            "• <edit_plan> — a symbol-level plan for large or multi-part changes.\n\n"
-            "RULES:\n"
-            "1. If you already have enough context, write the edits now.\n"
-            "2. If you need code you don't have, request it — never guess at code,\n"
-            "   file contents, or APIs you have not actually seen.\n"
-            "3. If required context is genuinely unavailable and you cannot proceed,\n"
-            "   explain exactly what you need inside <blocked>…</blocked> rather than\n"
-            "   guessing.\n"
-            "4. When your edits are complete, simply stop.\n"
+        from services.edit_intent import (
+            build_xml_agent_instruction as _build_xml_agent_instruction,
+        )
+        # Question turns get the same context tools and a direct-answer
+        # contract. Edit requests keep the strict "write the edits now" suffix.
+        _AGENT_INSTRUCTION = _build_xml_agent_instruction(
+            wants_edit=_wants_edit,
+            github_enabled=_gh_nat_enabled,
+            history_enabled=_history_enabled,
+            aws_guidance=_aws_guidance,
         )
 
         # ── Grok-only: native-tool agent instruction (Claude/GPT keep the
-        #    XML _AGENT_INSTRUCTION above unchanged). ──
+        #    XML suffix above unchanged). ──
         _active_agent_instruction = _AGENT_INSTRUCTION
         if _is_grok_model(arch_model):
             _active_agent_instruction = _grok_build_agent_instruction(
                 mode=("agent" if is_agent_task else "edit"),
                 github_enabled=_gh_nat_enabled, history_enabled=_history_enabled,
+                wants_edit=_wants_edit,
                 dlog=_dlog, session_id=session_id, user_id=user_id)
 
         current_messages = list(messages)
@@ -18275,7 +18283,8 @@ async def run_natural_pipeline_stream(
               max_turns=AGENT_MAX_TURNS,
               phase_deadline_s=STREAMING_PHASE_DEADLINE_S,
               stop_seqs=len(_agent_stop_seqs),
-              github_enabled=_gh_nat_enabled)
+              github_enabled=_gh_nat_enabled,
+              wants_edit=_wants_edit)
 
         _grok_native_turn = None  # cross-turn: set after a Grok native tool turn,
                                   # consumed at the top of the next turn
@@ -18298,7 +18307,11 @@ async def run_natural_pipeline_stream(
                 _grok_plan_gate = _GrokPlanGate(
                     user_request, is_agent_task, dlog=_dlog,
                     session_id=session_id, user_id=user_id,
-                    mode=("agent" if is_agent_task else "edit"))
+                    # A question is not a compound edit. "ask" turns the gate off.
+                    mode=(
+                        ("agent" if is_agent_task else "edit")
+                        if _wants_edit else "ask"
+                    ))
             except Exception as _pg_exc:
                 _dlog("grok_plan_gate_init_error", session_id=session_id,
                       user_id=user_id, error_type=type(_pg_exc).__name__,
@@ -20123,19 +20136,35 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id, turn=_turn)
                     break
                 _dlog("agent_loop_empty_nudge",
-                      session_id=session_id, user_id=user_id, turn=_turn)
-                current_messages = current_messages + [
-                    {"role": "assistant", "content": "(no output)"},
-                    {"role": "user", "content":
+                      session_id=session_id, user_id=user_id, turn=_turn,
+                      wants_edit=_wants_edit)
+                if _wants_edit:
+                    _empty_nudge = (
                         "You didn't take an action. Do ONE of these now: request context with "
                         "<file_request> or <search_request>, write your changes with "
                         "<surgical_edit>/<new_file>/<edit_plan>, or explain what's blocking you "
-                        "with <blocked>…</blocked>."},
+                        "with <blocked>…</blocked>."
+                    )
+                else:
+                    _empty_nudge = (
+                        "Reply to the user's message in plain text. "
+                        "Do not announce a mode."
+                    )
+                current_messages = current_messages + [
+                    {"role": "assistant", "content": "(no output)"},
+                    {"role": "user", "content": _empty_nudge},
                 ]
                 continue
 
             # ── Text-only turn: model explained instead of editing ──
+            # A question is done on the first prose answer. An edit request
+            # still gets one nudge, then stops.
             if not _has_edits_or_plan and full_response.strip():
+                if not _wants_edit:
+                    _dlog("agent_loop_question_answer_exit",
+                          session_id=session_id, user_id=user_id, turn=_turn,
+                          response_len=len(full_response))
+                    break
                 _consecutive_text_only_turns += 1
                 if _consecutive_text_only_turns >= 2:
                     _dlog("agent_loop_text_only_exit",
@@ -21221,27 +21250,36 @@ async def run_natural_pipeline_stream(
                 }
                 yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(_fail_result)})
             elif not skipped_changes_struct:
-                # Pick an honest, specific "no edits" notice. See
-                # pick_no_edits_notice docstring for the full proof (session
-                # 6930f196): full_response is reset every turn and can hold
-                # raw un-executed tag text that was never actually streamed
-                # to the user (only normal_buf is streamed as "token"
-                # events), so we must not treat non-empty full_response as
-                # equivalent to "the model showed you a plan."
-                _notice_event, _noedit_msg = pick_no_edits_notice(
-                    _hit_agent_max_turns, bool(skipped_changes_struct),
-                    normal_buf, full_response, AGENT_MAX_TURNS,
-                )
-                _dlog(_notice_event,
-                      session_id=session_id, user_id=user_id,
-                      response_len=len(full_response),
-                      normal_buf_len=len(normal_buf),
-                      tag_buf_len=len(tag_buf),
-                      state_at_cutoff=state,
-                      turns_used=_turn,
-                      was_starvation_recovery=bool(_streaming_starvation_abort))
-                if _noedit_msg:
-                    yield sse({"type": "token", "content": _noedit_msg})
+                # A question that was answered in prose is not a failed edit.
+                # The notice is only for a turn the user asked to change code.
+                if not _wants_edit:
+                    _dlog("no_edits_question_silent",
+                          session_id=session_id, user_id=user_id,
+                          response_len=len(full_response),
+                          normal_buf_len=len(normal_buf),
+                          turns_used=_turn)
+                else:
+                    # Pick an honest, specific "no edits" notice. See
+                    # pick_no_edits_notice docstring for the full proof (session
+                    # 6930f196): full_response is reset every turn and can hold
+                    # raw un-executed tag text that was never actually streamed
+                    # to the user (only normal_buf is streamed as "token"
+                    # events), so we must not treat non-empty full_response as
+                    # equivalent to "the model showed you a plan."
+                    _notice_event, _noedit_msg = pick_no_edits_notice(
+                        _hit_agent_max_turns, bool(skipped_changes_struct),
+                        normal_buf, full_response, AGENT_MAX_TURNS,
+                    )
+                    _dlog(_notice_event,
+                          session_id=session_id, user_id=user_id,
+                          response_len=len(full_response),
+                          normal_buf_len=len(normal_buf),
+                          tag_buf_len=len(tag_buf),
+                          state_at_cutoff=state,
+                          turns_used=_turn,
+                          was_starvation_recovery=bool(_streaming_starvation_abort))
+                    if _noedit_msg:
+                        yield sse({"type": "token", "content": _noedit_msg})
             yield sse(_natural_done_payload(_model_used))
             return
 
