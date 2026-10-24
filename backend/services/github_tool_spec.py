@@ -153,7 +153,7 @@ GH_TOOLS: Tuple[GhTool, ...] = (
         args=(
             _a("owner", "string", True, "Repository owner."),
             _a("repo", "string", True, "Repository name."),
-            _a("branch", "string", False, "Branch name. Defaults to the default branch."),
+            _a("branch", "string", False, "Branch name. Defaults to the working branch when one is set, otherwise the default branch."),
             _a("path", "string", False, "Only commits that touch this path."),
             _a("limit", "integer", False, "How many commits (1-30). Defaults to 10."),
         ),
@@ -166,7 +166,7 @@ GH_TOOLS: Tuple[GhTool, ...] = (
         args=(
             _a("owner", "string", True, "Repository owner."),
             _a("repo", "string", True, "Repository name."),
-            _a("ref", "string", False, "Branch or commit SHA. Defaults to the default branch."),
+            _a("ref", "string", False, "Branch or commit SHA. Defaults to the working branch when one is set, otherwise the default branch."),
             _a("path_prefix", "string", False, "Only files under this directory, for example backend/services/."),
         ),
         example={"owner": "acme", "repo": "app", "path_prefix": "backend/"},
@@ -179,7 +179,7 @@ GH_TOOLS: Tuple[GhTool, ...] = (
             _a("owner", "string", True, "Repository owner."),
             _a("repo", "string", True, "Repository name."),
             _a("path", "string", True, "Path from the repo root, for example backend/services/pipeline.py."),
-            _a("ref", "string", False, "Branch or commit SHA. Defaults to the default branch."),
+            _a("ref", "string", False, "Branch or commit SHA. Defaults to the working branch when one is set, otherwise the default branch."),
             _a("start_line", "integer", False, "1-based line to start at. Required to read past a truncated page."),
         ),
         example={"owner": "acme", "repo": "app", "path": "backend/app.py", "start_line": 1},

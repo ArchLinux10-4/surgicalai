@@ -347,6 +347,13 @@ def load_files(body: LoadFilesRequest, request: Request):
                 elif err:
                     errors.append(err)
 
+        if loaded:
+            try:
+                from services.github_natural_tag import set_session_target_if_empty
+                set_session_target_if_empty(body.session_id, body.owner, body.repo, body.branch)
+            except Exception:
+                pass
+
         return {"loaded": loaded, "errors": errors, "truncated": truncated}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))

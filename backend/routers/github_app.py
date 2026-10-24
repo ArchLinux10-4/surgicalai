@@ -424,6 +424,13 @@ def load_files(body: LoadFilesRequest, request: Request):
                 _dlog("github_app_load_file_failed", path=path, error=str(e))
                 errors.append({"path": path, "error": str(e)})
 
+        if loaded:
+            try:
+                from services.github_natural_tag import set_session_target_if_empty
+                set_session_target_if_empty(body.session_id, body.owner, body.repo, body.branch)
+            except Exception:
+                pass
+
         _dlog("github_app_load_ok", session_id=body.session_id, loaded=len(loaded), errors=len(errors))
         return {"loaded": loaded, "errors": errors, "truncated": False}
     except Exception as e:

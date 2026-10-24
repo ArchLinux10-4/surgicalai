@@ -1012,6 +1012,81 @@ def rename_session(session_id: str, body: dict, request: Request):
     return {"ok": True}
 
 
+def _github_connection_flags(user_id: str) -> dict:
+    """Database-only. A failure on any check is false, never a 500."""
+    flags = {"pat": False, "app": False, "app_configured": False}
+    if not user_id:
+        return flags
+    try:
+        flags["pat"] = bool(get_user_api_key(user_id, "github"))
+    except Exception:
+        flags["pat"] = False
+    try:
+        from database import list_github_app_installations
+        flags["app"] = bool(list_github_app_installations(user_id))
+    except Exception:
+        flags["app"] = False
+    try:
+        from services.github_app_auth import is_github_app_configured
+        flags["app_configured"] = bool(is_github_app_configured())
+    except Exception:
+        flags["app_configured"] = False
+    return flags
+
+
+@router.get("/sessions/{session_id}/github-target")
+def get_github_target(session_id: str, request: Request):
+    """Chat working branch plus whether this user has GitHub connected.
+
+    No call to GitHub. ``target`` is null when the chat has no repo yet.
+    """
+    require_session_access_from_request(session_id, request)
+    from services.github_natural_tag import get_session_target
+    target = get_session_target(session_id)
+    return {
+        "target": target,
+        "connections": _github_connection_flags(get_request_user_id(request)),
+    }
+
+
+@router.patch("/sessions/{session_id}/github-target")
+def patch_github_target(session_id: str, body: dict, request: Request):
+    """Set or clear the chat's owner/repo/branch. All three, or all empty."""
+    require_session_access_from_request(session_id, request)
+    body = body or {}
+    owner = str(body.get("owner") or "").strip()
+    repo = str(body.get("repo") or "").strip()
+    branch = str(body.get("branch") or "").strip()
+    if not owner and not repo and not branch:
+        with get_db_ctx() as conn:
+            conn.execute(
+                """UPDATE chat_sessions
+                   SET github_owner = NULL, github_repo = NULL, github_branch = NULL
+                   WHERE id = ?""",
+                (session_id,),
+            )
+            conn.commit()
+        return {"ok": True, "target": None}
+    if not owner or not repo or not branch:
+        raise HTTPException(status_code=400, detail="owner, repo, and branch are all required")
+    from services.github_natural_tag import validate_github_target
+    err = validate_github_target(owner, repo, branch)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
+    with get_db_ctx() as conn:
+        conn.execute(
+            """UPDATE chat_sessions
+               SET github_owner = ?, github_repo = ?, github_branch = ?
+               WHERE id = ?""",
+            (owner, repo, branch, session_id),
+        )
+        conn.commit()
+    return {
+        "ok": True,
+        "target": {"owner": owner, "repo": repo, "branch": branch, "explicit": True},
+    }
+
+
 @router.get("/plans/active")
 def get_active_plan(session_id: str, request: Request):
     """Latest source=plan run for the Plan tracker (reload / session switch)."""

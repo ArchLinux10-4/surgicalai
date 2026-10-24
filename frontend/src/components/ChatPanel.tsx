@@ -9,6 +9,7 @@ import { LiveEditCard } from './LiveEditCard'
 import { NewFileCard } from './NewFileCard'
 import { MarkdownCode } from './CodeBlock'
 import { SessionFilesTray } from './SessionFilesTray'
+import { GitHubBranchChip } from './GitHubBranchChip'
 import { PickedElementsTray } from './PickedElementsTray'
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker } from './PlanTracker'
@@ -3340,6 +3341,11 @@ export function ChatPanel() {
                   <span className="hidden sm:inline">Research</span>
                 </button>
               )}
+              <GitHubBranchChip
+                sessionId={activeSessions}
+                disabled={isStreaming || isCompacting}
+                variant="desktop"
+              />
               {/* Mode selector — Edit (default) | Ask | Plan | Agent */}
               <div className="relative">
                 <button

@@ -346,6 +346,22 @@ def _classify_github_exception(tool_name, tool_input, exc, repo_obj=None, _log=N
     return gh_error("generic", tool=tool_name, message=message)
 
 
+def _working_branch_missing(exc, tool_name: str) -> bool:
+    """True when a 404 is the working branch itself, not a missing file.
+
+    read_file returns 404 both for a bad path and a bad ref. GitHub says
+    'No commit found for the ref' only for the ref. list_commits and
+    list_files 404 when the ref does not exist.
+    """
+    status = _exc_status(exc)
+    lowered = str(exc).lower()
+    if status != 404 and "not found" not in lowered:
+        return False
+    if "no commit found" in lowered or "reference does not exist" in lowered:
+        return True
+    return tool_name in ("list_commits", "list_files")
+
+
 # read_file paging: serve at most this many characters of file content per call.
 _READ_FILE_MAX_CHARS = 14000
 # list_files: cap entries so one giant monorepo can't blow up the context.
@@ -547,6 +563,16 @@ def resolve_paths_via_tree(
     try:
         r = g.get_repo(f"{owner}/{repo}")
         ref = r.default_branch or "main"
+        if session_id:
+            from services.github_natural_tag import resolve_read_ref
+            filled_ref, from_target = resolve_read_ref("", session_id, owner, repo)
+            if from_target and filled_ref:
+                ref = filled_ref
+                _log(
+                    "gh_session_target_ref_used",
+                    tool="resolve_paths_via_tree", ref=filled_ref,
+                    owner=owner, repo=repo,
+                )
     except Exception as e:
         return _all_unknown("get_repo_error", owner=owner, repo=repo,
                             detail=str(e)[:200])
@@ -899,6 +925,25 @@ def execute_github_context_tool(
     if err:
         return err
 
+    tool_input = dict(tool_input or {})
+    _used_session_ref = False
+    _session_ref_name = ""
+
+    def _read_ref(explicit, key="ref"):
+        nonlocal _used_session_ref, _session_ref_name
+        from services.github_natural_tag import resolve_read_ref
+        filled, from_target = resolve_read_ref(explicit, session_id, owner, repo)
+        if from_target:
+            _used_session_ref = True
+            _session_ref_name = filled
+            if not str(tool_input.get(key) or "").strip():
+                tool_input[key] = filled
+            _log(
+                "gh_session_target_ref_used",
+                tool=tool_name, ref=filled, owner=owner, repo=repo,
+            )
+        return filled
+
     try:
         r = g.get_repo(f"{owner}/{repo}")
 
@@ -1033,7 +1078,7 @@ def execute_github_context_tool(
 
         elif tool_name == "list_commits":
             limit = _clamp_limit(tool_input.get("limit"), 10, 1, 30)
-            branch = (tool_input.get("branch") or "").strip() or r.default_branch
+            branch = _read_ref(tool_input.get("branch"), key="branch") or r.default_branch
             path = (tool_input.get("path") or "").strip().lstrip("/")
             kwargs = {"sha": branch}
             if path:
@@ -1052,7 +1097,7 @@ def execute_github_context_tool(
                 result = "\n".join(lines) + _more_footer(len(shown), total, "commits")
 
         elif tool_name == "list_files":
-            ref = tool_input.get("ref") or r.default_branch
+            ref = _read_ref(tool_input.get("ref")) or r.default_branch
             path_prefix = tool_input.get("path_prefix") or ""
             _log("github_context_list_files", ref=ref, path_prefix=path_prefix)
             tree = _get_cached_tree(r, ref, owner, repo, _log)
@@ -1076,7 +1121,7 @@ def execute_github_context_tool(
             if not path:
                 _log("github_context_read_file_missing_path")
                 return gh_error("missing_arg", tool="read_file", arg="path")
-            ref = tool_input.get("ref") or r.default_branch
+            ref = _read_ref(tool_input.get("ref")) or r.default_branch
             try:
                 start_line = max(1, int(tool_input.get("start_line") or 1))
             except (TypeError, ValueError):
@@ -1148,7 +1193,7 @@ def execute_github_context_tool(
             if count == 0:
                 lines.append("(no matches — note: GitHub code search only indexes the default branch)")
                 try:
-                    ref = tool_input.get("ref") or r.default_branch
+                    ref = _read_ref(tool_input.get("ref")) or r.default_branch
                     _log("github_context_search_code_zero_hits_fallback_trigger", query=query, ref=ref)
                     fallback_text = _search_code_fallback_scan(r, ref, query, _log, owner=owner, repo=repo)
                     if fallback_text:
@@ -1265,4 +1310,10 @@ def execute_github_context_tool(
     except Exception as e:
         _log("github_context_tool_error", tool_name=tool_name, error=str(e))
         repo_obj = locals().get("r")
-        return _classify_github_exception(tool_name, tool_input, e, repo_obj=repo_obj, _log=_log)
+        msg = _classify_github_exception(tool_name, tool_input, e, repo_obj=repo_obj, _log=_log)
+        if _used_session_ref and _working_branch_missing(e, tool_name):
+            msg = (
+                f"[The working branch '{_session_ref_name}' was not found. "
+                "Call list_branches.]"
+            )
+        return msg

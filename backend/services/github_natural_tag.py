@@ -323,6 +323,192 @@ def natural_github_availability(user_id: str, dlog: Optional[Callable] = None):
         return False, []
 
 
+_OWNER_RE = re.compile(r"^[A-Za-z0-9-]{1,39}$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+_BRANCH_RE = re.compile(r"^[A-Za-z0-9._/-]{1,200}$")
+
+
+def validate_github_target(owner: str, repo: str, branch: str) -> Optional[str]:
+    """Return a plain error, or None when owner, repo, and branch are safe to store.
+
+    The empty triple is not valid here. Callers that clear a target check
+    emptiness before calling this.
+    """
+    if not _OWNER_RE.match(owner or ""):
+        return "Invalid GitHub owner."
+    if not _REPO_RE.match(repo or ""):
+        return "Invalid GitHub repo."
+    branch = branch or ""
+    if (
+        not _BRANCH_RE.match(branch)
+        or ".." in branch
+        or branch.startswith("/")
+        or branch.startswith("-")
+        or branch.endswith("/")
+        or branch.endswith(".lock")
+    ):
+        return "Invalid GitHub branch."
+    return None
+
+
+def _row_cell(row, key: str, index: int):
+    if row is None:
+        return ""
+    if hasattr(row, "keys"):
+        value = row[key]
+    else:
+        value = row[index]
+    return (value or "").strip() if isinstance(value, str) else (str(value).strip() if value else "")
+
+
+def get_session_target(session_id: str):
+    """The chat's GitHub target, or None. Never raises.
+
+    Stored columns win. Otherwise the newest session file's github_meta
+    (owner, repo, branch) so an older chat still agrees with its files.
+    ``explicit`` is True only when the columns are set.
+    """
+    try:
+        if not session_id:
+            return None
+        from database import get_db_ctx
+        with get_db_ctx() as conn:
+            row = conn.execute(
+                "SELECT github_owner, github_repo, github_branch FROM chat_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+        owner = _row_cell(row, "github_owner", 0)
+        repo = _row_cell(row, "github_repo", 1)
+        branch = _row_cell(row, "github_branch", 2)
+        if owner and repo and branch:
+            return {"owner": owner, "repo": repo, "branch": branch, "explicit": True}
+        with get_db_ctx() as conn:
+            rows = conn.execute(
+                """SELECT github_meta FROM session_files
+                   WHERE session_id = ?
+                     AND github_meta IS NOT NULL AND github_meta != ''
+                   ORDER BY updated_at DESC
+                   LIMIT 5""",
+                (session_id,),
+            ).fetchall()
+        for meta_row in rows:
+            raw = meta_row["github_meta"] if hasattr(meta_row, "keys") else meta_row[0]
+            try:
+                meta = json.loads(raw or "{}")
+            except Exception:
+                continue
+            if not isinstance(meta, dict):
+                continue
+            owner = (meta.get("owner") or "").strip()
+            repo = (meta.get("repo") or "").strip()
+            branch = (meta.get("branch") or "").strip()
+            if owner and repo and branch:
+                return {"owner": owner, "repo": repo, "branch": branch, "explicit": False}
+        return None
+    except Exception:
+        return None
+
+
+def target_ref_for(session_id: str, owner: str, repo: str) -> str:
+    """Working branch when owner and repo match case-insensitively, else ''."""
+    try:
+        target = get_session_target(session_id)
+        if not target:
+            return ""
+        same_owner = (target.get("owner") or "").lower() == (owner or "").strip().lower()
+        same_repo = (target.get("repo") or "").lower() == (repo or "").strip().lower()
+        if same_owner and same_repo:
+            return (target.get("branch") or "").strip()
+        return ""
+    except Exception:
+        return ""
+
+
+def resolve_read_ref(explicit, session_id, owner: str, repo: str):
+    """(ref, from_target). An explicit ref wins. Never raises.
+
+    from_target is True only when the session working branch filled an empty ref.
+    """
+    try:
+        text = explicit.strip() if isinstance(explicit, str) else ""
+        if text:
+            return text, False
+        filled = target_ref_for(session_id, owner, repo)
+        if filled:
+            return filled, True
+        return "", False
+    except Exception:
+        return "", False
+
+
+def merge_target_first(known_repos, target):
+    """Put the target repo first. None target returns the list unchanged."""
+    if not target:
+        return known_repos
+    try:
+        owner = (target.get("owner") or "").strip()
+        repo = (target.get("repo") or "").strip()
+        if not owner or not repo:
+            return known_repos
+        full = f"{owner}/{repo}"
+        out = [full]
+        for item in known_repos or []:
+            if isinstance(item, str) and item not in out:
+                out.append(item)
+        return out
+    except Exception:
+        return known_repos
+
+
+def working_branch_line(target) -> str:
+    """One prompt line, or '' when there is no valid target.
+
+    The branch is checked with the same rules as the patch route so a value
+    read back from the database cannot inject a new prompt line.
+    """
+    try:
+        if not isinstance(target, dict):
+            return ""
+        owner = (target.get("owner") or "").strip()
+        repo = (target.get("repo") or "").strip()
+        branch = (target.get("branch") or "").strip()
+        if validate_github_target(owner, repo, branch):
+            return ""
+        return (
+            f"Working branch: {owner}/{repo}@{branch}. "
+            "Use it for GitHub reads unless the user names another branch."
+        )
+    except Exception:
+        return ""
+
+
+def set_session_target_if_empty(session_id: str, owner: str, repo: str, branch: str) -> bool:
+    """Set the chat target only when github_repo is still NULL. Never raises."""
+    try:
+        owner = (owner or "").strip()
+        repo = (repo or "").strip()
+        branch = (branch or "").strip()
+        if not session_id or not owner or not repo or not branch:
+            return False
+        if validate_github_target(owner, repo, branch):
+            return False
+        from database import get_db_ctx, _dlog
+        with get_db_ctx() as conn:
+            cur = conn.execute(
+                """UPDATE chat_sessions
+                   SET github_owner = ?, github_repo = ?, github_branch = ?
+                   WHERE id = ? AND github_repo IS NULL""",
+                (owner, repo, branch, session_id),
+            )
+            conn.commit()
+            changed = bool(getattr(cur, "rowcount", 0))
+        if changed:
+            _dlog("gh_session_target_set", session_id=session_id, owner=owner, repo=repo, branch=branch)
+        return changed
+    except Exception:
+        return False
+
+
 def get_known_repos(user_id: str, session_id: str,
                     dlog: Optional[Callable] = None,
                     limit: int = 3) -> list:
@@ -375,7 +561,8 @@ def build_github_prompt_section(installations: list,
                                 tier: str = "read_only",
                                 wants_push: bool = False,
                                 wants_deploy: bool = False,
-                                wants_edit: bool = False) -> str:
+                                wants_edit: bool = False,
+                                working_branch=None) -> str:
     """Short GitHub instructions. Extra push/deploy/edit rules only when relevant."""
     try:
         from services.github_tool_spec import render_selection_table, render_tool_list
@@ -429,6 +616,9 @@ def build_github_prompt_section(installations: list,
             "- If a result is an error, follow its instruction. Do not repeat the same call.",
             "- Use owner and repo exactly as listed. When one default repo is shown, you may omit them.",
         ]
+        branch_line = working_branch_line(working_branch)
+        if branch_line:
+            parts.insert(3, branch_line)
         if wants_edit:
             parts.append(
                 "EDITING A REPO FILE: after read_file, the complete file is loaded into this session. "
@@ -444,6 +634,8 @@ def build_github_prompt_section(installations: list,
                 "Do not resend file content and do not call read_file first. Never push unless the user asked. "
                 "After success, give the commit link, the +/- line stats, one line on what changed, and the Deploy line if present."
             )
+            if branch_line:
+                parts.append("For push_files use this branch.")
         if wants_deploy:
             parts.append(
                 "DEPLOYS: call check_deploy. Compare the result commit sha and time to the commit you pushed. "
@@ -637,7 +829,15 @@ def fetch_and_register_github_file(parsed: dict, user_id: str,
             return None
 
         r = g.get_repo(f"{owner}/{repo}")
-        ref = (args.get("ref") or "").strip() or r.default_branch
+        explicit_ref = (args.get("ref") or "").strip()
+        filled_ref, from_target = resolve_read_ref(explicit_ref, session_id, owner, repo)
+        if from_target:
+            _safe_dlog(
+                dlog, "gh_session_target_ref_used",
+                tool="fetch_and_register_github_file", ref=filled_ref,
+                owner=owner, repo=repo, session_id=session_id,
+            )
+        ref = filled_ref or r.default_branch
         contents = r.get_contents(path, ref=ref)
         if isinstance(contents, list):
             _safe_dlog(dlog, "gh_session_register_is_dir",
@@ -715,6 +915,8 @@ def fetch_and_register_github_file(parsed: dict, user_id: str,
                            user_id=user_id, session_id=session_id,
                            file_id=file_id, filename=filename)
             conn.commit()
+
+        set_session_target_if_empty(session_id, owner, repo, ref)
 
         _safe_dlog(dlog, "gh_session_register_ok",
                    user_id=user_id, session_id=session_id, file_id=file_id,

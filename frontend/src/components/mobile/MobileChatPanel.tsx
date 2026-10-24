@@ -25,6 +25,7 @@ import {
   type ChatMode,
 } from './chatMode'
 import { SessionFilesTray } from '../SessionFilesTray'
+import { GitHubBranchChip } from '../GitHubBranchChip'
 import { AgentMissionControl } from '../AgentMissionControl'
 import { PlanTracker } from '../PlanTracker'
 import { PlanPane } from '../PlanPane'
@@ -1810,6 +1811,12 @@ export function MobileChatPanel() {
                   Research
                 </button>
               )}
+
+              <GitHubBranchChip
+                sessionId={activeSessions}
+                disabled={isStreaming || isCompacting}
+                variant="mobile"
+              />
 
               {/* Expand to full-screen compose */}
               <button
