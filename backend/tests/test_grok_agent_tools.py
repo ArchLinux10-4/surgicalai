@@ -281,6 +281,18 @@ def test_translate_request_github_context_tuple():
     assert payload["args"] == {"path": "x"}
 
 
+def test_request_github_schema_matches_the_shared_catalogue():
+    from services.github_tool_spec import ALL_TOOL_NAMES
+    schema = gat._schema_request_github()
+    tool = schema["function"]["parameters"]["properties"]["tool"]
+    assert tool["enum"] == list(ALL_TOOL_NAMES)
+    desc = tool["description"] + schema["function"]["description"]
+    assert "path_prefix" in desc
+    assert "path?" not in desc
+    assert "provider" in desc
+    assert schema["function"]["parameters"]["required"] == ["tool"]
+
+
 def test_translate_request_history_context_tuple():
     res = gat.translate_tool_calls([_call("request_history",
                                           {"filename": "a.py", "query": "old"})])

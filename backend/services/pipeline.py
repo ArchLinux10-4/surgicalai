@@ -4339,6 +4339,41 @@ def run_chat(
 _ASK_PLAN_GH_WRITE_TOOLS = frozenset({"push_files", "push_session_file"})
 
 
+def _gh_prompt_bits(known_repos) -> str:
+    """Ask/Plan GitHub instructions, generated from the shared tool catalogue."""
+    from services.github_tool_spec import render_selection_table, render_tool_list
+    repos = [r for r in (known_repos or []) if isinstance(r, str) and "/" in r]
+    if repos:
+        owner, repo = repos[0].split("/", 1)
+        known = (
+            "KNOWN REPOS (use these exactly as owner/repo, most recent first): "
+            + ", ".join(repos)
+            + "\n"
+        )
+        if len(repos) == 1:
+            known += f"Default repo: {repos[0]} (you may omit owner and repo).\n"
+    else:
+        owner, repo = "OWNER", "<repo name>"
+        known = "Call list_repos first if you do not know owner/repo.\n"
+    example = (
+        '{"tool": "list_prs", "args": {"owner": "%s", "repo": "%s", "state": "all", "limit": 5}}'
+        % (owner, repo)
+    )
+    return (
+        known
+        + "Which tool:\n"
+        + render_selection_table()
+        + "\n\nTools:\n"
+        + render_tool_list(known_repo=repos[0] if len(repos) == 1 else None, include_write=False)
+        + "\n\n<github_request>"
+        + example
+        + "</github_request>\n"
+        + "ONE tag, then stop. If the result says TRUNCATED, call read_file again "
+        + "with the start_line it gives you. If a result is an error, follow it "
+        + "instead of repeating the call.\n"
+    )
+
+
 def _ask_plan_build_tool_instructions(
     *, has_files: bool, gh_enabled: bool, gh_known_repos: list, max_rounds: int,
     aws_enabled: bool = False,
@@ -4395,25 +4430,11 @@ def _ask_plan_build_tool_instructions(
         )
 
     if gh_enabled:
-        known_line = (
-            f"\nKNOWN REPOS (most recent first): {', '.join(gh_known_repos)}\n"
-            "Use these owner/repo values directly instead of calling list_repos.\n"
-            if gh_known_repos else ""
-        )
         tag_blocks.append(
             "You can read the connected GitHub repository (read-only in "
-            "this mode — you cannot push, commit, or edit files here):\n\n"
-            '<github_request>{"tool": "list_prs", "args": {"owner": "...", '
-            '"repo": "..."}, "reason": "why you need this"}</github_request>\n\n'
-            "Available tools: list_repos {}, list_prs {owner, repo, state?}, "
-            "get_pr_diff {owner, repo, pr_number}, get_pr_comments {owner, "
-            "repo, pr_number}, list_issues {owner, repo, state?}, "
-            "get_issue_comments {owner, repo, issue_number}, diff_branches "
-            "{owner, repo, base, head}, list_files {owner, repo, ref?, "
-            "path_prefix?}, read_file {owner, repo, path, ref?, start_line?}, "
-            "search_code {owner, repo, query}, check_deploy {provider?}."
-            f"{known_line}\n"
-            "If the user wants an actual code change made or pushed, tell "
+            "this mode — you cannot push, commit, or edit files here).\n\n"
+            + _gh_prompt_bits(gh_known_repos)
+            + "\nIf the user wants an actual code change made or pushed, tell "
             "them to switch to Agent/Edit mode — this mode can only look, "
             "not write."
         )
@@ -4448,6 +4469,7 @@ def _ask_plan_strip_tool_tags(text: str) -> str:
 def _ask_plan_execute_tool_round(
     *, sr_match, fr_match, gr_match, hr_match=None, aws_match=None,
     symbol_maps_by_name, file_content_lookup, user_id, session_id, tool_round,
+    known_repos=None, gh_seen=None,
 ):
     """
     Executes whichever tag(s) the model emitted this round, reusing the
@@ -4464,7 +4486,10 @@ def _ask_plan_execute_tool_round(
     unmodified too.
     Returns the list of result strings to feed back to the model.
     """
-    from services.github_natural_tag import parse_github_request, execute_github_request
+    from services.github_natural_tag import (
+        parse_github_request, execute_github_request, shape_github_result,
+    )
+    from services.github_context_tools import gh_error
 
     tool_parts = []
     if sr_match:
@@ -4492,11 +4517,19 @@ def _ask_plan_execute_tool_round(
         _dlog("ask_plan_file_fetched", session_id=session_id, user_id=user_id,
               tool_round=tool_round, requested=fr_names[:5])
     if gr_match:
-        gr_parsed = parse_github_request(gr_match.group(1), dlog=_dlog)
+        gr_parsed = parse_github_request(
+            gr_match.group(1), dlog=_dlog, known_repos=known_repos)
         if not gr_parsed:
-            tool_parts.append(
-                "Your <github_request> was not valid JSON. Emit a corrected "
-                "<github_request>, or answer with what you already know.")
+            tool_parts.append(gh_error(
+                "bad_json",
+                reason="the body was not valid JSON",
+                example=json.dumps(
+                    {"tool": "list_prs", "args": {"owner": "acme", "repo": "app", "state": "all"}},
+                    separators=(",", ":"),
+                ),
+            ))
+        elif gr_parsed.get("_error"):
+            tool_parts.append(gr_parsed["_error"])
         elif gr_parsed.get("tool") in _ASK_PLAN_GH_WRITE_TOOLS:
             _dlog("ask_plan_github_write_blocked", session_id=session_id,
                   user_id=user_id, tool_round=tool_round,
@@ -4506,11 +4539,33 @@ def _ask_plan_execute_tool_round(
                 "Ask/Plan is read-only. Tell the user to switch to Agent/Edit "
                 "mode to make and push that change.")
         else:
-            gr_result = execute_github_request(gr_parsed, user_id, dlog=_dlog, session_id=session_id)
-            tool_parts.append(f"GitHub {gr_parsed.get('tool')} result:\n{gr_result}")
-            _dlog("ask_plan_github_executed", session_id=session_id, user_id=user_id,
-                  tool_round=tool_round, tool=gr_parsed.get("tool"),
-                  result_chars=len(gr_result))
+            _gh_args = gr_parsed.get("args") if isinstance(gr_parsed.get("args"), dict) else {}
+            _gh_sig = (
+                gr_parsed.get("tool"),
+                json.dumps(_gh_args, sort_keys=True, default=str),
+            )
+            _seen = gh_seen if isinstance(gh_seen, dict) else None
+            if _seen is not None and _gh_sig in _seen:
+                tool_parts.append(
+                    f"You already have this result above (round {_seen[_gh_sig]}). "
+                    "Use it to answer, or request something different."
+                )
+                _dlog("ask_plan_github_repeat_skipped", session_id=session_id,
+                      user_id=user_id, tool_round=tool_round, tool=gr_parsed.get("tool"))
+            else:
+                gr_result = execute_github_request(
+                    gr_parsed, user_id, dlog=_dlog, session_id=session_id,
+                    known_repos=known_repos,
+                )
+                if _seen is not None:
+                    _seen[_gh_sig] = tool_round
+                tool_parts.append(
+                    f"GitHub {gr_parsed.get('tool')} result:\n"
+                    f"{shape_github_result(str(gr_result), 14000)}"
+                )
+                _dlog("ask_plan_github_executed", session_id=session_id, user_id=user_id,
+                      tool_round=tool_round, tool=gr_parsed.get("tool"),
+                      result_chars=len(gr_result))
     if hr_match:
         # All-modes rollout: same handler shape as Agent mode's <history_request>
         # branch in natural_conversation_pipeline (agent_history_* dlog names
@@ -4637,6 +4692,7 @@ async def run_chat_stream(
     _gh_nat_enabled = False
     _gh_nat_installs: list = []
     _gh_known_repos: list = []
+    _ask_plan_gh_seen: dict = {}
     if not _ask_plan_is_ollama:
         try:
             from services.github_natural_tag import (
@@ -4905,6 +4961,7 @@ async def run_chat_stream(
                         symbol_maps_by_name=symbol_maps_by_name,
                         file_content_lookup=file_content_lookup,
                         user_id=user_id, session_id=session_id, tool_round=_tool_round,
+                        known_repos=_gh_known_repos, gh_seen=_ask_plan_gh_seen,
                     )
 
                 if not _tool_parts:
@@ -5165,6 +5222,7 @@ async def run_chat_stream(
                         symbol_maps_by_name=symbol_maps_by_name,
                         file_content_lookup=file_content_lookup,
                         user_id=user_id, session_id=session_id, tool_round=_tool_round,
+                        known_repos=_gh_known_repos, gh_seen=_ask_plan_gh_seen,
                     )
 
                 if not _tool_parts:
@@ -17757,6 +17815,7 @@ async def run_natural_pipeline_stream(
         # inactive, TAG_DEFS and the system prompt are byte-identical to
         # before — the single-pass path is untouched.
         _gh_nat_enabled = False
+        _gh_known_repos = []
         try:
             from services.github_natural_tag import (
                 natural_github_availability, build_github_prompt_section,
@@ -17773,10 +17832,35 @@ async def run_natural_pipeline_stream(
                 # already works with so round 1 isn't burned on list_repos.
                 _gh_known_repos = get_known_repos(
                     user_id, session_id, dlog=_dlog)
+                _gh_tier = "read_only"
+                _gh_wants_push = False
+                _gh_wants_deploy = False
+                _gh_prompt_wants_edit = True
+                try:
+                    from services.github_natural_tag import (
+                        message_mentions_push as _gh_mentions_push,
+                        message_mentions_deploy as _gh_mentions_deploy,
+                    )
+                    if any((i.get("permission_tier") == "read_write") for i in _gh_nat_installs):
+                        _gh_tier = "read_write"
+                    _gh_wants_push = (
+                        _gh_tier == "read_write" and _gh_mentions_push(user_request or "")
+                    )
+                    _gh_wants_deploy = _gh_mentions_deploy(user_request or "")
+                    _gh_prompt_wants_edit = bool(_wants_edit)
+                except Exception:
+                    _gh_tier = "read_write"
+                    _gh_wants_push = True
+                    _gh_wants_deploy = True
+                    _gh_prompt_wants_edit = True
                 system_prompt.append({
                     "type": "text",
                     "text": build_github_prompt_section(
-                        _gh_nat_installs, known_repos=_gh_known_repos),
+                        _gh_nat_installs, known_repos=_gh_known_repos,
+                        tier=_gh_tier, wants_push=_gh_wants_push,
+                        wants_deploy=_gh_wants_deploy,
+                        wants_edit=_gh_prompt_wants_edit,
+                    ),
                 })
                 _dlog("natural_github_tag_registered",
                       session_id=session_id, user_id=user_id,
@@ -18165,7 +18249,7 @@ async def run_natural_pipeline_stream(
         MAX_GITHUB_READ_ROUNDS = 30
         MAX_GITHUB_WRITE_ROUNDS = 30
         MAX_GITHUB_ATTEMPTS = 60
-        _GITHUB_READ_TOOLS = frozenset({"list_files", "read_file", "search_code", "check_deploy", "list_repos"})
+        from services.github_tool_spec import READ_TOOL_NAMES as _GITHUB_READ_TOOLS
 
         # ---- Discovery state (accumulates across turns; no phase wall resets it) ----
         searched_terms: list = []
@@ -18183,6 +18267,8 @@ async def run_natural_pipeline_stream(
         _github_reads_used = 0
         _github_writes_used = 0
         _github_attempts = 0
+        _gh_seen: dict = {}
+        _gh_read_streak = 0
         # Grok-only deterministic pagination backstop (proven root cause,
         # session 36118be1): Grok's read_file result is truncated at ~14,000
         # chars/call and tells the model to pass start_line to continue, but
@@ -18228,8 +18314,11 @@ async def run_natural_pipeline_stream(
                 _fn = _parse_filereq_content(_block)
                 return ("file", _fn[:5]) if _fn else None
             if _kind == "github":
-                _gd = parse_github_request(_block, dlog=_dlog)
-                return ("github", _gd if _gd is not None else {"_invalid": _block[:500]})
+                _gd = parse_github_request(
+                    _block, dlog=_dlog, known_repos=_gh_known_repos)
+                if _gd is None:
+                    return ("github", {"_invalid": _block[:500]})
+                return ("github", _gd)
             if _kind == "history":
                 _hd = _parse_history_content(_block)
                 return ("history", _hd if _hd is not None else {"_invalid": _block[:500]})
@@ -19849,32 +19938,66 @@ async def run_natural_pipeline_stream(
                                 "<blocked>…</blocked>."},
                         ]
                         continue
-                    if "_invalid" in _gh_req:
+                    if _gh_req.get("_error"):
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
-                                "Your <github_request> was not valid JSON. Emit a corrected "
-                                "<github_request>, or write your edits."},
+                            {"role": "user", "content": str(_gh_req["_error"])},
                         ]
                         continue
-                    # ── Grok-only auto-continue backstop ──────────────────
-                    # See _grok_gh_read_progress comment above. Only rewrites
-                    # start_line for grok read_file calls on a path we've
-                    # already served a page of; Claude/GPT are untouched.
+                    if "_invalid" in _gh_req:
+                        from services.github_context_tools import gh_error as _gh_error
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content": _gh_error(
+                                "bad_json",
+                                reason="the body was not valid JSON",
+                                example='{"tool":"list_prs","args":{"owner":"acme","repo":"app","state":"all"}}',
+                            )},
+                        ]
+                        continue
+                    # Page tracking is recorded for every model. Only Grok has
+                    # start_line rewritten when it re-reads a file from the top.
+                    from services.github_natural_tag import (
+                        maybe_resume_read_file as _gh_resume,
+                        note_read_file_page as _gh_note_page,
+                        shape_github_result as _shape_gh,
+                    )
                     _gh_key = None
-                    if _is_grok_model(arch_model) and _gh_tool == "read_file":
-                        _gh_args = _gh_req.get("args") if isinstance(_gh_req.get("args"), dict) else {}
+                    _gh_args = _gh_req.get("args") if isinstance(_gh_req.get("args"), dict) else {}
+                    if _gh_tool == "read_file":
                         _gh_key = "|".join(str(_gh_args.get(k, "")) for k in ("owner", "repo", "path", "ref"))
-                        _gh_prev_end = _grok_gh_read_progress.get(_gh_key)
-                        _gh_req_start_line = _gh_args.get("start_line")
-                        if _gh_prev_end and (not _gh_req_start_line or int(_gh_req_start_line) <= 1):
-                            _gh_args = dict(_gh_args)
-                            _gh_args["start_line"] = _gh_prev_end + 1
+                        _gh_before_line = _gh_args.get("start_line")
+                        _gh_args = _gh_resume(
+                            _gh_args, _grok_gh_read_progress,
+                            rewrite=_is_grok_model(arch_model),
+                        )
+                        if _gh_args.get("start_line") != _gh_before_line:
                             _gh_req = dict(_gh_req)
                             _gh_req["args"] = _gh_args
                             _dlog("grok_gh_auto_continue",
                                   session_id=session_id, user_id=user_id,
-                                  path=_gh_args.get("path"), resumed_at=_gh_prev_end + 1)
+                                  path=_gh_args.get("path"), resumed_at=_gh_args.get("start_line"))
+                    _gh_sig = (
+                        _gh_tool,
+                        json.dumps(_gh_args, sort_keys=True, default=str),
+                    )
+                    if _gh_is_read and _gh_sig in _gh_seen:
+                        _repeat = (
+                            f"You already have this result above (round {_gh_seen[_gh_sig]}). "
+                            "Use it to answer, or request something different."
+                        )
+                        if _gh_read_streak >= 3:
+                            _repeat += (
+                                "\nAnswer the user now." if not _wants_edit
+                                else "\nYou have enough context. Answer or write the edits now."
+                            )
+                        _dlog("agent_github_repeat_skipped",
+                              session_id=session_id, user_id=user_id, tool=_gh_tool)
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content": _repeat},
+                        ]
+                        continue
                     _gh_target = ""
                     if isinstance(_gh_req.get("args"), dict):
                         _gh_target = _gh_req["args"].get("path") or _gh_req["args"].get("query") or ""
@@ -19886,13 +20009,15 @@ async def run_natural_pipeline_stream(
                                           + (f" — {_gh_target}" if _gh_target else "") + "..."})
                     try:
                         _gh_result = execute_github_request(
-                            _gh_req, user_id, dlog=_dlog, session_id=session_id)
+                            _gh_req, user_id, dlog=_dlog, session_id=session_id,
+                            known_repos=_gh_known_repos)
                         if _gh_key is not None:
-                            _gh_end_match = re.search(r"showing lines \d+-(\d+)", str(_gh_result))
-                            if _gh_end_match:
-                                _grok_gh_read_progress[_gh_key] = int(_gh_end_match.group(1))
+                            _gh_end = _gh_note_page(str(_gh_result))
+                            if _gh_end is not None:
+                                _grok_gh_read_progress[_gh_key] = _gh_end
                         if _gh_is_read:
                             _github_reads_used += 1
+                            _gh_seen[_gh_sig] = _turn
                         else:
                             _github_writes_used += 1
                         _dlog("agent_github_result",
@@ -19906,6 +20031,7 @@ async def run_natural_pipeline_stream(
                         #    file_content_lookup_stream + symbol_maps_by_name,
                         #    not just in the conversation history) ──
                         _gh_note = ""
+                        _gh_registered = False
                         if _gh_tool == "read_file" and _gh_result and not str(_gh_result).startswith("["):
                             try:
                                 from services.github_natural_tag import (
@@ -19914,6 +20040,7 @@ async def run_natural_pipeline_stream(
                                 _rf_entry = fetch_and_register_github_file(
                                     _gh_req, user_id, session_id, dlog=_dlog)
                                 if _rf_entry and _rf_entry.get("content"):
+                                    _gh_registered = True
                                     _rf_fname = _rf_entry["filename"]
                                     # Inject into file_content_lookup_stream
                                     # so plan executor can find + edit it
@@ -19947,11 +20074,22 @@ async def run_natural_pipeline_stream(
                                       user_id=user_id,
                                       error=str(_rf_err)[:300])
 
+                        if _gh_is_read and not _gh_registered:
+                            _gh_read_streak += 1
+                        else:
+                            _gh_read_streak = 0
+                        _gh_nudge = ""
+                        if _gh_is_read and _gh_read_streak >= 3:
+                            _gh_nudge = (
+                                "\n\nAnswer the user now." if not _wants_edit
+                                else "\n\nYou have enough context. Answer or write the edits now."
+                            )
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
                             {"role": "user", "content":
-                                f"GitHub result:\n{json.dumps(_gh_result, indent=2, default=str)[:8000]}"
+                                f"GitHub {_gh_tool} result:\n{_shape_gh(str(_gh_result), 14000)}"
                                 + _gh_note
+                                + _gh_nudge
                                 + "\n\nRequest more if you need it, or write your edits now."},
                         ]
                     except Exception as _gh_err:

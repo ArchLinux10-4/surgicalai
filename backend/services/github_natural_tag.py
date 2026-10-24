@@ -32,21 +32,38 @@ Every function here degrades gracefully: no exception ever escapes into
 the streaming loop.
 """
 import json
+import re
 from typing import Callable, Optional
 
+from services.github_tool_spec import ALL_TOOL_NAMES
 
-# Tools Claude may request via the tag. Read tools work on any tier;
-# push_files is additionally gated on the read_write tier inside
-# execute_github_context_tool (server-side, never trusted to the model).
-_NATURAL_GH_TOOLS = (
-    "list_repos", "list_prs", "get_pr_diff", "get_pr_comments",
-    "list_issues", "get_issue_comments", "diff_branches",
-    "list_files", "read_file", "search_code", "push_files",
-    "push_session_file", "check_deploy",
-)
+
+# Every tool the model may name. The server still enforces the read_write
+# tier inside the push tools.
+_NATURAL_GH_TOOLS = ALL_TOOL_NAMES
 
 GH_TAG_OPEN = "<github_request>"
 GH_TAG_CLOSE = "</github_request>"
+
+_PLACEHOLDER_VALUES = {
+    "", "repo_name", "reponame", "repo-name", "<repo>", "<repo name>",
+    "...", "repo", "owner", "your_repo", "your-repo", "somerepo",
+    "<owner>", "user", "org",
+}
+_PR_NUMBER_TOOLS = {"get_pr", "get_pr_diff", "get_pr_comments"}
+_ISSUE_NUMBER_TOOLS = {"get_issue", "get_issue_comments"}
+_NO_REPO_TOOLS = {"list_repos", "check_deploy", "push_session_file"}
+_PUSH_RE = re.compile(
+    r"\b(push(?:ed|ing)?|commit(?:ted|ting)?|ship(?:ped| it)?|"
+    r"make it live|send it to(?: the)? (?:repo|github)|"
+    r"update github|save my changes)\b",
+    re.IGNORECASE,
+)
+_DEPLOY_RE = re.compile(
+    r"\b(deploy(?:ment|ed|ing)?|vercel|railway|go live|went live|"
+    r"build(?: fail(?:ed|ure)?| error| log)?)\b",
+    re.IGNORECASE,
+)
 
 
 def _safe_dlog(dlog: Optional[Callable], event: str, **kw) -> None:
@@ -56,6 +73,221 @@ def _safe_dlog(dlog: Optional[Callable], event: str, **kw) -> None:
         dlog(event, **kw)
     except Exception:
         pass
+
+
+def shape_github_result(text: str, limit: int = 14000) -> str:
+    """Trim to `limit` chars without dropping a trailing '[TRUNCATED ...]' hint.
+
+    Cuts the body and keeps the last footer line so a paged read_file still
+    tells the model which start_line to request next.
+    """
+    try:
+        text = "" if text is None else str(text)
+        if len(text) <= limit:
+            return text
+        lines = text.rstrip("\n").split("\n")
+        footer = lines[-1] if lines and lines[-1].startswith("[") else ""
+        keep = max(0, limit - len(footer) - 80)
+        cut = text[:keep]
+        if "\n" in cut:
+            cut = cut.rsplit("\n", 1)[0]
+        note = f"\n[Output shortened by {len(text) - len(cut)} chars to fit.]\n"
+        out = cut + note + footer
+        if len(out) <= limit:
+            return out
+        if footer and len(footer) <= limit:
+            return footer
+        return out[:limit]
+    except Exception:
+        return ("" if text is None else str(text))[:limit]
+
+
+def note_read_file_page(result_text: str):
+    """Last line number from a read_file header, or None. Never raises."""
+    try:
+        match = re.search(r"showing lines \d+-(\d+)", result_text or "")
+        return int(match.group(1)) if match else None
+    except Exception:
+        return None
+
+
+def maybe_resume_read_file(args: dict, progress: dict, *, rewrite: bool) -> dict:
+    """Return args, rewriting start_line only when rewrite is true (Grok).
+
+    progress maps 'owner|repo|path|ref' to the last line already shown.
+    Claude and GPT keep the args they sent; Grok is resumed past page 1
+    when it asks for the same file again from the top.
+    """
+    try:
+        args = dict(args or {})
+        key = "|".join(str(args.get(k, "")) for k in ("owner", "repo", "path", "ref"))
+        prev = (progress or {}).get(key)
+        start = args.get("start_line")
+        try:
+            start_n = int(start) if start not in (None, "") else None
+        except (TypeError, ValueError):
+            start_n = None
+        if rewrite and prev and (start_n is None or start_n <= 1):
+            args["start_line"] = int(prev) + 1
+        return args
+    except Exception:
+        return dict(args or {})
+
+
+def message_mentions_push(text: str) -> bool:
+    """True when the user asked to push, or the request is ambiguous about it."""
+    try:
+        raw = text or ""
+        if _PUSH_RE.search(raw):
+            return True
+        mentions_github = re.search(r"\bgithub\b", raw, re.IGNORECASE)
+        mentions_change = re.search(r"\b(change|update|edit|fix)\b", raw, re.IGNORECASE)
+        looks_like_question = re.match(
+            r"\s*(what|why|how|when|did|is|are|do|does|can|could)\b",
+            raw,
+            re.IGNORECASE,
+        )
+        return bool(mentions_github and mentions_change and not looks_like_question)
+    except Exception:
+        return True
+
+
+def message_mentions_deploy(text: str) -> bool:
+    try:
+        return bool(_DEPLOY_RE.search(text or ""))
+    except Exception:
+        return True
+
+
+def _as_int(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text.startswith("#"):
+        text = text[1:].strip()
+    if text.isdigit():
+        return int(text)
+    return None
+
+
+def _split_repo_slug(value: str):
+    text = (value or "").strip()
+    if not text:
+        return None, None
+    web = re.search(r"github\.com/([^/\s]+)/([^/\s#?]+)", text, re.IGNORECASE)
+    if web:
+        repo = web.group(2)
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        return web.group(1), repo
+    blob = re.search(r"github\.com/([^/\s]+)/([^/\s]+)/blob/[^/]+/(.+)$", text, re.IGNORECASE)
+    if blob:
+        return blob.group(1), blob.group(2)
+    if "/" in text and not text.startswith("http"):
+        owner, repo = text.split("/", 1)
+        repo = repo.strip().lstrip("/")
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        if owner.strip() and repo and "/" not in repo:
+            return owner.strip(), repo
+    return None, None
+
+
+def _placeholder(value) -> bool:
+    return str(value or "").strip().lower() in _PLACEHOLDER_VALUES
+
+
+def _clean_path(value: str) -> str:
+    text = (value or "").strip()
+    text = re.sub(r"^https?://github\.com/[^/]+/[^/]+/blob/[^/]+/", "", text, flags=re.IGNORECASE)
+    text = text.replace("/./", "/")
+    while text.startswith("./"):
+        text = text[2:]
+    return text.lstrip("/")
+
+
+def normalize_github_args(tool: str, args: dict, known_repos=None) -> dict:
+    """Fill and clean arguments. Never rejects a call."""
+    try:
+        cleaned = dict(args or {})
+        known = []
+        for repo in known_repos or []:
+            if isinstance(repo, str) and "/" in repo and repo not in known:
+                known.append(repo.strip())
+
+        repo_val = cleaned.get("repo")
+        if isinstance(repo_val, str):
+            owner_part, repo_part = _split_repo_slug(repo_val)
+            if owner_part and repo_part:
+                if _placeholder(cleaned.get("owner")) or not str(cleaned.get("owner") or "").strip():
+                    cleaned["owner"] = owner_part
+                cleaned["repo"] = repo_part
+
+        if tool not in _NO_REPO_TOOLS and known:
+            owner_name, repo_name = known[0].split("/", 1)
+            only_one = len(known) == 1
+
+            def _bad(value):
+                return value is not None and str(value).strip().lower() in _PLACEHOLDER_VALUES
+
+            def _absent(value):
+                return value is None
+
+            if _bad(cleaned.get("repo")) or _bad(cleaned.get("owner")):
+                if _bad(cleaned.get("owner")) or _absent(cleaned.get("owner")):
+                    cleaned["owner"] = owner_name
+                if _bad(cleaned.get("repo")) or _absent(cleaned.get("repo")):
+                    cleaned["repo"] = repo_name
+            elif only_one:
+                if _absent(cleaned.get("owner")) or _bad(cleaned.get("owner")):
+                    cleaned["owner"] = owner_name
+                if _absent(cleaned.get("repo")) or _bad(cleaned.get("repo")):
+                    cleaned["repo"] = repo_name
+
+        if tool in _PR_NUMBER_TOOLS:
+            if _as_int(cleaned.get("pr_number")) is None:
+                for alias in ("pr", "number", "id", "pull_number"):
+                    if alias in cleaned:
+                        cleaned["pr_number"] = cleaned.pop(alias)
+                        break
+            number = _as_int(cleaned.get("pr_number"))
+            if number is not None:
+                cleaned["pr_number"] = number
+        if tool in _ISSUE_NUMBER_TOOLS:
+            if _as_int(cleaned.get("issue_number")) is None:
+                for alias in ("issue", "number", "id"):
+                    if alias in cleaned:
+                        cleaned["issue_number"] = cleaned.pop(alias)
+                        break
+            number = _as_int(cleaned.get("issue_number"))
+            if number is not None:
+                cleaned["issue_number"] = number
+
+        if "state" in cleaned and cleaned.get("state") is not None:
+            state = str(cleaned.get("state")).strip().lower()
+            if state == "merged":
+                state = "closed"
+            if state not in ("open", "closed", "all"):
+                state = "open"
+            cleaned["state"] = state
+
+        for key in ("path", "path_prefix"):
+            if isinstance(cleaned.get(key), str):
+                cleaned[key] = _clean_path(cleaned[key])
+
+        if "start_line" in cleaned:
+            number = _as_int(cleaned.get("start_line"))
+            if number is not None:
+                cleaned["start_line"] = number
+        if "limit" in cleaned:
+            number = _as_int(cleaned.get("limit"))
+            if number is not None:
+                cleaned["limit"] = number
+        return cleaned
+    except Exception:
+        return dict(args or {})
 
 
 def natural_github_availability(user_id: str, dlog: Optional[Callable] = None):
@@ -139,100 +371,101 @@ def get_known_repos(user_id: str, session_id: str,
 
 
 def build_github_prompt_section(installations: list,
-                                known_repos: Optional[list] = None) -> str:
-    """System-prompt text telling Claude the tag exists and how to use it.
-    Only ever called when natural_github_availability returned True."""
-    accounts = ", ".join(
-        str(i.get("account_login", "?")) for i in installations
-    ) or "?"
-    known_line = ""
-    if known_repos:
-        known_line = (
-            "\nKNOWN REPOS (from this user's session history, most recent "
-            f"first): {', '.join(known_repos)}\n"
-            "Use these owner/repo values directly. Do NOT call list_repos "
-            "when the repo you need is already listed here.\n"
+                                known_repos: Optional[list] = None,
+                                tier: str = "read_only",
+                                wants_push: bool = False,
+                                wants_deploy: bool = False,
+                                wants_edit: bool = False) -> str:
+    """Short GitHub instructions. Extra push/deploy/edit rules only when relevant."""
+    try:
+        from services.github_tool_spec import render_selection_table, render_tool_list
+        accounts = [str(i.get("account_login", "?")) for i in (installations or [])]
+        account_text = ", ".join(a for a in accounts if a) or "?"
+        repos = [r for r in (known_repos or []) if isinstance(r, str) and "/" in r]
+        write_ok = (tier or "read_only") == "read_write"
+        access = "read and write" if write_ok else "read"
+        if repos:
+            owner, repo = repos[0].split("/", 1)
+            repo_note = (
+                "KNOWN REPOS (use these exactly as owner/repo): "
+                + ", ".join(repos)
+            )
+            if len(repos) == 1:
+                repo_note += f"\nDefault repo: {repos[0]} (you may omit owner and repo)."
+            else:
+                repo_note += "\nDo NOT call list_repos when the repo you need is already listed."
+        else:
+            owner = accounts[0].strip() if accounts else "OWNER"
+            repo = "<repo name>"
+            repo_note = (
+                "No repo has been used in this session yet. Call list_repos first, "
+                "then copy owner and repo from that list. Do not invent a repo name."
+            )
+        list_example = json.dumps(
+            {"tool": "list_prs", "args": {"owner": owner, "repo": repo, "state": "all", "limit": 5}},
+            separators=(",", ":"),
         )
-    return f"""
-━━━ GITHUB ACCESS (LIVE) ━━━
-This user has connected their GitHub account ({accounts}) via the GitHub App.
-You HAVE live read access to their repositories. When the user asks about
-their pull requests, issues, branches, diffs, or repos, DO NOT say you lack
-access — fetch the data with a github_request tag:
-{known_line}
-
-<github_request>
-{{"tool": "list_prs", "args": {{"owner": "{accounts.split(',')[0].strip()}", "repo": "REPO_NAME"}}, "reason": "why you need this"}}
-</github_request>
-
-Available tools:
-- list_repos    args: {{}}                                    → repos the connection can reach (use FIRST if you don't know the repo name)
-- list_prs      args: {{owner, repo, state?}}                 → open PRs ("state": "open"|"closed"|"all")
-- get_pr_diff   args: {{owner, repo, pr_number}}              → file-by-file diff of one PR
-- get_pr_comments args: {{owner, repo, pr_number}}            → review comments + discussion
-- list_issues   args: {{owner, repo, state?}}                 → issues
-- get_issue_comments args: {{owner, repo, issue_number}}      → issue discussion
-- diff_branches args: {{owner, repo, base, head}}             → compare two branches
-- list_files    args: {{owner, repo, ref?, path_prefix?}}     → list all files in a branch (filter with path_prefix)
-- read_file     args: {{owner, repo, path, ref?, start_line?}} → read one file (paged; follow the TRUNCATED hint to continue)
-- search_code   args: {{owner, repo, query}}                  → search file contents (default branch only)
-- push_files    args: {{owner, repo, branch, message, files: [{{path, content}} or {{path, delete: true}}]}} → one commit to a branch (created from the default branch if missing); requires the connection's read_write tier
-- push_session_file args: {{filename, message, branch?}}      → push a session file that was loaded from the repo (and edited/applied here) back to GitHub. Send ONLY the file's basename and a commit message — the server supplies the file content and repo location itself. Requires the connection's read_write tier
-- check_deploy  args: {{provider?}}                           → latest deployment status from the user's connected deploy platforms ("provider": "vercel"|"railway"|"both", default "both"). On a FAILED deploy the result includes the build-log tail so you can diagnose the error
-
-Rules:
-- The tag body must be a single valid JSON object: {{"tool": ..., "args": {{...}}, "reason": ...}}
-- ONE github_request per response. Emit it, stop, and wait for results.
-- If you don't know the exact repo name, call list_repos first.
-- Before push_files: read the current file with read_file first, and always send the COMPLETE new file content — partial content overwrites the whole file.
-- PUSHING AN EDITED SESSION FILE: when the user expresses ANY intent to get an
-  edited session file into GitHub — "push it", "ship it", "commit that",
-  "send it to the repo", "make it live", "update GitHub", "save my changes",
-  or anything similar — treat it as a push request. Specifically: when the user asks to push/commit a file that
-  was loaded from the repo into this session (edited via surgical_edit + diff
-  cards), ALWAYS use push_session_file with just the basename and a commit
-  message — e.g. {{"tool": "push_session_file", "args": {{"filename": "LandingPage.tsx", "message": "Update pricing"}}}}.
-- AFTER A SUCCESSFUL PUSH: present a short, well-formatted summary — the
-  commit as a markdown link, the file with the +/- line stats from the tool
-  result, a one-line "What changed" describing the edits you made in this
-  session, and the Deploy line from the tool result if present. Keep it
-  brief and celebratory. Do NOT re-read the file or take any further action.
-  NEVER retype the file content and NEVER use push_files for these files — the
-  server pushes the exact applied content from the session. This is a simple,
-  instant request: do not re-read the file first.
-- Never push unless the user explicitly asked for a change to be pushed/committed.
-- DEPLOY QUESTIONS: when the user expresses ANY intent to check a deployment —
-  "did it deploy?", "is the build done?", "did my push go live?", "any deploy
-  errors?", "why did the build fail?", or anything similar — use check_deploy.
-  The result includes the deployment's commit sha and timestamp: compare them
-  against the commit you just pushed to confirm you are looking at the right
-  deploy (a deploy created BEFORE your push is not yours — say it hasn't
-  started or is still queued). If the status is a failure, the build-log tail
-  is included — quote the actual error lines and explain the likely fix.
-  Never claim a deploy succeeded or failed without calling check_deploy.
-- CRITICAL — TAGS MUST BE TYPED, NOT THOUGHT: the <github_request> tag only
-  executes when it appears in your VISIBLE response text. A tag written inside
-  your thinking is never executed and the user gets nothing. NEVER end your
-  response after announcing a check (e.g. "Let me check the deployment
-  status") — if you announce an action, you MUST emit the tag in that same
-  message. Announcing without acting is a silent failure.
-- Results come back as a user message; then answer the user's question naturally.
-- EDITING REPO FILES: when you read_file a code file, the COMPLETE file is
-  automatically loaded into this session as an editable file — exactly as if
-  the user uploaded it. To change it, emit standard <surgical_edit> blocks
-  using the file's BASENAME as the filename (e.g. "LandingPage.tsx", not the
-  full repo path). The user then gets a diff card with a QA score and applies
-  the change themselves. For ordinary edit requests this is the ONLY correct
-  flow — do NOT use push_files unless the user explicitly asked to push/commit.
-- If the file is large and you have not yet seen the region you need to edit,
-  keep calling read_file with start_line until you have — never guess code you
-  have not seen.
-"""
+        search_example = json.dumps(
+            {"tool": "search_code", "args": {"owner": owner, "repo": repo, "query": "function name"}},
+            separators=(",", ":"),
+        )
+        parts = [
+            "GITHUB ACCESS (LIVE)",
+            f"This user connected GitHub ({account_text}). You have {access} access. "
+            "Never say you lack access; look it up.",
+            repo_note,
+            "Format: one tag, then stop and wait. The body is ONE JSON object.",
+            f"<github_request>{list_example}</github_request>",
+            f"<github_request>{search_example}</github_request>",
+            "Which tool:",
+            render_selection_table(),
+            "Tools:",
+            render_tool_list(known_repo=repos[0] if len(repos) == 1 else None, include_write=write_ok and wants_push),
+            "Rules:",
+            "- ONE <github_request> per response, then stop. Type the tag in the visible reply, never only in thinking, and never announce a check without emitting the tag.",
+            "- Results are paged and show line numbers. If you see TRUNCATED, call read_file again with the start_line in the footer. Do not re-read the file from the start.",
+            "- Do not guess code you have not seen.",
+            "- Answer with the result first. Cite #number and links, and say what you did not check.",
+            "- If a result is an error, follow its instruction. Do not repeat the same call.",
+            "- Use owner and repo exactly as listed. When one default repo is shown, you may omit them.",
+        ]
+        if wants_edit:
+            parts.append(
+                "EDITING A REPO FILE: after read_file, the complete file is loaded into this session. "
+                "Change it with <surgical_edit> using the file BASENAME (LandingPage.tsx, not the repo path). "
+                "Do not use push_files unless the user asked to push. If the lines you need are not in the page, "
+                "call read_file again with the start_line from the footer."
+            )
+        if write_ok and wants_push:
+            parts.append(
+                "PUSHING: when the user asks to push, commit, or ship an edited session file, call "
+                'push_session_file with the basename and a commit message only. Example: '
+                '{"tool":"push_session_file","args":{"filename":"LandingPage.tsx","message":"Update pricing"}}. '
+                "Do not resend file content and do not call read_file first. Never push unless the user asked. "
+                "After success, give the commit link, the +/- line stats, one line on what changed, and the Deploy line if present."
+            )
+        if wants_deploy:
+            parts.append(
+                "DEPLOYS: call check_deploy. Compare the result commit sha and time to the commit you pushed. "
+                "Quote the build-log lines on failure. Never claim a deploy succeeded or failed without calling check_deploy."
+            )
+        return "\n" + "\n".join(parts) + "\n"
+    except Exception:
+        return (
+            "\nGITHUB ACCESS (LIVE)\n"
+            "Use <github_request>{\"tool\":\"list_repos\",\"args\":{}}</github_request> "
+            "to see repositories, then answer from the tool result.\n"
+        )
 
 
-def parse_github_request(raw: str, dlog: Optional[Callable] = None):
-    """Parse the tag body. Returns {"tool": str, "args": dict, "reason": str}
-    or None if unusable. Never raises."""
+def parse_github_request(raw: str, dlog: Optional[Callable] = None,
+                         known_repos=None):
+    """Parse the tag body.
+
+    Returns {"tool", "args", "reason"} on success, {"_error": message} when
+    the tool name is not one we know, or None when the body is not JSON.
+    Never raises.
+    """
     try:
         text = (raw or "").strip()
         # Tolerate ```json fences Claude sometimes adds
@@ -251,7 +484,9 @@ def parse_github_request(raw: str, dlog: Optional[Callable] = None):
             args = {}
         if tool not in _NATURAL_GH_TOOLS:
             _safe_dlog(dlog, "natural_github_parse_unknown_tool", tool=tool)
-            return None
+            from services.github_context_tools import gh_error
+            return {"_error": gh_error("unknown_tool", name=tool)}
+        args = normalize_github_args(tool, args, known_repos)
         parsed = {"tool": tool, "args": args, "reason": str(data.get("reason", ""))}
         _safe_dlog(dlog, "natural_github_parsed", tool=tool, args=args)
         return parsed
@@ -308,24 +543,33 @@ def _list_repos(user_id: str, dlog: Optional[Callable]) -> str:
 
 def execute_github_request(parsed: dict, user_id: str,
                            dlog: Optional[Callable] = None,
-                           session_id: Optional[str] = None) -> str:
+                           session_id: Optional[str] = None,
+                           known_repos=None) -> str:
     """Execute one parsed github_request. Always returns a string —
     never raises, so the streaming loop can always continue.
 
-    ``session_id`` (added during the PR #134 fallback investigation) is
-    threaded into this function's own start/done/error events AND passed
-    through to execute_github_context_tool so its internal events (list_files,
-    search_code, the zero-hit fallback scan, etc.) are also tagged — closing
-    the blind spot where these events were previously untagged and invisible
-    in per-session debug exports. Logging only — no behavior change.
+    ``session_id`` is threaded into this function's own events and into
+    execute_github_context_tool. ``known_repos`` fills a missing or
+    placeholder owner/repo before the call runs.
     """
     def _log(event, **kw):
         kw.setdefault("session_id", session_id)
         _safe_dlog(dlog, event, **kw)
 
     try:
-        tool = parsed.get("tool", "")
-        args = parsed.get("args", {}) or {}
+        if isinstance(parsed, dict) and parsed.get("_error"):
+            return str(parsed["_error"])
+        tool = (parsed or {}).get("tool", "")
+        if tool not in _NATURAL_GH_TOOLS:
+            from services.github_context_tools import gh_error
+            return gh_error("unknown_tool", name=tool)
+        args = normalize_github_args(tool, (parsed or {}).get("args", {}) or {}, known_repos)
+        parsed = {"tool": tool, "args": args, "reason": (parsed or {}).get("reason", "")}
+        if tool not in _NO_REPO_TOOLS and (
+            _placeholder(args.get("owner")) or _placeholder(args.get("repo"))
+        ):
+            from services.github_context_tools import gh_error
+            return gh_error("placeholder_repo", repo=args.get("repo") or args.get("owner") or "")
         _log("natural_github_execute_start",
              user_id=user_id, tool=tool, args=args)
 
@@ -335,25 +579,16 @@ def execute_github_request(parsed: dict, user_id: str,
             from services.deploy_status import check_deploy_status
             result = check_deploy_status(user_id, args, dlog=dlog)
         elif tool == "push_session_file":
-            # Wire-up fix: the prompt (see module docstring section on
-            # push_session_file) has always told the model to use this
-            # tool for session files, and push_session_file_from_db has
-            # been fully implemented below since it was added — but this
-            # dispatch never called it, so every request fell through to
-            # execute_github_context_tool()'s whitelist, which doesn't
-            # know this tool name, and returned "unknown tool". The model
-            # would then retry with push_files, which requires re-sending
-            # the ENTIRE file content on every push. This elif is the only
-            # change: it calls the already-existing, already-_dlog'd
-            # implementation instead of falling through.
+            # The model sends only a basename and commit message. The server
+            # loads the applied file content and repo coordinates itself.
             result = push_session_file_from_db(parsed, user_id, session_id, dlog=dlog)
         else:
             from services.github_context_tools import execute_github_context_tool
             result = execute_github_context_tool(tool, args, user_id, dlog=dlog, session_id=session_id)
 
         _log("natural_github_execute_done",
-             user_id=user_id, tool=tool, result_len=len(result))
-        return result[:16000]
+             user_id=user_id, tool=tool, result_len=len(result or ""))
+        return shape_github_result(result or "", 16000)
     except Exception as e:
         _log("natural_github_execute_error",
              user_id=user_id, error=str(e))
