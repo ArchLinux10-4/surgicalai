@@ -1,7 +1,8 @@
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { api } from '../api/client'
 import { useAppStore } from '../stores/appStore'
 import { toast } from '../lib/toast'
+import { confirmReplaceEditedCopy, githubLoadedKey, saveGithubTarget } from '../lib/githubBranch'
 import { AccountTree, Description, ErrorOutline, FileDownload, Folder, FolderOpen, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, Lock, Refresh, Search, Settings, Star, Sync, TaskAlt } from '@mui/icons-material';
 
 interface GHRepo {
@@ -56,6 +57,8 @@ function fileIcon(name: string) {
 
 export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void }) {
   const { activeSessions, sessionFiles, setSessionFiles } = useAppStore()
+  const storedTarget = useAppStore(s => activeSessions ? s.githubTargets[activeSessions]?.target : null)
+  const restoredRepo = useRef(false)
 
   const [status, setStatus] = useState<GitHubStatus | null>(null)
   const [loadingStatus, setLoadingStatus] = useState(true)
@@ -81,14 +84,16 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
   const [loadingFiles, setLoadingFiles] = useState<Set<string>>(new Set())
   const [loadedPaths, setLoadedPaths] = useState<Set<string>>(new Set())
 
-  // Check which files are already in this session
+  // Check which files are already in this session, including repo and branch.
   useEffect(() => {
     const paths = new Set<string>()
     sessionFiles.forEach(f => {
       if (f.github_meta) {
         try {
           const meta = JSON.parse(f.github_meta)
-          if (meta.path) paths.add(meta.path)
+          if (meta.path && meta.owner && meta.repo && meta.branch) {
+            paths.add(githubLoadedKey(meta.owner, meta.repo, meta.branch, meta.path))
+          }
         } catch {}
       }
     })
@@ -124,15 +129,36 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
     setLoadingBranches(true)
     try {
       const d: any = await (api as any).github.branches(repo.owner, repo.name)
-      setBranches(d.branches || [])
-      const def = d.default || repo.default_branch || 'main'
-      setSelectedBranch(def)
+      const names: string[] = d.branches || []
+      const stored = activeSessions
+        ? useAppStore.getState().githubTargets[activeSessions]?.target
+        : null
+      const same = stored && stored.owner === repo.owner && stored.repo === repo.name
+      const preferred = same ? stored.branch : (d.default || repo.default_branch || 'main')
+      const list = preferred && !names.includes(preferred) ? [preferred, ...names] : names
+      setBranches(list)
+      setSelectedBranch(preferred)
+      if (activeSessions && (!same || stored.branch !== preferred)) {
+        try {
+          await saveGithubTarget(activeSessions, repo.owner, repo.name, preferred)
+        } catch (err: any) {
+          toast.error('Could not save branch', err?.message)
+        }
+      }
     } catch (e: any) {
       toast.error('Could not load branches', e.message)
     } finally {
       setLoadingBranches(false)
     }
-  }, [])
+  }, [activeSessions])
+
+  useEffect(() => {
+    if (restoredRepo.current || !activeSessions || !storedTarget || repos.length === 0 || selectedRepo) return
+    const repo = repos.find(r => r.owner === storedTarget.owner && r.name === storedTarget.repo)
+    if (!repo) return
+    restoredRepo.current = true
+    void selectRepo(repo)
+  }, [repos, activeSessions, storedTarget, selectedRepo, selectRepo])
 
   const loadTree = useCallback(async (path: string, branch: string, repo: GHRepo) => {
     setLoadingTree(true)
@@ -172,6 +198,9 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
       toast.error('No active chat', 'Open or create a chat first')
       return
     }
+    if (!confirmReplaceEditedCopy(sessionFiles, selectedRepo.owner, selectedRepo.name, [item.path], selectedBranch)) {
+      return
+    }
     setLoadingFiles(f => new Set(f).add(item.path))
     try {
       const d: any = await (api as any).github.load({
@@ -186,7 +215,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
         // Refresh session files from backend
         const updated: any[] = await (api as any).sessionFiles.list(activeSessions)
         setSessionFiles(updated)
-        setLoadedPaths(p => new Set(p).add(item.path))
+        setLoadedPaths(p => new Set(p).add(githubLoadedKey(selectedRepo.owner, selectedRepo.name, selectedBranch, item.path)))
         toast.success(`${item.name} loaded into chat`)
       }
       if (d.errors?.length) {
@@ -197,11 +226,14 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
     } finally {
       setLoadingFiles(f => { const s = new Set(f); s.delete(item.path); return s })
     }
-  }, [activeSessions, selectedRepo, selectedBranch, setSessionFiles])
+  }, [activeSessions, selectedRepo, selectedBranch, setSessionFiles, sessionFiles])
 
   const loadFolder = useCallback(async (folderPath: string) => {
     if (!activeSessions || !selectedRepo || !selectedBranch) {
       toast.error('No active chat', 'Open or create a chat first')
+      return
+    }
+    if (!confirmReplaceEditedCopy(sessionFiles, selectedRepo.owner, selectedRepo.name, [folderPath], selectedBranch)) {
       return
     }
     // Send the folder path straight to the backend, which expands it
@@ -219,7 +251,9 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
       setSessionFiles(updated)
       result.loaded?.forEach((f: any) => {
         const meta = f.github_meta ? JSON.parse(f.github_meta) : null
-        if (meta?.path) setLoadedPaths(p => new Set(p).add(meta.path))
+        if (meta?.path && meta.owner && meta.repo && meta.branch) {
+          setLoadedPaths(p => new Set(p).add(githubLoadedKey(meta.owner, meta.repo, meta.branch, meta.path)))
+        }
       })
       const n = result.loaded?.length || 0
       if (n === 0) { toast.error('No files in folder'); return }
@@ -233,7 +267,7 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
       setLoadingTree(false)
       setLoadingFiles(new Set())
     }
-  }, [activeSessions, selectedRepo, selectedBranch, setSessionFiles])
+  }, [activeSessions, selectedRepo, selectedBranch, setSessionFiles, sessionFiles])
 
   // ── Render ────────────────────────────────────────────────────────────────
 
@@ -383,7 +417,13 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
                   <AccountTree sx={{ fontSize: 11 }} className="text-faint" />
                   <select
                     value={selectedBranch}
-                    onChange={e => setSelectedBranch(e.target.value)}
+                    onChange={e => {
+                      const next = e.target.value
+                      setSelectedBranch(next)
+                      if (!activeSessions || !selectedRepo) return
+                      saveGithubTarget(activeSessions, selectedRepo.owner, selectedRepo.name, next)
+                        .catch((err: any) => toast.error('Could not save branch', err?.message))
+                    }}
                     className="text-[11px] text-ink bg-transparent outline-none cursor-pointer max-w-[80px]"
                   >
                     {branches.map(b => (
@@ -444,7 +484,9 @@ export function GitHubPanel({ onOpenSettings }: { onOpenSettings?: () => void })
                 {tree.map(item => {
                   const isDir = item.type === 'dir'
                   const isLoading = loadingFiles.has(item.path)
-                  const isLoaded = loadedPaths.has(item.path)
+                  const isLoaded = !!selectedRepo && loadedPaths.has(
+                    githubLoadedKey(selectedRepo.owner, selectedRepo.name, selectedBranch, item.path),
+                  )
 
                   return (
                     <div

@@ -502,6 +502,9 @@ def _init_sqlite():
         cur.execute("ALTER TABLE chat_sessions ADD COLUMN user_id TEXT REFERENCES users(id) ON DELETE SET NULL")
     if "session_summary" not in existing_cols:
         cur.execute("ALTER TABLE chat_sessions ADD COLUMN session_summary TEXT DEFAULT ''")
+    for _gh_col in ("github_owner", "github_repo", "github_branch"):
+        if _gh_col not in existing_cols:
+            cur.execute(f"ALTER TABLE chat_sessions ADD COLUMN {_gh_col} TEXT")
 
     # Migration: add is_compacted to chat_messages if missing
     cm_cols = [row[1] for row in cur.execute("PRAGMA table_info(chat_messages)").fetchall()]
@@ -903,6 +906,15 @@ def _init_postgres():
         """)
         conn.execute("""
             ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS session_summary TEXT DEFAULT ''
+        """)
+        conn.execute("""
+            ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS github_owner TEXT
+        """)
+        conn.execute("""
+            ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS github_repo TEXT
+        """)
+        conn.execute("""
+            ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS github_branch TEXT
         """)
         conn.execute("""
             ALTER TABLE chat_messages ADD COLUMN IF NOT EXISTS is_compacted INTEGER DEFAULT 0

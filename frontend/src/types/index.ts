@@ -27,6 +27,26 @@ export interface ChatSession {
   file_count?: number
 }
 
+/** Repo and branch this chat is working on. Not read from the session list. */
+export interface GitHubTarget {
+  owner: string
+  repo: string
+  branch: string
+  explicit?: boolean
+}
+
+/** Database flags only. `pat` is a stored token, `app` is a linked installation. */
+export interface GitHubConnections {
+  pat: boolean
+  app: boolean
+  app_configured: boolean
+}
+
+export interface GitHubTargetState {
+  target: GitHubTarget | null
+  connections: GitHubConnections
+}
+
 export interface FileNode {
   name: string
   path: string

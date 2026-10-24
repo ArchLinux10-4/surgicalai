@@ -4339,7 +4339,7 @@ def run_chat(
 _ASK_PLAN_GH_WRITE_TOOLS = frozenset({"push_files", "push_session_file"})
 
 
-def _gh_prompt_bits(known_repos) -> str:
+def _gh_prompt_bits(known_repos, working_branch=None) -> str:
     """Ask/Plan GitHub instructions, generated from the shared tool catalogue."""
     from services.github_tool_spec import render_selection_table, render_tool_list
     repos = [r for r in (known_repos or []) if isinstance(r, str) and "/" in r]
@@ -4359,8 +4359,14 @@ def _gh_prompt_bits(known_repos) -> str:
         '{"tool": "list_prs", "args": {"owner": "%s", "repo": "%s", "state": "all", "limit": 5}}'
         % (owner, repo)
     )
+    branch_line = ""
+    if working_branch:
+        from services.github_natural_tag import working_branch_line as _working_branch_line
+        branch_line = _working_branch_line(working_branch)
+    prefix = (branch_line + "\n") if branch_line else ""
     return (
-        known
+        prefix
+        + known
         + "Which tool:\n"
         + render_selection_table()
         + "\n\nTools:\n"
@@ -4378,6 +4384,7 @@ def _ask_plan_build_tool_instructions(
     *, has_files: bool, gh_enabled: bool, gh_known_repos: list, max_rounds: int,
     aws_enabled: bool = False, websearch_enabled: bool = False,
     mcp_guidance: str = "",
+    working_branch=None,
 ) -> str:
     """
     Composes the Ask/Plan tool-instructions system-prompt block from
@@ -4434,7 +4441,7 @@ def _ask_plan_build_tool_instructions(
         tag_blocks.append(
             "You can read the connected GitHub repository (read-only in "
             "this mode — you cannot push, commit, or edit files here).\n\n"
-            + _gh_prompt_bits(gh_known_repos)
+            + _gh_prompt_bits(gh_known_repos, working_branch)
             + "\nIf the user wants an actual code change made or pushed, tell "
             "them to switch to Agent/Edit mode — this mode can only look, "
             "not write."
@@ -4707,17 +4714,21 @@ async def run_chat_stream(
     _gh_nat_enabled = False
     _gh_nat_installs: list = []
     _gh_known_repos: list = []
+    _gh_session_target = None
     _ask_plan_gh_seen: dict = {}
     if not _ask_plan_is_ollama:
         try:
             from services.github_natural_tag import (
                 natural_github_availability, parse_github_request,
                 execute_github_request, get_known_repos,
+                get_session_target, merge_target_first,
             )
             _gh_nat_enabled, _gh_nat_installs = natural_github_availability(
                 user_id, dlog=_dlog)
             if _gh_nat_enabled:
                 _gh_known_repos = get_known_repos(user_id, session_id, dlog=_dlog)
+                _gh_session_target = get_session_target(session_id)
+                _gh_known_repos = merge_target_first(_gh_known_repos, _gh_session_target)
         except Exception as _gh_nat_err:
             _gh_nat_enabled = False
             _dlog("ask_plan_github_setup_error", session_id=session_id,
@@ -4868,7 +4879,8 @@ async def run_chat_stream(
             has_files=_ask_plan_has_files, gh_enabled=_gh_nat_enabled,
             gh_known_repos=_gh_known_repos, max_rounds=_ASK_PLAN_MAX_ROUNDS,
             aws_enabled=_aws_connected, websearch_enabled=_ask_plan_websearch,
-            mcp_guidance=_ask_plan_mcp_guidance))
+            mcp_guidance=_ask_plan_mcp_guidance,
+            working_branch=_gh_session_target))
         _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
               model=chat_model, num_files=len(file_content_lookup),
               github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
@@ -18089,12 +18101,14 @@ async def run_natural_pipeline_stream(
         # before — the single-pass path is untouched.
         _gh_nat_enabled = False
         _gh_known_repos = []
+        _gh_session_target = None
         try:
             from services.github_natural_tag import (
                 natural_github_availability, build_github_prompt_section,
                 parse_github_request, execute_github_request,
                 get_known_repos,
                 GH_TAG_OPEN, GH_TAG_CLOSE,
+                get_session_target, merge_target_first,
             )
             _gh_nat_enabled, _gh_nat_installs = natural_github_availability(
                 user_id, dlog=_dlog
@@ -18105,6 +18119,8 @@ async def run_natural_pipeline_stream(
                 # already works with so round 1 isn't burned on list_repos.
                 _gh_known_repos = get_known_repos(
                     user_id, session_id, dlog=_dlog)
+                _gh_session_target = get_session_target(session_id)
+                _gh_known_repos = merge_target_first(_gh_known_repos, _gh_session_target)
                 _gh_tier = "read_only"
                 _gh_wants_push = False
                 _gh_wants_deploy = False
@@ -18133,6 +18149,7 @@ async def run_natural_pipeline_stream(
                         tier=_gh_tier, wants_push=_gh_wants_push,
                         wants_deploy=_gh_wants_deploy,
                         wants_edit=_gh_prompt_wants_edit,
+                        working_branch=_gh_session_target,
                     ),
                 })
                 _dlog("natural_github_tag_registered",

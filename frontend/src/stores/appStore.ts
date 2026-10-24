@@ -1,5 +1,5 @@
 import { create } from 'zustand'
-import type { ChatSession, ChatMessage, FileContent, SurgicalAnalysis, AppSettings, FileNode, PromptTemplate, ImpactAnalysis } from '../types'
+import type { ChatSession, ChatMessage, FileContent, SurgicalAnalysis, AppSettings, FileNode, PromptTemplate, ImpactAnalysis, GitHubTargetState } from '../types'
 import { api } from '../api/client'
 import type { EditLiveEvent } from '../api/client'
 import { clientLog } from '../lib/clientLog'
@@ -58,8 +58,12 @@ interface AppState {
   // Settings
   settings: AppSettings | null
   settingsOpen: boolean
+  settingsInitialTab: string | null
   setSettings: (s: AppSettings) => void
   setSettingsOpen: (v: boolean) => void
+  setSettingsInitialTab: (tab: string | null) => void
+  githubTargets: Record<string, GitHubTargetState | undefined>
+  setGithubTarget: (sessionId: string, value: GitHubTargetState | undefined) => void
 
   // Model picker list — shared so any component that adds/verifies a
   // provider key can call refreshModels() and have every consumer
@@ -281,8 +285,17 @@ export interface PickedElementRef {
 export const useAppStore = create<AppState>((set) => ({
   settings: null,
   settingsOpen: false,
+  settingsInitialTab: null,
   setSettings: (settings) => set({ settings }),
   setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
+  setSettingsInitialTab: (settingsInitialTab) => set({ settingsInitialTab }),
+  githubTargets: {},
+  setGithubTarget: (sessionId, value) => set((state) => {
+    const githubTargets = { ...state.githubTargets }
+    if (value === undefined) delete githubTargets[sessionId]
+    else githubTargets[sessionId] = value
+    return { githubTargets }
+  }),
 
   availableModels: [],
   setAvailableModels: (availableModels) => set({ availableModels }),

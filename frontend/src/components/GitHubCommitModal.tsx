@@ -2,6 +2,8 @@ import React, { useState, useMemo } from 'react'
 import { api } from '../api/client'
 import { DeployStatusPanel } from './DeployStatusPanel'
 import { toast } from '../lib/toast'
+import { saveGithubTarget } from '../lib/githubBranch'
+import { useAppStore } from '../stores/appStore'
 import type { SessionFile } from '../types'
 import { AccountTree, Check, Close, ErrorOutline, GitHub, MergeType, OpenInNew, Sync } from '@mui/icons-material';
 
@@ -89,6 +91,16 @@ export function GitHubCommitModal({ sessionFiles, onClose, onSuccess }: GitHubCo
       }
 
       const res: any = await (api as any).github.commit(body)
+      if (createPR && newBranch.trim() && res?.branch) {
+        const sessionId = useAppStore.getState().activeSessions
+        if (sessionId) {
+          try {
+            await saveGithubTarget(sessionId, primaryMeta.owner, primaryMeta.repo, res.branch)
+          } catch {
+            // The commit landed. The chip stays on the previous branch.
+          }
+        }
+      }
       setResult(res)
       toast.success(
         createPR ? `PR #${res.pr_number} opened` : `${res.committed.length} file(s) committed`,

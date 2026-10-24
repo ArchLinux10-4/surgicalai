@@ -29,9 +29,15 @@ const TABS: { id: Tab; icon: React.ReactNode; label: string }[] = [
 ]
 
 export function SettingsModal() {
-  const { settingsOpen, setSettingsOpen, settings, setSettings } = useAppStore()
+  const { settingsOpen, setSettingsOpen, settings, setSettings, settingsInitialTab, setSettingsInitialTab } = useAppStore()
   const { user } = useAuthStore()
   const [tab, setTab] = useState<Tab>('api')
+  useEffect(() => {
+    if (settingsOpen && settingsInitialTab) {
+      setTab(settingsInitialTab as Tab)
+      setSettingsInitialTab(null)
+    }
+  }, [settingsOpen, settingsInitialTab, setSettingsInitialTab])
   const [apiKey, setApiKey] = useState('')
   const [showKey, setShowKey] = useState(false)
   const [verifying, setVerifying] = useState(false)

@@ -355,6 +355,13 @@ export const api = {
         { method: 'POST', body: JSON.stringify({ ids }) },
       ),
     renameSession: (id: string, title: string) => request(`/chat/sessions/${id}`, { method: 'PATCH', body: JSON.stringify({ title }) }),
+    getGithubTarget: (sessionId: string) =>
+      request<import('../types').GitHubTargetState>(`/chat/sessions/${sessionId}/github-target`),
+    setGithubTarget: (sessionId: string, body: { owner: string; repo: string; branch: string }) =>
+      request<{ ok: boolean; target: import('../types').GitHubTarget | null }>(
+        `/chat/sessions/${sessionId}/github-target`,
+        { method: 'PATCH', body: JSON.stringify(body) },
+      ),
     search: (q: string) => request<any[]>(`/chat/search?q=${encodeURIComponent(q)}`),
     getCreditPause: (sessionId: string) =>
       request<{

@@ -14,6 +14,7 @@ import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { api } from '../../api/client'
 import { useAppStore } from '../../stores/appStore'
 import { toast } from '../../lib/toast'
+import { confirmReplaceEditedCopy, githubLoadedKey, saveGithubTarget } from '../../lib/githubBranch'
 
 interface GHRepo {
   id: number; name: string; full_name: string; owner: string
@@ -58,6 +59,8 @@ interface Props {
 
 export function MobileGitHubSheet({ open, onClose, onOpenSettings }: Props) {
   const { activeSessions, sessionFiles, setSessionFiles } = useAppStore()
+  const storedTarget = useAppStore(s => activeSessions ? s.githubTargets[activeSessions]?.target : null)
+  const restoredRepo = useRef(false)
 
   const [status, setStatus]       = useState<GitHubStatus | null>(null)
   const [loadingStatus, setLdSt]  = useState(true)
@@ -80,7 +83,12 @@ export function MobileGitHubSheet({ open, onClose, onOpenSettings }: Props) {
     const paths = new Set<string>()
     sessionFiles.forEach(f => {
       if (f.github_meta) {
-        try { const m = JSON.parse(f.github_meta); if (m.path) paths.add(m.path) } catch {}
+        try {
+          const m = JSON.parse(f.github_meta)
+          if (m.path && m.owner && m.repo && m.branch) {
+            paths.add(githubLoadedKey(m.owner, m.repo, m.branch, m.path))
+          }
+        } catch {}
       }
     })
     setLdPaths(paths)
@@ -111,11 +119,32 @@ export function MobileGitHubSheet({ open, onClose, onOpenSettings }: Props) {
     setLdBr(true)
     try {
       const d: any = await (api as any).github.branches(repo.owner, repo.name)
-      setBranches(d.branches || [])
-      setBranch(d.default || repo.default_branch || 'main')
-    } catch (e: any) { toast.error('Could not load branches') }
+      const names: string[] = d.branches || []
+      const stored = activeSessions
+        ? useAppStore.getState().githubTargets[activeSessions]?.target
+        : null
+      const same = stored && stored.owner === repo.owner && stored.repo === repo.name
+      const preferred = same ? stored.branch : (d.default || repo.default_branch || 'main')
+      setBranches(preferred && !names.includes(preferred) ? [preferred, ...names] : names)
+      setBranch(preferred)
+      if (activeSessions && !same) {
+        try {
+          await saveGithubTarget(activeSessions, repo.owner, repo.name, preferred)
+        } catch (err: any) {
+          toast.error('Could not save branch', err?.message)
+        }
+      }
+    } catch { toast.error('Could not load branches') }
     finally { setLdBr(false) }
-  }, [])
+  }, [activeSessions])
+
+  useEffect(() => {
+    if (!open || restoredRepo.current || !activeSessions || !storedTarget || repos.length === 0 || selectedRepo) return
+    const repo = repos.find(r => r.owner === storedTarget.owner && r.name === storedTarget.repo)
+    if (!repo) return
+    restoredRepo.current = true
+    void selectRepo(repo)
+  }, [open, repos, activeSessions, storedTarget, selectedRepo, selectRepo])
 
   const loadTree = useCallback(async (path: string, br: string, repo: GHRepo) => {
     setLdTr(true)
@@ -147,6 +176,9 @@ export function MobileGitHubSheet({ open, onClose, onOpenSettings }: Props) {
     if (!activeSessions || !selectedRepo || !branch) {
       toast.error('Open a chat session first'); return
     }
+    if (!confirmReplaceEditedCopy(sessionFiles, selectedRepo.owner, selectedRepo.name, [item.path], branch)) {
+      return
+    }
     setLdF(f => new Set(f).add(item.path))
     try {
       const d: any = await (api as any).github.load({
@@ -159,13 +191,13 @@ export function MobileGitHubSheet({ open, onClose, onOpenSettings }: Props) {
       if (d.loaded?.length > 0) {
         const updated: any[] = await (api as any).sessionFiles.list(activeSessions)
         setSessionFiles(updated)
-        setLdPaths(p => new Set(p).add(item.path))
+        setLdPaths(p => new Set(p).add(githubLoadedKey(selectedRepo.owner, selectedRepo.name, branch, item.path)))
         toast.success(`${item.name} loaded into chat`)
       }
       if (d.errors?.length) toast.error(d.errors[0].error)
     } catch (e: any) { toast.error('Failed to load file') }
     finally { setLdF(f => { const s = new Set(f); s.delete(item.path); return s }) }
-  }, [activeSessions, selectedRepo, branch, setSessionFiles])
+  }, [activeSessions, selectedRepo, branch, setSessionFiles, sessionFiles])
 
   const breadcrumbs = currentPath ? currentPath.split('/') : []
 
@@ -319,7 +351,13 @@ export function MobileGitHubSheet({ open, onClose, onOpenSettings }: Props) {
                       <line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/>
                       <path d="M18 9a9 9 0 0 1-9 9"/>
                     </svg>
-                    <select value={branch} onChange={e => setBranch(e.target.value)}
+                    <select value={branch} onChange={e => {
+                      const next = e.target.value
+                      setBranch(next)
+                      if (!activeSessions || !selectedRepo) return
+                      saveGithubTarget(activeSessions, selectedRepo.owner, selectedRepo.name, next)
+                        .catch((err: any) => toast.error('Could not save branch', err?.message))
+                    }}
                       className="text-[11px] text-ink bg-transparent outline-none max-w-[90px]">
                       {branches.map(b => <option key={b} value={b}>{b}</option>)}
                     </select>
@@ -366,7 +404,7 @@ export function MobileGitHubSheet({ open, onClose, onOpenSettings }: Props) {
                     {tree.map(item => {
                       const isDir     = item.type === 'dir'
                       const isLoading = loadingFiles.has(item.path)
-                      const isLoaded  = loadedPaths.has(item.path)
+                      const isLoaded  = loadedPaths.has(githubLoadedKey(selectedRepo.owner, selectedRepo.name, branch, item.path))
                       return (
                         <div key={item.path}
                           className="flex items-center gap-3 px-4 py-2.5 border-b border-border/20 active:bg-overlay/60 transition-colors">
