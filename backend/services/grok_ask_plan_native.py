@@ -291,6 +291,16 @@ async def run_grok_ask_plan_native_stream(
     _git_calls = 0
     _mcp_calls = 0
     _promise_nudged = False
+    _prose_break_pending = False
+    _prose_needs_break = False
+
+    def _emit_prose(content: str) -> str:
+        nonlocal _prose_break_pending, _prose_needs_break
+        from services.prose_break import separate_turn_prose
+        content, _prose_break_pending, _prose_needs_break = separate_turn_prose(
+            content, break_pending=_prose_break_pending, needs_break=_prose_needs_break,
+        )
+        return content
     if steer_inbox is not None:
         yield _sse({"type": "steer_ready"})
     _ws_budget = None
@@ -298,13 +308,15 @@ async def run_grok_ask_plan_native_stream(
         from services.openai_web_search import SearchBudget as _WsBudget
         _ws_budget = _WsBudget()
     while True:
+        if tool_round > 0 and _prose_needs_break:
+            _prose_break_pending = True
         elapsed = time.time() - t0
         if elapsed >= deadline_s or tool_round >= max_rounds:
             reason = "budget_exhausted_deadline" if elapsed >= deadline_s else "budget_exhausted_rounds"
             dlog("grok_ask_plan_native_budget_exhausted", session_id=session_id,
                  user_id=user_id, tool_round=tool_round, elapsed_s=round(elapsed, 1),
                  reason=reason)
-            yield _sse({"type": "token", "content": (
+            yield _sse({"type": "token", "content": _emit_prose(
                 "I looked at the available code but couldn't fully answer within "
                 "my lookup budget — try asking about a more specific file or function."
             )})
@@ -408,7 +420,7 @@ async def run_grok_ask_plan_native_stream(
             dlog("grok_ask_plan_native_final_answer", session_id=session_id,
                  user_id=user_id, tool_round=tool_round, chars=len(final_text),
                  thinking_deltas=thinking_deltas)
-            yield _sse({"type": "token", "content": final_text})
+            yield _sse({"type": "token", "content": _emit_prose(final_text)})
             break
 
         calls = acc.finalize()
@@ -430,7 +442,7 @@ async def run_grok_ask_plan_native_stream(
                 f"{blocked_text}\n\n{translated.blocked_reason}" if blocked_text
                 else translated.blocked_reason
             )
-            yield _sse({"type": "token", "content": blocked_text})
+            yield _sse({"type": "token", "content": _emit_prose(blocked_text)})
             break
 
         context_result = None
@@ -515,6 +527,12 @@ async def run_grok_ask_plan_native_stream(
                 if _git_done.get("counted"):
                     _git_calls += 1
                 context_result = _git_done.get("note") or ""
+                if _git_done.get("stop"):
+                    from services.git_cli import render_git_outcome as _render_git_outcome
+                    _git_block = _render_git_outcome([_git_done])
+                    if _git_block:
+                        yield _sse({"type": "token", "content": _emit_prose("\n\n" + _git_block)})
+                    break
             elif tag_kind == "aws":
                 from services.aws_cli import resolve_aws_call, split_intent
                 _aws_intent, _aws_cmd = split_intent(str(body))

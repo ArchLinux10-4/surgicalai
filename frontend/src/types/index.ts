@@ -292,7 +292,7 @@ export interface SessionFile {
   github_pushed_at?: string  // timestamp of last push to GitHub
   repo_path?: string | null
   base_sha?: string | null
-  /** pending = staged edit, applied = matches disk, conflict/missing = disk changed */
+  /** pending = edited in chat, not written to the folder; applied = matches disk; conflict = disk changed since load; missing = file gone */
   disk_state?: 'pending' | 'applied' | 'conflict' | 'missing' | null
 }
 

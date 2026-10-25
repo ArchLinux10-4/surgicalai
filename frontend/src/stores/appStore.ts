@@ -154,6 +154,22 @@ interface AppState {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
   } | null
   setGitApproval: (value: AppState['gitApproval']) => void
+  gitSteps: { sessionId: string; name: string; ok: boolean; detail: string }[]
+  pushGitStep: (step: AppState['gitSteps'][number]) => void
+  clearGitRun: (sessionId: string) => void
+  gitResult: {
+    sessionId: string
+    ok: boolean
+    branch: string
+    pr_url: string
+    commit: string
+    fix_url: string
+    next: string
+    verified: string[]
+  } | null
+  setGitResult: (value: AppState['gitResult']) => void
+  gitFollowup: string | null
+  setGitFollowup: (value: string | null) => void
   mcpApproval: {
     sessionId: string
     server: string
@@ -410,6 +426,18 @@ export const useAppStore = create<AppState>((set) => ({
   })),
   gitApproval: null,
   setGitApproval: (gitApproval) => set({ gitApproval }),
+  gitSteps: [],
+  pushGitStep: (step) => set((s) => ({
+    gitSteps: [...s.gitSteps, step].slice(-20),
+  })),
+  clearGitRun: (sessionId) => set((s) => ({
+    gitSteps: s.gitSteps.filter(step => step.sessionId !== sessionId),
+    gitResult: s.gitResult?.sessionId === sessionId ? null : s.gitResult,
+  })),
+  gitResult: null,
+  setGitResult: (gitResult) => set({ gitResult }),
+  gitFollowup: null,
+  setGitFollowup: (gitFollowup) => set({ gitFollowup }),
   mcpApproval: null,
   setMcpApproval: (mcpApproval) => set({ mcpApproval }),
   mcpCalls: [],

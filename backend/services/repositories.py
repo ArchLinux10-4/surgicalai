@@ -776,7 +776,7 @@ def _default_diff(root: str, view: str, rel_path: str) -> str:
     return "\n\n".join(parts)
 
 
-def git_status_text(root: str) -> str:
+def git_status_text(root: str, session_id: str = "") -> str:
     git = detect_git(root)
     if not git["is_git"]:
         return "This folder is not a git repository."
@@ -792,4 +792,9 @@ def git_status_text(root: str) -> str:
         lines.extend(changes[:40])
         if len(changes) > 40:
             lines.append(f"... {len(changes) - 40} more")
+    if session_id:
+        from services.git_cli import unapplied_edits_note
+        note = unapplied_edits_note(session_id, root)
+        if note:
+            lines.append(note)
     return "\n".join(lines)

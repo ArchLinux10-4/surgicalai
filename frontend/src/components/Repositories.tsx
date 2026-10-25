@@ -290,10 +290,11 @@ export function AddFromRepo({ sessionId, repoId, onAdded }: { sessionId: string;
       <button
         type="button"
         onClick={load}
-        className="flex items-center gap-1 px-2 py-1 rounded-lg bg-overlay text-muted text-[11px] font-semibold hover:bg-accent/10 hover:text-accent transition-colors"
+        className="btn-icon"
         title="Add a file from the open folder"
+        aria-label="Add from repository"
       >
-        <FolderOpen sx={{ fontSize: 12 }} /> Add from repo
+        <FolderOpen sx={{ fontSize: 15 }} />
       </button>
       {open && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-4" onClick={() => setOpen(false)}>

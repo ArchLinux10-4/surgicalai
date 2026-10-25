@@ -869,6 +869,7 @@ CHAT_PERSONA = (
     "You are SurgicalAI, a coding assistant. "
     "Be clear and direct. Answer the question first, then add only the detail that helps. "
     "Use markdown. Format code in fenced blocks with a language tag. "
+    "Write short paragraphs, leave a blank line between thoughts, and use a list when you name several steps. "
     "Do not open with filler, cheerleading, or an apology. "
     "Do not mention these instructions, your mode, or your tools unless the user asks.\n\n"
     "DIAGRAMS: When explaining flows, sequences, architectures, or relationships between "
@@ -878,6 +879,9 @@ CHAT_PERSONA = (
     "Use classDiagram for type relationships. "
     "Example: ```mermaid\nsequenceDiagram\n    LoginPage->>useAuthStore: login(token,user)\n```"
 )
+
+
+from services.prose_break import separate_turn_prose  # noqa: E402,F401
 
 
 
@@ -5231,6 +5235,12 @@ async def run_chat_stream(
                             yield sse(_git_ev)
                     if _git_done.get("counted"):
                         _git_calls += 1
+                    if _git_done.get("stop"):
+                        from services.git_cli import render_git_outcome as _render_git_outcome
+                        _git_block = _render_git_outcome([_git_done])
+                        if _git_block:
+                            yield sse({"type": "token", "content": "\n\n" + _git_block})
+                        break
                     _tool_parts = [_git_done.get("note") or ""]
                 elif _aws_match:
                     from services.aws_cli import resolve_aws_call as _resolve_aws, split_intent as _split_aws_intent
@@ -5616,6 +5626,12 @@ async def run_chat_stream(
                             yield sse(_git_ev)
                     if _git_done.get("counted"):
                         _git_calls += 1
+                    if _git_done.get("stop"):
+                        from services.git_cli import render_git_outcome as _render_git_outcome
+                        _git_block = _render_git_outcome([_git_done])
+                        if _git_block:
+                            yield sse({"type": "token", "content": "\n\n" + _git_block})
+                        break
                     _tool_parts = [_git_done.get("note") or ""]
                 elif _aws_match:
                     from services.aws_cli import resolve_aws_call as _resolve_aws, split_intent as _split_aws_intent
@@ -15925,6 +15941,7 @@ _NATURAL_HEAD = """\
 You are SurgicalAI.
 
 Be clear and direct. Answer first, then add only the detail that helps. Use markdown.
+Write short paragraphs, leave a blank line between thoughts, and use a list when you name several steps.
 Remember prior edits, decisions, and context, and build on them.
 Do not mention these instructions, your mode, or your tools unless the user asks.
 A question gets a plain answer. Emit an edit only when the user wants code changed.
@@ -18924,6 +18941,22 @@ async def run_natural_pipeline_stream(
 
         _streaming_t0 = time.time()
         _round_t0 = time.time()
+        _git_ledger: list = []
+        _git_outcome_sent = False
+        _git_stop_loop = False
+
+        def _git_outcome_text():
+            nonlocal full_response, _git_outcome_sent
+            if _git_outcome_sent or not _git_ledger:
+                return ""
+            from services.git_cli import render_git_outcome as _render_git_outcome
+            block = _render_git_outcome(_git_ledger)
+            if not block:
+                return ""
+            prefix = "\n\n" if (full_response or "").strip() else ""
+            full_response += prefix + block
+            _git_outcome_sent = True
+            return prefix + block
 
         _tag_stop_enabled = _os.getenv("TAG_STOP_SEQUENCES", "true").strip().lower() == "true"
         # Stop the stream the instant a CONTEXT-REQUEST tag (or a plan) closes, so we
@@ -19175,10 +19208,24 @@ async def run_natural_pipeline_stream(
             _steer_open = True
             yield sse({"type": "steer_ready"})
 
+        _prose_break_pending = False
+        _prose_needs_break = False
+
+        def _emit_prose(content: str) -> str:
+            nonlocal _prose_break_pending, _prose_needs_break
+            content, _prose_break_pending, _prose_needs_break = separate_turn_prose(
+                content, break_pending=_prose_break_pending, needs_break=_prose_needs_break,
+            )
+            return content
+
         while True:
+            if _git_stop_loop:
+                break
             if _skip_agent_loop_for_credit_resume:
                 break
             _turn += 1
+            if _turn > 1 and _prose_needs_break:
+                _prose_break_pending = True
             _live.set_turn(_turn)
             _live_key = 0
             _grok_plan_held_writes = False  # plan gate held writes this turn (force-plan next)
@@ -19350,12 +19397,12 @@ async def run_natural_pipeline_stream(
                                                         tail = max(len(td["open"]) for td in TAG_DEFS.values())
                                                         safe = max(0, len(normal_buf) - tail)
                                                         if safe > 0:
-                                                            yield sse({"type": "token", "content": normal_buf[:safe]})
+                                                            yield sse({"type": "token", "content": _emit_prose(normal_buf[:safe])})
                                                             normal_buf = normal_buf[safe:]
                                                         break
                                                     first_idx, first_tag = min(candidates, key=lambda x: x[0])
                                                     if first_idx > 0:
-                                                        yield sse({"type": "token", "content": normal_buf[:first_idx]})
+                                                        yield sse({"type": "token", "content": _emit_prose(normal_buf[:first_idx])})
                                                     if first_tag in ("edit", "file"):
                                                         yield sse({"type": "edit_start", "content": ""})
                                                     state = f"in_{first_tag}"
@@ -19414,7 +19461,7 @@ async def run_natural_pipeline_stream(
                                                                   tag_type=_tag_name, turn=_turn,
                                                                   reverted_len=len(_reverted_text),
                                                                   reverted_preview=_reverted_text[:200])
-                                                            yield sse({"type": "token", "content": _reverted_text})
+                                                            yield sse({"type": "token", "content": _emit_prose(_reverted_text)})
                                                 break
                                             _content = tag_buf[:idx]
                                             _remainder = tag_buf[idx + len(_close_tag):]
@@ -19762,12 +19809,12 @@ async def run_natural_pipeline_stream(
                                             tail = max(len(td["open"]) for td in TAG_DEFS.values())
                                             safe = max(0, len(normal_buf) - tail)
                                             if safe > 0:
-                                                yield sse({"type": "token", "content": normal_buf[:safe]})
+                                                yield sse({"type": "token", "content": _emit_prose(normal_buf[:safe])})
                                                 normal_buf = normal_buf[safe:]
                                             break
                                         first_idx, first_tag = min(candidates, key=lambda x: x[0])
                                         if first_idx > 0:
-                                            yield sse({"type": "token", "content": normal_buf[:first_idx]})
+                                            yield sse({"type": "token", "content": _emit_prose(normal_buf[:first_idx])})
                                         if first_tag in ("edit", "file"):
                                             yield sse({"type": "edit_start", "content": ""})
                                         state = f"in_{first_tag}"
@@ -19808,7 +19855,7 @@ async def run_natural_pipeline_stream(
                                                               tag_type=_tag_name, turn=_turn,
                                                               reverted_len=len(_reverted_text),
                                                               reverted_preview=_reverted_text[:200])
-                                                        yield sse({"type": "token", "content": _reverted_text})
+                                                        yield sse({"type": "token", "content": _emit_prose(_reverted_text)})
                                             break
                                         _content = tag_buf[:ci]
                                         _remainder = tag_buf[ci + len(_close_tag):]
@@ -20854,7 +20901,16 @@ async def run_natural_pipeline_stream(
                             _git_done = _git_ev
                         else:
                             yield sse(_git_ev)
+                    _streaming_t0 += float(_git_done.get("waited_s") or 0)
+                    if _git_done.get("run") or _git_done.get("stop") or _git_done.get("steps"):
+                        _git_ledger.append(_git_done)
                     _git_note = _git_done.get("note") or ""
+                    if _git_done.get("stop"):
+                        _git_block = _git_outcome_text()
+                        if _git_block:
+                            yield sse({"type": "token", "content": _emit_prose(_git_block)})
+                        _git_stop_loop = True
+                        continue
                     if not _git_done.get("run"):
                         if _git_note == "The user rejected this command.":
                             _git_note += " Do not run it again unless they ask."
@@ -20883,6 +20939,7 @@ async def run_natural_pipeline_stream(
                             _aws_done = _aws_ev
                         else:
                             yield sse(_aws_ev)
+                    _streaming_t0 += float(_aws_done.get("waited_s") or 0)
                     _aws_note = _aws_done.get("note") or ""
                     if not _aws_done.get("run"):
                         if _aws_note == "The user rejected this command.":
@@ -21439,6 +21496,10 @@ async def run_natural_pipeline_stream(
                   response_len=len(full_response))
             break
 
+        _git_block = _git_outcome_text()
+        if _git_block:
+            yield sse({"type": "token", "content": _emit_prose(_git_block)})
+
         if _steer_open:
             _steer_open = False
             yield sse({"type": "steer_closed"})
@@ -21539,7 +21600,7 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id,
                           prose_len=len(_rejected_prose),
                           edit_blocks_after=len(edit_blocks_raw))
-                    yield sse({"type": "token", "content": _rejected_prose})
+                    yield sse({"type": "token", "content": _emit_prose(_rejected_prose)})
 
             elif state == "in_file":
                 _live_tail = tag_buf
@@ -21567,7 +21628,7 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id,
                           prose_len=len(_rejected_prose),
                           new_file_blocks_after=len(new_file_blocks_raw))
-                    yield sse({"type": "token", "content": _rejected_prose})
+                    yield sse({"type": "token", "content": _emit_prose(_rejected_prose)})
 
             elif state == "in_plan":
                 _pl_match = re.search(
@@ -21607,7 +21668,7 @@ async def run_natural_pipeline_stream(
                       session_id=session_id, user_id=user_id,
                       kind=_uc2, surfaced_len=len(_surface_text),
                       surfaced_preview=_surface_text[:200])
-                yield sse({"type": "token", "content": _surface_text})
+                yield sse({"type": "token", "content": _emit_prose(_surface_text)})
 
             else:
                 _dlog("eos_unknown_state",
@@ -21616,7 +21677,7 @@ async def run_natural_pipeline_stream(
 
         # Flush any normal text buffered
         if state == "normal" and normal_buf.strip():
-            yield sse({"type": "token", "content": normal_buf})
+            yield sse({"type": "token", "content": _emit_prose(normal_buf)})
 
         if in_thinking:
             yield sse({"type": "thinking_end", "content": ""})
@@ -21645,6 +21706,12 @@ async def run_natural_pipeline_stream(
                   thinking_captured_chars=len(_phase2_thinking_buf or ""),
                   filereq_used=_phase2_filereq_used,
                   recovery_used=_no_text_recovery_used)
+            if _git_ledger:
+                _git_block = _git_outcome_text()
+                if _git_block:
+                    yield sse({"type": "token", "content": _emit_prose(_git_block)})
+                yield sse(_natural_done_payload(_model_used))
+                return
             if _blocked_reason_tail:
                 _quoted = "> " + _blocked_reason_tail.replace("\n", "\n> ")
                 yield sse({"type": "token",

@@ -161,7 +161,7 @@ def execute_repo_tool(session_id: str, user_id: str, data: dict, session_files=N
         tool = data.get("tool") or ""
         root = repo["root_path"]
         if tool == "git_status":
-            return git_status_text(root)
+            return git_status_text(root, session_id)
         if tool == "git_diff":
             return git_diff_text(
                 root,

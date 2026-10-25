@@ -9,6 +9,8 @@ import type { SessionFile } from '../types'
 interface Props {
   sessionId: string
   sessionFiles: SessionFile[]
+  /** Icon-only 28px control. Progress stays in the tooltip so the button cannot grow. */
+  compact?: boolean
 }
 
 type ZipStage = 'idle' | 'fetching' | 'compressing' | 'downloading'
@@ -29,7 +31,7 @@ function deriveZipName(files: { filename: string }[]): string {
 
 /* ─── component ─────────────────────────────────────────────────────────── */
 
-export function DownloadSessionButton({ sessionId, sessionFiles }: Props) {
+export function DownloadSessionButton({ sessionId, sessionFiles, compact = false }: Props) {
   const [stage, setStage] = useState<ZipStage>('idle')
   const [progress, setProgress] = useState('')
 
@@ -104,19 +106,34 @@ export function DownloadSessionButton({ sessionId, sessionFiles }: Props) {
   /* ─── label ─────────────────────────────────────────────────────────── */
   const busy = stage !== 'idle'
   const label = busy ? progress : `Download All (${sessionFiles.length})`
+  const title = busy
+    ? label
+    : `Download all ${sessionFiles.length} session files as a zip (folder structure preserved)`
+
+  if (compact) {
+    return (
+      <button
+        type="button"
+        onClick={handleDownload}
+        disabled={busy}
+        title={title}
+        aria-label={title}
+        className={`btn-icon ${busy ? 'cursor-wait' : ''}`}
+      >
+        <FolderZip sx={{ fontSize: 15 }} />
+      </button>
+    )
+  }
 
   return (
     <button
+      type="button"
       onClick={handleDownload}
       disabled={busy}
-      title={
-        busy
-          ? label
-          : `Download all ${sessionFiles.length} session files as a zip (folder structure preserved)`
-      }
+      title={title}
       className={`
         flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-[12px] font-medium
-        border border-border/60 transition-all
+        border border-border/60 transition-all whitespace-nowrap
         ${busy
           ? 'text-muted cursor-wait bg-surface/40'
           : 'text-muted hover:text-ink hover:bg-surface/80 active:scale-[0.97]'
@@ -124,7 +141,7 @@ export function DownloadSessionButton({ sessionId, sessionFiles }: Props) {
       `}
     >
       <FolderZip sx={{ fontSize: 14 }} />
-      <span>{label}</span>
+      <span className="whitespace-nowrap">{label}</span>
     </button>
   )
 }

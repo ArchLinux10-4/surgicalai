@@ -52,6 +52,12 @@ UNKNOWN_NOTE = (
     "Use status, diff, log, branch, switch, add, commit, push, pull, fetch, or gh pr."
 )
 MERGE_EDIT_NOTE = "Merge commands cannot be edited. Reject this and send a new command."
+REPEAT_STOP_NOTE = (
+    "This command failed the same way twice. Stop. Tell the user the error. Do not run it again."
+)
+MODEL_STOP_NOTE = "Stop. Report this to the user. Do not read or search this app's source code."
+
+_last_fail: dict[str, str] = {}
 
 _LEVEL_RANK = {"read": 0, "local": 1, "remote": 2, "merge": 3}
 _READ_CMDS = {"status", "diff", "log", "show", "rev-parse", "ls-files", "blame", "fetch"}
@@ -136,7 +142,7 @@ def _reject_syntax(command: str) -> str | None:
     if not raw.strip():
         return "Command is empty."
     if "\n" in raw or "\r" in raw or any(ch in raw for ch in _FORBIDDEN):
-        return "Only a single git or gh command is allowed."
+        return "One command per call. Send them separately."
     try:
         argv = shlex.split(raw)
     except ValueError:
@@ -274,6 +280,8 @@ def _ok(command: str, level: str, title: str, target: str, argv: list[str], kind
 
 
 def _classify_gh(command: str, argv: list[str]) -> dict:
+    if len(argv) >= 3 and argv[1] == "auth" and argv[2] == "status" and len(argv) == 3:
+        return _ok(command, "read", "GitHub access", "", argv, "gh", "auth_status")
     if len(argv) < 3 or argv[1] != "pr":
         return _blank(command, UNKNOWN_NOTE, argv)
     action = argv[2]
@@ -293,6 +301,9 @@ def _classify_gh(command: str, argv: list[str]) -> dict:
         state = flags.get("--state") or "open"
         if state not in ("open", "closed", "all"):
             return _blank(command, "gh pr list --state must be open, closed, or all.", argv)
+        limit = str(flags.get("--limit") or "").strip()
+        if limit and (not limit.isdigit() or not 1 <= int(limit) <= 50):
+            return _blank(command, "gh pr list --limit must be a number from 1 to 50.", argv)
         if pos:
             return _blank(command, UNKNOWN_NOTE, argv)
         return _ok(command, "read", "List pull requests", state, argv, "gh", "pr_list")
@@ -316,7 +327,7 @@ def _classify_gh(command: str, argv: list[str]) -> dict:
 
 def _gh_flags(argv: list[str]) -> tuple[list[str], dict, str]:
     bools = {"--draft", "--merge", "--squash", "--rebase"}
-    values = {"--title", "--body", "--base", "--head", "--state"}
+    values = {"--title", "--body", "--base", "--head", "--state", "--limit"}
     positionals: list[str] = []
     flags: dict = {}
     i = 0
@@ -344,11 +355,53 @@ def _gh_flags(argv: list[str]) -> tuple[list[str], dict, str]:
     return positionals, flags, ""
 
 
+def _publish_flags(argv: list[str]) -> tuple[dict, str]:
+    bools = {"--draft"}
+    values = {"--branch", "--message", "--title", "--body", "--base"}
+    flags: dict = {}
+    i = 0
+    while i < len(argv):
+        tok = argv[i]
+        if tok in bools:
+            flags[tok] = True
+            i += 1
+            continue
+        name = _flag_name(tok)
+        if name in values and "=" in tok:
+            flags[name] = tok.split("=", 1)[1]
+            i += 1
+            continue
+        if tok in values:
+            if i + 1 >= len(argv):
+                return {}, f"{tok} needs a value."
+            flags[tok] = argv[i + 1]
+            i += 2
+            continue
+        return {}, f"Unknown publish flag {tok}."
+    return flags, ""
+
+
+def _classify_publish(command: str, argv: list[str]) -> dict:
+    flags, err = _publish_flags(argv[2:])
+    if err:
+        return _blank(command, err, argv)
+    branch = (flags.get("--branch") or "").strip()
+    message = (flags.get("--message") or "").strip()
+    title = (flags.get("--title") or "").strip()
+    if not branch or not message or not title:
+        return _blank(command, "git publish needs --branch, --message, and --title.", argv)
+    if _bad_path(branch, "") or any(part == ".." for part in branch.split("/")):
+        return _blank(command, "That branch name is not allowed.", argv)
+    return _ok(command, "remote", f"Publish {branch}", branch, argv, "git", "publish")
+
+
 def _classify_git(command: str, argv: list[str], root: str, head: str, default_branch: str, allow_default: bool) -> dict:
     if len(argv) < 2:
         return _blank(command, UNKNOWN_NOTE, argv)
     cmd = argv[1]
     rest = argv[2:]
+    if cmd == "publish":
+        return _classify_publish(command, argv)
     if any(_bad_path(tok, root) for tok in rest):
         return _blank(command, "That path is outside the open folder.", argv)
     if any("://" in tok or tok.startswith("git@") for tok in rest):
@@ -921,7 +974,15 @@ def session_repo_files(session_id: str) -> list[dict]:
     return out
 
 
+def _disk_name_list(names: list) -> str:
+    shown = ", ".join(names[:12])
+    if len(names) > 12:
+        shown += f" ({len(names) - 12} more)"
+    return shown
+
+
 def unapplied_edits_note(session_id: str, root: str) -> str:
+    """Chat copy versus the open folder. Not git's index."""
     rows = session_repo_files(session_id)
     if not rows or not root:
         return ""
@@ -929,19 +990,34 @@ def unapplied_edits_note(session_id: str, root: str) -> str:
         from services.repo_apply import disk_state_for
     except Exception:
         return ""
-    names = []
+    pending, changed, missing = [], [], []
     for row in rows:
         rel = row.get("repo_path") or ""
         state = disk_state_for(rel, root, row.get("content") or "", row.get("base_sha") or "")
+        name = row.get("filename") or rel
         if state == "pending":
-            names.append(row.get("filename") or rel)
-    if not names:
-        return ""
-    shown = ", ".join(names[:12])
-    return (
-        f"{len(names)} edited files are not applied to disk yet: {shown}. "
-        "Apply them or they are not part of this commit."
-    )
+            pending.append(name)
+        elif state == "conflict":
+            changed.append(name)
+        elif state == "missing":
+            missing.append(name)
+    parts = []
+    if pending:
+        parts.append(
+            f"{len(pending)} edited file(s) are not saved to the folder yet: {_disk_name_list(pending)}. "
+            "They are not part of a commit until the user saves them."
+        )
+    if changed:
+        parts.append(
+            f"{len(changed)} file(s) changed on disk after this chat loaded them: {_disk_name_list(changed)}. "
+            "Saving would overwrite the folder copy."
+        )
+    if missing:
+        parts.append(
+            f"{len(missing)} file(s) are missing from the folder: {_disk_name_list(missing)}. "
+            "Saving would recreate them."
+        )
+    return " ".join(parts)
 
 
 def change_summary(root: str, default_branch: str, head: str) -> str:
@@ -1019,6 +1095,600 @@ def _rewrite_argv(classified: dict) -> list[str]:
     return argv
 
 
+def explain_failure(text: str, owner: str = "", repo_name: str = "") -> tuple[str, bool]:
+    """Turn a known git or GitHub failure into one next step. The bool means stop."""
+    raw = text or ""
+    low = raw.lower()
+    where = f"{owner}/{repo_name}" if owner and repo_name else "this repository"
+    denied = "permission to" in low and "denied" in low
+    forbidden = "error: 403" in low or "http 403" in low
+    if denied or forbidden:
+        return (
+            f"GitHub refused the push. The SurgicalAI GitHub App needs access to {where}, "
+            f"with Contents: Read and write and Pull requests: Read and write. "
+            f"Add the repository if it is not selected. Nothing was pushed.",
+            True,
+        )
+    if "error: 401" in low or "authentication failed" in low or "invalid username or token" in low:
+        return (
+            f"GitHub rejected the credentials for {where}. Reconnect the GitHub App in Settings.",
+            True,
+        )
+    if "non-fast-forward" in low or ("rejected" in low and "fetch first" in low):
+        return (
+            "The remote branch has commits this folder does not. "
+            "Run git fetch, then git pull --ff-only, and try the push again.",
+            False,
+        )
+    return "", False
+
+
+def _note_repeat(session_id: str, command: str, failed: bool) -> str:
+    key = session_id or "_"
+    sig = " ".join((command or "").split())
+    if failed and _last_fail.get(key) == sig:
+        return REPEAT_STOP_NOTE
+    if failed:
+        _last_fail[key] = sig
+    else:
+        _last_fail.pop(key, None)
+    return ""
+
+
+def _apply_failure(out: dict, *, owner: str = "", repo_name: str = "", session_id: str = "", command: str = "") -> dict:
+    code = out.get("exit_code")
+    stderr = out.get("stderr") or ""
+    stdout = out.get("stdout") or ""
+    explained, stop = explain_failure(stderr + "\n" + stdout, owner, repo_name)
+    if code not in (0, None) and explained:
+        stderr = explained
+        out["stderr"] = stderr
+        out["stop"] = True if stop else bool(out.get("stop"))
+    elif stop:
+        out["stop"] = True
+    out.setdefault("stop", False)
+    out.setdefault("steps", [])
+    out.setdefault("verified", [])
+    out.setdefault("pr_url", "")
+    out.setdefault("commit", "")
+    return out
+
+
+def _selected_repos(inst_id: str):
+    if not inst_id:
+        return []
+    try:
+        from services.github_app_auth import installation_repositories
+        return installation_repositories(inst_id)
+    except Exception:
+        return []
+
+
+def _permissions_for(inst: dict | None) -> tuple[dict, str]:
+    inst_id = str((inst or {}).get("installation_id") or "")
+    if not inst_id:
+        return {}, ""
+    try:
+        from services.github_app_auth import installation_permissions
+        return installation_permissions(inst_id) or {}, inst_id
+    except Exception:
+        return {}, inst_id
+
+
+def git_readiness(root: str, user_id: str = "", repo: dict | None = None, session_id: str = "") -> dict:
+    """Checks that must pass before a push or a pull request. No approval card."""
+    checks: list[dict] = []
+    owner, repo_name = _github_coords(root, repo)
+    url = _origin_url(root) if root else ""
+    file_remote = os.environ.get("GIT_AGENT_ALLOW_FILE_REMOTE") == "1" and (
+        url.startswith("/") or url.startswith("file://")
+    )
+    origin_problem = "" if file_remote else (remote_allowed(url, user_id, repo) if url else "origin is not set.")
+    checks.append({
+        "name": "origin",
+        "ok": not origin_problem,
+        "detail": origin_problem or (f"origin is {owner}/{repo_name}" if owner else "origin is set"),
+    })
+    perms: dict = {}
+    inst_id = ""
+    if file_remote:
+        checks.append({"name": "repository", "ok": True, "detail": "Local remote. GitHub repository selection is not required."})
+        checks.append({"name": "contents", "ok": True, "detail": "Local remote. GitHub write is not required."})
+        checks.append({"name": "pull_requests", "ok": True, "detail": "Local remote. GitHub write is not required."})
+    elif owner and repo_name and user_id and not origin_problem:
+        _gh_repo, inst, _token, err = open_github_repo(user_id, owner, repo_name)
+        perms, inst_id = _permissions_for(inst)
+        if err and not perms:
+            checks.append({"name": "contents", "ok": False, "detail": err})
+            checks.append({"name": "pull_requests", "ok": False, "detail": err})
+        else:
+            full_name = f"{owner}/{repo_name}"
+            selected = _selected_repos(inst_id)
+            if selected is None:
+                checks.append({"name": "repository", "ok": True, "detail": f"{full_name} is covered by this GitHub App installation."})
+            elif full_name.lower() in {name.lower() for name in selected}:
+                checks.append({"name": "repository", "ok": True, "detail": f"{full_name} is included in this GitHub App installation."})
+            else:
+                shown = ", ".join(selected[:5]) or "no repositories"
+                checks.append({
+                    "name": "repository",
+                    "ok": False,
+                    "detail": (
+                        f"The GitHub App is not installed on {full_name}. "
+                        f"It currently includes {shown}. Add {full_name} in the installation settings."
+                    ),
+                })
+            contents = str(perms.get("contents") or "")
+            pulls = str(perms.get("pull_requests") or "")
+            checks.append({
+                "name": "contents",
+                "ok": contents == "write",
+                "detail": (
+                    "Contents: Read and write is granted."
+                    if contents == "write"
+                    else f"The GitHub App contents permission is '{contents or 'missing'}', not write."
+                ),
+            })
+            checks.append({
+                "name": "pull_requests",
+                "ok": pulls == "write",
+                "detail": (
+                    "Pull requests: Read and write is granted."
+                    if pulls == "write"
+                    else f"The GitHub App pull request permission is '{pulls or 'missing'}', not write."
+                ),
+            })
+    else:
+        checks.append({"name": "repository", "ok": False, "detail": "This folder is not linked to a GitHub repository."})
+        checks.append({"name": "contents", "ok": False, "detail": "This folder is not linked to a GitHub repository."})
+        checks.append({"name": "pull_requests", "ok": False, "detail": "This folder is not linked to a GitHub repository."})
+    fix_url = (
+        f"https://github.com/settings/installations/{inst_id}"
+        if inst_id else "https://github.com/settings/installations"
+    )
+    head = _head_branch(root) if root else ""
+    default = _default_branch(root, repo) if root else ""
+    dirty = False
+    if root:
+        code, status_out, _err = _git(root, ["status", "--porcelain"])
+        dirty = code == 0 and bool(status_out.strip())
+    ahead = ""
+    if root and head:
+        ahead = _divergence(root, f"origin/{head}")
+    checks.append({
+        "name": "branch",
+        "ok": True,
+        "detail": " ".join(p for p in (
+            f"On {head or 'no branch'}.",
+            "Uncommitted changes." if dirty else "Working tree clean.",
+            ahead,
+        ) if p),
+    })
+    ident_name, ident_email = read_identity(root, "")
+    checks.append({
+        "name": "identity",
+        "ok": bool(ident_name and ident_email),
+        "detail": f"Commits use {ident_name} <{ident_email}>." if ident_name else "No git name or email is set.",
+    })
+    pending = unapplied_edits_note(session_id, root) if session_id else ""
+    checks.append({
+        "name": "unapplied",
+        "ok": not pending,
+        "detail": pending or "Chat edits match disk.",
+    })
+    blocking_names = {"origin", "repository", "contents", "pull_requests"}
+    blocking = [c for c in checks if c["name"] in blocking_names and not c["ok"]]
+    message = ""
+    if blocking:
+        message = "\n".join(c["detail"] for c in blocking) + f"\nOpen {fix_url} and grant the missing access."
+    return {
+        "ok": not blocking,
+        "checks": checks,
+        "message": message,
+        "fix_url": fix_url,
+        "branch": head,
+        "default_branch": default,
+        "dirty": dirty,
+    }
+
+
+def _readiness_relevant(action: str) -> set[str]:
+    names = set()
+    if action in ("push", "publish"):
+        names.update({"origin", "repository", "contents"})
+    if action in ("pr_create", "pr_ready", "pr_merge", "publish"):
+        names.update({"origin", "repository", "pull_requests"})
+    return names
+
+
+def readiness_block(action: str, report: dict) -> str:
+    if not _readiness_relevant(action):
+        return ""
+    failed = {c["name"] for c in report.get("checks") or [] if not c.get("ok")}
+    hit = failed & _readiness_relevant(action)
+    if not hit:
+        return ""
+    lines = [c["detail"] for c in report["checks"] if c["name"] in hit]
+    return "\n".join(lines) + f"\nOpen {report.get('fix_url') or 'https://github.com/settings/installations'} and grant the missing access."
+
+
+def _porcelain_paths(root: str) -> list[str]:
+    code, out, _err = _git(root, ["status", "--porcelain"])
+    if code != 0:
+        return []
+    paths = []
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        path = line[3:]
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        paths.append(path.strip())
+    return [p for p in paths if p]
+
+
+def _split_publish_files(root: str) -> tuple[list[str], list[str]]:
+    included, excluded = [], []
+    for path in _porcelain_paths(root):
+        full = os.path.join(root, path)
+        too_big = False
+        try:
+            too_big = os.path.isfile(full) and os.path.getsize(full) > _MAX_FILE_BYTES
+        except OSError:
+            too_big = False
+        if _secret_path(path) or too_big:
+            excluded.append(path)
+        else:
+            included.append(path)
+    return included, excluded
+
+
+def publish_preview(root: str, command: str, head: str, default: str) -> str:
+    flags, _err = _publish_flags(_argv(command)[2:])
+    branch = (flags.get("--branch") or head or "").strip()
+    base = (flags.get("--base") or default or "main").strip()
+    included, excluded = _split_publish_files(root)
+    lines = [
+        f"Branch {branch} into {base}.",
+        f"Commit: {flags.get('--message') or ''}",
+        f"Pull request: {flags.get('--title') or ''}",
+    ]
+    body = (flags.get("--body") or "").strip()
+    if body:
+        lines.append("Body: " + body[:240])
+    if included:
+        shown = ", ".join(included[:12])
+        more = f" (+{len(included) - 12} more)" if len(included) > 12 else ""
+        lines.append(f"{len(included)} file(s): {shown}{more}")
+    else:
+        lines.append("No new files. Existing commits on this branch will be pushed.")
+    if excluded:
+        lines.append("Left out: " + ", ".join(excluded[:12]))
+    return "\n".join(lines)
+
+
+def _publish_flags_from(command: str) -> dict:
+    flags, err = _publish_flags(_argv(command)[2:])
+    if err:
+        raise RuntimeError(err)
+    return flags
+
+
+def _step(name: str, ok: bool, detail: str, **extra) -> dict:
+    item = {"name": name, "ok": bool(ok), "detail": detail}
+    item.update(extra)
+    return item
+
+
+def _publish_branch(root: str, branch: str, env: dict) -> dict:
+    head = _head_branch(root)
+    if head == branch:
+        return _step("branch", True, f"Already on {branch}.")
+    code, _out, _err = _git(root, ["show-ref", "--verify", "--quiet", f"refs/heads/{branch}"])
+    args = ["switch", branch] if code == 0 else ["switch", "-c", branch]
+    status, stdout, stderr = _run_argv([_git_bin(), *args], root, env, _LOCAL_TIMEOUT)
+    detail = (stdout or stderr or "").strip() or f"On {branch}."
+    return _step("branch", status == 0, detail)
+
+
+def _publish_commit(root: str, message: str, env: dict, session_id: str) -> dict:
+    included, excluded = _split_publish_files(root)
+    if not included and not excluded:
+        return _step("commit", True, "Nothing new to commit.", skipped=True)
+    if not included:
+        return _step("commit", False, "Only secret or oversized files are left. Nothing was committed.")
+    status, _stdout, stderr = _run_argv(
+        [_git_bin(), "add", "--", *included], root, env, _LOCAL_TIMEOUT,
+    )
+    if status != 0:
+        return _step("commit", False, (stderr or "git add failed.").strip())
+    blocked = commit_block_reason(root)
+    if blocked:
+        return _step("commit", False, blocked)
+    status, stdout, stderr = _run_argv(
+        [_git_bin(), "commit", "-m", message], root, env, _LOCAL_TIMEOUT,
+    )
+    if status != 0:
+        return _step("commit", False, (stderr or stdout or "git commit failed.").strip())
+    note = unapplied_edits_note(session_id, root)
+    code, sha, _err = _git(root, ["rev-parse", "--short", "HEAD"])
+    detail = (stdout or "").strip()
+    if note:
+        detail = (detail + "\n" + note).strip()
+    return _step("commit", True, detail or "Committed.", sha=(sha or "").strip() if code == 0 else "")
+
+
+def _publish_push(root: str, branch: str, env: dict, token: str, owner: str, repo_name: str) -> dict:
+    status, stdout, stderr = _run_argv(
+        [_git_bin(), "push", "-u", "origin", branch], root, env, _NETWORK_TIMEOUT,
+    )
+    text = _redact((stderr or stdout or "").strip(), [token] if token else [])
+    if status != 0:
+        explained, stop = explain_failure(text, owner, repo_name)
+        return _step("push", False, explained or text or "git push failed.", stop=stop)
+    verified, line = _verify_push(root, branch, token)
+    return _step("push", True, line if verified else (text or f"Pushed {branch}."), verified=verified, verify_line=line)
+
+
+def _verify_push(root: str, branch: str, token: str) -> tuple[bool, str]:
+    code, local, _err = _git(root, ["rev-parse", "HEAD"])
+    local = (local or "").strip()
+    if code != 0 or not local:
+        return False, "Could not verify the push. This folder has no commit."
+    missing = _branch_pushed(root, branch, token)
+    if missing:
+        return False, "Could not verify the push. " + missing
+    env = build_child_env(root, network_token=token)
+    try:
+        status, out, err = _run_argv(
+            [_git_bin(), "ls-remote", "--heads", "origin", branch], root, env, _NETWORK_TIMEOUT,
+        )
+    finally:
+        _cleanup_env(env)
+    if status != 0:
+        return False, "Could not verify the push. " + (err or "").strip()
+    wanted = f"refs/heads/{branch}"
+    remote = ""
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1] == wanted:
+            remote = parts[0]
+            break
+    if remote == local:
+        return True, f"Verified: {branch} is at {local[:7]}."
+    return False, "Could not verify the push. The remote branch does not match this folder."
+
+
+def _sha_ok(local: str, remote: str) -> bool:
+    if not local or not remote or len(local) < 7 or len(remote) < 7:
+        return True
+    return local.startswith(remote) or remote.startswith(local)
+
+
+def _pr_number_from(text: str) -> int:
+    import re
+    match = re.search(r"#(\d+)", text or "")
+    return int(match.group(1)) if match else 0
+
+
+def _verify_pr(gh_repo, number: int, local_sha: str) -> tuple[bool, str, str]:
+    try:
+        pr = gh_repo.get_pull(int(number))
+    except Exception as exc:
+        return False, f"Could not verify the pull request. {exc}", ""
+    url = getattr(pr, "html_url", "") or ""
+    state = getattr(pr, "state", "") or ""
+    head_sha = getattr(getattr(pr, "head", None), "sha", "") or ""
+    merged = bool(getattr(pr, "merged", False))
+    if merged:
+        return True, f"Verified: pull request #{number} is merged. {url}", url
+    if state == "open" and _sha_ok(local_sha, head_sha):
+        return True, f"Verified: pull request #{number} is open. {url}", url
+    return False, f"Could not verify pull request #{number} ({state or 'unknown'}). {url}", url
+
+
+def _verify_default_branch(root: str, default: str, token: str) -> str:
+    if not default:
+        return "Could not verify the default branch."
+    env = build_child_env(root, network_token=token)
+    try:
+        status, out, err = _run_argv(
+            [_git_bin(), "ls-remote", "--heads", "origin", default], root, env, _NETWORK_TIMEOUT,
+        )
+    finally:
+        _cleanup_env(env)
+    if status != 0:
+        return "Could not verify the default branch. " + (err or "").strip()
+    wanted = f"refs/heads/{default}"
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[-1] == wanted:
+            return f"Verified: {default} is at {parts[0][:7]}."
+    return f"Could not verify {default} on GitHub."
+
+
+def run_publish(
+    command: str,
+    *,
+    root: str,
+    user_id: str = "",
+    session_id: str = "",
+    repo: dict | None = None,
+    head_branch: str = "",
+    default_branch: str = "",
+    on_step=None,
+) -> dict:
+    """Branch, commit, push, and open a pull request. Stops at the first failure."""
+    flags = _publish_flags_from(command)
+    branch = (flags.get("--branch") or "").strip()
+    message = flags.get("--message") or ""
+    title = flags.get("--title") or ""
+    body = flags.get("--body") or ""
+    base = (flags.get("--base") or default_branch or "main").strip()
+    draft = bool(flags.get("--draft"))
+    owner, repo_name = _github_coords(root, repo)
+    url = _origin_url(root)
+    steps: list[dict] = []
+
+    def record(step: dict) -> dict:
+        steps.append(step)
+        if on_step:
+            on_step(dict(step))
+        return step
+
+    token = ""
+    login = ""
+    gh_repo = None
+    file_remote = os.environ.get("GIT_AGENT_ALLOW_FILE_REMOTE") == "1" and (
+        url.startswith("/") or url.startswith("file://")
+    )
+    if not file_remote:
+        problem = remote_allowed(url, user_id, repo)
+        if problem:
+            return _apply_failure({
+                "exit_code": 1, "stdout": "", "stderr": problem, "stop": True,
+                "steps": [record(_step("push", False, problem, stop=True))],
+            }, owner=owner, repo_name=repo_name, session_id=session_id, command=command)
+        gh_repo, inst, token, err = open_github_repo(user_id, owner, repo_name) if owner and repo_name else (None, None, "", "This folder is not linked to a GitHub repository.")
+        if err or not token:
+            detail = err or "Could not get a GitHub token."
+            return _apply_failure({
+                "exit_code": 1, "stdout": "", "stderr": detail, "stop": True,
+                "steps": [record(_step("push", False, detail, stop=True))],
+            }, owner=owner, repo_name=repo_name, session_id=session_id, command=command)
+        login = (inst or {}).get("account_login") or ""
+    env = build_child_env(root, network_token=token, login=login)
+    verified: list[str] = []
+    pr_url = ""
+    commit = ""
+    try:
+        branched = record(_publish_branch(root, branch, env))
+        if not branched["ok"]:
+            raise RuntimeError(branched["detail"])
+        committed = record(_publish_commit(root, message, env, session_id))
+        if not committed["ok"]:
+            raise RuntimeError(committed["detail"])
+        commit = committed.get("sha") or ""
+        if not file_remote:
+            pushed = _publish_push(root, branch, env, token, owner, repo_name)
+        else:
+            status, stdout, stderr = _run_argv(
+                [_git_bin(), "push", "-u", "origin", branch], root, env, _NETWORK_TIMEOUT,
+            )
+            if status != 0:
+                pushed = _step("push", False, (stderr or stdout or "git push failed.").strip())
+            else:
+                verified_push, line = _verify_push(root, branch, "")
+                pushed = _step("push", verified_push, line, verified=verified_push, verify_line=line)
+        record(pushed)
+        if not pushed["ok"]:
+            raise RuntimeError(pushed["detail"])
+        if pushed.get("verify_line"):
+            verified.append(pushed["verify_line"])
+        if file_remote:
+            record(_step("pull request", True, "Local remote. No pull request was opened.", skipped=True))
+        else:
+            existing = _pr_for_branch(gh_repo, branch) if gh_repo is not None else None
+            if existing is not None:
+                pr_url = getattr(existing, "html_url", "") or ""
+                number = getattr(existing, "number", "")
+                ok, line, pr_url = _verify_pr(gh_repo, int(number), commit)
+                verified.append(line)
+                record(_step("pull request", ok, f"Already open: {pr_url}", url=pr_url))
+                if not ok:
+                    raise RuntimeError(line)
+            else:
+                pr_flags = {"--title": title, "--body": body, "--base": base, "--head": branch}
+                if draft:
+                    pr_flags["--draft"] = True
+                try:
+                    created = _gh_create(gh_repo, root, pr_flags, branch, base, token)
+                except Exception as exc:
+                    record(_step("pull request", False, str(exc)))
+                    raise
+                pr_url = ""
+                number = ""
+                for part in created.split():
+                    if part.startswith("http"):
+                        pr_url = part
+                    if part.startswith("(#") and part.endswith(")"):
+                        number = part[2:-1]
+                code, full_sha, _err = _git(root, ["rev-parse", "HEAD"])
+                local_sha = (full_sha or "").strip() if code == 0 else ""
+                if number.isdigit() and gh_repo is not None:
+                    ok, line, pr_url = _verify_pr(gh_repo, int(number), local_sha)
+                    verified.append(line)
+                    record(_step("pull request", ok, line, url=pr_url))
+                    if not ok:
+                        raise RuntimeError(line)
+                else:
+                    record(_step("pull request", True, created, url=pr_url))
+        stdout = "\n".join(verified) or "Published."
+        return _apply_failure({
+            "exit_code": 0, "stdout": stdout, "stderr": "", "stop": False,
+            "steps": steps, "verified": verified, "pr_url": pr_url, "commit": commit,
+        }, owner=owner, repo_name=repo_name, session_id=session_id, command=command)
+    except Exception as exc:
+        stderr = str(exc).strip() or "Publish stopped."
+        explained, stop = explain_failure(stderr, owner, repo_name)
+        if any(step.get("stop") for step in steps):
+            stop = True
+        return _apply_failure({
+            "exit_code": 1,
+            "stdout": "",
+            "stderr": explained or stderr,
+            "stop": stop,
+            "steps": steps,
+            "verified": verified,
+            "pr_url": pr_url,
+            "commit": commit,
+        }, owner=owner, repo_name=repo_name, session_id=session_id, command=command)
+    finally:
+        _cleanup_env(env)
+
+
+def _first_line(text: str) -> str:
+    lines = (text or "").strip().splitlines()
+    return lines[0][:240] if lines else ""
+
+
+def render_git_outcome(entries: list[dict]) -> str:
+    """Markdown the user sees even when the model never writes a summary."""
+    if not entries:
+        return ""
+    lines = ["**Git result**"]
+    for entry in entries:
+        steps = entry.get("steps") or []
+        if steps:
+            for step in steps:
+                mark = "done" if step.get("ok") else "failed"
+                detail = _first_line(step.get("detail"))
+                lines.append(f"- {step.get('name')}: {mark}. {detail}")
+        else:
+            mark = "done" if entry.get("ok") else "failed"
+            detail = _first_line(entry.get("detail"))
+            lines.append(f"- `{entry.get('command') or 'git'}`: {mark}. {detail}")
+        for line in entry.get("verified") or []:
+            if line and line not in "\n".join(lines):
+                lines.append(f"- {line}")
+    last = entries[-1]
+    if last.get("pr_url"):
+        lines.append(f"- Pull request: {last['pr_url']}")
+    nxt = (last.get("next") or "").strip()
+    if nxt:
+        lines.append("")
+        lines.append(nxt)
+    elif not last.get("ok"):
+        lines.append("")
+        lines.append("Nothing was opened on GitHub." if not last.get("pr_url") else "GitHub was not fully updated.")
+    if last.get("fix_url") and not last.get("ok"):
+        lines.append(f"- Fix: {last['fix_url']}")
+    branch = last.get("branch") or ""
+    if branch:
+        lines.append(f"This folder is on `{branch}`. `git switch main` returns you to the default branch.")
+    return "\n".join(lines)
+
+
 def run_git_cli(
     command: str,
     *,
@@ -1044,6 +1714,20 @@ def run_git_cli(
     if not root or not os.path.isdir(root):
         return {"exit_code": 1, "stdout": "", "stderr": "This chat has no open folder."}
     action = classified.get("action") or ""
+    if action == "publish":
+        return run_publish(
+            command, root=root, user_id=user_id, session_id=session_id, repo=repo,
+            head_branch=head, default_branch=default,
+        )
+    if action == "auth_status":
+        report = git_readiness(root, user_id, repo, session_id)
+        lines = [
+            f"{item['name']}: {'ok' if item['ok'] else 'missing'} — {item['detail']}"
+            for item in report.get("checks") or []
+        ]
+        if report.get("fix_url") and not report.get("ok"):
+            lines.append(report["fix_url"])
+        return {"exit_code": 0 if report.get("ok") else 1, "stdout": "\n".join(lines), "stderr": "" if report.get("ok") else (report.get("message") or ""), "stop": not report.get("ok")}
     if action == "commit":
         blocked = commit_block_reason(root)
         if blocked:
@@ -1073,7 +1757,7 @@ def run_git_cli(
         return _run_gh(classified, root, user_id, repo, head, default)
     env = build_child_env(root, network_token=token, login=login)
     extra = ""
-    if action in ("commit", "push"):
+    if action in ("commit", "push", "status"):
         extra = unapplied_edits_note(session_id, root)
     try:
         argv = _rewrite_argv(classified)
@@ -1098,12 +1782,24 @@ def run_git_cli(
                     ).strip()
         if extra:
             stdout = (stdout + ("\n" if stdout else "") + extra).strip()
+        verified: list[str] = []
+        if action == "push" and code == 0:
+            target = classified.get("target") or ""
+            dest = target[len("origin/"):] if target.startswith("origin/") else (target or head)
+            dest = dest.strip()
+            _ok_push, line = _verify_push(root, dest, token)
+            stdout = (stdout + "\n" + line).strip()
+            verified.append(line)
+            if not _ok_push:
+                stderr = (stderr + "\n" + line).strip()
         secrets = [token] if token else []
-        return {
+        owner, repo_name = _github_coords(root, repo)
+        return _apply_failure({
             "exit_code": code,
             "stdout": _redact(stdout, secrets),
             "stderr": _redact(stderr, secrets),
-        }
+            "verified": verified,
+        }, owner=owner, repo_name=repo_name, session_id=session_id, command=command)
     finally:
         _cleanup_env(env)
 
@@ -1131,7 +1827,8 @@ def _run_gh(classified: dict, root: str, user_id: str, repo: dict | None, head: 
     _cmd, pos, flags = _gh_parsed(classified["argv"])
     try:
         if action == "pr_list":
-            text = _gh_list(gh_repo, flags.get("--state") or "open")
+            raw_limit = str(flags.get("--limit") or "").strip()
+            text = _gh_list(gh_repo, flags.get("--state") or "open", int(raw_limit) if raw_limit.isdigit() else 20)
         elif action == "pr_view":
             text = _gh_view(gh_repo, pos[0] if pos else "", head)
         elif action == "pr_checks":
@@ -1146,17 +1843,39 @@ def _run_gh(classified: dict, root: str, user_id: str, repo: dict | None, head: 
             text = UNKNOWN_NOTE
             return {"exit_code": 1, "stdout": "", "stderr": text}
     except Exception as exc:
-        return {"exit_code": 1, "stdout": "", "stderr": _redact(str(exc), [token] if token else [])}
-    return {"exit_code": 0, "stdout": _redact(text, [token] if token else []), "stderr": ""}
+        message = _redact(str(exc), [token] if token else [])
+        explained, stop = explain_failure(message, owner, name)
+        return {"exit_code": 1, "stdout": "", "stderr": explained or message, "stop": stop}
+    verified: list[str] = []
+    pr_url = ""
+    if action in ("pr_create", "pr_merge"):
+        number = _pr_number_from(text)
+        if number:
+            local = ""
+            if action == "pr_create":
+                code, local, _err = _git(root, ["rev-parse", "HEAD"])
+                local = (local or "").strip() if code == 0 else ""
+            ok, line, pr_url = _verify_pr(gh_repo, number, local)
+            verified.append(line)
+            if action == "pr_merge":
+                verified.append(_verify_default_branch(root, default, token))
+            text = text + "\n" + "\n".join(verified)
+            if not ok and action == "pr_create":
+                return {"exit_code": 1, "stdout": "", "stderr": line, "stop": False, "verified": verified, "pr_url": pr_url}
+    return {
+        "exit_code": 0, "stdout": _redact(text, [token] if token else []), "stderr": "",
+        "stop": False, "verified": verified, "pr_url": pr_url,
+    }
 
 
-def _gh_list(gh_repo, state: str) -> str:
+def _gh_list(gh_repo, state: str, limit: int = 20) -> str:
     lines = []
+    cap = limit if 1 <= limit <= 50 else 20
     for pr in gh_repo.get_pulls(state=state):
         lines.append(
             f"#{pr.number} {getattr(pr, 'title', '')} ({getattr(pr, 'state', '')}) {getattr(pr, 'html_url', '')}"
         )
-        if len(lines) >= 20:
+        if len(lines) >= cap:
             break
     if not lines:
         return f"No {state} pull requests."
@@ -1267,7 +1986,7 @@ def _gh_merge(gh_repo, number: int, flags: dict) -> str:
         method = "merge"
     pr = gh_repo.get_pull(number)
     if getattr(pr, "draft", False):
-        return f"Pull request #{number} is a draft. Run gh pr ready {number} first."
+        raise RuntimeError(f"Pull request #{number} is a draft. Run gh pr ready {number} first.")
     state = (getattr(pr, "mergeable_state", None) or "") or ""
     if getattr(pr, "mergeable", None) is False or state in ("dirty", "blocked"):
         raise RuntimeError(f"Pull request #{number} is not mergeable ({state or 'unknown'}).")
@@ -1305,12 +2024,12 @@ def _gh_create(gh_repo, root: str, flags: dict, head: str, default: str, token: 
     branch = (flags.get("--head") or head or "").strip()
     base = (flags.get("--base") or default or "main").strip()
     if not branch:
-        return "gh pr create needs a branch. Switch to one or pass --head."
+        raise RuntimeError("gh pr create needs a branch. Switch to one or pass --head.")
     if branch == base:
-        return "The pull request head is the base branch. Push a different branch."
+        raise RuntimeError("The pull request head is the base branch. Push a different branch.")
     missing = _branch_pushed(root, branch, token)
     if missing:
-        return missing
+        raise RuntimeError(missing)
     title = flags.get("--title") or ""
     body = flags.get("--body") or ""
     draft = bool(flags.get("--draft"))
@@ -1439,6 +2158,74 @@ def _apply_merge_preview(state: dict, user_id: str, repo: dict | None, root: str
     return state
 
 
+def _done(state: dict, *, run: bool, note: str, stop: bool = False, branch: str = "", waited_s: float = 0, **extra) -> dict:
+    payload = {
+        "type": "git_done",
+        "run": run,
+        "counted": bool(extra.pop("counted", False)),
+        "note": note,
+        "command": state.get("command") or "",
+        "level": state.get("level") or "",
+        "title": state.get("title") or "",
+        "target": state.get("target") or "",
+        "summary": state.get("summary") or "",
+        "stop": stop,
+        "steps": extra.pop("steps", []),
+        "verified": extra.pop("verified", []),
+        "waited_s": round(float(waited_s or 0), 3),
+        "pr_url": extra.pop("pr_url", ""),
+        "commit": extra.pop("commit", ""),
+        "branch": branch or state.get("target") or "",
+        "next": extra.pop("next", ""),
+        "fix_url": extra.pop("fix_url", ""),
+        "ok": bool(extra.pop("ok", False)),
+        "detail": extra.pop("detail", ""),
+    }
+    payload.update(extra)
+    return payload
+
+
+def _outcome_next(out: dict, ok: bool) -> str:
+    if ok and out.get("pr_url"):
+        return "Review the pull request. Say merge it when you want it on the default branch."
+    if ok:
+        return ""
+    if out.get("stop"):
+        return (out.get("stderr") or "Fix the GitHub App access, then ask again.").strip()
+    return "The step that failed is listed above. Fix that and ask again."
+
+
+def _audit_refused(dlog, *, session_id: str, command: str, reason: str) -> None:
+    if dlog is None:
+        return
+    try:
+        dlog("git_cli_refused", session_id=session_id or "", command=(command or "")[:180], reason=reason)
+    except Exception:
+        return
+
+
+def _pr_needs_push(root: str, user_id: str, repo: dict | None, state: dict, head: str, default: str) -> str:
+    _pos, flags, _err = _gh_flags((state.get("argv") or [])[3:])
+    branch = (flags.get("--head") or head or "").strip()
+    if not branch or branch == (flags.get("--base") or default):
+        return ""
+    url = _origin_url(root)
+    file_remote = os.environ.get("GIT_AGENT_ALLOW_FILE_REMOTE") == "1" and (
+        url.startswith("/") or url.startswith("file://")
+    )
+    if file_remote:
+        return _branch_pushed(root, branch, "")
+    if "github.com" not in (url or ""):
+        return ""
+    owner, name = _github_coords(root, repo)
+    if not owner or not name:
+        return ""
+    _gh_repo, _inst, token, err = open_github_repo(user_id, owner, name)
+    if err or not token:
+        return err or "Could not check whether the branch is on GitHub."
+    return _branch_pushed(root, branch, token)
+
+
 async def resolve_git_call(
     command: str,
     mode: str,
@@ -1474,6 +2261,33 @@ async def resolve_git_call(
         state["title"] = f"{state['title']} to {label}"
     elif state.get("action") == "pr_create":
         state["title"] = f"Open a pull request on {label}"
+    elif state.get("action") == "publish":
+        state["title"] = f"Publish {state.get('target') or 'branch'} on {label}"
+        state["summary"] = publish_preview(root, state["command"], head, default)
+    origin = _origin_url(root) if root else ""
+    if state.get("run") or state.get("needs_approval"):
+        if "github.com" in origin and state.get("action") in ("push", "pr_create", "pr_ready", "pr_merge", "publish"):
+            report = git_readiness(root, user_id, repo, session_id)
+            blocked = readiness_block(state.get("action") or "", report)
+            if blocked:
+                _audit_refused(dlog, session_id=session_id, command=(state.get("command") or "")[:180], reason="readiness")
+                yield {
+                    "type": "git_result", "ok": False, "branch": head, "pr_url": "",
+                    "commit": "", "fix_url": report.get("fix_url") or "", "next": blocked,
+                    "steps": [], "verified": [],
+                }
+                yield _done(state, run=False, note=blocked, stop=True, fix_url=report.get("fix_url") or "", branch=head, next=blocked, detail=blocked)
+                return
+        if state.get("action") == "pr_create":
+            missing = _pr_needs_push(root, user_id, repo, state, head, default)
+            if missing:
+                _audit_refused(dlog, session_id=session_id, command=(state.get("command") or "")[:180], reason="not_pushed")
+                yield {
+                    "type": "git_result", "ok": False, "branch": head, "pr_url": "",
+                    "commit": "", "fix_url": "", "next": missing, "steps": [], "verified": [],
+                }
+                yield _done(state, run=False, note=missing, stop=False, branch=head, next=missing, detail=missing)
+                return
     if state["needs_approval"] and client_inbox is None:
         yield {
             "type": "git_done", "run": False, "counted": False, "note": NO_INBOX_NOTE,
@@ -1482,6 +2296,7 @@ async def resolve_git_call(
         }
         return
     cards = 0
+    waited = 0.0
     while state.get("needs_approval"):
         cards += 1
         if cards > _MAX_APPROVAL_CARDS:
@@ -1499,23 +2314,55 @@ async def resolve_git_call(
             "target": state["target"],
             "summary": state.get("summary") or "",
         }
+        _wait_t0 = time.perf_counter()
         state = await _after_decision(state, client_inbox, timeout, root, head, default)
+        waited += time.perf_counter() - _wait_t0
         state = _apply_merge_preview(state, user_id, repo, root)
     if not state["run"]:
-        yield {
-            "type": "git_done", "run": False, "counted": False, "note": state["note"],
-            "command": state["command"], "level": state["level"], "title": state["title"],
-            "target": state["target"], "summary": state.get("summary") or "",
-        }
+        _note_text = state.get("note") or ""
+        if "timed out" in _note_text:
+            reason = "timeout"
+        elif _note_text == REJECT_NOTE or "rejected" in _note_text.lower():
+            reason = "rejected"
+        else:
+            reason = "refused"
+        _audit_refused(dlog, session_id=session_id, command=(state.get("command") or "")[:180], reason=reason)
+        yield _done(state, run=False, note=state["note"], stop=False, branch=head, waited_s=waited)
         return
     shown = " ".join((state["command"] or "").split())
     yield {"type": "progress", "content": f"Running {shown[:120] or 'git'}..."}
     started = time.perf_counter()
-    out = await asyncio.to_thread(
-        run_git_cli, state["command"],
-        root=root, user_id=user_id, session_id=session_id or "", repo=repo,
-        head_branch=head, default_branch=default,
-    )
+    streamed_steps = False
+    if state.get("action") == "publish":
+        import queue as _queue
+        step_q: _queue.Queue = _queue.Queue()
+
+        def _on_step(step, _q=step_q):
+            _q.put(dict(step))
+
+        task = asyncio.create_task(asyncio.to_thread(
+            run_publish, state["command"],
+            root=root, user_id=user_id, session_id=session_id or "", repo=repo,
+            head_branch=head, default_branch=default, on_step=_on_step,
+        ))
+        while not task.done() or not step_q.empty():
+            try:
+                step = step_q.get_nowait()
+            except _queue.Empty:
+                await asyncio.sleep(0.05)
+                continue
+            streamed_steps = True
+            yield {"type": "git_step", **step}
+        try:
+            out = task.result()
+        except Exception as exc:
+            out = {"exit_code": 1, "stdout": "", "stderr": str(exc), "stop": True, "steps": []}
+    else:
+        out = await asyncio.to_thread(
+            run_git_cli, state["command"],
+            root=root, user_id=user_id, session_id=session_id or "", repo=repo,
+            head_branch=head, default_branch=default,
+        )
     _audit(
         dlog,
         session_id=session_id,
@@ -1526,9 +2373,18 @@ async def resolve_git_call(
         stdout_len=len(out.get("stdout") or ""),
         duration_ms=int((time.perf_counter() - started) * 1000),
     )
+    repeat = _note_repeat(session_id or "", state["command"], out.get("exit_code") not in (0, None))
+    if repeat:
+        out["stderr"] = ((out.get("stderr") or "") + "\n" + repeat).strip()
+        out["stop"] = True
     text = format_git_result(state["command"], out)
+    if out.get("stop"):
+        text = text + "\n" + MODEL_STOP_NOTE
     if _ask_plan(mode) and calls_so_far + 1 >= 3:
         text = text + "\n" + ASK_PLAN_STOP_NOTE
+    if not streamed_steps:
+        for step in out.get("steps") or []:
+            yield {"type": "git_step", **step}
     yield {
         "type": "git_cli",
         "command": state["command"],
@@ -1540,15 +2396,31 @@ async def resolve_git_call(
         "target": state["target"],
         "summary": state.get("summary") or "",
     }
-    yield {
-        "type": "git_done",
-        "run": True,
-        "counted": True,
-        "note": text,
-        "command": state["command"],
-        "level": state["level"],
-        "title": state["title"],
-        "target": state["target"],
-        "summary": state.get("summary") or "",
-        "out": out,
-    }
+    ok = out.get("exit_code") in (0, None) and not out.get("stop")
+    nxt = _outcome_next(out, ok)
+    done = _done(
+        state, run=True, counted=True, note=text, stop=bool(out.get("stop")),
+        branch=head, waited_s=waited, ok=ok, next=nxt,
+        steps=out.get("steps") or [], verified=out.get("verified") or [],
+        pr_url=out.get("pr_url") or "", commit=out.get("commit") or "",
+        detail=(out.get("stderr") or out.get("stdout") or "")[:400],
+    )
+    done["out"] = out
+    if (
+        state.get("action") in ("publish", "push", "pr_create", "pr_merge", "pr_ready")
+        or out.get("steps")
+        or not ok
+    ):
+        yield {
+            "type": "git_result",
+            "ok": ok,
+            "branch": head,
+            "pr_url": out.get("pr_url") or "",
+            "commit": out.get("commit") or "",
+            "fix_url": "",
+            "next": nxt,
+            "steps": out.get("steps") or [],
+            "verified": out.get("verified") or [],
+            "markdown": render_git_outcome([done]),
+        }
+    yield done

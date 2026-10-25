@@ -75,7 +75,7 @@ export function GitApprovalCard({ command, level, title, summary, onDecide }: {
         />
       )}
       {summary && (
-        <span className="w-full truncate text-[11px] text-muted" title={summary}>{summary}</span>
+        <pre className="w-full max-h-40 overflow-auto whitespace-pre-wrap font-sans text-[11px] text-muted">{summary}</pre>
       )}
       <button
         type="button"

@@ -317,8 +317,9 @@ def repo_text(form="tag", repo=None) -> str:
         )
     return (
         f"{where}\n{when}\n{examples}\n{diff}\n"
-        "read_repo_file loads the file into this chat. Edits stay staged until "
-        "the user applies them to disk. You cannot run a shell."
+        "read_repo_file loads the file into this chat. Chat edits are not git-staged; "
+        "git status includes which chat files are unsaved or changed on disk. "
+        "You cannot run a shell."
     )
 
 
@@ -328,7 +329,7 @@ def git_cli_text(form="tag") -> str:
         "One command per turn, then stop. "
         "Reads run immediately, including in Ask and Plan: git status, diff, log, show, "
         "branch with no name, rev-parse, remote -v, ls-files, blame, fetch, "
-        "gh pr view, gh pr list, and gh pr checks. "
+        "gh pr view, gh pr list, gh pr checks, and gh auth status. "
         "On a branch that is not the default, Edit and Agent also run these immediately: "
         "git switch, git switch -c, git checkout -b, git branch NAME, git add, "
         "git restore --staged, git commit -m, git stash push, git stash pop, "
@@ -343,7 +344,10 @@ def git_cli_text(form="tag") -> str:
         "After a merge, git switch to the default branch and git pull --ff-only to sync. "
         "If a pull cannot fast-forward, propose git merge origin/BRANCH. "
         "Edits in this chat are not on disk until the user applies them. "
-        "The only remote name is origin."
+        "The only remote name is origin. "
+        "To put local changes on GitHub, call git publish once with --branch, --message, --title, and --body. "
+        "Do not chain add, commit, push, and gh pr create for that. "
+        "If a push or a pull request fails, tell the user the error and stop. Do not read this app's source code."
     )
     if form == "tag":
         return (
@@ -351,6 +355,7 @@ def git_cli_text(form="tag") -> str:
             "The open tag is exactly <git_cli> with no attributes. "
             "The body is one command, not JSON.\n"
             "<git_cli>\ngit status\n</git_cli>\n"
+            "<git_cli>\ngit publish --branch surgicalai/short-name --message \"Why\" --title \"Title\" --body \"What changed\"\n</git_cli>\n"
             "<git_cli>\ngit switch -c surgicalai/short-name\n</git_cli>\n"
             "<git_cli>\ngh pr create --title \"Title\" --body \"Why\" --base main\n</git_cli>\n"
             "<git_cli>\ngh pr merge 123 --merge\n</git_cli>\n"
@@ -359,6 +364,7 @@ def git_cli_text(form="tag") -> str:
     return (
         "Run one git or gh command on the open folder. "
         'Call git_cli with {"command": "git status"}. '
+        'Example: {"command": "git publish --branch surgicalai/short-name --message \\"Why\\" --title \\"Title\\" --body \\"What changed\\""}. '
         'Example: {"command": "git switch -c surgicalai/short-name"}. '
         'Example: {"command": "gh pr create --title \\"Title\\" --body \\"Why\\" --base main"}. '
         'Example: {"command": "gh pr merge 123 --merge"}. '

@@ -78,6 +78,17 @@ export type SmartStreamHandlers = {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean,
     meta?: { level?: string; title?: string; target?: string; summary?: string },
   ) => void
+  onGitStep?: (event: { name?: string; ok?: boolean; detail?: string }) => void
+  onGitResult?: (event: {
+    ok?: boolean
+    branch?: string
+    pr_url?: string
+    commit?: string
+    fix_url?: string
+    next?: string
+    steps?: { name?: string; ok?: boolean; detail?: string }[]
+    verified?: string[]
+  }) => void
 }
 
 export type EditLiveEvent = {
@@ -500,6 +511,14 @@ export const api = {
     update: (id: string, body: Record<string, unknown>) => request<import('../types').Repository>(`/repositories/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
     remove: (id: string) => request(`/repositories/${id}`, { method: 'DELETE' }),
     status: (id: string) => request<{ id: string; missing: boolean; status: string; branch: string; dirty: boolean }>(`/repositories/${id}/status`),
+    gitReadiness: (id: string) => request<{
+      ok: boolean
+      checks: { name: string; ok: boolean; detail: string }[]
+      message: string
+      fix_url: string
+      branch: string
+      default_branch: string
+    }>(`/repositories/${id}/git-readiness`),
     tree: (id: string) => request<import('../types').FileNode>(`/repositories/${id}/tree`),
     stage: (id: string, sessionId: string, path: string) => request<{ id: string; filename: string; kept_edits: boolean }>(`/repositories/${id}/stage`, { method: 'POST', body: JSON.stringify({ session_id: sessionId, path }) }),
   },
@@ -603,6 +622,8 @@ export const api = {
       onSteer?: (event: { type: string; id?: string; text?: string }) => void,
       onGitCli?: SmartStreamHandlers['onGitCli'],
       onGitApproval?: SmartStreamHandlers['onGitApproval'],
+      onGitStep?: SmartStreamHandlers['onGitStep'],
+      onGitResult?: SmartStreamHandlers['onGitResult'],
     ): SteerStream => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -612,6 +633,7 @@ export const api = {
           onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
           onCreditPaused, onPlan, onAwsCli, onAwsApproval, onPreviewCheck,
           onEditLive, onMcpApproval, onMcpCall, onSteer, onGitCli, onGitApproval,
+          onGitStep, onGitResult,
         } = onThinking)
       }
       const controller = attachSteer(new AbortController(), () => sendToServer)
@@ -681,6 +703,8 @@ export const api = {
               return true
             }, { level: chunk.level, title: chunk.title, target: chunk.target, summary: chunk.summary })
           }
+          else if (chunk.type === 'git_step') onGitStep?.(chunk)
+          else if (chunk.type === 'git_result') onGitResult?.(chunk)
           else if (chunk.type === 'aws_approval_needed') {
             onAwsApproval?.(chunk.command || '', (resp) => {
               if (!sendToServer) return false

@@ -156,6 +156,21 @@ def delete_repo(repo_id: str, request: Request):
     return remove_repository(_user_id(request), repo_id)
 
 
+@router.get("/{repo_id}/git-readiness")
+def repo_git_readiness(repo_id: str, request: Request):
+    _guard_local_only()
+    user_id = _user_id(request)
+    from services.repositories import get_owned
+    from services.git_cli import git_readiness
+    row = get_owned(user_id, repo_id, include_removed=True)
+    if not row:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    root = row.get("root_path") or ""
+    if not root or not os.path.isdir(root):
+        return {"ok": False, "checks": [], "message": "This folder is not on disk.", "fix_url": "", "branch": "", "default_branch": ""}
+    return git_readiness(root, user_id, row, "")
+
+
 @router.get("/{repo_id}/status")
 def repo_status(repo_id: str, request: Request):
     _guard_local_only()

@@ -109,6 +109,21 @@
   .section-label { @apply text-xs font-semibold uppercase tracking-widest text-faint px-3 py-2; }
 }
 
+/* ── Assistant prose ───────────────────────────────── */
+.assistant-prose { max-width: 68ch; }
+.assistant-prose-compact { max-width: none; }
+.assistant-prose.is-streaming > :last-child::after {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 1.05em;
+  margin-left: 3px;
+  border-radius: 1px;
+  background: rgb(var(--c-accent) / 0.85);
+  vertical-align: text-bottom;
+  animation: blink 1s step-end infinite;
+}
+
 /* ── Markdown ──────────────────────────────────────── */
 .markdown-body { line-height: 1.65; }
 .markdown-body p { margin: 0 0 10px 0; }
