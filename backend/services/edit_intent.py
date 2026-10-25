@@ -140,7 +140,7 @@ def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
                                 history_enabled=False, aws_guidance="",
                                 preview_enabled=False, preflight_enabled=False,
                                 websearch_enabled=False, mcp_guidance="",
-                                repo_guidance="", max_rounds=None):
+                                repo_guidance="", git_guidance="", max_rounds=None):
     """Suffix appended to the latest user turn for Claude and GPT.
 
     ``wants_edit`` True is the existing edit contract, unchanged.
@@ -161,6 +161,7 @@ def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
         repo=bool(repo_guidance),
         github=bool(github_enabled),
         web=bool(websearch_enabled),
+        git=bool(git_guidance),
         form="tag",
     )
     tools = (
@@ -186,6 +187,7 @@ def build_xml_agent_instruction(*, wants_edit, github_enabled=False,
         )
         + (mcp_guidance if mcp_guidance else "")
         + (repo_guidance if repo_guidance else "")
+        + (git_guidance or "")
     )
     if wants_edit:
         return (

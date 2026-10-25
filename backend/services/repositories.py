@@ -194,6 +194,7 @@ def _public(row: dict, user_id: str) -> dict:
         "github_repo": repo,
         "github_linked": bool(owner and repo),
         "default_branch": row.get("default_branch") or git.get("branch") or "",
+        "branch": git.get("branch") or "",
         "auto_apply": bool(row.get("auto_apply")),
         "last_opened_at": row.get("last_opened_at"),
         "created_at": row.get("created_at"),

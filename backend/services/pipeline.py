@@ -4433,6 +4433,7 @@ def _ask_plan_build_tool_instructions(
     mcp_guidance: str = "",
     working_branch=None,
     repo_enabled: bool = False,
+    git_enabled: bool = False,
 ) -> str:
     """
     Composes the Ask/Plan tool-instructions system-prompt block from
@@ -4491,6 +4492,10 @@ def _ask_plan_build_tool_instructions(
         from services.aws_cli import aws_agent_guidance
         tag_blocks.append(aws_agent_guidance())
 
+    if git_enabled:
+        from services.agent_tool_spec import git_cli_text as _git_cli_text
+        tag_blocks.append(_git_cli_text("tag"))
+
     if websearch_enabled:
         tag_blocks.append(
             '<web_search_request>{"query": "what to look up", "reason": "why"}'
@@ -4510,7 +4515,7 @@ def _ask_plan_build_tool_instructions(
     from services.agent_tool_spec import scope_block as _scope_block
     _scope = _scope_block(
         session_files=has_files, repo=repo_enabled, github=gh_enabled,
-        web=websearch_enabled, form="tag",
+        web=websearch_enabled, git=git_enabled, form="tag",
     )
     if _scope:
         parts.append(_scope)
@@ -4537,6 +4542,7 @@ def _ask_plan_strip_tool_tags(text: str) -> str:
     text = re.sub(r'<github_request>.*?</github_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<history_request>.*?</history_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<aws_cli>.*?</aws_cli>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<git_cli>.*?</git_cli>', '', text, flags=re.DOTALL)
     text = re.sub(r'<web_search_request>.*?</web_search_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<mcp_request>.*?</mcp_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<repo_request>.*?</repo_request>', '', text, flags=re.DOTALL)
@@ -4705,6 +4711,8 @@ def _ask_plan_execute_tool_round(
                   tool_round=tool_round, tool=(parsed.get("tool") if isinstance(parsed, dict) else ""))
     # AWS is not run here. Ask/Plan loops call resolve_aws_call, which
     # applies the read-only gate, the three-command stop, and file capture.
+    # Git is not run here. Ask/Plan loops call resolve_git_call, which
+    # applies the read-only gate and the three-command stop.
     return tool_parts
 
 
@@ -4874,6 +4882,15 @@ async def run_chat_stream(
             _dlog("ask_plan_repo_gate_error", session_id=session_id, user_id=user_id,
                   error=str(_repo_gate_err)[:200])
     _repo_tools = _repo_ctx is not None
+    _git_tools = False
+    if _repo_tools:
+        try:
+            from services.git_cli import git_agent_tools_enabled as _git_on
+            _git_tools = bool(_git_on())
+        except Exception as _git_gate_err:
+            _git_tools = False
+            _dlog("ask_plan_git_gate_error", session_id=session_id, user_id=user_id,
+                  error=str(_git_gate_err)[:200])
     _ask_plan_tools_enabled = (
         (_ask_plan_has_files or _gh_nat_enabled or _aws_connected
          or _oa_search_enabled or _ask_plan_mcp or _repo_tools)
@@ -4965,7 +4982,8 @@ async def run_chat_stream(
             aws_enabled=_aws_connected, websearch_enabled=_ask_plan_websearch,
             mcp_guidance=_ask_plan_mcp_guidance,
             working_branch=_gh_session_target,
-            repo_enabled=_repo_tools))
+            repo_enabled=_repo_tools,
+            git_enabled=_git_tools))
         _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
               model=chat_model, num_files=len(file_content_lookup),
               github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
@@ -5075,6 +5093,7 @@ async def run_chat_stream(
                 websearch_enabled=_oa_search_enabled,
                 mcp_enabled=_ask_plan_mcp,
                 repo_enabled=_repo_tools,
+                git_enabled=_git_tools,
                 openai_client=_oa_search_client,
                 web_search_sources=_web_search_sources_final,
                 client_inbox=client_inbox,
@@ -5101,6 +5120,7 @@ async def run_chat_stream(
             _oai_msgs = list(all_messages)
             _tool_round = 0
             _aws_calls = 0
+            _git_calls = 0
             _mcp_calls = 0
             _oa_budget = None
             if _ask_plan_websearch:
@@ -5151,6 +5171,10 @@ async def run_chat_stream(
                     re.search(r'<aws_cli>\s*(.*?)\s*</aws_cli>', _round_text, re.DOTALL)
                     if _aws_connected else None
                 )
+                _git_match = (
+                    re.search(r'<git_cli>\s*(.*?)\s*</git_cli>', _round_text, re.DOTALL)
+                    if _git_tools else None
+                )
                 _wr_match = (
                     re.search(
                         r'<web_search_request>\s*(.*?)\s*</web_search_request>',
@@ -5167,13 +5191,13 @@ async def run_chat_stream(
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
                 _ask_plan_no_more_tools = (
                     not _sr_match and not _fr_match and not _gr_match and not _rr_match
-                    and not _hr_match and not _aws_match and not _wr_match
+                    and not _hr_match and not _aws_match and not _git_match and not _wr_match
                     and not _mcp_match
                 )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _wr_match or _mcp_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _git_match or _wr_match or _mcp_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5189,7 +5213,26 @@ async def run_chat_stream(
                     break
 
                 _tool_parts = None
-                if _aws_match:
+                if _git_match:
+                    from services.git_cli import resolve_git_call as _resolve_git
+                    _git_done = {"note": "", "counted": False, "run": False}
+                    async for _git_ev in _resolve_git(
+                        (_git_match.group(1) or "").strip(),
+                        mode or "ask",
+                        _git_calls,
+                        client_inbox,
+                        user_id=user_id,
+                        dlog=_dlog,
+                        session_id=session_id or "",
+                    ):
+                        if _git_ev.get("type") == "git_done":
+                            _git_done = _git_ev
+                        else:
+                            yield sse(_git_ev)
+                    if _git_done.get("counted"):
+                        _git_calls += 1
+                    _tool_parts = [_git_done.get("note") or ""]
+                elif _aws_match:
                     from services.aws_cli import resolve_aws_call as _resolve_aws, split_intent as _split_aws_intent
                     _aws_intent, _proposed = _split_aws_intent((_aws_match.group(1) or "").strip())
                     _aws_done = {"note": "", "counted": False, "run": False}
@@ -5433,6 +5476,7 @@ async def run_chat_stream(
 
             _tool_round = 0
             _aws_calls = 0
+            _git_calls = 0
             _mcp_calls = 0
             if steer_inbox is not None:
                 yield sse({"type": "steer_ready"})
@@ -5519,6 +5563,10 @@ async def run_chat_stream(
                     re.search(r'<aws_cli>\s*(.*?)\s*</aws_cli>', _round_text, re.DOTALL)
                     if _aws_connected else None
                 )
+                _git_match = (
+                    re.search(r'<git_cli>\s*(.*?)\s*</git_cli>', _round_text, re.DOTALL)
+                    if _git_tools else None
+                )
                 _mcp_match = (
                     re.search(
                         r'<mcp_request>\s*(.*?)\s*</mcp_request>',
@@ -5529,12 +5577,12 @@ async def run_chat_stream(
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
                 _ask_plan_no_more_tools = (
                     not _sr_match and not _fr_match and not _gr_match and not _rr_match
-                    and not _hr_match and not _aws_match and not _mcp_match
+                    and not _hr_match and not _aws_match and not _git_match and not _mcp_match
                 )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _mcp_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _git_match or _mcp_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5550,7 +5598,26 @@ async def run_chat_stream(
                     break
 
                 _tool_parts = None
-                if _aws_match:
+                if _git_match:
+                    from services.git_cli import resolve_git_call as _resolve_git
+                    _git_done = {"note": "", "counted": False, "run": False}
+                    async for _git_ev in _resolve_git(
+                        (_git_match.group(1) or "").strip(),
+                        mode or "ask",
+                        _git_calls,
+                        client_inbox,
+                        user_id=user_id,
+                        dlog=_dlog,
+                        session_id=session_id or "",
+                    ):
+                        if _git_ev.get("type") == "git_done":
+                            _git_done = _git_ev
+                        else:
+                            yield sse(_git_ev)
+                    if _git_done.get("counted"):
+                        _git_calls += 1
+                    _tool_parts = [_git_done.get("note") or ""]
+                elif _aws_match:
                     from services.aws_cli import resolve_aws_call as _resolve_aws, split_intent as _split_aws_intent
                     _aws_intent, _proposed = _split_aws_intent((_aws_match.group(1) or "").strip())
                     _aws_done = {"note": "", "counted": False, "run": False}
@@ -18369,6 +18436,25 @@ async def run_natural_pipeline_stream(
             _dlog("natural_repo_setup_error", session_id=session_id, user_id=user_id,
                   error=str(_repo_nat_err)[:200])
 
+        _git_tools = False
+        _git_guidance = ""
+        if _repo_ctx and not str(arch_model or "").startswith("ollama:"):
+            try:
+                from services.git_cli import git_agent_tools_enabled as _git_on
+                from services.agent_tool_spec import git_cli_text as _git_cli_text
+                _git_tools = bool(_git_on())
+                if _git_tools:
+                    TAG_DEFS["git"] = {"open": "<git_cli>", "close": "</git_cli>"}
+                    if not _is_grok_model(arch_model):
+                        _git_guidance = "\n" + _git_cli_text("tag") + "\n"
+                    _dlog("natural_git_tag_registered", session_id=session_id, user_id=user_id,
+                          repo=(_repo_ctx or {}).get("name"))
+            except Exception as _git_nat_err:
+                _git_tools = False
+                _git_guidance = ""
+                _dlog("natural_git_setup_error", session_id=session_id, user_id=user_id,
+                      error=str(_git_nat_err)[:200])
+
         _aws_connected = False
         try:
             from services.aws_cli import aws_connected as _aws_connected_fn
@@ -18518,6 +18604,7 @@ async def run_natural_pipeline_stream(
                     websearch_enabled=_oa_search_enabled,
                     mcp_enabled=_natural_mcp,
                     repo_enabled=bool(_repo_ctx),
+                    git_enabled=_git_tools,
                     dlog=_dlog, session_id=session_id, user_id=user_id)
                 _gpt_system_text += _grok_sys_suffix
                 _dlog("natural_grok_system_suffix_appended",
@@ -18855,7 +18942,7 @@ async def run_natural_pipeline_stream(
         # freely use every stop tag. GPT's API only accepts the first four
         # (_agent_stop_seqs[:4] below). "preview" is last, so GPT captures it
         # in the stream parser instead of via a stop sequence, same as aws.
-        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "preview", "repo"]
+        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "git", "preview", "repo"]
         _agent_stop_seqs = (
             [TAG_DEFS[t]["close"] for t in _stop_tag_order if t in TAG_DEFS]
             if _tag_stop_enabled else []
@@ -18880,6 +18967,8 @@ async def run_natural_pipeline_stream(
                 return ("history", _hd if _hd is not None else {"_invalid": _block[:500]})
             if _kind == "aws":
                 return ("aws", (_block or "").strip())
+            if _kind == "git":
+                return ("git", (_block or "").strip())
             if _kind == "preview":
                 return ("preview", (_block or "").strip())
             if _kind == "websearch":
@@ -18918,6 +19007,7 @@ async def run_natural_pipeline_stream(
             repo_guidance=(
                 _repo_text_fn("tag", _repo_ctx) + "\n" if _repo_ctx else ""
             ),
+            git_guidance=_git_guidance,
         )
 
         # ── Grok-only: native-tool agent instruction (Claude/GPT keep the
@@ -19309,7 +19399,7 @@ async def run_natural_pipeline_stream(
                                                 # starts with JSON ('[' or '{'). An AWS command
                                                 # starts with "aws" or "intent". context_tag_looks_real
                                                 # is that check. Anything else is prose.
-                                                if (_tag_name in ("search", "filereq", "github", "history", "aws", "mcp")
+                                                if (_tag_name in ("search", "filereq", "github", "history", "aws", "git", "mcp")
                                                         and not _ctx_shape_checked):
                                                     _ctx_stripped = tag_buf.lstrip()
                                                     if _ctx_stripped:
@@ -19345,7 +19435,7 @@ async def run_natural_pipeline_stream(
                                                 if _pd is not None:
                                                     edit_plan_data = _pd
                                                 _break_stream = True
-                                            elif _tag_name in ("search", "filereq", "github", "history", "aws", "mcp"):
+                                            elif _tag_name in ("search", "filereq", "github", "history", "aws", "git", "mcp"):
                                                 pending_tool = _capture_request(_tag_name, _content)
                                                 _break_stream = True
 
@@ -19519,6 +19609,7 @@ async def run_natural_pipeline_stream(
                         websearch_enabled=_oa_search_enabled,
                         mcp_enabled=_natural_mcp,
                         repo_enabled=bool(_repo_ctx),
+                        git_enabled=_git_tools,
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
                     # Plan-first gate decides tool_choice: forced write_edit_plan
@@ -19702,7 +19793,7 @@ async def run_natural_pipeline_stream(
                                             # Claude branch above — same proven bug, session
                                             # 71737af0: a model quoting its own tag syntax in
                                             # prose must not trap the rest of its real text). ──
-                                            if (_tag_name in ("search", "filereq", "github", "history", "aws", "websearch", "mcp")
+                                            if (_tag_name in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp")
                                                     and not _ctx_shape_checked):
                                                 _ctx_stripped = tag_buf.lstrip()
                                                 if _ctx_stripped:
@@ -19737,7 +19828,7 @@ async def run_natural_pipeline_stream(
                                             if _pd is not None:
                                                 edit_plan_data = _pd
                                             _break_stream = True
-                                        elif _tag_name in ("search", "filereq", "github", "history", "aws", "websearch", "mcp"):
+                                        elif _tag_name in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp"):
                                             pending_tool = _capture_request(_tag_name, _content)
                                             _break_stream = True
                                         state = "normal"
@@ -19803,7 +19894,7 @@ async def run_natural_pipeline_stream(
             # ── Recover a context-request tag the stop_sequence halted before closing ──
             if pending_tool is None and state.startswith("in_"):
                 _uc = state[3:]
-                if _uc in ("search", "filereq", "github", "history", "aws", "websearch", "mcp"):
+                if _uc in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp"):
                     _ucm = re.search(
                         re.escape(TAG_DEFS[_uc]["open"]) + r"(.*)",
                         full_response, re.DOTALL)
@@ -20750,6 +20841,34 @@ async def run_natural_pipeline_stream(
                     ]
                     continue
 
+                if _kind == "git":
+                    from services.git_cli import resolve_git_call as _resolve_git
+                    _git_body = _data if isinstance(_data, str) else str(_data or "")
+                    _git_mode = "agent" if is_agent_task else "edit"
+                    _git_done = {"note": "", "run": False}
+                    async for _git_ev in _resolve_git(
+                        _git_body, _git_mode, 0, client_inbox,
+                        user_id=user_id, dlog=_dlog, session_id=session_id or "",
+                    ):
+                        if _git_ev.get("type") == "git_done":
+                            _git_done = _git_ev
+                        else:
+                            yield sse(_git_ev)
+                    _git_note = _git_done.get("note") or ""
+                    if not _git_done.get("run"):
+                        if _git_note == "The user rejected this command.":
+                            _git_note += " Do not run it again unless they ask."
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content": _git_note},
+                        ]
+                        continue
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": _assistant_echo},
+                        {"role": "user", "content": _git_note + "\nContinue the task."},
+                    ]
+                    continue
+
                 if _kind == "aws":
                     from services.aws_cli import resolve_aws_call as _resolve_aws, split_intent as _split_aws_intent
                     _aws_body = _data if isinstance(_data, str) else str(_data or "")
@@ -21464,7 +21583,7 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id,
                           plan_items=len(edit_plan_data) if edit_plan_data else 0)
 
-            elif state.startswith("in_") and state[3:] in ("search", "filereq", "github", "history", "aws", "websearch", "mcp"):
+            elif state.startswith("in_") and state[3:] in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp"):
                 # ── Safety net for a stuck context-request tag ──────────────
                 # PROVEN BUG (session 71737af0): unlike in_edit/in_file/in_plan
                 # above, this branch had NO recovery/surface path at all before

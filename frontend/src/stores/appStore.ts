@@ -132,6 +132,28 @@ interface AppState {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
   } | null
   setAwsApproval: (value: AppState['awsApproval']) => void
+  gitTerminalLines: {
+    sessionId: string
+    command: string
+    stdout: string
+    stderr: string
+    exit_code: number
+    level?: string
+    title?: string
+    target?: string
+    summary?: string
+  }[]
+  pushGitTerminalLine: (line: AppState['gitTerminalLines'][number]) => void
+  gitApproval: {
+    sessionId: string
+    command: string
+    level?: string
+    title?: string
+    target?: string
+    summary?: string
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
+  } | null
+  setGitApproval: (value: AppState['gitApproval']) => void
   mcpApproval: {
     sessionId: string
     server: string
@@ -382,6 +404,12 @@ export const useAppStore = create<AppState>((set) => ({
   })),
   awsApproval: null,
   setAwsApproval: (awsApproval) => set({ awsApproval }),
+  gitTerminalLines: [],
+  pushGitTerminalLine: (line) => set((s) => ({
+    gitTerminalLines: [...s.gitTerminalLines, line].slice(-40),
+  })),
+  gitApproval: null,
+  setGitApproval: (gitApproval) => set({ gitApproval }),
   mcpApproval: null,
   setMcpApproval: (mcpApproval) => set({ mcpApproval }),
   mcpCalls: [],

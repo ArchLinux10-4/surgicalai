@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Use this to get the latest code from GitHub and then rebuild Docker.
+# Pulls origin main, then runs docker-rebuild-local.sh.
+# Stops if you are not on main, or if you have uncommitted changes.
 set -euo pipefail
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -16,4 +19,4 @@ branch="$(git rev-parse --abbrev-ref HEAD)"
 git fetch origin
 git pull --ff-only origin main
 echo "Rebuilding. Accounts, keys, and settings stay in the Docker volume."
-./docker-up.sh
+./docker-rebuild-local.sh

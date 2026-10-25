@@ -19,6 +19,7 @@ import type { SteerQueueItem } from '../stores/appStore'
 
 const NO_PASTED: PastedBlock[] = []
 const NO_QUEUE: SteerQueueItem[] = []
+import { refreshRepoBranch } from './GitTerminalDock'
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker } from './PlanTracker'
 import { PlanPane } from './PlanPane'
@@ -2489,6 +2490,31 @@ export function ChatPanel() {
       },
       (event) => {
         useAppStore.getState().applySteerFrame(sessionId, event)
+      },
+      (event) => {
+        useAppStore.getState().pushGitTerminalLine({
+          sessionId,
+          command: event?.command || 'git',
+          stdout: event?.stdout || '',
+          stderr: event?.stderr || '',
+          exit_code: event?.exit_code ?? 1,
+          level: event?.level,
+          title: event?.title,
+          target: event?.target,
+          summary: event?.summary,
+        })
+        refreshRepoBranch(sessionId)
+      },
+      (command, reply, meta) => {
+        useAppStore.getState().setGitApproval({
+          sessionId,
+          command,
+          reply,
+          level: meta?.level,
+          title: meta?.title,
+          target: meta?.target,
+          summary: meta?.summary,
+        })
       },
     )
     abortMapRef.current.set(sessionId, ctrl)

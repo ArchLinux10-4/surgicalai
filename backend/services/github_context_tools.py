@@ -867,6 +867,16 @@ def _find_client_for_repo(user_id: str, owner: str, repo: str, dlog: Callable):
     )
 
 
+def default_branch_push_block(branch: str, default_branch: str) -> str:
+    """Refuse a push that would commit straight onto the default branch."""
+    if (branch or "").strip() and (branch or "").strip() == (default_branch or "").strip():
+        return (
+            "Pushing to the default branch is blocked. "
+            "Use git_cli: create a branch, commit, push it, then gh pr create."
+        )
+    return ""
+
+
 def execute_github_context_tool(
     tool_name: str,
     tool_input: Dict,
@@ -1239,6 +1249,10 @@ def execute_github_context_tool(
 
             # Resolve the target branch; create it from the default branch if missing.
             default_branch = r.default_branch
+            _blocked_default = default_branch_push_block(branch, default_branch)
+            if _blocked_default:
+                _log("github_context_push_files_default_branch_blocked", branch=branch)
+                return _blocked_default
             try:
                 ref = r.get_git_ref(f"heads/{branch}")
                 _log("github_context_push_files_branch_exists", branch=branch, head_sha=ref.object.sha)

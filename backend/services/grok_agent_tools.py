@@ -107,6 +107,7 @@ TOOL_REQUEST_FILE = "request_file"
 TOOL_REQUEST_SEARCH = "request_search"
 TOOL_REQUEST_GITHUB = "request_github"
 TOOL_AWS_CLI = "aws_cli"
+TOOL_GIT_CLI = "git_cli"
 TOOL_REQUEST_HISTORY = "request_history"
 TOOL_REQUEST_PREVIEW = "request_preview"
 TOOL_REQUEST_WEB_SEARCH = "request_web_search"
@@ -377,6 +378,29 @@ def _schema_report_blocked():
     }
 
 
+def _schema_git_cli():
+    return {
+        "type": "function",
+        "function": {
+            "name": TOOL_GIT_CLI,
+            "description": (
+                "Run one git or gh command on the open folder. Follow the git rules in the system prompt.\n"
+                "command starts with git or gh."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Full command, starting with git or gh.",
+                    },
+                },
+                "required": ["command"],
+            },
+        },
+    }
+
+
 def _schema_aws_cli():
     return {
         "type": "function",
@@ -550,7 +574,7 @@ def _schema_request_repo():
 def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=False,
                            aws_enabled=False, preview_enabled=False,
                            websearch_enabled=False, mcp_enabled=False,
-                           repo_enabled=False, dlog=None,
+                           repo_enabled=False, git_enabled=False, dlog=None,
                            session_id="", user_id=""):
     """Return the OpenAI-style tool schemas Grok should be offered for ``mode``.
 
@@ -582,6 +606,8 @@ def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=Fa
         tools.append(_schema_request_history())
     if aws_enabled:
         tools.append(_schema_aws_cli())
+    if git_enabled:
+        tools.append(_schema_git_cli())
     if preview_enabled and m in _EDIT_MODES:
         tools.append(_schema_request_preview())
     if websearch_enabled:
@@ -617,6 +643,7 @@ TOOL_PROGRESS_LABELS = {
     TOOL_REQUEST_WEB_SEARCH: "Searching the web…",
     TOOL_REQUEST_MCP: "Calling MCP…",
     TOOL_REQUEST_REPO: "Reading the repository…",
+    TOOL_GIT_CLI: "Running git…",
     TOOL_REPORT_BLOCKED: "Reporting blocked…",
 }
 
@@ -961,6 +988,19 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
                  user_id=user_id, tool_call_id=cid,
                  reason_preview=res.blocked_reason[:200])
 
+        elif name == TOOL_GIT_CLI:
+            # Do not run yet. resolve_git_call decides auto-run, refusal, or a card.
+            _git_cmd = str(args.get("command") or "").strip()
+            if res.context_request is None:
+                res.context_request = ("git", _git_cmd)
+                res.context_call_id = cid
+            else:
+                fb = "Only one git command is handled per turn."
+                res.errors.append((cid, fb))
+                res.results_by_id[cid] = fb
+            _log(dlog, "grok_translate_git_cli", session_id=session_id,
+                 user_id=user_id, tool_call_id=cid, command=_git_cmd[:180])
+
         elif name == TOOL_AWS_CLI:
             # Do not run yet. resolve_aws_call decides auto-run, refusal, or a card.
             _aws_cmd = str(args.get("command") or "").strip()
@@ -1225,7 +1265,8 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
                              dlog=None, session_id="", user_id="",
                              wants_edit=True, preview_enabled=False,
                              preflight_enabled=False, websearch_enabled=False,
-                             mcp_enabled=False, repo_enabled=False):
+                             mcp_enabled=False, repo_enabled=False,
+                             git_enabled=False):
     """Function-tool contract for Grok. No XML tag names, and no instruction to ignore them.
 
     The main system text Grok receives is the tag-free head plus the code-quality
@@ -1238,7 +1279,7 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     ]
     scope = _scope_block(
         session_files=True, repo=bool(repo_enabled), github=bool(github_enabled),
-        web=bool(websearch_enabled), form="function",
+        web=bool(websearch_enabled), git=bool(git_enabled), form="function",
     )
     if scope:
         lines.append(scope)
@@ -1269,6 +1310,9 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     if aws_enabled:
         from services.aws_cli import aws_agent_guidance
         lines.append("• aws_cli — " + aws_agent_guidance())
+    if git_enabled:
+        from services.agent_tool_spec import git_cli_text
+        lines.append("• git_cli — " + git_cli_text("function"))
     if preview_enabled and m in _EDIT_MODES:
         lines.append(
             "• request_preview — render a pending .tsx/.jsx edit and read "

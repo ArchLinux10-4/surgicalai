@@ -465,6 +465,8 @@ def context_tag_looks_real(tag_name: str, body: str) -> bool:
         return True
     if tag_name == "aws":
         return stripped[0] in "aAiI"
+    if tag_name == "git":
+        return stripped[0] in "gG"
     return stripped[0] in "[{"
 
 

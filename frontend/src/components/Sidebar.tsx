@@ -244,7 +244,7 @@ function SessionGroups({
                 <span className="text-[10px] text-faint">{closed ? '▸' : '▾'}</span>
                 <FolderOpen sx={{ fontSize: 13 }} className={repo.missing ? 'text-danger' : 'text-muted'} />
                 <span className="truncate text-[12px] font-semibold text-ink">{repo.name}</span>
-                {repo.default_branch && <span className="truncate text-[10px] text-faint">{repo.default_branch}</span>}
+                {(repo.branch || repo.default_branch) && <span className="truncate text-[10px] text-faint">{repo.branch || repo.default_branch}</span>}
                 {repo.github_linked && <GitHub sx={{ fontSize: 11 }} className="text-muted" />}
                 {repo.missing && <span className="text-[10px] text-danger">Missing</span>}
               </button>

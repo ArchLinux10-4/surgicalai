@@ -46,6 +46,7 @@ export interface Repository {
   github_repo: string
   github_linked: boolean
   default_branch: string
+  branch?: string
   auto_apply: boolean
   last_opened_at?: string | null
   created_at?: string | null

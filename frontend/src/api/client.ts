@@ -63,6 +63,21 @@ export type SmartStreamHandlers = {
   ) => void
   onMcpCall?: (event: { server?: string; tool?: string; ok?: boolean; error?: string; text?: string }) => void
   onSteer?: (event: { type: string; id?: string; text?: string }) => void
+  onGitCli?: (event: {
+    command?: string
+    stdout?: string
+    stderr?: string
+    exit_code?: number
+    level?: string
+    title?: string
+    target?: string
+    summary?: string
+  }) => void
+  onGitApproval?: (
+    command: string,
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean,
+    meta?: { level?: string; title?: string; target?: string; summary?: string },
+  ) => void
 }
 
 export type EditLiveEvent = {
@@ -480,10 +495,11 @@ export const api = {
     list: (includeRemoved = false) => request<import('../types').Repository[]>(`/repositories${includeRemoved ? '?include_removed=true' : ''}`),
     preview: (path: string) => request<import('../types').RepoPreview>(`/repositories/preview?path=${encodeURIComponent(path)}`),
     browseFs: (path: string) => request<{ path: string; parent: string; entries: { name: string; path: string }[] }>(`/repositories/fs?path=${encodeURIComponent(path)}`),
-    browseNative: () => request<{ path: string }>('/repositories/browse', { method: 'POST' }),
+    browseNative: (path?: string) => request<{ path: string }>('/repositories/browse', { method: 'POST', body: JSON.stringify({ path: path || '' }) }),
     open: (path: string, name?: string) => request<import('../types').Repository>('/repositories/open', { method: 'POST', body: JSON.stringify({ path, name }) }),
     update: (id: string, body: Record<string, unknown>) => request<import('../types').Repository>(`/repositories/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
     remove: (id: string) => request(`/repositories/${id}`, { method: 'DELETE' }),
+    status: (id: string) => request<{ id: string; missing: boolean; status: string; branch: string; dirty: boolean }>(`/repositories/${id}/status`),
     tree: (id: string) => request<import('../types').FileNode>(`/repositories/${id}/tree`),
     stage: (id: string, sessionId: string, path: string) => request<{ id: string; filename: string; kept_edits: boolean }>(`/repositories/${id}/stage`, { method: 'POST', body: JSON.stringify({ session_id: sessionId, path }) }),
   },
@@ -585,6 +601,8 @@ export const api = {
       onMcpApproval?: SmartStreamHandlers['onMcpApproval'],
       onMcpCall?: SmartStreamHandlers['onMcpCall'],
       onSteer?: (event: { type: string; id?: string; text?: string }) => void,
+      onGitCli?: SmartStreamHandlers['onGitCli'],
+      onGitApproval?: SmartStreamHandlers['onGitApproval'],
     ): SteerStream => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -593,7 +611,7 @@ export const api = {
           onThinking, onCompacting, onEditStart, onEditEnd, onTask,
           onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
           onCreditPaused, onPlan, onAwsCli, onAwsApproval, onPreviewCheck,
-          onEditLive, onMcpApproval, onMcpCall, onSteer,
+          onEditLive, onMcpApproval, onMcpCall, onSteer, onGitCli, onGitApproval,
         } = onThinking)
       }
       const controller = attachSteer(new AbortController(), () => sendToServer)
@@ -655,6 +673,14 @@ export const api = {
             )
           }
           else if (chunk.type === 'aws_cli') onAwsCli?.(chunk)
+          else if (chunk.type === 'git_cli') onGitCli?.(chunk)
+          else if (chunk.type === 'git_approval_needed') {
+            onGitApproval?.(chunk.command || '', (resp) => {
+              if (!sendToServer) return false
+              sendToServer({ type: 'git_cli_response', ...resp })
+              return true
+            }, { level: chunk.level, title: chunk.title, target: chunk.target, summary: chunk.summary })
+          }
           else if (chunk.type === 'aws_approval_needed') {
             onAwsApproval?.(chunk.command || '', (resp) => {
               if (!sendToServer) return false

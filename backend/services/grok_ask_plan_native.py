@@ -217,6 +217,7 @@ async def run_grok_ask_plan_native_stream(
     websearch_enabled: bool = False,
     mcp_enabled: bool = False,
     repo_enabled: bool = False,
+    git_enabled: bool = False,
     openai_client=None,
     web_search_sources: Optional[list] = None,
     client_inbox=None,
@@ -245,6 +246,7 @@ async def run_grok_ask_plan_native_stream(
         mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
         aws_enabled=aws_enabled, websearch_enabled=websearch_enabled,
         mcp_enabled=mcp_enabled, repo_enabled=repo_enabled,
+        git_enabled=git_enabled,
         dlog=dlog, session_id=session_id, user_id=user_id,
     )
 
@@ -259,6 +261,7 @@ async def run_grok_ask_plan_native_stream(
                 mode=mode, github_enabled=gh_nat_enabled, history_enabled=history_enabled,
                 aws_enabled=aws_enabled, websearch_enabled=websearch_enabled,
                 mcp_enabled=mcp_enabled, repo_enabled=repo_enabled,
+                git_enabled=git_enabled,
                 dlog=dlog, session_id=session_id, user_id=user_id,
             )
             messages[i] = {**m, "content": (m.get("content") or "") + suffix}
@@ -285,6 +288,7 @@ async def run_grok_ask_plan_native_stream(
 
     tool_round = 0
     _aws_calls = 0
+    _git_calls = 0
     _mcp_calls = 0
     _promise_nudged = False
     if steer_inbox is not None:
@@ -497,6 +501,20 @@ async def run_grok_ask_plan_native_stream(
                 if _mcp_done.get("counted"):
                     _mcp_calls += 1
                 context_result = _mcp_done.get("note") or ""
+            elif tag_kind == "git":
+                from services.git_cli import resolve_git_call
+                _git_done = {"note": "", "counted": False, "run": False}
+                async for _git_ev in resolve_git_call(
+                    str(body or "").strip(), mode, _git_calls, client_inbox,
+                    user_id=user_id, dlog=dlog, session_id=session_id or "",
+                ):
+                    if _git_ev.get("type") == "git_done":
+                        _git_done = _git_ev
+                    else:
+                        yield _sse(_git_ev)
+                if _git_done.get("counted"):
+                    _git_calls += 1
+                context_result = _git_done.get("note") or ""
             elif tag_kind == "aws":
                 from services.aws_cli import resolve_aws_call, split_intent
                 _aws_intent, _aws_cmd = split_intent(str(body))

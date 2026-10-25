@@ -68,10 +68,26 @@ export function OpenFolderModal() {
   const browseNative = async () => {
     setBrowsing(true)
     try {
-      const res = await api.repositories.browseNative()
-      if (res.path) choose(res.path)
+      const res = await api.repositories.browseNative(path.trim())
+      if (res.path) {
+        const same = res.path === path.trim()
+        choose(res.path)
+        // choose() clears the preview. If the picked path is already in the
+        // field, the path effect does not run again, so load the preview here.
+        if (same) {
+          const picked = res.path
+          api.repositories.preview(picked)
+            .then((previewRes) => { setPreview(previewRes); setPreviewError('') })
+            .catch((err: any) => { setPreview(null); setPreviewError(err.message || 'Folder not found') })
+        }
+      }
     } catch (e: any) {
-      toast.error('Folder picker unavailable', e.message)
+      if (e?.status === 501) {
+        toast.info('Use the folder list', e.message || 'Run ./docker-rebuild-local.sh on macOS to install the folder helper, or type the path.')
+        loadFs(path.trim() || '')
+      } else {
+        toast.error('Folder picker unavailable', e.message)
+      }
     } finally {
       setBrowsing(false)
     }
@@ -130,6 +146,7 @@ export function OpenFolderModal() {
                 {browsing ? 'Opening…' : 'Browse'}
               </button>
             </div>
+            {browsing && <p className="mt-1 text-[11px] text-muted">Finder is opening so you can choose a folder. If you don't see it, click Finder in the Dock.</p>}
             {previewError && <p className="mt-1 text-[11px] text-danger">{previewError}</p>}
             {preview && (
               <div className="mt-2 rounded-lg border border-border bg-base/40 px-3 py-2 text-[12px]">

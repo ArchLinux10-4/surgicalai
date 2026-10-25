@@ -110,6 +110,7 @@ export function SettingsModal() {
     // per-message "Research" checkbox in the chat composer, so this toggle
     // is scoped to "on by default for Ask/Plan" only.
     web_search_enabled: false,
+    git_agent_tools: false,
   })
 
   const { theme, setTheme } = useThemeStore()
@@ -129,6 +130,7 @@ export function SettingsModal() {
         ollama_base_url: (settings as any).ollama_base_url || 'http://localhost:11434',
         ollama_model: (settings as any).ollama_model || 'qwen2.5-coder:7b',
         web_search_enabled: (settings as any).web_search_enabled || false,
+        git_agent_tools: (settings as any).git_agent_tools || false,
       })
     }
     refreshModels()
@@ -286,7 +288,11 @@ export function SettingsModal() {
         toast.success('Folder selected', res.path)
       }
     } catch (e: any) {
-      toast.error('Could not open folder picker', e.message || 'Please type the path manually')
+      if (e?.status === 501) {
+        toast.info('Folder picker unavailable', e.message || 'Run ./docker-rebuild-local.sh on macOS to install the folder helper, or type the path.')
+      } else {
+        toast.error('Could not open folder picker', e.message || 'Please type the path manually')
+      }
     } finally {
       setBrowsingDir(false)
     }
@@ -639,6 +645,25 @@ export function SettingsModal() {
                 {/* Confidence Threshold slider hidden — not wired to pipeline (uses hardcoded 8/10 gate) */}
 
                 <div className="mt-6 pt-5 border-t border-border">
+                  <SectionHeader title="Git" subtitle="Let the agent branch, commit, push, and open pull requests on the open folder" />
+                  <label className="flex items-start gap-3 cursor-pointer group mt-3">
+                    <input
+                      type="checkbox"
+                      checked={form.git_agent_tools}
+                      onChange={(e) => upd('git_agent_tools')(e.target.checked)}
+                      className="mt-0.5 accent-accent"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-ink">Let the agent run git</div>
+                      <div className="text-xs text-muted mt-0.5">
+                        Reads and local commits on a branch run immediately. Push, opening a pull request,
+                        and merging ask you first. Commands that delete work are refused.
+                      </div>
+                    </div>
+                  </label>
+                </div>
+
+                <div className="mt-6 pt-5 border-t border-border">
                   <SectionHeader title="Web Search" subtitle="Claude looks things up live before answering — real-time facts, cited sources" />
                   <label className="flex items-start gap-3 cursor-pointer group mt-3">
                     <input
@@ -739,7 +764,7 @@ export function SettingsModal() {
                       </div>
                       <div className="text-[11px] text-faint mt-1">Opens automatically when the app starts</div>
                       <div className="text-[11px] text-faint mt-1">
-                        "Browse…" opens a native folder picker on the machine running SurgicalAI's backend — only works when running locally with a display available.
+                        Browse opens a Finder folder dialog. In Docker it uses the macOS folder helper installed by ./docker-rebuild-local.sh. If that isn't running, type the path.
                       </div>
                     </Field>
                   </>

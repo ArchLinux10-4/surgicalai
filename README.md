@@ -151,6 +151,12 @@ surgicalai/
 
 ---
 
+## Git from chat
+
+With an open folder and GitHub connected, the agent can run git on that folder. The classifier and runner are `backend/services/git_cli.py`. Turn it on with `GIT_AGENT_TOOLS=true` or Settings → Git. Reads and commits on a branch other than the default run on their own. Push, opening a pull request, and merging wait for an approval card. `reset --hard`, force push, and rebase are refused.
+
+The GitHub App installation token is passed only in the environment of that git command. It is not written to `.git/config`. Repo hooks still run. On a Linux Docker host, files created in a bind-mounted folder are owned by the container user. Docker Desktop on macOS maps that back to your user.
+
 ## Troubleshooting
 
 **Backend won't start:**

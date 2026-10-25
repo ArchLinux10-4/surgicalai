@@ -64,6 +64,7 @@ def get_settings(request: Request):
         ollama_base_url=s.get("ollama_base_url", "http://localhost:11434"),
         ollama_model=s.get("ollama_model", "qwen2.5-coder:7b"),
         web_search_enabled=s.get("web_search_enabled", "false").lower() == "true",
+        git_agent_tools=get_setting("git_agent_tools", "false").lower() == "true",
         is_hosted=USE_POSTGRES,
     )
 
@@ -135,6 +136,10 @@ def browse_directory(request: Request):
     if USE_POSTGRES and not is_admin:
         raise HTTPException(status_code=403, detail="Admin access required to browse for a workspace directory")
 
+    from services.folder_picker import NO_NATIVE_PICKER_MESSAGE, native_picker_available
+    if not native_picker_available():
+        raise HTTPException(status_code=501, detail=NO_NATIVE_PICKER_MESSAGE)
+
     result: dict = {}
     dialog_thread = threading.Thread(target=_open_directory_dialog, args=(result,), daemon=True)
     dialog_thread.start()
@@ -159,11 +164,12 @@ def browse_directory(request: Request):
         _dlog("settings_browse_directory_failed", user_id=user_id, error=result["error"])
         raise HTTPException(
             status_code=500,
-            detail="Could not open a folder picker on this machine (no display or tkinter unavailable). "
+            detail=f"Could not open a folder picker on this machine ({str(result['error'])[:200]}). "
                    "Please type the path manually instead."
         )
 
-    path = result.get("path", "")
+    from routers.repositories import _checked_picker_path
+    path = _checked_picker_path(result.get("path", ""))
     _dlog("settings_browse_directory_picked", user_id=user_id, path=path)
     return {"path": path}
 

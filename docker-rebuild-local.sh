@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Use this after changing code on this machine.
+# Rebuilds the Docker image from this folder and restarts the app.
+# Does not pull from GitHub. Accounts, keys, and settings stay in the Docker volume.
 set -euo pipefail
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do
@@ -19,6 +22,12 @@ if ! command -v docker >/dev/null 2>&1; then
   done
 fi
 command -v docker >/dev/null || { echo "Install Docker Desktop first."; exit 1; }
+
+# The container cannot open a Mac dialog. On macOS, install the host helper
+# before the app starts so Browse works on the first click.
+if [ "$(uname -s)" = "Darwin" ]; then
+  ./scripts/install-folder-helper.sh
+fi
 
 docker volume create surgicalai-data >/dev/null
 

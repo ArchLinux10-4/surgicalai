@@ -6,8 +6,19 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:${SURGICALAI_PORT:-8000}:8000"
+    env_file:
+      # Optional. Gitignored. Holds platform keys copied from Railway
+      # (GitHub App id/private key, and similar). Never put DATABASE_URL or
+      # JWT_SECRET here: DATABASE_URL turns on hosted mode, and API keys
+      # decrypt with the jwt_secret stored in the database.
+      - path: .env.local
+        required: false
+    extra_hosts:
+      # Lets the container reach the macOS folder helper on the host.
+      - "host.docker.internal:host-gateway"
     environment:
       SURGICALAI_BROWSE_ROOT: /Users/pm
+      SURGICALAI_PICKER_URL: http://host.docker.internal:18765
       # Do not set DATABASE_URL. That switches the app to hosted mode and turns Open Folder off.
       # Do not set JWT_SECRET. Saved API keys and AWS credentials decrypt with the secret stored in the database.
     volumes:
