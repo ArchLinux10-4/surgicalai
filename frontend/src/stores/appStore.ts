@@ -155,6 +155,30 @@ interface AppState {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
   } | null
   setGitApproval: (value: AppState['gitApproval']) => void
+  localTerminalLines: {
+    sessionId: string
+    command: string
+    stdout: string
+    stderr: string
+    exit_code: number
+    level?: string
+    title?: string
+    target?: string
+  }[]
+  pushLocalTerminalLine: (line: AppState['localTerminalLines'][number]) => void
+  // Live SSE reply. Not persisted and not cloned — the closure belongs to the
+  // stream that asked for approval.
+  localApproval: {
+    sessionId: string
+    command: string
+    level?: string
+    title?: string
+    target?: string
+    summary?: string
+    cwd?: string
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string; always?: boolean }) => boolean
+  } | null
+  setLocalApproval: (value: AppState['localApproval']) => void
   gitSteps: { sessionId: string; name: string; ok: boolean; detail: string }[]
   pushGitStep: (step: AppState['gitSteps'][number]) => void
   clearGitRun: (sessionId: string) => void
@@ -431,6 +455,12 @@ export const useAppStore = create<AppState>((set) => ({
   })),
   gitApproval: null,
   setGitApproval: (gitApproval) => set({ gitApproval }),
+  localTerminalLines: [],
+  pushLocalTerminalLine: (line) => set((s) => ({
+    localTerminalLines: [...s.localTerminalLines, line].slice(-40),
+  })),
+  localApproval: null,
+  setLocalApproval: (localApproval) => set({ localApproval }),
   gitSteps: [],
   pushGitStep: (step) => set((s) => ({
     gitSteps: [...s.gitSteps, step].slice(-20),

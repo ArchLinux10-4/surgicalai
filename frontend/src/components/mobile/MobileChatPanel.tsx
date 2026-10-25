@@ -37,6 +37,7 @@ import { AgentMissionControl } from '../AgentMissionControl'
 import { PlanTracker } from '../PlanTracker'
 import { PlanPane } from '../PlanPane'
 import { AwsTerminalDock } from '../AwsTerminalDock'
+import { LocalTerminalDock } from '../LocalTerminalDock'
 import { GitTerminalDock, refreshRepoBranch } from '../GitTerminalDock'
 import { McpApprovalCard } from '../McpApprovalCard'
 import { PlanQuestionsCard } from '../PlanQuestionsCard'
@@ -1474,6 +1475,30 @@ export function MobileChatPanel() {
         refreshRepoBranch(sessionId)
       },
       (ev) => { useAppStore.getState().applyToolActivity(sessionId, ev) },
+      (event) => {
+        useAppStore.getState().pushLocalTerminalLine({
+          sessionId,
+          command: event?.command || 'local',
+          stdout: event?.stdout || '',
+          stderr: event?.stderr || '',
+          exit_code: event?.exit_code ?? 1,
+          level: event?.level,
+          title: event?.title,
+          target: event?.target,
+        })
+      },
+      (command, reply, meta) => {
+        useAppStore.getState().setLocalApproval({
+          sessionId,
+          command,
+          reply,
+          level: meta?.level,
+          title: meta?.title,
+          target: meta?.target,
+          summary: meta?.summary,
+          cwd: meta?.cwd,
+        })
+      },
     )
     ctrlRef.current = ctrl
   }, [input, pastedBlocks, draftKey, isStreaming, settings, ensureSession, messages.length, sessionFiles,
@@ -2221,6 +2246,7 @@ export function MobileChatPanel() {
       </div>
       <McpApprovalCard />
       <GitTerminalDock compact />
+      <LocalTerminalDock compact />
       <AwsTerminalDock compact />
     </div>
   )

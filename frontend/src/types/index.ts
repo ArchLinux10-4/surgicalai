@@ -1,4 +1,4 @@
-export type ToolKind = 'file' | 'search' | 'repo' | 'github' | 'history' | 'preview' | 'web' | 'git' | 'aws' | 'mcp' | 'edit' | 'qa' | 'step'
+export type ToolKind = 'file' | 'search' | 'repo' | 'github' | 'history' | 'preview' | 'web' | 'git' | 'aws' | 'mcp' | 'edit' | 'qa' | 'step' | 'local'
 export type ToolStatus = 'running' | 'waiting' | 'done' | 'failed' | 'stopped'
 
 export interface ToolActivityEvent {

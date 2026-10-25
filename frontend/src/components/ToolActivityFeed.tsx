@@ -46,6 +46,7 @@ const KIND_CLASS: Record<ToolKind, string> = {
   qa: 'text-accent bg-accent/10',
   git: 'text-warning bg-warning/10',
   aws: 'text-warning bg-warning/10',
+  local: 'text-warning bg-warning/10',
   mcp: 'text-warning bg-warning/10',
   history: 'text-muted bg-overlay',
   preview: 'text-muted bg-overlay',

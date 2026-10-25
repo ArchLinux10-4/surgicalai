@@ -6,7 +6,7 @@ import type { ToolActivityEvent, ToolKind, ToolRow, ToolStatus } from '../types/
 
 const KINDS = new Set<ToolKind>([
   'file', 'search', 'repo', 'github', 'history', 'preview', 'web',
-  'git', 'aws', 'mcp', 'edit', 'qa', 'step',
+  'git', 'aws', 'mcp', 'edit', 'qa', 'step', 'local',
 ])
 const PHASE_KINDS = new Set<ToolKind>(['step', 'edit', 'qa'])
 const MAX_ROWS = 40

@@ -25,6 +25,7 @@ class SettingsUpdate(BaseModel):
     # services/claude_web_search.py for the tool this enables.
     web_search_enabled: Optional[bool] = None
     git_agent_tools: Optional[bool] = None
+    local_agent_tools: Optional[bool] = None
 
 
 class SettingsResponse(BaseModel):
@@ -44,6 +45,11 @@ class SettingsResponse(BaseModel):
     ollama_model: str = "qwen2.5-coder:7b"
     web_search_enabled: bool = False
     git_agent_tools: bool = False
+    local_agent_tools: bool = False
+
+
+class LocalAllowlistUpdate(BaseModel):
+    rules: list[str] = []
     is_hosted: bool = False
 
 

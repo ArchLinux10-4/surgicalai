@@ -747,6 +747,7 @@ def _seed_defaults_sqlite(cur):
         # Claude-only web research (Ask/Plan mode). New, additive, off by
         # default — see services/claude_web_search.py.
         "web_search_enabled": "false",
+        "local_agent_tools": "false",
     }
     for k, v in defaults.items():
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -1178,6 +1179,7 @@ def _seed_defaults_postgres(conn):
         # Claude-only web research (Ask/Plan mode). New, additive, off by
         # default — see services/claude_web_search.py.
         "web_search_enabled": "false",
+        "local_agent_tools": "false",
     }
     for k, v in defaults.items():
         conn.execute(

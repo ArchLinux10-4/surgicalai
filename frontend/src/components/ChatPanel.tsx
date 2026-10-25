@@ -2474,6 +2474,30 @@ export function ChatPanel() {
         refreshRepoBranch(sessionId)
       },
       (ev) => { useAppStore.getState().applyToolActivity(sessionId, ev) },
+      (event) => {
+        useAppStore.getState().pushLocalTerminalLine({
+          sessionId,
+          command: event?.command || 'local',
+          stdout: event?.stdout || '',
+          stderr: event?.stderr || '',
+          exit_code: event?.exit_code ?? 1,
+          level: event?.level,
+          title: event?.title,
+          target: event?.target,
+        })
+      },
+      (command, reply, meta) => {
+        useAppStore.getState().setLocalApproval({
+          sessionId,
+          command,
+          reply,
+          level: meta?.level,
+          title: meta?.title,
+          target: meta?.target,
+          summary: meta?.summary,
+          cwd: meta?.cwd,
+        })
+      },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change

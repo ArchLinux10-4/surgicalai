@@ -91,6 +91,20 @@ export type SmartStreamHandlers = {
     verified?: string[]
   }) => void
   onToolActivity?: (ev: ToolActivityEvent) => void
+  onLocalCli?: (event: {
+    command?: string
+    stdout?: string
+    stderr?: string
+    exit_code?: number
+    level?: string
+    title?: string
+    target?: string
+  }) => void
+  onLocalApproval?: (
+    command: string,
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string; always?: boolean }) => boolean,
+    meta?: { level?: string; title?: string; target?: string; summary?: string; action?: string; path?: string; cwd?: string },
+  ) => void
 }
 
 export type EditLiveEvent = {
@@ -368,6 +382,8 @@ export const api = {
       return request('/settings/verify-grok-key', { method: 'POST', body: JSON.stringify({ key }) })
     },
     browseDirectory: () => request<any>('/settings/browse-directory', { method: 'POST' }),
+    localAgent: () => request<{ enabled: boolean; helper: boolean; rules: string[] }>('/settings/local-agent'),
+    saveLocalAllowlist: (rules: string[]) => request('/settings/local-allowlist', { method: 'PUT', body: JSON.stringify({ rules }) }),
   },
   chat: {
     createSession: (data: any) => request<any>('/chat/sessions', { method: 'POST', body: JSON.stringify(data) }),
@@ -636,6 +652,8 @@ export const api = {
       onGitStep?: SmartStreamHandlers['onGitStep'],
       onGitResult?: SmartStreamHandlers['onGitResult'],
       onToolActivity?: SmartStreamHandlers['onToolActivity'],
+      onLocalCli?: SmartStreamHandlers['onLocalCli'],
+      onLocalApproval?: SmartStreamHandlers['onLocalApproval'],
     ): SteerStream => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -646,6 +664,7 @@ export const api = {
           onCreditPaused, onPlan, onAwsCli, onAwsApproval, onPreviewCheck,
           onEditLive, onMcpApproval, onMcpCall, onSteer,           onGitCli, onGitApproval,
           onGitStep, onGitResult, onToolActivity,
+          onLocalCli, onLocalApproval,
         } = onThinking)
       }
       const controller = attachSteer(new AbortController(), () => sendToServer)
@@ -714,6 +733,17 @@ export const api = {
               sendToServer({ type: 'git_cli_response', ...resp })
               return true
             }, { level: chunk.level, title: chunk.title, target: chunk.target, summary: chunk.summary })
+          }
+          else if (chunk.type === 'local_cli') onLocalCli?.(chunk)
+          else if (chunk.type === 'local_approval_needed') {
+            onLocalApproval?.(chunk.command || '', (resp) => {
+              if (!sendToServer) return false
+              sendToServer({ type: 'local_cli_response', ...resp })
+              return true
+            }, {
+              level: chunk.level, title: chunk.title, target: chunk.target,
+              summary: chunk.summary, action: chunk.action, path: chunk.path, cwd: chunk.cwd,
+            })
           }
           else if (chunk.type === 'git_step') onGitStep?.(chunk)
           else if (chunk.type === 'git_result') onGitResult?.(chunk)
