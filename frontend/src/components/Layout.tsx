@@ -160,7 +160,7 @@ export function Layout() {
         className={`flex flex-col min-h-0 bg-base overflow-hidden ${
           (activeFile || elementPickerOpen)
             ? 'flex-shrink-0 border-r border-border'
-            : 'flex-1 transition-all duration-200'
+            : 'flex-1 transition-[width] duration-200'
         }`}
         style={(activeFile || elementPickerOpen) ? { width: chatWidth } : undefined}
       >

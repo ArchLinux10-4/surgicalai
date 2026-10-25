@@ -56,6 +56,39 @@ def _noop_dlog(_event: str, **_kwargs):  # pragma: no cover - trivial
     return None
 
 
+def new_symbol_region(
+    file_content: str,
+    located_old: str,
+    new_code: str,
+    filename: str,
+    symbol_name: str = "",
+):
+    """Accept an insert whose symbol is new when old_code matches the file.
+
+    The symbol name is not in the index (a new constant, function, or import).
+    The anchor is a real line, so the edit is the text around that line, not a
+    hunt for a function that does not exist yet. Returns
+    (symbol, new_code, ok, reason).
+    """
+    span = _abs_line_span_of_substring(file_content or "", located_old or "")
+    if span is None or new_code is None:
+        return None, None, False, "old_code_not_unique"
+    start, end = span
+    bare = (filename or "file").rsplit("/", 1)[-1] or "file"
+    label = (symbol_name or "").strip() or bare
+    symbol = SymbolInfo(
+        name=label,
+        symbol_type=SymbolType.VARIABLE,
+        start_line=start,
+        end_line=end,
+        parent=None,
+        indentation=0,
+        code=located_old,
+        signature=filename or bare,
+    )
+    return symbol, new_code, True, "new_symbol_file_level"
+
+
 def _abs_line_span_of_substring(text: str, sub: str) -> Optional[Tuple[int, int]]:
     """1-indexed inclusive (start_line, end_line) that `sub` occupies in `text`.
 

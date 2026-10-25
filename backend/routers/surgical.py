@@ -10,15 +10,95 @@ from models.schemas import (
 from database import get_setting, get_db_ctx
 from services.pipeline import analyze_and_plan, analyze_and_plan_stream, _dlog
 from services.surgical_editor import apply_changes_to_file
+from services.apply_messages import annotate_failure
 from services.edit_rescue import rescue_failed_changes
 from services.session_auth import require_session_access_from_request
 
 router = APIRouter()
 
 
+def _stamp(result):
+    if result is None:
+        return result
+    result.failed_changes = [
+        annotate_failure(item) for item in (result.failed_changes or [])
+    ]
+    return result
+
+
+def _file_missing_response(req, error: str):
+    ids = [c.id for c in req.changes if getattr(c, "id", None)]
+    if req.change_id and req.change_id not in ids:
+        ids.append(req.change_id)
+    if not ids:
+        ids = [None]
+    return _stamp(SurgicalApplyResponse(
+        file_path=req.file_path,
+        new_content=req.file_content or "",
+        modified_content=req.file_content,
+        applied_count=0,
+        failed_count=len(ids),
+        failed_changes=[
+            {
+                "change_id": cid,
+                "code": "file_missing",
+                "reason": error,
+                "already_applied": False,
+            }
+            for cid in ids
+        ],
+    ))
+
+
 def _require_admin(request: Request):
     if not getattr(request.state, "is_admin", False):
         raise HTTPException(status_code=403, detail="Admin access required")
+
+
+def _ensure_applied(conn):
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS applied_changes
+           (session_id TEXT NOT NULL, change_id TEXT NOT NULL,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (session_id, change_id))"""
+    )
+
+
+def _recorded_ids(session_id: str) -> set:
+    if not session_id:
+        return set()
+    with get_db_ctx() as conn:
+        _ensure_applied(conn)
+        rows = conn.execute(
+            "SELECT change_id FROM applied_changes WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+    return {dict(row)["change_id"] for row in rows}
+
+
+def _mark_recorded(session_id: str, change_ids) -> None:
+    ids = [cid for cid in (change_ids or []) if cid]
+    if not session_id or not ids:
+        return
+    with get_db_ctx() as conn:
+        _ensure_applied(conn)
+        conn.executemany(
+            "INSERT OR IGNORE INTO applied_changes (session_id, change_id) VALUES (?, ?)",
+            [(session_id, cid) for cid in ids],
+        )
+        conn.commit()
+
+
+def _remember_success(req: SurgicalApplyRequest, result: SurgicalApplyResponse) -> None:
+    failed = {
+        item.get("change_id")
+        for item in (result.failed_changes or [])
+        if not item.get("already_applied")
+    }
+    _mark_recorded(
+        req.session_id or "",
+        [c.id for c in req.changes if c.id and c.id not in failed],
+    )
 
 
 def _attempt_rescue(req: SurgicalApplyRequest, request: Request,
@@ -203,6 +283,25 @@ def apply(req: SurgicalApplyRequest, request: Request):
     _dlog("change_apply_requested", endpoint="apply",
           session_id=req.session_id, file_path=req.file_path,
           change_id=req.change_id, change_count=len(req.changes))
+    if req.session_id and not req.change_id and not any(c.id for c in req.changes):
+        _dlog("apply_missing_change_id", session_id=req.session_id, file_path=req.file_path)
+    wanted = {c.id for c in req.changes if c.id}
+    if req.change_id:
+        wanted.add(req.change_id)
+    recorded = _recorded_ids(req.session_id or "")
+    if wanted and wanted <= recorded:
+        return _stamp(SurgicalApplyResponse(
+            file_path=req.file_path,
+            new_content=req.file_content or "",
+            modified_content=req.file_content,
+            applied_count=0,
+            failed_count=len(wanted),
+            failed_changes=[
+                {"change_id": cid, "already_applied": True, "code": "already_applied",
+                 "reason": "Already applied"}
+                for cid in wanted
+            ],
+        ))
     try:
         try:
             result = apply_changes_to_file(
@@ -237,13 +336,14 @@ def apply(req: SurgicalApplyRequest, request: Request):
               rescued_count=result.rescued_count,
               already_applied_count=sum(
                   1 for f in (result.failed_changes or []) if f.get("already_applied")))
-        return result
+        _remember_success(req, result)
+        return _stamp(result)
     except HTTPException:
         raise
     except FileNotFoundError as e:
         _dlog("change_apply_result", endpoint="apply", session_id=req.session_id,
               file_path=req.file_path, error="file_not_found", detail=str(e))
-        raise HTTPException(status_code=404, detail=str(e))
+        return _file_missing_response(req, str(e))
     except ValueError as e:
         _dlog("change_apply_result", endpoint="apply", session_id=req.session_id,
               file_path=req.file_path, error="value_error", detail=str(e))
@@ -280,13 +380,14 @@ def apply_all(req: SurgicalApplyRequest, request: Request):
               rescued_count=result.rescued_count,
               already_applied_count=sum(
                   1 for f in (result.failed_changes or []) if f.get("already_applied")))
-        return result
+        _remember_success(req, result)
+        return _stamp(result)
     except HTTPException:
         raise
     except FileNotFoundError as e:
         _dlog("change_apply_result", endpoint="apply-all", session_id=req.session_id,
               file_path=req.file_path, error="file_not_found", detail=str(e))
-        raise HTTPException(status_code=404, detail=str(e))
+        return _file_missing_response(req, str(e))
     except Exception as e:
         _dlog("change_apply_result", endpoint="apply-all", session_id=req.session_id,
               file_path=req.file_path, error="unhandled", detail=str(e))

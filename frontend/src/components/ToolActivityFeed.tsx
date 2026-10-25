@@ -20,7 +20,6 @@ import {
   deriveStage,
   formatDuration,
   modelFamily,
-  rowsFromProgress,
   summarizeTrail,
 } from '../lib/toolActivity'
 
@@ -204,6 +203,7 @@ interface FeedProps {
   model?: string
   content?: string
   progress?: string
+  phaseLabel?: string
   isThinking?: boolean
   isBuildingEdit?: boolean
   compact?: boolean
@@ -211,7 +211,7 @@ interface FeedProps {
 }
 
 function ToolActivityFeedInner({
-  mode, rows, startedAt, model, content, progress, isThinking, isBuildingEdit, compact, max,
+  mode, rows, startedAt, model, content, progress, phaseLabel, isThinking, isBuildingEdit, compact, max,
 }: FeedProps) {
   const live = mode === 'live'
   const [open, setOpen] = useState(false)
@@ -219,10 +219,9 @@ function ToolActivityFeedInner({
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
   const source = useMemo(() => {
-    if (live && rows.length === 0) return rowsFromProgress(progress || '', startedAt || Date.now())
     if (max && rows.length > max) return rows.slice(rows.length - max)
     return rows
-  }, [live, rows, progress, startedAt, max])
+  }, [rows, max])
 
   const pinned = useMemo(() => {
     const ids = new Set<string>()
@@ -239,13 +238,15 @@ function ToolActivityFeedInner({
     && !source.some(row => row.status === 'running' || row.status === 'waiting')
   const stage = halted && !(content || '').trim()
     ? { label: 'Stopped', tone: 'think' as const }
-    : deriveStage({
-      rows: source,
-      content,
-      progress,
-      isThinking,
-      isBuildingEdit,
-    })
+    : (live && rows.length === 0 && phaseLabel)
+      ? { label: phaseLabel, tone: 'work' as const }
+      : deriveStage({
+        rows: source,
+        content,
+        progress,
+        isThinking,
+        isBuildingEdit,
+      })
   const { earlier, shown } = live
     ? partitionRows(source, content || '', pinned, earlierOpen)
     : { earlier: [] as ToolRow[], shown: source }

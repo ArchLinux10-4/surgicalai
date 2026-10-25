@@ -22,6 +22,13 @@ _ADMIN_ONLY_SETTINGS = {"workspace_path"}
 router = APIRouter()
 
 
+def _safe_rounds(raw) -> int:
+    try:
+        return max(0, int(raw if raw not in (None, "") else 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _get_user_id(request: Request) -> str:
     """Extract user_id from JWT middleware. Returns empty string if unauthenticated."""
     return getattr(request.state, "user_id", "") or ""
@@ -66,6 +73,9 @@ def get_settings(request: Request):
         web_search_enabled=s.get("web_search_enabled", "false").lower() == "true",
         git_agent_tools=get_setting("git_agent_tools", "false").lower() == "true",
         local_agent_tools=get_setting("local_agent_tools", "false").lower() == "true",
+        qa_enabled=str(s.get("qa_enabled", "1")).strip().lower() in ("1", "true", "yes", "on"),
+        qa_auto_fix_rounds=_safe_rounds(s.get("qa_auto_fix_rounds", "0")),
+        qa_diff_first=str(s.get("qa_diff_first", "1")).strip().lower() in ("1", "true", "yes", "on"),
         is_hosted=USE_POSTGRES,
     )
 

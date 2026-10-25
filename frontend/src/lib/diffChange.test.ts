@@ -4,7 +4,6 @@
 import { describe, it, beforeEach } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  appliedStorageKey,
   isRealDiffChange,
   skippedStorageKey,
   splitPendingChanges,
@@ -104,19 +103,18 @@ describe('splitPendingChanges', () => {
     assert.equal(flagged.length, 0)
   })
 
-  it('ignores locally applied and locally skipped', () => {
-    localStorage.setItem(appliedStorageKey(sessionId, 'applied-local'), '1')
+  it('ignores locally skipped and keeps server-only applied state', () => {
     localStorage.setItem(skippedStorageKey(sessionId, 'skipped-local'), '1')
     const { clean, flagged } = splitPendingChanges(
       [
-        { id: 'applied-local', diff: realDiff },
+        { id: 'old-local', diff: realDiff },
         { id: 'skipped-local', diff: realDiff },
         { id: 'pending', diff: realDiff },
       ],
       new Set(),
       sessionId,
     )
-    assert.deepEqual(clean.map((c: any) => c.id), ['pending'])
+    assert.deepEqual(clean.map((c: any) => c.id), ['old-local', 'pending'])
     assert.equal(flagged.length, 0)
   })
 

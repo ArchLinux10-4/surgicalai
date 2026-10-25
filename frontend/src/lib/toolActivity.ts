@@ -208,19 +208,6 @@ export function modelFamily(id?: string): { name: string; family: 'claude' | 'gp
   return { name: 'SurgicalAI', family: 'unknown' }
 }
 
-export function rowsFromProgress(progress: string, now: number): ToolRow[] {
-  const label = stripLeadingEmoji((progress || '').trim())
-  if (!label || label === 'Thinking...' || label === 'Thinking') return []
-  return [{
-    id: 'legacy-progress',
-    kind: 'step',
-    label,
-    doneLabel: label,
-    status: 'running',
-    startedAt: now,
-  }]
-}
-
 export function hydrateToolRows(raw: unknown): ToolRow[] {
   if (!Array.isArray(raw)) return []
   const rows: ToolRow[] = []

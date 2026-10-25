@@ -273,6 +273,8 @@ interface AppState {
   beginToolActivity: (sessionId: string) => void
   applyToolActivity: (sessionId: string, ev: ToolActivityEvent) => void
   stopToolActivity: (sessionId: string) => void
+  qaNotes: Record<string, Record<string, any>>
+  setQaNote: (sessionId: string, changeId: string, qa: any) => void
 
   // Multi-file
   multiFileMode: boolean
@@ -553,19 +555,31 @@ export const useAppStore = create<AppState>((set) => ({
     const { [sessionId]: _edits, ...liveRest } = state.liveEdits
     const { [sessionId]: _order, ...orderRest } = state.liveEditOrder
     const { [sessionId]: _tools, ...toolRest } = state.toolActivity || {}
+    const { [sessionId]: _notes, ...noteRest } = state.qaNotes || {}
     const display = state.activeSessions === sessionId
       ? { isStreaming: false, streamingMessage: '', streamProgress: '' }
       : {}
-    return { streamingSessions: rest, liveEdits: liveRest, liveEditOrder: orderRest, toolActivity: toolRest, ...display }
+    return { streamingSessions: rest, liveEdits: liveRest, liveEditOrder: orderRest, toolActivity: toolRest, qaNotes: noteRest, ...display }
   }),
 
   liveEdits: {},
   liveEditOrder: {},
   toolActivity: {},
-  beginToolActivity: (sessionId) => set((state) => ({
-    toolActivity: {
-      ...state.toolActivity,
-      [sessionId]: { startedAt: Date.now(), rows: [] },
+  qaNotes: {},
+  beginToolActivity: (sessionId) => set((state) => {
+    const { [sessionId]: _old, ...rest } = state.qaNotes || {}
+    return {
+      qaNotes: rest,
+      toolActivity: {
+        ...state.toolActivity,
+        [sessionId]: { startedAt: Date.now(), rows: [] },
+      },
+    }
+  }),
+  setQaNote: (sessionId, changeId, qa) => set((state) => ({
+    qaNotes: {
+      ...state.qaNotes,
+      [sessionId]: { ...(state.qaNotes[sessionId] || {}), [changeId]: qa },
     },
   })),
   applyToolActivity: (sessionId, ev) => set((state) => {

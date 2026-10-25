@@ -54,6 +54,7 @@ success and error. Long strings are truncated and file contents / edit bodies
 are never logged verbatim — only lengths and previews.
 """
 
+import datetime as _dt
 import json as _json
 
 # grok_provider does NOT import this module, so importing from it is cycle-safe.
@@ -70,6 +71,7 @@ except Exception:  # pragma: no cover
 try:  # pragma: no cover
     from services.agent_tool_spec import (
         blocked_text as _blocked_text,
+        code_tools_text as _code_tools_text,
         edit_ladder as _edit_ladder,
         file_blurb as _file_blurb,
         history_text as _history_text,
@@ -85,6 +87,7 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     from agent_tool_spec import (  # type: ignore
         blocked_text as _blocked_text,
+        code_tools_text as _code_tools_text,
         edit_ladder as _edit_ladder,
         file_blurb as _file_blurb,
         history_text as _history_text,
@@ -601,7 +604,11 @@ def _schema_request_repo():
                             "git_status", "git_diff",
                         ],
                     },
-                    "path": {"type": "string", "description": "Repo-relative path."},
+                    "path": {"type": "string", "description": "Repo-relative path. search_repo uses it to limit the folder."},
+                    "start_line": {
+                        "type": "integer",
+                        "description": "read_repo_file only. 1-based line to start at when the file is long.",
+                    },
                     "terms": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -899,6 +906,7 @@ class TranslationResult:
         self.edit_plan = None                # -> edit_plan_data (list) or None
         self.context_request = None          # (tag_kind, body_json_str) or None
         self.context_call_id = None          # tool_call_id of the context req
+        self.kept_context_tool = ""          # name of the one context tool kept
         self.blocked_reason = None           # -> terminal <blocked> signal
         self.results_by_id = {}              # tool_call_id -> tool-result text
         self.errors = []                     # list of (tool_call_id, feedback)
@@ -1057,6 +1065,7 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
             if res.context_request is None:
                 res.context_request = ("git", _git_cmd)
                 res.context_call_id = cid
+                res.kept_context_tool = name
             else:
                 fb = "Only one git command is handled per turn."
                 res.errors.append((cid, fb))
@@ -1069,6 +1078,7 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
             if res.context_request is None:
                 res.context_request = ("local", _local_rendered)
                 res.context_call_id = cid
+                res.kept_context_tool = name
             else:
                 fb = "Only one local action is handled per turn."
                 res.errors.append((cid, fb))
@@ -1087,6 +1097,7 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
             if res.context_request is None:
                 res.context_request = ("aws", _aws_body)
                 res.context_call_id = cid
+                res.kept_context_tool = name
             else:
                 fb = "Only one AWS command is sent for approval per turn."
                 res.errors.append((cid, fb))
@@ -1105,11 +1116,12 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
                 res.results_by_id[cid] = fb
                 _log(dlog, "grok_translate_extra_context_ignored",
                      session_id=session_id, user_id=user_id, tool_call_id=cid,
-                     tool_name=name)
+                     tool_name=name, kept_tool=res.kept_context_tool)
                 continue
             tag_kind, body = _context_body(name, args)
             res.context_request = (tag_kind, body)
             res.context_call_id = cid
+            res.kept_context_tool = name
             # NOTE: context result text is filled in by pipeline.py after it runs
             # the tool (search results / file contents), so we do NOT set
             # results_by_id[cid] here.
@@ -1197,6 +1209,12 @@ def _context_body(name, args):
             "path": args.get("path", "") or "",
             "terms": args.get("terms") or [],
         }
+        try:
+            start_line = int(args.get("start_line") or 0)
+        except (TypeError, ValueError):
+            start_line = 0
+        if start_line > 0:
+            payload["start_line"] = start_line
         # Only git_diff reads these, and only when the model sent them, so a
         # call to the other repo tools keeps its old payload exactly.
         for field in ("scope", "base", "head", "view", "dots"):
@@ -1258,6 +1276,16 @@ def build_tool_result_messages(calls, results_by_id, context_call_id=None,
             content = str(content)
         msgs.append({"role": "tool", "tool_call_id": cid, "content": content})
     return msgs
+
+
+def _live_web_guidance() -> str:
+    """Today's date plus the instruction to trust live web facts over memory."""
+    today = _dt.date.today().isoformat()
+    return (
+        f"Today's date is {today}. Web search results are live and newer than "
+        "your training data. Trust them over memory for model names, versions, "
+        "and dates."
+    )
 
 
 def build_native_followup_messages(assistant_text, calls, results_by_id,
@@ -1363,6 +1391,12 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     lines.append(_limits_block("function"))
     if m in _EDIT_MODES and wants_edit:
         lines.append(_edit_ladder("function", "grok"))
+        lines.append(_code_tools_text(
+            "function",
+            repo=bool(repo_enabled),
+            local=bool(local_enabled),
+            git=bool(git_enabled),
+        ))
     elif m in _EDIT_MODES:
         lines.append(
             "• write_surgical_edit — edit an existing file. "
@@ -1404,6 +1438,7 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
             "information. The query is sent to a search engine: do not include "
             "code, file names, or secrets."
         )
+        lines.append(_live_web_guidance())
     if mcp_enabled:
         lines.append(
             "• request_mcp — call a tool on a connected MCP server. The user "
@@ -1522,6 +1557,7 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
             "information. The query is sent to a search engine: do not include "
             "code, file names, or secrets."
         )
+        parts.append(_live_web_guidance())
     if local_enabled:
         parts.append(
             "Call run_local for a command or a file on this Mac that the other "

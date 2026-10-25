@@ -102,6 +102,13 @@ def test_exec_read_write_list_and_timeout(tmp_path, monkeypatch):
     assert blocked["status"] == 403
 
 
+def test_missing_command_is_a_normal_result(tmp_path):
+    missing = core.run_exec(["not-a-real-surgicalai-bin"], cwd=str(tmp_path), timeout_s=5)
+    assert missing["exit_code"] == 127
+    assert "command not found" in missing["stderr"]
+    assert "status" not in missing
+
+
 def test_truncation_and_binary(tmp_path):
     huge = core.run_exec([sys.executable, "-c", "print('x' * 40000)"], cwd=str(tmp_path), timeout_s=5)
     assert huge["truncated"] is True

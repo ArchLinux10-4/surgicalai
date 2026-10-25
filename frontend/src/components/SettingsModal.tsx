@@ -112,6 +112,9 @@ export function SettingsModal() {
     web_search_enabled: false,
     git_agent_tools: false,
     local_agent_tools: false,
+    qa_enabled: true,
+    qa_auto_fix_rounds: 0,
+    qa_diff_first: true,
   })
   const [localRules, setLocalRules] = useState<string[]>([])
   const [localHelper, setLocalHelper] = useState<boolean | null>(null)
@@ -135,6 +138,9 @@ export function SettingsModal() {
         web_search_enabled: (settings as any).web_search_enabled || false,
         git_agent_tools: (settings as any).git_agent_tools || false,
         local_agent_tools: (settings as any).local_agent_tools || false,
+        qa_enabled: (settings as any).qa_enabled !== false,
+        qa_auto_fix_rounds: Number((settings as any).qa_auto_fix_rounds ?? 0) || 0,
+        qa_diff_first: (settings as any).qa_diff_first !== false,
       })
     }
     api.settings.localAgent().then((s) => {
@@ -669,6 +675,44 @@ export function SettingsModal() {
                       </div>
                     </div>
                   </label>
+                </div>
+
+                <div className="mt-6 pt-5 border-t border-border">
+                  <SectionHeader title="Review" subtitle="Checks that run after an edit is shown" />
+                  <label className="flex items-start gap-3 cursor-pointer group mt-3">
+                    <input
+                      type="checkbox"
+                      checked={form.qa_enabled}
+                      onChange={(e) => upd('qa_enabled')(e.target.checked)}
+                      className="mt-0.5 accent-accent"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-ink">Check edits after they appear</div>
+                      <div className="text-xs text-muted mt-0.5">Turn this off to skip the review pass.</div>
+                    </div>
+                  </label>
+                  <label className="flex items-start gap-3 cursor-pointer group mt-3">
+                    <input
+                      type="checkbox"
+                      checked={form.qa_diff_first}
+                      onChange={(e) => upd('qa_diff_first')(e.target.checked)}
+                      className="mt-0.5 accent-accent"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-ink">Show the diff before the review finishes</div>
+                      <div className="text-xs text-muted mt-0.5">The review result arrives on the card after the diff.</div>
+                    </div>
+                  </label>
+                  <Field label="Automatic fix rounds">
+                    <input
+                      type="number"
+                      min={0}
+                      max={3}
+                      value={form.qa_auto_fix_rounds}
+                      onChange={(e) => upd('qa_auto_fix_rounds')(Math.max(0, Number(e.target.value) || 0))}
+                      className="input w-24"
+                    />
+                  </Field>
                 </div>
 
                 <div className="mt-6 pt-5 border-t border-border">

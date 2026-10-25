@@ -10,7 +10,7 @@ catalogues.
 import os
 
 MAX_FILES_PER_REQUEST = 5
-MAX_SEARCH_TERMS = 5
+from services.limits import LOCAL_OUTPUT_MAX_CHARS, MAX_SEARCH_TERMS
 # Same default as AGENT_MAX_TURNS and the Ask/Plan round cap.
 DEFAULT_MAX_TURNS = 60
 
@@ -98,7 +98,7 @@ def limits_block(form="tag", max_rounds=None) -> str:
     """Caps the model can hit. Round count comes from the caller, not a guess."""
     rounds = default_max_turns() if max_rounds is None else int(max_rounds)
     return (
-        "One context request per turn, then wait for the result. "
+        "Use these tools as many times as the task needs, one per turn. "
         f"At most {MAX_FILES_PER_REQUEST} files or {MAX_SEARCH_TERMS} search terms "
         "in that request. Extra requests in the same turn are skipped. "
         f"You can continue across turns, up to {rounds} turns."
@@ -121,6 +121,60 @@ def _family_line(family: str) -> str:
     raise ValueError(f"unknown family {family}")
 
 
+def new_symbol_rule() -> str:
+    """How to insert a constant, function, or import that is not in the file yet."""
+    return (
+        "To add something new, such as a constant, a function, or an import: "
+        "set symbol to the nearest existing symbol, or the filename at file level. "
+        "Set old_code to a line next to where it goes, copied exactly. "
+        "Set new_code to that line plus the new code."
+    )
+
+
+def plan_step_lead(symbol_name: str, filename: str, symbol_in_index: bool) -> str:
+    """First line of a plan step. A missing symbol is an insert, not a rename."""
+    if symbol_in_index:
+        return f"Edit the symbol `{symbol_name}` in `{filename}`."
+    return (
+        f"`{symbol_name}` is new. It is not in `{filename}` yet.\n"
+        + new_symbol_rule()
+    )
+
+
+def code_tools_text(form="tag", *, repo=False, local=False, git=False) -> str:
+    """Which tool writes code. Same rules in tag form and function form.
+
+    repo, local, and git lines are included only when that tool is offered,
+    so a prompt never names a tool the model cannot call.
+    """
+    n = _names(form)
+    lines = [
+        "Which tool writes code.",
+        f"{n['edit']}: change or add code in a file that already exists. "
+        "This is the only way to change repository code.",
+        f"{n['new']}: only for a file that does not exist yet.",
+        f"{n['plan']}: three or more distinct files or symbols. "
+        "It ends the turn, and each step then runs separately.",
+        f"{n['file']} and {n['search']}: load code before editing it. "
+        "Never edit code you have not seen.",
+    ]
+    if repo:
+        lines.append(
+            f"{n['repo']} read_repo_file: load a file from the open folder before editing it."
+        )
+    if local or git:
+        names = []
+        if local:
+            names.append(f"{n['local']} write")
+        if git:
+            names.append(n["git"])
+        lines.append(
+            f"{' and '.join(names)}: not for repository source edits."
+        )
+    lines.append("Nothing is written to disk until the user applies it.")
+    return "\n".join(lines)
+
+
 def edit_ladder(form="tag", family="claude") -> str:
     """One way to choose how an edit is addressed. Family line is the only difference."""
     n = _names(form)
@@ -128,12 +182,13 @@ def edit_ladder(form="tag", family="claude") -> str:
         "How to point at the code you change.",
         f"1. A small symbol you can see completely: send new_code only, with {n['edit']}. "
         "It replaces the whole symbol, so include every line.",
-        "2. Anything larger: send old_code and new_code. They replace only that text. "
+        "2. " + new_symbol_rule(),
+        "3. Anything larger: send old_code and new_code. They replace only that text. "
         "Copy old_code exactly. It must match one place, so add a few surrounding lines "
         "if it could match twice.",
-        "3. " + _family_line(family),
-        "4. A file with no named symbols, such as yaml or plain text: use the filename as symbol.",
-        f"5. {n['new']} is only for a file that does not exist yet. "
+        "4. " + _family_line(family),
+        "5. A file with no named symbols, such as yaml or plain text: use the filename as symbol.",
+        f"6. {n['new']} is only for a file that does not exist yet. "
         "Never create a new file to avoid editing an existing one.",
     ])
 
@@ -277,14 +332,16 @@ def old_code_description() -> str:
     return (
         "The exact original text you are replacing, copied verbatim. "
         "It must match one place. With old_code set, new_code replaces only that text, "
-        "not the rest of the symbol."
+        "not the rest of the symbol. "
+        + new_symbol_rule()
     )
 
 
 def symbol_description() -> str:
     return (
         "Exact symbol name from the SYMBOL INDEX. "
-        "For a file with no named symbols, use the filename."
+        "For a file with no named symbols, use the filename. "
+        + new_symbol_rule()
     )
 
 
@@ -324,7 +381,9 @@ def repo_text(form="tag", repo=None) -> str:
         )
     return (
         f"{where}\n{when}\n{examples}\n{diff}\n"
-        "read_repo_file loads the file into this chat. Chat edits are not git-staged; "
+        "read_repo_file loads the file into this chat. "
+        "Pass start_line to read a long file from that line. "
+        "Chat edits are not git-staged; "
         "git status includes which chat files are unsaved or changed on disk. "
         "You cannot run a shell from this tool."
     )
@@ -333,7 +392,7 @@ def repo_text(form="tag", repo=None) -> str:
 def git_cli_text(form="tag") -> str:
     """How to publish the open folder. Tag form is for Claude, GPT, and Gemini."""
     rules = (
-        "One command per turn, then stop. "
+        "One command per turn. You get the result next turn. "
         "Reads run immediately, including in Ask and Plan: git status, diff, log, show, "
         "branch with no name, rev-parse, remote -v, ls-files, blame, fetch, "
         "gh pr view, gh pr list, gh pr checks, and gh auth status. "
@@ -358,7 +417,7 @@ def git_cli_text(form="tag") -> str:
     )
     if form == "tag":
         return (
-            "How to call git. Emit exactly one tag and then stop. "
+            "How to call git. Emit one tag per turn. You get the result next turn. "
             "The open tag is exactly <git_cli> with no attributes. "
             "The body is one command, not JSON.\n"
             "<git_cli>\ngit status\n</git_cli>\n"
@@ -384,8 +443,9 @@ def local_text(form="tag") -> str:
     rules = (
         "run_local runs one action on the user's Mac: exec (a command), read, write, or list. "
         "Use it for work the other tools cannot do: running tests, builds, and scripts, and "
-        "reading or writing files that are not part of this chat. One action per turn, then "
-        "wait for the result. "
+        "reading or writing files that are not part of this chat. One action, then "
+        "wait for the result. When it returns, continue the task. If the user asked "
+        "for a code change, write the edit. A finished command is not the end of the task. "
         "Reads and plain listing run at once. Writes, installs, network use, deletes, and "
         "anything outside the open folder wait for the user's approval. If the user rejects, "
         "do not try it again unless they ask. "
@@ -394,11 +454,11 @@ def local_text(form="tag") -> str:
         "Do not use it for git, gh, or aws. Use their tools. "
         "Edits to files in the open repository go through the normal edit flow, not write. "
         "Each result shows the exit code, stdout, stderr, and says if output was cut at "
-        "32000 characters. Ask and Plan can only read."
+        f"{LOCAL_OUTPUT_MAX_CHARS} characters. Ask and Plan can only read."
     )
     if form == "tag":
         return (
-            "How to call the local Mac tool. Emit exactly one tag and then stop. "
+            "How to call the local Mac tool. Emit exactly one tag, then wait for the result. "
             "The open tag is exactly <local_cli> with no attributes.\n"
             "<local_cli>\naction: exec\nls\n</local_cli>\n"
             "<local_cli>\naction: read\npath: README.md\nlines: 1-80\n</local_cli>\n"

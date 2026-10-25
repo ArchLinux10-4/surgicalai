@@ -1,0 +1,17 @@
+How to call the local Mac tool. Emit exactly one tag, then wait for the result. The open tag is exactly <local_cli> with no attributes.
+<local_cli>
+action: exec
+ls
+</local_cli>
+<local_cli>
+action: read
+path: README.md
+lines: 1-80
+</local_cli>
+<local_cli>
+action: write
+path: scratch-note.txt
+---
+hello
+</local_cli>
+run_local runs one action on the user's Mac: exec (a command), read, write, or list. Use it for work the other tools cannot do: running tests, builds, and scripts, and reading or writing files that are not part of this chat. One action, then wait for the result. When it returns, continue the task. If the user asked for a code change, write the edit. A finished command is not the end of the task. Reads and plain listing run at once. Writes, installs, network use, deletes, and anything outside the open folder wait for the user's approval. If the user rejects, do not try it again unless they ask. Commands run without a shell: no pipes, no redirects, no &&. If you truly need a shell, send bash -lc "..." and it will always ask. No sudo. Do not use it for git, gh, or aws. Use their tools. Edits to files in the open repository go through the normal edit flow, not write. Each result shows the exit code, stdout, stderr, and says if output was cut at 32000 characters. Ask and Plan can only read.

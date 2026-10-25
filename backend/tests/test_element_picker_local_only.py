@@ -74,8 +74,9 @@ def fresh_picker_module():
         pass
 
 
+@pytest.mark.browser
 class TestElementPickerServiceReal:
-    """Real CDP flow — no mocks — proves the actual attach/screenshot/pick/detach path."""
+    """Real CDP flow. Deselected by default: it launches Chromium and sleeps."""
 
     def test_connect_reports_connected(self, headless_chrome, fresh_picker_module):
         result = fresh_picker_module.connect(headless_chrome)

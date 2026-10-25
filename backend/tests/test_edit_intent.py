@@ -14,8 +14,11 @@ if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
 from services.edit_intent import (  # noqa: E402
+    answer_without_edit,
     build_xml_agent_instruction,
+    command_is_the_whole_task,
     message_wants_edit,
+    stop_after_command,
     pending_saved_plan,
     strip_attachment_hint,
 )
@@ -100,6 +103,36 @@ _CASES = [
 ])
 def test_message_wants_edit_table(text, kwargs, expected):
     assert message_wants_edit(text, **kwargs) is expected
+
+
+def test_a_command_with_no_change_verb_is_not_an_edit_job():
+    assert answer_without_edit("Use run_local once. action exec, command: whoami.")
+    assert not answer_without_edit("fix the login bug, then run the tests")
+    # "go update it" is the edit. It must not take the whoami "stop" path.
+    assert not answer_without_edit("go update it")
+    assert message_wants_edit("go update it") is True
+    assert answer_without_edit("don't go update it")
+
+
+def test_stop_after_command_is_decided_once():
+    edit = (
+        "no reason for you to have truncation issues or stopping when i asked "
+        "you to update the UXUI. USe the right tools and make the code edits needed"
+    )
+    assert stop_after_command(edit, True) is False
+    assert stop_after_command("whoami", True) is True
+    assert stop_after_command("whoami", False) is True
+    assert stop_after_command(edit, False) is True
+
+
+def test_a_change_verb_later_in_the_message_is_still_an_edit():
+    text = (
+        "no reason for you to have truncation issues or stopping when i asked "
+        "you to update the UXUI. USe the right tools and make the code edits needed"
+    )
+    assert not command_is_the_whole_task(text)
+    assert command_is_the_whole_task("Use run_local once. action exec, command: whoami.")
+    assert command_is_the_whole_task("don't update it, just run the tests")
 
 
 def test_attachment_hint_is_stripped_before_classification():

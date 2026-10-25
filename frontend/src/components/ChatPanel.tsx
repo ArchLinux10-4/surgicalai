@@ -7,6 +7,7 @@ import { LiveEditCard } from './LiveEditCard'
 import { NewFileCard } from './NewFileCard'
 import { AssistantMarkdown } from './AssistantMarkdown'
 import { stripInternalTags } from '../lib/prepareAssistantMarkdown'
+import { phaseForProgress, phaseLabel, phaseRank } from '../api/streamEvents'
 import { SessionFilesTray } from './SessionFilesTray'
 import { GitHubBranchChip } from './GitHubBranchChip'
 import { RepoChip } from './Repositories'
@@ -22,6 +23,7 @@ import { refreshRepoBranch } from './GitTerminalDock'
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker } from './PlanTracker'
 import { PlanPane } from './PlanPane'
+import { planStatusBadge, planTabKey, shouldQueueAfterStart } from '../lib/planTab'
 import { PlanQuestionsCard } from './PlanQuestionsCard'
 import { normalizeQuestions } from '../lib/planQuestions'
 import { useTaskPolling } from '../hooks/useTaskPolling'
@@ -35,7 +37,8 @@ import { clientLog } from '../lib/clientLog'
 import { ApplyProgressStrip } from './ApplyProgressStrip'
 import type { ApplyProgress } from '../lib/applyProgress'
 import { applyStageLabel } from '../lib/applyProgress'
-import { splitPendingChanges } from '../lib/diffChange'
+import { migrateLocalApplied, splitPendingChanges, supersededKeysByMessage } from '../lib/diffChange'
+import { applyChanges as runApply, applyFailureCopy, notifyApplied } from '../hooks/useApplyChange'
 import { ToolActivityFeed } from './ToolActivityFeed'
 import { finalizeTrail, modelFamily } from '../lib/toolActivity'
 import type { ToolRow } from '../types'
@@ -56,6 +59,7 @@ function snapshotTaskTools(sessionId: string, taskId: string): ToolRow[] | undef
 // Explicit user-selected intent (like Cursor/Copilot/Cline). Ask/Plan stream a
 // plain answer with no edit pipeline; Edit/Agent are the existing code paths.
 type ChatMode = 'edit' | 'ask' | 'plan' | 'agent'
+
 const MODE_META: Record<ChatMode, { icon: typeof AutoFixHigh; label: string; desc: string }> = {
   edit:  { icon: AutoFixHigh,       label: 'Edit',  desc: 'Code edits with QA review' },
   ask:   { icon: LightbulbOutlined, label: 'Ask',   desc: 'Questions & research — no edits' },
@@ -107,9 +111,13 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
   // Fetch applied IDs from DB on mount + re-sync when individual cards apply changes
   useEffect(() => {
     const fetchApplied = () => {
-      api.surgical.getApplied(sessionId)
-        .then(({ applied_ids }: { applied_ids: string[] }) => setAppliedIds(new Set(applied_ids)))
+      migrateLocalApplied(sessionId)
         .catch(() => {})
+        .finally(() => {
+          api.surgical.getApplied(sessionId)
+            .then(({ applied_ids }: { applied_ids: string[] }) => setAppliedIds(new Set(applied_ids)))
+            .catch(() => {})
+        })
     }
     fetchApplied()
     window.addEventListener('sai-applied-refresh', fetchApplied)
@@ -129,6 +137,16 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
   // QA-blocked changes are NOT bulk-applyable: the per-row checkbox disables them
   // (see InlineDiffCard), so Apply All must respect the same gate. We track clean
   // (applyable) vs flagged (QA-blocked) separately so the button can show the split.
+  const latestByFile = new Map<string, string>()
+  for (const msg of pendingMessages) {
+    try {
+      const parsed: SmartResult = JSON.parse(msg.surgical_data)
+      for (const fileData of Object.values(parsed.changes_by_file || {})) {
+        const name = (fileData as any)?.filename
+        if (name) latestByFile.set(name, msg.id)
+      }
+    } catch {}
+  }
   let cleanChanges   = 0
   let flaggedChanges = 0
   const fileSet      = new Set<string>()
@@ -136,6 +154,8 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
     try {
       const result: SmartResult = JSON.parse(msg.surgical_data)
       for (const [fname, fd] of Object.entries(result.changes_by_file || {})) {
+        const name = (fd as any)?.filename || fname
+        if (latestByFile.get(name) !== msg.id) continue
         const { clean, flagged } = splitPendingChanges(
           (fd as any)?.changes || [],
           appliedIds,
@@ -152,7 +172,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
 
   // Nothing clean to bulk-apply → hide the button (flagged changes stay visible
   // on their individual cards for manual review).
-  if (cleanChanges === 0) return null
+  if (cleanChanges + flaggedChanges === 0) return null
 
   const handleApplyAll = async () => {
     const started = Date.now()
@@ -169,6 +189,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
       detail: `Preparing ${cleanChanges} change${cleanChanges !== 1 ? 's' : ''} across ${totalFiles} file${totalFiles !== 1 ? 's' : ''}…`,
       fraction: 0,
     })
+    let wroteDisk = false
     let appliedFiles   = 0
     let failed         = 0
     let appliedChanges = 0
@@ -179,6 +200,15 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
     let fileCursor = 0
 
     const markPromises: Promise<any>[] = []
+    const latestByFile = new Map<string, string>()
+    for (const msg of pendingMessages) {
+      try {
+        const parsed: SmartResult = JSON.parse(msg.surgical_data)
+        for (const fname of Object.keys(parsed.changes_by_file || {})) {
+          if (fname) latestByFile.set(fname, msg.id)
+        }
+      } catch {}
+    }
     try {
       for (const msg of pendingMessages) {
         let result: SmartResult
@@ -188,6 +218,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
         for (const [, fileData] of Object.entries(result.changes_by_file || {})) {
           const fd = fileData as any
           if (!fd?.changes?.length) continue
+          if (fd.filename && latestByFile.get(fd.filename) !== msg.id) continue
           // ── file_id recovery net ──────────────────────────────────────
           // Apply is keyed on the session_files row id. A pipeline producer
           // that never persisted its content emits file_id: "" — this used to
@@ -213,11 +244,12 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
           }
           // Only bulk-apply QA-clean real diffs that are not already applied
           // (DB or local) or skipped — same splitPendingChanges as the label.
-          const { clean: applyChanges } = splitPendingChanges(
+          const { clean, flagged } = splitPendingChanges(
             fd.changes,
             appliedIds,
             sessionId,
           )
+          const applyChanges = [...clean, ...flagged]
           if (applyChanges.length === 0) continue
           // Mutual exclusion with individual diff-card Apply buttons — see
           // fileApplyLock.ts for the proven race this closes. If a diff card
@@ -249,11 +281,15 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
               detail: `File ${fileCursor}/${totalFiles}: applying ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''} to ${fd.filename}…`,
               fraction: fileFracBase + fileFracStep * 0.45,
             })
-            const applied = await api.surgical.applyAll({
-              file_path: fd.filename,
+            const outcome = await runApply({
+              sessionId,
+              filename: fd.filename,
+              fileId: fdFileId,
               changes: applyChanges,
-              file_content: current.content,
+              fileContent: current.content,
+              mode: 'all',
             })
+            const applied = outcome.raw
             if (applied.modified_content) {
               setApplyProgress({
                 stage: 'saving',
@@ -261,8 +297,9 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
                 detail: `File ${fileCursor}/${totalFiles}: saving ${fd.filename}…`,
                 fraction: fileFracBase + fileFracStep * 0.8,
               })
-              await api.sessionFiles.update(sessionId, fdFileId, applied.modified_content,
+              const saved = await api.sessionFiles.update(sessionId, fdFileId, applied.modified_content,
                 `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''}`)
+              if (saved?.written_to_disk) wroteDisk = true
               appliedFiles++
               appliedChanges += applied.applied_count ?? applyChanges.length
               rescuedChanges += applied.rescued_count ?? 0
@@ -282,7 +319,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
               const failedIds = new Set(realFailed.map((f: any) => f.change_id).filter(Boolean))
               failedChanges += realFailed.length
               if (realFailed.length > 0 && !firstFailReason) {
-                firstFailReason = realFailed[0]?.reason || ''
+                firstFailReason = applyFailureCopy(realFailed[0]?.code) || realFailed[0]?.detail || realFailed[0]?.reason || ''
               }
               for (const ch of applyChanges) {
                 if (ch?.id && (alreadyAppliedIds.has(ch.id) || !failedIds.has(ch.id))) {
@@ -347,11 +384,12 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
         if (appliedFiles === 0 && skippedLocked > 0) {
           toast.error(`Nothing applied — every clean file is currently being applied elsewhere. Try again in a moment.`)
         } else {
+          const dest = wroteDisk ? 'Written to disk' : 'Saved to the session copy'
           toast.success(
-            `Applied ${appliedChanges} change${appliedChanges !== 1 ? 's' : ''} across ` +
+            `${dest}. Applied ${appliedChanges} change${appliedChanges !== 1 ? 's' : ''} across ` +
             `${appliedFiles} file${appliedFiles !== 1 ? 's' : ''}${rescuedNote}${lockedNote}`
           )
-          window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
+          notifyApplied()
           if (skippedLocked === 0) setDone(true)
         }
       } else if (failedChanges > 0) {
@@ -360,7 +398,7 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
           `change${failedChanges !== 1 ? 's' : ''} could not be applied${lockedNote}`,
           firstFailReason ? firstFailReason.slice(0, 200) : undefined
         )
-        window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
+        notifyApplied()
       } else {
         toast.error(
           `Applied ${appliedFiles} file(s) — ${failed} file(s) failed entirely${lockedNote}`,
@@ -487,7 +525,7 @@ function CompactMarkerChip({ msg }: { msg: any }) {
   )
 }
 
-function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: string; onRetryWithQA?: (reportText: string) => void }) {
+function MessageImpl({ msg, sessionId, onRetryWithQA, supersededKey = '' }: { msg: any; sessionId: string; onRetryWithQA?: (reportText: string) => void; supersededKey?: string }) {
   const isUser = msg.role === 'user'
   const isSurgical = msg.message_type === 'surgical_result'
   const isNaturalResult = msg.message_type === 'natural_result'
@@ -511,6 +549,23 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
   // "compaction happened" with no way to audit what it did.
   if (msg.message_type === 'compact_marker') {
     return <CompactMarkerChip msg={msg} />
+  }
+
+  if (msg.message_type === 'dropped_stream') {
+    return (
+      <div className="mx-4 my-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5">
+        <p className="text-[13px] text-ink">{msg.content || 'The connection dropped before SurgicalAI answered.'}</p>
+        {onRetryWithQA && msg._retryText && (
+          <button
+            type="button"
+            onClick={() => onRetryWithQA(msg._retryText)}
+            className="mt-2 text-[12px] font-semibold px-2.5 py-1 rounded-lg text-accent border border-accent/30"
+          >
+            Retry
+          </button>
+        )}
+      </div>
+    )
   }
 
   // A clarifying-question turn is often just a fence: the card renders it, so
@@ -593,7 +648,7 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
               {surgicalResult.intent === 'create' ? (
                 <NewFileCard result={surgicalResult} sessionId={sessionId} />
               ) : (
-                <InlineDiffCard result={surgicalResult} sessionId={sessionId} onRetryWithQA={onRetryWithQA} />
+                <InlineDiffCard result={surgicalResult} sessionId={sessionId} onRetryWithQA={onRetryWithQA} supersededIds={supersededKey ? supersededKey.split(',') : []} />
               )}
             </DiffCardBoundary>
           </div>
@@ -660,7 +715,7 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
                   {surgicalResult.intent === 'create' ? (
                     <NewFileCard result={surgicalResult} sessionId={sessionId} />
                   ) : (
-                    <InlineDiffCard result={surgicalResult} sessionId={sessionId} onRetryWithQA={onRetryWithQA} />
+                    <InlineDiffCard result={surgicalResult} sessionId={sessionId} onRetryWithQA={onRetryWithQA} supersededIds={supersededKey ? supersededKey.split(',') : []} />
                   )}
                 </DiffCardBoundary>
               </>
@@ -690,6 +745,17 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
     </div>
   )
 }
+
+const Message = React.memo(MessageImpl, (prev, next) => (
+  prev.sessionId === next.sessionId
+  && prev.onRetryWithQA === next.onRetryWithQA
+  && prev.msg.id === next.msg.id
+  && prev.msg.content === next.msg.content
+  && prev.msg.metadata === next.msg.metadata
+  && prev.msg.surgical_data === next.msg.surgical_data
+  && prev.msg.message_type === next.msg.message_type
+  && prev.supersededKey === next.supersededKey
+))
 
 // ── Streaming bubble with thinking trail ──────────────────
 // ── Claude Thinking Block ─────────────────────────────────
@@ -848,15 +914,6 @@ function PersistentSteps({ steps }: { steps: string[] }) {
 // existing regexes to also recognize the native-tool-loop strings, so the
 // timeline advances in real time as Grok actually works, instead of relying
 // on the old catch-all default. No existing match is removed or narrowed.
-const _ANALYZE_PHASE_RE = /reading \d+ file|parsing file|found \d+ symbol|looking up|loaded:|claude is analyzing|searching codebase|^loading:|🐙 github:|checking history:/i
-const _CODE_PHASE_RE = /preparing code|narrowing:|writing code changes|✍️/i
-const _QA_PHASE_RE = /running qa|QA\s*[✅⚠️🚫⏭]/i
-
-// One-time-per-string debug log for progress text that matches NONE of the
-// three phase regexes above. Purely diagnostic — lets us catch the next
-// phase-text mismatch (e.g. a future GPT/Grok wording change) from real
-// clientLog data instead of another silent "stuck on Analyze" bug report.
-// Deduped + capped so it can never spam on a fast-streaming session.
 const _unmatchedPhaseTextSeen = new Set<string>()
 function _logUnmatchedPhaseText(s: string) {
   if (_unmatchedPhaseTextSeen.has(s) || _unmatchedPhaseTextSeen.size > 200) return
@@ -864,24 +921,21 @@ function _logUnmatchedPhaseText(s: string) {
   clientLog('pipeline_timeline_unmatched_progress', { text: s.slice(0, 200) })
 }
 
-function PipelineTimeline({ steps, isLive = false }: { steps: string[]; isLive?: boolean }) {
+function PipelineTimeline({ steps, isLive = false, phase = 0 }: { steps: string[]; isLive?: boolean; phase?: number }) {
   const filtered = steps.filter(s => s !== 'Thinking...')
-  if (!filtered.length) return null
+  if (!filtered.length && phase === 0) return null
 
-  // Detect furthest phase reached from progress text
-  let reached = 0  // 0=none, 1=analyze, 2=code, 3=qa
+  let reached = phase
   let healed = false
   let qaScore = ''
   let qaIcon = ''
 
   for (const s of filtered) {
-    const isAnalyze = _ANALYZE_PHASE_RE.test(s)
-    const isCode = _CODE_PHASE_RE.test(s)
-    const isQA = _QA_PHASE_RE.test(s)
-    if (isAnalyze) reached = Math.max(reached, 1)
-    if (isCode) reached = Math.max(reached, 2)
-    if (isQA) reached = Math.max(reached, 3)
-    if (!isAnalyze && !isCode && !isQA && s !== 'Working...') _logUnmatchedPhaseText(s)
+    const found = phaseForProgress(s)
+    if (found === 'analyze') reached = Math.max(reached, 1)
+    if (found === 'code') reached = Math.max(reached, 2)
+    if (found === 'qa') reached = Math.max(reached, 3)
+    if (!found && s !== 'Working...') _logUnmatchedPhaseText(s)
     if (/🔁|surgeon retry|auto.fix|fixing blocked/i.test(s))
       healed = true
     const scoreMatch = s.match(/score:\s*(\d+)/)
@@ -950,7 +1004,7 @@ function PipelineTimeline({ steps, isLive = false }: { steps: string[]; isLive?:
   )
 }
 
-function StreamingBubble({ content, progress, thinkingText, isThinking, isBuildingEdit, webSearchLive, sessionId, model }: { content: string; progress: string; progressHistory?: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean; webSearchLive?: { searching: boolean; query?: string } | null; sessionId?: string; model?: string }) {
+function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit, webSearchLive, sessionId, model, phase = 0 }: { content: string; progress: string; progressHistory?: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean; webSearchLive?: { searching: boolean; query?: string } | null; sessionId?: string; model?: string; phase?: number }) {
   const liveOrder = useAppStore((s) => (sessionId ? s.liveEditOrder[sessionId] : undefined))
   const liveMap = useAppStore((s) => (sessionId ? s.liveEdits[sessionId] : undefined))
   const activity = useAppStore((s) => (sessionId ? s.toolActivity[sessionId] : undefined))
@@ -981,6 +1035,7 @@ function StreamingBubble({ content, progress, thinkingText, isThinking, isBuildi
           )}
         </div>
 
+        <PipelineTimeline steps={progressHistory || []} isLive phase={phase} />
         <ToolActivityFeed
           mode="live"
           rows={toolRows}
@@ -988,6 +1043,7 @@ function StreamingBubble({ content, progress, thinkingText, isThinking, isBuildi
           model={model}
           content={content}
           progress={progress}
+          phaseLabel={phaseLabel(phase)}
           isThinking={isThinking}
           isBuildingEdit={isBuildingEdit || liveCards.some(card => card.status === 'writing')}
         />
@@ -1309,6 +1365,7 @@ export function ChatPanel() {
 
   const [progressHistory, setProgressHistory] = useState<string[]>([])
   const [thinkingText, setThinkingText] = useState('')
+  const [streamPhase, setStreamPhase] = useState(0)
   const [isThinking, setIsThinking] = useState(false)
   const [isCompacting, setIsCompacting] = useState(false)
   // ── Claude web-search live indicator (Ask/Plan's global toggle AND the
@@ -1319,7 +1376,6 @@ export function ChatPanel() {
   // note there) so verifying a provider key in SettingsModal updates this
   // picker immediately, without needing a page reload.
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
-  const bottomRef = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const userScrolledUpRef = useRef(false)
   // ── Agent Mode toggle (multi-agent task breakdown) ───────────────────────
@@ -1336,6 +1392,33 @@ export function ChatPanel() {
     return 'edit'
   }
   const [chatMode, setChatMode] = useState<ChatMode>(readChatMode)
+  const planTasks = useAppStore(s => s.planTasks)
+  const planPhase = useAppStore(s => s.planPhase)
+  const planMarkdown = useAppStore(s => s.planMarkdown)
+  const hasPlan = planPhase !== 'idle' && (planTasks.length > 0 || !!(planMarkdown || '').trim())
+  const [planTabHidden, setPlanTabHidden] = useState(false)
+  const [chatView, setChatView] = useState<'chat' | 'plan'>('chat')
+  useEffect(() => {
+    if (!activeSessions) return
+    try {
+      setPlanTabHidden(localStorage.getItem(planTabKey(activeSessions)) === '1')
+    } catch { setPlanTabHidden(false) }
+    setChatView('chat')
+  }, [activeSessions])
+  const openPlanTab = () => {
+    setPlanTabHidden(false)
+    setChatView('plan')
+    if (activeSessions) {
+      try { localStorage.removeItem(planTabKey(activeSessions)) } catch { /* ignore */ }
+    }
+  }
+  const closePlanTab = () => {
+    setPlanTabHidden(true)
+    setChatView('chat')
+    if (activeSessions) {
+      try { localStorage.setItem(planTabKey(activeSessions), '1') } catch { /* ignore */ }
+    }
+  }
   const [modeMenuOpen, setModeMenuOpen] = useState(false)
   // Dismissible Agent+non-Claude warning banner — resets whenever the mode or
   // architect model changes, so it can't stay hidden after the condition that
@@ -1421,18 +1504,53 @@ export function ChatPanel() {
   webResearchAvailableRef.current = webResearchAvailable
   const webResearchEnabledRef = useRef(webResearchEnabled)
   webResearchEnabledRef.current = webResearchEnabled
+  const qaRetryRef = useRef(false)
 
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const abortMapRef = useRef<Map<string, AbortController>>(new Map())
   const sentMessageMapRef = useRef<Map<string, string>>(new Map())
   const thinkingTextRef = useRef('')
+  const tokenRafRef = useRef(0)
+  const thinkingRafRef = useRef(0)
+  const pendingStreamRef = useRef<Map<string, string>>(new Map())
   const progressHistoryRef = useRef<string[]>([])
   // Final, de-duplicated web-search sources for the turn just completed —
   // populated by onDoneSources, attached to the persisted message so a
   // reload shows the same citations (backend already saves + reloads them
   // identically — see routers/chat.py get_messages' `_sources` field).
   const webSearchSourcesRef = useRef<Array<{ url: string; title: string; domain: string; page_age?: string | null }>>([])
+
+  const cancelStreamFrames = () => {
+    if (tokenRafRef.current) {
+      cancelAnimationFrame(tokenRafRef.current)
+      tokenRafRef.current = 0
+    }
+    if (thinkingRafRef.current) {
+      cancelAnimationFrame(thinkingRafRef.current)
+      thinkingRafRef.current = 0
+    }
+    pendingStreamRef.current.clear()
+  }
+
+  const queueStreamingText = (sid: string, text: string) => {
+    pendingStreamRef.current.set(sid, text)
+    if (tokenRafRef.current) return
+    tokenRafRef.current = requestAnimationFrame(() => {
+      tokenRafRef.current = 0
+      pendingStreamRef.current.forEach((value, id) => setSessionStreamingMessage(id, value))
+      pendingStreamRef.current.clear()
+    })
+  }
+
+  const queueThinkingText = (text: string) => {
+    thinkingTextRef.current = text
+    if (thinkingRafRef.current) return
+    thinkingRafRef.current = requestAnimationFrame(() => {
+      thinkingRafRef.current = 0
+      setThinkingText(thinkingTextRef.current)
+    })
+  }
 
   // Manual abort (Escape / Stop button): preserve whatever was streamed so far
   // — including any thinking text — as a real message instead of discarding it.
@@ -1531,7 +1649,9 @@ export function ChatPanel() {
 
   useEffect(() => {
     if (userScrolledUpRef.current) return
-    bottomRef.current?.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' })
+    const el = scrollContainerRef.current
+    if (!el) return
+    el.scrollTo({ top: el.scrollHeight, behavior: isStreaming ? 'auto' : 'smooth' })
   }, [messages, streamingMessage, liveToolCount, liveToolStage, isStreaming])
 
   // Load session files when session changes
@@ -1547,7 +1667,9 @@ export function ChatPanel() {
     // bleed into the new one (e.g. isCompacting disabling input permanently)
     setIsThinking(false)
     setIsCompacting(false)
+    cancelStreamFrames()
     setThinkingText('')
+    setStreamPhase(0)
     thinkingTextRef.current = ''
     webSearchSourcesRef.current = []
     setWebSearchLive(null)
@@ -1680,6 +1802,7 @@ export function ChatPanel() {
   }, [])
 
   const stopStream = (sessionId?: string) => {
+    cancelStreamFrames()
     const sid = sessionId || useAppStore.getState().activeSessions
     if (sid) clearSessionStream(sid)
     else { setIsStreaming(false); setStreamingMessage(''); setStreamProgress('') }
@@ -1728,6 +1851,11 @@ export function ChatPanel() {
         updateAgentTask(event.id, { status: 'blocked', qa_score: event.qa_score, verdict: event.verdict }); break
       case 'task_cancelled':
         updateAgentTask(event.id, { status: 'cancelled' }); break
+      case 'task_skipped':
+        updateAgentTask(event.task_id || event.id, {
+          status: event.status || 'blocked',
+          progress: event.reason || 'This step was skipped',
+        }); break
       case 'tasks_complete':
         setAgentPhase('complete'); break
     }
@@ -1821,11 +1949,11 @@ export function ChatPanel() {
         reconcileOnClose,  // per-task stream closed
         (err) => { streamErr = err },  // defer: reconcileOnClose decides the outcome
         (event) => {
-          if (event.type === 'task_done' || event.type === 'task_blocked' || event.type === 'task_cancelled') {
+          if (event.type === 'task_done' || event.type === 'task_blocked' || event.type === 'task_cancelled' || event.type === 'task_skipped') {
             sawTerminal = true
           }
           handleTaskEvent(event)
-          if (event.type === 'task_done') runNext()
+          if (event.type === 'task_done' || event.type === 'task_skipped') runNext()
           else if (event.type === 'task_blocked' || event.type === 'task_cancelled') {
             // Credit pause leaves siblings pending — surface Resume for them
             // mid-session (session reload already detects pending, but the
@@ -1893,6 +2021,7 @@ export function ChatPanel() {
     setSessionStreaming(sid, true)
     useAppStore.getState().beginToolActivity(sid)
     setSessionStreamProgress(sid, 'Resuming saved edits…')
+    cancelStreamFrames()
     setSessionStreamingMessage(sid, '')
     setProgressHistory(['Resuming saved edits…'])
     progressHistoryRef.current = ['Resuming saved edits…']
@@ -1915,7 +2044,7 @@ export function ChatPanel() {
       (token) => {
         if (useAppStore.getState().activeSessions !== sid) return
         accumulated += token
-        setSessionStreamingMessage(sid, accumulated)
+        queueStreamingText(sid, accumulated)
       },
       (result) => {
         gotResult = true
@@ -1943,6 +2072,7 @@ export function ChatPanel() {
         setCreditPause(null)
       },
       (_full, _model) => {
+        cancelStreamFrames()
         clearSessionStream(sid)
         if (!gotResult) {
           api.chat.getMessages(sid).then(saved => {
@@ -1952,6 +2082,7 @@ export function ChatPanel() {
         abortMapRef.current.delete(sid)
       },
       (err) => {
+        cancelStreamFrames()
         if (useAppStore.getState().activeSessions === sid) setError(err)
         clearSessionStream(sid)
         abortMapRef.current.delete(sid)
@@ -1990,6 +2121,14 @@ export function ChatPanel() {
         if (resp?.ok) {
           setAgentPhase('executing')
           setServerRun({ sid, runId, onFinish })
+        } else if (!shouldQueueAfterStart(resp)) {
+          const phase = useAppStore.getState().planPhase
+          const planned = useAppStore.getState().planTasks
+          const stuck = planned.find(t => t.status === 'blocked' || (t.status === 'pending' && t.result_summary))
+          if (phase === 'blocked' || stuck) {
+            setError(stuck?.result_summary || 'Those steps still need work. Use Retry remaining on the plan.')
+          }
+          finishTaskRun(sid, onFinish, Boolean(stuck))
         } else {
           // Disabled / already running / error — the client queue always works.
           runTaskQueue(sid, runId, tasks, onFinish)
@@ -2045,7 +2184,8 @@ export function ChatPanel() {
     // Round7: Retry-with-QA builds "QA failed for …" and was re-sent with
     // Research still on → dummy web searches + no_edits. Force Research off
     // for that override path (and for a pasted QA report with the same prefix).
-    const _isQaRetry = /^\s*QA failed for\b/i.test(messageText)
+    const _isQaRetry = qaRetryRef.current || /^\s*QA failed for\b/i.test(messageText)
+    qaRetryRef.current = false
     const _sendWebResearch = !_isQaRetry
       && webResearchAvailableRef.current
       && webResearchEnabledRef.current
@@ -2056,7 +2196,7 @@ export function ChatPanel() {
       }, sessionId)
     }
     const ctrl = api.stream.smart(
-      { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id), mode: _sendMode, force_tasks: _sendMode === 'agent', enable_web_research: _sendWebResearch },
+      { session_id: sessionId, message: messageText, file_ids: sessionFiles.map(f => f.id), mode: _sendMode, force_tasks: _sendMode === 'agent', enable_web_research: _sendWebResearch, qa_retry: _isQaRetry },
       (progress) => {
         setSessionStreamProgress(sessionId, progress)
         if (useAppStore.getState().activeSessions !== sessionId) return
@@ -2069,7 +2209,7 @@ export function ChatPanel() {
           return prev
         })
       },
-      (token) => { accumulated += token; setSessionStreamingMessage(sessionId, accumulated) },
+      (token) => { accumulated += token; queueStreamingText(sessionId, accumulated) },
       (result) => {
         clearStaleFileRequest(sessionId)
         gotResult = true
@@ -2082,6 +2222,7 @@ export function ChatPanel() {
           .replace(/<new_file>[\s\S]*$/, '')
           .trim()
 
+        cancelStreamFrames()
         clearSessionStream(sessionId)
         if (useAppStore.getState().activeSessions === sessionId) setIsBuildingEdit(false)
 
@@ -2142,6 +2283,7 @@ export function ChatPanel() {
         const _thinking = thinkingTextRef.current
         const _steps = [...progressHistoryRef.current]
         const _tools = snapshotTools(sessionId)
+        cancelStreamFrames()
         clearSessionStream(sessionId)
         if (useAppStore.getState().activeSessions === sessionId) setIsBuildingEdit(false)
         const _sources = webSearchSourcesRef.current.length ? [...webSearchSourcesRef.current] : undefined
@@ -2159,6 +2301,16 @@ export function ChatPanel() {
             _tools,
             _model: streamModel || 'N/A',
             _sources,
+          } as any)
+        } else if (streamOutcomeRef.current[sessionId] !== 'stopped') {
+          addMessage({
+            id: Date.now().toString() + '_dropped',
+            session_id: sessionId,
+            role: 'assistant',
+            message_type: 'dropped_stream',
+            content: 'The connection dropped before SurgicalAI answered.',
+            created_at: new Date().toISOString(),
+            _retryText: sentMessageMapRef.current.get(sessionId) || '',
           } as any)
         }
         if (isFirst) autoRename()
@@ -2190,6 +2342,7 @@ export function ChatPanel() {
         }
         setWebSearchLive(null)
         if (useAppStore.getState().activeSessions === sessionId) setError(err)
+        cancelStreamFrames()
         clearSessionStream(sessionId)
         if (useAppStore.getState().activeSessions === sessionId) setIsBuildingEdit(false)
         setTimeout(async () => {
@@ -2213,11 +2366,10 @@ export function ChatPanel() {
         if (phase === 'start') {
           setIsThinking(true)
           if (thinkingTextRef.current) {
-            const next = thinkingTextRef.current + '\n\n---\n\n'
-            setThinkingText(next); thinkingTextRef.current = next
+            queueThinkingText(thinkingTextRef.current + '\n\n---\n\n')
           }
         } else if (phase === 'delta') {
-          setThinkingText(prev => { const next = prev + thinkToken; thinkingTextRef.current = next; return next })
+          queueThinkingText(thinkingTextRef.current + thinkToken)
         } else if (phase === 'end') {
           setIsThinking(false)
         }
@@ -2496,6 +2648,14 @@ export function ChatPanel() {
           target: meta?.target,
           summary: meta?.summary,
           cwd: meta?.cwd,
+        })
+      },
+      (phase) => { setStreamPhase(phaseRank(phase)) },
+      (note) => {
+        const id = String(note?.change_id || '')
+        if (!id) return
+        useAppStore.getState().setQaNote(sessionId, id, note.qa_result || {
+          verdict: note.level, summary: note.message, machine_verified: !!note.machine_verified,
         })
       },
     )
@@ -2868,9 +3028,11 @@ export function ChatPanel() {
     setSessionStreaming(sid, true)
     useAppStore.getState().beginToolActivity(sid)
     setSessionStreamProgress(sid, 'Thinking...')
+    cancelStreamFrames()
     setSessionStreamingMessage(sid, '')
     setProgressHistory(['Thinking...'])
     setThinkingText('')
+    setStreamPhase(0)
     setIsThinking(false)
     setIsBuildingEdit(false)
     thinkingTextRef.current = ''
@@ -2900,6 +3062,7 @@ export function ChatPanel() {
     clientLog('chat_handle_send_invoked', { isOverride: overrideText !== undefined, isStreaming, mode, length: payload.length }, activeSessions || '')
 
     if (isStreaming) {
+      qaRetryRef.current = false
       const sid = activeSessions
       if (!sid) return
       const waitingOnFile = !!(fileRequest && fileRequest.sessionId === sid)
@@ -2951,6 +3114,18 @@ export function ChatPanel() {
     const sessionId = await ensureSession()
     launchFresh(sessionId, payload, messages.length === 0)
   }, [input, isStreaming, settings, activeSessions, pastedBlocks, pickedElements, doStream, fileRequest, draftKey, messages.length, launchFresh])
+
+  // handleSend's identity changes with the draft and stream state. Message is
+  // memoized on onRetryWithQA, so a fresh callback would re-render every row
+  // on each keystroke. Keep one stable function for the cards.
+  const handleSendRef = useRef(handleSend)
+  handleSendRef.current = handleSend
+  const stableSend = useCallback((overrideText?: string, mode: 'auto' | 'queue' | 'now' = 'auto') => {
+    if (typeof overrideText === 'string' && /^\s*QA failed for\b/i.test(overrideText)) {
+      qaRetryRef.current = true
+    }
+    return handleSendRef.current(overrideText, mode)
+  }, [])
 
   const gitFollowup = useAppStore(s => s.gitFollowup)
   useEffect(() => {
@@ -3019,7 +3194,7 @@ export function ChatPanel() {
 
   return (
     <div
-      className="flex flex-col h-full relative"
+      className="flex flex-1 flex-col min-h-0 h-full w-full relative"
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
@@ -3052,6 +3227,44 @@ export function ChatPanel() {
           <span className="text-sm font-semibold text-ink">
             SurgicalAI
           </span>
+          {hasPlan && !planTabHidden && (
+            <div className="flex items-center gap-0.5 ml-1">
+              <button
+                type="button"
+                onClick={() => setChatView('chat')}
+                className={`text-[12px] font-semibold px-2 py-0.5 rounded-md ${chatView === 'chat' ? 'bg-overlay text-ink' : 'text-muted hover:text-ink'}`}
+              >
+                Chat
+              </button>
+              <button
+                type="button"
+                onClick={() => setChatView('plan')}
+                className={`text-[12px] font-semibold px-2 py-0.5 rounded-md inline-flex items-center gap-1 ${chatView === 'plan' ? 'bg-overlay text-ink' : 'text-muted hover:text-ink'}`}
+              >
+                Plan
+                {planStatusBadge(planPhase, planTasks) && (
+                  <span className="text-[10px] font-medium text-accent">{planStatusBadge(planPhase, planTasks)}</span>
+                )}
+              </button>
+              <button
+                type="button"
+                onClick={closePlanTab}
+                title="Close plan"
+                className="text-[12px] text-muted hover:text-ink px-1"
+              >
+                ×
+              </button>
+            </div>
+          )}
+          {hasPlan && planTabHidden && (
+            <button
+              type="button"
+              onClick={openPlanTab}
+              className="text-[12px] font-semibold px-2 py-0.5 rounded-md text-muted hover:text-ink border border-border"
+            >
+              Plan
+            </button>
+          )}
         </div>
         <div className="flex items-center gap-1.5">
           {activeSessions && (
@@ -3141,14 +3354,18 @@ export function ChatPanel() {
         </div>
       )}
 
-      {/* Messages */}
-      <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto">
+      {hasPlan && chatView === 'plan' && !planTabHidden ? (
+        <PlanPane placement="tab" />
+      ) : (
+      <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto" style={{ overflowAnchor: 'none' }}>
         {messages.length === 0 && !isStreaming ? (
-          <EmptyState onUpload={() => fileInputRef.current?.click()} />
+          <div className="min-h-full flex flex-col">
+            <EmptyState onUpload={() => fileInputRef.current?.click()} />
+          </div>
         ) : (
-          <div className="py-2">
+          <div className="min-h-full flex flex-col justify-end py-2">
             {messages.map((msg, i) => (
-              <Message key={msg.id || i} msg={msg} sessionId={msg.session_id || activeSessions || ''} onRetryWithQA={handleSend} />
+              <Message key={msg.id || i} msg={msg} sessionId={msg.session_id || activeSessions || ''} onRetryWithQA={stableSend} supersededKey={supersededKeysByMessage(messages)[msg.id] || ''} />
             ))}
             {resumableRun && resumableRun.sid === activeSessions && !isStreaming && (
               <div className="mx-3 mb-2 flex items-center justify-between gap-3 rounded-xl border border-warning/30 bg-warning/10 px-3.5 py-2.5 animate-slide-up">
@@ -3219,7 +3436,7 @@ export function ChatPanel() {
             )}
             <PlanTracker hintOnly emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
             {isStreaming && (streamingMessage || streamProgress) && (
-              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} model={settings?.architect_model} />
+              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} model={settings?.architect_model} phase={streamPhase} />
             )}
             {/* Human-in-the-loop: agent needs a file that isn't in the session */}
             {fileRequest && fileRequest.sessionId === activeSessions && (
@@ -3271,10 +3488,8 @@ export function ChatPanel() {
             )}
           </div>
         )}
-        <div ref={bottomRef} />
       </div>
-
-      <PlanPane />
+      )}
 
       {/* Apply All — single click to apply every pending change across all files */}
       {activeSessions && !isStreaming && (
@@ -3365,11 +3580,24 @@ export function ChatPanel() {
 
         {/* Persistent mode chip — always in direct line of sight before typing,
             so the active mode is never buried in a toolbar dropdown. */}
+        {planPhase === 'implementing' && (
+          <button
+            type="button"
+            onClick={openPlanTab}
+            className="mb-1.5 text-left text-[12px] text-accent font-medium"
+          >
+            Building plan {planTasks.filter(t => t.status === 'done').length}/{planTasks.length} · View plan
+          </button>
+        )}
         <div className="mb-1.5 flex items-center gap-1.5">
-          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold ${MODE_COLOR[effectiveMode].bg} ${MODE_COLOR[effectiveMode].text}`}>
+          <button
+            type="button"
+            onClick={() => { if (effectiveMode === 'plan' && hasPlan) openPlanTab() }}
+            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold ${MODE_COLOR[effectiveMode].bg} ${MODE_COLOR[effectiveMode].text}`}
+          >
             {(() => { const I = MODE_META[effectiveMode].icon; return <I sx={{ fontSize: 11 }} /> })()}
             {MODE_META[effectiveMode].label} Mode
-          </span>
+          </button>
         </div>
 
         {agentRequiresClaudeForCurrentModel && !agentClaudeNoticeDismissed && (

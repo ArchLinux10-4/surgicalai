@@ -627,6 +627,7 @@ def test_wiring_matches_local():
     assert "resolve_local_call" in native
     assert "local_cli_response" in steering
     assert '_streaming_t0 += float(_local_done.get("waited_s") or 0)' in pipeline
+    assert '"local"' in pipeline[pipeline.find("Recover a context-request tag"):pipeline.find("Recover a context-request tag") + 500]
 
 
 def test_wiring_matches_aws():

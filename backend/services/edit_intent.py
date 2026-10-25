@@ -32,8 +32,11 @@ _VERB_ALT = "|".join(_ACTION_VERBS)
 # Verb in instruction position: start of the message, or right after
 # "please" / "can you" / "let's". A verb mentioned later ("why does the
 # add button fail") does not count.
+# "go update it" is an instruction. "go" alone is not a change-verb, so it
+# has to be allowed as the word in front of one. Without that, the terminal
+# follow-up treats the message like "whoami" and tells the model to stop.
 _INSTRUCTION_VERB_RE = re.compile(
-    rf"(?:^|[.!?]\s+|\b(?:{_POLITE})\s+)(?:{_VERB_ALT})\b",
+    rf"(?:^|[.!?]\s+|\b(?:{_POLITE}|go)\s+)(?:{_VERB_ALT})\b",
     re.IGNORECASE,
 )
 
@@ -110,6 +113,46 @@ def _is_question(text: str) -> bool:
 
 def _instruction_verb(text: str) -> bool:
     return _INSTRUCTION_VERB_RE.search(text or "") is not None
+
+
+_ANY_CHANGE_VERB_RE = re.compile(rf"\b(?:{_VERB_ALT})\b", re.IGNORECASE)
+
+
+def command_is_the_whole_task(text: str) -> bool:
+    """True when a finished command is the whole request.
+
+    "whoami" is. "make the code edits" is not, even when the change-verb
+    is not the first word. A terminal result must not tell that second
+    message to stop.
+    """
+    body = strip_attachment_hint(text if isinstance(text, str) else ("" if text is None else str(text)))
+    if not body or _NEGATION_RE.match(body):
+        return True
+    return _ANY_CHANGE_VERB_RE.search(body) is None
+
+
+def stop_after_command(user_request: str, wants_edit: bool) -> bool:
+    """True when a finished command should end the turn.
+
+    Computed once per request. Tool footers and the text-only exit read
+    this instead of classifying the message again.
+    """
+    if not wants_edit:
+        return True
+    return command_is_the_whole_task(user_request)
+
+
+def answer_without_edit(text: str) -> bool:
+    """True when the message does not ask for a code change.
+
+    A command result is then the whole answer. The edit loop must not demand
+    a surgical edit or append the no-code-changes notice. A refusal
+    ("don't update it") stays a non-edit even if a change-verb follows.
+    """
+    body = strip_attachment_hint(text if isinstance(text, str) else ("" if text is None else str(text)))
+    if _NEGATION_RE.match(body):
+        return True
+    return not _instruction_verb(body)
 
 
 def message_wants_edit(text, has_saved_plan=False, is_agent_task=False) -> bool:

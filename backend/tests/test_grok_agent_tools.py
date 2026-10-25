@@ -327,15 +327,32 @@ def test_translate_report_blocked_terminal():
     assert res.produced_any()
 
 
+def test_web_search_guidance_includes_todays_date():
+    import datetime
+    today = datetime.date.today().isoformat()
+    off = gat.build_grok_system_suffix("plan", websearch_enabled=False)
+    on = gat.build_grok_system_suffix("plan", websearch_enabled=True)
+    instruction = gat.build_grok_agent_instruction("edit", websearch_enabled=True)
+    assert today not in off
+    assert f"Today's date is {today}" in on
+    assert "Trust them over memory" in on
+    assert f"Today's date is {today}" in instruction
+
+
 def test_translate_only_first_context_request_dispatched():
     calls = [
         _call("request_search", {"terms": ["a"]}, cid="c1"),
         _call("request_file", {"filenames": ["b.py"]}, cid="c2"),
     ]
-    res = gat.translate_tool_calls(calls)
+    events = []
+    res = gat.translate_tool_calls(calls, dlog=lambda event, **kw: events.append((event, kw)))
     assert res.context_request[0] == "search"      # first wins
     assert res.context_call_id == "c1"
+    assert res.kept_context_tool == "request_search"
     assert any(cid == "c2" for cid, _ in res.errors)  # second recorded as no-op
+    ignored = [kw for event, kw in events if event == "grok_translate_extra_context_ignored"]
+    assert ignored and ignored[0]["kept_tool"] == "request_search"
+    assert ignored[0]["tool_name"] == "request_file"
 
 
 def test_translate_multiple_writes_all_collected():

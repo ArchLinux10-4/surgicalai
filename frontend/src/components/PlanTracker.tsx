@@ -94,6 +94,8 @@ export function PlanTracker({
   const canImplement = (planPhase === 'ready' || planPhase === 'blocked')
     && planTasks.some(t => t.status === 'pending' || t.status === 'blocked')
     && !busy
+  const retryRemaining = planTasks.some(t => t.status === 'done')
+    && planTasks.some(t => t.status === 'pending' || t.status === 'blocked')
 
   const body = displayMarkdown(planMarkdown)
 
@@ -180,7 +182,7 @@ export function PlanTracker({
               title="Build the saved plan in Edit mode"
               className="text-[12px] font-semibold px-3 py-1.5 rounded-lg bg-accent/15 text-accent border border-accent/30 hover:bg-accent/25 disabled:opacity-50"
             >
-              {busy ? 'Building…' : 'Build from plan'}
+              {busy ? 'Building…' : (retryRemaining ? 'Retry remaining' : 'Build from plan')}
             </button>
           )}
           {onToggleCollapsed && (
@@ -237,7 +239,7 @@ export function PlanTracker({
                   {t.status === 'running' && (
                     <div className="text-[11px] text-accent mt-0.5">Working on this</div>
                   )}
-                  {t.status === 'blocked' && (
+                  {(t.status === 'blocked' || (t.status === 'pending' && t.result_summary)) && (
                     <div className="text-[11px] text-danger/90 mt-0.5">
                       {t.result_summary || 'This planned step was not produced.'}
                     </div>

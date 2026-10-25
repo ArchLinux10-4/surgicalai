@@ -1,0 +1,10 @@
+You can read the open local repository.
+Use this for files on disk that are not in this chat yet.
+<repo_request>{"tool":"list_repo_files"}</repo_request>
+<repo_request>{"tool":"read_repo_file","path":"src/app.py"}</repo_request>
+<repo_request>{"tool":"search_repo","terms":["symbol"]}</repo_request>
+<repo_request>{"tool":"git_status"}</repo_request>
+<repo_request>{"tool":"git_diff"}</repo_request>
+<repo_request>{"tool":"git_diff","scope":"worktree","view":"patch","path":"backend/app.py"}</repo_request>
+git_diff shows what changed. With no extra fields it compares your local HEAD to the repository (origin/main, or the repo's default branch, or main) and also shows uncommitted changes. It does not fetch. scope is unstaged, staged, worktree, or range. view is stat (the default) or patch. path limits it to one file. base and head name the two refs for a range, and dots is two or three. Use git_status for just the file list, and GitHub diff_branches only for two branches on GitHub.
+read_repo_file loads the file into this chat. Pass start_line to read a long file from that line. Chat edits are not git-staged; git status includes which chat files are unsaved or changed on disk. You cannot run a shell from this tool.

@@ -145,7 +145,7 @@ def test_native_loop_dispatches_search_then_streams_final_answer():
     call_log = []
 
     def _fake_chat_create(client, model=None, messages=None, temperature=None,
-                          tools=None, stream=None):
+                          tools=None, stream=None, **_extra):
         call_log.append({"messages": list(messages), "tools": tools})
         return rounds[len(call_log) - 1]
 
@@ -196,7 +196,7 @@ def test_native_loop_plain_answer_needs_no_tool_round():
     ]
 
     def _fake_chat_create(client, model=None, messages=None, temperature=None,
-                          tools=None, stream=None):
+                          tools=None, stream=None, **_extra):
         return chunks
 
     agen = gapn.run_grok_ask_plan_native_stream(
@@ -224,7 +224,7 @@ def test_native_loop_report_blocked_yields_reason_as_final_answer():
     ]
 
     def _fake_chat_create(client, model=None, messages=None, temperature=None,
-                          tools=None, stream=None):
+                          tools=None, stream=None, **_extra):
         return chunks
 
     agen = gapn.run_grok_ask_plan_native_stream(
@@ -250,7 +250,7 @@ def test_native_loop_round_cap_yields_budget_message():
     search_args = json.dumps({"terms": ["x"], "reason": "r"})
 
     def _always_tool_call(client, model=None, messages=None, temperature=None,
-                          tools=None, stream=None):
+                          tools=None, stream=None, **_extra):
         return [
             _Chunk(_Delta(tool_calls=[
                 _TCDelta(0, id="call_n", name="request_search", arguments=search_args)])),
@@ -292,7 +292,7 @@ def test_native_loop_emits_tool_named_and_reasoning_progress():
     events_log = []
 
     def _fake_chat_create(client, model=None, messages=None, temperature=None,
-                          tools=None, stream=None):
+                          tools=None, stream=None, **_extra):
         call_log.append(1)
         return rounds[len(call_log) - 1]
 
@@ -320,3 +320,61 @@ def test_native_loop_emits_tool_named_and_reasoning_progress():
     assert "grok_agent_tool_named" in events_log
     assert "grok_agent_reasoning_delta" in events_log
     assert "grok_agent_tool_progress" in events_log
+
+
+def test_plan_request_matches_edit_and_retries_a_dead_stream():
+    """Plan sends tool_choice auto and no temperature, and retries a stream
+    that dies before any output."""
+    class _Boom(Exception):
+        def __init__(self):
+            super().__init__(
+                "Service temporarily unavailable. The model did not respond to this request."
+            )
+            self.status_code = 503
+            self.request_id = "req_test"
+
+    calls = []
+
+    def _chat(client, model=None, messages=None, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            def _bad():
+                raise _Boom()
+                yield None
+            return _bad()
+        return [
+            _Chunk(_Delta(content="The plan is ready.", reasoning_content="Checked the dates.")),
+            _Chunk(finish_reason="stop"),
+        ]
+
+    logged = []
+
+    def _dlog(event, **kw):
+        logged.append((event, kw))
+
+    agen = gapn.run_grok_ask_plan_native_stream(
+        client=object(), chat_model="grok-4.7",
+        all_messages=[{"role": "user", "content": "Plan the model update."}],
+        mode="plan", gh_nat_enabled=False, gh_known_repos=[],
+        symbol_maps_by_name={}, file_content_lookup={},
+        execute_tool_round_fn=lambda **_kw: (_ for _ in ()).throw(AssertionError("no tool")),
+        chat_create_fn=_chat, iter_chunks_fn=_iter_chunks_fn,
+        max_rounds=4, deadline_s=30, session_id="s", user_id="u", dlog=_dlog,
+    )
+    events = _sse_events(_drain(agen))
+    tokens = [e["content"] for e in events if e["type"] == "token"]
+    assert tokens == ["The plan is ready."]
+    assert len(calls) == 2
+    assert calls[0]["tool_choice"] == "auto"
+    assert calls[0]["stream"] is True
+    assert "temperature" not in calls[0]
+    assert any(event == "grok_request_built" and kw.get("temperature_set") is False
+               for event, kw in logged)
+    assert any(event == "grok_round_api_error" and kw.get("phase") == "stream"
+               and kw.get("status_code") == 503 and kw.get("request_id") == "req_test"
+               for event, kw in logged)
+    assert any(event == "grok_ask_plan_pre_output_retry" for event, _kw in logged)
+    assert any(event == "grok_reasoning_preview" and "Checked the dates" in kw.get("preview", "")
+               for event, kw in logged)
+    assert any(event == "grok_ask_plan_native_end" and kw.get("reason") == "answer"
+               for event, kw in logged)

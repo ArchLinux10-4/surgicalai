@@ -139,7 +139,13 @@ def login_path():
         found = (proc.stdout or "").strip()
     except Exception:
         found = ""
-    _PATH_CACHE["value"] = found or os.environ.get("PATH") or "/usr/bin:/bin"
+    found = found or os.environ.get("PATH") or "/usr/bin:/bin"
+    parts = [part for part in found.split(":") if part]
+    home = os.path.expanduser("~")
+    for extra in ("/opt/homebrew/bin", "/usr/local/bin", os.path.join(home, "bin")):
+        if extra not in parts and os.path.isdir(extra):
+            parts.insert(0, extra)
+    _PATH_CACHE["value"] = ":".join(parts)
     return _PATH_CACHE["value"]
 
 
@@ -184,15 +190,26 @@ def run_exec(argv, cwd="", timeout_s=None):
         return {"error": "cwd is not a directory", "status": 400}
     timeout = _clamp_timeout(timeout_s)
     started = time.time()
-    proc = subprocess.Popen(
-        argv,
-        cwd=work,
-        env=child_env(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=work,
+            env=child_env(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        name = os.path.basename(argv[0]) or argv[0]
+        return {
+            "exit_code": 127,
+            "stdout": "",
+            "stderr": name + ": command not found",
+            "timed_out": False,
+            "truncated": False,
+            "duration_ms": int((time.time() - started) * 1000),
+        }
     timed_out = False
     try:
         stdout, stderr = proc.communicate(timeout=timeout)

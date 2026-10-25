@@ -244,26 +244,30 @@ class PickerHandler(BaseHTTPRequestHandler):
         if status:
             self._send(status, payload)
             return
-        if path == "/exec":
-            result = local_agent.run_exec(
-                body.get("argv"),
-                str(body.get("cwd") or ""),
-                body.get("timeout_s"),
-            )
-            audit_path = str(body.get("cwd") or "")
-        elif path == "/read":
-            result = local_agent.read_file(body.get("path"), body.get("offset"), body.get("limit"))
-            audit_path = str(body.get("path") or "")
-        elif path == "/write":
-            result = local_agent.write_file(
-                body.get("path"),
-                body.get("content"),
-                str(body.get("expected_sha") or ""),
-            )
-            audit_path = str(body.get("path") or "")
-        else:
-            result = local_agent.list_dir(body.get("path"))
-            audit_path = str(body.get("path") or "")
+        try:
+            if path == "/exec":
+                result = local_agent.run_exec(
+                    body.get("argv"),
+                    str(body.get("cwd") or ""),
+                    body.get("timeout_s"),
+                )
+                audit_path = str(body.get("cwd") or "")
+            elif path == "/read":
+                result = local_agent.read_file(body.get("path"), body.get("offset"), body.get("limit"))
+                audit_path = str(body.get("path") or "")
+            elif path == "/write":
+                result = local_agent.write_file(
+                    body.get("path"),
+                    body.get("content"),
+                    str(body.get("expected_sha") or ""),
+                )
+                audit_path = str(body.get("path") or "")
+            else:
+                result = local_agent.list_dir(body.get("path"))
+                audit_path = str(body.get("path") or "")
+        except Exception:
+            self._send(500, {"error": "the helper could not run that action"})
+            return
         status = int(result.pop("status", 200))
         local_agent.audit(local_log_path(), {
             "endpoint": path,

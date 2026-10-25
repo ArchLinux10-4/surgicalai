@@ -20,7 +20,7 @@ function clampHeight(px: number, parentH: number, compact: boolean) {
   return Math.min(max, Math.max(min, px))
 }
 
-export function PlanPane({ compact = false }: { compact?: boolean }) {
+export function PlanPane({ compact = false, placement = 'dock' }: { compact?: boolean; placement?: 'dock' | 'tab' }) {
   const planTasks = useAppStore(s => s.planTasks)
   const planPhase = useAppStore(s => s.planPhase)
   const planMarkdown = useAppStore(s => s.planMarkdown)
@@ -41,6 +41,13 @@ export function PlanPane({ compact = false }: { compact?: boolean }) {
   }, [compact, hasTasks, hasDoc])
 
   if (!hasTasks && !hasDoc) return null
+  if (placement === 'tab') {
+    return (
+      <div className="flex flex-1 min-h-0 flex-col overflow-hidden">
+        <PlanTracker docked />
+      </div>
+    )
+  }
 
   const onResizeDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     e.preventDefault()

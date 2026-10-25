@@ -383,8 +383,12 @@ export interface SmartResult {
     file_id: string
     changes: SurgicalChange[]
   }>
-  skipped_changes?: { symbol: string; reason: string }[]
+  skipped_changes?: { symbol: string; filename?: string; reason: string }[]
   new_files?: NewFile[]
   /** Set when chat.py safety_net saved Apply cards after SSE disconnect. */
   recovered?: boolean
+  /** Plan build: one review, no QA scores. */
+  plan_review?: boolean
+  lint_notes?: string[]
+  failed_steps?: { filename: string; symbol: string; reason: string }[]
 }

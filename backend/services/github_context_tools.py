@@ -38,6 +38,7 @@ from services.github_tool_spec import (
     example_call_json,
     tool_by_name,
 )
+from services.limits import GITHUB_READ_MAX_CHARS as _READ_FILE_MAX_CHARS
 
 
 GITHUB_CONTEXT_TOOLS_V2 = anthropic_tool_schemas()
@@ -362,8 +363,7 @@ def _working_branch_missing(exc, tool_name: str) -> bool:
     return tool_name in ("list_commits", "list_files")
 
 
-# read_file paging: serve at most this many characters of file content per call.
-_READ_FILE_MAX_CHARS = 14000
+# read_file paging uses GITHUB_READ_MAX_CHARS.
 # list_files: cap entries so one giant monorepo can't blow up the context.
 _LIST_FILES_MAX_ENTRIES = 400
 

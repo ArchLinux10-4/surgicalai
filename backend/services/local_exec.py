@@ -14,8 +14,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from services.limits import LOCAL_OUTPUT_MAX_CHARS as _OUTPUT_CAP
+
 _FORBIDDEN = set(";|&`$<>")
-_OUTPUT_CAP = 32_000
 _MAX_APPROVAL_CARDS = 4
 _LEVEL_RANK = {"read": 0, "change": 1, "network": 2, "delete": 3, "protected": 4}
 
@@ -539,7 +540,7 @@ def format_local_result(out: dict) -> str:
         if out.get("binary"):
             return "That file is binary. It was not read."
         text = out.get("content") or ""
-        extra = "\nOutput was cut at 32000 characters." if out.get("truncated") else ""
+        extra = f"\nOutput was cut at {_OUTPUT_CAP} characters." if out.get("truncated") else ""
         return f"exit 0\n{text}{extra}"
     if out.get("ok") and "sha" in out:
         verb = "Created" if out.get("created") else "Wrote"
@@ -551,7 +552,7 @@ def format_local_result(out: dict) -> str:
     if out.get("timed_out"):
         lines.append("The command timed out and was stopped.")
     if out.get("truncated"):
-        lines.append("Output was cut at 32000 characters.")
+        lines.append(f"Output was cut at {_OUTPUT_CAP} characters.")
     return "\n".join(lines).strip()
 
 

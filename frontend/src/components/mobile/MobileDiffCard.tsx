@@ -10,7 +10,7 @@ import { api } from '../../api/client'
 import { toast } from '../../lib/toast'
 import { clientLog } from '../../lib/clientLog'
 import { getApplyGate, provenanceEvidence } from '../../lib/qaApplyPolicy'
-import { appliedStorageKey } from '../../lib/diffChange'
+import { applyChanges as runApply, applyFailureCopy, notifyApplied } from '../../hooks/useApplyChange'
 import type { SmartResult, SessionFile } from '../../types'
 import { useAppStore } from '../../stores/appStore'
 
@@ -21,18 +21,9 @@ interface Props {
   setSessionFiles: (f: SessionFile[]) => void
 }
 
-// ── localStorage helpers — mirrors InlineDiffCard exactly ────────────────────
-const appliedKey = appliedStorageKey
-const saveApplied = (sid: string, cid: string) => {
-  try { localStorage.setItem(appliedKey(sid, cid), '1') } catch {}
-}
-const loadApplied = (sid: string, ids: string[]): Record<string, boolean> => {
-  const out: Record<string, boolean> = {}
-  for (const id of ids) {
-    try { if (localStorage.getItem(appliedKey(sid, id)) === '1') out[id] = true } catch {}
-  }
-  return out
-}
+// Applied state is stored on the server. Skip stays local.
+const saveApplied = (_sid: string, _cid: string) => {}
+const loadApplied = (_sid: string, _ids: string[]): Record<string, boolean> => ({})
 
 // ── Mini diff renderer — shows +/- lines with color ──────────────────────────
 function DiffPreview({ diff }: { diff: string }) {
@@ -69,15 +60,18 @@ function DiffPreview({ diff }: { diff: string }) {
 
 // ── Single file change card ───────────────────────────────────────────────────
 function FileCard({
-  filename, fileData, sessionId, onApplied,
+  filename, fileData, sessionId, onApplied, qaStatus = '',
 }: {
   filename: string
   fileData: { filename: string; file_id: string; changes: any[] }
   sessionId: string
   onApplied: () => void
+  qaStatus?: string
 }) {
+  const liveNotes = useAppStore(s => s.qaNotes[sessionId] || {})
   const [expanded, setExpanded]     = useState(false)
   const [applying, setApplying]     = useState(false)
+  const [failedNotes, setFailedNotes] = useState<string[]>([])
   const [undoing, setUndoing]       = useState(false)
   const [activeChange, setActive]   = useState(0)
   const [confOpen, setConfOpen]     = useState(false)
@@ -127,9 +121,8 @@ function FileCard({
     // Option A: never bulk-apply machine hard-stops; LLM-only only if acked.
     const applyChanges = changes.filter((c: any) => {
       const gate = getApplyGate(c?.qa_result)
-      if (gate.kind === 'hard_stop') return false
       if (gate.kind === 'ack_required') return Boolean(llmAck[c?.id])
-      return c?.qa_result?.verdict !== 'blocked'
+      return true
     })
     if (applyChanges.length === 0) {
       const anyHard = changes.some((c: any) => getApplyGate(c?.qa_result).kind === 'hard_stop')
@@ -160,37 +153,45 @@ function FileCard({
     setApplying(true)
     try {
       const current = await api.sessionFiles.get(sessionId, effectiveFileId)
-      const result  = await api.surgical.applyAll({
-        file_path: filename,
+      const outcome = await runApply({
+        sessionId,
+        filename,
+        fileId: effectiveFileId,
         changes: applyChanges,
-        file_content: current.content,
+        fileContent: current.content,
+        mode: 'all',
+        save: true,
+        saveLabel: `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''}`,
       })
-      if (result.modified_content) {
-        await api.sessionFiles.update(sessionId, effectiveFileId, result.modified_content,
-          `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''}`)
-      }
-      // Mark every applied change in localStorage + backend DB
+      const realFailed = outcome.failed.filter(item => item.code !== 'already_applied')
+      const failedIds = new Set(realFailed.map(item => item.id))
       const newApplied: Record<string, boolean> = {}
       for (const ch of applyChanges) {
-        if (ch?.id) {
+        if (ch?.id && !failedIds.has(ch.id)) {
           saveApplied(sessionId, ch.id)
           api.surgical.markApplied(sessionId, ch.id).catch(() => {})
           newApplied[ch.id] = true
         }
       }
       setAppliedMap(prev => ({ ...prev, ...newApplied }))
+      setFailedNotes(realFailed.map(item => item.detail || applyFailureCopy(item.code)))
       const flagged = changes.length - applyChanges.length
       clientLog('mobile_diff_apply_succeeded', {
         filename,
         fileId: effectiveFileId,
-        okCount: applyChanges.length,
+        okCount: outcome.appliedIds.length,
         flaggedSkipped: flagged,
+        failedCount: realFailed.length,
         elapsedMs: Date.now() - started,
       }, sessionId)
+      const dest = outcome.destination === 'disk' ? 'Written to disk' : 'Saved to the session copy'
       toast.success(
-        `Applied ${applyChanges.length} change${applyChanges.length !== 1 ? 's' : ''} to ${filename}` +
-        (flagged > 0 ? ` (${flagged} QA-flagged, skipped)` : '')
+        `${dest}. Applied ${outcome.appliedIds.length} change${outcome.appliedIds.length !== 1 ? 's' : ''} to ${filename}` +
+        (flagged > 0 ? ` (${flagged} QA-flagged, skipped)` : '') +
+        (realFailed.length ? ` (${realFailed.length} failed)` : '')
       )
+      notifyApplied()
+      onApplied()
       onApplied()
     } catch (e: any) {
       const msg = e?.message || 'Apply failed'
@@ -237,7 +238,6 @@ function FileCard({
       // Unmark all changes for this file
       for (const ch of changes) {
         if (ch?.id) {
-          try { localStorage.removeItem(appliedKey(sessionId, ch.id)) } catch {}
           api.surgical.unmarkApplied(sessionId, ch.id).catch(() => {})
         }
       }
@@ -441,6 +441,15 @@ function FileCard({
           </>
         )}
       </div>
+      {failedNotes.length > 0 && (
+        <p className="mx-3 mb-2 text-[11px] text-warning">{failedNotes.join(' ')}</p>
+      )}
+      {qaStatus === 'pending' && changes.some((c: any) => c?.id && !liveNotes[c.id] && !c.qa_result) && (
+        <p className="mx-3 mb-2 text-[11px] text-muted">Checking</p>
+      )}
+      {qaStatus === 'unfinished' && (
+        <p className="mx-3 mb-2 text-[11px] text-warning">QA unfinished</p>
+      )}
 
       {!allApplied && currentChange?.qa_result?.verdict === 'blocked' && (() => {
         const gate = getApplyGate(currentChange.qa_result)
@@ -612,6 +621,7 @@ export function MobileDiffCard({ result, sessionId, sessionFiles, setSessionFile
           filename={filename}
           fileData={fileData as any}
           sessionId={sessionId}
+          qaStatus={(result as any).qa_status || ''}
           onApplied={handleApplied}
         />
       ))}

@@ -4,7 +4,7 @@
  * Render layer is completely separate: no shared JSX with desktop ChatPanel.
  */
 import React, { useState, useRef, useEffect, useCallback, memo } from 'react'
-import { useAppStore } from '../../stores/appStore'
+import { useAppStore, type LiveEditCardState } from '../../stores/appStore'
 import { api, type SteerStream } from '../../api/client'
 import { toast } from '../../lib/toast'
 import { CollapseHint, ComposerPastedTray, UserMessageBody } from '../PastedBlocks'
@@ -16,6 +16,8 @@ const NO_PASTED: PastedBlock[] = []
 const NO_QUEUE: SteerQueueItem[] = []
 import { AssistantMarkdown } from '../AssistantMarkdown'
 import { MobileDiffCard } from './MobileDiffCard'
+import { InlineDiffCard } from '../InlineDiffCard'
+import { LiveEditCard } from '../LiveEditCard'
 import { MobileModeSheet } from './MobileModeSheet'
 import {
   CHAT_MODES,
@@ -36,6 +38,7 @@ import { RepoChip } from '../Repositories'
 import { AgentMissionControl } from '../AgentMissionControl'
 import { PlanTracker } from '../PlanTracker'
 import { PlanPane } from '../PlanPane'
+import { planStatusBadge, planTabKey } from '../../lib/planTab'
 import { AwsTerminalDock } from '../AwsTerminalDock'
 import { LocalTerminalDock } from '../LocalTerminalDock'
 import { GitTerminalDock, refreshRepoBranch } from '../GitTerminalDock'
@@ -50,6 +53,7 @@ import type { SessionFile, SmartResult } from '../../types'
 import { validateFileSize } from '../../utils/fileValidation'
 import { clientLog } from '../../lib/clientLog'
 import { ToolActivityFeed } from '../ToolActivityFeed'
+import { phaseLabel, phaseRank } from '../../api/streamEvents'
 import { finalizeTrail, modelFamily } from '../../lib/toolActivity'
 import type { ToolRow } from '../../types'
 
@@ -119,14 +123,21 @@ function MobileThinkingBlock({ text, isStreaming, label }: { text: string; isStr
 // ── Streaming bubble ─────────────────────────────────────────────────────────
 // Markdown is throttled inside AssistantMarkdown so a token flood does not
 // reparse the whole reply on every chunk.
-function StreamingBubble({ text, progress, isBuildingEdit, thinkingText, isThinking, sessionId, model }: {
+function StreamingBubble({ text, progress, isBuildingEdit, thinkingText, isThinking, sessionId, model, phase = 0 }: {
   text: string; progress: string; isBuildingEdit: boolean
   thinkingText?: string; isThinking?: boolean
-  sessionId?: string; model?: string
+  sessionId?: string; model?: string; phase?: number
 }) {
   const activity = useAppStore(s => (sessionId ? s.toolActivity[sessionId] : undefined))
+  const liveOrder = useAppStore(s => (sessionId ? s.liveEditOrder[sessionId] : undefined))
+  const liveMap = useAppStore(s => (sessionId ? s.liveEdits[sessionId] : undefined))
   const rows = activity?.rows ?? []
-  const quiet = !stripPlanQuestionsFence(text || '', true) && !isBuildingEdit && !thinkingText && !isThinking && rows.length === 0
+  const liveCards: LiveEditCardState[] = []
+  for (const id of liveOrder || []) {
+    const card = liveMap?.[id]
+    if (card) liveCards.push(card)
+  }
+  const quiet = !stripPlanQuestionsFence(text || '', true) && !isBuildingEdit && !thinkingText && !isThinking && rows.length === 0 && liveCards.length === 0
   return (
     <div className="flex items-start gap-2.5 px-4 py-3">
       <div className="w-7 h-7 rounded-full bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)] flex items-center justify-center flex-shrink-0 mt-0.5">
@@ -141,18 +152,25 @@ function StreamingBubble({ text, progress, isBuildingEdit, thinkingText, isThink
           model={model}
           content={text}
           progress={progress}
+          phaseLabel={phaseLabel(phase)}
           isThinking={isThinking}
-          isBuildingEdit={isBuildingEdit}
+          isBuildingEdit={isBuildingEdit || liveCards.some(card => card.status === 'writing')}
         />
         {(thinkingText || isThinking) && (
           <MobileThinkingBlock text={thinkingText || ''} isStreaming={!!isThinking} />
         )}
-        {isBuildingEdit && (
+        {liveCards.length > 0 ? (
+          <div className="flex flex-col">
+            {liveCards.map((card) => (
+              <LiveEditCard key={card.id} card={card} />
+            ))}
+          </div>
+        ) : isBuildingEdit ? (
           <div className="flex items-center gap-1.5 text-[11px] text-warning/80 mb-1.5 px-2 py-1 bg-warning/10 rounded-lg border border-warning/20">
             <span className="w-1.5 h-1.5 rounded-full bg-warning motion-safe:animate-pulse" />
             Preparing code change...
           </div>
-        )}
+        ) : null}
         {text && (
           <AssistantMarkdown text={text} streaming />
         )}
@@ -317,12 +335,16 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
                 Recovered after interruption — apply or re-send
               </div>
             )}
-            <MobileDiffCard
-              result={result}
-              sessionId={sessionId}
-              sessionFiles={sessionFiles}
-              setSessionFiles={setSessionFiles}
-            />
+            {result.plan_review || (result.failed_steps && result.failed_steps.length > 0) ? (
+              <InlineDiffCard result={result} sessionId={sessionId} />
+            ) : (
+              <MobileDiffCard
+                result={result}
+                sessionId={sessionId}
+                sessionFiles={sessionFiles}
+                setSessionFiles={setSessionFiles}
+              />
+            )}
           </>
         )}
       </div>
@@ -554,6 +576,27 @@ export function MobileChatPanel() {
   const setPlanTasks = useAppStore(s => s.setPlanTasks)
   const setPlanRunId = useAppStore(s => s.setPlanRunId)
   const setPlanPhase = useAppStore(s => s.setPlanPhase)
+  const planTasks = useAppStore(s => s.planTasks)
+  const planPhase = useAppStore(s => s.planPhase)
+  const planMarkdown = useAppStore(s => s.planMarkdown)
+  const hasPlan = planPhase !== 'idle' && (planTasks.length > 0 || !!(planMarkdown || '').trim())
+  const [planTabHidden, setPlanTabHidden] = useState(false)
+  const [chatView, setChatView] = useState<'chat' | 'plan'>('chat')
+  useEffect(() => {
+    if (!activeSessions) return
+    try { setPlanTabHidden(localStorage.getItem(planTabKey(activeSessions)) === '1') } catch { setPlanTabHidden(false) }
+    setChatView('chat')
+  }, [activeSessions])
+  const openPlanTab = () => {
+    setPlanTabHidden(false)
+    setChatView('plan')
+    if (activeSessions) { try { localStorage.removeItem(planTabKey(activeSessions)) } catch { /* ignore */ } }
+  }
+  const closePlanTab = () => {
+    setPlanTabHidden(true)
+    setChatView('chat')
+    if (activeSessions) { try { localStorage.setItem(planTabKey(activeSessions), '1') } catch { /* ignore */ } }
+  }
 
   // Keep the task list in sync with the DB-backed source of truth while a run
   // is active (SSE is the instant channel; polling reconciles after drops).
@@ -592,6 +635,7 @@ export function MobileChatPanel() {
 
   const [input, setInput]               = useState('')
   const [isStreaming, setIsStreaming]    = useState(false)
+  const [streamPhase, setStreamPhase]   = useState(0)
   const [streamProgress, setProgress]   = useState('')
   const [streamingMsg, setStreamingMsg] = useState('')
   const [isBuildingEdit, setBuildEdit]  = useState(false)
@@ -625,6 +669,7 @@ export function MobileChatPanel() {
   const tokenRafRef        = useRef(0)
   const textareaRef        = useRef<HTMLTextAreaElement>(null)
   const thinkingTextRef    = useRef('')
+  const webSearchSourcesRef = useRef<Array<{ url: string; title: string; domain: string; page_age?: string | null }>>([])
   const creditPausePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const fileRequestInputRef = useRef<HTMLInputElement>(null)
   const fileRequestRespondRef = useRef<((resp: { filename?: string; content?: string; action?: 'skip' }) => boolean) | null>(null)
@@ -959,6 +1004,7 @@ export function MobileChatPanel() {
     })
 
     setIsStreaming(true)
+    setStreamPhase(0)
     useAppStore.getState().beginToolActivity(sessionId)
     setProgress('Thinking...')
     setStreamingMsg('')
@@ -978,7 +1024,8 @@ export function MobileChatPanel() {
 
     const _rawMode = readChatMode()
     const _sendMode = degradeModeForOffline(_rawMode, isOfflineSettings(settings))
-    const _sendWebResearch = webResearchAvailableFor(settings, isOfflineSettings(settings))
+    const _isQaRetry = /^\s*QA failed for\b/i.test(text)
+    const _sendWebResearch = !_isQaRetry && webResearchAvailableFor(settings, isOfflineSettings(settings))
       && webResearchEnabledRef.current
 
     let accumulated  = ''
@@ -1018,6 +1065,8 @@ export function MobileChatPanel() {
           updateAgentTask(event.id, { status: 'blocked', qa_score: event.qa_score, verdict: event.verdict }); break
         case 'task_cancelled':
           updateAgentTask(event.id, { status: 'cancelled' }); break
+        case 'task_skipped':
+          updateAgentTask(event.task_id || event.id, { status: event.status || 'blocked', progress: event.reason || 'This step was skipped' }); break
         case 'tasks_complete':
           setAgentPhase('complete'); break
       }
@@ -1108,11 +1157,11 @@ export function MobileChatPanel() {
           reconcileOnClose,
           (err) => { streamErr = err },
           (event) => {
-            if (event.type === 'task_done' || event.type === 'task_blocked' || event.type === 'task_cancelled') {
+            if (event.type === 'task_done' || event.type === 'task_blocked' || event.type === 'task_cancelled' || event.type === 'task_skipped') {
               sawTerminal = true
             }
             handleTaskEvent(event)
-            if (event.type === 'task_done') runNext()
+            if (event.type === 'task_done' || event.type === 'task_skipped') runNext()
             else if (event.type === 'task_blocked' || event.type === 'task_cancelled') {
               if (event.type === 'task_blocked' && event.verdict === 'credit_paused') {
                 const remaining = tasks.slice(idx)
@@ -1138,6 +1187,7 @@ export function MobileChatPanel() {
         mode: _sendMode,
         force_tasks: _sendMode === 'agent',
         enable_web_research: _sendWebResearch,
+        qa_retry: _isQaRetry,
       },
       (progress) => {
         setProgress(progress)
@@ -1164,6 +1214,7 @@ export function MobileChatPanel() {
         const _thinking = thinkingTextRef.current
         const _tools = snapshotTools(sessionId)
         const naturalText = result.natural_text || accumulated
+        const hasChanges = !!(result?.changes_by_file && Object.keys(result.changes_by_file).length)
         dropToolActivity(sessionId)
         stopStream()
         setBuildEdit(false)
@@ -1173,14 +1224,15 @@ export function MobileChatPanel() {
           id: Date.now().toString() + '_ai',
           session_id: sessionId,
           role: 'assistant',
-          message_type: 'natural_result',
+          message_type: naturalText.trim() ? 'natural_result' : (hasChanges ? 'surgical_result' : 'natural_result'),
           surgical_data: JSON.stringify(result),
           content: naturalText.trim(),
           created_at: new Date().toISOString(),
           _steps,
           _thinking,
           _tools,
-        })
+          _sources: webSearchSourcesRef.current.length ? [...webSearchSourcesRef.current] : undefined,
+        } as any)
         if (isFirst) autoName()
         else api.chat.getSessions().then(setSessions).catch(() => {})
         api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
@@ -1213,7 +1265,17 @@ export function MobileChatPanel() {
             _steps,
             _thinking,
             _tools,
-          })
+            _sources: webSearchSourcesRef.current.length ? [...webSearchSourcesRef.current] : undefined,
+          } as any)
+        } else {
+          addMessage({
+            id: Date.now().toString() + '_dropped',
+            session_id: sessionId,
+            role: 'assistant',
+            message_type: 'dropped_stream',
+            content: 'The connection dropped before SurgicalAI answered.',
+            created_at: new Date().toISOString(),
+          } as any)
         }
         if (isFirst) autoName()
         else api.chat.getSessions().then(setSessions).catch(() => {})
@@ -1307,6 +1369,11 @@ export function MobileChatPanel() {
           case 'task_progress':
             updateAgentTask(event.id, { progress: event.content })
             break
+          case 'task_thinking': {
+            const existing = useAppStore.getState().agentTasks.find(t => t.id === event.id)?.thinking || ''
+            updateAgentTask(event.id, { thinking: existing + (event.content || '') })
+            break
+          }
           case 'task_done':
             updateAgentTask(event.id, { status: 'done', qa_score: event.qa_score, verdict: event.verdict })
             break
@@ -1343,7 +1410,7 @@ export function MobileChatPanel() {
           setProgress(event.phase === 'query' && 'query' in event ? `Searching: ${event.query}` : 'Searching the web…')
         }
       },
-      undefined, // onDoneSources — deferred to PR2 citations strip
+      (sources) => { webSearchSourcesRef.current = sources || [] },
       // onCreditPaused
       (info) => {
         if (useAppStore.getState().activeSessions !== sessionId) return
@@ -1393,8 +1460,24 @@ export function MobileChatPanel() {
           target: meta?.target,
         })
       },
-      undefined,
-      undefined,
+      (event, reply) => {
+        if (event?.session_id && event.session_id !== sessionId) return
+        const bundle = event?.bundle
+        if (!bundle || typeof bundle !== 'object') {
+          reply({ status: 'unreachable', proposed_runs: [] })
+          return
+        }
+        useAppStore.getState().setPreviewCheck({
+          sessionId,
+          checkId: event.check_id,
+          entry: event.entry,
+          bundle: bundle as any,
+          baselineBundle: (event.baseline_bundle as any) || null,
+          unresolved: event.unresolved || [],
+          reply,
+        })
+      },
+      (ev) => { useAppStore.getState().applyLiveEdit(sessionId, ev) },
       (info, reply) => {
         useAppStore.getState().setMcpApproval({
           sessionId,
@@ -1497,6 +1580,14 @@ export function MobileChatPanel() {
           target: meta?.target,
           summary: meta?.summary,
           cwd: meta?.cwd,
+        })
+      },
+      (phase) => { setStreamPhase(phaseRank(phase)) },
+      (note) => {
+        const id = String(note?.change_id || '')
+        if (!id) return
+        useAppStore.getState().setQaNote(sessionId, id, note.qa_result || {
+          verdict: note.level, summary: note.message, machine_verified: !!note.machine_verified,
         })
       },
     )
@@ -1831,7 +1922,25 @@ export function MobileChatPanel() {
 
   return (
     <div className="flex flex-col h-full bg-base">
-      {/* Messages */}
+      {hasPlan && (
+        <div className="flex items-center gap-1 px-3 py-2 border-b border-border shrink-0">
+          {!planTabHidden ? (
+            <>
+              <button type="button" onClick={() => setChatView('chat')} className={`text-[12px] font-semibold px-2 py-0.5 rounded-md ${chatView === 'chat' ? 'bg-overlay text-ink' : 'text-muted'}`}>Chat</button>
+              <button type="button" onClick={() => setChatView('plan')} className={`text-[12px] font-semibold px-2 py-0.5 rounded-md inline-flex items-center gap-1 ${chatView === 'plan' ? 'bg-overlay text-ink' : 'text-muted'}`}>
+                Plan
+                <span className="text-[10px] text-accent">{planStatusBadge(planPhase, planTasks)}</span>
+              </button>
+              <button type="button" onClick={closePlanTab} className="text-muted px-1" title="Close plan">×</button>
+            </>
+          ) : (
+            <button type="button" onClick={openPlanTab} className="text-[12px] font-semibold px-2 py-0.5 rounded-md border border-border text-muted">Plan</button>
+          )}
+        </div>
+      )}
+      {hasPlan && chatView === 'plan' && !planTabHidden ? (
+        <PlanPane placement="tab" compact />
+      ) : (
       <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto">
         {messages.length === 0 && !isStreaming ? (
           <EmptyHomeScreen />
@@ -1959,6 +2068,7 @@ export function MobileChatPanel() {
                 isThinking={isThinking}
                 sessionId={streamingSessionIdRef.current || activeSessions || undefined}
                 model={settings?.architect_model}
+                phase={streamPhase}
               />
             )}
             {error && (
@@ -1972,8 +2082,7 @@ export function MobileChatPanel() {
         )}
         <div ref={bottomRef} />
       </div>
-
-      <PlanPane compact />
+      )}
 
       {/* Session file drawer — single docked source of truth atop the composer */}
       {activeSessions && hasFiles && (

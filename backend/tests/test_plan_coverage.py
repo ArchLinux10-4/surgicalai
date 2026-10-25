@@ -102,6 +102,47 @@ def test_coverage_missing_and_skipped():
     assert {"filename": "b.py", "symbol": "bar"} in cov["skipped"]
 
 
+def test_missing_file_and_time_budget_stay_pending():
+    planned = [
+        {"filename": "a.py", "symbol": "foo"},
+        {"filename": "b.py", "symbol": "bar"},
+        {"filename": "c.py", "symbol": "baz"},
+    ]
+    result = {
+        "changes_by_file": {},
+        "skipped_changes": [
+            {"filename": "a.py", "symbol": "foo", "reason": "File not found in session: a.py"},
+            {"filename": "b.py", "symbol": "bar", "reason": "Skipped — pipeline time budget reached before this edit could run"},
+            {"filename": "c.py", "symbol": "baz", "reason": "already matches"},
+        ],
+    }
+    cov = compute_plan_coverage(planned, result)
+    assert cov["ok"] is False
+    assert {"filename": "c.py", "symbol": "baz"} in cov["covered"]
+    pending = {(p["filename"], p["symbol"]) for p in cov["pending"]}
+    assert pending == {("a.py", "foo"), ("b.py", "bar")}
+    assert cov["missing"] == []
+
+
+def test_apply_coverage_keeps_failed_skips_pending(plan_db):
+    sid = plan_db["sid"]
+    ev = persist_plan_from_assistant_text(sid, GROK_STYLE)
+    run_id = ev["run_id"]
+    planned = forced_edit_plan_from_run(sid, run_id)
+    cov = compute_plan_coverage(planned, {
+        "changes_by_file": {},
+        "skipped_changes": [
+            {"filename": "Header.tsx", "symbol": "Header", "reason": "File not found in session: Header.tsx"},
+        ],
+    })
+    updated = apply_coverage_to_run(sid, run_id, cov)
+    statuses = {t["symbol"]: t["status"] for t in updated}
+    assert statuses["Header"] == "pending"
+    header = next(t for t in updated if t["symbol"] == "Header")
+    assert "not in this chat" in header["result_summary"]
+    assert latest_plan_run(sid)["phase"] == "ready"
+
+
 def test_coverage_complete_with_extra_allowed():
     planned = [{"filename": "a.py", "symbol": "foo"}]
     result = {

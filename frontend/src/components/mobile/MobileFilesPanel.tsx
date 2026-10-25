@@ -10,6 +10,7 @@ import { toast } from '../../lib/toast'
 import type { SessionFile } from '../../types'
 import { FileFilterTabs, NewBadge, matchesFileFilter, fileCounts, isCreatedFile } from '../../lib/fileClassify'
 import { relativeTimeFromServer } from '../../lib/relativeTime'
+import { migrateLocalApplied } from '../../lib/diffChange'
 
 const EXT_COLORS: Record<string, string> = {
   ts: '#3178c6', tsx: '#3178c6', js: '#f7df1e', jsx: '#61dafb',
@@ -50,24 +51,17 @@ export function MobileFilesPanel() {
   // Load applied change state from backend on mount / session change
   useEffect(() => {
     if (!activeSessions) return
-    // Get all applied change IDs for this session, then cross-reference to files
-    // We check localStorage keys matching sai-applied:{sessionId}: for file-level detection
-    // Also use updated_at heuristic as primary signal (matches desktop logic)
-    try {
-      const keys = Object.keys(localStorage)
-      const prefix = `sai-applied:${activeSessions}:`
-      const hasApplied = new Set<string>()
-      keys.forEach(k => {
-        if (k.startsWith(prefix) && localStorage.getItem(k) === '1') {
-          // Key format: sai-applied:{sessionId}:{changeId}
-          // We can't directly map changeId → fileId from localStorage alone,
-          // so we use updated_at heuristic (same as desktop) supplemented by
-          // the backend getApplied call
-          hasApplied.add(k)
-        }
+    let cancelled = false
+    migrateLocalApplied(activeSessions)
+      .catch(() => {})
+      .finally(() => {
+        api.surgical.getApplied(activeSessions)
+          .then(({ applied_ids }) => {
+            if (!cancelled) setAppliedFileIds(new Set(applied_ids || []))
+          })
+          .catch(() => {})
       })
-      setAppliedFileIds(hasApplied)
-    } catch {}
+    return () => { cancelled = true }
   }, [activeSessions, sessionFiles])
 
   const removeFile = async (fileId: string, filename: string) => {

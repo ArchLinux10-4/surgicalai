@@ -7,9 +7,12 @@ from services.agent_tool_spec import (
     DEFAULT_MAX_TURNS,
     MAX_FILES_PER_REQUEST,
     MAX_SEARCH_TERMS,
+    code_tools_text,
     history_text,
     limits_block,
     local_text,
+    new_symbol_rule,
+    plan_step_lead,
     repo_text,
     scope_block,
 )
@@ -326,6 +329,47 @@ def test_history_text_names_the_three_views():
         assert "diff_branches" in text
     assert "<history_request>" in history_text("tag")
     assert "<" not in history_text("function")
+
+
+def test_code_tools_text_matches_both_forms():
+    rule = new_symbol_rule()
+    for flags in (
+        {},
+        {"repo": True, "local": True, "git": True},
+    ):
+        tag = code_tools_text("tag", **flags)
+        function = code_tools_text("function", **flags)
+        assert "Which tool writes code." in tag and "Which tool writes code." in function
+        assert tag.count("\n") == function.count("\n")
+        assert ("<surgical_edit>" in tag) and ("write_surgical_edit" in function)
+        assert ("<new_file>" in tag) and ("write_new_file" in function)
+        assert ("<edit_plan>" in tag) and ("write_edit_plan" in function)
+        assert "Nothing is written to disk until the user applies it." in tag
+        assert "Nothing is written to disk until the user applies it." in function
+        if flags.get("repo"):
+            assert "read_repo_file" in tag and "read_repo_file" in function
+        else:
+            assert "read_repo_file" not in tag and "request_repo" not in function
+        if flags.get("local"):
+            assert "<local_cli>" in tag and "run_local" in function
+        else:
+            assert "run_local" not in function
+        if flags.get("git"):
+            assert "<git_cli>" in tag and "git_cli" in function
+        else:
+            assert "git_cli" not in function
+    assert NATURAL_SYSTEM.count(rule) == 1
+    assert _assemble_natural("gpt").count(rule) == 1
+    assert _assemble_natural("gemini").count(rule) == 1
+    grok = grok_natural_system() + build_grok_system_suffix("edit")
+    assert grok.count(rule) == 1
+    assert "To add something new" not in build_grok_system_suffix("ask")
+    assert "To add something new" not in build_grok_system_suffix("plan")
+    known = plan_step_lead("Header", "Header.tsx", True)
+    unknown = plan_step_lead("MODEL_CATALOG", "config.py", False)
+    assert known.startswith("Edit the symbol")
+    assert "is new" in unknown and rule in unknown
+    assert "Edit the symbol" not in unknown
 
 
 def test_limits_use_the_real_constants():

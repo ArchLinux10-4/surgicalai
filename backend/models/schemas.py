@@ -26,6 +26,9 @@ class SettingsUpdate(BaseModel):
     web_search_enabled: Optional[bool] = None
     git_agent_tools: Optional[bool] = None
     local_agent_tools: Optional[bool] = None
+    qa_enabled: Optional[bool] = None
+    qa_auto_fix_rounds: Optional[int] = None
+    qa_diff_first: Optional[bool] = None
 
 
 class SettingsResponse(BaseModel):
@@ -46,6 +49,9 @@ class SettingsResponse(BaseModel):
     web_search_enabled: bool = False
     git_agent_tools: bool = False
     local_agent_tools: bool = False
+    qa_enabled: bool = True
+    qa_auto_fix_rounds: int = 0
+    qa_diff_first: bool = True
 
 
 class LocalAllowlistUpdate(BaseModel):

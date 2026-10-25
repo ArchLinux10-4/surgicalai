@@ -162,7 +162,7 @@ def _events(chunks):
 def _run(rounds, execute):
     call_log = []
 
-    def _chat(client, model=None, messages=None, temperature=None, tools=None, stream=None):
+    def _chat(client, model=None, messages=None, temperature=None, tools=None, stream=None, **_extra):
         call_log.append(1)
         return rounds[len(call_log) - 1]
 

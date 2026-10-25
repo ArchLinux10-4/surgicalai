@@ -19,10 +19,10 @@ import { clientLog } from '../lib/clientLog'
 import { getApplyGate, provenanceEvidence } from '../lib/qaApplyPolicy'
 import { parseServerUtc, relativeTimeFromServer } from '../lib/relativeTime'
 import {
-  appliedStorageKey,
   isRealDiffChange,
   skippedStorageKey,
 } from '../lib/diffChange';
+import { applyChanges, applyFailureCopy, notifyApplied } from '../hooks/useApplyChange'
 interface Props {
   result: SmartResult
   sessionId: string
@@ -34,6 +34,7 @@ interface Props {
   // ChatPanel to its real send pathway so this is a genuine resend, not a
   // cosmetic mock.
   onRetryWithQA?: (reportText: string) => void
+  supersededIds?: string[]
 }
 
 // Builds the same information a user would have copy/pasted back into chat
@@ -61,16 +62,11 @@ function buildQARetryReportText(filename: string, change: any): string {
   return lines.join('\n\n')
 }
 
-// --- localStorage helpers for persisting applied/skipped state across refresh ---
-const appliedKey = appliedStorageKey
+// --- localStorage helpers for skipped state. Applied state lives on the server. ---
 const skippedKey = skippedStorageKey
 
-const loadApplied = (sessionId: string, changeIds: string[]): Record<string, boolean> => {
-  const out: Record<string, boolean> = {}
-  for (const id of changeIds) {
-    if (localStorage.getItem(appliedKey(sessionId, id)) === '1') out[id] = true
-  }
-  return out
+const loadApplied = (_sessionId: string, _changeIds: string[]): Record<string, boolean> => {
+  return {}
 }
 
 const loadSkipped = (sessionId: string, changeIds: string[]): Record<string, boolean> => {
@@ -81,12 +77,7 @@ const loadSkipped = (sessionId: string, changeIds: string[]): Record<string, boo
   return out
 }
 
-const saveApplied = (sessionId: string, changeId: string) => {
-  try {
-    localStorage.setItem(appliedKey(sessionId, changeId), '1')
-    localStorage.removeItem(skippedKey(sessionId, changeId))
-  } catch {}
-}
+const saveApplied = (_sessionId: string, _changeId: string) => {}
 
 const saveSkipped = (sessionId: string, changeId: string) => {
   try { localStorage.setItem(skippedKey(sessionId, changeId), '1') } catch {}
@@ -186,7 +177,7 @@ function QABadge({ qa }: { qa: QAResult }) {
                   : 'border-warning/40 bg-warning/10 text-warning'
               }`}>
                 <div className="font-semibold mb-0.5">
-                  {gate.kind === 'hard_stop' ? 'Machine-verified block — Apply hard-stopped' : 'LLM QA only — Apply requires acknowledgment'}
+                  {gate.kind === 'hard_stop' ? 'Machine-verified failure — you can still apply' : 'LLM QA only — Apply requires acknowledgment'}
                 </div>
                 <div>{gate.reasons.join(' · ')}</div>
               </div>
@@ -620,16 +611,19 @@ function DiffBlock({ diff, language: _language }: { diff: string; language: stri
   )
 }
 
-function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeApplied, onRetryWithQA }: {
+function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeApplied, onRetryWithQA, supersededIds = [], qaStatus = '' }: {
   filename: string
   fileData: { filename: string; file_id: string; changes: any[] }
   sessionId: string
   onApplied?: (filename: string, content: string) => void
   onChangeApplied?: (delta?: number) => void
   onRetryWithQA?: (reportText: string) => void
+  supersededIds?: string[]
+  qaStatus?: string
 }) {
   // Filter ghost diffs first — do this before any state so IDs are stable
   const realChanges = fileData.changes.filter(isRealDiffChange)
+  const liveNotes = useAppStore(s => s.qaNotes[sessionId] || {})
 
   const changeIds = realChanges.map((c: any) => c.id)
 
@@ -638,7 +632,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     Object.fromEntries(
       realChanges.map((c: any) => {
         const gate = getApplyGate(c.qa_result)
-        if (gate.kind === 'hard_stop' || gate.kind === 'ack_required') return [c.id, false]
+        if (gate.kind === 'ack_required') return [c.id, false]
         return [c.id, c.qa_result?.verdict !== 'blocked']
       })
     )
@@ -741,7 +735,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   const selectedChanges = pendingChanges.filter((c: any) => {
     if (!checked[c.id]) return false
     const gate = getApplyGate(c.qa_result)
-    if (gate.kind === 'hard_stop') return false
     if (gate.kind === 'ack_required' && !llmAck[c.id]) return false
     return true
   })
@@ -812,13 +805,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     // even if UI state desyncs.
     for (const ch of selectedChanges) {
       const gate = getApplyGate(ch.qa_result)
-      if (gate.kind === 'hard_stop') {
-        clientLog('qa_apply_rejected_hard_stop', {
-          filename, changeId: ch.id, sources: gate.sources,
-        }, sessionId)
-        toast.error('Cannot apply — machine-verified QA block. Use Retry with QA.')
-        return
-      }
       if (gate.kind === 'ack_required' && !llmAck[ch.id]) {
         clientLog('qa_apply_rejected_needs_ack', {
           filename, changeId: ch.id, sources: gate.sources,
@@ -867,6 +853,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       label: applyStageLabel('reading'),
       detail: `Reading ${filename}…`,
     })
+    let destinationNote = 'Saved to the session copy'
     try {
       const fileData2 = await api.sessionFiles.get(sessionId, effectiveFileId)
       if (!originalCode) setOriginalCode(fileData2.content)
@@ -876,20 +863,15 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         label: applyStageLabel('applying'),
         detail: `Applying ${n} change${n !== 1 ? 's' : ''} to ${filename}…`,
       })
-      let result: any
-      if (selectedChanges.length === 1) {
-        result = await api.surgical.apply({
-          file_path: filename,
-          changes: selectedChanges,
-          file_content: fileData2.content,
-        })
-      } else {
-        result = await api.surgical.applyAll({
-          file_path: filename,
-          changes: selectedChanges,
-          file_content: fileData2.content,
-        })
-      }
+      const outcome = await applyChanges({
+        filename,
+        sessionId,
+        fileId: effectiveFileId,
+        changes: selectedChanges,
+        fileContent: fileData2.content,
+        mode: selectedChanges.length === 1 ? 'one' : 'all',
+      })
+      const result = outcome.raw
 
       const newContent = result.modified_content || ''
       if (newContent) {
@@ -902,7 +884,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           const changeLabel = selectedChanges.length === 1
             ? `Applied: ${selectedChanges[0]?.symbol?.full_path || selectedChanges[0]?.symbol?.name || 'change'}`
             : `Applied ${selectedChanges.length} changes`
-          await api.sessionFiles.update(sessionId, effectiveFileId, newContent, changeLabel)
+          const saved = await api.sessionFiles.update(sessionId, effectiveFileId, newContent, changeLabel)
+          destinationNote = saved?.written_to_disk ? 'Written to disk' : 'Saved to the session copy'
           console.debug('[InlineDiffCard] DB updated OK, re-syncing originalCode from DB')
           // Re-fetch originalCode from DB — replicates what page refresh does on mount.
           // This ensures the next round of edits starts from the true DB state.
@@ -957,7 +940,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         const names = failedChanges.map((f: any) => f.symbol || '?').slice(0, 3).join(', ')
         toast.error(
           `${failedChanges.length} change${failedChanges.length !== 1 ? 's' : ''} could not be applied (${names})`,
-          'The file changed since these edits were generated. Re-run the request to regenerate them.'
+          failedChanges.map((f: any) => applyFailureCopy(f.code)).filter((text: string, index: number, all: string[]) => all.indexOf(text) === index).join(' '),
         )
       }
       if (okCount > 0) {
@@ -968,7 +951,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           failedCount: failedChanges.length,
           elapsedMs: Date.now() - started,
         }, sessionId)
-        toast.success(`Applied ${okCount} change${okCount !== 1 ? 's' : ''} to ${filename}`)
+        toast.success(`${destinationNote} · ${okCount} change${okCount !== 1 ? 's' : ''} in ${filename}`)
       }
       setModifiedCode(undefined)  // clear so LivePreview falls back to originalCode (fresh from DB)
       setPreviewKey(k => k + 1)     // force full remount — replicates page refresh
@@ -988,7 +971,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       // Wait for the backend DB writes to land before telling ApplyAllButton
       // (and other cards) to re-check applied state.
       await Promise.all(markPromises)
-      window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
+      notifyApplied()
     } catch (e: any) {
       const errMsg: string = e?.message || 'Apply failed'
       // If code couldn't be found, it was likely already applied — auto-mark it
@@ -1027,7 +1010,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           elapsedMs: Date.now() - started,
         }, sessionId)
         toast.success('These changes appear to already be applied ✓')
-        window.dispatchEvent(new CustomEvent('sai-applied-refresh'))
+        notifyApplied()
       } else {
         clientLog('diff_apply_failed', {
           filename,
@@ -1058,7 +1041,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       let revertedAdded = 0, revertedRemoved = 0
       for (const c of realChanges) {
         if (!applied[c.id]) continue
-        try { localStorage.removeItem(appliedKey(sessionId, c.id)) } catch {}
         try { localStorage.removeItem(skippedKey(sessionId, c.id)) } catch {}
         if (sessionId) api.surgical.unmarkApplied(sessionId, c.id).catch(() => {})
         if (c.diff) {
@@ -1158,7 +1140,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       // Restoring changes file content out from under the applied/skipped
       // bookkeeping (same reasoning as file-level undo above) — clear it.
       for (const c of realChanges) {
-        try { localStorage.removeItem(appliedKey(sessionId, c.id)) } catch {}
         try { localStorage.removeItem(skippedKey(sessionId, c.id)) } catch {}
       }
       setApplied({})
@@ -1194,7 +1175,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       const changesToApply = selectedChanges.length > 0
         ? selectedChanges
         : pendingChanges
-      let result: any
       if (changesToApply.length === 0) {
         // Nothing pending — download current file as-is
         const blob = new Blob([fileData2.content], { type: 'text/plain' })
@@ -1205,11 +1185,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
         toast.success(`Downloaded ${filename}`)
         return
       }
-      if (changesToApply.length === 1) {
-        result = await api.surgical.apply({ file_path: filename, changes: changesToApply, file_content: fileData2.content })
-      } else {
-        result = await api.surgical.applyAll({ file_path: filename, changes: changesToApply, file_content: fileData2.content })
-      }
+      const outcome = await applyChanges({
+        filename,
+        sessionId,
+        changes: changesToApply,
+        fileContent: fileData2.content,
+        mode: changesToApply.length === 1 ? 'one' : 'all',
+      })
+      const result = outcome.raw
       const content = result.modified_content || fileData2.content
       const blob = new Blob([content], { type: 'text/plain' })
       const url = URL.createObjectURL(blob)
@@ -1262,6 +1245,9 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           />
           <Description sx={{ fontSize: 14 }} className="text-accent flex-shrink-0" />
           <span className="text-[13px] font-semibold text-ink truncate">{filename}</span>
+          {realChanges.some((change: any) => supersededIds.includes(change.id)) && (
+            <span className="text-[10px] font-medium text-warning flex-shrink-0">Superseded by a newer edit</span>
+          )}
           <span className="text-[11px] text-muted/70 flex-shrink-0">
             {realChanges.length} change{realChanges.length !== 1 ? 's' : ''}
           </span>
@@ -1419,8 +1405,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           {realChanges.map((change: any, idx: number) => {
             const gate = getApplyGate(change.qa_result)
             const acked = Boolean(llmAck[change.id])
-            const applyLocked =
-              gate.kind === 'hard_stop' || (gate.kind === 'ack_required' && !acked)
+            const applyLocked = gate.kind === 'ack_required' && !acked
             const isApplied = applied[change.id]
             const isSkipped = !isApplied && skipped[change.id]
             const isChecked = checked[change.id] && !applyLocked && !isSkipped
@@ -1483,7 +1468,13 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                       <span className="text-danger">-{removeCount}</span>
                     </span>
                     <ConfidenceBadge change={change} />
-                    {change.qa_result && <QABadge qa={change.qa_result} />}
+                    {(() => {
+                      const qa = liveNotes[change.id] || change.qa_result
+                      if (qa) return <QABadge qa={qa} />
+                      if (qaStatus === 'pending') return <span className="text-[10px] font-medium text-muted">Checking</span>
+                      if (qaStatus === 'unfinished') return <span className="text-[10px] font-medium text-warning">QA unfinished</span>
+                      return null
+                    })()}
                     {change.qa_result && <BlastRadius change={{ qa: change.qa_result }} />}
                     {change.confidence < 7 && !applyLocked && (
                       <span className="flex items-center gap-1 text-[10px] text-warning">
@@ -1539,7 +1530,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                   }`}>
                     <div className="font-semibold mb-1">
                       {gate.kind === 'hard_stop'
-                        ? 'Blocked — machine-verified (Apply disabled)'
+                        ? 'Machine-verified failure'
                         : 'Blocked — LLM QA only'}
                       <span className="font-normal opacity-80"> · {gate.reasons.join(' · ')}</span>
                     </div>
@@ -1552,8 +1543,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     )}
                     {gate.kind === 'hard_stop' ? (
                       <p className="text-muted">
-                        Use <span className="font-semibold text-danger">Retry with QA</span> to regenerate a fix.
-                        Apply stays locked while compile/structural/plan evidence remains.
+                        Apply stays available. The red note is the compile or structural finding.
                       </p>
                     ) : (
                       <label className="flex items-start gap-2 cursor-pointer text-ink">
@@ -1665,16 +1655,86 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   )
 }
 
-export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA }: Props) {
+export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA, supersededIds = [] }: Props) {
   const [showTestRunner, setShowTestRunner] = useState(false)
   const [detailsOpen, setDetailsOpen] = useState(false)
   const [risksOpen, setRisksOpen] = useState(false)
-  const fileEntries = Object.entries(result.changes_by_file)
-  const totalChanges = fileEntries.reduce((sum, [, v]) => sum + v.changes.length, 0)
-  const fileCount = fileEntries.length
-
-  // Track how many changes have been applied to hide the risks alert
   const [appliedCount, setAppliedCount] = useState(0)
+  const fileEntries = Object.entries(result.changes_by_file || {})
+  const totalChanges = fileEntries.reduce((sum, [, v]) => sum + (v.changes?.length || 0), 0)
+  const fileCount = fileEntries.length
+  const failedSteps = result.failed_steps || []
+  const lintNotes = result.lint_notes || []
+  if (result.plan_review || (fileCount === 0 && totalChanges === 0 && failedSteps.length > 0)) {
+    const retryStep = (step: { filename: string; symbol: string; reason: string }) => {
+      onRetryWithQA?.(
+        `Retry this step: ${step.symbol || 'the edit'} in ${step.filename || 'the file'}. ${step.reason}`,
+      )
+    }
+    return (
+      <div className="mt-2 rounded-xl border border-border bg-surface/40">
+        <div className="px-3 py-2.5 border-b border-border/60">
+          <div className="text-[13px] font-semibold text-ink">
+            {result.summary || 'Review'}
+          </div>
+          {lintNotes.length > 0 && (
+            <ul className="mt-2 space-y-1">
+              {lintNotes.map((note, i) => (
+                <li key={i} className="text-[12px] text-warning">{note}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+        {failedSteps.length > 0 && (
+          <ul className="divide-y divide-border/40">
+            {failedSteps.map((step, i) => (
+              <li key={i} className="px-3 py-2 flex items-start gap-2">
+                <div className="min-w-0 flex-1">
+                  <div className="text-[12px] font-medium text-ink">
+                    {step.symbol || 'Step'} in {step.filename || 'a file'}
+                  </div>
+                  <p className="text-[12px] text-muted mt-0.5">{step.reason}</p>
+                </div>
+                {onRetryWithQA && (
+                  <button
+                    type="button"
+                    onClick={() => retryStep(step)}
+                    className="shrink-0 text-[11px] font-semibold px-2 py-1 rounded-lg text-accent border border-accent/30"
+                  >
+                    Retry this step
+                  </button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+        {fileEntries.map(([filename, fileData]) => (
+          <FileChangeCard
+            key={filename}
+            filename={filename}
+            fileData={fileData}
+            sessionId={sessionId}
+            supersededIds={supersededIds}
+            qaStatus={(result as any).qa_status || ''}
+            onApplied={onApplied}
+            onChangeApplied={() => { setShowTestRunner(true) }}
+          />
+        ))}
+        {result.plan_review && failedSteps.length > 0 && onRetryWithQA && (
+          <div className="px-3 py-2 border-t border-border/60">
+            <button
+              type="button"
+              onClick={() => onRetryWithQA('Retry the remaining plan steps.')}
+              className="text-[12px] font-semibold px-3 py-1.5 rounded-lg bg-accent/15 text-accent border border-accent/30"
+            >
+              Retry remaining
+            </button>
+          </div>
+        )}
+      </div>
+    )
+  }
+
   const allApplied = appliedCount >= totalChanges
 
   return (
@@ -1717,6 +1777,8 @@ export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA }: 
           filename={filename}
           fileData={fileData}
           sessionId={sessionId}
+          supersededIds={supersededIds}
+          qaStatus={(result as any).qa_status || ''}
           onApplied={onApplied}
           onChangeApplied={(delta = 1) => { setAppliedCount(n => Math.max(0, n + delta)); setShowTestRunner(true) }}
           onRetryWithQA={onRetryWithQA}

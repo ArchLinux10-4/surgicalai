@@ -62,9 +62,10 @@ def test_sonnet_55_forced_tool_choice_is_downgraded():
 
 
 def test_qa_call_sites_use_sonnet_55():
-    assert f'_qa_model = "{S55}"' in _func_src(_PIPELINE, "run_qa_agent")
-    assert f'_model = "{S55}"' in _func_src(_PIPELINE, "_run_qa_for_new_file")
-    assert f'_qa_model_legacy = "{S55}"' in _func_src(_PIPELINE, "run_qa_for_changes")
+    default = f'get_setting("qa_model", "{S55}")'
+    assert default in _func_src(_PIPELINE, "run_qa_agent")
+    assert default in _func_src(_PIPELINE, "_run_qa_for_new_file")
+    assert default in _func_src(_PIPELINE, "run_qa_for_changes")
     assert f'model="{S55}"' in _func_src(_TASK_RUNNER, "_run_integration_qa")
     assert f'_SECOND_QA_MODEL = "{S55}"' in _SECOND_QA
 

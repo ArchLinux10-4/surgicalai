@@ -615,10 +615,41 @@ def _keys_from_changes_by_file(changes_by_file) -> list[tuple[str, str]]:
     return keys
 
 
-def _keys_from_skipped(skipped) -> list[tuple[str, str]]:
-    keys: list[tuple[str, str]] = []
+def plain_skip_reason(item: dict) -> str:
+    """One sentence a person can act on. No score, no file counts."""
+    filename = (item or {}).get("filename") or "that file"
+    symbol = (item or {}).get("symbol") or "that step"
+    reason = str((item or {}).get("reason") or "")
+    low = reason.lower()
+    if low in ("symbol_not_found", "file_not_parseable") or (
+        "symbol" in low and "not found" in low
+    ):
+        return (
+            f"Could not add `{symbol}` to `{filename}`. "
+            "The edit pointed at the whole file instead of a line next to where it goes."
+        )
+    if "file not found" in low or low == "file_not_in_session":
+        return (
+            f"Could not edit `{filename}`. "
+            "That file is not in this chat and it is not in the open folder."
+        )
+    if "time budget" in low or "deadline" in low:
+        return f"`{symbol}` in `{filename}` did not run. The time budget ran out first."
+    if reason:
+        return f"Could not change `{symbol}` in `{filename}`. {reason}"
+    return f"Could not change `{symbol}` in `{filename}`."
+
+
+def _skip_is_already_done(reason: str) -> bool:
+    """A skip that means the step is finished, not one that failed to run."""
+    text = (reason or "").lower()
+    return any(mark in text for mark in ("already", "no-op", "noop", "no change", "unchanged"))
+
+
+def _skipped_pairs(skipped) -> list[tuple[str, str, str]]:
+    rows: list[tuple[str, str, str]] = []
     if not isinstance(skipped, list):
-        return keys
+        return rows
     for item in skipped:
         if not isinstance(item, dict):
             continue
@@ -628,8 +659,12 @@ def _keys_from_skipped(skipped) -> list[tuple[str, str]]:
         fn = str(item.get("filename") or "")
         symbol = _extract_symbol(item)
         if fn or symbol:
-            keys.append((fn, symbol))
-    return keys
+            rows.append((fn, symbol, reason))
+    return rows
+
+
+def _keys_from_skipped(skipped) -> list[tuple[str, str]]:
+    return [(fn, symbol) for fn, symbol, _reason in _skipped_pairs(skipped)]
 
 
 def compute_plan_coverage(planned_steps: list[dict], result: dict) -> dict:
@@ -652,17 +687,36 @@ def compute_plan_coverage(planned_steps: list[dict], result: dict) -> dict:
         planned.append(pair)
 
     produced = _keys_from_changes_by_file((result or {}).get("changes_by_file"))
-    skipped = _keys_from_skipped((result or {}).get("skipped_changes"))
-    pool = produced + skipped
+    skipped_rows = _skipped_pairs((result or {}).get("skipped_changes"))
+    done_skips = [(fn, sym) for fn, sym, reason in skipped_rows if _skip_is_already_done(reason)]
+    failed_skips = [
+        (fn, sym, reason) for fn, sym, reason in skipped_rows if not _skip_is_already_done(reason)
+    ]
+    pool = produced + done_skips
 
     covered = [p for p in planned if any(_keys_compatible(p, q) for q in pool)]
-    missing = [p for p in planned if p not in covered]
+    pending_rows = []
+    for fn, sym, reason in failed_skips:
+        pair = (fn, sym)
+        if any(_keys_compatible(pair, p) for p in planned) and not any(
+            _keys_compatible(pair, c) for c in covered
+        ):
+            pending_rows.append((fn, sym, reason))
+    pending_pairs = [(fn, sym) for fn, sym, _reason in pending_rows]
+    missing = [
+        p for p in planned
+        if p not in covered and not any(_keys_compatible(p, q) for q in pending_pairs)
+    ]
     extra = [q for q in produced if not any(_keys_compatible(q, p) for p in planned)]
-    skipped_hit = [q for q in skipped if any(_keys_compatible(q, p) for p in planned)]
+    skipped_hit = [q for q in done_skips if any(_keys_compatible(q, p) for p in planned)]
     return {
-        "ok": len(missing) == 0,
+        "ok": len(missing) == 0 and len(pending_rows) == 0,
         "covered": [{"filename": fn, "symbol": sym} for fn, sym in covered],
         "missing": [{"filename": fn, "symbol": sym} for fn, sym in missing],
+        "pending": [
+            {"filename": fn, "symbol": sym, "reason": reason}
+            for fn, sym, reason in pending_rows
+        ],
         "extra": [{"filename": fn, "symbol": sym} for fn, sym in extra],
         "skipped": [{"filename": fn, "symbol": sym} for fn, sym in skipped_hit],
     }
@@ -674,12 +728,27 @@ def apply_coverage_to_run(session_id: str, run_id: str, coverage: dict) -> list[
         _norm_key(m.get("filename") or "", m.get("symbol") or "")
         for m in (coverage or {}).get("missing") or []
     }
+    pending = {}
+    for item in (coverage or {}).get("pending") or []:
+        pending[_norm_key(item.get("filename") or "", item.get("symbol") or "")] = (
+            item.get("reason") or "This step still needs work."
+        )
     updated = []
     for t in list_tasks(session_id, run_id):
         if (t.get("source") or "") != "plan":
             continue
         key = _task_key(t)
-        if key in missing:
+        if key in pending:
+            reason = plain_skip_reason({
+                "filename": t.get("filename") or "",
+                "symbol": t.get("symbol") or "",
+                "reason": pending[key],
+            })
+            update_task(t["id"], status="pending", verdict="", result_summary=reason)
+            t["status"] = "pending"
+            t["verdict"] = ""
+            t["result_summary"] = reason
+        elif key in missing:
             update_task(
                 t["id"],
                 status="blocked",
