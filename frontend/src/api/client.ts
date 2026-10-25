@@ -1,4 +1,5 @@
-import type { StreamChunk, ProjectMemory, PromptTemplate, ImpactAnalysis, MultiFileAnalysis, MemoryPreset } from '../types'
+import type { StreamChunk, ProjectMemory, PromptTemplate, ImpactAnalysis, MultiFileAnalysis, MemoryPreset, ToolActivityEvent } from '../types'
+import { hydrateToolRows } from '../lib/toolActivity'
 
 const BASE = (import.meta.env.VITE_API_URL ?? '') + '/api'
 
@@ -89,6 +90,7 @@ export type SmartStreamHandlers = {
     steps?: { name?: string; ok?: boolean; detail?: string }[]
     verified?: string[]
   }) => void
+  onToolActivity?: (ev: ToolActivityEvent) => void
 }
 
 export type EditLiveEvent = {
@@ -370,7 +372,14 @@ export const api = {
   chat: {
     createSession: (data: any) => request<any>('/chat/sessions', { method: 'POST', body: JSON.stringify(data) }),
     getSessions: () => request<any[]>('/chat/sessions'),
-    getMessages: (sessionId: string) => request<any[]>(`/chat/sessions/${sessionId}/messages`),
+    getMessages: async (sessionId: string) => {
+      const msgs = await request<any[]>(`/chat/sessions/${sessionId}/messages`)
+      return msgs.map((message) => (
+        message && Array.isArray(message._tools)
+          ? { ...message, _tools: hydrateToolRows(message._tools) }
+          : message
+      ))
+    },
     send: (data: any) => request<any>('/chat/send', { method: 'POST', body: JSON.stringify(data) }),
     deleteSession: (id: string) => request(`/chat/sessions/${id}`, { method: 'DELETE' }),
     getActivePlan: (sessionId: string) =>
@@ -443,6 +452,7 @@ export const api = {
       onDone: (fullText: string, model?: string) => void,
       onError: (err: string) => void,
       onCreditPaused?: (info: any) => void,
+      onToolActivity?: (ev: ToolActivityEvent) => void,
     ): AbortController => {
       const controller = new AbortController()
       const tokens: string[] = []
@@ -487,7 +497,8 @@ export const api = {
               } else if (chunk.type === 'done') {
                 if (chunk.model) _modelUsed = chunk.model
                 fireDone()
-              } else if (chunk.type === 'error') onError(chunk.content)
+              }               else if (chunk.type === 'error') onError(chunk.content)
+              else if (chunk.type === 'tool_activity') onToolActivity?.(chunk as ToolActivityEvent)
               else if (chunk.type === 'credit_paused') onCreditPaused?.(chunk.content)
             } catch { /* ignore partial SSE */ }
           }
@@ -624,6 +635,7 @@ export const api = {
       onGitApproval?: SmartStreamHandlers['onGitApproval'],
       onGitStep?: SmartStreamHandlers['onGitStep'],
       onGitResult?: SmartStreamHandlers['onGitResult'],
+      onToolActivity?: SmartStreamHandlers['onToolActivity'],
     ): SteerStream => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -632,8 +644,8 @@ export const api = {
           onThinking, onCompacting, onEditStart, onEditEnd, onTask,
           onFileNeeded, onFileCleared, onWebSearch, onDoneSources,
           onCreditPaused, onPlan, onAwsCli, onAwsApproval, onPreviewCheck,
-          onEditLive, onMcpApproval, onMcpCall, onSteer, onGitCli, onGitApproval,
-          onGitStep, onGitResult,
+          onEditLive, onMcpApproval, onMcpCall, onSteer,           onGitCli, onGitApproval,
+          onGitStep, onGitResult, onToolActivity,
         } = onThinking)
       }
       const controller = attachSteer(new AbortController(), () => sendToServer)
@@ -705,6 +717,7 @@ export const api = {
           }
           else if (chunk.type === 'git_step') onGitStep?.(chunk)
           else if (chunk.type === 'git_result') onGitResult?.(chunk)
+          else if (chunk.type === 'tool_activity') onToolActivity?.(chunk as ToolActivityEvent)
           else if (chunk.type === 'aws_approval_needed') {
             onAwsApproval?.(chunk.command || '', (resp) => {
               if (!sendToServer) return false
@@ -814,6 +827,7 @@ export const api = {
       // Anthropic credit exhaustion mid agent task (parity with smart()).
       onCreditPaused?: (info: any) => void,
       onSteer?: (event: { type: string; id?: string; text?: string }) => void,
+      onToolActivity?: (ev: ToolActivityEvent) => void,
     ): SteerStream => {
       let sendToServer: ((msg: unknown) => void) | null = null
       const controller = attachSteer(new AbortController(), () => sendToServer)
@@ -828,6 +842,7 @@ export const api = {
           if (chunk.type === 'smart_result') onResult(JSON.parse(chunk.content))
           else if (chunk.type === 'done') fireDone()
           else if (chunk.type === 'error') onError(chunk.content)
+          else if (chunk.type === 'tool_activity') onToolActivity?.(chunk as ToolActivityEvent)
           else if (chunk.type === 'credit_paused') {
             const info = (chunk.content && typeof chunk.content === 'object')
               ? chunk.content

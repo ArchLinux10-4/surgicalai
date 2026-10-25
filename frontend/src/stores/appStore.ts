@@ -1,5 +1,6 @@
 import { create } from 'zustand'
-import type { ChatSession, ChatMessage, FileContent, SurgicalAnalysis, AppSettings, FileNode, PromptTemplate, ImpactAnalysis, GitHubTargetState } from '../types'
+import type { ChatSession, ChatMessage, FileContent, SurgicalAnalysis, AppSettings, FileNode, PromptTemplate, ImpactAnalysis, GitHubTargetState, ToolActivityEvent, ToolRow } from '../types'
+import { applyToolEvent, stopRunning } from '../lib/toolActivity'
 import { api } from '../api/client'
 import type { EditLiveEvent } from '../api/client'
 import { clientLog } from '../lib/clientLog'
@@ -244,6 +245,10 @@ interface AppState {
   liveEdits: Record<string, Record<string, LiveEditCardState>>
   liveEditOrder: Record<string, string[]>
   applyLiveEdit: (sessionId: string, ev: EditLiveEvent) => void
+  toolActivity: Record<string, { startedAt: number; rows: ToolRow[] }>
+  beginToolActivity: (sessionId: string) => void
+  applyToolActivity: (sessionId: string, ev: ToolActivityEvent) => void
+  stopToolActivity: (sessionId: string) => void
 
   // Multi-file
   multiFileMode: boolean
@@ -517,14 +522,41 @@ export const useAppStore = create<AppState>((set) => ({
     const { [sessionId]: _, ...rest } = state.streamingSessions
     const { [sessionId]: _edits, ...liveRest } = state.liveEdits
     const { [sessionId]: _order, ...orderRest } = state.liveEditOrder
+    const { [sessionId]: _tools, ...toolRest } = state.toolActivity || {}
     const display = state.activeSessions === sessionId
       ? { isStreaming: false, streamingMessage: '', streamProgress: '' }
       : {}
-    return { streamingSessions: rest, liveEdits: liveRest, liveEditOrder: orderRest, ...display }
+    return { streamingSessions: rest, liveEdits: liveRest, liveEditOrder: orderRest, toolActivity: toolRest, ...display }
   }),
 
   liveEdits: {},
   liveEditOrder: {},
+  toolActivity: {},
+  beginToolActivity: (sessionId) => set((state) => ({
+    toolActivity: {
+      ...state.toolActivity,
+      [sessionId]: { startedAt: Date.now(), rows: [] },
+    },
+  })),
+  applyToolActivity: (sessionId, ev) => set((state) => {
+    if (!sessionId || !ev?.id) return state
+    const prev = state.toolActivity[sessionId] || { startedAt: Date.now(), rows: [] as ToolRow[] }
+    const rows = applyToolEvent(prev.rows, ev, Date.now())
+    if (rows === prev.rows && state.toolActivity[sessionId]) return state
+    return {
+      toolActivity: {
+        ...state.toolActivity,
+        [sessionId]: { startedAt: prev.startedAt, rows },
+      },
+    }
+  }),
+  stopToolActivity: (sessionId) => set((state) => {
+    const prev = state.toolActivity[sessionId]
+    if (!prev) return state
+    const rows = stopRunning(prev.rows, Date.now())
+    if (rows === prev.rows) return state
+    return { toolActivity: { ...state.toolActivity, [sessionId]: { ...prev, rows } } }
+  }),
   applyLiveEdit: (sessionId, ev) => set((state) => {
     if (!sessionId || !ev?.id) return state
     const prev = state.liveEdits[sessionId] || {}

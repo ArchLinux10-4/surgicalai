@@ -76,6 +76,22 @@ def test_save_task_message_persists_and_reloads_sources():
     assert saved["content"] == "researched answer"
 
 
+def test_save_task_message_persists_and_reloads_tool_trail():
+    """A task's tool rows must reload as `_tools`, or a refresh hides what the agent did."""
+    sid = _make_session()
+    trail = [{
+        "id": "t1", "kind": "search", "label": "Searching the code",
+        "done_label": "Searched the code", "target": "login",
+        "status": "done", "ok": True, "ms": 40, "summary": "3 hits", "preview": "",
+    }]
+    chat_router._save_task_message(
+        sid, "looked it up", None, model="grok-4.5", tool_trail=trail,
+    )
+    msgs = chat_router.get_messages(sid, request=fake_request())
+    saved = [m for m in msgs if m["role"] == "assistant"][-1]
+    assert saved.get("_tools") == trail
+
+
 def test_save_task_message_empty_sources_list_is_noop():
     """An empty list (research ran but found nothing / wasn't enabled) must
     not add a `web_search_sources` key at all — mirrors the falsy-check

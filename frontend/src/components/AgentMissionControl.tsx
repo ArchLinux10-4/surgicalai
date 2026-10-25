@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import type { AgentTask, AgentTaskStatus } from '../types'
+import { ToolActivityFeed } from './ToolActivityFeed'
 
 /**
  * AgentMissionControl — dual-agent mission control panel.
@@ -298,6 +299,10 @@ function ExecutorCard({
   cancelOne: (t: AgentTask) => void
   cancelAll: () => void
 }) {
+  const activityRows = useAppStore(s => {
+    const sid = s.activeSessions
+    return sid ? s.toolActivity[sid]?.rows : undefined
+  })
   return (
     <div
       className={`rounded-xl border bg-surface/70 backdrop-blur-sm overflow-hidden transition-colors ${
@@ -365,6 +370,14 @@ function ExecutorCard({
                 <div className="text-[11px] text-muted/80 truncate mt-0.5">
                   {t.progress}
                 </div>
+              )}
+              {t.status === 'running' && (
+                <ToolActivityFeed
+                  compact
+                  mode="live"
+                  rows={(activityRows || []).filter(row => row.taskId === t.id)}
+                  max={3}
+                />
               )}
               {t.thinking && (
                 <TaskThinking text={t.thinking} isLive={t.status === 'running'} />
