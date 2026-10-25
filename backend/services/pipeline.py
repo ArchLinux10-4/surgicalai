@@ -4438,6 +4438,7 @@ def _ask_plan_build_tool_instructions(
     working_branch=None,
     repo_enabled: bool = False,
     git_enabled: bool = False,
+    local_enabled: bool = False,
 ) -> str:
     """
     Composes the Ask/Plan tool-instructions system-prompt block from
@@ -4500,6 +4501,10 @@ def _ask_plan_build_tool_instructions(
         from services.agent_tool_spec import git_cli_text as _git_cli_text
         tag_blocks.append(_git_cli_text("tag"))
 
+    if local_enabled:
+        from services.agent_tool_spec import local_text as _local_text
+        tag_blocks.append(_local_text("tag"))
+
     if websearch_enabled:
         tag_blocks.append(
             '<web_search_request>{"query": "what to look up", "reason": "why"}'
@@ -4519,7 +4524,7 @@ def _ask_plan_build_tool_instructions(
     from services.agent_tool_spec import scope_block as _scope_block
     _scope = _scope_block(
         session_files=has_files, repo=repo_enabled, github=gh_enabled,
-        web=websearch_enabled, git=git_enabled, form="tag",
+        web=websearch_enabled, git=git_enabled, local=local_enabled, form="tag",
     )
     if _scope:
         parts.append(_scope)
@@ -4547,6 +4552,7 @@ def _ask_plan_strip_tool_tags(text: str) -> str:
     text = re.sub(r'<history_request>.*?</history_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<aws_cli>.*?</aws_cli>', '', text, flags=re.DOTALL)
     text = re.sub(r'<git_cli>.*?</git_cli>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<local_cli>.*?</local_cli>', '', text, flags=re.DOTALL)
     text = re.sub(r'<web_search_request>.*?</web_search_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<mcp_request>.*?</mcp_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<repo_request>.*?</repo_request>', '', text, flags=re.DOTALL)
@@ -4733,6 +4739,8 @@ def _ask_plan_execute_tool_round(
     # applies the read-only gate, the three-command stop, and file capture.
     # Git is not run here. Ask/Plan loops call resolve_git_call, which
     # applies the read-only gate and the three-command stop.
+    # The local Mac tool is not run here. Ask/Plan loops call resolve_local_call,
+    # which applies the read-only gate and the three-command stop.
     return tool_parts
 
 
@@ -4911,9 +4919,18 @@ async def run_chat_stream(
             _git_tools = False
             _dlog("ask_plan_git_gate_error", session_id=session_id, user_id=user_id,
                   error=str(_git_gate_err)[:200])
+    _local_tools = False
+    if not _ask_plan_is_ollama:
+        try:
+            from services.local_exec import local_available as _local_on
+            _local_tools = bool(_local_on(user_id))
+        except Exception as _local_gate_err:
+            _local_tools = False
+            _dlog("ask_plan_local_gate_error", session_id=session_id, user_id=user_id,
+                  error=str(_local_gate_err)[:200])
     _ask_plan_tools_enabled = (
         (_ask_plan_has_files or _gh_nat_enabled or _aws_connected
-         or _oa_search_enabled or _ask_plan_mcp or _repo_tools)
+         or _oa_search_enabled or _ask_plan_mcp or _repo_tools or _local_tools)
         and not _ask_plan_is_ollama
     )
     _dlog("ask_plan_tools_gate_evaluated", session_id=session_id, user_id=user_id,
@@ -5003,7 +5020,8 @@ async def run_chat_stream(
             mcp_guidance=_ask_plan_mcp_guidance,
             working_branch=_gh_session_target,
             repo_enabled=_repo_tools,
-            git_enabled=_git_tools))
+            git_enabled=_git_tools,
+            local_enabled=_local_tools))
         _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
               model=chat_model, num_files=len(file_content_lookup),
               github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
@@ -5114,6 +5132,7 @@ async def run_chat_stream(
                 mcp_enabled=_ask_plan_mcp,
                 repo_enabled=_repo_tools,
                 git_enabled=_git_tools,
+                local_enabled=_local_tools,
                 openai_client=_oa_search_client,
                 web_search_sources=_web_search_sources_final,
                 client_inbox=client_inbox,
@@ -5141,6 +5160,7 @@ async def run_chat_stream(
             _tool_round = 0
             _aws_calls = 0
             _git_calls = 0
+            _local_calls = 0
             _mcp_calls = 0
             _oa_budget = None
             if _ask_plan_websearch:
@@ -5197,6 +5217,10 @@ async def run_chat_stream(
                     re.search(r'<git_cli>\s*(.*?)\s*</git_cli>', _round_text, re.DOTALL)
                     if _git_tools else None
                 )
+                _local_match = (
+                    re.search(r'<local_cli>\s*(.*?)\s*</local_cli>', _round_text, re.DOTALL)
+                    if _local_tools else None
+                )
                 _wr_match = (
                     re.search(
                         r'<web_search_request>\s*(.*?)\s*</web_search_request>',
@@ -5213,13 +5237,13 @@ async def run_chat_stream(
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
                 _ask_plan_no_more_tools = (
                     not _sr_match and not _fr_match and not _gr_match and not _rr_match
-                    and not _hr_match and not _aws_match and not _git_match and not _wr_match
+                    and not _hr_match and not _aws_match and not _git_match and not _local_match and not _wr_match
                     and not _mcp_match
                 )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _git_match or _wr_match or _mcp_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _git_match or _local_match or _wr_match or _mcp_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5297,6 +5321,35 @@ async def run_chat_stream(
                     if _aws_done.get("counted"):
                         _aws_calls += 1
                     _tool_parts = [_aws_done.get("note") or ""]
+                    _end = _ask_tracker.end(_tool_parts[0])
+                    if _end:
+                        yield sse(_end)
+                elif _local_match:
+                    from services.local_exec import resolve_local_call as _resolve_local
+                    _local_done = {"note": "", "counted": False, "run": False}
+                    _ev = _ask_tracker.start("local", (_local_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
+                    async for _local_ev in _resolve_local(
+                        (_local_match.group(1) or "").strip(),
+                        mode or "ask",
+                        _local_calls,
+                        client_inbox,
+                        user_id=user_id,
+                        dlog=_dlog,
+                        session_id=session_id or "",
+                        root=((_repo_ctx or {}).get("root_path") or ""),
+                    ):
+                        if _local_ev.get("type") == "local_done":
+                            _local_done = _local_ev
+                        else:
+                            _o = _ask_tracker.observe(_local_ev)
+                            if _o:
+                                yield sse(_o)
+                            yield sse(_local_ev)
+                    if _local_done.get("counted"):
+                        _local_calls += 1
+                    _tool_parts = [_local_done.get("note") or ""]
                     _end = _ask_tracker.end(_tool_parts[0])
                     if _end:
                         yield sse(_end)
@@ -5549,6 +5602,7 @@ async def run_chat_stream(
             _tool_round = 0
             _aws_calls = 0
             _git_calls = 0
+            _local_calls = 0
             _mcp_calls = 0
             if steer_inbox is not None:
                 yield sse({"type": "steer_ready"})
@@ -5659,6 +5713,10 @@ async def run_chat_stream(
                     re.search(r'<git_cli>\s*(.*?)\s*</git_cli>', _round_text, re.DOTALL)
                     if _git_tools else None
                 )
+                _local_match = (
+                    re.search(r'<local_cli>\s*(.*?)\s*</local_cli>', _round_text, re.DOTALL)
+                    if _local_tools else None
+                )
                 _mcp_match = (
                     re.search(
                         r'<mcp_request>\s*(.*?)\s*</mcp_request>',
@@ -5669,12 +5727,12 @@ async def run_chat_stream(
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
                 _ask_plan_no_more_tools = (
                     not _sr_match and not _fr_match and not _gr_match and not _rr_match
-                    and not _hr_match and not _aws_match and not _git_match and not _mcp_match
+                    and not _hr_match and not _aws_match and not _git_match and not _local_match and not _mcp_match
                 )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _git_match or _mcp_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _git_match or _local_match or _mcp_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5752,6 +5810,35 @@ async def run_chat_stream(
                     if _aws_done.get("counted"):
                         _aws_calls += 1
                     _tool_parts = [_aws_done.get("note") or ""]
+                    _end = _ask_tracker.end(_tool_parts[0])
+                    if _end:
+                        yield sse(_end)
+                elif _local_match:
+                    from services.local_exec import resolve_local_call as _resolve_local
+                    _local_done = {"note": "", "counted": False, "run": False}
+                    _ev = _ask_tracker.start("local", (_local_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
+                    async for _local_ev in _resolve_local(
+                        (_local_match.group(1) or "").strip(),
+                        mode or "ask",
+                        _local_calls,
+                        client_inbox,
+                        user_id=user_id,
+                        dlog=_dlog,
+                        session_id=session_id or "",
+                        root=((_repo_ctx or {}).get("root_path") or ""),
+                    ):
+                        if _local_ev.get("type") == "local_done":
+                            _local_done = _local_ev
+                        else:
+                            _o = _ask_tracker.observe(_local_ev)
+                            if _o:
+                                yield sse(_o)
+                            yield sse(_local_ev)
+                    if _local_done.get("counted"):
+                        _local_calls += 1
+                    _tool_parts = [_local_done.get("note") or ""]
                     _end = _ask_tracker.end(_tool_parts[0])
                     if _end:
                         yield sse(_end)
@@ -18601,6 +18688,23 @@ async def run_natural_pipeline_stream(
         if _aws_connected:
             TAG_DEFS["aws"] = {"open": "<aws_cli>", "close": "</aws_cli>"}
 
+        _local_tools = False
+        _local_guidance = ""
+        if not str(arch_model or "").startswith("ollama:"):
+            try:
+                from services.local_exec import local_available as _local_on
+                from services.agent_tool_spec import local_text as _local_text
+                _local_tools = bool(_local_on(user_id))
+                if _local_tools:
+                    TAG_DEFS["local"] = {"open": "<local_cli>", "close": "</local_cli>"}
+                    if not _is_grok_model(arch_model):
+                        _local_guidance = "\n" + _local_text("tag") + "\n"
+            except Exception as _local_nat_err:
+                _local_tools = False
+                _local_guidance = ""
+                _dlog("natural_local_setup_error", session_id=session_id, user_id=user_id,
+                      error=str(_local_nat_err)[:200])
+
         # ── History-search tag (Edit + Agent Mode) ──────────────────────────
         # Lets the agent/edit loop pull an OLDER/original version of a
         # session file from session_file_versions (already-existing,
@@ -18742,6 +18846,7 @@ async def run_natural_pipeline_stream(
                     mcp_enabled=_natural_mcp,
                     repo_enabled=bool(_repo_ctx),
                     git_enabled=_git_tools,
+                    local_enabled=_local_tools,
                     dlog=_dlog, session_id=session_id, user_id=user_id)
                 _gpt_system_text += _grok_sys_suffix
                 _dlog("natural_grok_system_suffix_appended",
@@ -19095,7 +19200,7 @@ async def run_natural_pipeline_stream(
         # freely use every stop tag. GPT's API only accepts the first four
         # (_agent_stop_seqs[:4] below). "preview" is last, so GPT captures it
         # in the stream parser instead of via a stop sequence, same as aws.
-        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "git", "preview", "repo"]
+        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "git", "local", "preview", "repo"]
         _agent_stop_seqs = (
             [TAG_DEFS[t]["close"] for t in _stop_tag_order if t in TAG_DEFS]
             if _tag_stop_enabled else []
@@ -19122,6 +19227,8 @@ async def run_natural_pipeline_stream(
                 return ("aws", (_block or "").strip())
             if _kind == "git":
                 return ("git", (_block or "").strip())
+            if _kind == "local":
+                return ("local", (_block or "").strip())
             if _kind == "preview":
                 return ("preview", (_block or "").strip())
             if _kind == "websearch":
@@ -19161,6 +19268,7 @@ async def run_natural_pipeline_stream(
                 _repo_text_fn("tag", _repo_ctx) + "\n" if _repo_ctx else ""
             ),
             git_guidance=_git_guidance,
+            local_guidance=_local_guidance,
         )
 
         # ── Grok-only: native-tool agent instruction (Claude/GPT keep the
@@ -19176,6 +19284,7 @@ async def run_natural_pipeline_stream(
                 websearch_enabled=_oa_search_enabled,
                 mcp_enabled=_natural_mcp,
                 repo_enabled=bool(_repo_ctx),
+                local_enabled=_local_tools,
                 dlog=_dlog, session_id=session_id, user_id=user_id)
 
         # Research is off, but the user clearly asked for a web search.
@@ -19615,7 +19724,7 @@ async def run_natural_pipeline_stream(
                                                 # starts with JSON ('[' or '{'). An AWS command
                                                 # starts with "aws" or "intent". context_tag_looks_real
                                                 # is that check. Anything else is prose.
-                                                if (_tag_name in ("search", "filereq", "github", "history", "aws", "git", "mcp")
+                                                if (_tag_name in ("search", "filereq", "github", "history", "aws", "git", "mcp", "local")
                                                         and not _ctx_shape_checked):
                                                     _ctx_stripped = tag_buf.lstrip()
                                                     if _ctx_stripped:
@@ -19826,6 +19935,7 @@ async def run_natural_pipeline_stream(
                         mcp_enabled=_natural_mcp,
                         repo_enabled=bool(_repo_ctx),
                         git_enabled=_git_tools,
+                        local_enabled=_local_tools,
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
                     # Plan-first gate decides tool_choice: forced write_edit_plan
@@ -20009,7 +20119,7 @@ async def run_natural_pipeline_stream(
                                             # Claude branch above — same proven bug, session
                                             # 71737af0: a model quoting its own tag syntax in
                                             # prose must not trap the rest of its real text). ──
-                                            if (_tag_name in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp")
+                                            if (_tag_name in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp", "local")
                                                     and not _ctx_shape_checked):
                                                 _ctx_stripped = tag_buf.lstrip()
                                                 if _ctx_stripped:
@@ -21139,6 +21249,39 @@ async def run_natural_pipeline_stream(
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
                         {"role": "user", "content": _aws_note + "\nContinue the task."},
+                    ]
+                    continue
+
+                if _kind == "local":
+                    from services.local_exec import resolve_local_call as _resolve_local
+                    _local_body = _data if isinstance(_data, str) else str(_data or "")
+                    _local_mode = "agent" if is_agent_task else "edit"
+                    _local_done = {"note": "", "run": False}
+                    async for _local_ev in _resolve_local(
+                        _local_body, _local_mode, 0, client_inbox,
+                        user_id=user_id, dlog=_dlog, session_id=session_id or "",
+                        root=((_repo_ctx or {}).get("root_path") or ""),
+                    ):
+                        if _local_ev.get("type") == "local_done":
+                            _local_done = _local_ev
+                        else:
+                            _o = _tool_tracker.observe(_local_ev)
+                            if _o:
+                                yield sse(_o)
+                            yield sse(_local_ev)
+                    _streaming_t0 += float(_local_done.get("waited_s") or 0)
+                    _local_note = _local_done.get("note") or ""
+                    if not _local_done.get("run"):
+                        if _local_note == "The user rejected this command.":
+                            _local_note += " Do not run it again unless they ask."
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content": _local_note},
+                        ]
+                        continue
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": _assistant_echo},
+                        {"role": "user", "content": _local_note + "\nContinue the task."},
                     ]
                     continue
 

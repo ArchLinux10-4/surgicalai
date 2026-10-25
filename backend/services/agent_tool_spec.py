@@ -27,6 +27,7 @@ _NAMES = {
         "blocked": "<blocked>",
         "history": "<history_request>",
         "git": "<git_cli>",
+        "local": "<local_cli>",
     },
     "function": {
         "file": "request_file",
@@ -40,6 +41,7 @@ _NAMES = {
         "blocked": "report_blocked",
         "history": "request_history",
         "git": "git_cli",
+        "local": "run_local",
     },
 }
 
@@ -59,7 +61,7 @@ def default_max_turns() -> int:
         return DEFAULT_MAX_TURNS
 
 
-def scope_block(*, session_files=False, repo=False, github=False, web=False, git=False, form="tag") -> str:
+def scope_block(*, session_files=False, repo=False, github=False, web=False, git=False, local=False, form="tag") -> str:
     """Where each enabled read tool looks. Empty unless at least two are on."""
     n = _names(form)
     lines = []
@@ -81,6 +83,11 @@ def scope_block(*, session_files=False, repo=False, github=False, web=False, git
         lines.append(
             f"{n['git']}: git and pull requests on the open folder. "
             "One command at a time. Push, pull requests, and merging wait for approval."
+        )
+    if local:
+        lines.append(
+            f"{n['local']}: commands and files on this Mac. "
+            "Reads run immediately. Changes wait for approval."
         )
     if len(lines) < 2:
         return ""
@@ -319,7 +326,7 @@ def repo_text(form="tag", repo=None) -> str:
         f"{where}\n{when}\n{examples}\n{diff}\n"
         "read_repo_file loads the file into this chat. Chat edits are not git-staged; "
         "git status includes which chat files are unsaved or changed on disk. "
-        "You cannot run a shell."
+        "You cannot run a shell from this tool."
     )
 
 
@@ -368,6 +375,41 @@ def git_cli_text(form="tag") -> str:
         'Example: {"command": "git switch -c surgicalai/short-name"}. '
         'Example: {"command": "gh pr create --title \\"Title\\" --body \\"Why\\" --base main"}. '
         'Example: {"command": "gh pr merge 123 --merge"}. '
+        + rules
+    )
+
+
+def local_text(form="tag") -> str:
+    """Mac terminal and file tool. Tag form is for Claude, GPT, and Gemini."""
+    rules = (
+        "run_local runs one action on the user's Mac: exec (a command), read, write, or list. "
+        "Use it for work the other tools cannot do: running tests, builds, and scripts, and "
+        "reading or writing files that are not part of this chat. One action per turn, then "
+        "wait for the result. "
+        "Reads and plain listing run at once. Writes, installs, network use, deletes, and "
+        "anything outside the open folder wait for the user's approval. If the user rejects, "
+        "do not try it again unless they ask. "
+        "Commands run without a shell: no pipes, no redirects, no &&. If you truly need a "
+        "shell, send bash -lc \"...\" and it will always ask. No sudo. "
+        "Do not use it for git, gh, or aws. Use their tools. "
+        "Edits to files in the open repository go through the normal edit flow, not write. "
+        "Each result shows the exit code, stdout, stderr, and says if output was cut at "
+        "32000 characters. Ask and Plan can only read."
+    )
+    if form == "tag":
+        return (
+            "How to call the local Mac tool. Emit exactly one tag and then stop. "
+            "The open tag is exactly <local_cli> with no attributes.\n"
+            "<local_cli>\naction: exec\nls\n</local_cli>\n"
+            "<local_cli>\naction: read\npath: README.md\nlines: 1-80\n</local_cli>\n"
+            "<local_cli>\naction: write\npath: scratch-note.txt\n---\nhello\n</local_cli>\n"
+            + rules
+        )
+    return (
+        "Call run_local with action exec, read, write, or list. "
+        'Example: {"action": "exec", "command": "ls"}. '
+        'Example: {"action": "read", "path": "README.md", "lines": "1-80"}. '
+        'Example: {"action": "write", "path": "scratch-note.txt", "content": "hello"}. '
         + rules
     )
 

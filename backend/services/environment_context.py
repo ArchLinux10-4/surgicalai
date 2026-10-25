@@ -59,11 +59,21 @@ def environment_block(conn, session_id: str) -> str:
         lines.append("GitHub reads and pushes are available only when that account is connected.")
     else:
         lines.append("This folder is not linked to a GitHub repository.")
+    shell_line = "You cannot run other shell commands."
+    try:
+        from services.local_exec import local_available
+        if local_available():
+            shell_line = (
+                "run_local can run commands and read or write files on this Mac. "
+                "Reads run immediately. Changes wait for approval."
+            )
+    except Exception:
+        shell_line = "You cannot run other shell commands."
     lines.append(
         "You can read files in this repository. Edits are staged in the chat and "
         "are not written to disk until the user applies them. "
         "When git_cli is available, use it for git and pull requests. "
-        "You cannot run other shell commands."
+        + shell_line
     )
     if branch:
         lines.append(f"Current branch: {branch}. Call git_status for uncommitted changes.")

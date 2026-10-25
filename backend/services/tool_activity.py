@@ -16,7 +16,7 @@ MAX_PREVIEW = 400
 
 _KINDS = {
     "file", "search", "repo", "github", "history", "preview", "web",
-    "git", "aws", "mcp", "edit", "qa", "step",
+    "git", "aws", "mcp", "edit", "qa", "step", "local",
 }
 
 _REDACTIONS = (
@@ -207,6 +207,14 @@ def _describe(kind, data):
         if isinstance(parsed, dict):
             cmd = str(parsed.get("command") or "")
         target = _clip(cmd, MAX_TARGET)
+    elif ck == "local":
+        label, done = "Running a local command", "Ran a local command"
+        cmd = parsed if isinstance(parsed, str) else ""
+        if isinstance(parsed, dict):
+            cmd = str(parsed.get("command") or parsed.get("path") or "")
+        lines = [part.strip() for part in cmd.splitlines() if part.strip()]
+        shown = next((part for part in lines if not part.lower().startswith("action:")), "")
+        target = _clip(shown or cmd, MAX_TARGET)
     elif ck == "aws":
         label, done = "Running an AWS command", "Ran an AWS command"
         cmd = parsed if isinstance(parsed, str) else ""
@@ -431,9 +439,9 @@ class ToolTracker:
             if not rid:
                 return None
             kind = ev.get("type")
-            if kind in ("git_approval_needed", "aws_approval_needed", "mcp_approval_needed"):
+            if kind in ("git_approval_needed", "aws_approval_needed", "mcp_approval_needed", "local_approval_needed"):
                 return {"type": EVENT_TYPE, "id": rid, "phase": "update", "status": "waiting"}
-            if kind in ("git_cli", "aws_cli", "mcp_call"):
+            if kind in ("git_cli", "aws_cli", "mcp_call", "local_cli"):
                 if ev.get("exit_code") is not None:
                     try:
                         self._exit[rid] = int(ev.get("exit_code")) == 0

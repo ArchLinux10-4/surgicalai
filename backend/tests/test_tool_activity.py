@@ -73,6 +73,18 @@ def test_tracker_approval_then_running_and_close_all():
     assert tracker.end("should be a no-op") is None
 
 
+def test_local_activity_waits_then_runs():
+    tracker = ToolTracker(agent="claude", id_prefix="")
+    start = tracker.start("local", "action: exec\nnpm test")
+    assert start["label"] == "Running a local command"
+    assert "npm test" in start["target"]
+    waiting = tracker.observe({"type": "local_approval_needed", "command": "npm test"})
+    running = tracker.observe({"type": "local_cli", "exit_code": 0, "stdout": "ok"})
+    assert waiting["status"] == "waiting"
+    assert running["status"] == "running"
+    assert waiting["id"] == start["id"] == running["id"]
+
+
 def test_trail_merges_caps_and_stops_open_rows():
     trail = ToolTrail()
     trail.observe({"type": "tool_activity", "id": "t1", "phase": "start", "kind": "search", "label": "Searching the code"})

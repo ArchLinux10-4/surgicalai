@@ -842,25 +842,6 @@ async def resolve_local_call(
 
 
 def local_agent_guidance() -> str:
-    """Prompt text. Callers must not paraphrase a shorter version."""
-    return (
-        "run_local runs one action on the user's Mac: exec (a command), read, write, or list. "
-        "Use it for work the other tools cannot do: running tests, builds, and scripts, and "
-        "reading or writing files that are not part of this chat. One action per turn, then "
-        "wait for the result.\n"
-        "Reads and plain listing run at once. Writes, installs, network use, deletes, and "
-        "anything outside the open folder wait for the user's approval. If the user rejects, "
-        "do not try it again unless they ask.\n"
-        "Commands run without a shell: no pipes, no redirects, no &&. If you truly need a "
-        "shell, send bash -lc \"...\" and it will always ask. No sudo.\n"
-        "Do not use it for git, gh, or aws. Use their tools.\n"
-        "Edits to files in the open repository go through the normal edit flow, not write.\n"
-        "Each result shows the exit code, stdout, stderr, and says if output was cut at "
-        "32000 characters. Ask and Plan can only read.\n"
-        "How to call it. Emit exactly one tag and then stop. The open tag is exactly "
-        "<local_cli> with no attributes.\n"
-        "<local_cli>\naction: exec\ncwd: /absolute/open/folder\nls\n</local_cli>\n"
-        "<local_cli>\naction: read\npath: README.md\nlines: 1-80\n</local_cli>\n"
-        "<local_cli>\naction: write\npath: scratch-note.txt\n---\nhello\n</local_cli>\n"
-        "Grok does not emit that tag. Call run_local with action exec, read, write, or list."
-    )
+    """Prompt text for tag models. Callers must not paraphrase a shorter version."""
+    from services.agent_tool_spec import local_text
+    return local_text("tag")

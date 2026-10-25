@@ -108,6 +108,7 @@ TOOL_REQUEST_SEARCH = "request_search"
 TOOL_REQUEST_GITHUB = "request_github"
 TOOL_AWS_CLI = "aws_cli"
 TOOL_GIT_CLI = "git_cli"
+TOOL_LOCAL = "run_local"
 TOOL_REQUEST_HISTORY = "request_history"
 TOOL_REQUEST_PREVIEW = "request_preview"
 TOOL_REQUEST_WEB_SEARCH = "request_web_search"
@@ -401,6 +402,65 @@ def _schema_git_cli():
     }
 
 
+def _local_body(args):
+    """Render a run_local call as the line format resolve_local_call parses."""
+    action = str((args or {}).get("action") or "").strip().lower()
+    if action == "exec":
+        lines = ["action: exec"]
+        cwd = str(args.get("cwd") or "").strip()
+        if cwd:
+            lines.append("cwd: " + cwd)
+        lines.append(str(args.get("command") or "").strip())
+        return "\n".join(lines)
+    if action == "write":
+        lines = ["action: write", "path: " + str(args.get("path") or "").strip()]
+        sha = str(args.get("expected_sha") or "").strip()
+        if sha:
+            lines.append("expected_sha: " + sha)
+        lines.append("---")
+        content = args.get("content")
+        lines.append(content if isinstance(content, str) else "")
+        return "\n".join(lines)
+    lines = ["action: " + action, "path: " + str(args.get("path") or "").strip()]
+    span = str(args.get("lines") or "").strip()
+    if span:
+        lines.append("lines: " + span)
+    return "\n".join(lines)
+
+
+def _schema_local():
+    return {
+        "type": "function",
+        "function": {
+            "name": TOOL_LOCAL,
+            "description": (
+                "Run one action on the user's Mac. Follow the local rules in the system prompt.\n"
+                "action is exec, read, write, or list. exec needs command. "
+                "read, write, and list need path. write also needs content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["exec", "read", "write", "list"],
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "The command for action exec. No pipes or redirects.",
+                    },
+                    "path": {"type": "string", "description": "File or folder for read, write, or list."},
+                    "cwd": {"type": "string", "description": "Working directory for exec. Defaults to the open folder."},
+                    "content": {"type": "string", "description": "Full new file text for action write."},
+                    "expected_sha": {"type": "string", "description": "Optional sha from a previous read."},
+                    "lines": {"type": "string", "description": "Optional line range for read, such as 1-80."},
+                },
+                "required": ["action"],
+            },
+        },
+    }
+
+
 def _schema_aws_cli():
     return {
         "type": "function",
@@ -574,8 +634,8 @@ def _schema_request_repo():
 def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=False,
                            aws_enabled=False, preview_enabled=False,
                            websearch_enabled=False, mcp_enabled=False,
-                           repo_enabled=False, git_enabled=False, dlog=None,
-                           session_id="", user_id=""):
+                           repo_enabled=False, git_enabled=False, local_enabled=False,
+                           dlog=None, session_id="", user_id=""):
     """Return the OpenAI-style tool schemas Grok should be offered for ``mode``.
 
     * ``edit`` / ``agent`` — full write + read toolset + report_blocked.
@@ -608,6 +668,8 @@ def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=Fa
         tools.append(_schema_aws_cli())
     if git_enabled:
         tools.append(_schema_git_cli())
+    if local_enabled:
+        tools.append(_schema_local())
     if preview_enabled and m in _EDIT_MODES:
         tools.append(_schema_request_preview())
     if websearch_enabled:
@@ -644,6 +706,7 @@ TOOL_PROGRESS_LABELS = {
     TOOL_REQUEST_MCP: "Calling MCP…",
     TOOL_REQUEST_REPO: "Reading the repository…",
     TOOL_GIT_CLI: "Running git…",
+    TOOL_LOCAL: "Running on this Mac…",
     TOOL_REPORT_BLOCKED: "Reporting blocked…",
 }
 
@@ -1001,6 +1064,19 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
             _log(dlog, "grok_translate_git_cli", session_id=session_id,
                  user_id=user_id, tool_call_id=cid, command=_git_cmd[:180])
 
+        elif name == TOOL_LOCAL:
+            _local_rendered = _local_body(args)
+            if res.context_request is None:
+                res.context_request = ("local", _local_rendered)
+                res.context_call_id = cid
+            else:
+                fb = "Only one local action is handled per turn."
+                res.errors.append((cid, fb))
+                res.results_by_id[cid] = fb
+            _log(dlog, "grok_translate_local", session_id=session_id,
+                 user_id=user_id, tool_call_id=cid,
+                 command=_local_rendered[:180])
+
         elif name == TOOL_AWS_CLI:
             # Do not run yet. resolve_aws_call decides auto-run, refusal, or a card.
             _aws_cmd = str(args.get("command") or "").strip()
@@ -1266,7 +1342,7 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
                              wants_edit=True, preview_enabled=False,
                              preflight_enabled=False, websearch_enabled=False,
                              mcp_enabled=False, repo_enabled=False,
-                             git_enabled=False):
+                             git_enabled=False, local_enabled=False):
     """Function-tool contract for Grok. No XML tag names, and no instruction to ignore them.
 
     The main system text Grok receives is the tag-free head plus the code-quality
@@ -1279,7 +1355,8 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     ]
     scope = _scope_block(
         session_files=True, repo=bool(repo_enabled), github=bool(github_enabled),
-        web=bool(websearch_enabled), git=bool(git_enabled), form="function",
+        web=bool(websearch_enabled), git=bool(git_enabled),
+        local=bool(local_enabled), form="function",
     )
     if scope:
         lines.append(scope)
@@ -1313,6 +1390,9 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     if git_enabled:
         from services.agent_tool_spec import git_cli_text
         lines.append("• git_cli — " + git_cli_text("function"))
+    if local_enabled:
+        from services.agent_tool_spec import local_text
+        lines.append("• run_local — " + local_text("function"))
     if preview_enabled and m in _EDIT_MODES:
         lines.append(
             "• request_preview — render a pending .tsx/.jsx edit and read "
@@ -1373,7 +1453,8 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
                                  session_id="", user_id="",
                                  wants_edit=True, preview_enabled=False,
                                  preflight_enabled=False, websearch_enabled=False,
-                                 mcp_enabled=False, repo_enabled=False):
+                                 mcp_enabled=False, repo_enabled=False,
+                                 local_enabled=False):
     """Native-tool replacement for the pipeline's XML turn suffix.
 
     ``wants_edit`` False is a plain question on an Edit/Agent turn: same
@@ -1440,6 +1521,11 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
             "Call request_web_search to search the public internet for current "
             "information. The query is sent to a search engine: do not include "
             "code, file names, or secrets."
+        )
+    if local_enabled:
+        parts.append(
+            "Call run_local for a command or a file on this Mac that the other "
+            "tools cannot handle. One action, then wait. Do not use it for git or aws."
         )
     if mcp_enabled:
         parts.append(

@@ -9,6 +9,7 @@ from services.agent_tool_spec import (
     MAX_SEARCH_TERMS,
     history_text,
     limits_block,
+    local_text,
     repo_text,
     scope_block,
 )
@@ -16,6 +17,7 @@ from services.edit_intent import build_xml_agent_instruction
 from services.grok_agent_tools import (
     TOOL_AWS_CLI,
     TOOL_GIT_CLI,
+    TOOL_LOCAL,
     TOOL_REPORT_BLOCKED,
     TOOL_REQUEST_FILE,
     TOOL_REQUEST_GITHUB,
@@ -59,6 +61,7 @@ _TOOL_NAMES = {
     TOOL_REQUEST_REPO,
     TOOL_AWS_CLI,
     TOOL_GIT_CLI,
+    TOOL_LOCAL,
     TOOL_REPORT_BLOCKED,
 }
 
@@ -76,6 +79,7 @@ _TAG_NAMES = {
     "repo_request",
     "aws_cli",
     "git_cli",
+    "local_cli",
     "blocked",
 }
 
@@ -88,6 +92,7 @@ _FLAG_KEYS = (
     "mcp_enabled",
     "repo_enabled",
     "git_enabled",
+    "local_enabled",
 )
 
 
@@ -159,6 +164,7 @@ def test_function_name_parity_across_modes_and_flags():
                     if k in (
                         "github_enabled", "history_enabled", "preview_enabled",
                         "websearch_enabled", "mcp_enabled", "repo_enabled",
+                        "local_enabled",
                     )
                 })
             )
@@ -250,11 +256,12 @@ def test_grok_prompt_has_no_tool_tags_and_no_ignore():
         + build_grok_system_suffix(
             "edit", github_enabled=True, history_enabled=True, repo_enabled=True,
             preview_enabled=True, websearch_enabled=True, mcp_enabled=True,
-            aws_enabled=True, git_enabled=True,
+            aws_enabled=True, git_enabled=True, local_enabled=True,
         )
         + build_grok_agent_instruction(
             "edit", github_enabled=True, history_enabled=True, repo_enabled=True,
             preview_enabled=True, websearch_enabled=True, mcp_enabled=True,
+            local_enabled=True,
         )
     )
     assert "IGNORE" not in text
@@ -262,6 +269,17 @@ def test_grok_prompt_has_no_tool_tags_and_no_ignore():
     # Grok to call the function instead. Every other tool tag stays out.
     leaked = _tags(text) - {"aws_cli"}
     assert leaked == set(), leaked
+
+
+def test_local_text_matches_both_forms():
+    tag = local_text("tag")
+    function = local_text("function")
+    for text in (tag, function):
+        assert "run_local" in text
+        assert "Ask and Plan can only read" in text
+        assert "No sudo" in text
+    assert "<local_cli>" in tag
+    assert "<" not in function
 
 
 def test_git_diff_is_described_for_both_forms():

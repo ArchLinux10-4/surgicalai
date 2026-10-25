@@ -220,6 +220,7 @@ async def run_grok_ask_plan_native_stream(
     mcp_enabled: bool = False,
     repo_enabled: bool = False,
     git_enabled: bool = False,
+    local_enabled: bool = False,
     openai_client=None,
     web_search_sources: Optional[list] = None,
     client_inbox=None,
@@ -249,6 +250,7 @@ async def run_grok_ask_plan_native_stream(
         aws_enabled=aws_enabled, websearch_enabled=websearch_enabled,
         mcp_enabled=mcp_enabled, repo_enabled=repo_enabled,
         git_enabled=git_enabled,
+        local_enabled=local_enabled,
         dlog=dlog, session_id=session_id, user_id=user_id,
     )
 
@@ -264,6 +266,7 @@ async def run_grok_ask_plan_native_stream(
                 aws_enabled=aws_enabled, websearch_enabled=websearch_enabled,
                 mcp_enabled=mcp_enabled, repo_enabled=repo_enabled,
                 git_enabled=git_enabled,
+                local_enabled=local_enabled,
                 dlog=dlog, session_id=session_id, user_id=user_id,
             )
             messages[i] = {**m, "content": (m.get("content") or "") + suffix}
@@ -291,6 +294,7 @@ async def run_grok_ask_plan_native_stream(
     tool_round = 0
     _aws_calls = 0
     _git_calls = 0
+    _local_calls = 0
     _mcp_calls = 0
     _promise_nudged = False
     _prose_break_pending = False
@@ -570,6 +574,31 @@ async def run_grok_ask_plan_native_stream(
                 if _aws_done.get("counted"):
                     _aws_calls += 1
                 context_result = _aws_done.get("note") or ""
+            elif tag_kind == "local":
+                from services.local_exec import resolve_local_call
+                _local_root = ""
+                try:
+                    from services.repo_tools import session_repo as _session_repo
+                    _local_repo = _session_repo(session_id)
+                    _local_root = (_local_repo or {}).get("root_path") or ""
+                except Exception:
+                    _local_root = ""
+                _local_done = {"note": "", "counted": False, "run": False}
+                async for _local_ev in resolve_local_call(
+                    str(body or ""), mode, _local_calls, client_inbox,
+                    user_id=user_id, dlog=dlog, session_id=session_id or "",
+                    root=_local_root,
+                ):
+                    if _local_ev.get("type") == "local_done":
+                        _local_done = _local_ev
+                    else:
+                        _o = _tracker.observe(_local_ev)
+                        if _o:
+                            yield _sse(_o)
+                        yield _sse(_local_ev)
+                if _local_done.get("counted"):
+                    _local_calls += 1
+                context_result = _local_done.get("note") or ""
             else:
                 yield _sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 context_result = _dispatch_context_request(
