@@ -244,7 +244,7 @@ function SessionGroups({
                 <span className="text-[10px] text-faint">{closed ? '▸' : '▾'}</span>
                 <FolderOpen sx={{ fontSize: 13 }} className={repo.missing ? 'text-danger' : 'text-muted'} />
                 <span className="truncate text-[12px] font-semibold text-ink">{repo.name}</span>
-                {repo.default_branch && <span className="truncate text-[10px] text-faint">{repo.default_branch}</span>}
+                {(repo.branch || repo.default_branch) && <span className="truncate text-[10px] text-faint">{repo.branch || repo.default_branch}</span>}
                 {repo.github_linked && <GitHub sx={{ fontSize: 11 }} className="text-muted" />}
                 {repo.missing && <span className="text-[10px] text-danger">Missing</span>}
               </button>
@@ -805,6 +805,44 @@ function getFileIcon(filename: string) {
   return FILE_TYPE_ICONS[ext] || '📄'
 }
 
+function diskConflictReason(reason: string) {
+  if (reason === 'drift') return 'Changed on disk since this chat loaded it'
+  if (reason === 'missing') return 'Missing from the folder'
+  return 'Saving would overwrite what is in the folder'
+}
+
+function DiskStateBadge({ state }: { state?: string | null }) {
+  if (state === 'pending') {
+    return (
+      <span title="Edited in this chat. Not written to the folder yet." className="text-[9px] font-medium px-1.5 py-0.5 rounded-md bg-accent/10 text-accent shrink-0">
+        Not saved
+      </span>
+    )
+  }
+  if (state === 'applied') {
+    return (
+      <span title="Matches the folder." className="text-[9px] font-medium px-1.5 py-0.5 rounded-md bg-overlay text-faint shrink-0">
+        On disk
+      </span>
+    )
+  }
+  if (state === 'conflict') {
+    return (
+      <span title="The folder copy changed after this chat loaded it, so saving would overwrite it." className="text-[9px] font-medium px-1.5 py-0.5 rounded-md bg-danger/10 text-danger shrink-0">
+        Changed on disk
+      </span>
+    )
+  }
+  if (state === 'missing') {
+    return (
+      <span title="This file is gone from the folder. Saving would recreate it." className="text-[9px] font-medium px-1.5 py-0.5 rounded-md bg-danger/10 text-danger shrink-0">
+        Missing
+      </span>
+    )
+  }
+  return null
+}
+
 function SessionFilesPanel() {
   const { sessionFiles, setSessionFiles, removeSessionFile, addSessionFile, fileFilter, activeSessions, settings, sessions, repositories } = useAppStore()
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -814,7 +852,10 @@ function SessionFilesPanel() {
   const activeRepoId = sessions.find(s => s.id === activeSessions)?.repository_id || ''
   const activeRepo = repositories.find(r => r.id === activeRepoId) || null
   const repoMode = !!settings && !settings.is_hosted && !!activeRepo
-  const staged = sessionFiles.filter(f => f.disk_state === 'pending' || f.disk_state === 'conflict' || f.disk_state === 'missing')
+  const unsaved = sessionFiles.filter(f => f.disk_state === 'pending')
+  const drifted = sessionFiles.filter(f => f.disk_state === 'conflict')
+  const missingOnDisk = sessionFiles.filter(f => f.disk_state === 'missing')
+  const needsSave = unsaved.length + drifted.length + missingOnDisk.length > 0
   // Import Folder reads from a path on the *server's* disk (see
   // routers/files.py:_get_workspace_root). On a local install the server IS
   // the user's machine, so this is a real "open my project" action. On a
@@ -840,7 +881,7 @@ function SessionFilesPanel() {
       } else {
         setConflicts([])
         const n = result.applied?.length || 0
-        if (n) toast.success(`Applied ${n} file${n === 1 ? '' : 's'} to disk`)
+        if (n) toast.success(`Saved ${n} file${n === 1 ? '' : 's'} to the folder`)
         else toast.info('Nothing to apply')
       }
       await refreshFiles()
@@ -919,15 +960,16 @@ function SessionFilesPanel() {
 
   return (
     <div className="flex flex-col h-full">
-      <div className="px-3 py-2 border-b border-border flex items-center justify-between">
-        <span className="text-[11px] text-muted">
+      <div className="h-10 px-2.5 border-b border-border flex items-center gap-2 shrink-0">
+        <span className="text-[11px] text-muted tabular-nums truncate">
           {sessionFiles.length > 0
             ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''}`
             : 'No files yet'}
         </span>
-        <div className="flex items-center gap-1.5">
+        <div className="ml-auto flex items-center gap-0.5 shrink-0">
           {activeSessions && sessionFiles.length >= 2 && (
             <DownloadSessionButton
+              compact
               sessionId={activeSessions}
               sessionFiles={sessionFiles}
             />
@@ -937,20 +979,23 @@ function SessionFilesPanel() {
           )}
           {canImportFolder && (
             <button
+              type="button"
               onClick={handleImportFolder}
               disabled={importing || !activeSessions}
-              className="flex items-center gap-1 px-2 py-1 rounded-lg bg-overlay text-muted text-[11px] font-semibold hover:bg-accent/10 hover:text-accent transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-              title="Import every code file from your configured workspace folder (skips node_modules, venv, .git, etc.)"
+              className="btn-icon disabled:opacity-50 disabled:cursor-not-allowed"
+              title={importing ? 'Importing…' : 'Import every code file from your configured workspace folder (skips node_modules, venv, .git, etc.)'}
+              aria-label={importing ? 'Importing folder' : 'Import folder'}
             >
-              <CreateNewFolder sx={{ fontSize: 12 }} /> {importing ? 'Importing…' : 'Import Folder'}
+              <CreateNewFolder sx={{ fontSize: 15 }} />
             </button>
           )}
           <button
+            type="button"
             onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-1 px-2 py-1 rounded-lg bg-accent/10 text-accent text-[11px] font-semibold hover:bg-accent/20 transition-colors"
+            className="inline-flex items-center gap-1 h-7 px-2 rounded-md bg-accent/10 text-accent text-[11px] font-semibold hover:bg-accent/20 transition-colors whitespace-nowrap shrink-0"
             title="Upload files"
           >
-            <FileUpload sx={{ fontSize: 11 }} /> Add
+            <FileUpload sx={{ fontSize: 13 }} /> Add
           </button>
         </div>
         <input
@@ -1021,9 +1066,7 @@ function SessionFilesPanel() {
                         <span className="w-1.5 h-1.5 rounded-full bg-success inline-block" /> Edited
                       </span>
                     )}
-                    {file.disk_state === 'pending' && <span className="text-[9px] font-medium px-1.5 py-0.5 rounded-md bg-accent/10 text-accent shrink-0">Staged</span>}
-                    {file.disk_state === 'applied' && <span className="text-[9px] font-medium px-1.5 py-0.5 rounded-md bg-overlay text-faint shrink-0">On disk</span>}
-                    {(file.disk_state === 'conflict' || file.disk_state === 'missing') && <span className="text-[9px] font-medium px-1.5 py-0.5 rounded-md bg-danger/10 text-danger shrink-0">Conflict</span>}
+                    <DiskStateBadge state={file.disk_state} />
                     <DiffStatsBadge fileId={file.id} />
                   </div>
                   {file.lines > 0 && (
@@ -1045,24 +1088,39 @@ function SessionFilesPanel() {
           </div>
         )}
       </div>
-      {repoMode && staged.length > 0 && (
+      {repoMode && needsSave && (
         <div className="border-t border-border px-3 py-2 flex items-center gap-2">
-          <span className="text-[11px] text-muted flex-1">{staged.length} change{staged.length === 1 ? '' : 's'} staged</span>
-          <button type="button" disabled={applying} className="btn-primary px-2 py-1 text-[11px] disabled:opacity-50" onClick={() => applyDisk(false)}>
-            {applying ? 'Applying…' : 'Apply to disk'}
+          <div className="flex-1 min-w-0">
+            {unsaved.length > 0 && (
+              <p className="text-[11px] text-muted">{unsaved.length} file{unsaved.length === 1 ? '' : 's'} not saved</p>
+            )}
+            {drifted.length > 0 && (
+              <p className="text-[11px] text-danger">{drifted.length} changed on disk</p>
+            )}
+            {missingOnDisk.length > 0 && (
+              <p className="text-[11px] text-danger">{missingOnDisk.length} missing from the folder</p>
+            )}
+          </div>
+          <button type="button" disabled={applying} className="btn-primary px-2 py-1 text-[11px] disabled:opacity-50 shrink-0" onClick={() => applyDisk(false)}>
+            {applying ? 'Saving…' : 'Save to folder'}
           </button>
         </div>
       )}
       {conflicts.length > 0 && (
         <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/50 p-4" onClick={() => setConflicts([])}>
           <div role="dialog" aria-modal="true" aria-labelledby="disk-drift-title" className="w-full max-w-sm rounded-xl border border-border bg-surface p-4 shadow-modal" onClick={(e) => e.stopPropagation()}>
-            <h2 id="disk-drift-title" className="text-sm font-semibold text-ink">Disk changed since this file was loaded</h2>
-            <p className="mt-1 text-[12px] text-muted">Applying will overwrite what is on disk. A backup is kept when backups are on.</p>
-            <ul className="mt-2 max-h-32 overflow-y-auto text-[12px] text-ink">
-              {conflicts.map(c => <li key={c.id} className="truncate">{c.filename}</li>)}
+            <h2 id="disk-drift-title" className="text-sm font-semibold text-ink">Saving would overwrite the folder</h2>
+            <p className="mt-1 text-[12px] text-muted">These files changed, or disappeared, after this chat loaded them. A backup is kept when backups are on.</p>
+            <ul className="mt-2 max-h-32 overflow-y-auto text-[12px] text-ink space-y-1">
+              {conflicts.map(c => (
+                <li key={c.id} className="truncate">
+                  <span className="font-medium">{c.filename}</span>
+                  <span className="text-muted"> — {diskConflictReason(c.reason)}</span>
+                </li>
+              ))}
             </ul>
             <div className="mt-3 flex justify-end gap-2">
-              <button type="button" className="btn-ghost px-3 text-[12px]" onClick={() => setConflicts([])}>Keep disk</button>
+              <button type="button" className="btn-ghost px-3 text-[12px]" onClick={() => setConflicts([])}>Keep folder</button>
               <button type="button" className="btn-primary px-3 text-[12px]" onClick={() => applyDisk(true)}>Overwrite</button>
             </div>
           </div>

@@ -1,10 +1,8 @@
 import { useState } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
-import { MarkdownCode } from './CodeBlock'
+import { AssistantMarkdown } from './AssistantMarkdown'
 import type { PlanTask, PlanPhase, AgentTaskStatus } from '../types'
 import { FileDownload } from '@mui/icons-material'
 
@@ -34,12 +32,6 @@ function phaseLabel(phase: PlanPhase, done: number, total: number) {
   if (phase === 'blocked') return `Blocked — ${done}/${total} covered`
   if (phase === 'ready') return `Ready — ${total} step${total !== 1 ? 's' : ''}`
   return ''
-}
-
-const mdComponents = {
-  code({ className, children, ...props }: any) {
-    return <MarkdownCode className={className} {...props}>{children}</MarkdownCode>
-  },
 }
 
 /** Strip the machine fence from the displayed document — checklist owns steps. */
@@ -218,10 +210,8 @@ export function PlanTracker({
             <span className="text-[10px] text-muted">{docOpen ? 'Collapse' : 'Expand'}</span>
           </button>
           {docOpen && (
-            <div className="px-3 pb-3 prose-ai text-[12px]">
-              <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                {body}
-              </ReactMarkdown>
+            <div className="px-3 pb-3">
+              <AssistantMarkdown text={body} density="compact" />
             </div>
           )}
         </div>

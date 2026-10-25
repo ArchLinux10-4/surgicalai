@@ -24,6 +24,7 @@ class SettingsUpdate(BaseModel):
     # Claude-only web research toggle (Ask/Plan mode). See
     # services/claude_web_search.py for the tool this enables.
     web_search_enabled: Optional[bool] = None
+    git_agent_tools: Optional[bool] = None
 
 
 class SettingsResponse(BaseModel):
@@ -42,6 +43,7 @@ class SettingsResponse(BaseModel):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen2.5-coder:7b"
     web_search_enabled: bool = False
+    git_agent_tools: bool = False
     is_hosted: bool = False
 
 

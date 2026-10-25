@@ -465,6 +465,8 @@ def context_tag_looks_real(tag_name: str, body: str) -> bool:
         return True
     if tag_name == "aws":
         return stripped[0] in "aAiI"
+    if tag_name == "git":
+        return stripped[0] in "gG"
     return stripped[0] in "[{"
 
 
@@ -763,6 +765,7 @@ async def resolve_aws_call(
         }
         return
     cards = 0
+    waited = 0.0
     while state.get("needs_approval"):
         cards += 1
         if cards > _MAX_APPROVAL_CARDS:
@@ -784,7 +787,9 @@ async def resolve_aws_call(
             "title": state["title"],
             "target": state["target"],
         }
+        _wait_t0 = time.perf_counter()
         state = await _after_decision(state, client_inbox, timeout)
+        waited += time.perf_counter() - _wait_t0
     if not state["run"]:
         yield {
             "type": "aws_done",
@@ -795,6 +800,7 @@ async def resolve_aws_call(
             "level": state["level"],
             "title": state["title"],
             "target": state["target"],
+            "waited_s": round(waited, 3),
         }
         return
     yield {"type": "progress", "content": f"Running {_running_label(state['command'])}..."}
@@ -836,6 +842,7 @@ async def resolve_aws_call(
         "title": state["title"],
         "target": state["target"],
         "out": out,
+        "waited_s": round(waited, 3),
     }
 
 

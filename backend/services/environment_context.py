@@ -62,7 +62,8 @@ def environment_block(conn, session_id: str) -> str:
     lines.append(
         "You can read files in this repository. Edits are staged in the chat and "
         "are not written to disk until the user applies them. "
-        "You cannot run shell commands. You cannot write to disk yourself."
+        "When git_cli is available, use it for git and pull requests. "
+        "You cannot run other shell commands."
     )
     if branch:
         lines.append(f"Current branch: {branch}. Call git_status for uncommitted changes.")

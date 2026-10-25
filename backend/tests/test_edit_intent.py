@@ -165,6 +165,28 @@ def test_grok_question_instruction_does_not_demand_edits():
     assert "Do NOT narrate" in gat.build_grok_system_suffix("edit")
 
 
+def test_separate_turn_prose_inserts_a_blank_line_between_turns():
+    from services.pipeline import separate_turn_prose
+
+    text, pending, needs = separate_turn_prose(
+        "Local changes are on main.", break_pending=True, needs_break=True,
+    )
+    assert text == "\n\nLocal changes are on main."
+    assert pending is False
+    assert needs is True
+
+    text, pending, needs = separate_turn_prose(
+        "\nAlready broken", break_pending=True, needs_break=True,
+    )
+    assert text == "\nAlready broken"
+    assert pending is False
+
+    text, pending, needs = separate_turn_prose(
+        "same turn", break_pending=False, needs_break=True,
+    )
+    assert text == "same turn"
+
+
 def test_shared_voice_does_not_cheerlead_or_name_a_mode():
     from services.pipeline import CHAT_PERSONA, NATURAL_SYSTEM
 

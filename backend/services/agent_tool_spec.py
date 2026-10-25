@@ -26,6 +26,7 @@ _NAMES = {
         "plan": "<edit_plan>",
         "blocked": "<blocked>",
         "history": "<history_request>",
+        "git": "<git_cli>",
     },
     "function": {
         "file": "request_file",
@@ -38,6 +39,7 @@ _NAMES = {
         "plan": "write_edit_plan",
         "blocked": "report_blocked",
         "history": "request_history",
+        "git": "git_cli",
     },
 }
 
@@ -57,7 +59,7 @@ def default_max_turns() -> int:
         return DEFAULT_MAX_TURNS
 
 
-def scope_block(*, session_files=False, repo=False, github=False, web=False, form="tag") -> str:
+def scope_block(*, session_files=False, repo=False, github=False, web=False, git=False, form="tag") -> str:
     """Where each enabled read tool looks. Empty unless at least two are on."""
     n = _names(form)
     lines = []
@@ -75,6 +77,11 @@ def scope_block(*, session_files=False, repo=False, github=False, web=False, for
         lines.append(f"{n['github']}: the connected GitHub repository.")
     if web:
         lines.append(f"{n['web']}: the public internet, not the code.")
+    if git:
+        lines.append(
+            f"{n['git']}: git and pull requests on the open folder. "
+            "One command at a time. Push, pull requests, and merging wait for approval."
+        )
     if len(lines) < 2:
         return ""
     return "Where each tool looks. " + " ".join(lines)
@@ -310,9 +317,58 @@ def repo_text(form="tag", repo=None) -> str:
         )
     return (
         f"{where}\n{when}\n{examples}\n{diff}\n"
-        "read_repo_file loads the file into this chat. Edits stay staged until "
-        "the user applies them to disk. You cannot run shell commands and you "
-        "cannot write to disk."
+        "read_repo_file loads the file into this chat. Chat edits are not git-staged; "
+        "git status includes which chat files are unsaved or changed on disk. "
+        "You cannot run a shell."
+    )
+
+
+def git_cli_text(form="tag") -> str:
+    """How to publish the open folder. Tag form is for Claude, GPT, and Gemini."""
+    rules = (
+        "One command per turn, then stop. "
+        "Reads run immediately, including in Ask and Plan: git status, diff, log, show, "
+        "branch with no name, rev-parse, remote -v, ls-files, blame, fetch, "
+        "gh pr view, gh pr list, gh pr checks, and gh auth status. "
+        "On a branch that is not the default, Edit and Agent also run these immediately: "
+        "git switch, git switch -c, git checkout -b, git branch NAME, git add, "
+        "git restore --staged, git commit -m, git stash push, git stash pop, "
+        "git merge --abort, and git pull (it is forced to --ff-only). "
+        "A commit while you are on the default branch asks the user first. "
+        "git push and gh pr create and gh pr ready ask the user first. "
+        "Never push the default branch. Open a pull request instead. "
+        "gh pr merge and git merge always ask the user. You cannot merge until they approve. "
+        "Ask and Plan cannot change the repository. "
+        "reset --hard, clean, rebase, force push, and git config are refused. "
+        "Branch first. Do not commit on the default branch. "
+        "After a merge, git switch to the default branch and git pull --ff-only to sync. "
+        "If a pull cannot fast-forward, propose git merge origin/BRANCH. "
+        "Edits in this chat are not on disk until the user applies them. "
+        "The only remote name is origin. "
+        "To put local changes on GitHub, call git publish once with --branch, --message, --title, and --body. "
+        "Do not chain add, commit, push, and gh pr create for that. "
+        "If a push or a pull request fails, tell the user the error and stop. Do not read this app's source code."
+    )
+    if form == "tag":
+        return (
+            "How to call git. Emit exactly one tag and then stop. "
+            "The open tag is exactly <git_cli> with no attributes. "
+            "The body is one command, not JSON.\n"
+            "<git_cli>\ngit status\n</git_cli>\n"
+            "<git_cli>\ngit publish --branch surgicalai/short-name --message \"Why\" --title \"Title\" --body \"What changed\"\n</git_cli>\n"
+            "<git_cli>\ngit switch -c surgicalai/short-name\n</git_cli>\n"
+            "<git_cli>\ngh pr create --title \"Title\" --body \"Why\" --base main\n</git_cli>\n"
+            "<git_cli>\ngh pr merge 123 --merge\n</git_cli>\n"
+            + rules
+        )
+    return (
+        "Run one git or gh command on the open folder. "
+        'Call git_cli with {"command": "git status"}. '
+        'Example: {"command": "git publish --branch surgicalai/short-name --message \\"Why\\" --title \\"Title\\" --body \\"What changed\\""}. '
+        'Example: {"command": "git switch -c surgicalai/short-name"}. '
+        'Example: {"command": "gh pr create --title \\"Title\\" --body \\"Why\\" --base main"}. '
+        'Example: {"command": "gh pr merge 123 --merge"}. '
+        + rules
     )
 
 

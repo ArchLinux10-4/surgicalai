@@ -3050,7 +3050,7 @@ async def _ws_pump(websocket: WebSocket, handler, endpoint_name: str):
     async def _client_receiver():
         """Forward client→server messages for the duration of the stream.
 
-        Approvals (`file_response`, `aws_cli_response`, `preview_check_response`,
+        Approvals (`file_response`, `aws_cli_response`, `git_cli_response`, `preview_check_response`,
         `mcp_call_response`) go to `client_inbox`. A `steer` follow-up goes to
         `steer_inbox` so an approval drain cannot drop it. Unknown shapes are
         ignored. Any receive error (disconnect / closed socket) ends the

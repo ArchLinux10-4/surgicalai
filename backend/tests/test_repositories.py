@@ -185,7 +185,7 @@ def test_environment_block_only_for_scoped_local_chats(env, monkeypatch):
         text = _load_effective_memory(conn, scoped["id"])
     assert text.startswith("ENVIRONMENT")
     assert os.path.realpath(str(folder)) in text
-    assert "cannot run shell commands" in text
+    assert "git_cli" in text
     assert "Current branch:" in text
     monkeypatch.setattr(db, "USE_POSTGRES", True)
     assert environment_block(None, scoped["id"]) == ""
@@ -307,7 +307,7 @@ def test_repo_tools_are_opt_in():
     assert "write_surgical_edit" not in {t["function"]["name"] for t in build_grok_agent_tools("ask", repo_enabled=True)}
     text = prompt_section({"name": "demo", "root_path": "/tmp/demo"})
     assert "<repo_request>" in text
-    assert "cannot run shell commands" in text
+    assert "cannot run a shell" in text
     assert "no open folder" in execute_repo_tool("", "", {"tool": "git_status"}).lower() or \
         "no open folder" in execute_repo_tool("missing", "u", {"tool": "git_status"}).lower()
 

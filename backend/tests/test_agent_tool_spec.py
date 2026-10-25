@@ -15,6 +15,7 @@ from services.agent_tool_spec import (
 from services.edit_intent import build_xml_agent_instruction
 from services.grok_agent_tools import (
     TOOL_AWS_CLI,
+    TOOL_GIT_CLI,
     TOOL_REPORT_BLOCKED,
     TOOL_REQUEST_FILE,
     TOOL_REQUEST_GITHUB,
@@ -57,6 +58,7 @@ _TOOL_NAMES = {
     TOOL_REQUEST_MCP,
     TOOL_REQUEST_REPO,
     TOOL_AWS_CLI,
+    TOOL_GIT_CLI,
     TOOL_REPORT_BLOCKED,
 }
 
@@ -73,6 +75,7 @@ _TAG_NAMES = {
     "mcp_request",
     "repo_request",
     "aws_cli",
+    "git_cli",
     "blocked",
 }
 
@@ -84,6 +87,7 @@ _FLAG_KEYS = (
     "websearch_enabled",
     "mcp_enabled",
     "repo_enabled",
+    "git_enabled",
 )
 
 
@@ -246,7 +250,7 @@ def test_grok_prompt_has_no_tool_tags_and_no_ignore():
         + build_grok_system_suffix(
             "edit", github_enabled=True, history_enabled=True, repo_enabled=True,
             preview_enabled=True, websearch_enabled=True, mcp_enabled=True,
-            aws_enabled=True,
+            aws_enabled=True, git_enabled=True,
         )
         + build_grok_agent_instruction(
             "edit", github_enabled=True, history_enabled=True, repo_enabled=True,

@@ -1,13 +1,12 @@
 import React, { useState, useRef, useEffect, useCallback, Component } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { useAppStore, type PickedElementRef, type LiveEditCardState } from '../stores/appStore'
 import { api, type SteerStream } from '../api/client'
 import { toast } from '../lib/toast'
 import { InlineDiffCard } from './InlineDiffCard'
 import { LiveEditCard } from './LiveEditCard'
 import { NewFileCard } from './NewFileCard'
-import { MarkdownCode } from './CodeBlock'
+import { AssistantMarkdown } from './AssistantMarkdown'
+import { stripInternalTags } from '../lib/prepareAssistantMarkdown'
 import { SessionFilesTray } from './SessionFilesTray'
 import { GitHubBranchChip } from './GitHubBranchChip'
 import { RepoChip } from './Repositories'
@@ -19,11 +18,12 @@ import type { SteerQueueItem } from '../stores/appStore'
 
 const NO_PASTED: PastedBlock[] = []
 const NO_QUEUE: SteerQueueItem[] = []
+import { refreshRepoBranch } from './GitTerminalDock'
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker } from './PlanTracker'
 import { PlanPane } from './PlanPane'
 import { PlanQuestionsCard } from './PlanQuestionsCard'
-import { normalizeQuestions, stripPlanQuestionsFence } from '../lib/planQuestions'
+import { normalizeQuestions } from '../lib/planQuestions'
 import { useTaskPolling } from '../hooks/useTaskPolling'
 import type { SessionFile, SmartResult } from '../types'
 import { AccountTree, Add, AdsClick, AttachFile, AttachMoney, AutoFixHigh, Biotech, Bolt, BugReport, Close, Delete, Description, DoneAll, LightbulbOutlined, Lock, Psychology, Search, Security, Send, Warning } from '@mui/icons-material';
@@ -75,23 +75,6 @@ function ModelCostIndicator({ cost }: { cost?: number }) {
       ))}
     </span>
   )
-}
-
-// ── Strip internal protocol tags from model output ────────────────────────────
-function stripInternalTags(text: string, streaming = false): string {
-  if (!text) return text
-  let result = text
-    .replace(/<edit_plan>[\s\S]*?<\/edit_plan>/g, '')
-    .replace(/<search_request>[\s\S]*?<\/search_request>/g, '')
-    .replace(/```(?:implementation_plan|plan-json)[\s\S]*?```/gi, '')
-  if (streaming) {
-    // During streaming: hide from start of any incomplete opening tag
-    result = result
-      .replace(/<edit_plan>[\s\S]*$/, '')
-      .replace(/<search_request>[\s\S]*$/, '')
-      .replace(/```(?:implementation_plan|plan-json)[\s\S]*$/, '')
-  }
-  return stripPlanQuestionsFence(result, streaming)
 }
 
 // ── Apply All Button — applies every unapplied change across all messages ─────
@@ -414,60 +397,6 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
   )
 }
 
-// ── Markdown component overrides ──────────────────────────
-const mdComponents = {
-  code: (({ className, children, ...props }: any) => {
-    const lang = /language-(\w+)/.exec(className || '')?.[1] || ''
-    return <MarkdownCode className={className} {...props}>{children}</MarkdownCode>
-  }) as any,
-  // Beautiful prose overrides
-  h1: ({ children }: any) => (
-    <h1 className="text-lg font-bold text-ink mt-5 mb-2 border-b border-border/50 pb-1.5">{children}</h1>
-  ),
-  h2: ({ children }: any) => (
-    <h2 className="text-base font-bold text-ink mt-4 mb-1.5">{children}</h2>
-  ),
-  h3: ({ children }: any) => (
-    <h3 className="text-sm font-semibold text-ink mt-3 mb-1">{children}</h3>
-  ),
-  p: ({ children }: any) => (
-    <p className="text-sm text-ink/80 leading-7 mb-3 last:mb-0">{children}</p>
-  ),
-  ul: ({ children }: any) => (
-    <ul className="my-2 space-y-1 pl-1">{children}</ul>
-  ),
-  ol: ({ children }: any) => (
-    <ol className="my-2 space-y-1 pl-1 list-decimal list-inside">{children}</ol>
-  ),
-  li: ({ children }: any) => (
-    <li className="flex items-start gap-2 text-sm text-ink/80 leading-6">
-      <span className="mt-1.5 w-1.5 h-1.5 rounded-full bg-accent/70 flex-shrink-0 list-none" />
-      <span>{children}</span>
-    </li>
-  ),
-  blockquote: ({ children }: any) => (
-    <blockquote className="my-3 pl-4 border-l-2 border-accent/50 text-muted italic text-sm leading-6">{children}</blockquote>
-  ),
-  strong: ({ children }: any) => (
-    <strong className="font-semibold text-ink">{children}</strong>
-  ),
-  em: ({ children }: any) => (
-    <em className="text-ink/80 italic">{children}</em>
-  ),
-  a: ({ children, href }: any) => (
-    <a href={href} target="_blank" rel="noopener noreferrer" className="text-accent hover:text-accent underline underline-offset-2 transition-colors">{children}</a>
-  ),
-  hr: () => <hr className="my-4 border-border/50" />,
-  table: ({ children }: any) => (
-    <div className="my-3 overflow-x-auto rounded-lg border border-border/60">
-      <table className="w-full text-sm">{children}</table>
-    </div>
-  ),
-  thead: ({ children }: any) => <thead className="bg-surface/80">{children}</thead>,
-  th: ({ children }: any) => <th className="px-3 py-2 text-left text-xs font-semibold text-ink/80 uppercase tracking-wide">{children}</th>,
-  td: ({ children }: any) => <td className="px-3 py-2 text-muted text-sm border-t border-border/40">{children}</td>,
-}
-
 // ── Helpers ───────────────────────────────────────────────
 function getLanguage(filename: string): string {
   const ext = filename.split('.').pop()?.toLowerCase() || ''
@@ -673,11 +602,7 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
                     </button>
                   ) : (
                     <>
-                      <div className="prose-ai">
-                        <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-                          {narrative}
-                        </ReactMarkdown>
-                      </div>
+                      <AssistantMarkdown text={narrative} />
                       {hasCards && longNarrative && (
                         <button
                           type="button"
@@ -717,11 +642,7 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
             )}
           </div>
         ) : (
-          <div className="prose-ai">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-              {stripInternalTags(msg.content)}
-            </ReactMarkdown>
-          </div>
+          <AssistantMarkdown text={stripInternalTags(msg.content)} />
         )}
 
         {/* Copy button — hover-reveal, bottom-right of AI bubble */}
@@ -1109,15 +1030,10 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
         ) : null}
 
         {content ? (
-          <div className="prose-ai">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
-              {stripInternalTags(content, true)}
-            </ReactMarkdown>
-          </div>
-        ) : null}
-
-        {/* Blinking cursor */}
-        <span className="inline-block w-2 h-[1.1em] bg-accent/80 rounded-sm align-text-bottom ml-0.5 animate-pulse" />
+          <AssistantMarkdown text={content} streaming />
+        ) : (
+          <span className="inline-block w-2 h-[1.1em] bg-accent/80 rounded-sm align-text-bottom animate-pulse" />
+        )}
       </div>
     </div>
   )
@@ -2490,6 +2406,64 @@ export function ChatPanel() {
       (event) => {
         useAppStore.getState().applySteerFrame(sessionId, event)
       },
+      (event) => {
+        useAppStore.getState().pushGitTerminalLine({
+          sessionId,
+          command: event?.command || 'git',
+          stdout: event?.stdout || '',
+          stderr: event?.stderr || '',
+          exit_code: event?.exit_code ?? 1,
+          level: event?.level,
+          title: event?.title,
+          target: event?.target,
+          summary: event?.summary,
+        })
+        refreshRepoBranch(sessionId)
+      },
+      (command, reply, meta) => {
+        useAppStore.getState().clearGitRun(sessionId)
+        useAppStore.getState().setGitApproval({
+          sessionId,
+          command,
+          reply,
+          level: meta?.level,
+          title: meta?.title,
+          target: meta?.target,
+          summary: meta?.summary,
+        })
+      },
+      (event) => {
+        useAppStore.getState().pushGitStep({
+          sessionId,
+          name: event?.name || 'step',
+          ok: !!event?.ok,
+          detail: event?.detail || '',
+        })
+      },
+      (event) => {
+        const steps = (event?.steps || []).map(step => ({
+          sessionId,
+          name: step?.name || 'step',
+          ok: !!step?.ok,
+          detail: step?.detail || '',
+        }))
+        if (steps.length) {
+          useAppStore.setState((s) => ({
+            gitSteps: [...s.gitSteps.filter(step => step.sessionId !== sessionId), ...steps].slice(-20),
+          }))
+        }
+        useAppStore.getState().setGitResult({
+          sessionId,
+          ok: !!event?.ok,
+          branch: event?.branch || '',
+          pr_url: event?.pr_url || '',
+          commit: event?.commit || '',
+          fix_url: event?.fix_url || '',
+          next: event?.next || '',
+          verified: event?.verified || [],
+        })
+        refreshRepoBranch(sessionId)
+      },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change
@@ -2942,6 +2916,13 @@ export function ChatPanel() {
     const sessionId = await ensureSession()
     launchFresh(sessionId, payload, messages.length === 0)
   }, [input, isStreaming, settings, activeSessions, pastedBlocks, pickedElements, doStream, fileRequest, draftKey, messages.length, launchFresh])
+
+  const gitFollowup = useAppStore(s => s.gitFollowup)
+  useEffect(() => {
+    if (!gitFollowup) return
+    useAppStore.getState().setGitFollowup(null)
+    void handleSend(gitFollowup)
+  }, [gitFollowup, handleSend])
 
   const handleKey = (e: React.KeyboardEvent) => {
     if (e.key !== 'Enter' || !(e.metaKey || e.ctrlKey)) return

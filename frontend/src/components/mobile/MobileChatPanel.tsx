@@ -4,8 +4,6 @@
  * Render layer is completely separate: no shared JSX with desktop ChatPanel.
  */
 import React, { useState, useRef, useEffect, useCallback, memo } from 'react'
-import ReactMarkdown from 'react-markdown'
-import remarkGfm from 'remark-gfm'
 import { useAppStore } from '../../stores/appStore'
 import { api, type SteerStream } from '../../api/client'
 import { toast } from '../../lib/toast'
@@ -16,6 +14,7 @@ import type { SteerQueueItem } from '../../stores/appStore'
 
 const NO_PASTED: PastedBlock[] = []
 const NO_QUEUE: SteerQueueItem[] = []
+import { AssistantMarkdown } from '../AssistantMarkdown'
 import { MobileDiffCard } from './MobileDiffCard'
 import { MobileModeSheet } from './MobileModeSheet'
 import {
@@ -38,6 +37,7 @@ import { AgentMissionControl } from '../AgentMissionControl'
 import { PlanTracker } from '../PlanTracker'
 import { PlanPane } from '../PlanPane'
 import { AwsTerminalDock } from '../AwsTerminalDock'
+import { GitTerminalDock, refreshRepoBranch } from '../GitTerminalDock'
 import { McpApprovalCard } from '../McpApprovalCard'
 import { PlanQuestionsCard } from '../PlanQuestionsCard'
 import { normalizeQuestions, stripPlanQuestionsFence } from '../../lib/planQuestions'
@@ -94,8 +94,8 @@ function MobileThinkingBlock({ text, isStreaming }: { text: string; isStreaming:
 }
 
 // ── Streaming bubble ─────────────────────────────────────────────────────────
-// Plain text while streaming (no ReactMarkdown per token — major mobile jank).
-// Completed history bubbles still markdown on finalize.
+// Markdown is throttled inside AssistantMarkdown so a token flood does not
+// reparse the whole reply on every chunk.
 function StreamingBubble({ text, progress, isBuildingEdit, thinkingText, isThinking }: {
   text: string; progress: string; isBuildingEdit: boolean
   thinkingText?: string; isThinking?: boolean
@@ -121,10 +121,8 @@ function StreamingBubble({ text, progress, isBuildingEdit, thinkingText, isThink
             Preparing code change...
           </div>
         )}
-        {stripPlanQuestionsFence(text || '', true) && (
-          <div className="text-sm text-ink leading-relaxed whitespace-pre-wrap break-words">
-            {stripPlanQuestionsFence(text, true)}
-          </div>
+        {text && (
+          <AssistantMarkdown text={text} streaming />
         )}
         {!stripPlanQuestionsFence(text || '', true) && !isBuildingEdit && !thinkingText && !isThinking && (
           <div className="flex gap-1">
@@ -252,9 +250,7 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
           }
           return (
             <div className="mb-2">
-              <div className="text-sm text-ink leading-relaxed">
-                <ReactMarkdown remarkPlugins={[remarkGfm]}>{narrative}</ReactMarkdown>
-              </div>
+              <AssistantMarkdown text={narrative} />
               {hasCards && longNarrative && (
                 <button
                   type="button"
@@ -1351,11 +1347,76 @@ export function MobileChatPanel() {
         })
       },
       (event) => { useAppStore.getState().applySteerFrame(sessionId, event) },
+      (event) => {
+        useAppStore.getState().pushGitTerminalLine({
+          sessionId,
+          command: event?.command || 'git',
+          stdout: event?.stdout || '',
+          stderr: event?.stderr || '',
+          exit_code: event?.exit_code ?? 1,
+          level: event?.level,
+          title: event?.title,
+          target: event?.target,
+          summary: event?.summary,
+        })
+        refreshRepoBranch(sessionId)
+      },
+      (command, reply, meta) => {
+        useAppStore.getState().clearGitRun(sessionId)
+        useAppStore.getState().setGitApproval({
+          sessionId,
+          command,
+          reply,
+          level: meta?.level,
+          title: meta?.title,
+          target: meta?.target,
+          summary: meta?.summary,
+        })
+      },
+      (event) => {
+        useAppStore.getState().pushGitStep({
+          sessionId,
+          name: event?.name || 'step',
+          ok: !!event?.ok,
+          detail: event?.detail || '',
+        })
+      },
+      (event) => {
+        const steps = (event?.steps || []).map(step => ({
+          sessionId,
+          name: step?.name || 'step',
+          ok: !!step?.ok,
+          detail: step?.detail || '',
+        }))
+        if (steps.length) {
+          useAppStore.setState((s) => ({
+            gitSteps: [...s.gitSteps.filter(step => step.sessionId !== sessionId), ...steps].slice(-20),
+          }))
+        }
+        useAppStore.getState().setGitResult({
+          sessionId,
+          ok: !!event?.ok,
+          branch: event?.branch || '',
+          pr_url: event?.pr_url || '',
+          commit: event?.commit || '',
+          fix_url: event?.fix_url || '',
+          next: event?.next || '',
+          verified: event?.verified || [],
+        })
+        refreshRepoBranch(sessionId)
+      },
     )
     ctrlRef.current = ctrl
   }, [input, pastedBlocks, draftKey, isStreaming, settings, ensureSession, messages.length, sessionFiles,
       addMessage, setSessions, stopStream, updateAgentTask, setAgentPhase, setTaskRunId,
       setTaskPreamble, setAgentTasks, setSessionFiles, activeSessions, handleStopClick])
+
+  const gitFollowup = useAppStore(s => s.gitFollowup)
+  useEffect(() => {
+    if (!gitFollowup) return
+    useAppStore.getState().setGitFollowup(null)
+    void handleSend(gitFollowup)
+  }, [gitFollowup, handleSend])
 
   const wasStreamingRef = useRef(false)
   useEffect(() => {
@@ -2079,6 +2140,7 @@ export function MobileChatPanel() {
         />
       </div>
       <McpApprovalCard />
+      <GitTerminalDock compact />
       <AwsTerminalDock compact />
     </div>
   )

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# One time only, when moving from a non-Docker install to Docker.
+# Copies ~/.surgicalai/surgicalai.db into the Docker volume.
+# Does not rebuild, and refuses to overwrite a database already in Docker.
 set -euo pipefail
 _src="${BASH_SOURCE[0]}"
 while [ -L "$_src" ]; do

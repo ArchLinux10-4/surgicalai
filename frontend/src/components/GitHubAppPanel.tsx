@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
+import { useAppStore } from '../stores/appStore'
 import { GitHub, CheckCircle, Lock, Edit, LockOpen, DeleteOutline } from '@mui/icons-material'
 
 interface Installation {
@@ -31,6 +32,38 @@ const TIER_DESCRIPTIONS: Record<string, string> = {
  * own install screen, done. No token, key, or ID is ever entered here —
  * those live only as server-side environment variables.
  */
+function WriteAccessStatus() {
+  const repoId = useAppStore(s => {
+    const sid = s.activeSessions
+    return s.sessions.find(session => session.id === sid)?.repository_id || ''
+  })
+  const [report, setReport] = useState<{ ok: boolean; message: string; fix_url: string; checks: { name: string; ok: boolean; detail: string }[] } | null>(null)
+  useEffect(() => {
+    if (!repoId) { setReport(null); return }
+    let live = true
+    api.repositories.gitReadiness(repoId).then(data => { if (live) setReport(data) }).catch(() => { if (live) setReport(null) })
+    return () => { live = false }
+  }, [repoId])
+  if (!repoId || !report) return null
+  const labels: Record<string, string> = { contents: 'Contents', pull_requests: 'Pull requests', repository: 'Repository' }
+  const failed = report.checks.filter(c => ['repository', 'contents', 'pull_requests'].includes(c.name) && !c.ok)
+  const missing = failed.map(c => labels[c.name] || c.name)
+  return (
+    <div className={`rounded-md border px-3 py-2 text-xs ${report.ok ? 'border-emerald-800 text-emerald-300' : 'border-amber-800 text-amber-200'}`}>
+      <div>
+        {report.ok ? 'Write access: OK' : `Missing: ${missing.join(', ') || 'GitHub write'}`}
+        {!report.ok && report.fix_url && (
+          <>
+            {' '}
+            <a className="underline" href={report.fix_url} target="_blank" rel="noreferrer">Open GitHub App settings</a>
+          </>
+        )}
+      </div>
+      {!report.ok && failed[0]?.detail && <div className="mt-1 text-[11px] leading-snug">{failed[0].detail}</div>}
+    </div>
+  )
+}
+
 export function GitHubAppPanel() {
   const [enabled, setEnabled] = useState(false)
   const [loadingConfig, setLoadingConfig] = useState(true)
@@ -138,6 +171,8 @@ export function GitHubAppPanel() {
         No tokens or keys to copy or paste. Click Connect, choose which repos to share on
         GitHub's own screen, and you're done — GitHub handles the login for you.
       </p>
+
+      <WriteAccessStatus />
 
       {loadingStatus ? (
         <div className="text-xs text-gray-500">Loading connections…</div>

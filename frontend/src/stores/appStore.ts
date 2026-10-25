@@ -132,6 +132,44 @@ interface AppState {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
   } | null
   setAwsApproval: (value: AppState['awsApproval']) => void
+  gitTerminalLines: {
+    sessionId: string
+    command: string
+    stdout: string
+    stderr: string
+    exit_code: number
+    level?: string
+    title?: string
+    target?: string
+    summary?: string
+  }[]
+  pushGitTerminalLine: (line: AppState['gitTerminalLines'][number]) => void
+  gitApproval: {
+    sessionId: string
+    command: string
+    level?: string
+    title?: string
+    target?: string
+    summary?: string
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
+  } | null
+  setGitApproval: (value: AppState['gitApproval']) => void
+  gitSteps: { sessionId: string; name: string; ok: boolean; detail: string }[]
+  pushGitStep: (step: AppState['gitSteps'][number]) => void
+  clearGitRun: (sessionId: string) => void
+  gitResult: {
+    sessionId: string
+    ok: boolean
+    branch: string
+    pr_url: string
+    commit: string
+    fix_url: string
+    next: string
+    verified: string[]
+  } | null
+  setGitResult: (value: AppState['gitResult']) => void
+  gitFollowup: string | null
+  setGitFollowup: (value: string | null) => void
   mcpApproval: {
     sessionId: string
     server: string
@@ -382,6 +420,24 @@ export const useAppStore = create<AppState>((set) => ({
   })),
   awsApproval: null,
   setAwsApproval: (awsApproval) => set({ awsApproval }),
+  gitTerminalLines: [],
+  pushGitTerminalLine: (line) => set((s) => ({
+    gitTerminalLines: [...s.gitTerminalLines, line].slice(-40),
+  })),
+  gitApproval: null,
+  setGitApproval: (gitApproval) => set({ gitApproval }),
+  gitSteps: [],
+  pushGitStep: (step) => set((s) => ({
+    gitSteps: [...s.gitSteps, step].slice(-20),
+  })),
+  clearGitRun: (sessionId) => set((s) => ({
+    gitSteps: s.gitSteps.filter(step => step.sessionId !== sessionId),
+    gitResult: s.gitResult?.sessionId === sessionId ? null : s.gitResult,
+  })),
+  gitResult: null,
+  setGitResult: (gitResult) => set({ gitResult }),
+  gitFollowup: null,
+  setGitFollowup: (gitFollowup) => set({ gitFollowup }),
   mcpApproval: null,
   setMcpApproval: (mcpApproval) => set({ mcpApproval }),
   mcpCalls: [],

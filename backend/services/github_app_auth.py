@@ -117,6 +117,38 @@ def get_integration() -> "GithubIntegration":
     return integration
 
 
+def installation_repositories(installation_id: str):
+    """Full names this installation can access.
+
+    None means the installation is granted every repository on the account.
+    A list means only those repositories were selected.
+    """
+    installation = get_integration().get_app_installation(int(installation_id))
+    raw = installation.raw_data if isinstance(getattr(installation, "raw_data", None), dict) else {}
+    if raw.get("repository_selection") == "all":
+        return None
+    names = []
+    for repo in installation.get_repos():
+        full = getattr(repo, "full_name", "") or ""
+        if full:
+            names.append(full)
+    return names
+
+
+def installation_permissions(installation_id: str) -> dict:
+    """The GitHub App grant on this installation. This is what GitHub enforces.
+
+    The local permission_tier setting only says what SurgicalAI is willing to
+    do. An installation can be stored as read_write while GitHub still has
+    Contents set to read.
+    """
+    integration = get_integration()
+    installation = integration.get_app_installation(int(installation_id))
+    raw = installation.raw_data if isinstance(getattr(installation, "raw_data", None), dict) else {}
+    perms = raw.get("permissions") or {}
+    return dict(perms) if isinstance(perms, dict) else {}
+
+
 def get_installation_account_info(installation_id: str) -> dict:
     """Fetch the account (user/org) an installation belongs to, plus repo
     selection info. Used right after the install callback to record a
