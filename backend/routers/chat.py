@@ -734,6 +734,9 @@ def get_messages(session_id: str, request: Request):
                 _pq_meta = _meta.get("plan_questions")
                 if isinstance(_pq_meta, list) and _pq_meta:
                     d["_plan_questions"] = _pq_meta
+                _tt = _meta.get("tool_trail")
+                if isinstance(_tt, list) and _tt:
+                    d["_tools"] = _tt
             except Exception:
                 pass
         content = d.get("content", "")
@@ -1242,6 +1245,8 @@ async def implement_plan(body: dict, request: Request):
         import json as _json
         collected_tokens = []
         result_content = None
+        from services.tool_activity import ToolTrail as _ToolTrail
+        _impl_trail = _ToolTrail()
         try:
             yield "data: " + _json.dumps({
                 "type": "plan_updated",
@@ -1270,6 +1275,8 @@ async def implement_plan(body: dict, request: Request):
                             collected_tokens.append(data.get("content", ""))
                         elif chunk_type == "smart_result":
                             result_content = data.get("content", "")
+                        elif chunk_type == "tool_activity":
+                            _impl_trail.observe(data)
                     except Exception:
                         pass
                 yield chunk
@@ -1311,7 +1318,11 @@ async def implement_plan(body: dict, request: Request):
                     "INSERT INTO chat_messages (id, session_id, role, content, metadata) "
                     "VALUES (?, ?, ?, ?, ?)",
                     (resp_id, session_id, "assistant", content,
-                     json.dumps({"mode": "plan_implement", "plan_run_id": run_id})),
+                     json.dumps({
+                         "mode": "plan_implement",
+                         "plan_run_id": run_id,
+                         **({"tool_trail": _impl_trail.rows()} if _impl_trail.rows() else {}),
+                     })),
                 )
                 db.commit()
         except Exception as e:
@@ -1547,6 +1558,8 @@ async def smart_stream(req: dict, request: Request):
             _mode_error = False
             _mode_model = None  # captured from run_chat_stream's `done` event
             _mode_web_search_sources: list = []  # Ask/Plan sources — Claude, GPT, or Grok
+            from services.tool_activity import ToolTrail as _ToolTrail
+            _mode_trail = _ToolTrail()
             _plan_event = None  # plan_ready / plan_updated — set once after persist
             _plan_needs_retry = False
             _plan_questions = None  # validated clarifying questions, if this turn asked
@@ -1598,6 +1611,8 @@ async def smart_stream(req: dict, request: Request):
                             _mt = _md.get("type")
                             if _mt == "token":
                                 _mode_collected.append(_md.get("content", ""))
+                            elif _mt == "tool_activity":
+                                _mode_trail.observe(_md)
                             elif _mt == "error":
                                 _mode_error = True
                             elif _mt == "done":
@@ -1679,6 +1694,8 @@ async def smart_stream(req: dict, request: Request):
                                     _rt = _rd.get("type")
                                     if _rt == "token":
                                         _mode_collected.append(_rd.get("content", ""))
+                                    elif _rt == "tool_activity":
+                                        _mode_trail.observe(_rd)
                                     elif _rt == "error":
                                         _mode_error = True
                                     elif _rt == "done":
@@ -1718,6 +1735,8 @@ async def smart_stream(req: dict, request: Request):
                         _mode_metadata: dict = {"model": _mode_model or ""}
                         if _mode_web_search_sources:
                             _mode_metadata["web_search_sources"] = _mode_web_search_sources
+                        if _mode_trail.rows():
+                            _mode_metadata["tool_trail"] = _mode_trail.rows()
                         if _eff_mode == "plan":
                             _mode_metadata["mode"] = "plan"
                             if _plan_event and _plan_event.get("run_id"):
@@ -1958,6 +1977,8 @@ async def smart_stream(req: dict, request: Request):
         # model if the pipeline never emits one (e.g. crash before first done).
         _resolved_model = ""
         _single_pass_ws_sources: list = []  # v1.7 research checkbox — see below
+        from services.tool_activity import ToolTrail as _ToolTrail
+        _single_pass_trail = _ToolTrail()
 
         try:
             _pipe_kwargs = dict(
@@ -2020,6 +2041,8 @@ async def smart_stream(req: dict, request: Request):
                             result_content = data.get("content", "")
                         elif chunk_type == "checkpoint":
                             checkpoint_content = data.get("content", "")
+                        elif chunk_type == "tool_activity":
+                            _single_pass_trail.observe(data)
                         elif chunk_type in ("done", "error"):
                             # Pipeline's own done/error chunk is the source of
                             # truth for which model actually ran; only fall
@@ -2078,6 +2101,8 @@ async def smart_stream(req: dict, request: Request):
                                     _dlog("single_pass_web_search_persisted", session_id=session_id,
                                           user_id=current_user_id,
                                           source_count=len(_single_pass_ws_sources))
+                                if _single_pass_trail.rows():
+                                    _single_pass_metadata["tool_trail"] = _single_pass_trail.rows()
                                 db.execute(
                                     "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
                                     (resp_id, session_id, "assistant", saved_content,
@@ -2159,8 +2184,11 @@ async def smart_stream(req: dict, request: Request):
                                     db.execute(
                                         "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
                                         (resp_id, session_id, "assistant", _rec_saved_content,
-                                         _json.dumps({"model": _resolved_model or _arch_model,
-                                                      "recovered": True}))
+                                         _json.dumps({
+                                             "model": _resolved_model or _arch_model,
+                                             "recovered": True,
+                                             **({"tool_trail": _single_pass_trail.rows()} if _single_pass_trail.rows() else {}),
+                                         }))
                                     )
                                     db.execute(
                                         "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -2214,7 +2242,10 @@ async def smart_stream(req: dict, request: Request):
                             db.execute(
                                 "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
                                 (resp_id, session_id, "assistant", fallback_text,
-                                 _json.dumps({"model": _resolved_model or _arch_model}))
+                                 _json.dumps({
+                                     "model": _resolved_model or _arch_model,
+                                     **({"tool_trail": _single_pass_trail.rows()} if _single_pass_trail.rows() else {}),
+                                 }))
                             )
                             db.execute(
                                 "UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -2309,7 +2340,7 @@ def _build_prior_work_context(session_id, run_id, current_seq):
     return ctx
 
 
-def _save_task_message(session_id, natural_text, parsed, model="", web_search_sources=None):
+def _save_task_message(session_id, natural_text, parsed, model="", web_search_sources=None, tool_trail=None):
     """Persist a task's assistant message (natural text + optional diff result).
 
     web_search_sources : v1.7 research checkbox — this task's Claude
@@ -2344,6 +2375,8 @@ def _save_task_message(session_id, natural_text, parsed, model="", web_search_so
             _task_msg_metadata["web_search_sources"] = web_search_sources
             _dlog("save_task_message_web_search_persisted", session_id=session_id,
                   source_count=len(web_search_sources))
+        if tool_trail:
+            _task_msg_metadata["tool_trail"] = tool_trail
         db.execute(
             "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
             (rid, session_id, "assistant", saved, json.dumps(_task_msg_metadata)),
@@ -2608,6 +2641,8 @@ async def execute_task(req: dict, request: Request):
         _think_parts: list = []  # accumulated extended-thinking text for this task
         _task_model = ""  # captured from this task's own done chunk
         _task_ws_sources: list = []  # v1.7 research checkbox — this task's web-search sources, if any
+        from services.tool_activity import ToolTrail as _ToolTrail
+        _task_trail = _ToolTrail()
         _credit_paused_view = None  # Anthropic credit pause payload (cb380321)
         try:
             # v1.7 research checkbox — a task spawned from a "research-enabled"
@@ -2661,6 +2696,10 @@ async def execute_task(req: dict, request: Request):
                             yield _sse({"type": "credit_paused", "content": _credit_paused_view})
                         elif _ct == "progress":
                             yield _sse({"type": "task_progress", "id": task_id, "content": _d.get("content", "")})
+                        elif _ct == "tool_activity":
+                            _d = {**_d, "task_id": task_id}
+                            _task_trail.observe(_d)
+                            yield _sse(_d)
                         elif _ct == "thinking":
                             # Forward the model's extended thinking so the UI can
                             # show a per-task expandable reasoning trail (parity
@@ -2753,11 +2792,13 @@ async def execute_task(req: dict, request: Request):
                     _rp["natural_text"] = natural_text
                     _rp["credit_paused"] = True
                     _save_task_message(session_id, natural_text, _rp, model=_task_model,
-                                        web_search_sources=_task_ws_sources)
+                                        web_search_sources=_task_ws_sources,
+                                        tool_trail=_task_trail.rows() or None)
                     yield _sse({"type": "smart_result", "content": json.dumps(_rp)})
                 elif natural_text:
                     _save_task_message(session_id, natural_text, None, model=_task_model,
-                                        web_search_sources=_task_ws_sources)
+                                        web_search_sources=_task_ws_sources,
+                                        tool_trail=_task_trail.rows() or None)
             except Exception:
                 pass
             update_task(
@@ -2788,7 +2829,8 @@ async def execute_task(req: dict, request: Request):
 
         score, worst = _eval_task_result(parsed) if parsed else (None, "safe")
         _save_task_message(session_id, natural_text, parsed, model=_task_model,
-                            web_search_sources=_task_ws_sources)
+                            web_search_sources=_task_ws_sources,
+                            tool_trail=_task_trail.rows() or None)
 
         # Non-code ("answer") tasks edit nothing → skip the QA verdict gate.
         _is_answer = task.get("kind") == "answer"
@@ -3312,6 +3354,8 @@ async def resume_credit_pause(pause_id: str, request: Request):
         result_content = None
         _resolved_model = ""
         _ok = False
+        from services.tool_activity import ToolTrail as _ToolTrail
+        _resume_trail = _ToolTrail()
         try:
             async for chunk in _with_heartbeat(run_natural_pipeline_stream(
                 session_files=session_files,
@@ -3352,6 +3396,8 @@ async def resume_credit_pause(pause_id: str, request: Request):
                                 _ok = True
                         elif chunk_type == "credit_paused":
                             _ok = False
+                        elif chunk_type == "tool_activity":
+                            _resume_trail.observe(data)
                         elif chunk_type in ("done", "error"):
                             _resolved_model = data.get("model") or _resolved_model
                             if chunk_type == "done" and result_content:
@@ -3378,8 +3424,9 @@ async def resume_credit_pause(pause_id: str, request: Request):
                 else:
                     content = natural_text or "(credit-pause resume finished)"
                 db.execute(
-                    "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-                    (resp_id, session_id, "assistant", content),
+                    "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
+                    (resp_id, session_id, "assistant", content,
+                     json.dumps({"tool_trail": _resume_trail.rows()} if _resume_trail.rows() else {})),
                 )
                 db.commit()
         except Exception as e:

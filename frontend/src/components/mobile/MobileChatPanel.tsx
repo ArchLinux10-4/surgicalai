@@ -48,6 +48,28 @@ import { useThemeStore } from '../../stores/themeStore'
 import type { SessionFile, SmartResult } from '../../types'
 import { validateFileSize } from '../../utils/fileValidation'
 import { clientLog } from '../../lib/clientLog'
+import { ToolActivityFeed } from '../ToolActivityFeed'
+import { finalizeTrail, modelFamily } from '../../lib/toolActivity'
+import type { ToolRow } from '../../types'
+
+function snapshotTools(sessionId: string): ToolRow[] | undefined {
+  const rows = finalizeTrail(useAppStore.getState().toolActivity[sessionId]?.rows ?? [])
+  return rows.length ? rows : undefined
+}
+
+function snapshotTaskTools(sessionId: string, taskId: string): ToolRow[] | undefined {
+  const rows = (useAppStore.getState().toolActivity[sessionId]?.rows ?? []).filter(row => row.taskId === taskId)
+  const done = finalizeTrail(rows)
+  return done.length ? done : undefined
+}
+
+function dropToolActivity(sessionId: string) {
+  useAppStore.setState(state => {
+    if (!state.toolActivity[sessionId]) return state
+    const { [sessionId]: _drop, ...rest } = state.toolActivity
+    return { toolActivity: rest }
+  })
+}
 
 // ── Thin progress steps component ───────────────────────────────────────────
 function ProgressSteps({ steps }: { steps: string[] }) {
@@ -66,7 +88,7 @@ function ProgressSteps({ steps }: { steps: string[] }) {
 }
 
 /** Lightweight thinking toggle — plain text (no Prism) to preserve lag wins. */
-function MobileThinkingBlock({ text, isStreaming }: { text: string; isStreaming: boolean }) {
+function MobileThinkingBlock({ text, isStreaming, label }: { text: string; isStreaming: boolean; label?: string }) {
   const [expanded, setExpanded] = useState(isStreaming)
   const userToggledRef = useRef(false)
   useEffect(() => {
@@ -81,7 +103,7 @@ function MobileThinkingBlock({ text, isStreaming }: { text: string; isStreaming:
         className="flex items-center gap-1.5 text-[11px] text-purple"
       >
         <span className={`transform transition-transform ${expanded ? 'rotate-90' : ''}`}>▶</span>
-        {isStreaming ? <span>Thinking<span className="animate-pulse">…</span></span> : <span>Reasoning</span>}
+        {isStreaming ? <span>Thinking<span className="animate-pulse">…</span></span> : <span>{label || 'Reasoning'}</span>}
       </button>
       {expanded && text && (
         <div className="mt-1.5 ml-3 pl-2 border-l-2 border-purple/30 text-[11px] text-muted/90 whitespace-pre-wrap max-h-48 overflow-y-auto font-mono leading-relaxed">
@@ -96,38 +118,47 @@ function MobileThinkingBlock({ text, isStreaming }: { text: string; isStreaming:
 // ── Streaming bubble ─────────────────────────────────────────────────────────
 // Markdown is throttled inside AssistantMarkdown so a token flood does not
 // reparse the whole reply on every chunk.
-function StreamingBubble({ text, progress, isBuildingEdit, thinkingText, isThinking }: {
+function StreamingBubble({ text, progress, isBuildingEdit, thinkingText, isThinking, sessionId, model }: {
   text: string; progress: string; isBuildingEdit: boolean
   thinkingText?: string; isThinking?: boolean
+  sessionId?: string; model?: string
 }) {
+  const activity = useAppStore(s => (sessionId ? s.toolActivity[sessionId] : undefined))
+  const rows = activity?.rows ?? []
+  const quiet = !stripPlanQuestionsFence(text || '', true) && !isBuildingEdit && !thinkingText && !isThinking && rows.length === 0
   return (
     <div className="flex items-start gap-2.5 px-4 py-3">
       <div className="w-7 h-7 rounded-full bg-[rgba(74,222,128,0.12)] border border-[rgba(74,222,128,0.25)] flex items-center justify-center flex-shrink-0 mt-0.5">
         <span className="text-[#4ade80] text-[10px] font-bold">AI</span>
       </div>
       <div className="flex-1 min-w-0">
+        <ToolActivityFeed
+          compact
+          mode="live"
+          rows={rows}
+          startedAt={activity?.startedAt}
+          model={model}
+          content={text}
+          progress={progress}
+          isThinking={isThinking}
+          isBuildingEdit={isBuildingEdit}
+        />
         {(thinkingText || isThinking) && (
           <MobileThinkingBlock text={thinkingText || ''} isStreaming={!!isThinking} />
         )}
-        {progress && progress !== 'Thinking...' && (
-          <div className="flex items-center gap-1.5 text-[11px] text-muted/70 mb-1.5">
-            <span className="w-1.5 h-1.5 rounded-full bg-[#4ade80] animate-pulse" />
-            {progress}
-          </div>
-        )}
         {isBuildingEdit && (
           <div className="flex items-center gap-1.5 text-[11px] text-warning/80 mb-1.5 px-2 py-1 bg-warning/10 rounded-lg border border-warning/20">
-            <span className="w-1.5 h-1.5 rounded-full bg-warning animate-pulse" />
+            <span className="w-1.5 h-1.5 rounded-full bg-warning motion-safe:animate-pulse" />
             Preparing code change...
           </div>
         )}
         {text && (
           <AssistantMarkdown text={text} streaming />
         )}
-        {!stripPlanQuestionsFence(text || '', true) && !isBuildingEdit && !thinkingText && !isThinking && (
+        {quiet && (
           <div className="flex gap-1">
             {[0, 1, 2].map(i => (
-              <span key={i} className="w-1.5 h-1.5 rounded-full bg-muted/40 animate-bounce"
+              <span key={i} className="w-1.5 h-1.5 rounded-full bg-muted/40 motion-safe:animate-bounce"
                 style={{ animationDelay: `${i * 0.15}s` }} />
             ))}
           </div>
@@ -213,11 +244,18 @@ function MessageBubbleImpl({ msg, sessionId, sessionFiles, setSessionFiles }: {
         {msg._aborted && (
           <span className="inline-block text-[9px] font-medium text-danger/80 bg-danger/10 px-1.5 py-0.5 rounded mb-1.5">Stopped</span>
         )}
-        {/* Steps trail */}
-        {msg._steps && <ProgressSteps steps={msg._steps} />}
+        {msg._tools?.length ? (
+          <ToolActivityFeed mode="done" rows={msg._tools} model={msg._model} compact />
+        ) : (
+          msg._steps && <ProgressSteps steps={msg._steps} />
+        )}
 
         {msg._thinking && (
-          <MobileThinkingBlock text={msg._thinking} isStreaming={false} />
+          <MobileThinkingBlock
+            text={msg._thinking}
+            isStreaming={false}
+            label={`${modelFamily(msg._model).name} reasoning`}
+          />
         )}
 
         {/* Natural text — collapse long narratives when Apply cards are present */}
@@ -297,6 +335,7 @@ const MessageBubble = memo(MessageBubbleImpl, (prev, next) => (
   prev.msg.surgical_data === next.msg.surgical_data &&
   prev.msg.message_type === next.msg.message_type &&
   prev.msg._aborted === next.msg._aborted &&
+  prev.msg._tools === next.msg._tools &&
   prev.msg._steps === next.msg._steps &&
   prev.msg._thinking === next.msg._thinking &&
   prev.msg.compact_summary === next.msg.compact_summary &&
@@ -658,16 +697,26 @@ export function MobileChatPanel() {
     return () => el.removeEventListener('scroll', handleScroll)
   }, [])
 
+  const liveToolCount = useAppStore(s => {
+    const sid = s.activeSessions
+    return sid ? (s.toolActivity[sid]?.rows.length ?? 0) : 0
+  })
+  const liveToolStage = useAppStore(s => {
+    const sid = s.activeSessions
+    const active = sid ? s.toolActivity[sid]?.rows.find(row => row.status === 'running' || row.status === 'waiting') : undefined
+    return active ? `${active.id}:${active.status}` : ''
+  })
+
   useEffect(() => {
     if (userScrolledUpRef.current) return
-    if (streamingMsg) {
+    if (isStreaming) {
       const el = scrollContainerRef.current
       if (el) el.scrollTop = el.scrollHeight
       else bottomRef.current?.scrollIntoView({ behavior: 'auto' })
       return
     }
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, streamingMsg])
+  }, [messages, streamingMsg, liveToolCount, liveToolStage, isStreaming])
 
   // Load session files when active session changes
   useEffect(() => {
@@ -793,7 +842,10 @@ export function MobileChatPanel() {
       streamOutcomeRef.current = 'stopped'
       useAppStore.getState().setSteerPaused(sid, true)
     }
-    if (!gotResultRef.current && (accumulatedRef.current.trim() || thinkingTextRef.current.trim()) && streamingSessionIdRef.current) {
+    const sidForTools = streamingSessionIdRef.current || activeSessions
+    if (sidForTools) useAppStore.getState().stopToolActivity(sidForTools)
+    const _tools = sidForTools ? snapshotTools(sidForTools) : undefined
+    if (!gotResultRef.current && (accumulatedRef.current.trim() || thinkingTextRef.current.trim() || _tools?.length) && streamingSessionIdRef.current) {
       addMessage({
         id: Date.now().toString() + '_ai_aborted',
         session_id: streamingSessionIdRef.current,
@@ -802,10 +854,12 @@ export function MobileChatPanel() {
         created_at: new Date().toISOString(),
         _steps: [...progressHistoryRef.current],
         _thinking: thinkingTextRef.current || undefined,
+        _tools,
         _aborted: true,
       })
       gotResultRef.current = true
     }
+    if (sidForTools) dropToolActivity(sidForTools)
     thinkingTextRef.current = ''
     setThinkingText('')
     stopStream()
@@ -904,6 +958,7 @@ export function MobileChatPanel() {
     })
 
     setIsStreaming(true)
+    useAppStore.getState().beginToolActivity(sessionId)
     setProgress('Thinking...')
     setStreamingMsg('')
     setBuildEdit(false)
@@ -932,7 +987,7 @@ export function MobileChatPanel() {
     // /smart-stream now ends right after planning. Each task then runs in its
     // own short-lived SSE stream, sequentially, so no single connection can
     // hit the proxy/process timeout that previously killed long runs.
-    const addTaskResultCard = (result: any) => {
+    const addTaskResultCard = (result: any, taskId?: string) => {
       const naturalText = (result.natural_text || '')
         .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
         .replace(/<new_file>[\s\S]*$/, '')
@@ -945,6 +1000,7 @@ export function MobileChatPanel() {
         surgical_data: JSON.stringify(result),
         content: naturalText,
         created_at: new Date().toISOString(),
+        _tools: taskId ? snapshotTaskTools(sessionId, taskId) : undefined,
       })
       api.sessionFiles.list(sessionId).then(setSessionFiles).catch(() => {})
     }
@@ -1047,7 +1103,7 @@ export function MobileChatPanel() {
         const ctrl = api.stream.executeTask(
           { session_id: sid, run_id: runId, task_id: t.id },
           (progress) => setProgress(progress),
-          (result) => addTaskResultCard(result),
+          (result) => addTaskResultCard(result, t.id),
           reconcileOnClose,
           (err) => { streamErr = err },
           (event) => {
@@ -1065,6 +1121,8 @@ export function MobileChatPanel() {
             }
           },
           onTaskCreditPaused,
+          undefined,
+          (ev) => { useAppStore.getState().applyToolActivity(sid, ev) },
         )
         ctrlRef.current = ctrl
       }
@@ -1103,7 +1161,9 @@ export function MobileChatPanel() {
         gotResultRef.current = true
         const _steps = [...progressHistoryRef.current]
         const _thinking = thinkingTextRef.current
+        const _tools = snapshotTools(sessionId)
         const naturalText = result.natural_text || accumulated
+        dropToolActivity(sessionId)
         stopStream()
         setBuildEdit(false)
         thinkingTextRef.current = ''
@@ -1118,6 +1178,7 @@ export function MobileChatPanel() {
           created_at: new Date().toISOString(),
           _steps,
           _thinking,
+          _tools,
         })
         if (isFirst) autoName()
         else api.chat.getSessions().then(setSessions).catch(() => {})
@@ -1136,10 +1197,12 @@ export function MobileChatPanel() {
         gotResultRef.current = true
         const _steps = [...progressHistoryRef.current]
         const _thinking = thinkingTextRef.current
+        const _tools = snapshotTools(sessionId)
+        dropToolActivity(sessionId)
         stopStream()
         thinkingTextRef.current = ''
         setThinkingText('')
-        if (fullText.trim()) {
+        if (fullText.trim() || _tools?.length) {
           addMessage({
             id: Date.now().toString() + '_ai',
             session_id: sessionId,
@@ -1148,6 +1211,7 @@ export function MobileChatPanel() {
             created_at: new Date().toISOString(),
             _steps,
             _thinking,
+            _tools,
           })
         }
         if (isFirst) autoName()
@@ -1157,7 +1221,10 @@ export function MobileChatPanel() {
       (err) => {
         // Preserve whatever was streamed before the connection error — same
         // long-term fix as manual stop: nothing streamed is silently dropped.
-        if ((accumulated.trim() || thinkingTextRef.current.trim()) && !gotResult) {
+        useAppStore.getState().stopToolActivity(sessionId)
+        const _tools = snapshotTools(sessionId)
+        dropToolActivity(sessionId)
+        if ((accumulated.trim() || thinkingTextRef.current.trim() || _tools?.length) && !gotResult) {
           addMessage({
             id: Date.now().toString() + '_ai_err',
             session_id: sessionId,
@@ -1166,6 +1233,7 @@ export function MobileChatPanel() {
             created_at: new Date().toISOString(),
             _steps: [...progressHistoryRef.current],
             _thinking: thinkingTextRef.current || undefined,
+            _tools,
           })
           gotResult = true
           gotResultRef.current = true
@@ -1405,6 +1473,7 @@ export function MobileChatPanel() {
         })
         refreshRepoBranch(sessionId)
       },
+      (ev) => { useAppStore.getState().applyToolActivity(sessionId, ev) },
     )
     ctrlRef.current = ctrl
   }, [input, pastedBlocks, draftKey, isStreaming, settings, ensureSession, messages.length, sessionFiles,
@@ -1528,6 +1597,7 @@ export function MobileChatPanel() {
             surgical_data: JSON.stringify(result),
             content: naturalText,
             created_at: new Date().toISOString(),
+            _tools: snapshotTaskTools(sid, t.id),
           })
           api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
         },
@@ -1565,6 +1635,8 @@ export function MobileChatPanel() {
             probing: false,
           })
         },
+        undefined,
+        (ev) => { useAppStore.getState().applyToolActivity(sid, ev) },
       )
       ctrlRef.current = ctrl
     }
@@ -1583,6 +1655,8 @@ export function MobileChatPanel() {
     if (useAppStore.getState().activeSessions !== sid) { setCreditPause(null); return }
     setError(null)
     setIsStreaming(true)
+    streamingSessionIdRef.current = sid
+    useAppStore.getState().beginToolActivity(sid)
     setProgress('Resuming saved edits…')
     setStreamingMsg('')
     progressHistoryRef.current = ['Resuming saved edits…']
@@ -1619,6 +1693,8 @@ export function MobileChatPanel() {
           .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
           .replace(/<new_file>[\s\S]*$/, '')
           .trim()
+        const _tools = snapshotTools(sid)
+        dropToolActivity(sid)
         addMessage({
           id: Date.now().toString() + '_credit_resume',
           session_id: sid,
@@ -1627,6 +1703,7 @@ export function MobileChatPanel() {
           surgical_data: JSON.stringify(result),
           content: naturalText,
           created_at: new Date().toISOString(),
+          _tools,
         } as any)
         api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
         setCreditPause(null)
@@ -1653,6 +1730,7 @@ export function MobileChatPanel() {
           probing: false,
         })
       },
+      (ev) => { useAppStore.getState().applyToolActivity(sid, ev) },
     )
     ctrlRef.current = ctrl
   }, [creditPause, isStreaming, addMessage, setSessionFiles, stopStream])
@@ -1854,6 +1932,8 @@ export function MobileChatPanel() {
                 isBuildingEdit={isBuildingEdit}
                 thinkingText={thinkingText}
                 isThinking={isThinking}
+                sessionId={streamingSessionIdRef.current || activeSessions || undefined}
+                model={settings?.architect_model}
               />
             )}
             {error && (

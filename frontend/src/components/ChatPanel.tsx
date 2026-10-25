@@ -36,6 +36,20 @@ import { ApplyProgressStrip } from './ApplyProgressStrip'
 import type { ApplyProgress } from '../lib/applyProgress'
 import { applyStageLabel } from '../lib/applyProgress'
 import { splitPendingChanges } from '../lib/diffChange'
+import { ToolActivityFeed } from './ToolActivityFeed'
+import { finalizeTrail, modelFamily } from '../lib/toolActivity'
+import type { ToolRow } from '../types'
+
+function snapshotTools(sessionId: string): ToolRow[] | undefined {
+  const rows = finalizeTrail(useAppStore.getState().toolActivity[sessionId]?.rows ?? [])
+  return rows.length ? rows : undefined
+}
+
+function snapshotTaskTools(sessionId: string, taskId: string): ToolRow[] | undefined {
+  const rows = (useAppStore.getState().toolActivity[sessionId]?.rows ?? []).filter(row => row.taskId === taskId)
+  const done = finalizeTrail(rows)
+  return done.length ? done : undefined
+}
 
 
 // ── Chat mode selector ────────────────────────────────────────────────────────
@@ -544,15 +558,26 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
           <span className="text-[10px] text-faint opacity-0 group-hover:opacity-100 transition-opacity">{time}</span>
         </div>
 
-        {/* Persistent phase trail — PipelineTimeline for edits, PersistentSteps for text */}
-        {(msg._thinking || (msg._steps && msg._steps.filter((s: string) => s !== 'Thinking...').length > 0)) && (
+        {/* Tool trail persists with the message. Older history without one keeps the step list. */}
+        {(msg._tools?.length || msg._thinking || (msg._steps && msg._steps.filter((s: string) => s !== 'Thinking...').length > 0)) && (
           <div className="mb-3 space-y-1">
-            {msg._steps && (
-              (isSurgical || isNaturalResult)
-                ? <PipelineTimeline steps={msg._steps} />
-                : <PersistentSteps steps={msg._steps} />
+            {msg._tools?.length ? (
+              <ToolActivityFeed mode="done" rows={msg._tools} model={msg._model} />
+            ) : null}
+            {msg._steps && (isSurgical || isNaturalResult) && (
+              <PipelineTimeline steps={msg._steps} />
             )}
-            {msg._thinking && <ThinkingBlock text={msg._thinking} isStreaming={false} sessionId={sessionId} />}
+            {msg._steps && !msg._tools?.length && !(isSurgical || isNaturalResult) && (
+              <PersistentSteps steps={msg._steps} />
+            )}
+            {msg._thinking && (
+              <ThinkingBlock
+                text={msg._thinking}
+                isStreaming={false}
+                sessionId={sessionId}
+                label={`${modelFamily(msg._model).name} reasoning`}
+              />
+            )}
           </div>
         )}
         <SourcesRow sources={msg._sources} />
@@ -668,7 +693,7 @@ function Message({ msg, sessionId, onRetryWithQA }: { msg: any; sessionId: strin
 
 // ── Streaming bubble with thinking trail ──────────────────
 // ── Claude Thinking Block ─────────────────────────────────
-function ThinkingBlock({ text, isStreaming, sessionId }: { text: string; isStreaming: boolean; sessionId?: string }) {
+function ThinkingBlock({ text, isStreaming, sessionId, label }: { text: string; isStreaming: boolean; sessionId?: string; label?: string }) {
   const [expanded, setExpanded] = useState(isStreaming)
   // Tracks whether the user has explicitly clicked the toggle for *this*
   // streaming turn. Claude's thinking often fires several thinking_start/
@@ -716,7 +741,7 @@ function ThinkingBlock({ text, isStreaming, sessionId }: { text: string; isStrea
             Thinking<span className="animate-pulse">…</span>
           </span>
         ) : (
-          <span>Claude's reasoning ({text.length > 1000 ? `${Math.round(text.length / 100)} steps` : 'click to view'})</span>
+          <span>{label || 'Reasoning'} ({text.length > 1000 ? `${Math.round(text.length / 100)} steps` : 'click to view'})</span>
         )}
       </button>
       {expanded && text && (
@@ -925,25 +950,17 @@ function PipelineTimeline({ steps, isLive = false }: { steps: string[]; isLive?:
   )
 }
 
-function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit, webSearchLive, sessionId }: { content: string; progress: string; progressHistory: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean; webSearchLive?: { searching: boolean; query?: string } | null; sessionId?: string }) {
-  const [elapsed, setElapsed] = useState(0)
+function StreamingBubble({ content, progress, thinkingText, isThinking, isBuildingEdit, webSearchLive, sessionId, model }: { content: string; progress: string; progressHistory?: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean; webSearchLive?: { searching: boolean; query?: string } | null; sessionId?: string; model?: string }) {
   const liveOrder = useAppStore((s) => (sessionId ? s.liveEditOrder[sessionId] : undefined))
   const liveMap = useAppStore((s) => (sessionId ? s.liveEdits[sessionId] : undefined))
+  const activity = useAppStore((s) => (sessionId ? s.toolActivity[sessionId] : undefined))
   const liveCards: LiveEditCardState[] = []
   for (const id of liveOrder || []) {
     const card = liveMap?.[id]
     if (card) liveCards.push(card)
   }
-
-  // Elapsed timer — ticks every second while streaming
-  useEffect(() => {
-    const start = Date.now()
-    const interval = setInterval(() => setElapsed(Math.floor((Date.now() - start) / 1000)), 1000)
-    return () => clearInterval(interval)
-  }, [])
-
-  const completedSteps = progressHistory.slice(0, -1)
-  const hasSteps = completedSteps.length > 0
+  const toolRows = activity?.rows ?? []
+  const webRowRunning = toolRows.some(row => row.kind === 'web' && (row.status === 'running' || row.status === 'waiting'))
 
   return (
     <div className="flex items-start gap-3 px-4 py-4">
@@ -955,60 +972,25 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 mb-2">
           <span className="text-[12px] font-semibold text-ink/80">SurgicalAI</span>
-          {/* Current progress badge — QA and Auto-Heal get distinct styling */}
-          {progress && (() => {
-            const isHeal = /🔁|surgeon retry|auto.fix|fixing blocked/i.test(progress)
-            const isQA = /running qa|QA\s*[✅⚠️🚫⏭]/i.test(progress)
-            // Tool-use phases (agent-mode github/codebase requests — mainly
-            // seen with Grok's native tool loop, but harmless for any model
-            // that reaches this dispatch code). Distinct from Claude's
-            // dedicated web-search pill below, which is a separate feature.
-            const isGithub = /🐙|github:/i.test(progress)
-            const isCodeSearch = /🔍|searching codebase/i.test(progress)
-            const badgeCls = isHeal
-              ? 'text-amber-400 bg-amber-500/10 border-amber-500/25 shadow-sm shadow-amber-500/10'
-              : isQA
-                ? 'text-blue-400 bg-blue-500/10 border-blue-500/25'
-                : isGithub
-                  ? 'text-violet-400 bg-violet-500/10 border-violet-500/25'
-                  : isCodeSearch
-                    ? 'text-emerald-400 bg-emerald-500/10 border-emerald-500/25'
-                    : 'text-accent bg-accent/10 border-accent/20'
-            const dotCls = isHeal
-              ? 'bg-amber-400'
-              : isQA
-                ? 'bg-blue-400'
-                : isGithub
-                  ? 'bg-violet-400'
-                  : isCodeSearch
-                    ? 'bg-emerald-400'
-                    : 'bg-accent'
-            return (
-              <span className={`text-[11px] flex items-center gap-1.5 px-2 py-0.5 rounded-full border font-medium ${badgeCls}`}>
-                <span className={`w-1.5 h-1.5 rounded-full animate-pulse ${dotCls}`} />
-                {progress}
-              </span>
-            )
-          })()}
-          {/* Claude web-search live pill — "Searching…" then the actual query
-              once we know it, per services/claude_web_search.py's events. */}
-          {webSearchLive?.searching && (
-            <span className="text-[11px] flex items-center gap-1.5 px-2 py-0.5 rounded-full border font-medium text-sky-400 bg-sky-500/10 border-sky-500/25">
-              <span className="w-1.5 h-1.5 rounded-full animate-pulse bg-sky-400" />
+          {webSearchLive?.searching && !webRowRunning && (
+            <span className="text-[11px] flex items-center gap-1.5 px-2 py-0.5 rounded-full border font-medium text-accent bg-accent/10 border-accent/25">
+              <span className="w-1.5 h-1.5 rounded-full bg-accent motion-safe:animate-pulse" />
               <Search sx={{ fontSize: 12 }} />
               {webSearchLive.query ? `Searching: “${webSearchLive.query}”` : 'Searching the web…'}
             </span>
           )}
-          {/* Elapsed timer */}
-          {elapsed > 0 && !content && (
-            <span className="text-[10px] text-muted/70 tabular-nums">{elapsed}s</span>
-          )}
         </div>
 
-        {/* Live pipeline phase timeline */}
-        {hasSteps && !content && (
-          <PipelineTimeline steps={completedSteps} isLive />
-        )}
+        <ToolActivityFeed
+          mode="live"
+          rows={toolRows}
+          startedAt={activity?.startedAt}
+          model={model}
+          content={content}
+          progress={progress}
+          isThinking={isThinking}
+          isBuildingEdit={isBuildingEdit || liveCards.some(card => card.status === 'writing')}
+        />
 
         {/* Claude thinking block */}
         {(thinkingText || isThinking) && (
@@ -1461,7 +1443,9 @@ export function ChatPanel() {
     const accumulated = (entry?.streamingMessage ?? (state.activeSessions === sid ? state.streamingMessage : '')) || ''
     const thinking = thinkingTextRef.current
     const steps = [...progressHistoryRef.current]
-    if (accumulated.trim() || thinking.trim()) {
+    useAppStore.getState().stopToolActivity(sid)
+    const _tools = snapshotTools(sid)
+    if (accumulated.trim() || thinking.trim() || _tools?.length) {
       addMessage({
         id: Date.now().toString() + '_ai_aborted',
         session_id: sid,
@@ -1470,6 +1454,7 @@ export function ChatPanel() {
         created_at: new Date().toISOString(),
         _thinking: thinking || undefined,
         _steps: steps,
+        _tools,
         _aborted: true,
       })
     }
@@ -1533,11 +1518,21 @@ export function ChatPanel() {
     return () => el.removeEventListener('scroll', handleScroll)
   }, [])
 
+  const liveToolCount = useAppStore(s => {
+    const sid = s.activeSessions
+    return sid ? (s.toolActivity[sid]?.rows.length ?? 0) : 0
+  })
+  const liveToolStage = useAppStore(s => {
+    const sid = s.activeSessions
+    const rows = sid ? s.toolActivity[sid]?.rows : undefined
+    const active = rows?.find(row => row.status === 'running' || row.status === 'waiting')
+    return active ? `${active.id}:${active.status}:${active.target || ''}` : ''
+  })
+
   useEffect(() => {
-    if (!userScrolledUpRef.current) {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-    }
-  }, [messages, streamingMessage])
+    if (userScrolledUpRef.current) return
+    bottomRef.current?.scrollIntoView({ behavior: isStreaming ? 'auto' : 'smooth' })
+  }, [messages, streamingMessage, liveToolCount, liveToolStage, isStreaming])
 
   // Load session files when session changes
   useEffect(() => {
@@ -1697,7 +1692,7 @@ export function ChatPanel() {
   // own short-lived SSE stream, sequentially, so no single connection can
   // hit the proxy/process timeout that previously killed long runs.
 
-  const addTaskResultCard = (sid: string, result: any) => {
+  const addTaskResultCard = (sid: string, result: any, taskId?: string) => {
     const naturalText = (result.natural_text || '')
       .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
       .replace(/<new_file>[\s\S]*$/, '')
@@ -1711,6 +1706,7 @@ export function ChatPanel() {
       content: naturalText,
       created_at: new Date().toISOString(),
       _model: result._model || 'N/A',
+      _tools: taskId ? snapshotTaskTools(sid, taskId) : undefined,
     })
     api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
   }
@@ -1821,7 +1817,7 @@ export function ChatPanel() {
       const ctrl = api.stream.executeTask(
         { session_id: sid, run_id: runId, task_id: t.id },
         (progress) => { setSessionStreamProgress(sid, progress) },
-        (result) => addTaskResultCard(sid, result),
+        (result) => addTaskResultCard(sid, result, t.id),
         reconcileOnClose,  // per-task stream closed
         (err) => { streamErr = err },  // defer: reconcileOnClose decides the outcome
         (event) => {
@@ -1859,6 +1855,7 @@ export function ChatPanel() {
           })
         },
         (event) => { useAppStore.getState().applySteerFrame(sid, event) },
+        (ev) => { useAppStore.getState().applyToolActivity(sid, ev) },
       )
       abortMapRef.current.set(sid, ctrl)
     }
@@ -1894,6 +1891,7 @@ export function ChatPanel() {
     if (useAppStore.getState().activeSessions !== sid) { setCreditPause(null); return }
     setError(null)
     setSessionStreaming(sid, true)
+    useAppStore.getState().beginToolActivity(sid)
     setSessionStreamProgress(sid, 'Resuming saved edits…')
     setSessionStreamingMessage(sid, '')
     setProgressHistory(['Resuming saved edits…'])
@@ -1929,6 +1927,7 @@ export function ChatPanel() {
           .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
           .replace(/<new_file>[\s\S]*$/, '')
           .trim()
+        const _tools = snapshotTools(sid)
         addMessage({
           id: Date.now().toString() + '_credit_resume',
           session_id: sid,
@@ -1938,6 +1937,7 @@ export function ChatPanel() {
           content: naturalText,
           created_at: new Date().toISOString(),
           _model: result._model || 'N/A',
+          _tools,
         } as any)
         api.sessionFiles.list(sid).then(setSessionFiles).catch(() => {})
         setCreditPause(null)
@@ -1969,6 +1969,7 @@ export function ChatPanel() {
           probing: false,
         })
       },
+      (ev) => { useAppStore.getState().applyToolActivity(sid, ev) },
     )
     abortMapRef.current.set(sid, ctrl)
   }
@@ -2075,6 +2076,7 @@ export function ChatPanel() {
         if (result._model) streamModel = result._model
         const _thinking = thinkingTextRef.current
         const _steps = [...progressHistoryRef.current]
+        const _tools = snapshotTools(sessionId)
         const naturalText = (result.natural_text || accumulated)
           .replace(/<new_file>[\s\S]*?<\/new_file>/g, '')
           .replace(/<new_file>[\s\S]*$/, '')
@@ -2094,6 +2096,7 @@ export function ChatPanel() {
             created_at: new Date().toISOString(),
             _thinking,
             _steps,
+            _tools,
             _model: streamModel || 'N/A',
           })
         } else {
@@ -2107,6 +2110,7 @@ export function ChatPanel() {
             created_at: new Date().toISOString(),
             _thinking,
             _steps,
+            _tools,
             _model: streamModel || 'N/A',
           })
         }
@@ -2137,12 +2141,13 @@ export function ChatPanel() {
         if (useAppStore.getState().activeSessions === sessionId) clearAgentTasks()
         const _thinking = thinkingTextRef.current
         const _steps = [...progressHistoryRef.current]
+        const _tools = snapshotTools(sessionId)
         clearSessionStream(sessionId)
         if (useAppStore.getState().activeSessions === sessionId) setIsBuildingEdit(false)
         const _sources = webSearchSourcesRef.current.length ? [...webSearchSourcesRef.current] : undefined
         setWebSearchLive(null)
         if (_sources) clientLog('web_search_sources_attached_to_message', { sourceCount: _sources.length }, sessionId)
-        if (fullText.trim()) {
+        if (fullText.trim() || _tools?.length) {
           addMessage({
             id: Date.now().toString() + '_ai',
             session_id: sessionId,
@@ -2151,6 +2156,7 @@ export function ChatPanel() {
             created_at: new Date().toISOString(),
             _thinking,
             _steps,
+            _tools,
             _model: streamModel || 'N/A',
             _sources,
           } as any)
@@ -2165,7 +2171,9 @@ export function ChatPanel() {
           useAppStore.getState().setSteerPaused(sessionId, true)
         }
         clearStaleFileRequest(sessionId)
-        if ((accumulated.trim() || thinkingTextRef.current.trim()) && !gotResult) {
+        useAppStore.getState().stopToolActivity(sessionId)
+        const _tools = snapshotTools(sessionId)
+        if ((accumulated.trim() || thinkingTextRef.current.trim() || _tools?.length) && !gotResult) {
           addMessage({
             id: Date.now().toString() + '_ai_err',
             session_id: sessionId,
@@ -2174,6 +2182,7 @@ export function ChatPanel() {
             created_at: new Date().toISOString(),
             _thinking: thinkingTextRef.current || undefined,
             _steps: [...progressHistoryRef.current],
+            _tools,
             _model: streamModel || 'N/A',
             _sources: webSearchSourcesRef.current.length ? [...webSearchSourcesRef.current] : undefined,
           } as any)
@@ -2464,6 +2473,7 @@ export function ChatPanel() {
         })
         refreshRepoBranch(sessionId)
       },
+      (ev) => { useAppStore.getState().applyToolActivity(sessionId, ev) },
     )
     abortMapRef.current.set(sessionId, ctrl)
   }, [sessionFiles, clearStaleFileRequest]) // all setters + clearStaleFileRequest are stable; only sessionFiles can change
@@ -2832,6 +2842,7 @@ export function ChatPanel() {
     sentMessageRef.current = text
     sentMessageMapRef.current.set(sid, text)
     setSessionStreaming(sid, true)
+    useAppStore.getState().beginToolActivity(sid)
     setSessionStreamProgress(sid, 'Thinking...')
     setSessionStreamingMessage(sid, '')
     setProgressHistory(['Thinking...'])
@@ -3184,7 +3195,7 @@ export function ChatPanel() {
             )}
             <PlanTracker hintOnly emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
             {isStreaming && (streamingMessage || streamProgress) && (
-              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} />
+              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} model={settings?.architect_model} />
             )}
             {/* Human-in-the-loop: agent needs a file that isn't in the session */}
             {fileRequest && fileRequest.sessionId === activeSessions && (

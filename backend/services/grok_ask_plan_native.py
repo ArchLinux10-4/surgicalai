@@ -164,6 +164,7 @@ def _dispatch_context_request(
     user_id: str,
     session_id: str,
     tool_round: int,
+    activity=None,
 ) -> str:
     """Route a translated native context request through the existing,
     unmodified ``_ask_plan_execute_tool_round`` via a duck-typed match.
@@ -188,6 +189,7 @@ def _dispatch_context_request(
         symbol_maps_by_name=symbol_maps_by_name,
         file_content_lookup=file_content_lookup,
         user_id=user_id, session_id=session_id, tool_round=tool_round,
+        **({"activity": activity} if activity is not None else {}),
     )
     return "\n\n".join(tool_parts) if tool_parts else (
         f"No result for this {tag_kind} request."
@@ -307,6 +309,8 @@ async def run_grok_ask_plan_native_stream(
     if websearch_enabled:
         from services.openai_web_search import SearchBudget as _WsBudget
         _ws_budget = _WsBudget()
+    from services.tool_activity import ToolTracker as _ToolTracker
+    _tracker = _ToolTracker(agent=chat_model, dlog=dlog)
     while True:
         if tool_round > 0 and _prose_needs_break:
             _prose_break_pending = True
@@ -446,8 +450,12 @@ async def run_grok_ask_plan_native_stream(
             break
 
         context_result = None
+        _tool_open = None
         if translated.context_request is not None:
             tag_kind, body = translated.context_request
+            _tool_open = _tracker.start(tag_kind, body, turn=tool_round)
+            if _tool_open:
+                yield _sse(_tool_open)
             if tag_kind == "websearch":
                 import asyncio
                 from services.openai_web_search import (
@@ -509,6 +517,9 @@ async def run_grok_ask_plan_native_stream(
                     if _mcp_ev.get("type") == "mcp_done":
                         _mcp_done = _mcp_ev
                     else:
+                        _o = _tracker.observe(_mcp_ev)
+                        if _o:
+                            yield _sse(_o)
                         yield _sse(_mcp_ev)
                 if _mcp_done.get("counted"):
                     _mcp_calls += 1
@@ -523,11 +534,19 @@ async def run_grok_ask_plan_native_stream(
                     if _git_ev.get("type") == "git_done":
                         _git_done = _git_ev
                     else:
+                        _o = _tracker.observe(_git_ev)
+                        if _o:
+                            yield _sse(_o)
                         yield _sse(_git_ev)
                 if _git_done.get("counted"):
                     _git_calls += 1
                 context_result = _git_done.get("note") or ""
                 if _git_done.get("stop"):
+                    if _tool_open:
+                        _end = _tracker.end(context_result)
+                        if _end:
+                            yield _sse(_end)
+                        _tool_open = None
                     from services.git_cli import render_git_outcome as _render_git_outcome
                     _git_block = _render_git_outcome([_git_done])
                     if _git_block:
@@ -544,6 +563,9 @@ async def run_grok_ask_plan_native_stream(
                     if _aws_ev.get("type") == "aws_done":
                         _aws_done = _aws_ev
                     else:
+                        _o = _tracker.observe(_aws_ev)
+                        if _o:
+                            yield _sse(_o)
                         yield _sse(_aws_ev)
                 if _aws_done.get("counted"):
                     _aws_calls += 1
@@ -556,6 +578,10 @@ async def run_grok_ask_plan_native_stream(
                     file_content_lookup=file_content_lookup,
                     user_id=user_id, session_id=session_id, tool_round=tool_round,
                 )
+            if _tool_open:
+                _end = _tracker.end(context_result or "")
+                if _end:
+                    yield _sse(_end)
             dlog("grok_ask_plan_native_context_dispatched", session_id=session_id,
                  user_id=user_id, tool_round=tool_round, tag_kind=tag_kind,
                  result_chars=len(context_result))
@@ -568,6 +594,8 @@ async def run_grok_ask_plan_native_stream(
         )
         messages.extend(followup)
         tool_round += 1
+    for _ev in _tracker.close_all():
+        yield _sse(_ev)
     if steer_inbox is not None:
         yield _sse({"type": "steer_closed"})
         from services.steering import flush_unapplied as _flush_steer

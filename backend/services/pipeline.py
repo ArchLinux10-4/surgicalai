@@ -4556,7 +4556,7 @@ def _ask_plan_strip_tool_tags(text: str) -> str:
 def _ask_plan_execute_tool_round(
     *, sr_match, fr_match, gr_match, hr_match=None, aws_match=None, rr_match=None,
     symbol_maps_by_name, file_content_lookup, user_id, session_id, tool_round,
-    known_repos=None, gh_seen=None,
+    known_repos=None, gh_seen=None, activity=None,
 ):
     """
     Executes whichever tag(s) the model emitted this round, reusing the
@@ -4579,7 +4579,14 @@ def _ask_plan_execute_tool_round(
     from services.github_context_tools import gh_error
 
     tool_parts = []
+
+    def _finish(kind, before):
+        if activity is None:
+            return
+        activity.finish(kind, "\n\n".join(tool_parts[before:]))
+
     if sr_match:
+        _before = len(tool_parts)
         sr_data = _parse_search_content(sr_match.group(1))
         sr_terms = sr_data.get("terms", []) if isinstance(sr_data, dict) else []
         if sr_terms:
@@ -4587,7 +4594,9 @@ def _ask_plan_execute_tool_round(
             tool_parts.append(f"Search results for {sr_terms}:\n{sr_result}")
             _dlog("ask_plan_search_executed", session_id=session_id, user_id=user_id,
                   tool_round=tool_round, terms=sr_terms, result_chars=len(sr_result))
+        _finish("search", _before)
     if fr_match:
+        _before = len(tool_parts)
         fr_names = _parse_filereq_content(fr_match.group(1))
         for fr_fn in fr_names[:5]:
             fr_content = file_content_lookup.get(fr_fn, "")
@@ -4603,7 +4612,9 @@ def _ask_plan_execute_tool_round(
                 tool_parts.append(f"FILE NOT FOUND: '{fr_fn}'")
         _dlog("ask_plan_file_fetched", session_id=session_id, user_id=user_id,
               tool_round=tool_round, requested=fr_names[:5])
+        _finish("file", _before)
     if gr_match:
+        _before = len(tool_parts)
         gr_parsed = parse_github_request(
             gr_match.group(1), dlog=_dlog, known_repos=known_repos)
         if not gr_parsed:
@@ -4653,7 +4664,9 @@ def _ask_plan_execute_tool_round(
                 _dlog("ask_plan_github_executed", session_id=session_id, user_id=user_id,
                       tool_round=tool_round, tool=gr_parsed.get("tool"),
                       result_chars=len(gr_result))
+        _finish("github", _before)
     if hr_match:
+        _before = len(tool_parts)
         # All-modes rollout: same handler shape as Agent mode's <history_request>
         # branch in natural_conversation_pipeline (agent_history_* dlog names
         # mirrored here as ask_plan_history_* so both paths are distinguishable
@@ -4700,7 +4713,9 @@ def _ask_plan_execute_tool_round(
                 tool_parts.append(
                     f"Could not search file history for '{_hr_fn}': "
                     f"{str(_hr_err)[:150]}")
+        _finish("history", _before)
     if rr_match:
+        _before = len(tool_parts)
         from services.repo_tools import parse_repo_request, execute_repo_tool
         parsed = parse_repo_request(rr_match.group(1))
         if not parsed:
@@ -4713,6 +4728,7 @@ def _ask_plan_execute_tool_round(
             ))
             _dlog("ask_plan_repo_executed", session_id=session_id, user_id=user_id,
                   tool_round=tool_round, tool=(parsed.get("tool") if isinstance(parsed, dict) else ""))
+        _finish("repo", _before)
     # AWS is not run here. Ask/Plan loops call resolve_aws_call, which
     # applies the read-only gate, the three-command stop, and file capture.
     # Git is not run here. Ask/Plan loops call resolve_git_call, which
@@ -5132,6 +5148,8 @@ async def run_chat_stream(
                 _oa_budget = _OaSearchBudget()
             if steer_inbox is not None:
                 yield sse({"type": "steer_ready"})
+            from services.tool_activity import ToolTracker as _ToolTracker
+            _ask_tracker = _ToolTracker(agent=chat_model, dlog=_dlog)
             while True:
                 if _tool_round > 0 and steer_inbox is not None:
                     from services.steering import apply_steer_at_boundary as _apply_steer
@@ -5220,6 +5238,9 @@ async def run_chat_stream(
                 if _git_match:
                     from services.git_cli import resolve_git_call as _resolve_git
                     _git_done = {"note": "", "counted": False, "run": False}
+                    _ev = _ask_tracker.start("git", (_git_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
                     async for _git_ev in _resolve_git(
                         (_git_match.group(1) or "").strip(),
                         mode or "ask",
@@ -5232,20 +5253,30 @@ async def run_chat_stream(
                         if _git_ev.get("type") == "git_done":
                             _git_done = _git_ev
                         else:
+                            _o = _ask_tracker.observe(_git_ev)
+                            if _o:
+                                yield sse(_o)
                             yield sse(_git_ev)
                     if _git_done.get("counted"):
                         _git_calls += 1
+                    _git_note = _git_done.get("note") or ""
+                    _end = _ask_tracker.end(_git_note)
+                    if _end:
+                        yield sse(_end)
                     if _git_done.get("stop"):
                         from services.git_cli import render_git_outcome as _render_git_outcome
                         _git_block = _render_git_outcome([_git_done])
                         if _git_block:
                             yield sse({"type": "token", "content": "\n\n" + _git_block})
                         break
-                    _tool_parts = [_git_done.get("note") or ""]
+                    _tool_parts = [_git_note]
                 elif _aws_match:
                     from services.aws_cli import resolve_aws_call as _resolve_aws, split_intent as _split_aws_intent
                     _aws_intent, _proposed = _split_aws_intent((_aws_match.group(1) or "").strip())
                     _aws_done = {"note": "", "counted": False, "run": False}
+                    _ev = _ask_tracker.start("aws", (_aws_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
                     async for _aws_ev in _resolve_aws(
                         _proposed,
                         _aws_intent,
@@ -5259,10 +5290,16 @@ async def run_chat_stream(
                         if _aws_ev.get("type") == "aws_done":
                             _aws_done = _aws_ev
                         else:
+                            _o = _ask_tracker.observe(_aws_ev)
+                            if _o:
+                                yield sse(_o)
                             yield sse(_aws_ev)
                     if _aws_done.get("counted"):
                         _aws_calls += 1
                     _tool_parts = [_aws_done.get("note") or ""]
+                    _end = _ask_tracker.end(_tool_parts[0])
+                    if _end:
+                        yield sse(_end)
                 elif _wr_match:
                     import asyncio as _ws_asyncio
                     from services.openai_web_search import (
@@ -5273,6 +5310,9 @@ async def run_chat_stream(
                         perform_search as _ws_perform,
                         sse_events as _ws_events,
                     )
+                    _ev = _ask_tracker.start("web", (_wr_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
                     _ws_parsed = _parse_ws(_wr_match.group(1) or "")
                     if not _ws_parsed:
                         _tool_parts = [_ws_invalid]
@@ -5318,9 +5358,15 @@ async def run_chat_stream(
                                   source_count=len(_ws_result.get("sources") or []),
                                   error=(_ws_result.get("error") or "")[:200])
                             _tool_parts = [_ws_feedback(_ws_query, _ws_result)]
+                    _end = _ask_tracker.end("\n".join(_tool_parts or []))
+                    if _end:
+                        yield sse(_end)
                 elif _mcp_match:
                     from services.mcp_client import resolve_mcp_call as _resolve_mcp
                     _mcp_done = {"note": "", "counted": False}
+                    _ev = _ask_tracker.start("mcp", (_mcp_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
                     async for _mcp_ev in _resolve_mcp(
                         (_mcp_match.group(1) or "").strip(),
                         user_id=user_id,
@@ -5332,13 +5378,24 @@ async def run_chat_stream(
                         if _mcp_ev.get("type") == "mcp_done":
                             _mcp_done = _mcp_ev
                         else:
+                            _o = _ask_tracker.observe(_mcp_ev)
+                            if _o:
+                                yield sse(_o)
                             yield sse(_mcp_ev)
                     if _mcp_done.get("counted"):
                         _mcp_calls += 1
                     _tool_parts = [_mcp_done.get("note") or ""]
+                    _end = _ask_tracker.end(_tool_parts[0])
+                    if _end:
+                        yield sse(_end)
                 else:
                     yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 if _tool_parts is None:
+                    for _ev in _ask_tracker.begin_tags(
+                        sr=_sr_match, fr=_fr_match, gr=_gr_match,
+                        hr=_hr_match, rr=_rr_match,
+                    ):
+                        yield sse(_ev)
                     _tool_parts = _ask_plan_execute_tool_round(
                         sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
                         hr_match=_hr_match, aws_match=None, rr_match=_rr_match,
@@ -5346,7 +5403,10 @@ async def run_chat_stream(
                         file_content_lookup=file_content_lookup,
                         user_id=user_id, session_id=session_id, tool_round=_tool_round,
                         known_repos=_gh_known_repos, gh_seen=_ask_plan_gh_seen,
+                        activity=_ask_tracker,
                     )
+                    for _ev in _ask_tracker.drain_ends():
+                        yield sse(_ev)
 
                 if not _tool_parts:
                     yield sse({"type": "token", "content": _round_text})
@@ -5355,6 +5415,8 @@ async def run_chat_stream(
                 _oai_msgs.append({"role": "assistant", "content": _round_text})
                 _oai_msgs.append({"role": "user", "content": "\n\n".join(_tool_parts)})
                 _tool_round += 1
+            for _ev in _ask_tracker.close_all():
+                yield sse(_ev)
             if steer_inbox is not None:
                 yield sse({"type": "steer_closed"})
                 from services.steering import flush_unapplied as _flush_steer
@@ -5490,6 +5552,8 @@ async def run_chat_stream(
             _mcp_calls = 0
             if steer_inbox is not None:
                 yield sse({"type": "steer_ready"})
+            from services.tool_activity import ToolTracker as _ToolTracker
+            _ask_tracker = _ToolTracker(agent=chat_model, dlog=_dlog)
             while True:
                 if _tool_round > 0 and steer_inbox is not None:
                     from services.steering import apply_steer_at_boundary as _apply_steer
@@ -5520,6 +5584,24 @@ async def run_chat_stream(
                     async for event in _cstream:
                         if _ws_tracker is not None:
                             for _ws_sse_event in _ws_tracker.on_event(event):
+                                _ws_type = _ws_sse_event.get("type")
+                                if _ws_type == "web_search_start":
+                                    _ev = _ask_tracker.start("web", "", turn=_tool_round)
+                                    if _ev:
+                                        yield sse(_ev)
+                                elif _ws_type == "web_search_query":
+                                    _ev = _ask_tracker.retarget(_ws_sse_event.get("content") or "")
+                                    if _ev:
+                                        yield sse(_ev)
+                                elif _ws_type == "web_search_results":
+                                    _n = len(_ws_sse_event.get("results") or [])
+                                    _err = _ws_sse_event.get("error")
+                                    _end = _ask_tracker.end(
+                                        _err or f"{_n} result{'s' if _n != 1 else ''}",
+                                        ok=False if _err else True,
+                                    )
+                                    if _end:
+                                        yield sse(_end)
                                 yield sse(_ws_sse_event)
                         event_type = getattr(event, "type", None)
                         if event_type == "content_block_start":
@@ -5611,6 +5693,9 @@ async def run_chat_stream(
                 if _git_match:
                     from services.git_cli import resolve_git_call as _resolve_git
                     _git_done = {"note": "", "counted": False, "run": False}
+                    _ev = _ask_tracker.start("git", (_git_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
                     async for _git_ev in _resolve_git(
                         (_git_match.group(1) or "").strip(),
                         mode or "ask",
@@ -5623,20 +5708,30 @@ async def run_chat_stream(
                         if _git_ev.get("type") == "git_done":
                             _git_done = _git_ev
                         else:
+                            _o = _ask_tracker.observe(_git_ev)
+                            if _o:
+                                yield sse(_o)
                             yield sse(_git_ev)
                     if _git_done.get("counted"):
                         _git_calls += 1
+                    _git_note = _git_done.get("note") or ""
+                    _end = _ask_tracker.end(_git_note)
+                    if _end:
+                        yield sse(_end)
                     if _git_done.get("stop"):
                         from services.git_cli import render_git_outcome as _render_git_outcome
                         _git_block = _render_git_outcome([_git_done])
                         if _git_block:
                             yield sse({"type": "token", "content": "\n\n" + _git_block})
                         break
-                    _tool_parts = [_git_done.get("note") or ""]
+                    _tool_parts = [_git_note]
                 elif _aws_match:
                     from services.aws_cli import resolve_aws_call as _resolve_aws, split_intent as _split_aws_intent
                     _aws_intent, _proposed = _split_aws_intent((_aws_match.group(1) or "").strip())
                     _aws_done = {"note": "", "counted": False, "run": False}
+                    _ev = _ask_tracker.start("aws", (_aws_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
                     async for _aws_ev in _resolve_aws(
                         _proposed,
                         _aws_intent,
@@ -5650,13 +5745,22 @@ async def run_chat_stream(
                         if _aws_ev.get("type") == "aws_done":
                             _aws_done = _aws_ev
                         else:
+                            _o = _ask_tracker.observe(_aws_ev)
+                            if _o:
+                                yield sse(_o)
                             yield sse(_aws_ev)
                     if _aws_done.get("counted"):
                         _aws_calls += 1
                     _tool_parts = [_aws_done.get("note") or ""]
+                    _end = _ask_tracker.end(_tool_parts[0])
+                    if _end:
+                        yield sse(_end)
                 elif _mcp_match:
                     from services.mcp_client import resolve_mcp_call as _resolve_mcp
                     _mcp_done = {"note": "", "counted": False}
+                    _ev = _ask_tracker.start("mcp", (_mcp_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
                     async for _mcp_ev in _resolve_mcp(
                         (_mcp_match.group(1) or "").strip(),
                         user_id=user_id,
@@ -5668,13 +5772,24 @@ async def run_chat_stream(
                         if _mcp_ev.get("type") == "mcp_done":
                             _mcp_done = _mcp_ev
                         else:
+                            _o = _ask_tracker.observe(_mcp_ev)
+                            if _o:
+                                yield sse(_o)
                             yield sse(_mcp_ev)
                     if _mcp_done.get("counted"):
                         _mcp_calls += 1
                     _tool_parts = [_mcp_done.get("note") or ""]
+                    _end = _ask_tracker.end(_tool_parts[0])
+                    if _end:
+                        yield sse(_end)
                 else:
                     yield sse({"type": "progress", "content": "🔍 Looking at the code…"})
                 if _tool_parts is None:
+                    for _ev in _ask_tracker.begin_tags(
+                        sr=_sr_match, fr=_fr_match, gr=_gr_match,
+                        hr=_hr_match, rr=_rr_match,
+                    ):
+                        yield sse(_ev)
                     _tool_parts = _ask_plan_execute_tool_round(
                         sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
                         hr_match=_hr_match, aws_match=None, rr_match=_rr_match,
@@ -5682,7 +5797,10 @@ async def run_chat_stream(
                         file_content_lookup=file_content_lookup,
                         user_id=user_id, session_id=session_id, tool_round=_tool_round,
                         known_repos=_gh_known_repos, gh_seen=_ask_plan_gh_seen,
+                        activity=_ask_tracker,
                     )
+                    for _ev in _ask_tracker.drain_ends():
+                        yield sse(_ev)
 
                 if not _tool_parts:
                     yield sse({"type": "token", "content": _round_text})
@@ -5691,6 +5809,8 @@ async def run_chat_stream(
                 _claude_msgs.append({"role": "assistant", "content": _round_text})
                 _claude_msgs.append({"role": "user", "content": "\n\n".join(_tool_parts)})
                 _tool_round += 1
+            for _ev in _ask_tracker.close_all():
+                yield sse(_ev)
             if steer_inbox is not None:
                 yield sse({"type": "steer_closed"})
                 from services.steering import flush_unapplied as _flush_steer
@@ -19218,12 +19338,43 @@ async def run_natural_pipeline_stream(
             )
             return content
 
+        from services.tool_activity import ToolTracker as _ToolTracker, note_at as _tool_note_at
+        _tool_tracker = _ToolTracker(agent=arch_model, dlog=_dlog)
+        _tool_note_idx = None
+        _phase_open = None
+
+        def _finish_phase():
+            nonlocal _phase_open
+            if not _phase_open:
+                return None
+            blocked = False
+            if _phase_open == "qa":
+                try:
+                    for _fdata in changes_by_file.values():
+                        for _ch in (_fdata.get("changes", []) if isinstance(_fdata, dict) else []):
+                            if ((_ch.get("qa_result") or {}).get("verdict") == "blocked"):
+                                blocked = True
+                except Exception:
+                    blocked = False
+            note = (
+                "QA blocked a change" if blocked
+                else "QA finished" if _phase_open == "qa"
+                else "Resolved edits"
+            )
+            _phase_open = None
+            return _tool_tracker.end(note, ok=not blocked)
+
         while True:
             if _git_stop_loop:
                 break
             if _skip_agent_loop_for_credit_resume:
                 break
             _turn += 1
+            if _tool_note_idx is not None:
+                _ev = _tool_tracker.end(_tool_note_at(current_messages, _tool_note_idx))
+                if _ev:
+                    yield sse(_ev)
+                _tool_note_idx = None
             if _turn > 1 and _prose_needs_break:
                 _prose_break_pending = True
             _live.set_turn(_turn)
@@ -19329,6 +19480,24 @@ async def run_natural_pipeline_stream(
 
                                 if _natural_ws_tracker is not None:
                                     for _natural_ws_sse_event in _natural_ws_tracker.on_event(event):
+                                        _ws_type = _natural_ws_sse_event.get("type")
+                                        if _ws_type == "web_search_start":
+                                            _ev = _tool_tracker.start("web", "", turn=_turn)
+                                            if _ev:
+                                                yield sse(_ev)
+                                        elif _ws_type == "web_search_query":
+                                            _ev = _tool_tracker.retarget(_natural_ws_sse_event.get("content") or "")
+                                            if _ev:
+                                                yield sse(_ev)
+                                        elif _ws_type == "web_search_results":
+                                            _n = len(_natural_ws_sse_event.get("results") or [])
+                                            _err = _natural_ws_sse_event.get("error")
+                                            _end = _tool_tracker.end(
+                                                _err or f"{_n} result{'s' if _n != 1 else ''}",
+                                                ok=False if _err else True,
+                                            )
+                                            if _end:
+                                                yield sse(_end)
                                         yield sse(_natural_ws_sse_event)
 
                                 if etype == "content_block_start":
@@ -20134,6 +20303,10 @@ async def run_natural_pipeline_stream(
                 _consecutive_empty_turns = 0
                 _assistant_echo = full_response or "(working…)"
                 _kind, _data = pending_tool
+                _ev = _tool_tracker.start(_kind, _data, turn=_turn)
+                if _ev:
+                    yield sse(_ev)
+                    _tool_note_idx = len(current_messages)
 
                 if _kind == "repo":
                     from services.repo_tools import execute_repo_tool as _exec_repo
@@ -20241,6 +20414,9 @@ async def run_natural_pipeline_stream(
                         if _mcp_ev.get("type") == "mcp_done":
                             _mcp_done = _mcp_ev
                         else:
+                            _o = _tool_tracker.observe(_mcp_ev)
+                            if _o:
+                                yield sse(_o)
                             yield sse(_mcp_ev)
                     if _mcp_done.get("counted"):
                         _mcp_calls += 1
@@ -20900,12 +21076,20 @@ async def run_natural_pipeline_stream(
                         if _git_ev.get("type") == "git_done":
                             _git_done = _git_ev
                         else:
+                            _o = _tool_tracker.observe(_git_ev)
+                            if _o:
+                                yield sse(_o)
                             yield sse(_git_ev)
                     _streaming_t0 += float(_git_done.get("waited_s") or 0)
                     if _git_done.get("run") or _git_done.get("stop") or _git_done.get("steps"):
                         _git_ledger.append(_git_done)
                     _git_note = _git_done.get("note") or ""
                     if _git_done.get("stop"):
+                        if _tool_note_idx is not None:
+                            _end = _tool_tracker.end(_git_note)
+                            if _end:
+                                yield sse(_end)
+                            _tool_note_idx = None
                         _git_block = _git_outcome_text()
                         if _git_block:
                             yield sse({"type": "token", "content": _emit_prose(_git_block)})
@@ -20938,6 +21122,9 @@ async def run_natural_pipeline_stream(
                         if _aws_ev.get("type") == "aws_done":
                             _aws_done = _aws_ev
                         else:
+                            _o = _tool_tracker.observe(_aws_ev)
+                            if _o:
+                                yield sse(_o)
                             yield sse(_aws_ev)
                     _streaming_t0 += float(_aws_done.get("waited_s") or 0)
                     _aws_note = _aws_done.get("note") or ""
@@ -22553,6 +22740,9 @@ async def run_natural_pipeline_stream(
                         "reason": f"Edit execution failed: {str(exec_err)[:100]}",
                     })
 
+        for _ev in _tool_tracker.close_all():
+            yield sse(_ev)
+
         # ── Process edit blocks ───────────────────────────────────────────
         if not edit_blocks_raw and not new_file_blocks_raw:
             _dlog("no_edits_produced",
@@ -22643,6 +22833,13 @@ async def run_natural_pipeline_stream(
               session_id=session_id, user_id=user_id,
               edit_count=len(edit_blocks_raw),
               pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
+        _ev = _tool_tracker.phase(
+            "edit", "Resolving edits", "Resolved edits",
+            f"{len(edit_blocks_raw)} edits",
+        )
+        if _ev:
+            yield sse(_ev)
+            _phase_open = "edit"
         yield sse({"type": "progress", "content": f"Resolving {len(edit_blocks_raw)} edit(s)..."})
 
         # Build file content lookup
@@ -24803,6 +25000,18 @@ async def run_natural_pipeline_stream(
               change_count=len(resolved_edits),
               resolution_duration_s=round(time.time() - _resolution_t0, 1),
               pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
+        if _phase_open == "edit":
+            _end = _tool_tracker.end(f"Resolved {len(resolved_edits)} edit(s)")
+            if _end:
+                yield sse(_end)
+            _phase_open = None
+        _ev = _tool_tracker.phase(
+            "qa", "Running QA", "Ran QA",
+            f"{len(resolved_edits)} changes",
+        )
+        if _ev:
+            yield sse(_ev)
+            _phase_open = "qa"
         yield sse({"type": "progress", "content": f"Running QA on {len(resolved_edits)} change(s)..."})
 
         # Build shared context once — same view the architect had
@@ -26304,6 +26513,9 @@ async def run_natural_pipeline_stream(
                                             session_id=session_id, user_id=user_id,
                                         )
                                     _fu_task = asyncio.create_task(_fu_coro)
+                                    _ev = _tool_tracker.retarget(f"correction round {_qa_retry_round + 1}")
+                                    if _ev:
+                                        yield sse(_ev)
                                     while not _fu_task.done():
                                         try:
                                             await asyncio.wait_for(
@@ -26587,6 +26799,9 @@ async def run_natural_pipeline_stream(
                                     session_id=session_id, user_id=user_id,
                                 )
                             _fu_task = asyncio.create_task(_fu_coro)
+                            _ev = _tool_tracker.retarget(f"correction round {_qa_retry_round + 1}")
+                            if _ev:
+                                yield sse(_ev)
                             while not _fu_task.done():
                                 try:
                                     await asyncio.wait_for(
@@ -29113,6 +29328,9 @@ async def run_natural_pipeline_stream(
                     "new_files": [],
                     "natural_text": _msg,
                 }
+                _end = _finish_phase()
+                if _end:
+                    yield sse(_end)
                 yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(_fail_result)})
             yield sse(_natural_done_payload(_model_used))
             return
@@ -29150,6 +29368,9 @@ async def run_natural_pipeline_stream(
               skipped_count=len(skipped_changes_struct),
               files=list(changes_by_file.keys()),
               user_id=user_id)
+        _end = _finish_phase()
+        if _end:
+            yield sse(_end)
         yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(result)})
         _dlog("pipeline_complete",
               session_id=session_id, user_id=user_id,

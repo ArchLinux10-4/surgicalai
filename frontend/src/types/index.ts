@@ -1,3 +1,41 @@
+export type ToolKind = 'file' | 'search' | 'repo' | 'github' | 'history' | 'preview' | 'web' | 'git' | 'aws' | 'mcp' | 'edit' | 'qa' | 'step'
+export type ToolStatus = 'running' | 'waiting' | 'done' | 'failed' | 'stopped'
+
+export interface ToolActivityEvent {
+  type: 'tool_activity'
+  id: string
+  phase: 'start' | 'update' | 'end'
+  kind?: ToolKind
+  label?: string
+  done_label?: string
+  target?: string
+  tool?: string
+  agent?: string
+  turn?: number
+  status?: 'waiting' | 'running' | 'stopped'
+  ok?: boolean | null
+  ms?: number | null
+  summary?: string
+  preview?: string
+  task_id?: string
+}
+
+export interface ToolRow {
+  id: string
+  kind: ToolKind
+  label: string
+  doneLabel: string
+  target?: string
+  status: ToolStatus
+  startedAt: number
+  endedAt?: number
+  ms?: number
+  summary?: string
+  preview?: string
+  taskId?: string
+  agent?: string
+}
+
 export interface ChatMessage {
   id: string
   session_id: string
@@ -8,6 +46,7 @@ export interface ChatMessage {
   surgical_data?: string
   _thinking?: string
   _steps?: string[]
+  _tools?: ToolRow[]
   _model?: string
   _aborted?: boolean
   _steered?: boolean
