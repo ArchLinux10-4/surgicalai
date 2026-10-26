@@ -785,10 +785,30 @@ function ThinkingBlock({ text, isStreaming, sessionId, label }: { text: string; 
   // separate isStreaming={false} instance used for finalized messages), so
   // there is nothing to reset once the turn truly ends.
   const userToggledRef = useRef(false)
+  const boxRef = useRef<HTMLDivElement>(null)
+  const followRef = useRef(true)
+  const adjustingRef = useRef(false)
 
   useEffect(() => {
     if (isStreaming && !userToggledRef.current) setExpanded(true)
   }, [isStreaming])
+
+  useEffect(() => {
+    if (!isStreaming || !expanded) return
+    const box = boxRef.current
+    if (!box) return
+    const onScroll = () => {
+      if (adjustingRef.current) return
+      followRef.current = box.scrollHeight - box.scrollTop - box.clientHeight <= 24
+    }
+    box.addEventListener('scroll', onScroll, { passive: true })
+    if (followRef.current && box.scrollHeight - box.scrollTop - box.clientHeight > 1) {
+      adjustingRef.current = true
+      box.scrollTop = box.scrollHeight
+      adjustingRef.current = false
+    }
+    return () => box.removeEventListener('scroll', onScroll)
+  }, [text, isStreaming, expanded])
 
   const handleToggle = () => {
     userToggledRef.current = true
@@ -840,7 +860,7 @@ function ThinkingBlock({ text, isStreaming, sessionId, label }: { text: string; 
         )}
       </button>
       {expanded && text && (
-        <div className="mt-2 ml-5 pl-3 border-l-2 border-purple/30 text-[12px] text-muted/90 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed font-mono">
+        <div ref={boxRef} className="mt-2 ml-5 pl-3 border-l-2 border-purple/30 text-[12px] text-muted/90 whitespace-pre-wrap max-h-80 overflow-y-auto overscroll-contain leading-relaxed font-mono">
           {text}
           {isStreaming && <span className="inline-block w-1.5 h-3 bg-purple/60 rounded-sm ml-0.5 animate-pulse" />}
           {isStreaming && staleSec > 0 && (
@@ -1423,7 +1443,16 @@ export function ChatPanel() {
   // picker immediately, without needing a page reload.
   const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
-  const userScrolledUpRef = useRef(false)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const stickToBottomRef = useRef(true)
+  const adjustingRef = useRef(false)
+  const jumpToBottom = useCallback((el: HTMLElement | null) => {
+    if (!el) return
+    if (el.scrollHeight - el.scrollTop - el.clientHeight <= 1) return
+    adjustingRef.current = true
+    el.scrollTop = el.scrollHeight
+    adjustingRef.current = false
+  }, [])
   // ── Agent Mode toggle (multi-agent task breakdown) ───────────────────────
   // Mode selector: Edit (default) | Ask | Plan | Agent.
   // Read localStorage at send time (not from a closure) so doStream never sees
@@ -1684,39 +1713,33 @@ export function ChatPanel() {
     })
   }, [])
 
-  // Smart auto-scroll: only scroll to bottom when user is already at the bottom.
-  // If user scrolls up to read, don't yank them back down.
+  // Follow new output while the reader is at the bottom. A real scroll away
+  // pauses it. Our own scrollTop write is ignored so growth cannot unpin.
+  const showTranscript = messages.length > 0 || isStreaming
   useEffect(() => {
     const el = scrollContainerRef.current
-    if (!el) return
-    const handleScroll = () => {
-      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
-      userScrolledUpRef.current = distanceFromBottom > 80
+    const column = contentRef.current
+    if (!el || !column) return
+    const onScroll = () => {
+      if (adjustingRef.current) return
+      stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 80
     }
-    el.addEventListener('scroll', handleScroll, { passive: true })
-    return () => el.removeEventListener('scroll', handleScroll)
-  }, [])
-
-  const liveToolCount = useAppStore(s => {
-    const sid = s.activeSessions
-    return sid ? (s.toolActivity[sid]?.rows.length ?? 0) : 0
-  })
-  const liveToolStage = useAppStore(s => {
-    const sid = s.activeSessions
-    const rows = sid ? s.toolActivity[sid]?.rows : undefined
-    const active = rows?.find(row => row.status === 'running' || row.status === 'waiting')
-    return active ? `${active.id}:${active.status}:${active.target || ''}` : ''
-  })
-
-  useEffect(() => {
-    if (userScrolledUpRef.current) return
-    const el = scrollContainerRef.current
-    if (!el) return
-    el.scrollTo({ top: el.scrollHeight, behavior: isStreaming ? 'auto' : 'smooth' })
-  }, [messages, streamingMessage, liveToolCount, liveToolStage, isStreaming])
+    el.addEventListener('scroll', onScroll, { passive: true })
+    const observer = new ResizeObserver(() => {
+      if (stickToBottomRef.current) jumpToBottom(el)
+    })
+    observer.observe(column)
+    if (stickToBottomRef.current) jumpToBottom(el)
+    return () => {
+      el.removeEventListener('scroll', onScroll)
+      observer.disconnect()
+    }
+  }, [showTranscript, jumpToBottom])
 
   // Load session files when session changes
   useEffect(() => {
+    stickToBottomRef.current = true
+    jumpToBottom(scrollContainerRef.current)
     // Concurrent sessions: no abort on switch — streams continue in background
     setResumableRun(null)  // stale banner never survives a session switch
     setCreditPause(null)
@@ -1805,7 +1828,7 @@ export function ChatPanel() {
       setSessionFiles([])
       clearAgentTasks()
     }
-  }, [activeSessions])
+  }, [activeSessions, jumpToBottom])
 
   // Poll Anthropic until credits restore; only then enable the Resume button.
   useEffect(() => {
@@ -3184,10 +3207,11 @@ export function ChatPanel() {
     }
     setError(null)
     if (overrideText === undefined) clearDraft()
-    userScrolledUpRef.current = false
+    stickToBottomRef.current = true
+    jumpToBottom(scrollContainerRef.current)
     const sessionId = await ensureSession()
     launchFresh(sessionId, payload, messages.length === 0)
-  }, [input, isStreaming, settings, activeSessions, pastedBlocks, pickedElements, doStream, fileRequest, draftKey, messages.length, launchFresh])
+  }, [input, isStreaming, settings, activeSessions, pastedBlocks, pickedElements, doStream, fileRequest, draftKey, messages.length, launchFresh, jumpToBottom])
 
   // handleSend's identity changes with the draft and stream state. Message is
   // memoized on onRetryWithQA, so a fresh callback would re-render every row
@@ -3437,7 +3461,7 @@ export function ChatPanel() {
             <EmptyState onUpload={() => fileInputRef.current?.click()} />
           </div>
         ) : (
-          <div className="min-h-full flex flex-col justify-end py-2">
+          <div ref={contentRef} className="min-h-full flex flex-col justify-end py-2">
             {messages.map((msg, i) => (
               <Message key={msg.id || i} msg={msg} sessionId={msg.session_id || activeSessions || ''} onRetryWithQA={stableSend} supersededKey={supersededKeysByMessage(messages)[msg.id] || ''} />
             ))}
