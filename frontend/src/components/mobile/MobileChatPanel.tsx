@@ -96,9 +96,28 @@ function ProgressSteps({ steps }: { steps: string[] }) {
 function MobileThinkingBlock({ text, isStreaming, label }: { text: string; isStreaming: boolean; label?: string }) {
   const [expanded, setExpanded] = useState(isStreaming)
   const userToggledRef = useRef(false)
+  const boxRef = useRef<HTMLDivElement>(null)
+  const followRef = useRef(true)
+  const adjustingRef = useRef(false)
   useEffect(() => {
     if (isStreaming && !userToggledRef.current) setExpanded(true)
   }, [isStreaming])
+  useEffect(() => {
+    if (!isStreaming || !expanded) return
+    const box = boxRef.current
+    if (!box) return
+    const onScroll = () => {
+      if (adjustingRef.current) return
+      followRef.current = box.scrollHeight - box.scrollTop - box.clientHeight <= 24
+    }
+    box.addEventListener('scroll', onScroll, { passive: true })
+    if (followRef.current && box.scrollHeight - box.scrollTop - box.clientHeight > 1) {
+      adjustingRef.current = true
+      box.scrollTop = box.scrollHeight
+      adjustingRef.current = false
+    }
+    return () => box.removeEventListener('scroll', onScroll)
+  }, [text, isStreaming, expanded])
   if (!text && !isStreaming) return null
   return (
     <div className="mb-2">
@@ -111,7 +130,7 @@ function MobileThinkingBlock({ text, isStreaming, label }: { text: string; isStr
         {isStreaming ? <span>Thinking<span className="animate-pulse">…</span></span> : <span>{label || 'Reasoning'}</span>}
       </button>
       {expanded && text && (
-        <div className="mt-1.5 ml-3 pl-2 border-l-2 border-purple/30 text-[11px] text-muted/90 whitespace-pre-wrap max-h-48 overflow-y-auto font-mono leading-relaxed">
+        <div ref={boxRef} className="mt-1.5 ml-3 pl-2 border-l-2 border-purple/30 text-[11px] text-muted/90 whitespace-pre-wrap max-h-48 overflow-y-auto overscroll-contain font-mono leading-relaxed">
           {text}
           {isStreaming && <span className="inline-block w-1 h-2.5 bg-purple/60 ml-0.5 animate-pulse" />}
         </div>
@@ -665,7 +684,16 @@ export function MobileChatPanel() {
   const pendingRunRef      = useRef<{ runId: string; tasks: any[] } | null>(null)
   const bottomRef          = useRef<HTMLDivElement>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
-  const userScrolledUpRef  = useRef(false)
+  const contentRef = useRef<HTMLDivElement>(null)
+  const stickToBottomRef = useRef(true)
+  const adjustingScrollRef = useRef(false)
+  const jumpToBottom = useCallback((el: HTMLElement | null) => {
+    if (!el) return
+    if (el.scrollHeight - el.scrollTop - el.clientHeight <= 1) return
+    adjustingScrollRef.current = true
+    el.scrollTop = el.scrollHeight
+    adjustingScrollRef.current = false
+  }, [])
   const tokenRafRef        = useRef(0)
   const textareaRef        = useRef<HTMLTextAreaElement>(null)
   const thinkingTextRef    = useRef('')
@@ -730,42 +758,31 @@ export function MobileChatPanel() {
   }
   const fileInputRef       = useRef<HTMLInputElement>(null)
 
-  // Smart auto-scroll: same 80px sticky-bottom gate as desktop ChatPanel.
-  // While tokens stream, use instant scroll (smooth per-token fights iOS).
+  const showTranscript = messages.length > 0 || isStreaming
   useEffect(() => {
     const el = scrollContainerRef.current
-    if (!el) return
-    const handleScroll = () => {
-      const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
-      userScrolledUpRef.current = distanceFromBottom > 80
+    const column = contentRef.current
+    if (!el || !column) return
+    const onScroll = () => {
+      if (adjustingScrollRef.current) return
+      stickToBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= 80
     }
-    el.addEventListener('scroll', handleScroll, { passive: true })
-    return () => el.removeEventListener('scroll', handleScroll)
-  }, [])
-
-  const liveToolCount = useAppStore(s => {
-    const sid = s.activeSessions
-    return sid ? (s.toolActivity[sid]?.rows.length ?? 0) : 0
-  })
-  const liveToolStage = useAppStore(s => {
-    const sid = s.activeSessions
-    const active = sid ? s.toolActivity[sid]?.rows.find(row => row.status === 'running' || row.status === 'waiting') : undefined
-    return active ? `${active.id}:${active.status}` : ''
-  })
-
-  useEffect(() => {
-    if (userScrolledUpRef.current) return
-    if (isStreaming) {
-      const el = scrollContainerRef.current
-      if (el) el.scrollTop = el.scrollHeight
-      else bottomRef.current?.scrollIntoView({ behavior: 'auto' })
-      return
+    el.addEventListener('scroll', onScroll, { passive: true })
+    const observer = new ResizeObserver(() => {
+      if (stickToBottomRef.current) jumpToBottom(el)
+    })
+    observer.observe(column)
+    if (stickToBottomRef.current) jumpToBottom(el)
+    return () => {
+      el.removeEventListener('scroll', onScroll)
+      observer.disconnect()
     }
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages, streamingMsg, liveToolCount, liveToolStage, isStreaming])
+  }, [showTranscript, jumpToBottom])
 
   // Load session files when active session changes
   useEffect(() => {
+    stickToBottomRef.current = true
+    jumpToBottom(scrollContainerRef.current)
     setResumableRun(null)
     setCreditPause(null)
     setFileRequest(null)
@@ -831,7 +848,7 @@ export function MobileChatPanel() {
       setSessionFiles([])
       clearAgentTasks()
     }
-  }, [activeSessions])
+  }, [activeSessions, jumpToBottom])
 
   // Poll Anthropic until credits restore (same 15s cadence as desktop).
   useEffect(() => {
@@ -923,6 +940,8 @@ export function MobileChatPanel() {
   }, [activeSessions, setSessions, setActiveSession])
 
   const handleSend = useCallback(async (override?: unknown, mode: 'auto' | 'queue' | 'now' = 'auto') => {
+    stickToBottomRef.current = true
+    jumpToBottom(scrollContainerRef.current)
     // onClick handlers pass the click event; only a string is answer text.
     const overrideText = typeof override === 'string' ? override : undefined
     const typed = (overrideText ?? input).trim()
@@ -1596,7 +1615,7 @@ export function MobileChatPanel() {
     ctrlRef.current = ctrl
   }, [input, pastedBlocks, draftKey, isStreaming, settings, ensureSession, messages.length, sessionFiles,
       addMessage, setSessions, stopStream, updateAgentTask, setAgentPhase, setTaskRunId,
-      setTaskPreamble, setAgentTasks, setSessionFiles, activeSessions, handleStopClick])
+      setTaskPreamble, setAgentTasks, setSessionFiles, activeSessions, handleStopClick, jumpToBottom])
 
   const gitFollowup = useAppStore(s => s.gitFollowup)
   useEffect(() => {
@@ -1947,7 +1966,7 @@ export function MobileChatPanel() {
         {messages.length === 0 && !isStreaming ? (
           <EmptyHomeScreen />
         ) : (
-          <div className="py-2">
+          <div ref={contentRef} className="py-2">
             {messages.map((msg, i) => (
               <MessageBubble
                 key={msg.id || i}
