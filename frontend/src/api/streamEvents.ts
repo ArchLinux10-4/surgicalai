@@ -35,6 +35,7 @@ export const STREAM_EVENT_TYPES = [
   'plan_questions',
   'plan_ready',
   'plan_step',
+  'plan_step_result',
   'plan_unchanged',
   'plan_updated',
   'planning_started',

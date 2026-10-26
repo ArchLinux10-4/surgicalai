@@ -70,6 +70,7 @@ from services.grok_agent_tools import (
     translate_tool_calls,
     build_native_followup_messages,
     format_tool_call_progress,
+    aiter_sync,
     extract_reasoning_delta,
     summarize_translation_progress,
 )
@@ -294,7 +295,18 @@ async def run_grok_ask_plan_native_stream(
                 local_enabled=local_enabled,
                 dlog=dlog, session_id=session_id, user_id=user_id,
             )
-            messages[i] = {**m, "content": (m.get("content") or "") + suffix}
+            _sys = m.get("content") or ""
+            _sys = re.sub(
+                r"Emit ONLY ONE tag at a time, then STOP your response immediately —"
+                r"[\s\S]*?no tags in your final answer\)\.",
+                "Use the function tools. Do not write XML tags.",
+                _sys,
+            )
+            _sys = _sys.replace(
+                "Emit one tag per turn. You get the result next turn. ",
+                "",
+            )
+            messages[i] = {**m, "content": _sys + suffix}
             break
 
     # Sandwich reinforcement: append to the END of the last user turn.
@@ -399,8 +411,9 @@ async def run_grok_ask_plan_native_stream(
                     client, model=chat_model, messages=messages, **call_kwargs,
                 )
                 phase = "stream"
-                for chunk in iter_chunks_fn(stream, model=chat_model, session_id=session_id,
-                                            user_id=user_id):
+                async for chunk in aiter_sync(iter_chunks_fn(
+                        stream, model=chat_model, session_id=session_id,
+                        user_id=user_id)):
                     now = time.time()
                     if ((now - last_activity_ts) >= silence_s
                             and (now - last_silence_progress_ts) >= silence_s):
@@ -424,8 +437,6 @@ async def run_grok_ask_plan_native_stream(
                             thinking_open = True
                             yield _sse({"type": "thinking_start", "content": ""})
                         yield _sse({"type": "thinking", "content": rc})
-                        dlog("grok_agent_reasoning_delta", session_id=session_id,
-                             user_id=user_id, tool_round=tool_round, chars=len(rc), mode=mode)
 
                     content = getattr(delta, "content", None)
                     if content:

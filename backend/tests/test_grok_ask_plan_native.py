@@ -318,7 +318,7 @@ def test_native_loop_emits_tool_named_and_reasoning_progress():
     assert any("request_search" in p for p in progress)
     assert any("Next:" in p or "Looking at the code" in p for p in progress)
     assert "grok_agent_tool_named" in events_log
-    assert "grok_agent_reasoning_delta" in events_log
+    assert "grok_round_end" in events_log
     assert "grok_agent_tool_progress" in events_log
 
 

@@ -54,6 +54,7 @@ success and error. Long strings are truncated and file contents / edit bodies
 are never logged verbatim — only lengths and previews.
 """
 
+import asyncio
 import datetime as _dt
 import json as _json
 
@@ -718,6 +719,27 @@ TOOL_PROGRESS_LABELS = {
 }
 
 
+async def aiter_sync(iterable):
+    """Pull a blocking iterator one item at a time off the event loop.
+
+    The OpenAI/xAI stream's ``next()`` blocks the thread. Doing that inside
+    an async generator stalls the SSE writer, so every thinking token and
+    tool event sits in the socket buffer until the model pauses. Waiting
+    for the next chunk in a worker thread lets each event flush as it arrives.
+    """
+    sentinel = object()
+    iterator = iter(iterable)
+
+    def _pull():
+        return next(iterator, sentinel)
+
+    while True:
+        item = await asyncio.to_thread(_pull)
+        if item is sentinel:
+            break
+        yield item
+
+
 def format_tool_call_progress(name: str) -> str:
     """One-line progress string for a newly named tool call."""
     n = (name or "").strip()
@@ -1107,7 +1129,21 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
                  command=_aws_cmd[:180], intent=_aws_intent)
 
         elif name in CONTEXT_TOOLS:
-            # Only the FIRST context request is dispatched this turn.
+            # Same tool again: fold files or search terms into the request
+            # already kept, up to the cap. A different tool still waits.
+            if res.context_request is not None and name == res.kept_context_tool:
+                merged = _merge_same_context(
+                    res.context_request[0], res.context_request[1], name, args,
+                )
+                if merged is not None:
+                    res.context_request = (res.context_request[0], merged)
+                    res.results_by_id[cid] = (
+                        "Merged into the context request already started this turn."
+                    )
+                    _log(dlog, "grok_translate_context_merged",
+                         session_id=session_id, user_id=user_id, tool_call_id=cid,
+                         tool_name=name)
+                    continue
             if res.context_request is not None:
                 fb = ("Only one context request is handled per turn. Your other "
                       "requests were not run — re-request them next turn if still "
@@ -1142,6 +1178,52 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
          has_context=res.context_request is not None,
          blocked=res.blocked_reason is not None, errors=len(res.errors))
     return res
+
+
+def _merge_same_context(kept_kind: str, kept_body: str, name: str, args) -> str | None:
+    """Fold a second call of the same context tool into the first, or None.
+
+    Mixed tool types are not merged. Files and search terms stop at the
+    existing caps.
+    """
+    from services.agent_tool_spec import MAX_FILES_PER_REQUEST
+    from services.limits import MAX_SEARCH_TERMS
+
+    kind, body = _context_body(name, args)
+    if kind != kept_kind:
+        return None
+    try:
+        old = _json.loads(kept_body)
+        new = _json.loads(body)
+    except Exception:
+        return None
+    if kind == "filereq" and isinstance(old, list) and isinstance(new, list):
+        merged = list(old)
+        for item in new:
+            if item not in merged and len(merged) < MAX_FILES_PER_REQUEST:
+                merged.append(item)
+        return _json.dumps(merged)
+    if kind == "search" and isinstance(old, dict) and isinstance(new, dict):
+        terms = [str(t) for t in (old.get("terms") or [])]
+        for term in new.get("terms") or []:
+            text = str(term)
+            if text and text not in terms and len(terms) < MAX_SEARCH_TERMS:
+                terms.append(text)
+        old["terms"] = terms
+        return _json.dumps(old)
+    if kind == "repo" and isinstance(old, dict) and isinstance(new, dict):
+        if (old.get("tool") or "") != (new.get("tool") or ""):
+            return None
+        if (new.get("path") or "") and (old.get("path") or "") != (new.get("path") or ""):
+            return None
+        terms = [str(t) for t in (old.get("terms") or [])]
+        for term in new.get("terms") or []:
+            text = str(term)
+            if text and text not in terms and len(terms) < MAX_SEARCH_TERMS:
+                terms.append(text)
+        old["terms"] = terms
+        return _json.dumps(old)
+    return None
 
 
 def _context_body(name, args):

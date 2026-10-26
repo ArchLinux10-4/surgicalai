@@ -40,6 +40,7 @@ EVENT_TYPES = frozenset({
     "plan_questions",
     "plan_ready",
     "plan_step",
+    "plan_step_result",
     "plan_unchanged",
     "plan_updated",
     "planning_started",

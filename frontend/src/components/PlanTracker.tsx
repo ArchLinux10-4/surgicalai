@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
 import { AssistantMarkdown } from './AssistantMarkdown'
+import { ProgressMeter } from './ProgressMeter'
 import type { PlanTask, PlanPhase, AgentTaskStatus } from '../types'
 import { FileDownload } from '@mui/icons-material'
 
@@ -29,9 +30,21 @@ function StatusDot({ status }: { status: AgentTaskStatus }) {
 function phaseLabel(phase: PlanPhase, done: number, total: number) {
   if (phase === 'implementing') return `Working — ${done} of ${total} done`
   if (phase === 'complete') return `Complete — ${total} of ${total}`
-  if (phase === 'blocked') return `Blocked — ${done}/${total} covered`
+  if (phase === 'blocked') return `Needs work — ${done}/${total} covered`
   if (phase === 'ready') return `Ready — ${total} step${total !== 1 ? 's' : ''}`
   return ''
+}
+
+// Module-level so a second mounted tracker cannot start the same build twice,
+// and a request made before the Plan tab mounts is still picked up.
+let buildRequested = false
+let buildInFlight = false
+const PLAN_BUILD_EVENT = 'surgicalai:plan-build'
+
+/** Start the saved plan build from outside the Plan tab (the composer button). */
+export function requestPlanBuild() {
+  buildRequested = true
+  window.dispatchEvent(new Event(PLAN_BUILD_EVENT))
 }
 
 /** Strip the machine fence from the displayed document — checklist owns steps. */
@@ -67,6 +80,36 @@ export function PlanTracker({
   const [busy, setBusy] = useState(false)
   const [docOpen, setDocOpen] = useState(true)
   const [downloading, setDownloading] = useState(false)
+  const [stepStartedAt, setStepStartedAt] = useState<number | null>(null)
+  const [elapsedSec, setElapsedSec] = useState(0)
+  const runningId = planTasks.find(t => t.status === 'running')?.id || ''
+  useEffect(() => {
+    if (!runningId) {
+      setStepStartedAt(null)
+      return
+    }
+    setStepStartedAt(Date.now())
+    setElapsedSec(0)
+  }, [runningId])
+  useEffect(() => {
+    if (!stepStartedAt) return
+    const timer = window.setInterval(() => {
+      setElapsedSec(Math.max(0, Math.round((Date.now() - stepStartedAt) / 1000)))
+    }, 1000)
+    return () => window.clearInterval(timer)
+  }, [stepStartedAt])
+  const implementRef = useRef<() => void>(() => {})
+  useEffect(() => {
+    if (hintOnly) return
+    const run = () => {
+      if (!buildRequested) return
+      buildRequested = false
+      implementRef.current()
+    }
+    run()
+    window.addEventListener(PLAN_BUILD_EVENT, run)
+    return () => window.removeEventListener(PLAN_BUILD_EVENT, run)
+  }, [hintOnly])
 
   const hasDoc = !!(planMarkdown || '').trim()
   const hasTasks = planPhase !== 'idle' && planTasks.length > 0
@@ -90,7 +133,16 @@ export function PlanTracker({
 
   const total = planTasks.length
   const done = planTasks.filter(t => t.status === 'done').length
-  const pct = total ? Math.round((done / total) * 100) : 0
+  const delivered = planTasks.filter(t => t.delivered).length
+  const meterDone = planPhase === 'implementing' ? delivered : done
+  const needsWork = (t: { status: string; result_summary?: string }) =>
+    t.status === 'blocked' || t.status === 'error'
+    || (t.status === 'pending' && (t.result_summary || '').trim().length > 0)
+  const failed = planPhase === 'implementing'
+    ? planTasks.filter(t => t.status === 'blocked' || t.status === 'error').length
+    : planTasks.filter(needsWork).length
+  const runningTask = planTasks.find(t => t.status === 'running')
+  const runningIndex = runningTask ? planTasks.indexOf(runningTask) + 1 : 0
   const canImplement = (planPhase === 'ready' || planPhase === 'blocked')
     && planTasks.some(t => t.status === 'pending' || t.status === 'blocked')
     && !busy
@@ -100,8 +152,10 @@ export function PlanTracker({
   const body = displayMarkdown(planMarkdown)
 
   const implement = () => {
-    if (!activeSessions || !planRunId || busy) return
+    if (!activeSessions || !planRunId || busy || buildInFlight) return
+    buildInFlight = true
     setBusy(true)
+    const turnStarted = Date.now()
     api.stream.implementPlan(
       activeSessions,
       planRunId,
@@ -113,21 +167,25 @@ export function PlanTracker({
           role: 'assistant',
           content: '',
           created_at: new Date().toISOString(),
+          _turn_ms: Date.now() - turnStarted,
           message_type: 'natural_result',
           surgical_data: JSON.stringify(result),
         } as any)
       },
       () => {
+        buildInFlight = false
         setBusy(false)
         api.sessionFiles.list(activeSessions).then(setSessionFiles).catch(() => {})
       },
       (err) => {
+        buildInFlight = false
         setBusy(false)
         toast.error('Implement failed', err)
       },
       applyPlanEvent,
     )
   }
+  implementRef.current = () => { if (canImplement) implement() }
 
   const download = async () => {
     if (!activeSessions || downloading) return
@@ -197,6 +255,17 @@ export function PlanTracker({
         </div>
       </div>
 
+      {hasTasks && !collapsed && (
+        <ProgressMeter
+          done={meterDone}
+          failed={failed}
+          total={total}
+          running={!!runningTask}
+          hold
+          holdKey={planRunId || ''}
+        />
+      )}
+
       {collapsed ? null : (
       <div className={docked ? 'flex-1 min-h-0 overflow-y-auto overscroll-contain' : ''}>
       {hasDoc && body && (
@@ -221,9 +290,11 @@ export function PlanTracker({
 
       {hasTasks && (
         <>
-          <div className="h-1 bg-overlay/60">
-            <div className="h-full bg-accent transition-all duration-500" style={{ width: `${pct}%` }} />
-          </div>
+          {runningTask && (
+            <div className="px-3 py-1.5 text-[12px] text-accent border-b border-border/40">
+              Step {runningIndex} of {total} · {runningTask.filename || runningTask.title} · {runningTask.symbol} · {elapsedSec}s
+            </div>
+          )}
           <ul className="divide-y divide-border/40">
             {planTasks.map((t: PlanTask, i) => (
               <li key={t.id} className="flex items-start gap-2.5 px-3 py-2">
@@ -238,6 +309,17 @@ export function PlanTracker({
                   )}
                   {t.status === 'running' && (
                     <div className="text-[11px] text-accent mt-0.5">Working on this</div>
+                  )}
+                  {t.delivered && (
+                    <div className="text-[11px] text-success mt-0.5">
+                      edited +{t.added || 0} −{t.removed || 0}
+                    </div>
+                  )}
+                  {t.delivered && t.diff && (
+                    <details className="mt-1">
+                      <summary className="text-[11px] text-muted cursor-pointer">Diff</summary>
+                      <pre className="mt-1 text-[10px] leading-snug whitespace-pre-wrap text-muted max-h-40 overflow-auto">{t.diff}</pre>
+                    </details>
                   )}
                   {(t.status === 'blocked' || (t.status === 'pending' && t.result_summary)) && (
                     <div className="text-[11px] text-danger/90 mt-0.5">
@@ -260,15 +342,12 @@ export function PlanTracker({
           )}
           {planPhase === 'blocked' && (
             <div className="px-3 py-2 border-t border-border/60 text-[11px] text-danger">
-              Some planned steps were not produced. Implement again for remaining, or stay in Plan to revise.
+              {failed} step{failed === 1 ? '' : 's'} need work. Retry remaining, or stay in Plan to revise.
             </div>
           )}
-          {planPhase === 'ready' && planTasks.some(t => t.status === 'pending' && t.result_summary) && (
+          {planPhase === 'ready' && planTasks.some(t => /build crashed|implement failed/i.test(t.result_summary || '')) && (
             <div className="px-3 py-2 border-t border-border/60 text-[11px] text-danger">
-              Implement failed — try again
-              {planTasks.find(t => t.result_summary)?.result_summary
-                ? `: ${planTasks.find(t => t.result_summary)?.result_summary}`
-                : ''}
+              Build failed — retry
             </div>
           )}
         </>

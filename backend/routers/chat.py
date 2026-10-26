@@ -143,7 +143,9 @@ _PLAN_DIRECTIVE = (
     "{\"steps\": [{\"filename\": \"exact file name\", \"symbol\": "
     "\"function/class/component\", \"description\": \"what to change\"}]}\n"
     "```\n"
-    "Every planned edit needs filename + symbol. Code examples in the Steps "
+    "A step that creates a file which does not exist yet sets "
+    "\"action\": \"create\". Its symbol may be the filename. "
+    "Every other step needs filename + symbol. Code examples in the Steps "
     "section are prose illustrations for the Implement path — they are NOT "
     "the machine fence. Stay in Plan and the user can tell you what to change; "
     "emit a FULL replacement fence."
@@ -1180,7 +1182,9 @@ async def implement_plan(body: dict, request: Request):
         latest_plan_run,
         forced_edit_plan_from_run,
         compute_plan_coverage,
+        coverage_after_crash,
         apply_coverage_to_run,
+        release_unshipped_plan_steps,
         serialize_plan_task,
         plan_run_phase,
         plan_build_user_request,
@@ -1209,48 +1213,137 @@ async def implement_plan(body: dict, request: Request):
     if not plan_steps:
         raise HTTPException(status_code=400, detail="Plan has no executable steps")
 
-    with get_db_ctx() as conn:
-        sess_row = conn.execute(
-            "SELECT session_summary FROM chat_sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        session_summary = (
-            (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "")
-            or ""
-        )
-        history = conn.execute(
-            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
-            "AND content NOT LIKE ? ORDER BY created_at ASC",
-            (session_id, "__COMPACTION_EVENT__:%"),
-        ).fetchall()
-        conversation_history = [
-            {"role": r["role"], "content": r["content"]} for r in history
-        ]
-        file_rows = conn.execute(
-            "SELECT id, filename, content, language, lines, symbol_count, "
-            "file_type, created_at, updated_at FROM session_files "
-            "WHERE session_id = ? ORDER BY created_at ASC",
-            (session_id,),
-        ).fetchall()
-        session_files = [dict(r) for r in file_rows]
-        project_memory = _load_effective_memory(conn, session_id)
-        from services.user_memory import attach_user_memory
-        project_memory = attach_user_memory(project_memory, current_user_id, session_id, "")
-        conn.commit()
+    def _load_impl_context():
+        with get_db_ctx() as conn:
+            sess_row = conn.execute(
+                "SELECT session_summary FROM chat_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            session_summary = (
+                (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "")
+                or ""
+            )
+            history = conn.execute(
+                "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
+                "AND content NOT LIKE ? ORDER BY created_at ASC",
+                (session_id, "__COMPACTION_EVENT__:%"),
+            ).fetchall()
+            conversation_history = [
+                {"role": r["role"], "content": r["content"]} for r in history
+            ]
+            file_rows = conn.execute(
+                "SELECT id, filename, content, language, lines, symbol_count, "
+                "file_type, created_at, updated_at FROM session_files "
+                "WHERE session_id = ? ORDER BY created_at ASC",
+                (session_id,),
+            ).fetchall()
+            session_files = [dict(r) for r in file_rows]
+            project_memory = _load_effective_memory(conn, session_id)
+            from services.user_memory import attach_user_memory
+            project_memory = attach_user_memory(project_memory, current_user_id, session_id, "")
+            conn.commit()
+        return {
+            "session_summary": session_summary,
+            "conversation_history": conversation_history,
+            "session_files": session_files,
+            "project_memory": project_memory,
+        }
+
+    _loaded_impl = await asyncio.to_thread(_load_impl_context)
+    session_summary = _loaded_impl["session_summary"]
+    conversation_history = _loaded_impl["conversation_history"]
+    session_files = _loaded_impl["session_files"]
+    project_memory = _loaded_impl["project_memory"]
 
     if not session_files:
         raise HTTPException(status_code=400, detail="Session has no files to implement against")
 
+    def _diff_line_counts(diff: str) -> tuple[int, int]:
+        added = removed = 0
+        for line in (diff or "").splitlines():
+            if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+                continue
+            if line.startswith("+"):
+                added += 1
+            elif line.startswith("-"):
+                removed += 1
+        return added, removed
+
+    def _plan_step_result_events(parsed: dict) -> list[dict]:
+        events = []
+        changes_by_file = parsed.get("changes_by_file") if isinstance(parsed, dict) else None
+        if isinstance(changes_by_file, dict):
+            for filename, fd in changes_by_file.items():
+                changes = []
+                name = filename
+                if isinstance(fd, dict):
+                    name = fd.get("filename") or filename
+                    changes = fd.get("changes") or []
+                elif isinstance(fd, list):
+                    changes = fd
+                for change in changes:
+                    if not isinstance(change, dict):
+                        continue
+                    symbol = change.get("symbol")
+                    if isinstance(symbol, dict):
+                        symbol = symbol.get("name") or symbol.get("full_path") or ""
+                    diff = str(change.get("diff") or "")
+                    added, removed = _diff_line_counts(diff)
+                    if not diff:
+                        added = len(str(change.get("new_code") or "").splitlines())
+                        removed = len(str(change.get("original_code") or "").splitlines())
+                    events.append({
+                        "type": "plan_step_result",
+                        "run_id": run_id,
+                        "filename": name,
+                        "symbol": str(symbol or ""),
+                        "added": added,
+                        "removed": removed,
+                        "diff": diff[:8000],
+                    })
+        for created in (parsed.get("new_files") or []) if isinstance(parsed, dict) else []:
+            if not isinstance(created, dict):
+                continue
+            filename = str(created.get("filename") or "")
+            events.append({
+                "type": "plan_step_result",
+                "run_id": run_id,
+                "filename": filename,
+                "symbol": filename,
+                "added": len(str(created.get("content") or "").splitlines()),
+                "removed": 0,
+                "diff": "",
+            })
+        return events
+
     user_request = plan_build_user_request(session_id, plan_steps)
     _activated = activate_first_plan_step(session_id, run_id)
+
+    _dlog("plan_implement_start", session_id=session_id, user_id=current_user_id,
+          run_id=run_id, steps=len(plan_steps))
 
     async def stream_implement():
         import json as _json
         collected_tokens = []
         result_content = None
+        checkpoint_content = None
+        error_message = None
+        recovered_from_checkpoint = False
         from services.tool_activity import ToolTrail as _ToolTrail
         _impl_trail = _ToolTrail()
         _impl_thinking: list = []
+
+        def _finish_log(tasks, *, failed: bool):
+            statuses = [(t.get("status") or "") for t in (tasks or [])]
+            _dlog(
+                "plan_implement_error" if failed else "plan_implement_finish",
+                session_id=session_id, user_id=current_user_id, run_id=run_id,
+                done=statuses.count("done"), blocked=statuses.count("blocked"),
+                pending=statuses.count("pending"),
+                smart_result=bool(result_content),
+                error=(error_message or "")[:300],
+            )
+
         try:
             yield "data: " + _json.dumps({
                 "type": "plan_updated",
@@ -1279,6 +1372,12 @@ async def implement_plan(body: dict, request: Request):
                             collected_tokens.append(data.get("content", ""))
                         elif chunk_type == "smart_result":
                             result_content = data.get("content", "")
+                        elif chunk_type == "checkpoint":
+                            _ckpt = data.get("content") or ""
+                            if _ckpt:
+                                checkpoint_content = _ckpt
+                        elif chunk_type == "error":
+                            error_message = data.get("content") or error_message
                         elif chunk_type == "tool_activity":
                             _impl_trail.observe(data)
                         elif chunk_type == "thinking":
@@ -1289,24 +1388,61 @@ async def implement_plan(body: dict, request: Request):
                         pass
                 yield chunk
 
+            if not result_content and checkpoint_content:
+                _recovered = recovered_result_from_checkpoint(
+                    checkpoint_content,
+                    summary="Recovered the edits finished before the build crashed.",
+                    reasoning=error_message or "Build crashed after a checkpoint.",
+                )
+                if _recovered:
+                    result_content = _json.dumps(_recovered)
+                    recovered_from_checkpoint = True
+                    yield "data: " + _json.dumps({
+                        "type": "smart_result",
+                        "content": result_content,
+                    }) + "\n\n"
+
             parsed = {}
             if result_content:
                 try:
                     parsed = _json.loads(result_content)
                 except Exception:
                     parsed = {}
-            coverage = compute_plan_coverage(
-                plan_steps, parsed if isinstance(parsed, dict) else {},
-            )
-            updated = apply_coverage_to_run(session_id, run_id, coverage)
-            phase = plan_run_phase(updated)
-            yield "data: " + _json.dumps({
-                "type": "plan_coverage",
-                "run_id": run_id,
-                "phase": phase,
-                "coverage": coverage,
-                "tasks": [serialize_plan_task(t) for t in updated],
-            }) + "\n\n"
+            if not isinstance(parsed, dict):
+                parsed = {}
+
+            if error_message and not result_content:
+                updated = release_unshipped_plan_steps(
+                    session_id, run_id, error_message[:300],
+                )
+                phase = plan_run_phase(updated)
+                _finish_log(updated, failed=True)
+                yield "data: " + _json.dumps({
+                    "type": "plan_failed",
+                    "run_id": run_id,
+                    "phase": phase if phase in ("ready", "blocked") else "ready",
+                    "error": error_message[:300],
+                    "tasks": [serialize_plan_task(t) for t in updated],
+                }) + "\n\n"
+            else:
+                for _step_ev in _plan_step_result_events(parsed):
+                    yield "data: " + _json.dumps(_step_ev) + "\n\n"
+                if error_message and recovered_from_checkpoint:
+                    coverage = coverage_after_crash(
+                        plan_steps, parsed, f"Build crashed: {error_message[:220]}",
+                    )
+                else:
+                    coverage = compute_plan_coverage(plan_steps, parsed)
+                updated = apply_coverage_to_run(session_id, run_id, coverage)
+                phase = plan_run_phase(updated)
+                _finish_log(updated, failed=False)
+                yield "data: " + _json.dumps({
+                    "type": "plan_coverage",
+                    "run_id": run_id,
+                    "phase": phase,
+                    "coverage": coverage,
+                    "tasks": [serialize_plan_task(t) for t in updated],
+                }) + "\n\n"
 
             natural_text = "".join(collected_tokens).strip()
             with get_db_ctx() as db:
@@ -1321,7 +1457,7 @@ async def implement_plan(body: dict, request: Request):
                         f"{_json.dumps({'natural': natural_text, 'result': _res_obj})}"
                     )
                 else:
-                    content = natural_text or "(plan implement finished)"
+                    content = natural_text or (error_message or "(plan implement finished)")
                 db.execute(
                     "INSERT INTO chat_messages (id, session_id, role, content, metadata) "
                     "VALUES (?, ?, ?, ?, ?)",
@@ -1336,21 +1472,21 @@ async def implement_plan(body: dict, request: Request):
                 )
                 db.commit()
         except Exception as e:
+            error_message = str(e)[:300]
             _dlog("plan_implement_error", session_id=session_id,
-                  user_id=current_user_id, run_id=run_id, error=str(e)[:300])
+                  user_id=current_user_id, run_id=run_id, error=error_message)
             try:
-                from services.plan_artifact import revert_plan_after_implement_error
-                updated = revert_plan_after_implement_error(session_id, run_id, str(e)[:300])
+                updated = release_unshipped_plan_steps(session_id, run_id, error_message)
                 yield "data: " + _json.dumps({
                     "type": "plan_failed",
                     "run_id": run_id,
                     "phase": "ready",
-                    "error": str(e)[:300],
+                    "error": error_message,
                     "tasks": [serialize_plan_task(t) for t in updated],
                 }) + "\n\n"
             except Exception:
                 pass
-            yield f"data: {_json.dumps({'type': 'error', 'content': str(e)[:300]})}\n\n"
+            yield f"data: {_json.dumps({'type': 'error', 'content': error_message})}\n\n"
         yield "data: " + _json.dumps({"type": "done", "content": ""}) + "\n\n"
 
     return StreamingResponse(
@@ -1410,12 +1546,24 @@ async def smart_stream(req: dict, request: Request):
         raise HTTPException(status_code=401, detail="No AI backend configured. Go to Settings.")
 
     _accept_t0 = time.time()
+    _client_sent = req.get("client_sent_at")
+    _client_gap = None
+    try:
+        if _client_sent:
+            _client_gap = round(time.time() * 1000 - float(_client_sent), 1)
+    except (TypeError, ValueError):
+        _client_gap = None
     _dlog("smart_stream_accepted", session_id=session_id, user_id=current_user_id,
-          mode=mode, msg_len=len(message or ""))
+          mode=mode, msg_len=len(message or ""), client_gap_ms=_client_gap)
 
     def _load_turn_context():
         """Load this turn off the event loop so a large history cannot stall the next Send."""
         nonlocal message
+        _marks = {"thread_enter_s": round(time.time() - _accept_t0, 3)}
+
+        def _mark(name):
+            _marks[name] = round(time.time() - _accept_t0, 3)
+
         with get_db_ctx() as conn:
 
             # Save user message
@@ -1424,6 +1572,7 @@ async def smart_stream(req: dict, request: Request):
                 "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
                 (msg_id, session_id, "user", message)
             )
+            _mark("after_insert")
 
             # Load session_summary
             sess_row = conn.execute(
@@ -1442,6 +1591,7 @@ async def smart_stream(req: dict, request: Request):
             ).fetchall()
             conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
             _history_count = len(conversation_history)
+            _mark("after_history")
 
             # Token-aware compaction trigger: estimate tokens from loaded history.
             # See _estimate_history_tokens() for why this must use cleaned content.
@@ -1454,6 +1604,7 @@ async def smart_stream(req: dict, request: Request):
                 (session_id,)
             ).fetchall()
             session_files = [dict(r) for r in file_rows]
+            _mark("after_files")
 
             # File-awareness hint: prepend attached file list to user message so
             # all models (including smaller ones) notice files immediately.
@@ -1466,12 +1617,17 @@ async def smart_stream(req: dict, request: Request):
             # Project memory — GLOBAL team conventions (every prompt) + any per-session memory
             project_memory = _load_effective_memory(conn, session_id)
             from services.user_memory import attach_user_memory
+            _mark("after_memory")
             project_memory = attach_user_memory(project_memory, current_user_id, session_id, message)
+            _mark("after_user_memory")
 
             conn.commit()
+            _mark("after_commit")
 
         # Log after the write lock is released. A debug insert while this
         # transaction is open waits on SQLite and stalls the turn.
+        _dlog("turn_context_stages", session_id=session_id, user_id=current_user_id,
+              **_marks)
         _dlog("history_loaded_excludes_compaction_marker", session_id=session_id,
               msg_count=_history_count)
         _dlog("compaction_check", session_id=session_id,
@@ -2511,6 +2667,50 @@ def _save_task_message(session_id, natural_text, parsed, model="", web_search_so
         db.commit()
 
 
+def recovered_result_from_checkpoint(
+    checkpoint_content: str,
+    *,
+    fallback_text: str = "",
+    summary: str = "",
+    reasoning: str = "",
+) -> dict | None:
+    """smart_result body from a checkpoint that carries changes_by_file.
+
+    None when the checkpoint is missing, unparseable, or has no edits.
+    Does not write to the database.
+    """
+    if not checkpoint_content:
+        return None
+    try:
+        ckpt = json.loads(checkpoint_content)
+    except Exception:
+        return None
+    cbf = ckpt.get("changes_by_file") if isinstance(ckpt, dict) else None
+    if not isinstance(cbf, dict) or not cbf:
+        return None
+    rec_n = sum(len(v.get("changes", [])) for v in cbf.values() if isinstance(v, dict))
+    if rec_n <= 0:
+        return None
+    rec_text = (
+        ((fallback_text or "").strip() + ("\n\n" if (fallback_text or "").strip() else ""))
+        + "⚡ **Connection was interrupted** before I could finish, but I recovered "
+        + f"{rec_n} completed edit(s) below — review and apply them, or Resume "
+          "remaining agent tasks after applying."
+    ).strip()
+    return {
+        "intent": "edit",
+        "summary": summary or f"Recovered {rec_n} edit(s) from an interrupted agent task",
+        "reasoning": reasoning or "Recovered from a connection interruption mid agent task.",
+        "risks": [],
+        "skipped_changes": [],
+        "changes_by_file": cbf,
+        "new_files": [],
+        "natural_text": rec_text,
+        "recovered": True,
+        "format_version": ckpt.get("format_version"),
+    }
+
+
 def _persist_structured_checkpoint_recovery(
     session_id: str,
     checkpoint_content: str,
@@ -2535,34 +2735,20 @@ def _persist_structured_checkpoint_recovery(
         _dlog(dlog_event + "_parse_error", session_id=session_id, user_id=user_id,
               error=str(e)[:200])
         return out
-    cbf = ckpt.get("changes_by_file") if isinstance(ckpt, dict) else None
-    if not cbf:
-        return out
     try:
-        rec_n = sum(len(v.get("changes", [])) for v in cbf.values() if isinstance(v, dict))
-        if rec_n <= 0:
+        rec_result = recovered_result_from_checkpoint(
+            checkpoint_content, fallback_text=fallback_text,
+        )
+        if not rec_result:
             return out
-        rec_text = (
-            ((fallback_text or "").strip() + ("\n\n" if (fallback_text or "").strip() else ""))
-            + "⚡ **Connection was interrupted** before I could finish, but I recovered "
-            + f"{rec_n} completed edit(s) below — review and apply them, or Resume "
-              "remaining agent tasks after applying."
-        ).strip()
-        rec_result = {
-            "intent": "edit",
-            "summary": f"Recovered {rec_n} edit(s) from an interrupted agent task",
-            "reasoning": "Recovered from a connection interruption mid agent task.",
-            "risks": [],
-            "skipped_changes": [],
-            "changes_by_file": cbf,
-            "new_files": [],
-            "natural_text": rec_text,
-            "recovered": True,
-        }
+        cbf = rec_result["changes_by_file"]
+        rec_n = sum(len(v.get("changes", [])) for v in cbf.values() if isinstance(v, dict))
+        rec_text = rec_result.get("natural_text") or ""
         _save_task_message(session_id, rec_text, rec_result, model=model or "")
         out["saved"] = True
         out["recovered_changes"] = rec_n
-        out["format_version"] = ckpt.get("format_version")
+        out["format_version"] = rec_result.get("format_version")
+        out["result"] = rec_result
         _dlog(
             dlog_event,
             session_id=session_id,

@@ -435,7 +435,12 @@ export const useAppStore = create<AppState>((set) => ({
     // Guard: drop messages that belong to a different session (prevents
     // cross-session bleed when the user switches tabs mid-stream)
     if (m.session_id && state.activeSessions && m.session_id !== state.activeSessions) return {}
-    return { messages: [...state.messages, m] }
+    const sessions = state.sessions.map((session) =>
+      session.id === m.session_id
+        ? { ...session, message_count: (session.message_count || 0) + 1 }
+        : session,
+    )
+    return { messages: [...state.messages, m], sessions }
   }),
   setLoading: (isLoading) => set({ isLoading }),
 
@@ -731,6 +736,23 @@ export const useAppStore = create<AppState>((set) => ({
       })
       return
     }
+    if (t === 'plan_step_result') {
+      set((s) => ({
+        planTasks: s.planTasks.map((task) => {
+          const sameFile = (task.filename || '') === (event.filename || '')
+          const sameSymbol = (task.symbol || '') === (event.symbol || '')
+          if (!sameFile || !sameSymbol) return task
+          return {
+            ...task,
+            added: Number(event.added) || 0,
+            removed: Number(event.removed) || 0,
+            diff: typeof event.diff === 'string' ? event.diff : '',
+            delivered: true,
+          }
+        }),
+      }))
+      return
+    }
     if (t === 'plan_questions') {
       set({ pendingPlanQuestions: normalizeQuestions(event.questions) })
       return
@@ -742,11 +764,30 @@ export const useAppStore = create<AppState>((set) => ({
       docPatch.planVersion = Number(event.version)
     }
     if (t === 'plan_ready' || t === 'plan_updated' || t === 'plan_coverage' || t === 'plan_failed') {
-      set({
-        planRunId: event.run_id || null,
-        planTasks: Array.isArray(event.tasks) ? event.tasks : [],
-        planPhase: event.phase || (t === 'plan_failed' ? 'ready' : 'ready'),
-        ...docPatch,
+      set((s) => {
+        const incoming = Array.isArray(event.tasks) ? event.tasks : []
+        const planTasks = (t === 'plan_coverage' || t === 'plan_failed')
+          ? incoming.map((task: any) => {
+              const prev = s.planTasks.find((old) =>
+                (old.filename || '') === (task.filename || '') &&
+                (old.symbol || '') === (task.symbol || ''),
+              )
+              if (!prev?.delivered) return task
+              return {
+                ...task,
+                added: prev.added,
+                removed: prev.removed,
+                diff: prev.diff,
+                delivered: true,
+              }
+            })
+          : incoming
+        return {
+          planRunId: event.run_id || null,
+          planTasks,
+          planPhase: event.phase || (t === 'plan_failed' ? 'ready' : 'ready'),
+          ...docPatch,
+        }
       })
       return
     }

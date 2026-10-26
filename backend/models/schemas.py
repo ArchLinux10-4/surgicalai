@@ -236,9 +236,32 @@ class SurgicalChange(BaseModel):
     original_code: str
     new_code: str
     diff: str
-    confidence: int
+    confidence: int = 8
     description: str
     applied: bool = False
+
+    @validator('confidence', pre=True, always=True)
+    def _confidence_present(cls, v):
+        # Diff-first cards are shown before a score exists. A missing score
+        # must not make Apply fail validation.
+        if v is None or v == '':
+            return 8
+        return v
+
+    @validator('symbol', pre=True)
+    def _symbol_present(cls, v):
+        # The early diff frame only sends name and full_path. Apply can still
+        # land the edit from original_code, so fill the rest instead of 422.
+        if not isinstance(v, dict):
+            return v
+        sym = dict(v)
+        sym.setdefault('symbol_type', 'variable')
+        sym.setdefault('start_line', 0)
+        sym.setdefault('end_line', 0)
+        sym.setdefault('code', '')
+        if not sym.get('name'):
+            sym['name'] = (sym.get('full_path') or 'edit').split('.')[-1] or 'edit'
+        return sym
     surgeon_notes: List[str] = []
     qa_result: Optional[QAResult] = None
     # v3.4.0: search-and-replace operations (primary apply path)

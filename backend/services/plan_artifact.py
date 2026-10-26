@@ -60,17 +60,25 @@ def parse_implementation_plan(text: str) -> list[dict] | None:
         filename = str(item.get("filename") or "").strip()
         symbol = str(item.get("symbol") or item.get("symbol_path") or "").strip()
         description = str(item.get("description") or item.get("detail") or "").strip()
+        action = str(item.get("action") or "").strip().lower()
+        if action not in ("create", "edit"):
+            action = ""
+        if action == "create" and filename and not symbol:
+            symbol = filename
         if not filename or not symbol:
             continue
         key = _norm_key(filename, symbol)
         if key in seen:
             continue
         seen.add(key)
-        steps.append({
+        step = {
             "filename": filename,
             "symbol": symbol,
             "description": description or f"Update {symbol} in {filename}",
-        })
+        }
+        if action == "create":
+            step["action"] = "create"
+        steps.append(step)
     return steps or None
 
 
@@ -84,7 +92,7 @@ def steps_to_task_payloads(steps: list[dict]) -> list[dict]:
         out.append({
             "title": f"{filename} · {symbol}".strip(" ·"),
             "detail": desc,
-            "kind": "code",
+            "kind": "create" if s.get("action") == "create" else "code",
             "filename": filename,
             "symbol": symbol,
             "source": "plan",
@@ -108,6 +116,155 @@ def serialize_plan_task(row: dict) -> dict:
         "verdict": row.get("verdict"),
         "result_summary": row.get("result_summary") or "",
     }
+
+
+def module_assignment_window(content: str, symbol: str, radius: int = 20) -> str | None:
+    """Numbered window around a module-level `SYMBOL =` line, or None.
+
+    About 40 lines. Used when the symbol is not in the AST map, which is
+    normal for a constant.
+    """
+    if not content or not symbol:
+        return None
+    match = re.search(rf"^[ \t]*{re.escape(symbol)}\s*=", content, re.M)
+    if not match:
+        return None
+    lines = content.splitlines()
+    line = content[:match.start()].count("\n")
+    start = max(0, line - radius)
+    end = min(len(lines), line + radius + 1)
+    return "\n".join(f"{i + 1:5d}: {lines[i]}" for i in range(start, end))
+
+
+_LINE_REF_RE = re.compile(r"\blines?\s+(\d+)(?:\s*[–-]\s*(\d+))?", re.I)
+_VERSION_TOKEN_RE = re.compile(r"`([^`\n]{2,80})`|\"([^\"\n]{3,80})\"|“([^”\n]{3,80})”|([A-Za-z][\w\-]*\d[\w.]*)")
+
+
+def _anchor_terms(symbol: str, description: str) -> list[str]:
+    terms: list[str] = []
+    sym = (symbol or "").strip()
+    if sym:
+        terms.append(sym)
+    for match in _VERSION_TOKEN_RE.finditer(description or ""):
+        term = next((g for g in match.groups() if g), "").strip().rstrip(".,;:")
+        if len(term) >= 3 and term not in terms:
+            terms.append(term)
+    return terms
+
+
+def text_anchor_window(
+    content: str, symbol: str, description: str = "", radius: int = 30,
+) -> dict | None:
+    """Numbered window around text the step names, for non-symbol targets.
+
+    An HTML id, a sentence in a template, or a markdown note is never in the
+    symbol map. The planned name, a line number in the step, or a quoted or
+    versioned token from the step (`gpt-4.1`) usually is in the file. Returns
+    {"text", "start", "end", "line", "anchor", "other_lines"} with 1-based lines, or
+    None when nothing the step names is in the file.
+    """
+    if not content:
+        return None
+    lines = content.splitlines()
+    total = len(lines)
+    if not total:
+        return None
+    low = content.casefold()
+    center = None
+    anchor = ""
+    other: list[int] = []
+    for term in _anchor_terms(symbol, description):
+        idx = low.find(term.casefold())
+        if idx < 0:
+            continue
+        center = content[:idx].count("\n")
+        anchor = term
+        pos = idx + len(term)
+        while len(other) < 12:
+            nxt = low.find(term.casefold(), pos)
+            if nxt < 0:
+                break
+            line = content[:nxt].count("\n") + 1
+            if line != center + 1 and line not in other:
+                other.append(line)
+            pos = nxt + len(term)
+        break
+    if center is None:
+        match = _LINE_REF_RE.search(description or "")
+        if match:
+            first = int(match.group(1))
+            if 1 <= first <= total:
+                center = first - 1
+                anchor = f"line {first}"
+    if center is None:
+        return None
+    start = max(0, center - radius)
+    end = min(total, center + radius + 1)
+    text = "\n".join(f"{i + 1:5d}: {lines[i]}" for i in range(start, end))
+    return {
+        "text": text, "start": start + 1, "end": end, "line": center + 1,
+        "anchor": anchor, "other_lines": other,
+    }
+
+
+def flag_unresolved_plan_steps(session_id: str, tasks: list[dict]) -> list[dict]:
+    """Mark steps whose file is already staged but whose symbol is not in it.
+
+    Files that are not staged yet are left alone: Implement can still load
+    them from the open folder. Create steps are left alone.
+    """
+    conn = get_db()
+    try:
+        rows = conn.execute(
+            "SELECT filename, content FROM session_files WHERE session_id = ?",
+            (session_id,),
+        ).fetchall()
+    except Exception:
+        rows = []
+    finally:
+        conn.close()
+    by_name = {}
+    for row in rows:
+        try:
+            by_name[row["filename"]] = row["content"] or ""
+        except Exception:
+            by_name[row[0]] = row[1] or ""
+    if not by_name:
+        return tasks
+    try:
+        from services.ast_parser import ASTParser
+        parser = ASTParser()
+    except Exception:
+        parser = None
+    for task in tasks:
+        if (task.get("kind") or "") == "create":
+            continue
+        filename = task.get("filename") or ""
+        symbol = task.get("symbol") or ""
+        content = by_name.get(filename)
+        if content is None or not symbol:
+            continue
+        found = False
+        if parser is not None:
+            try:
+                smap = parser.parse(content, filename)
+                for sym in getattr(smap, "symbols", []) or []:
+                    if symbol in (getattr(sym, "name", ""), getattr(sym, "full_path", "")):
+                        found = True
+                        break
+            except Exception:
+                found = False
+        if not found and module_assignment_window(content, symbol):
+            found = True
+        if not found and text_anchor_window(content, symbol, task.get("detail") or ""):
+            found = True
+        if found:
+            continue
+        note = f"Could not find `{symbol}` in `{filename}`."
+        update_task(task["id"], verdict="unresolved", result_summary=note)
+        task["verdict"] = "unresolved"
+        task["result_summary"] = note
+    return tasks
 
 
 def _norm_key(filename: str, symbol: str) -> tuple[str, str]:
@@ -140,9 +297,14 @@ def _symbols_compatible(a: str, b: str) -> bool:
         return False
     if a == b:
         return True
+    # `b` is the produced symbol when coverage asks "does this edit cover
+    # the planned name". TitleMatcher.__init__ covers TitleMatcher.
+    # The reverse does not: a class edit does not cover one method.
     return (
         a.endswith("." + b) or b.endswith("." + a)
         or a.endswith("/" + b) or b.endswith("/" + a)
+        or a.endswith("#" + b) or b.endswith("#" + a)
+        or b.startswith(a + ".")
     )
 
 
@@ -432,6 +594,7 @@ def persist_plan_from_assistant_text(
 
     run_id = str(uuid.uuid4())
     created = create_tasks(session_id, run_id, steps_to_task_payloads(steps))
+    created = flag_unresolved_plan_steps(session_id, created)
     doc = upsert_session_plan(session_id, text or "", user_id=user_id)
     return {
         "type": event,
@@ -479,11 +642,14 @@ def forced_edit_plan_from_run(session_id: str, run_id: str) -> list[dict]:
         filename = t.get("filename") or ""
         symbol = t.get("symbol") or ""
         if filename and symbol:
-            plan.append({
+            step = {
                 "filename": filename,
                 "symbol": symbol,
                 "description": t.get("detail") or "",
-            })
+            }
+            if (t.get("kind") or "") == "create":
+                step["action"] = "create"
+            plan.append(step)
     return plan
 
 
@@ -560,7 +726,7 @@ def activate_first_plan_step(session_id: str, run_id: str) -> list[dict]:
     return tasks
 
 
-def note_plan_step(session_id: str, run_id: str, filename: str, symbol: str, status: str) -> dict | None:
+def note_plan_step(session_id: str, run_id: str, filename: str, symbol: str, status: str, reason: str = "") -> dict | None:
     """Set one plan task to running, done, or blocked. None if no matching row."""
     if status not in ("running", "done", "blocked"):
         return None
@@ -570,9 +736,11 @@ def note_plan_step(session_id: str, run_id: str, filename: str, symbol: str, sta
     fields = {"status": status}
     if status == "done":
         fields["verdict"] = "edited"
+        fields["result_summary"] = ""
     elif status == "blocked":
         fields["verdict"] = "edit_failed"
-        fields["result_summary"] = "This step did not produce an edit."
+        if reason:
+            fields["result_summary"] = str(reason)[:300]
     update_task(task["id"], **fields)
     task.update(fields)
     return task
@@ -584,7 +752,9 @@ def mark_next_plan_step_running(session_id: str, run_id: str) -> dict | None:
     if any((t.get("status") or "") == "running" for t in tasks):
         return None
     for t in tasks:
-        if (t.get("status") or "") in ("pending", "blocked"):
+        # A step that just failed is blocked. Promoting it again clears the
+        # reason and makes the live line stick on the failure.
+        if (t.get("status") or "") == "pending":
             update_task(t["id"], status="running", result_summary="")
             t["status"] = "running"
             t["result_summary"] = ""
@@ -612,7 +782,29 @@ def _keys_from_changes_by_file(changes_by_file) -> list[tuple[str, str]]:
             pair = (str(fn or ""), str(symbol or ""))
             if pair[0] or pair[1]:
                 keys.append(pair)
+            targeted = _text_region_target(ch)
+            if targeted:
+                keys.append((str(fn or ""), targeted))
     return keys
+
+
+_TARGETED_RE = re.compile(r"model targeted '([^']+)'")
+
+
+def _text_region_target(change: dict) -> str:
+    """The planned name behind a promoted `_text_region_L…` edit.
+
+    Promotion widens the edit to a real file window that contains the symbol
+    the model was asked to edit, and records that name in the signature.
+    """
+    sym = change.get("symbol")
+    if not isinstance(sym, dict):
+        return ""
+    name = str(sym.get("name") or "")
+    if not name.startswith("_text_region_L"):
+        return ""
+    match = _TARGETED_RE.search(str(sym.get("signature") or ""))
+    return match.group(1) if match else ""
 
 
 def plain_skip_reason(item: dict) -> str:
@@ -621,6 +813,12 @@ def plain_skip_reason(item: dict) -> str:
     symbol = (item or {}).get("symbol") or "that step"
     reason = str((item or {}).get("reason") or "")
     low = reason.lower()
+    if reason.lower().startswith("edited "):
+        return reason
+    if low == "symbol not found":
+        return f"Could not find `{symbol}` in `{filename}`."
+    if "timed out" in low:
+        return f"`{symbol}` in `{filename}` timed out before it produced an edit."
     if low in ("symbol_not_found", "file_not_parseable") or (
         "symbol" in low and "not found" in low
     ):
@@ -628,6 +826,8 @@ def plain_skip_reason(item: dict) -> str:
             f"Could not add `{symbol}` to `{filename}`. "
             "The edit pointed at the whole file instead of a line next to where it goes."
         )
+    if low.startswith("create ") or "meant to be created" in low:
+        return f"Could not create `{filename}`. {reason}"
     if "file not found" in low or low == "file_not_in_session":
         return (
             f"Could not edit `{filename}`. "
@@ -687,6 +887,32 @@ def compute_plan_coverage(planned_steps: list[dict], result: dict) -> dict:
         planned.append(pair)
 
     produced = _keys_from_changes_by_file((result or {}).get("changes_by_file"))
+
+    def _pairs(rows) -> set[tuple[str, str]]:
+        return {
+            _norm_key(str(r.get("filename") or ""), str(r.get("symbol") or ""))
+            for r in rows or [] if isinstance(r, dict)
+        }
+
+    answered = _pairs((result or {}).get("plan_answered_steps"))
+    created = _pairs((result or {}).get("plan_created_steps"))
+    create_steps = [
+        (str(s.get("filename") or ""), str(s.get("symbol") or ""))
+        for s in planned_steps or []
+        if isinstance(s, dict) and (
+            s.get("action") == "create"
+            or _norm_key(str(s.get("filename") or ""), str(s.get("symbol") or "")) in created
+        )
+    ]
+    for item in (result or {}).get("new_files") or []:
+        if not isinstance(item, dict):
+            continue
+        fn = str(item.get("filename") or "")
+        if not fn:
+            continue
+        for planned_fn, planned_sym in create_steps:
+            if _norm_filename(planned_fn) == _norm_filename(fn):
+                produced.append((planned_fn, planned_sym))
     skipped_rows = _skipped_pairs((result or {}).get("skipped_changes"))
     done_skips = [(fn, sym) for fn, sym, reason in skipped_rows if _skip_is_already_done(reason)]
     failed_skips = [
@@ -707,6 +933,37 @@ def compute_plan_coverage(planned_steps: list[dict], result: dict) -> dict:
         p for p in planned
         if p not in covered and not any(_keys_compatible(p, q) for q in pending_pairs)
     ]
+    still_missing = []
+    for planned_fn, planned_sym in missing:
+        others = []
+        for got_fn, got_sym in produced:
+            if not _files_compatible(planned_fn, got_fn):
+                continue
+            if _symbols_compatible(planned_sym, got_sym):
+                continue
+            if got_sym and got_sym not in others:
+                others.append(got_sym)
+        # The step's own focused call returned this edit, so a change in that
+        # file that no other planned step claims is this step's answer, even
+        # when the model named the function it delegates to or a heading.
+        unclaimed = [
+            o for o in others
+            if not any(
+                _keys_compatible((planned_fn, o), p)
+                for p in planned if p != (planned_fn, planned_sym)
+            )
+        ]
+        if unclaimed and _norm_key(planned_fn, planned_sym) in answered:
+            covered.append((planned_fn, planned_sym))
+        elif others:
+            pending_rows.append((
+                planned_fn,
+                planned_sym,
+                f"Edited `{others[0]}` instead of `{planned_sym}`.",
+            ))
+        else:
+            still_missing.append((planned_fn, planned_sym))
+    missing = still_missing
     extra = [q for q in produced if not any(_keys_compatible(q, p) for p in planned)]
     skipped_hit = [q for q in done_skips if any(_keys_compatible(q, p) for p in planned)]
     return {
@@ -758,9 +1015,60 @@ def apply_coverage_to_run(session_id: str, run_id: str, coverage: dict) -> list[
             t["status"] = "blocked"
             t["verdict"] = "plan_coverage"
         else:
-            update_task(t["id"], status="done", verdict="covered")
+            update_task(t["id"], status="done", verdict="covered", result_summary="")
             t["status"] = "done"
             t["verdict"] = "covered"
+            t["result_summary"] = ""
+        updated.append(t)
+    updated.sort(key=lambda r: r.get("seq") or 0)
+    return updated
+
+
+def coverage_after_crash(planned_steps: list[dict], result: dict, reason: str) -> dict:
+    """Coverage for a build that crashed after some edits were checkpointed.
+
+    Steps the checkpoint does not contain are pending with the crash reason.
+    They are not "not produced".
+    """
+    note = (reason or "Build crashed before this step finished.").strip()[:300]
+    cov = compute_plan_coverage(planned_steps, result or {})
+    if not cov.get("missing"):
+        return cov
+    merged = dict(result or {})
+    skipped = list(merged.get("skipped_changes") or [])
+    for item in cov["missing"]:
+        skipped.append({
+            "filename": item.get("filename") or "",
+            "symbol": item.get("symbol") or "",
+            "reason": note,
+        })
+    merged["skipped_changes"] = skipped
+    return compute_plan_coverage(planned_steps, merged)
+
+
+def release_unshipped_plan_steps(session_id: str, run_id: str, reason: str) -> list[dict]:
+    """Put a crashed build back to pending, including in-memory "edited" steps.
+
+    note_plan_step marks a step done as soon as its edit resolves, before any
+    diff is delivered. forced_edit_plan_from_run skips done steps, so leaving
+    those marks would drop the edits on Retry. Verdict "covered" is a finished
+    coverage pass and stays done.
+    """
+    note = (reason or "Build crashed before a result was delivered.").strip()[:300]
+    updated = []
+    for t in list_tasks(session_id, run_id):
+        if (t.get("source") or "") != "plan":
+            continue
+        status = t.get("status") or ""
+        verdict = t.get("verdict") or ""
+        unshipped = status in ("running", "pending") or (
+            status == "done" and verdict == "edited"
+        )
+        if unshipped:
+            update_task(t["id"], status="pending", verdict="", result_summary=note)
+            t["status"] = "pending"
+            t["verdict"] = ""
+            t["result_summary"] = note
         updated.append(t)
     updated.sort(key=lambda r: r.get("seq") or 0)
     return updated

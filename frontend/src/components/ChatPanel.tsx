@@ -21,7 +21,7 @@ const NO_PASTED: PastedBlock[] = []
 const NO_QUEUE: SteerQueueItem[] = []
 import { refreshRepoBranch } from './GitTerminalDock'
 import { AgentMissionControl } from './AgentMissionControl'
-import { PlanTracker } from './PlanTracker'
+import { PlanTracker, requestPlanBuild } from './PlanTracker'
 import { PlanPane } from './PlanPane'
 import { planStatusBadge, planTabKey, shouldQueueAfterStart } from '../lib/planTab'
 import { PlanQuestionsCard } from './PlanQuestionsCard'
@@ -40,7 +40,7 @@ import { applyStageLabel } from '../lib/applyProgress'
 import { migrateLocalApplied, splitPendingChanges, supersededKeysByMessage } from '../lib/diffChange'
 import { applyChanges as runApply, applyFailureCopy, notifyApplied } from '../hooks/useApplyChange'
 import { ToolActivityFeed } from './ToolActivityFeed'
-import { finalizeTrail, modelFamily } from '../lib/toolActivity'
+import { finalizeTrail, modelFamily, turnWallMs } from '../lib/toolActivity'
 import type { ToolRow } from '../types'
 
 function snapshotTools(sessionId: string): ToolRow[] | undefined {
@@ -473,20 +473,27 @@ function AIAvatar() {
 }
 
 // ── Diff card error boundary ──────────────────────────────
-class DiffCardBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean; error: string }> {
+class DiffCardBoundary extends Component<{ children: React.ReactNode }, { hasError: boolean; error: string; stack: string }> {
   constructor(props: any) {
     super(props)
-    this.state = { hasError: false, error: '' }
+    this.state = { hasError: false, error: '', stack: '' }
   }
   static getDerivedStateFromError(error: Error) {
-    return { hasError: true, error: error.message }
+    return { hasError: true, error: error.message, stack: '' }
+  }
+  componentDidCatch(_error: Error, info: { componentStack?: string }) {
+    const frame = (info.componentStack || '').split('\n').map(line => line.trim()).find(Boolean) || ''
+    this.setState({ stack: frame })
   }
   render() {
     if (this.state.hasError) {
       return (
         <div className="border border-danger/40 rounded-xl p-4 bg-danger/10 text-sm text-danger">
           <strong>Diff card error:</strong> {this.state.error}
-          <br /><span className="text-xs text-danger mt-1 block">The change was planned but could not be displayed. Check the console for details.</span>
+          {this.state.stack && (
+            <span className="text-xs text-danger mt-1 block font-mono">{this.state.stack}</span>
+          )}
+          <span className="text-xs text-danger mt-1 block">The change was planned but could not be displayed. Check the console for details.</span>
         </div>
       )
     }
@@ -617,7 +624,7 @@ function MessageImpl({ msg, sessionId, onRetryWithQA, supersededKey = '' }: { ms
         {(msg._tools?.length || msg._thinking || (msg._steps && msg._steps.filter((s: string) => s !== 'Thinking...').length > 0)) && (
           <div className="mb-3 space-y-1">
             {msg._tools?.length ? (
-              <ToolActivityFeed mode="done" rows={msg._tools} model={msg._model} />
+              <ToolActivityFeed mode="done" rows={msg._tools} model={msg._model} wallMs={(msg as any)._turn_ms || turnWallMs(msg.created_at, msg._tools)} />
             ) : null}
             {msg._steps && (isSurgical || isNaturalResult) && (
               <PipelineTimeline steps={msg._steps} />
@@ -792,6 +799,28 @@ function ThinkingBlock({ text, isStreaming, sessionId, label }: { text: string; 
     })
   }
 
+  const [staleSec, setStaleSec] = useState(0)
+  const lastChangeRef = useRef(Date.now())
+  const lastLenRef = useRef(text.length)
+  useEffect(() => {
+    if (text.length !== lastLenRef.current) {
+      lastLenRef.current = text.length
+      lastChangeRef.current = Date.now()
+      setStaleSec(0)
+    }
+  }, [text])
+  useEffect(() => {
+    if (!isStreaming) {
+      setStaleSec(0)
+      return
+    }
+    const timer = window.setInterval(() => {
+      const gap = Date.now() - lastChangeRef.current
+      setStaleSec(gap >= 2000 ? Math.round(gap / 1000) : 0)
+    }, 500)
+    return () => window.clearInterval(timer)
+  }, [isStreaming])
+
   if (!text && !isStreaming) return null
 
   return (
@@ -807,13 +836,16 @@ function ThinkingBlock({ text, isStreaming, sessionId, label }: { text: string; 
             Thinking<span className="animate-pulse">…</span>
           </span>
         ) : (
-          <span>{label || 'Reasoning'} ({text.length > 1000 ? `${Math.round(text.length / 100)} steps` : 'click to view'})</span>
+          <span>{label || 'Reasoning'} ({text.length.toLocaleString()} characters)</span>
         )}
       </button>
       {expanded && text && (
         <div className="mt-2 ml-5 pl-3 border-l-2 border-purple/30 text-[12px] text-muted/90 whitespace-pre-wrap max-h-80 overflow-y-auto leading-relaxed font-mono">
           {text}
           {isStreaming && <span className="inline-block w-1.5 h-3 bg-purple/60 rounded-sm ml-0.5 animate-pulse" />}
+          {isStreaming && staleSec > 0 && (
+            <div className="mt-1 text-purple/80">Still working {staleSec}s</div>
+          )}
         </div>
       )}
     </div>
@@ -1004,7 +1036,7 @@ function PipelineTimeline({ steps, isLive = false, phase = 0 }: { steps: string[
   )
 }
 
-function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit, webSearchLive, sessionId, model, phase = 0 }: { content: string; progress: string; progressHistory?: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean; webSearchLive?: { searching: boolean; query?: string } | null; sessionId?: string; model?: string; phase?: number }) {
+function StreamingBubble({ content, progress, progressHistory, thinkingText, isThinking, isBuildingEdit, webSearchLive, sessionId, model, phase = 0, mode }: { content: string; progress: string; progressHistory?: string[]; thinkingText?: string; isThinking?: boolean; isBuildingEdit?: boolean; webSearchLive?: { searching: boolean; query?: string } | null; sessionId?: string; model?: string; phase?: number; mode?: string }) {
   const liveOrder = useAppStore((s) => (sessionId ? s.liveEditOrder[sessionId] : undefined))
   const liveMap = useAppStore((s) => (sessionId ? s.liveEdits[sessionId] : undefined))
   const activity = useAppStore((s) => (sessionId ? s.toolActivity[sessionId] : undefined))
@@ -1035,7 +1067,9 @@ function StreamingBubble({ content, progress, progressHistory, thinkingText, isT
           )}
         </div>
 
-        <PipelineTimeline steps={progressHistory || []} isLive phase={phase} />
+        {mode !== 'ask' && mode !== 'plan' && (
+          <PipelineTimeline steps={progressHistory || []} isLive phase={phase} />
+        )}
         <ToolActivityFeed
           mode="live"
           rows={toolRows}
@@ -1276,6 +1310,18 @@ export function ChatPanel() {
     pickedElements, clearPickedElements,
     availableModels, refreshModels,
   } = useAppStore()
+  const [provisionalEdits, setProvisionalEdits] = useState<Record<string, any>>({})
+  const setProvisionalEdit = (sid: string, result: any) => {
+    setProvisionalEdits(prev => {
+      if (!result) {
+        if (!prev[sid]) return prev
+        const next = { ...prev }
+        delete next[sid]
+        return next
+      }
+      return { ...prev, [sid]: result }
+    })
+  }
 
   // Keep the agentic task list in sync with Claude's DB-backed progress while a
   // run is active (resilient fallback if the live stream drops mid-run).
@@ -1543,13 +1589,28 @@ export function ChatPanel() {
     })
   }
 
+  const thinkingShownRef = useRef('')
   const queueThinkingText = (text: string) => {
     thinkingTextRef.current = text
+    if (text.length < thinkingShownRef.current.length) thinkingShownRef.current = ''
+    const tick = () => {
+      const target = thinkingTextRef.current
+      const shown = thinkingShownRef.current
+      if (target.length < shown.length || shown.length >= target.length) {
+        thinkingShownRef.current = target
+        setThinkingText(target)
+        thinkingRafRef.current = 0
+        return
+      }
+      const behind = target.length - shown.length
+      const take = Math.max(12, Math.ceil(behind / 40))
+      const next = target.slice(0, shown.length + take)
+      thinkingShownRef.current = next
+      setThinkingText(next)
+      thinkingRafRef.current = requestAnimationFrame(tick)
+    }
     if (thinkingRafRef.current) return
-    thinkingRafRef.current = requestAnimationFrame(() => {
-      thinkingRafRef.current = 0
-      setThinkingText(thinkingTextRef.current)
-    })
+    thinkingRafRef.current = requestAnimationFrame(tick)
   }
 
   // Manual abort (Escape / Stop button): preserve whatever was streamed so far
@@ -1705,8 +1766,13 @@ export function ChatPanel() {
       api.tasks.list(activeSessions)
         .then((rows: any[]) => {
           if (!Array.isArray(rows) || rows.length === 0) return
-          const latestRun = rows[0]?.run_id
-          const forRun = rows.filter(r => r.run_id === latestRun)
+          // Plan steps live in the Plan tab and build through /plans/implement.
+          // Showing them here duplicated the checklist and offered a Resume
+          // that drives the agent queue instead of the plan build.
+          const agentRows = rows.filter(r => (r.source || '') !== 'plan')
+          if (agentRows.length === 0) return
+          const latestRun = agentRows[0]?.run_id
+          const forRun = agentRows.filter(r => r.run_id === latestRun)
           const TERMINAL = ['done', 'blocked', 'cancelled', 'error']
           const allTerminal = forRun.every(r => TERMINAL.includes(r.status))
           // Skip — completed runs don't need the mission control panel.
@@ -2212,6 +2278,14 @@ export function ChatPanel() {
       (token) => { accumulated += token; queueStreamingText(sessionId, accumulated) },
       (result) => {
         clearStaleFileRequest(sessionId)
+        // Diff-first ships the edit before the check finishes. Saving that
+        // frame ends the turn, so the card keeps "Low 0/10" and "still
+        // running" after the real 9/10 verdict arrives.
+        if (result?.qa_status === 'pending') {
+          setProvisionalEdit(sessionId, result)
+          return
+        }
+        setProvisionalEdit(sessionId, null)
         gotResult = true
         if (result._model) streamModel = result._model
         const _thinking = thinkingTextRef.current
@@ -3435,8 +3509,13 @@ export function ChatPanel() {
               />
             )}
             <PlanTracker hintOnly emptyHint={effectiveMode === 'plan' && !planQuestionsToShow} />
-            {isStreaming && (streamingMessage || streamProgress) && (
-              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} model={settings?.architect_model} phase={streamPhase} />
+            {activeSessions && provisionalEdits[activeSessions] && (
+              <div className="px-4">
+                <InlineDiffCard result={provisionalEdits[activeSessions]} sessionId={activeSessions} />
+              </div>
+            )}
+            {isStreaming && (
+              <StreamingBubble content={streamingMessage} progress={streamProgress} progressHistory={progressHistory} thinkingText={thinkingText} isThinking={isThinking} isBuildingEdit={isBuildingEdit} webSearchLive={webSearchLive} sessionId={activeSessions || undefined} model={settings?.architect_model} phase={streamPhase} mode={effectiveMode} />
             )}
             {/* Human-in-the-loop: agent needs a file that isn't in the session */}
             {fileRequest && fileRequest.sessionId === activeSessions && (
@@ -3586,7 +3665,21 @@ export function ChatPanel() {
             onClick={openPlanTab}
             className="mb-1.5 text-left text-[12px] text-accent font-medium"
           >
-            Building plan {planTasks.filter(t => t.status === 'done').length}/{planTasks.length} · View plan
+            {(() => {
+              const running = planTasks.find(t => t.status === 'running')
+              const index = running ? planTasks.indexOf(running) + 1 : planTasks.filter(t => t.status === 'done').length
+              const where = running ? ` · ${running.filename || running.title} · ${running.symbol}` : ''
+              return `Step ${index} of ${planTasks.length}${where} · View plan`
+            })()}
+          </button>
+        )}
+        {(planPhase === 'ready' || planPhase === 'blocked') && planTasks.some(t => t.status === 'pending' || t.status === 'blocked') && (
+          <button
+            type="button"
+            onClick={() => { openPlanTab(); requestPlanBuild() }}
+            className="mb-1.5 text-left text-[12px] text-accent font-medium"
+          >
+            Build from plan · {planTasks.filter(t => t.status === 'pending' || t.status === 'blocked').length} step{planTasks.filter(t => t.status === 'pending' || t.status === 'blocked').length === 1 ? '' : 's'} left
           </button>
         )}
         <div className="mb-1.5 flex items-center gap-1.5">
@@ -3800,7 +3893,7 @@ export function ChatPanel() {
                 )}
               </div>
               <span className="text-[11px] text-faint ml-1 select-none">
-                {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} attached` : ''}
+                {hasFiles ? `${sessionFiles.length} file${sessionFiles.length > 1 ? 's' : ''} in this chat` : ''}
               </span>
             </div>
             <div className="flex items-center gap-1.5">

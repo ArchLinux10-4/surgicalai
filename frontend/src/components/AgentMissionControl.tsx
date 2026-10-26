@@ -3,6 +3,7 @@ import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import type { AgentTask, AgentTaskStatus } from '../types'
 import { ToolActivityFeed } from './ToolActivityFeed'
+import { ProgressMeter } from './ProgressMeter'
 
 /**
  * AgentMissionControl — dual-agent mission control panel.
@@ -331,13 +332,13 @@ function ExecutorCard({
         )}
       </div>
 
-      {/* Progress bar */}
-      <div className="h-1 bg-overlay/60">
-        <div
-          className="h-full bg-success transition-all duration-500 ease-out"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
+      <ProgressMeter
+        done={done}
+        failed={tasks.filter(t => t.status === 'blocked' || t.status === 'error').length}
+        total={total}
+        running={anyActive}
+        tone="success"
+      />
 
       {/* Task rows */}
       <ul className="divide-y divide-border/40">

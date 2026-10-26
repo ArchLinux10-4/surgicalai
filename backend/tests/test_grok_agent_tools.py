@@ -158,6 +158,19 @@ def test_accumulator_empty_delta_returns_empty_list():
     assert acc.add_delta([]) == []
 
 
+def test_aiter_sync_yields_each_item_without_holding_the_rest():
+    import asyncio
+
+    seen = []
+
+    async def _run():
+        async for item in gat.aiter_sync(iter(["think", "tool"])):
+            seen.append(item)
+
+    asyncio.run(_run())
+    assert seen == ["think", "tool"]
+
+
 def test_format_tool_call_progress_known_and_unknown():
     assert gat.format_tool_call_progress("request_search") == "Calling request_search…"
     assert gat.format_tool_call_progress("") == "Calling tool…"
@@ -353,6 +366,20 @@ def test_translate_only_first_context_request_dispatched():
     ignored = [kw for event, kw in events if event == "grok_translate_extra_context_ignored"]
     assert ignored and ignored[0]["kept_tool"] == "request_search"
     assert ignored[0]["tool_name"] == "request_file"
+
+
+def test_translate_same_search_calls_are_merged():
+    calls = [
+        _call("request_search", {"terms": ["alpha"]}, cid="c1"),
+        _call("request_search", {"terms": ["beta", "alpha"]}, cid="c2"),
+    ]
+    events = []
+    res = gat.translate_tool_calls(calls, dlog=lambda event, **kw: events.append((event, kw)))
+    assert res.errors == []
+    kind, body = res.context_request
+    assert kind == "search"
+    assert json.loads(body)["terms"] == ["alpha", "beta"]
+    assert any(event == "grok_translate_context_merged" for event, _kw in events)
 
 
 def test_translate_multiple_writes_all_collected():

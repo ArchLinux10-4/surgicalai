@@ -8,6 +8,7 @@ Best Practice #2: Minimal footprint (surgeon only touches requested symbol)
 Best Practice #3: Verify before commit (confidence scoring + diff)
 """
 import ast
+import asyncio
 import copy
 import json
 import re
@@ -44,43 +45,14 @@ def _sse_line(obj) -> str:
 
 
 def _dlog(event: str, **kwargs):
-    """Append a structured debug record to the database (persistent) and /tmp file (fast fallback)."""
+    """Queue a debug record. The debug_events writer batches the insert.
+
+    A per-event connection here used to run on the event loop, inside the
+    token stream, and the chunks arrived in bursts.
+    """
     try:
-        ts = _dt.datetime.utcnow().isoformat() + "Z"
-        record = {"ts": ts, "event": event, **kwargs}
-        line = _json_mod.dumps(record, default=str) + "\n"
-
-        # ── Primary: write to database (survives deploys/restarts) ──
-        try:
-            from database import get_db_ctx
-            with get_db_ctx() as conn:
-                session_id = str(kwargs.get("session_id", ""))
-                user_id = str(kwargs.get("user_id", ""))
-                data_json = _json_mod.dumps(record, default=str)
-                conn.execute(
-                    "INSERT INTO debug_events (id, event, session_id, user_id, data, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (str(_uuid_dlog.uuid4()), event, session_id, user_id, data_json, ts),
-                )
-                # Probabilistic cleanup: ~1 in 50 calls, expire old entries
-                if _rnd_dlog.random() < 0.02:
-                    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=_DLOG_EXPIRE_DAYS)).isoformat()
-                    conn.execute("DELETE FROM debug_events WHERE created_at < ?", (cutoff,))
-                conn.commit()
-        except Exception:
-            pass  # DB write failed — file fallback still works
-
-        # ── Secondary: write to /tmp file (backward compat + fast grep) ──
-        try:
-            if _os.path.exists(_DLOG_PATH) and _os.path.getsize(_DLOG_PATH) > _DLOG_MAX_BYTES:
-                with open(_DLOG_PATH, "r") as _f:
-                    _lines = _f.readlines()
-                with open(_DLOG_PATH, "w") as _f:
-                    _f.writelines(_lines[len(_lines)//2:])
-        except Exception:
-            pass
-        with open(_DLOG_PATH, "a") as _f:
-            _f.write(line)
+        from debug_events import emit
+        emit(event, **kwargs)
     except Exception:
         pass  # logging must NEVER crash the pipeline
 
@@ -1423,6 +1395,7 @@ from services.grok_agent_tools import (  # noqa: E402
     build_grok_system_suffix as _grok_build_system_suffix,
     build_grok_agent_instruction as _grok_build_agent_instruction,
     format_tool_call_progress as _grok_format_tool_progress,
+    aiter_sync as _grok_aiter_sync,
     extract_reasoning_delta as _grok_extract_reasoning_delta,
     summarize_translation_progress as _grok_summarize_translation_progress,
 )
@@ -1969,6 +1942,12 @@ async def _safe_claude_call(aclient_inst, *, model: str,
 # HTTP 200 with stop_reason "refusal", so it never raises — QA callers must
 # check for it explicitly or they would parse the refusal text as a verdict.
 _QA_REFUSAL_FALLBACK_MODEL = "claude-sonnet-5"
+
+# QA correction rounds. Module-level on purpose: the diff-first block reads
+# this before the old in-function assignment, and plan builds always take
+# that path. A local assigned later makes Python treat every read as local
+# and raises UnboundLocalError.
+MAX_QA_RETRIES = 2
 
 
 class _QARefusalError(ValueError):
@@ -12378,6 +12357,52 @@ def _build_architect_checkpoint_resolved(edit_blocks_raw: list, new_file_blocks_
     return resolved
 
 
+def normalize_plan_new_file(raw: str, filename: str) -> str:
+    """Save a plan create step under the step's filename.
+
+    The model often wraps the file as JSON, and sometimes nests that JSON
+    again as the content string. The step name wins over any name inside
+    the body, including a name guessed from the plan text.
+    """
+    import json as _json
+
+    text = (raw or "").strip()
+    data = None
+    try:
+        data = _json.loads(text)
+    except Exception:
+        try:
+            data = _json.loads(_repair_json(text))
+        except Exception:
+            data = None
+    content = text
+    language = ""
+    summary = ""
+    if isinstance(data, dict):
+        inner = data.get("content")
+        content = inner if isinstance(inner, str) and inner.strip() else text
+        language = str(data.get("language") or "")
+        summary = str(data.get("summary") or "")
+    elif isinstance(data, str) and data.strip():
+        content = data
+    nested = content.strip()
+    if nested.startswith("{") and '"content"' in nested[:400]:
+        try:
+            again = _json.loads(nested)
+        except Exception:
+            again = None
+        if isinstance(again, dict) and isinstance(again.get("content"), str) and again["content"].strip():
+            content = again["content"]
+            language = language or str(again.get("language") or "")
+            summary = summary or str(again.get("summary") or "")
+    return _json.dumps({
+        "filename": filename,
+        "content": content,
+        "language": language,
+        "summary": summary,
+    })
+
+
 def _infer_new_file_from_raw(raw_content: str, user_request: str) -> dict | None:
     """
     Fallback for GPT models that write raw file content inside <new_file>
@@ -14373,6 +14398,7 @@ USER REQUEST:
                 _oai_arch_extra_kwargs["reasoning_effort"] = "low"
 
             _OAI_ARCH_TIMEOUT = 120
+            start_time = time.time()
 
             if steer_inbox is not None:
                 yield sse({"type": "steer_ready"})
@@ -14401,7 +14427,7 @@ USER REQUEST:
 
                 _round_label = f" (search round {_oai_round}/{_OAI_REACT_MAX})" if _oai_round > 1 else ""
                 if _oai_round > 1:
-                    elapsed = int(time.time() - start_time) if 'start_time' in dir() else 0
+                    elapsed = int(time.time() - start_time)
                     yield sse({"type": "progress", "content": f"Architect thinking{_round_label}... ({elapsed}s)"})
 
                 _dlog("oai_tool_use_call_setup",
@@ -17922,6 +17948,67 @@ async def _retry_truncated_newfile(
         return None
 
 
+class _PlanSymbolNotFound(Exception):
+    """The plan step's symbol is not in the file. Do not call the model."""
+
+
+class _PlanStepTimeout(Exception):
+    """One plan step's model call exceeded its timeout."""
+
+
+async def _execute_single_new_file(
+    aclient, model: str,
+    filename: str, description: str, user_request: str,
+    session_id: str = "", user_id: str = "",
+    max_wait_s: float = 120.0,
+) -> str | None:
+    """One <new_file> block for a plan step that creates a file."""
+    focused_system = (
+        "You are SurgicalAI. Write EXACTLY ONE <new_file> block.\n\n"
+        "<new_file>\n"
+        '{"filename": "...", "language": "...", "summary": "...", "content": "..."}\n'
+        "</new_file>\n\n"
+        "Write the complete file. No placeholders."
+    )
+    focused_user = (
+        f"Create `{filename}`.\n"
+        f"What it should do: {description}\n\n"
+        f"User's original request: {user_request}\n"
+    )
+    try:
+        chunks = []
+        async with asyncio.timeout(max(5.0, float(max_wait_s))):
+            async with aclient.messages.stream(
+                model=model,
+                max_tokens=_max_output_tokens(model),
+                system=focused_system,
+                messages=[{"role": "user", "content": focused_user}],
+            ) as stream:
+                async for piece in stream.text_stream:
+                    chunks.append(piece)
+        text = "".join(chunks)
+        start = text.find("<new_file>")
+        end = text.find("</new_file>")
+        if start != -1 and end != -1 and end > start:
+            raw = text[start + len("<new_file>"):end].strip()
+            _dlog("plan_create_success", session_id=session_id, user_id=user_id,
+                  filename=filename, raw_len=len(raw))
+            return raw
+        _dlog("plan_create_no_block", session_id=session_id, user_id=user_id,
+              filename=filename, response_preview=text[:200])
+        return None
+    except TimeoutError:
+        _dlog("plan_execute_timeout", session_id=session_id, user_id=user_id,
+              filename=filename, symbol=filename, timeout_sec=max_wait_s)
+        raise _PlanStepTimeout(filename)
+    except Exception as e:
+        _raise_if_anthropic_credit_error(
+            e, dlog=_dlog, session_id=session_id, user_id=user_id)
+        _dlog("plan_create_error", session_id=session_id, user_id=user_id,
+              filename=filename, error=str(e)[:300])
+        return None
+
+
 async def _execute_single_edit(
     aclient, model: str,
     filename: str, symbol_name: str, change_description: str,
@@ -18082,13 +18169,39 @@ async def _execute_single_edit(
                       term_hit=bool(_win.get("term_hit")),
                       terms=(_win.get("terms") or [])[:12])
         else:
-            # Symbol not found in map — show full content as fallback
-            file_display = file_content
-            _dlog("execute_task_no_window",
-                  session_id=session_id, user_id=user_id,
-                  filename=filename, symbol=symbol_name,
-                  total_lines=file_line_count,
-                  reason="symbol_not_found_in_map")
+            from services.plan_artifact import module_assignment_window, text_anchor_window
+            file_display = module_assignment_window(file_content, symbol_name)
+            if file_display:
+                _dlog("execute_task_assignment_window",
+                      session_id=session_id, user_id=user_id,
+                      filename=filename, symbol=symbol_name,
+                      total_lines=file_line_count)
+            else:
+                _anchor = text_anchor_window(file_content, symbol_name, change_description or "")
+                if not _anchor:
+                    _dlog("execute_task_no_window",
+                          session_id=session_id, user_id=user_id,
+                          filename=filename, symbol=symbol_name,
+                          total_lines=file_line_count,
+                          reason="symbol_not_found")
+                    raise _PlanSymbolNotFound(symbol_name)
+                file_display = _anchor["text"] + (
+                    f"\n\n`{symbol_name}` is text in this file, not a function. "
+                    "Put the exact current lines in old_code and the replacement in new_code."
+                )
+                if _anchor["other_lines"]:
+                    file_display += (
+                        f"\n\n`{_anchor['anchor']}` also appears on lines "
+                        + ", ".join(str(n) for n in _anchor["other_lines"])
+                        + ". Edit only the lines shown above."
+                    )
+                _dlog("execute_task_text_anchor_window",
+                      session_id=session_id, user_id=user_id,
+                      filename=filename, symbol=symbol_name,
+                      total_lines=file_line_count,
+                      anchor=_anchor["anchor"],
+                      window_start=_anchor["start"], window_end=_anchor["end"],
+                      other_lines=_anchor["other_lines"])
 
         focused_user = (
             f"{_step_lead}\n\n"
@@ -18102,12 +18215,43 @@ async def _execute_single_edit(
             "Produce exactly ONE <surgical_edit> block now."
         )
     else:
+        _small_body = file_content
+        _text_hint = ""
+        if not _symbol_in_index:
+            from services.plan_artifact import module_assignment_window, text_anchor_window
+            _small_body = module_assignment_window(file_content, symbol_name)
+            if not _small_body:
+                _anchor = text_anchor_window(file_content, symbol_name, change_description or "")
+                if not _anchor:
+                    _dlog("execute_task_no_window",
+                          session_id=session_id, user_id=user_id,
+                          filename=filename, symbol=symbol_name,
+                          total_lines=file_line_count,
+                          reason="symbol_not_found")
+                    raise _PlanSymbolNotFound(symbol_name)
+                _small_body = (
+                    file_content if file_line_count <= LARGE_FILE_WINDOW
+                    else _anchor["text"]
+                )
+                _text_hint = (
+                    f"`{symbol_name}` is text in this file, not a function. "
+                    f"It is on line {_anchor['line']}. "
+                    "Put the exact current lines in old_code and the replacement in new_code.\n\n"
+                )
+                _dlog("execute_task_text_anchor_window",
+                      session_id=session_id, user_id=user_id,
+                      filename=filename, symbol=symbol_name,
+                      total_lines=file_line_count,
+                      anchor=_anchor["anchor"],
+                      window_start=_anchor["start"], window_end=_anchor["end"],
+                      other_lines=_anchor["other_lines"])
         focused_user = (
             f"{_step_lead}\n\n"
             f"Change: {change_description}\n\n"
             f"User's original request: {user_request}\n\n"
             f"{sym_index}"
-            f"File content:\n```\n{file_content}\n```\n\n"
+            f"File content:\n```\n{_small_body}\n```\n\n"
+            f"{_text_hint}"
             "Produce exactly ONE <surgical_edit> block now."
         )
 
@@ -18169,7 +18313,7 @@ async def _execute_single_edit(
               session_id=session_id, user_id=user_id,
               filename=filename, symbol=symbol_name,
               timeout_sec=SINGLE_EDIT_TIMEOUT)
-        return None
+        raise _PlanStepTimeout(f"{symbol_name} in {filename}")
 
     except Exception as e:
         # Session cb380321: credit exhaustion must NOT be swallowed as None
@@ -19055,6 +19199,8 @@ async def run_natural_pipeline_stream(
         # ---- Output contract (consumed verbatim by post-streaming cleanup below) ----
         edit_blocks_raw: list = []
         new_file_blocks_raw: list = []
+        _plan_answered_steps: list = []
+        _plan_created_steps: list = []
         edit_plan_data: list | None = None
         # Round7: at most one mega-symbol plan→surgical reroute per request.
         _mega_plan_reroute_count = 0
@@ -19155,12 +19301,16 @@ async def run_natural_pipeline_stream(
                           plan_after=len(edit_plan_data),
                           covered=[{"filename": a, "symbol": b} for a, b in list(_covered)[:20]])
 
-            full_response = (
-                "Resuming saved planned edits after Anthropic credits were restored."
-            )
+            if resume_pause_id:
+                full_response = (
+                    "Resuming saved planned edits after Anthropic credits were restored."
+                )
+                _plan_lead = f"Resuming {len(edit_plan_data)} saved plan step(s)..."
+            else:
+                full_response = "Building the saved plan."
+                _plan_lead = f"Building {len(edit_plan_data)} saved plan step(s)..."
             yield sse({"type": "token", "content": full_response + "\n\n"})
-            yield sse({"type": "progress",
-                       "content": f"Resuming {len(edit_plan_data)} saved plan step(s)..."})
+            yield sse({"type": "progress", "content": _plan_lead})
             _dlog("credit_pause_resume_short_circuit",
                   session_id=session_id, user_id=user_id,
                   pause_id=resume_pause_id,
@@ -20111,12 +20261,14 @@ async def run_natural_pipeline_stream(
                                 **_gpt_call_kwargs,
                             )
                         _gpt_phase = "stream"
-                        for _gpt_chunk in _iter_openai_stream_chunks(_gpt_stream, model=arch_model,
-                                                                      session_id=session_id, user_id=user_id):
+                        async for _gpt_chunk in _grok_aiter_sync(_iter_openai_stream_chunks(
+                                _gpt_stream, model=arch_model,
+                                session_id=session_id, user_id=user_id)):
                             _gpt_choice = _gpt_chunk.choices[0]
-                            if _gpt_choice.finish_reason:
-                                _last_stop_reason = _gpt_choice.finish_reason
-                                break
+                            # The last chunk often carries both finish_reason and
+                            # the final reasoning or tool delta. Read the delta
+                            # before leaving the loop.
+                            _gpt_finish = _gpt_choice.finish_reason
 
                             _gpt_stall_elapsed = time.time() - _round_t0
                             if (time.time() - _last_hb_ts) >= STREAMING_HEARTBEAT_S:
@@ -20187,9 +20339,6 @@ async def run_natural_pipeline_stream(
                                     yield sse({"type": "thinking", "content": _rc})
                                     if len(_grok_reasoning_text) < 2000:
                                         _grok_reasoning_text = (_grok_reasoning_text + _rc)[:2000]
-                                    _dlog("grok_agent_reasoning_delta",
-                                          session_id=session_id, user_id=user_id,
-                                          turn=_turn, chars=len(_rc))
 
                             if _gpt_delta and hasattr(_gpt_delta, "content") and _gpt_delta.content:
                                 text_chunk = _gpt_delta.content
@@ -20336,6 +20485,9 @@ async def run_natural_pipeline_stream(
                                         for _lev in _live.feed(("grok", _gidx), _gkind, _gargs):
                                             yield sse(_lev)
 
+                            if _gpt_finish:
+                                _last_stop_reason = _gpt_finish
+                                break
                             if pending_tool is not None or edit_plan_data is not None:
                                 break
                         if _grok_thinking_open:
@@ -22659,11 +22811,11 @@ async def run_natural_pipeline_stream(
                   ],
                   pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
 
-            def _plan_step_event(filename: str, symbol: str, status: str):
+            def _plan_step_event(filename: str, symbol: str, status: str, reason: str = ""):
                 if not plan_run_id or not filename or not symbol:
                     return None
                 from services.plan_artifact import note_plan_step
-                task = note_plan_step(session_id, plan_run_id, filename, symbol, status)
+                task = note_plan_step(session_id, plan_run_id, filename, symbol, status, reason)
                 if not task:
                     return None
                 return sse({
@@ -22776,15 +22928,55 @@ async def run_natural_pipeline_stream(
                     continue
 
                 p_content = file_content_lookup_stream.get(p_filename, "")
-                if not p_content:
-                    skipped_changes_struct.append({
-                        "filename": p_filename,
-                        "symbol": p_symbol,
-                        "reason": f"File not found in session: {p_filename}",
-                    })
-                    _ev = _plan_step_event(p_filename, p_symbol, "blocked")
+                if not p_content or plan_item.get("action") == "create":
+                    # A missing file, or a step marked create, is a new file.
+                    # It is not "file not found".
+                    yield sse({"type": "progress",
+                               "content": f"Creating {p_filename} ({plan_idx+1}/{len(edit_plan_data)})..."})
+                    _ev = _plan_step_event(p_filename, p_symbol, "running")
                     if _ev:
                         yield _ev
+                    _created = None
+                    _create_reason = ""
+                    try:
+                        if aclient is None:
+                            _create_reason = (
+                                f"Could not create {p_filename}. "
+                                "No model was available for a new file."
+                            )
+                        else:
+                            _budget_left = PIPELINE_DEADLINE_S - (time.time() - _pipeline_t0)
+                            _created = await _execute_single_new_file(
+                                aclient, "claude-sonnet-5",
+                                p_filename, p_description, user_request,
+                                session_id, user_id,
+                                max_wait_s=max(5.0, min(120.0, _budget_left)),
+                            )
+                    except _PlanStepTimeout:
+                        _create_reason = f"timed out creating {p_filename}"
+                        yield sse({"type": "progress",
+                                   "content": f"{p_filename} timed out before the new file was written."})
+                    except Exception as _create_err:
+                        _create_reason = f"Could not create {p_filename}: {str(_create_err)[:120]}"
+                    if _created:
+                        new_file_blocks_raw.append(normalize_plan_new_file(_created, p_filename))
+                        _plan_created_steps.append({"filename": p_filename, "symbol": p_symbol})
+                        yield sse({"type": "progress", "content": f"✅ {p_filename} created"})
+                        _ev = _plan_step_event(p_filename, p_symbol, "done")
+                        if _ev:
+                            yield _ev
+                    else:
+                        skipped_changes_struct.append({
+                            "filename": p_filename,
+                            "symbol": p_symbol,
+                            "reason": _create_reason or f"Could not create {p_filename}. The new file was not produced.",
+                        })
+                        _ev = _plan_step_event(
+                            p_filename, p_symbol, "blocked",
+                            _create_reason or f"Could not create {p_filename}.",
+                        )
+                        if _ev:
+                            yield _ev
                     _adv = _advance_plan_step_event()
                     if _adv:
                         yield _adv
@@ -22939,6 +23131,7 @@ async def run_natural_pipeline_stream(
 
                     if result_raw:
                         edit_blocks_raw.append(result_raw)
+                        _plan_answered_steps.append({"filename": p_filename, "symbol": p_symbol})
                         yield sse({"type": "progress",
                                    "content": f"✅ {p_symbol} complete"})
                         _ev = _plan_step_event(p_filename, p_symbol, "done")
@@ -23087,12 +23280,48 @@ async def run_natural_pipeline_stream(
                         })
                         yield sse({"type": "progress",
                                    "content": f"⚠️ {p_symbol} — no edit produced"})
-                        _ev = _plan_step_event(p_filename, p_symbol, "blocked")
+                        _ev = _plan_step_event(
+                            p_filename, p_symbol, "blocked",
+                            "Focused edit call produced no valid edit block",
+                        )
                         if _ev:
                             yield _ev
                         _adv = _advance_plan_step_event()
                         if _adv:
                             yield _adv
+
+                except _PlanSymbolNotFound:
+                    skipped_changes_struct.append({
+                        "filename": p_filename,
+                        "symbol": p_symbol,
+                        "reason": "symbol not found",
+                    })
+                    yield sse({"type": "progress",
+                               "content": f"Could not find {p_symbol} in {p_filename}."})
+                    _ev = _plan_step_event(p_filename, p_symbol, "blocked", "symbol not found")
+                    if _ev:
+                        yield _ev
+                    _adv = _advance_plan_step_event()
+                    if _adv:
+                        yield _adv
+
+                except _PlanStepTimeout:
+                    skipped_changes_struct.append({
+                        "filename": p_filename,
+                        "symbol": p_symbol,
+                        "reason": f"timed out editing {p_symbol} in {p_filename}",
+                    })
+                    yield sse({"type": "progress",
+                               "content": f"{p_symbol} in {p_filename} timed out."})
+                    _ev = _plan_step_event(
+                        p_filename, p_symbol, "blocked",
+                        f"timed out editing {p_symbol} in {p_filename}",
+                    )
+                    if _ev:
+                        yield _ev
+                    _adv = _advance_plan_step_event()
+                    if _adv:
+                        yield _adv
 
                 except _AnthropicCreditExhaustedError as _cred_err:
                     # Session cb380321: pause + persist remaining work instead of
@@ -24712,6 +24941,18 @@ async def run_natural_pipeline_stream(
                           user_id=user_id)
                 else:
                     _kept_new_symbol = False
+                    if not old_code and edit_start_line and edit_end_line and file_content:
+                        try:
+                            _ln_lines = file_content.splitlines(keepends=True)
+                            _ln_s, _ln_e = int(edit_start_line), int(edit_end_line)
+                            if 1 <= _ln_s <= _ln_e <= len(_ln_lines):
+                                old_code = "".join(_ln_lines[_ln_s - 1:_ln_e]).rstrip("\n")
+                                _dlog("new_symbol_old_code_from_lines",
+                                      session_id=session_id, user_id=user_id,
+                                      filename=filename, symbol=symbol_name,
+                                      edit_start_line=_ln_s, edit_end_line=_ln_e)
+                        except (TypeError, ValueError):
+                            pass
                     if old_code and new_code is not None and file_content:
                         _ns_old, _ns_ok, _ns_why = _locate_snippet_in_text(
                             file_content, old_code,
@@ -25727,16 +25968,22 @@ async def run_natural_pipeline_stream(
                 _fname = cs["filename"]
                 if _fname not in _pending_files:
                     _pending_files[_fname] = {"filename": _fname, "file_id": _fid, "changes": []}
+                _stype = getattr(_sym, "symbol_type", None)
                 _pending_files[_fname]["changes"].append({
                     "id": cs["change_id"],
                     "symbol": {
                         "name": getattr(_sym, "name", "") or "",
                         "full_path": getattr(_sym, "full_path", "") or getattr(_sym, "name", "") or "",
+                        "symbol_type": getattr(_stype, "value", None) or "variable",
+                        "start_line": int(getattr(_sym, "start_line", 0) or 0),
+                        "end_line": int(getattr(_sym, "end_line", 0) or 0),
+                        "code": getattr(_sym, "code", "") or "",
                     },
                     "original_code": getattr(_sym, "code", "") or "",
                     "new_code": cs.get("new_code") or "",
                     "diff": cs.get("diff") or "",
                     "description": cs.get("description") or "",
+                    "confidence": 8,
                     "applied": False,
                     "qa_result": None,
                 })
@@ -26166,8 +26413,8 @@ async def run_natural_pipeline_stream(
         # ── QA retry loop — fix blocked changes before showing to user ────────
         # Triggers on verdict=="blocked" OR score<=5 with hard issues.
         # Sends QA findings back to Claude, re-runs QA on the fix.
+        # MAX_QA_RETRIES lives at module level. Do not reassign it here.
 
-        MAX_QA_RETRIES = 2
         # ── Correction history: track what each idx tried + why it was rejected ──
         # Key = change index, value = list of {round, code_preview, qa_summary}
         _correction_history: dict[int, list[dict]] = {}
@@ -30005,6 +30252,8 @@ async def run_natural_pipeline_stream(
             from services.plan_artifact import plain_skip_reason as _plain_skip
             result["plan_review"] = True
             result["lint_notes"] = _lint_notes
+            result["plan_answered_steps"] = list(_plan_answered_steps)
+            result["plan_created_steps"] = list(_plan_created_steps)
             result["failed_steps"] = [
                 {
                     "filename": s.get("filename") or "",
@@ -30076,4 +30325,8 @@ async def run_natural_pipeline_stream(
               error_type=type(e).__name__,
               traceback=_tb.format_exc()[-2000:],
               user_id=user_id)
-        yield f"data: {json.dumps({'type': 'error', 'content': _friendly_error(e)})}\n\n"
+        _shown = (
+            f"{_friendly_error(e)} "
+            f"[{type(e).__name__}; event execute_task_exception]"
+        )
+        yield f"data: {json.dumps({'type': 'error', 'content': _shown, 'error_type': type(e).__name__})}\n\n"

@@ -220,7 +220,7 @@ def create_tasks(session_id: str, run_id: str, tasks: list) -> list:
     try:
         for i, t in enumerate(tasks):
             tid = str(uuid.uuid4())
-            kind = "answer" if t.get("kind") == "answer" else "code"
+            kind = t.get("kind") if t.get("kind") in ("answer", "code", "create") else "code"
             filename = (t.get("filename") or "") if isinstance(t, dict) else ""
             symbol = (t.get("symbol") or t.get("symbol_path") or "") if isinstance(t, dict) else ""
             source = (t.get("source") or "agent") if isinstance(t, dict) else "agent"

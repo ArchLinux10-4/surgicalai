@@ -18,6 +18,8 @@ import { applyStageLabel } from '../lib/applyProgress'
 import { clientLog } from '../lib/clientLog'
 import { getApplyGate, provenanceEvidence } from '../lib/qaApplyPolicy'
 import { parseServerUtc, relativeTimeFromServer } from '../lib/relativeTime'
+
+const EMPTY_QA_NOTES: Record<string, any> = {}
 import {
   isRealDiffChange,
   skippedStorageKey,
@@ -286,7 +288,8 @@ function ConfidenceBadge({ change }: { change: any }) {
   const popupRef = useRef<HTMLDivElement>(null)
   const [pos, setPos] = useState({ top: 0, left: 0 })
 
-  const score: number = typeof change?.confidence === 'number' ? change.confidence : 0
+  if (typeof change?.confidence !== 'number') return null
+  const score: number = change.confidence
   const color = score >= 8 ? 'text-success bg-success/15 border-success/30'
     : score >= 6 ? 'text-warning bg-warning/15 border-warning/30'
     : 'text-danger bg-danger/15 border-danger/30'
@@ -623,7 +626,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
 }) {
   // Filter ghost diffs first — do this before any state so IDs are stable
   const realChanges = fileData.changes.filter(isRealDiffChange)
-  const liveNotes = useAppStore(s => s.qaNotes[sessionId] || {})
+  const liveNotes = useAppStore(s => s.qaNotes[sessionId] ?? EMPTY_QA_NOTES)
 
   const changeIds = realChanges.map((c: any) => c.id)
 
@@ -681,6 +684,15 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   const [originalCode, setOriginalCode] = useState<string>('')
   const [modifiedCode, setModifiedCode] = useState<string | undefined>(undefined)
   const [previewKey, setPreviewKey] = useState(0)
+  const [showHistory, setShowHistory] = useState(false)
+  const [versions, setVersions] = useState<{ id: string; lines: number; symbol_count: number; label: string; created_at: string }[] | null>(null)
+  const [loadingVersions, setLoadingVersions] = useState(false)
+  const [restoringId, setRestoringId] = useState<string | null>(null)
+  const [armedVersionId, setArmedVersionId] = useState<string | null>(null)
+  const [armCountdown, setArmCountdown] = useState(0)
+  const armIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const armTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const historyWasOpen = useRef(false)
 
   // Pre-fetch original file content so Preview works before Apply
   useEffect(() => {
@@ -725,6 +737,40 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     window.addEventListener('sai-applied-refresh', refresh)
     return () => window.removeEventListener('sai-applied-refresh', refresh)
   }, [sessionId]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if (!((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y'))) return
+      const mine = applyBtnRef.current
+      if (!mine || mine.disabled) return
+      const firstEnabled = document.querySelector<HTMLButtonElement>('[data-apply-btn]:not(:disabled)')
+      if (firstEnabled !== mine) return
+      e.preventDefault()
+      clientLog('diff_apply_cmd_y', { filename }, sessionId)
+      mine.click()
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [filename, sessionId])
+
+  useEffect(() => () => {
+    if (armIntervalRef.current) { clearInterval(armIntervalRef.current); armIntervalRef.current = null }
+    if (armTimeoutRef.current) { clearTimeout(armTimeoutRef.current); armTimeoutRef.current = null }
+  }, [])
+
+  useEffect(() => {
+    if (showHistory) {
+      historyWasOpen.current = true
+      return
+    }
+    if (!historyWasOpen.current) return
+    historyWasOpen.current = false
+    if (armIntervalRef.current) { clearInterval(armIntervalRef.current); armIntervalRef.current = null }
+    if (armTimeoutRef.current) { clearTimeout(armTimeoutRef.current); armTimeoutRef.current = null }
+    setArmedVersionId(null)
+    setArmCountdown(0)
+  }, [showHistory])
+
   const langFromFilename = getLangFromFilename(filename)
 
   if (realChanges.length === 0) return null
@@ -732,9 +778,10 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
   // Pending = not yet applied AND not skipped
   const pendingChanges = realChanges.filter((c: any) => !applied[c.id] && !skipped[c.id])
   // Selected = pending + checked + not apply-locked (hard-stop / unacked LLM)
+  const qaFor = (c: any) => liveNotes[c.id] || c.qa_result
   const selectedChanges = pendingChanges.filter((c: any) => {
     if (!checked[c.id]) return false
-    const gate = getApplyGate(c.qa_result)
+    const gate = getApplyGate(qaFor(c))
     if (gate.kind === 'ack_required' && !llmAck[c.id]) return false
     return true
   })
@@ -760,23 +807,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     if (idx === -1) return originalCode
     return originalCode.slice(0, idx) + next + originalCode.slice(idx + orig.length)
   }
-
-  // Cmd+Y: apply selected — only the first enabled apply button responds
-  // so multi-file results don't N×click the same first card.
-  useEffect(() => {
-    const handler = (e: KeyboardEvent) => {
-      if (!((e.metaKey || e.ctrlKey) && (e.key === 'y' || e.key === 'Y'))) return
-      const mine = applyBtnRef.current
-      if (!mine || mine.disabled) return
-      const firstEnabled = document.querySelector<HTMLButtonElement>('[data-apply-btn]:not(:disabled)')
-      if (firstEnabled !== mine) return
-      e.preventDefault()
-      clientLog('diff_apply_cmd_y', { filename }, sessionId)
-      mine.click()
-    }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [filename, sessionId])
 
   const markApplied = (changeId: string, diff?: string) => {
     saveApplied(sessionId, changeId)
@@ -804,7 +834,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     // Defense in depth — never apply machine hard-stops or unacked LLM blocks
     // even if UI state desyncs.
     for (const ch of selectedChanges) {
-      const gate = getApplyGate(ch.qa_result)
+      const gate = getApplyGate(qaFor(ch))
       if (gate.kind === 'ack_required' && !llmAck[ch.id]) {
         clientLog('qa_apply_rejected_needs_ack', {
           filename, changeId: ch.id, sources: gate.sources,
@@ -1071,23 +1101,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
     }
   }
 
-  // ── Version history (browse + restore any past saved state) ──────────────
-  const [showHistory, setShowHistory] = useState(false)
-  const [versions, setVersions] = useState<{ id: string; lines: number; symbol_count: number; label: string; created_at: string }[] | null>(null)
-  const [loadingVersions, setLoadingVersions] = useState(false)
-  const [restoringId, setRestoringId] = useState<string | null>(null)
-
-  // ── Restore confirm countdown (purely frontend) ───────────────────────
-  // Restore is destructive-feeling (silently overwrites current content), so
-  // clicking it "arms" a 3s countdown with a visible Cancel button instead
-  // of restoring immediately. Only fires the real restore if the user does
-  // not cancel and the countdown reaches 0. Never touches the backend API
-  // until the countdown completes.
-  const [armedVersionId, setArmedVersionId] = useState<string | null>(null)
-  const [armCountdown, setArmCountdown] = useState(0)
-  const armIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const armTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
+  // Restore confirm countdown. State lives with the other hooks so a file
+  // with no real diff can return early without changing the hook count.
   const clearArmTimers = () => {
     if (armIntervalRef.current) { clearInterval(armIntervalRef.current); armIntervalRef.current = null }
     if (armTimeoutRef.current) { clearTimeout(armTimeoutRef.current); armTimeoutRef.current = null }
@@ -1113,11 +1128,6 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
       handleRestoreVersion(versionId)
     }, 3000)
   }
-
-  // Clean up timers on unmount so a pending restore never fires after the
-  // card is gone, and cancel any armed restore if the history panel closes.
-  useEffect(() => () => clearArmTimers(), [])
-  useEffect(() => { if (!showHistory) cancelArmedRestore() }, [showHistory])
 
   const openHistory = async () => {
     setShowHistory(true)
@@ -1403,7 +1413,8 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
           )}
 
           {realChanges.map((change: any, idx: number) => {
-            const gate = getApplyGate(change.qa_result)
+            const shownQa = qaFor(change)
+            const gate = getApplyGate(shownQa)
             const acked = Boolean(llmAck[change.id])
             const applyLocked = gate.kind === 'ack_required' && !acked
             const isApplied = applied[change.id]
@@ -1469,14 +1480,14 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                     </span>
                     <ConfidenceBadge change={change} />
                     {(() => {
-                      const qa = liveNotes[change.id] || change.qa_result
+                      const qa = shownQa
                       if (qa) return <QABadge qa={qa} />
                       if (qaStatus === 'pending') return <span className="text-[10px] font-medium text-muted">Checking</span>
                       if (qaStatus === 'unfinished') return <span className="text-[10px] font-medium text-warning">QA unfinished</span>
                       return null
                     })()}
                     {change.qa_result && <BlastRadius change={{ qa: change.qa_result }} />}
-                    {change.confidence < 7 && !applyLocked && (
+                    {typeof change.confidence === 'number' && change.confidence < 7 && shownQa?.verdict !== 'safe' && !applyLocked && (
                       <span className="flex items-center gap-1 text-[10px] text-warning">
                         <Warning sx={{ fontSize: 10 }} /> Review
                       </span>
@@ -1522,7 +1533,7 @@ function FileChangeCard({ filename, fileData, sessionId, onApplied, onChangeAppl
                 </div>
 
                 {/* Provenance + Option A apply policy (must not hide Diff/Retry/History) */}
-                {!isApplied && gate.kind !== 'allowed' && (
+                {!isApplied && gate.kind !== 'allowed' && !(shownQa?.verdict === 'safe') && (
                   <div className={`px-4 py-2 border-t border-border/40 text-[11px] ${
                     gate.kind === 'hard_stop'
                       ? 'bg-danger/5 text-danger'
@@ -1663,6 +1674,17 @@ export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA, su
   const fileEntries = Object.entries(result.changes_by_file || {})
   const totalChanges = fileEntries.reduce((sum, [, v]) => sum + (v.changes?.length || 0), 0)
   const fileCount = fileEntries.length
+  const liveNotes = useAppStore(s => s.qaNotes[sessionId] ?? EMPTY_QA_NOTES)
+  const changeIds = fileEntries.flatMap(([, file]) => (file.changes || []).map((c: any) => c.id).filter(Boolean))
+  const checkSettled = (result as any).qa_status === 'pending'
+    && changeIds.length > 0
+    && changeIds.every((id: string) => liveNotes[id])
+  const scored = fileEntries.length > 0 && fileEntries.every(([, file]) =>
+    (file.changes || []).every((c: any) => c?.qa_result?.verdict),
+  )
+  const summary = (checkSettled || (scored && /still running/i.test(result.summary || '')))
+    ? 'Ready to apply.'
+    : (result.summary || '')
   const failedSteps = result.failed_steps || []
   const lintNotes = result.lint_notes || []
   if (result.plan_review || (fileCount === 0 && totalChanges === 0 && failedSteps.length > 0)) {
@@ -1675,7 +1697,7 @@ export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA, su
       <div className="mt-2 rounded-xl border border-border bg-surface/40">
         <div className="px-3 py-2.5 border-b border-border/60">
           <div className="text-[13px] font-semibold text-ink">
-            {result.summary || 'Review'}
+            {summary || 'Review'}
           </div>
           {lintNotes.length > 0 && (
             <ul className="mt-2 space-y-1">
@@ -1742,7 +1764,7 @@ export function InlineDiffCard({ result, sessionId, onApplied, onRetryWithQA, su
       {/* Dense one-line result strip — reasoning is opt-in; risks have their own toggle */}
       <div className="flex items-center gap-2 mb-2 min-w-0">
         <span className="text-[13px] font-semibold text-ink truncate min-w-0">
-          {result.summary || `${totalChanges} change${totalChanges !== 1 ? 's' : ''} ready`}
+          {summary || `${totalChanges} change${totalChanges !== 1 ? 's' : ''} ready`}
         </span>
         <span className="text-[11px] text-muted/70 flex-shrink-0 tabular-nums">
           {fileCount} file{fileCount !== 1 ? 's' : ''} · {totalChanges} change{totalChanges !== 1 ? 's' : ''}

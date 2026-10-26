@@ -316,6 +316,25 @@ function requireFileId(fileId: string, op: string): string {
   return fileId
 }
 
+function errorText(detail: unknown, status: number): string {
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (Array.isArray(detail)) {
+    const lines = detail.slice(0, 4).map(item => {
+      if (!item || typeof item !== 'object') return String(item ?? '')
+      const loc = Array.isArray((item as any).loc)
+        ? (item as any).loc.filter((part: unknown) => part !== 'body').join('.')
+        : ''
+      const msg = String((item as any).msg || (item as any).message || '')
+      return loc && msg ? `${loc}: ${msg}` : (msg || loc)
+    }).filter(Boolean)
+    if (lines.length) return lines.join('; ')
+  }
+  if (detail && typeof detail === 'object' && 'message' in detail) {
+    return String((detail as { message?: unknown }).message || `HTTP ${status}`)
+  }
+  return `HTTP ${status}`
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...authHeaders(), ...options?.headers },
@@ -336,7 +355,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
     const hdr = Number(res.headers.get('Retry-After'))
     const retryAfter = Number(err?.retry_after) || (Number.isFinite(hdr) && hdr > 0 ? hdr : undefined)
-    throw new ApiError(err.detail || `HTTP ${res.status}`, res.status, retryAfter)
+    throw new ApiError(errorText(err.detail, res.status), res.status, retryAfter)
   }
   return res.json()
 }
@@ -740,11 +759,12 @@ export const api = {
       }
 
       // HTTP/SSE transport (also the fallback when the WS never opens).
+      const payload = { ...data, client_sent_at: Date.now() }
       const runViaFetch = () => {
         fetch(`${BASE}/chat/smart-stream`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders() },
-          body: JSON.stringify(data),
+          body: JSON.stringify(payload),
           signal: controller.signal,
         }).then(async res => {
           if (!res.ok) {
@@ -775,7 +795,7 @@ export const api = {
       // WebSocket-first (removes Railway's 15-min transport wall); on a
       // connect-time failure only, transparently fall back to HTTP/SSE.
       if (typeof WebSocket !== 'undefined') {
-        streamViaWS('/chat/ws/smart-stream', data, controller, processLine, fireDone, runViaFetch,
+        streamViaWS('/chat/ws/smart-stream', payload, controller, processLine, fireDone, runViaFetch,
           (send) => { sendToServer = send })
       } else {
         runViaFetch()
@@ -964,7 +984,8 @@ export const api = {
               chunk.type === 'plan_ready' || chunk.type === 'plan_updated' ||
               chunk.type === 'plan_unchanged' || chunk.type === 'plan_locked' ||
               chunk.type === 'plan_coverage' || chunk.type === 'plan_missing' ||
-              chunk.type === 'plan_failed' || chunk.type === 'plan_step'
+              chunk.type === 'plan_failed' || chunk.type === 'plan_step' ||
+              chunk.type === 'plan_step_result'
             ) onPlan?.(chunk)
           } catch {}
         }

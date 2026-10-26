@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import type { AgentTask, AgentTaskStatus } from '../types'
+import { ProgressMeter } from './ProgressMeter'
 
 /**
  * NOTE: This component is not currently imported or rendered anywhere in the
@@ -174,13 +175,12 @@ export function TaskListPanel() {
         <div className="px-3 pt-2 text-[12px] text-muted leading-snug">{taskPreamble}</div>
       )}
 
-      {/* Progress bar */}
-      <div className="h-1 bg-overlay/60">
-        <div
-          className="h-full bg-accent transition-all duration-500 ease-out"
-          style={{ width: total ? `${Math.round((done / total) * 100)}%` : '0%' }}
-        />
-      </div>
+      <ProgressMeter
+        done={done}
+        failed={agentTasks.filter(t => t.status === 'blocked' || t.status === 'error').length}
+        total={total}
+        running={anyActive}
+      />
 
       {/* Task rows */}
       <ul className="divide-y divide-border/40">

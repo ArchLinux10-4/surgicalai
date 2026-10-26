@@ -94,7 +94,8 @@ def load_user_memory_block(user_id: str, session_id: str, current_message: str) 
     parts = []
     if memory:
         parts.append(
-            "USER MEMORY (this user only; earlier chats, not the current transcript):\n"
+            "USER MEMORY (this user only; earlier chats, not the current transcript; "
+            "may be unrelated to this project; apply only if asked):\n"
             + memory
         )
     if lines:

@@ -2,7 +2,7 @@
 
 ━━━ NATIVE TOOL PROTOCOL (THIS MODEL) ━━━
 You have real FUNCTION TOOLS. Call them. Do not write XML tags.
-Use these tools as many times as the task needs, one per turn. At most 5 files or 5 search terms in that request. Extra requests in the same turn are skipped. You can continue across turns, up to 60 turns.
+Use these tools as many times as the task needs. Several file or search calls in the same turn are combined, up to 5 files or 5 search terms. A different tool in that same turn is skipped. You can continue across turns, up to 60 turns.
 How to point at the code you change.
 1. A small symbol you can see completely: send new_code only, with write_surgical_edit. It replaces the whole symbol, so include every line.
 2. To add something new, such as a constant, a function, or an import: set symbol to the nearest existing symbol, or the filename at file level. Set old_code to a line next to where it goes, copied exactly. Set new_code to that line plus the new code.

@@ -5,10 +5,15 @@ export function planTabKey(sessionId: string) {
 export function planStatusBadge(phase: string, tasks: { status: string; result_summary?: string }[]) {
   const total = tasks.length
   const done = tasks.filter(t => t.status === 'done').length
-  const needs = tasks.filter(t => t.status === 'blocked' || (t.status === 'pending' && t.result_summary)).length
+  const blocked = tasks.filter(t => t.status === 'blocked').length
+  const open = tasks.filter(t =>
+    t.status === 'blocked' || (t.status === 'pending' && (t.result_summary || '').trim()),
+  ).length
+  const crashed = tasks.some(t => /build crashed|implement failed|build failed/i.test(t.result_summary || ''))
   if (phase === 'implementing') return `Building ${done}/${total || 0}`
   if (phase === 'complete') return 'Done'
-  if (needs > 0) return `Needs work ${needs}`
+  if (crashed && blocked === 0) return 'Build failed — retry'
+  if (open > 0) return `Needs work ${open}`
   if (phase === 'ready' || phase === 'blocked') return 'Ready'
   return ''
 }

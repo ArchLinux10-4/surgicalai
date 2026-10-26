@@ -30,6 +30,8 @@ CONTRACT
 """
 import os as _os
 import json as _json
+import queue as _queue
+import time as _time
 import uuid as _uuid
 import random as _rnd
 import threading as _threading
@@ -65,51 +67,110 @@ def _write_tmp_line(line: str) -> None:
         pass
 
 
-def emit(event: str, **kwargs) -> None:
-    """Write one debug event to the persistent debug_events table + /tmp file.
+# One writer for pipeline._dlog, database._dlog, and emit(). Callers enqueue.
+# A daemon thread batch-inserts. A full queue drops the new event.
+_QUEUE_MAX = 8000
+_BATCH_MAX = 100
+_BATCH_WAIT_S = 0.25
+_log_queue: _queue.Queue = _queue.Queue(maxsize=_QUEUE_MAX)
 
-    NEVER raises. If already emitting on this thread (reentrancy), skip the DB
-    write entirely and only append the /tmp line, then return.
-    """
-    try:
-        ts = _dt.datetime.utcnow().isoformat() + "Z"
-        record = {"ts": ts, "event": event, **kwargs}
-        line = _json.dumps(record, default=str) + "\n"
 
-        # ── Reentrancy guard ──────────────────────────────────────────────
-        # If we're already inside an emit() on this thread, a DB-lifecycle
-        # _dlog fired during our own get_db_ctx() open/close. Do NOT recurse
-        # into another DB write; the /tmp line is enough to preserve it.
-        if _emitting():
-            _write_tmp_line(line)
-            return
-
-        _state.in_progress = True
+def _write_batch(records: list) -> None:
+    """Insert one batch in a single transaction and append the same lines to /tmp."""
+    if not records:
+        return
+    lines = []
+    for record in records:
         try:
-            # ── Primary: persistent DB row (survives deploys/restarts) ──
-            try:
-                from database import get_db_ctx  # lazy — nothing heavy at import time
-                with get_db_ctx() as conn:
-                    session_id = str(kwargs.get("session_id", "") or "")
-                    user_id = str(kwargs.get("user_id", "") or "")
-                    data_json = _json.dumps(record, default=str)
+            lines.append(_json.dumps(record, default=str) + "\n")
+        except Exception:
+            lines.append("")
+    _state.in_progress = True
+    try:
+        try:
+            from database import get_db_ctx
+            with get_db_ctx() as conn:
+                for record, line in zip(records, lines):
+                    if not line:
+                        continue
                     conn.execute(
                         "INSERT INTO debug_events (id, event, session_id, user_id, data, created_at) "
                         "VALUES (?, ?, ?, ?, ?, ?)",
-                        (str(_uuid.uuid4()), event, session_id, user_id, data_json, ts),
+                        (
+                            str(_uuid.uuid4()),
+                            str(record.get("event") or ""),
+                            str(record.get("session_id") or ""),
+                            str(record.get("user_id") or ""),
+                            line.strip(),
+                            str(record.get("ts") or ""),
+                        ),
                     )
-                    # Probabilistic cleanup: ~1 in 50 calls, expire old rows so
-                    # the table can't grow unbounded (matches pipeline.py::_dlog).
-                    if _rnd.random() < 0.02:
-                        cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=_DLOG_EXPIRE_DAYS)).isoformat()
-                        conn.execute("DELETE FROM debug_events WHERE created_at < ?", (cutoff,))
-                    conn.commit()
-            except Exception:
-                pass  # DB write failed — /tmp fallback below still preserves it
-        finally:
-            _state.in_progress = False
+                if _rnd.random() < 0.02:
+                    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=_DLOG_EXPIRE_DAYS)).isoformat()
+                    conn.execute("DELETE FROM debug_events WHERE created_at < ?", (cutoff,))
+                conn.commit()
+        except Exception:
+            pass
+    finally:
+        _state.in_progress = False
+    for line in lines:
+        if line:
+            _write_tmp_line(line)
 
-        # ── Secondary: /tmp file (fast grep + backward compat) ──
-        _write_tmp_line(line)
+
+def _log_worker() -> None:
+    while True:
+        first = _log_queue.get()
+        batch = [first]
+        deadline = _time.monotonic() + _BATCH_WAIT_S
+        while len(batch) < _BATCH_MAX:
+            remaining = deadline - _time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                batch.append(_log_queue.get(timeout=remaining))
+            except _queue.Empty:
+                break
+        try:
+            _write_batch(batch)
+        except Exception:
+            pass
+        finally:
+            for _ in batch:
+                _log_queue.task_done()
+
+
+_worker = _threading.Thread(target=_log_worker, name="debug-events", daemon=True)
+_worker.start()
+
+
+def flush(timeout: float = 5.0) -> None:
+    """Wait until queued events have been written. Tests call this."""
+    deadline = _time.monotonic() + max(0.1, float(timeout))
+    while _time.monotonic() < deadline:
+        if _log_queue.unfinished_tasks == 0:
+            return
+        _time.sleep(0.01)
+
+
+def emit(event: str, **kwargs) -> None:
+    """Queue one debug event. NEVER raises.
+
+    If this thread is already writing a batch, skip the queue and append the
+    /tmp line only. That is what stops database._dlog, fired by get_db_ctx
+    during the batch write, from queueing another connection forever.
+    """
+    try:
+        ts = _dt.datetime.utcnow().isoformat() + "Z"
+        record = {"ts": ts, "event": event, "session_id": str(kwargs.get("session_id", "") or ""),
+                  "user_id": str(kwargs.get("user_id", "") or ""), **kwargs}
+        line = _json.dumps(record, default=str) + "\n"
+        if _emitting():
+            _write_tmp_line(line)
+            return
+        try:
+            _log_queue.put_nowait(record)
+        except _queue.Full:
+            _write_tmp_line(line)
     except Exception:
-        pass  # logging must NEVER crash a caller
+        pass

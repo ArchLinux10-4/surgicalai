@@ -67,6 +67,19 @@ class _FakeStreamCtx:
     async def get_final_message(self):
         return types.SimpleNamespace(stop_reason="end_turn", stop_sequence=None)
 
+    @property
+    def text_stream(self):
+        """What _execute_single_edit reads. The agent loop uses __aiter__."""
+
+        async def _gen():
+            for event in self._events:
+                delta = getattr(event, "delta", None)
+                text = getattr(delta, "text", None) if delta is not None else None
+                if text:
+                    yield text
+
+        return _gen()
+
 
 class _FakeMessages:
     def __init__(self, rounds):
@@ -211,10 +224,13 @@ _MODELS = {
 }
 
 
-def _install(monkeypatch, rounds, family="claude", logs=None):
+def _install(monkeypatch, rounds, family="claude", logs=None, settings=None):
     model = _MODELS[family]
+    extra = dict(settings or {})
 
     def _setting(key, default=None):
+        if key in extra:
+            return extra[key]
         if key == "architect_model":
             return model
         return "" if default is None else default
@@ -261,15 +277,21 @@ def stub_local(monkeypatch, note="pm\n", run=True):
 
 
 async def _run(monkeypatch, user_request, rounds, is_agent_task=False,
-               family="claude", logs=None, session_files=None):
-    client = _install(monkeypatch, rounds, family=family, logs=logs)
+               family="claude", logs=None, session_files=None,
+               forced_edit_plan=None, plan_run_id=None, session_id="",
+               settings=None, user_id=""):
+    client = _install(
+        monkeypatch, rounds, family=family, logs=logs, settings=settings,
+    )
     events = await _collect(pipeline.run_natural_pipeline_stream(
         session_files=session_files or [],
         user_request=user_request,
         conversation_history=[],
-        session_id="",
-        user_id="",
+        session_id=session_id,
+        user_id=user_id,
         is_agent_task=is_agent_task,
+        forced_edit_plan=forced_edit_plan,
+        plan_run_id=plan_run_id,
     ))
     errors = [e for e in events if e.get("type") == "error"]
     assert not errors, errors

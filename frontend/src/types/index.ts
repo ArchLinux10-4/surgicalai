@@ -357,6 +357,10 @@ export interface PlanTask {
   run_id?: string
   verdict?: string | null
   result_summary?: string
+  added?: number
+  removed?: number
+  diff?: string
+  delivered?: boolean
 }
 
 export interface AgentTask {

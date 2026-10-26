@@ -177,6 +177,36 @@ app.include_router(debug_router.router)
 @app.on_event("startup")
 async def startup():
     init_db()
+    import asyncio as _asyncio
+    import time as _time
+
+    async def _watch_loop_lag():
+        """Log when the event loop runs more than 250ms late.
+
+        The 20-46s dead start happens before the first SSE byte. This says
+        whether the loop itself was blocked.
+        """
+        while True:
+            started = _time.monotonic()
+            await _asyncio.sleep(0.1)
+            late = _time.monotonic() - started - 0.1
+            if late < 0.25:
+                continue
+            queued = None
+            try:
+                executor = _asyncio.get_running_loop()._default_executor
+                work = getattr(executor, "_work_queue", None)
+                if work is not None:
+                    queued = work.qsize()
+            except Exception:
+                queued = None
+            try:
+                from services.pipeline import _dlog
+                _dlog("event_loop_lag", late_ms=round(late * 1000), thread_queue=queued)
+            except Exception:
+                pass
+
+    _asyncio.get_running_loop().create_task(_watch_loop_lag())
     print("🚀 SurgicalAI backend running")
 
 

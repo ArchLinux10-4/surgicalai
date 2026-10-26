@@ -208,10 +208,11 @@ interface FeedProps {
   isBuildingEdit?: boolean
   compact?: boolean
   max?: number
+  wallMs?: number
 }
 
 function ToolActivityFeedInner({
-  mode, rows, startedAt, model, content, progress, phaseLabel, isThinking, isBuildingEdit, compact, max,
+  mode, rows, startedAt, model, content, progress, phaseLabel, isThinking, isBuildingEdit, compact, max, wallMs,
 }: FeedProps) {
   const live = mode === 'live'
   const [open, setOpen] = useState(false)
@@ -300,7 +301,7 @@ function ToolActivityFeedInner({
             onClick={() => setOpen(value => !value)}
           >
             <span aria-hidden>{open ? '▾' : '▸'}</span>
-            <span className="truncate">{summarizeTrail(rows)}</span>
+            <span className="truncate">{summarizeTrail(rows, wallMs)}</span>
           </button>
         )}
         {(live || open) && list}

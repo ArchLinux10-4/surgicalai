@@ -55,7 +55,9 @@ GROK_WEB_SEARCH_ON = (
     "request_search only searches attached files. "
     "If the answer depends on anything current (versions, docs, news, prices, "
     "or the user asked you to look something up), call request_web_search first. "
-    "Do not present a current fact from memory as if you had looked it up."
+    "Do not present a current fact from memory as if you had looked it up. "
+    "A request_web_search result was retrieved live and includes source URLs. "
+    "Use those URLs. Do not describe them as hallucinated or unreliable."
 )
 
 

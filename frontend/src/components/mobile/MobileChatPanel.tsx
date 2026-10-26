@@ -799,8 +799,10 @@ export function MobileChatPanel() {
       api.tasks.list(activeSessions)
         .then((rows: any[]) => {
           if (!Array.isArray(rows) || rows.length === 0) return
-          const latestRun = rows[0]?.run_id
-          const forRun = rows.filter(r => r.run_id === latestRun)
+          const agentRows = rows.filter(r => (r.source || '') !== 'plan')
+          if (agentRows.length === 0) return
+          const latestRun = agentRows[0]?.run_id
+          const forRun = agentRows.filter(r => r.run_id === latestRun)
           const TERMINAL = ['done', 'blocked', 'cancelled', 'error']
           const allTerminal = forRun.every(r => TERMINAL.includes(r.status))
           if (allTerminal) return

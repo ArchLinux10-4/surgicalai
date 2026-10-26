@@ -14,6 +14,8 @@ import { applyChanges as runApply, applyFailureCopy, notifyApplied } from '../..
 import type { SmartResult, SessionFile } from '../../types'
 import { useAppStore } from '../../stores/appStore'
 
+const EMPTY_QA_NOTES: Record<string, any> = {}
+
 interface Props {
   result: SmartResult
   sessionId: string
@@ -68,7 +70,7 @@ function FileCard({
   onApplied: () => void
   qaStatus?: string
 }) {
-  const liveNotes = useAppStore(s => s.qaNotes[sessionId] || {})
+  const liveNotes = useAppStore(s => s.qaNotes[sessionId] ?? EMPTY_QA_NOTES)
   const [expanded, setExpanded]     = useState(false)
   const [applying, setApplying]     = useState(false)
   const [failedNotes, setFailedNotes] = useState<string[]>([])

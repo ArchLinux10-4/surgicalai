@@ -97,6 +97,14 @@ def scope_block(*, session_files=False, repo=False, github=False, web=False, git
 def limits_block(form="tag", max_rounds=None) -> str:
     """Caps the model can hit. Round count comes from the caller, not a guess."""
     rounds = default_max_turns() if max_rounds is None else int(max_rounds)
+    if form == "function":
+        return (
+            "Use these tools as many times as the task needs. "
+            f"Several file or search calls in the same turn are combined, "
+            f"up to {MAX_FILES_PER_REQUEST} files or {MAX_SEARCH_TERMS} search terms. "
+            "A different tool in that same turn is skipped. "
+            f"You can continue across turns, up to {rounds} turns."
+        )
     return (
         "Use these tools as many times as the task needs, one per turn. "
         f"At most {MAX_FILES_PER_REQUEST} files or {MAX_SEARCH_TERMS} search terms "

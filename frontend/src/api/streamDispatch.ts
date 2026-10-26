@@ -53,7 +53,7 @@ const TASK_TYPES = new Set([
 
 const PLAN_TYPES = new Set([
   'plan_ready', 'plan_updated', 'plan_unchanged', 'plan_locked', 'plan_coverage',
-  'plan_missing', 'plan_failed', 'plan_questions', 'plan_step',
+  'plan_missing', 'plan_failed', 'plan_questions', 'plan_step', 'plan_step_result',
 ])
 
 function warnUnknown(type: string) {
