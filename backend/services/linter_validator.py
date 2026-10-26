@@ -148,7 +148,7 @@ def _run_pyflakes(code: str, filename: str) -> List[Dict]:
             clean = re.sub(r"^[^:]+:\d+:\d*\s*", "", str(message)).strip()
             errors.append(_make_err(line, col, clean, f"line {line}: {clean}"))
 
-    collector = _Collector(warningStream=io.StringIO())
+    collector = _Collector(io.StringIO(), io.StringIO())
     try:
         pf_api.check(code, filename=filename, reporter=collector)
     except Exception as exc:

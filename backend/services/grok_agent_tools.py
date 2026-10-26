@@ -54,6 +54,8 @@ success and error. Long strings are truncated and file contents / edit bodies
 are never logged verbatim — only lengths and previews.
 """
 
+import asyncio
+import datetime as _dt
 import json as _json
 
 # grok_provider does NOT import this module, so importing from it is cycle-safe.
@@ -70,6 +72,7 @@ except Exception:  # pragma: no cover
 try:  # pragma: no cover
     from services.agent_tool_spec import (
         blocked_text as _blocked_text,
+        code_tools_text as _code_tools_text,
         edit_ladder as _edit_ladder,
         file_blurb as _file_blurb,
         history_text as _history_text,
@@ -85,6 +88,7 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     from agent_tool_spec import (  # type: ignore
         blocked_text as _blocked_text,
+        code_tools_text as _code_tools_text,
         edit_ladder as _edit_ladder,
         file_blurb as _file_blurb,
         history_text as _history_text,
@@ -108,6 +112,7 @@ TOOL_REQUEST_SEARCH = "request_search"
 TOOL_REQUEST_GITHUB = "request_github"
 TOOL_AWS_CLI = "aws_cli"
 TOOL_GIT_CLI = "git_cli"
+TOOL_LOCAL = "run_local"
 TOOL_REQUEST_HISTORY = "request_history"
 TOOL_REQUEST_PREVIEW = "request_preview"
 TOOL_REQUEST_WEB_SEARCH = "request_web_search"
@@ -401,6 +406,65 @@ def _schema_git_cli():
     }
 
 
+def _local_body(args):
+    """Render a run_local call as the line format resolve_local_call parses."""
+    action = str((args or {}).get("action") or "").strip().lower()
+    if action == "exec":
+        lines = ["action: exec"]
+        cwd = str(args.get("cwd") or "").strip()
+        if cwd:
+            lines.append("cwd: " + cwd)
+        lines.append(str(args.get("command") or "").strip())
+        return "\n".join(lines)
+    if action == "write":
+        lines = ["action: write", "path: " + str(args.get("path") or "").strip()]
+        sha = str(args.get("expected_sha") or "").strip()
+        if sha:
+            lines.append("expected_sha: " + sha)
+        lines.append("---")
+        content = args.get("content")
+        lines.append(content if isinstance(content, str) else "")
+        return "\n".join(lines)
+    lines = ["action: " + action, "path: " + str(args.get("path") or "").strip()]
+    span = str(args.get("lines") or "").strip()
+    if span:
+        lines.append("lines: " + span)
+    return "\n".join(lines)
+
+
+def _schema_local():
+    return {
+        "type": "function",
+        "function": {
+            "name": TOOL_LOCAL,
+            "description": (
+                "Run one action on the user's Mac. Follow the local rules in the system prompt.\n"
+                "action is exec, read, write, or list. exec needs command. "
+                "read, write, and list need path. write also needs content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["exec", "read", "write", "list"],
+                    },
+                    "command": {
+                        "type": "string",
+                        "description": "The command for action exec. No pipes or redirects.",
+                    },
+                    "path": {"type": "string", "description": "File or folder for read, write, or list."},
+                    "cwd": {"type": "string", "description": "Working directory for exec. Defaults to the open folder."},
+                    "content": {"type": "string", "description": "Full new file text for action write."},
+                    "expected_sha": {"type": "string", "description": "Optional sha from a previous read."},
+                    "lines": {"type": "string", "description": "Optional line range for read, such as 1-80."},
+                },
+                "required": ["action"],
+            },
+        },
+    }
+
+
 def _schema_aws_cli():
     return {
         "type": "function",
@@ -541,7 +605,11 @@ def _schema_request_repo():
                             "git_status", "git_diff",
                         ],
                     },
-                    "path": {"type": "string", "description": "Repo-relative path."},
+                    "path": {"type": "string", "description": "Repo-relative path. search_repo uses it to limit the folder."},
+                    "start_line": {
+                        "type": "integer",
+                        "description": "read_repo_file only. 1-based line to start at when the file is long.",
+                    },
                     "terms": {
                         "type": "array",
                         "items": {"type": "string"},
@@ -574,8 +642,8 @@ def _schema_request_repo():
 def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=False,
                            aws_enabled=False, preview_enabled=False,
                            websearch_enabled=False, mcp_enabled=False,
-                           repo_enabled=False, git_enabled=False, dlog=None,
-                           session_id="", user_id=""):
+                           repo_enabled=False, git_enabled=False, local_enabled=False,
+                           dlog=None, session_id="", user_id=""):
     """Return the OpenAI-style tool schemas Grok should be offered for ``mode``.
 
     * ``edit`` / ``agent`` — full write + read toolset + report_blocked.
@@ -608,6 +676,8 @@ def build_grok_agent_tools(mode="edit", github_enabled=False, history_enabled=Fa
         tools.append(_schema_aws_cli())
     if git_enabled:
         tools.append(_schema_git_cli())
+    if local_enabled:
+        tools.append(_schema_local())
     if preview_enabled and m in _EDIT_MODES:
         tools.append(_schema_request_preview())
     if websearch_enabled:
@@ -644,8 +714,30 @@ TOOL_PROGRESS_LABELS = {
     TOOL_REQUEST_MCP: "Calling MCP…",
     TOOL_REQUEST_REPO: "Reading the repository…",
     TOOL_GIT_CLI: "Running git…",
+    TOOL_LOCAL: "Running on this Mac…",
     TOOL_REPORT_BLOCKED: "Reporting blocked…",
 }
+
+
+async def aiter_sync(iterable):
+    """Pull a blocking iterator one item at a time off the event loop.
+
+    The OpenAI/xAI stream's ``next()`` blocks the thread. Doing that inside
+    an async generator stalls the SSE writer, so every thinking token and
+    tool event sits in the socket buffer until the model pauses. Waiting
+    for the next chunk in a worker thread lets each event flush as it arrives.
+    """
+    sentinel = object()
+    iterator = iter(iterable)
+
+    def _pull():
+        return next(iterator, sentinel)
+
+    while True:
+        item = await asyncio.to_thread(_pull)
+        if item is sentinel:
+            break
+        yield item
 
 
 def format_tool_call_progress(name: str) -> str:
@@ -836,6 +928,7 @@ class TranslationResult:
         self.edit_plan = None                # -> edit_plan_data (list) or None
         self.context_request = None          # (tag_kind, body_json_str) or None
         self.context_call_id = None          # tool_call_id of the context req
+        self.kept_context_tool = ""          # name of the one context tool kept
         self.blocked_reason = None           # -> terminal <blocked> signal
         self.results_by_id = {}              # tool_call_id -> tool-result text
         self.errors = []                     # list of (tool_call_id, feedback)
@@ -994,12 +1087,27 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
             if res.context_request is None:
                 res.context_request = ("git", _git_cmd)
                 res.context_call_id = cid
+                res.kept_context_tool = name
             else:
                 fb = "Only one git command is handled per turn."
                 res.errors.append((cid, fb))
                 res.results_by_id[cid] = fb
             _log(dlog, "grok_translate_git_cli", session_id=session_id,
                  user_id=user_id, tool_call_id=cid, command=_git_cmd[:180])
+
+        elif name == TOOL_LOCAL:
+            _local_rendered = _local_body(args)
+            if res.context_request is None:
+                res.context_request = ("local", _local_rendered)
+                res.context_call_id = cid
+                res.kept_context_tool = name
+            else:
+                fb = "Only one local action is handled per turn."
+                res.errors.append((cid, fb))
+                res.results_by_id[cid] = fb
+            _log(dlog, "grok_translate_local", session_id=session_id,
+                 user_id=user_id, tool_call_id=cid,
+                 command=_local_rendered[:180])
 
         elif name == TOOL_AWS_CLI:
             # Do not run yet. resolve_aws_call decides auto-run, refusal, or a card.
@@ -1011,6 +1119,7 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
             if res.context_request is None:
                 res.context_request = ("aws", _aws_body)
                 res.context_call_id = cid
+                res.kept_context_tool = name
             else:
                 fb = "Only one AWS command is sent for approval per turn."
                 res.errors.append((cid, fb))
@@ -1020,7 +1129,21 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
                  command=_aws_cmd[:180], intent=_aws_intent)
 
         elif name in CONTEXT_TOOLS:
-            # Only the FIRST context request is dispatched this turn.
+            # Same tool again: fold files or search terms into the request
+            # already kept, up to the cap. A different tool still waits.
+            if res.context_request is not None and name == res.kept_context_tool:
+                merged = _merge_same_context(
+                    res.context_request[0], res.context_request[1], name, args,
+                )
+                if merged is not None:
+                    res.context_request = (res.context_request[0], merged)
+                    res.results_by_id[cid] = (
+                        "Merged into the context request already started this turn."
+                    )
+                    _log(dlog, "grok_translate_context_merged",
+                         session_id=session_id, user_id=user_id, tool_call_id=cid,
+                         tool_name=name)
+                    continue
             if res.context_request is not None:
                 fb = ("Only one context request is handled per turn. Your other "
                       "requests were not run — re-request them next turn if still "
@@ -1029,11 +1152,12 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
                 res.results_by_id[cid] = fb
                 _log(dlog, "grok_translate_extra_context_ignored",
                      session_id=session_id, user_id=user_id, tool_call_id=cid,
-                     tool_name=name)
+                     tool_name=name, kept_tool=res.kept_context_tool)
                 continue
             tag_kind, body = _context_body(name, args)
             res.context_request = (tag_kind, body)
             res.context_call_id = cid
+            res.kept_context_tool = name
             # NOTE: context result text is filled in by pipeline.py after it runs
             # the tool (search results / file contents), so we do NOT set
             # results_by_id[cid] here.
@@ -1054,6 +1178,52 @@ def translate_tool_calls(calls, dlog=None, session_id="", user_id=""):
          has_context=res.context_request is not None,
          blocked=res.blocked_reason is not None, errors=len(res.errors))
     return res
+
+
+def _merge_same_context(kept_kind: str, kept_body: str, name: str, args) -> str | None:
+    """Fold a second call of the same context tool into the first, or None.
+
+    Mixed tool types are not merged. Files and search terms stop at the
+    existing caps.
+    """
+    from services.agent_tool_spec import MAX_FILES_PER_REQUEST
+    from services.limits import MAX_SEARCH_TERMS
+
+    kind, body = _context_body(name, args)
+    if kind != kept_kind:
+        return None
+    try:
+        old = _json.loads(kept_body)
+        new = _json.loads(body)
+    except Exception:
+        return None
+    if kind == "filereq" and isinstance(old, list) and isinstance(new, list):
+        merged = list(old)
+        for item in new:
+            if item not in merged and len(merged) < MAX_FILES_PER_REQUEST:
+                merged.append(item)
+        return _json.dumps(merged)
+    if kind == "search" and isinstance(old, dict) and isinstance(new, dict):
+        terms = [str(t) for t in (old.get("terms") or [])]
+        for term in new.get("terms") or []:
+            text = str(term)
+            if text and text not in terms and len(terms) < MAX_SEARCH_TERMS:
+                terms.append(text)
+        old["terms"] = terms
+        return _json.dumps(old)
+    if kind == "repo" and isinstance(old, dict) and isinstance(new, dict):
+        if (old.get("tool") or "") != (new.get("tool") or ""):
+            return None
+        if (new.get("path") or "") and (old.get("path") or "") != (new.get("path") or ""):
+            return None
+        terms = [str(t) for t in (old.get("terms") or [])]
+        for term in new.get("terms") or []:
+            text = str(term)
+            if text and text not in terms and len(terms) < MAX_SEARCH_TERMS:
+                terms.append(text)
+        old["terms"] = terms
+        return _json.dumps(old)
+    return None
 
 
 def _context_body(name, args):
@@ -1121,6 +1291,12 @@ def _context_body(name, args):
             "path": args.get("path", "") or "",
             "terms": args.get("terms") or [],
         }
+        try:
+            start_line = int(args.get("start_line") or 0)
+        except (TypeError, ValueError):
+            start_line = 0
+        if start_line > 0:
+            payload["start_line"] = start_line
         # Only git_diff reads these, and only when the model sent them, so a
         # call to the other repo tools keeps its old payload exactly.
         for field in ("scope", "base", "head", "view", "dots"):
@@ -1182,6 +1358,16 @@ def build_tool_result_messages(calls, results_by_id, context_call_id=None,
             content = str(content)
         msgs.append({"role": "tool", "tool_call_id": cid, "content": content})
     return msgs
+
+
+def _live_web_guidance() -> str:
+    """Today's date plus the instruction to trust live web facts over memory."""
+    today = _dt.date.today().isoformat()
+    return (
+        f"Today's date is {today}. Web search results are live and newer than "
+        "your training data. Trust them over memory for model names, versions, "
+        "and dates."
+    )
 
 
 def build_native_followup_messages(assistant_text, calls, results_by_id,
@@ -1266,7 +1452,7 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
                              wants_edit=True, preview_enabled=False,
                              preflight_enabled=False, websearch_enabled=False,
                              mcp_enabled=False, repo_enabled=False,
-                             git_enabled=False):
+                             git_enabled=False, local_enabled=False):
     """Function-tool contract for Grok. No XML tag names, and no instruction to ignore them.
 
     The main system text Grok receives is the tag-free head plus the code-quality
@@ -1279,13 +1465,20 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     ]
     scope = _scope_block(
         session_files=True, repo=bool(repo_enabled), github=bool(github_enabled),
-        web=bool(websearch_enabled), git=bool(git_enabled), form="function",
+        web=bool(websearch_enabled), git=bool(git_enabled),
+        local=bool(local_enabled), form="function",
     )
     if scope:
         lines.append(scope)
     lines.append(_limits_block("function"))
     if m in _EDIT_MODES and wants_edit:
         lines.append(_edit_ladder("function", "grok"))
+        lines.append(_code_tools_text(
+            "function",
+            repo=bool(repo_enabled),
+            local=bool(local_enabled),
+            git=bool(git_enabled),
+        ))
     elif m in _EDIT_MODES:
         lines.append(
             "• write_surgical_edit — edit an existing file. "
@@ -1313,6 +1506,9 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
     if git_enabled:
         from services.agent_tool_spec import git_cli_text
         lines.append("• git_cli — " + git_cli_text("function"))
+    if local_enabled:
+        from services.agent_tool_spec import local_text
+        lines.append("• run_local — " + local_text("function"))
     if preview_enabled and m in _EDIT_MODES:
         lines.append(
             "• request_preview — render a pending .tsx/.jsx edit and read "
@@ -1324,6 +1520,7 @@ def build_grok_system_suffix(mode="edit", github_enabled=False,
             "information. The query is sent to a search engine: do not include "
             "code, file names, or secrets."
         )
+        lines.append(_live_web_guidance())
     if mcp_enabled:
         lines.append(
             "• request_mcp — call a tool on a connected MCP server. The user "
@@ -1373,7 +1570,8 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
                                  session_id="", user_id="",
                                  wants_edit=True, preview_enabled=False,
                                  preflight_enabled=False, websearch_enabled=False,
-                                 mcp_enabled=False, repo_enabled=False):
+                                 mcp_enabled=False, repo_enabled=False,
+                                 local_enabled=False):
     """Native-tool replacement for the pipeline's XML turn suffix.
 
     ``wants_edit`` False is a plain question on an Edit/Agent turn: same
@@ -1440,6 +1638,12 @@ def build_grok_agent_instruction(mode="edit", github_enabled=False,
             "Call request_web_search to search the public internet for current "
             "information. The query is sent to a search engine: do not include "
             "code, file names, or secrets."
+        )
+        parts.append(_live_web_guidance())
+    if local_enabled:
+        parts.append(
+            "Call run_local for a command or a file on this Mac that the other "
+            "tools cannot handle. One action, then wait. Do not use it for git or aws."
         )
     if mcp_enabled:
         parts.append(

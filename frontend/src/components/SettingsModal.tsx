@@ -111,7 +111,13 @@ export function SettingsModal() {
     // is scoped to "on by default for Ask/Plan" only.
     web_search_enabled: false,
     git_agent_tools: false,
+    local_agent_tools: false,
+    qa_enabled: true,
+    qa_auto_fix_rounds: 0,
+    qa_diff_first: true,
   })
+  const [localRules, setLocalRules] = useState<string[]>([])
+  const [localHelper, setLocalHelper] = useState<boolean | null>(null)
 
   const { theme, setTheme } = useThemeStore()
 
@@ -131,8 +137,16 @@ export function SettingsModal() {
         ollama_model: (settings as any).ollama_model || 'qwen2.5-coder:7b',
         web_search_enabled: (settings as any).web_search_enabled || false,
         git_agent_tools: (settings as any).git_agent_tools || false,
+        local_agent_tools: (settings as any).local_agent_tools || false,
+        qa_enabled: (settings as any).qa_enabled !== false,
+        qa_auto_fix_rounds: Number((settings as any).qa_auto_fix_rounds ?? 0) || 0,
+        qa_diff_first: (settings as any).qa_diff_first !== false,
       })
     }
+    api.settings.localAgent().then((s) => {
+      setLocalHelper(!!s.helper)
+      setLocalRules(s.rules || [])
+    }).catch(() => {})
     refreshModels()
     try { (api as any).github.status().then((s: any) => setGithubStatus(s)).catch(() => {}) } catch(_) {}
     try { (api as any).vercel.status().then((s: any) => setVercelStatus(s)).catch(() => {}) } catch(_) {}
@@ -661,6 +675,85 @@ export function SettingsModal() {
                       </div>
                     </div>
                   </label>
+                </div>
+
+                <div className="mt-6 pt-5 border-t border-border">
+                  <SectionHeader title="Review" subtitle="Checks that run after an edit is shown" />
+                  <label className="flex items-start gap-3 cursor-pointer group mt-3">
+                    <input
+                      type="checkbox"
+                      checked={form.qa_enabled}
+                      onChange={(e) => upd('qa_enabled')(e.target.checked)}
+                      className="mt-0.5 accent-accent"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-ink">Check edits after they appear</div>
+                      <div className="text-xs text-muted mt-0.5">Turn this off to skip the review pass.</div>
+                    </div>
+                  </label>
+                  <label className="flex items-start gap-3 cursor-pointer group mt-3">
+                    <input
+                      type="checkbox"
+                      checked={form.qa_diff_first}
+                      onChange={(e) => upd('qa_diff_first')(e.target.checked)}
+                      className="mt-0.5 accent-accent"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-ink">Show the diff before the review finishes</div>
+                      <div className="text-xs text-muted mt-0.5">The review result arrives on the card after the diff.</div>
+                    </div>
+                  </label>
+                  <Field label="Automatic fix rounds">
+                    <input
+                      type="number"
+                      min={0}
+                      max={3}
+                      value={form.qa_auto_fix_rounds}
+                      onChange={(e) => upd('qa_auto_fix_rounds')(Math.max(0, Number(e.target.value) || 0))}
+                      className="input w-24"
+                    />
+                  </Field>
+                </div>
+
+                <div className="mt-6 pt-5 border-t border-border">
+                  <SectionHeader title="This Mac" subtitle="Let agents run commands and read or write files on this computer" />
+                  <label className="flex items-start gap-3 cursor-pointer group mt-3">
+                    <input
+                      type="checkbox"
+                      checked={form.local_agent_tools}
+                      onChange={(e) => upd('local_agent_tools')(e.target.checked)}
+                      className="mt-0.5 accent-accent"
+                    />
+                    <div>
+                      <div className="text-sm font-medium text-ink">Let agents use my computer</div>
+                      <div className="text-xs text-muted mt-0.5">
+                        Off until you turn it on. Reads run immediately. Changes, installs, deletes,
+                        and anything outside the open folder ask you first.
+                        {localHelper === false ? ' The Mac helper is not running.' : ''}
+                        {localHelper === true ? ' The Mac helper is running.' : ''}
+                      </div>
+                    </div>
+                  </label>
+                  {localRules.length > 0 && (
+                    <ul className="mt-3 space-y-1">
+                      {localRules.map((rule) => (
+                        <li key={rule} className="flex items-center justify-between gap-2 text-xs">
+                          <span className="font-mono text-ink">{rule}</span>
+                          <button
+                            type="button"
+                            className="text-muted hover:text-ink"
+                            onClick={() => {
+                              const next = localRules.filter((item) => item !== rule)
+                              setLocalRules(next)
+                              api.settings.saveLocalAllowlist(next).catch(() => {})
+                            }}
+                          >
+                            Remove
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
 
                 <div className="mt-6 pt-5 border-t border-border">

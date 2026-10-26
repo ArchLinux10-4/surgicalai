@@ -24,6 +24,9 @@ from services.plan_artifact import (  # noqa: E402
     mark_plan_implementing,
     forced_edit_plan_from_run,
     revert_plan_after_implement_error,
+    note_plan_step,
+    coverage_after_crash,
+    release_unshipped_plan_steps,
 )
 from services.task_planner import create_tasks  # noqa: E402
 
@@ -81,6 +84,81 @@ def test_parse_missing_or_invalid_returns_none():
     ) is None
 
 
+def test_parse_create_step_uses_filename_as_symbol():
+    steps = parse_implementation_plan(
+        "```implementation_plan\n"
+        "{\"steps\": [{\"filename\": \"test_openai_models.py\", \"action\": \"create\", "
+        "\"description\": \"Add the model test\"}]}\n```"
+    )
+    assert steps == [{
+        "filename": "test_openai_models.py",
+        "symbol": "test_openai_models.py",
+        "description": "Add the model test",
+        "action": "create",
+    }]
+
+
+def test_create_step_round_trips_and_new_file_counts_as_done(plan_db):
+    sid = plan_db["sid"]
+    text = (
+        "```implementation_plan\n"
+        "{\"steps\": ["
+        "{\"filename\": \"test_openai_models.py\", \"action\": \"create\", \"description\": \"add tests\"},"
+        "{\"filename\": \"app.py\", \"symbol\": \"main\", \"description\": \"wire it\"}"
+        "]}\n```"
+    )
+    ev = persist_plan_from_assistant_text(sid, text)
+    planned = forced_edit_plan_from_run(sid, ev["run_id"])
+    assert planned[0]["action"] == "create"
+    assert planned[0]["symbol"] == "test_openai_models.py"
+    cov = compute_plan_coverage(planned, {
+        "changes_by_file": {
+            "app.py": {"filename": "app.py", "changes": [{"symbol": "main"}]},
+        },
+        "new_files": [{"filename": "test_openai_models.py", "content": "def test_ok():\n    pass\n"}],
+        "skipped_changes": [],
+    })
+    assert cov["ok"] is True
+    assert cov["missing"] == []
+
+
+def test_assignment_window_and_missing_symbol_skips_the_model():
+    import asyncio
+    from services.pipeline import _PlanSymbolNotFound, _execute_single_edit
+    from services.plan_artifact import module_assignment_window, plain_skip_reason
+
+    src = "HEADER = 1\n" + ("x = 1\n" * 80) + "MODEL = \"gpt-4.1\"\n" + ("y = 2\n" * 80)
+    window = module_assignment_window(src, "MODEL")
+    assert window is not None
+    assert "MODEL" in window
+    assert "HEADER" not in window
+    assert plain_skip_reason({
+        "filename": "a.py", "symbol": "MODEL", "reason": "symbol not found",
+    }) == "Could not find `MODEL` in `a.py`."
+    assert "timed out" in plain_skip_reason({
+        "filename": "a.py", "symbol": "MODEL", "reason": "timed out editing MODEL in a.py",
+    })
+
+    class _Boom:
+        class messages:
+            @staticmethod
+            def stream(**kwargs):
+                raise AssertionError("model must not be called")
+
+    async def _run():
+        await _execute_single_edit(
+            _Boom(), "claude-sonnet-5", "a.py", "MISSING", "set it",
+            "VALUE = 1\n", None, "change it",
+        )
+
+    try:
+        asyncio.run(_run())
+    except _PlanSymbolNotFound:
+        pass
+    else:
+        raise AssertionError("missing symbol should fail before the model call")
+
+
 def test_coverage_missing_and_skipped():
     planned = [
         {"filename": "a.py", "symbol": "foo"},
@@ -100,6 +178,47 @@ def test_coverage_missing_and_skipped():
     assert cov["missing"] == [{"filename": "c.py", "symbol": "baz"}]
     assert {"filename": "a.py", "symbol": "foo"} in cov["covered"]
     assert {"filename": "b.py", "symbol": "bar"} in cov["skipped"]
+
+
+def test_missing_file_and_time_budget_stay_pending():
+    planned = [
+        {"filename": "a.py", "symbol": "foo"},
+        {"filename": "b.py", "symbol": "bar"},
+        {"filename": "c.py", "symbol": "baz"},
+    ]
+    result = {
+        "changes_by_file": {},
+        "skipped_changes": [
+            {"filename": "a.py", "symbol": "foo", "reason": "File not found in session: a.py"},
+            {"filename": "b.py", "symbol": "bar", "reason": "Skipped — pipeline time budget reached before this edit could run"},
+            {"filename": "c.py", "symbol": "baz", "reason": "already matches"},
+        ],
+    }
+    cov = compute_plan_coverage(planned, result)
+    assert cov["ok"] is False
+    assert {"filename": "c.py", "symbol": "baz"} in cov["covered"]
+    pending = {(p["filename"], p["symbol"]) for p in cov["pending"]}
+    assert pending == {("a.py", "foo"), ("b.py", "bar")}
+    assert cov["missing"] == []
+
+
+def test_apply_coverage_keeps_failed_skips_pending(plan_db):
+    sid = plan_db["sid"]
+    ev = persist_plan_from_assistant_text(sid, GROK_STYLE)
+    run_id = ev["run_id"]
+    planned = forced_edit_plan_from_run(sid, run_id)
+    cov = compute_plan_coverage(planned, {
+        "changes_by_file": {},
+        "skipped_changes": [
+            {"filename": "Header.tsx", "symbol": "Header", "reason": "File not found in session: Header.tsx"},
+        ],
+    })
+    updated = apply_coverage_to_run(sid, run_id, cov)
+    statuses = {t["symbol"]: t["status"] for t in updated}
+    assert statuses["Header"] == "pending"
+    header = next(t for t in updated if t["symbol"] == "Header")
+    assert "not in this chat" in header["result_summary"]
+    assert latest_plan_run(sid)["phase"] == "ready"
 
 
 def test_coverage_complete_with_extra_allowed():
@@ -134,6 +253,28 @@ def plan_db(monkeypatch, tmp_path):
         )
         conn.commit()
     return {"db": db, "sid": sid}
+
+
+def test_staged_file_flags_unknown_symbol_before_build(plan_db):
+    sid = plan_db["sid"]
+    with plan_db["db"].get_db_ctx() as conn:
+        conn.execute(
+            "INSERT INTO session_files (id, session_id, filename, content, language) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), sid, "app.py", "def main():\n    return 1\n", "python"),
+        )
+        conn.commit()
+    text = (
+        "```implementation_plan\n"
+        "{\"steps\": [{\"filename\": \"app.py\", \"symbol\": \"missing_name\", "
+        "\"description\": \"no such function\"}]}\n```"
+    )
+    ev = persist_plan_from_assistant_text(sid, text)
+    task = latest_plan_run(sid)["tasks"][0]
+    assert task["status"] == "pending"
+    assert task["verdict"] == "unresolved"
+    assert "missing_name" in (task.get("result_summary") or "")
+    assert ev["tasks"][0]["verdict"] == "unresolved"
 
 
 def test_create_tasks_without_new_fields_still_inserts(plan_db):
@@ -476,7 +617,13 @@ def test_coverage_rejects_unrelated_qualified_symbols():
     }
     cov = compute_plan_coverage(planned, result)
     assert cov["ok"] is False
-    assert cov["missing"] == [{"filename": "a.py", "symbol": "Widget.render"}]
+    assert cov["missing"] == []
+    assert cov["covered"] == []
+    assert cov["pending"] == [{
+        "filename": "a.py",
+        "symbol": "Widget.render",
+        "reason": "Edited `Header.render` instead of `Widget.render`.",
+    }]
 
 
 def test_revert_implement_error_unlocks_pending(plan_db):
@@ -591,3 +738,192 @@ def test_implement_exception_emits_plan_failed_not_coverage(stream_env, monkeypa
     latest = latest_plan_run(sid)
     assert latest["phase"] == "ready"
     assert all(t["status"] == "pending" for t in latest["tasks"])
+
+
+def _drain_implement(stream_env, sid, run_id):
+    import asyncio
+
+    async def _drain(resp):
+        parts = []
+        async for p in resp.body_iterator:
+            parts.append(p.decode() if isinstance(p, (bytes, bytearray)) else p)
+        return "".join(parts)
+
+    resp = asyncio.run(stream_env["chat"].implement_plan(
+        {"session_id": sid, "run_id": run_id},
+        stream_env["req"],
+    ))
+    return asyncio.run(_drain(resp))
+
+
+def _insert_impl_file(stream_env, sid):
+    with stream_env["db"].get_db_ctx() as conn:
+        conn.execute(
+            "INSERT INTO session_files (id, session_id, filename, content, language) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (str(uuid.uuid4()), sid, "Header.tsx", "export function Header(){return null}\n", "tsx"),
+        )
+        conn.commit()
+
+
+def test_error_without_result_retries_steps_marked_done_in_memory(stream_env, monkeypatch):
+    sid = stream_env["sid"]
+    ev = persist_plan_from_assistant_text(sid, GROK_STYLE)
+    run_id = ev["run_id"]
+    _insert_impl_file(stream_env, sid)
+
+    async def _crash(*a, **k):
+        note_plan_step(sid, run_id, "Header.tsx", "Header", "done")
+        note_plan_step(sid, run_id, "App.tsx", "App", "done")
+        yield 'data: {"type": "error", "content": "UnboundLocalError: MAX_QA_RETRIES"}\n\n'
+        yield 'data: {"type": "done", "content": ""}\n\n'
+
+    monkeypatch.setattr("services.pipeline.run_natural_pipeline_stream", _crash)
+    body = _drain_implement(stream_env, sid, run_id)
+    assert '"type": "plan_failed"' in body
+    assert '"type": "plan_coverage"' not in body
+    assert "not produced" not in body
+    latest = latest_plan_run(sid)
+    assert latest["phase"] == "ready"
+    assert {t["symbol"]: t["status"] for t in latest["tasks"]} == {
+        "Header": "pending",
+        "App": "pending",
+    }
+    again = {(s["filename"], s["symbol"]) for s in forced_edit_plan_from_run(sid, run_id)}
+    assert again == {("Header.tsx", "Header"), ("App.tsx", "App")}
+    assert all("MAX_QA_RETRIES" in (t.get("result_summary") or "") for t in latest["tasks"])
+
+
+def test_error_with_checkpoint_keeps_recovered_steps(stream_env, monkeypatch):
+    sid = stream_env["sid"]
+    ev = persist_plan_from_assistant_text(sid, GROK_STYLE)
+    run_id = ev["run_id"]
+    _insert_impl_file(stream_env, sid)
+    checkpoint = json.dumps({
+        "phase": "plan_execute",
+        "changes_by_file": {
+            "Header.tsx": {
+                "filename": "Header.tsx",
+                "changes": [{"symbol": "Header", "original_code": "a", "new_code": "b"}],
+            },
+        },
+    })
+
+    async def _crash(*a, **k):
+        note_plan_step(sid, run_id, "Header.tsx", "Header", "done")
+        note_plan_step(sid, run_id, "App.tsx", "App", "done")
+        yield "data: " + json.dumps({"type": "checkpoint", "content": checkpoint}) + "\n\n"
+        yield 'data: {"type": "error", "content": "UnboundLocalError: MAX_QA_RETRIES"}\n\n'
+        yield 'data: {"type": "done", "content": ""}\n\n'
+
+    monkeypatch.setattr("services.pipeline.run_natural_pipeline_stream", _crash)
+    body = _drain_implement(stream_env, sid, run_id)
+    assert '"type": "smart_result"' in body
+    assert '"type": "plan_coverage"' in body
+    assert '"type": "plan_failed"' not in body
+    assert "not produced" not in body
+    latest = latest_plan_run(sid)
+    statuses = {t["symbol"]: t["status"] for t in latest["tasks"]}
+    assert statuses == {"Header": "done", "App": "pending"}
+    app = next(t for t in latest["tasks"] if t["symbol"] == "App")
+    assert "Build crashed" in (app.get("result_summary") or "")
+    again = {(s["filename"], s["symbol"]) for s in forced_edit_plan_from_run(sid, run_id)}
+    assert again == {("App.tsx", "App")}
+
+
+def test_release_unshipped_leaves_covered_steps(plan_db):
+    sid = plan_db["sid"]
+    ev = persist_plan_from_assistant_text(sid, GROK_STYLE)
+    run_id = ev["run_id"]
+    tasks = latest_plan_run(sid)["tasks"]
+    header = next(t for t in tasks if t["symbol"] == "Header")
+    app = next(t for t in tasks if t["symbol"] == "App")
+    from services.task_planner import update_task
+    update_task(header["id"], status="done", verdict="covered")
+    update_task(app["id"], status="done", verdict="edited")
+    release_unshipped_plan_steps(sid, run_id, "Build crashed")
+    again = {(s["filename"], s["symbol"]) for s in forced_edit_plan_from_run(sid, run_id)}
+    assert again == {("App.tsx", "App")}
+    cov = coverage_after_crash(
+        [{"filename": "Header.tsx", "symbol": "Header"}, {"filename": "App.tsx", "symbol": "App"}],
+        {"changes_by_file": {"Header.tsx": {"changes": [{"symbol": "Header"}]}}, "skipped_changes": []},
+        "Build crashed: boom",
+    )
+    assert cov["missing"] == []
+    assert {p["symbol"] for p in cov["pending"]} == {"App"}
+
+
+def test_new_file_does_not_cover_an_edit_and_a_child_symbol_covers_the_parent():
+    planned = [
+        {"filename": "config.py", "symbol": "MODEL_CATALOG", "description": "edit the catalog"},
+        {"filename": "test_openai_models.py", "symbol": "test_openai_models.py", "description": "add tests", "action": "create"},
+        {"filename": "title_matcher.py", "symbol": "TitleMatcher", "description": "update the matcher"},
+        {"filename": "api_governor.py", "symbol": "governed_chat_completion", "description": "govern the call"},
+    ]
+    cov = compute_plan_coverage(planned, {
+        "changes_by_file": {
+            "title_matcher.py": {"changes": [{"symbol": "TitleMatcher.__init__"}]},
+            "api_governor.py": {"changes": [{"symbol": "_text_region_L274_364"}]},
+        },
+        "new_files": [{"filename": "config.py", "content": "{\"filename\": \"test_openai_models.py\"}"}],
+        "skipped_changes": [],
+    })
+    covered = {row["symbol"] for row in cov["covered"]}
+    assert "MODEL_CATALOG" not in covered
+    assert "test_openai_models.py" not in covered
+    assert "TitleMatcher" in covered
+    pending = {row["symbol"]: row["reason"] for row in cov["pending"]}
+    assert pending["governed_chat_completion"] == (
+        "Edited `_text_region_L274_364` instead of `governed_chat_completion`."
+    )
+    matched = compute_plan_coverage(
+        [planned[1]],
+        {
+            "changes_by_file": {},
+            "new_files": [{"filename": "test_openai_models.py", "content": "def test_ok():\n    pass\n"}],
+            "skipped_changes": [],
+        },
+    )
+    assert matched["ok"] is True
+
+
+def test_done_clears_the_old_summary_and_a_blocked_step_is_not_rerun(plan_db):
+    from services.plan_artifact import mark_next_plan_step_running
+
+    sid = plan_db["sid"]
+    text = (
+        "```implementation_plan\n"
+        "{\"steps\": ["
+        "{\"filename\": \"config.py\", \"symbol\": \"MODEL_CATALOG\", \"description\": \"edit\"},"
+        "{\"filename\": \"app.py\", \"symbol\": \"main\", \"description\": \"edit\"}"
+        "]}\n```"
+    )
+    ev = persist_plan_from_assistant_text(sid, text)
+    run_id = ev["run_id"]
+    note_plan_step(sid, run_id, "config.py", "MODEL_CATALOG", "blocked", "symbol not found")
+    nxt = mark_next_plan_step_running(sid, run_id)
+    assert nxt["symbol"] == "main"
+    first = next(t for t in latest_plan_run(sid)["tasks"] if t["symbol"] == "MODEL_CATALOG")
+    assert first["status"] == "blocked"
+    assert first["result_summary"] == "symbol not found"
+    note_plan_step(sid, run_id, "config.py", "MODEL_CATALOG", "done")
+    done = next(t for t in latest_plan_run(sid)["tasks"] if t["symbol"] == "MODEL_CATALOG")
+    assert done["status"] == "done"
+    assert not (done.get("result_summary") or "").strip()
+
+
+def test_plan_create_keeps_the_step_filename_and_unwraps_nested_json():
+    from services.pipeline import normalize_plan_new_file
+
+    raw = json.dumps({
+        "filename": "config.py",
+        "content": json.dumps({
+            "filename": "test_openai_models.py",
+            "content": "def test_models():\n    assert True\n",
+            "language": "python",
+        }),
+    })
+    saved = json.loads(normalize_plan_new_file(raw, "test_openai_models.py"))
+    assert saved["filename"] == "test_openai_models.py"
+    assert saved["content"] == "def test_models():\n    assert True\n"
+    assert "config.py" not in saved["content"]

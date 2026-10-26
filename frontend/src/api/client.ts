@@ -1,5 +1,7 @@
 import type { StreamChunk, ProjectMemory, PromptTemplate, ImpactAnalysis, MultiFileAnalysis, MemoryPreset, ToolActivityEvent } from '../types'
 import { hydrateToolRows } from '../lib/toolActivity'
+import { dispatchStreamChunk, type StreamHandlers } from './streamDispatch'
+import type { StreamEvent } from './streamEvents'
 
 const BASE = (import.meta.env.VITE_API_URL ?? '') + '/api'
 
@@ -91,6 +93,23 @@ export type SmartStreamHandlers = {
     verified?: string[]
   }) => void
   onToolActivity?: (ev: ToolActivityEvent) => void
+  onLocalCli?: (event: {
+    command?: string
+    stdout?: string
+    stderr?: string
+    exit_code?: number
+    level?: string
+    title?: string
+    target?: string
+  }) => void
+  onLocalApproval?: (
+    command: string,
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string; always?: boolean }) => boolean,
+    meta?: { level?: string; title?: string; target?: string; summary?: string; action?: string; path?: string; cwd?: string },
+  ) => void
+  onPhase?: (phase: string) => void
+  onQaNote?: (note: any) => void
+  onQaDone?: (event: any) => void
 }
 
 export type EditLiveEvent = {
@@ -297,6 +316,25 @@ function requireFileId(fileId: string, op: string): string {
   return fileId
 }
 
+function errorText(detail: unknown, status: number): string {
+  if (typeof detail === 'string' && detail.trim()) return detail
+  if (Array.isArray(detail)) {
+    const lines = detail.slice(0, 4).map(item => {
+      if (!item || typeof item !== 'object') return String(item ?? '')
+      const loc = Array.isArray((item as any).loc)
+        ? (item as any).loc.filter((part: unknown) => part !== 'body').join('.')
+        : ''
+      const msg = String((item as any).msg || (item as any).message || '')
+      return loc && msg ? `${loc}: ${msg}` : (msg || loc)
+    }).filter(Boolean)
+    if (lines.length) return lines.join('; ')
+  }
+  if (detail && typeof detail === 'object' && 'message' in detail) {
+    return String((detail as { message?: unknown }).message || `HTTP ${status}`)
+  }
+  return `HTTP ${status}`
+}
+
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...authHeaders(), ...options?.headers },
@@ -317,7 +355,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
     const err = await res.json().catch(() => ({ detail: res.statusText }))
     const hdr = Number(res.headers.get('Retry-After'))
     const retryAfter = Number(err?.retry_after) || (Number.isFinite(hdr) && hdr > 0 ? hdr : undefined)
-    throw new ApiError(err.detail || `HTTP ${res.status}`, res.status, retryAfter)
+    throw new ApiError(errorText(err.detail, res.status), res.status, retryAfter)
   }
   return res.json()
 }
@@ -368,6 +406,8 @@ export const api = {
       return request('/settings/verify-grok-key', { method: 'POST', body: JSON.stringify({ key }) })
     },
     browseDirectory: () => request<any>('/settings/browse-directory', { method: 'POST' }),
+    localAgent: () => request<{ enabled: boolean; helper: boolean; rules: string[] }>('/settings/local-agent'),
+    saveLocalAllowlist: (rules: string[]) => request('/settings/local-allowlist', { method: 'PUT', body: JSON.stringify({ rules }) }),
   },
   chat: {
     createSession: (data: any) => request<any>('/chat/sessions', { method: 'POST', body: JSON.stringify(data) }),
@@ -607,7 +647,7 @@ export const api = {
     },
 
     smart: (
-      data: { session_id: string; message: string; file_ids?: string[]; mode?: 'edit' | 'ask' | 'plan' | 'agent'; force_tasks?: boolean; enable_web_research?: boolean },
+      data: { session_id: string; message: string; file_ids?: string[]; mode?: 'edit' | 'ask' | 'plan' | 'agent'; force_tasks?: boolean; enable_web_research?: boolean; qa_retry?: boolean },
       onProgress: (msg: string) => void,
       onToken: (token: string) => void,
       onResult: (result: any) => void,
@@ -636,6 +676,11 @@ export const api = {
       onGitStep?: SmartStreamHandlers['onGitStep'],
       onGitResult?: SmartStreamHandlers['onGitResult'],
       onToolActivity?: SmartStreamHandlers['onToolActivity'],
+      onLocalCli?: SmartStreamHandlers['onLocalCli'],
+      onLocalApproval?: SmartStreamHandlers['onLocalApproval'],
+      onPhase?: (phase: string) => void,
+      onQaNote?: (note: any) => void,
+      onQaDone?: (event: any) => void,
     ): SteerStream => {
       // After onError: a SmartStreamHandlers object (ChatPanel_live) or the
       // historical positional optional callbacks (ChatPanel / mobile).
@@ -646,6 +691,7 @@ export const api = {
           onCreditPaused, onPlan, onAwsCli, onAwsApproval, onPreviewCheck,
           onEditLive, onMcpApproval, onMcpCall, onSteer,           onGitCli, onGitApproval,
           onGitStep, onGitResult, onToolActivity,
+          onLocalCli, onLocalApproval, onPhase, onQaNote, onQaDone,
         } = onThinking)
       }
       const controller = attachSteer(new AbortController(), () => sendToServer)
@@ -664,117 +710,61 @@ export const api = {
       // Transport-independent SSE line handler — shared by WS and fetch paths.
       const processLine = (line: string) => {
         if (!line.startsWith('data: ')) return
+        let chunk: StreamEvent
         try {
-          const chunk = JSON.parse(line.slice(6))
-          if (chunk.type === 'progress') onProgress(chunk.content)
-          else if (chunk.type === 'token') { tokens.push(chunk.content); onToken(chunk.content) }
-          else if (chunk.type === 'smart_result') {
-            // Natural pipeline: result may include natural_text already streamed as tokens
-            const result = JSON.parse(chunk.content)
-            if (chunk.model) { _modelUsed = chunk.model; result._model = chunk.model }
-            onResult(result)
-          }
-          else if (chunk.type === 'chat') { tokens.push(chunk.content); onToken(chunk.content) }
-          else if (chunk.type === 'done') { if (chunk.model) _modelUsed = chunk.model; fireDone(chunk.web_search_sources) }
-          else if (chunk.type === 'error') onError(chunk.content)
-          else if (chunk.type === 'credit_paused') {
-            const info = (chunk.content && typeof chunk.content === 'object')
-              ? chunk.content
-              : (typeof chunk.content === 'string'
-                  ? (() => { try { return JSON.parse(chunk.content) } catch { return { message: chunk.content } } })()
-                  : chunk)
-            onCreditPaused?.(info)
-          }
-          else if (chunk.type === 'web_search_start') onWebSearch?.({ phase: 'start' })
-          else if (chunk.type === 'web_search_query') onWebSearch?.({ phase: 'query', query: chunk.content })
-          else if (chunk.type === 'web_search_results') onWebSearch?.({ phase: 'results', results: chunk.results || [], error: chunk.error })
-          else if (chunk.type === 'thinking_start') onThinking?.('', 'start')
-          else if (chunk.type === 'thinking') onThinking?.(chunk.content, 'delta')
-          else if (chunk.type === 'thinking_end') onThinking?.('', 'end')
-          else if (chunk.type === 'compacting') onCompacting?.('start')
-          else if (chunk.type === 'compacting_done') onCompacting?.('done', { summary: chunk.summary, compacted_count: chunk.compacted_count })
-          else if (chunk.type === 'edit_start') onEditStart?.()
-          else if (chunk.type === 'edit_end') onEditEnd?.()
-          else if (chunk.type === 'edit_live') onEditLive?.(chunk as EditLiveEvent)
-          else if (chunk.type === 'file_needed') {
-            onFileNeeded?.(
-              { filename: chunk.filename, message: chunk.content, retry: chunk.retry },
-              (resp) => {
-                if (!sendToServer) return false   // back-channel is gone — never silently no-op
-                sendToServer({ type: 'file_response', ...resp })
-                return true
-              },
-            )
-          }
-          else if (chunk.type === 'aws_cli') onAwsCli?.(chunk)
-          else if (chunk.type === 'git_cli') onGitCli?.(chunk)
-          else if (chunk.type === 'git_approval_needed') {
-            onGitApproval?.(chunk.command || '', (resp) => {
-              if (!sendToServer) return false
-              sendToServer({ type: 'git_cli_response', ...resp })
-              return true
-            }, { level: chunk.level, title: chunk.title, target: chunk.target, summary: chunk.summary })
-          }
-          else if (chunk.type === 'git_step') onGitStep?.(chunk)
-          else if (chunk.type === 'git_result') onGitResult?.(chunk)
-          else if (chunk.type === 'tool_activity') onToolActivity?.(chunk as ToolActivityEvent)
-          else if (chunk.type === 'aws_approval_needed') {
-            onAwsApproval?.(chunk.command || '', (resp) => {
-              if (!sendToServer) return false
-              sendToServer({ type: 'aws_cli_response', ...resp })
-              return true
-            }, { level: chunk.level, title: chunk.title, target: chunk.target })
-          }
-          else if (chunk.type === 'preview_check_needed') {
-            onPreviewCheck?.(chunk, (payload) => {
-              if (!sendToServer) return false
-              const body = JSON.stringify({ type: 'preview_check_response', check_id: chunk.check_id, ...payload })
-              if (body.length > 6000) return false
-              sendToServer({ type: 'preview_check_response', check_id: chunk.check_id, ...payload })
-              return true
-            })
-          }
-          else if (chunk.type === 'mcp_approval_needed') {
-            onMcpApproval?.({
-              server: chunk.server || '',
-              server_name: chunk.server_name,
-              tool: chunk.tool || '',
-              arguments: chunk.arguments || {},
-            }, (resp) => {
-              if (!sendToServer) return false
-              sendToServer({ type: 'mcp_call_response', action: resp.action })
-              return true
-            })
-          }
-          else if (chunk.type === 'mcp_call') onMcpCall?.(chunk)
-          else if (chunk.type === 'steer_ready') { setSteerLive(controller, true); onSteer?.(chunk) }
-          else if (chunk.type === 'steer_closed') { setSteerLive(controller, false); onSteer?.(chunk) }
-          else if (chunk.type === 'steer_applied' || chunk.type === 'steer_unapplied') onSteer?.(chunk)
-          else if (chunk.type === 'file_needed_cleared') onFileCleared?.(chunk.filename)
-          else if (
-            chunk.type === 'planning_started' ||
-            chunk.type === 'task_plan' || chunk.type === 'task_start' ||
-            chunk.type === 'task_progress' || chunk.type === 'task_done' ||
-            chunk.type === 'task_thinking' ||
-            chunk.type === 'task_blocked' || chunk.type === 'task_cancelled' ||
-            chunk.type === 'tasks_complete'
-          ) onTask?.(chunk)
-          else if (
-            chunk.type === 'plan_ready' || chunk.type === 'plan_updated' ||
-            chunk.type === 'plan_unchanged' || chunk.type === 'plan_locked' ||
-            chunk.type === 'plan_coverage' || chunk.type === 'plan_missing' ||
-            chunk.type === 'plan_failed' || chunk.type === 'plan_questions' ||
-            chunk.type === 'plan_step'
-          ) onPlan?.(chunk)
+          chunk = JSON.parse(line.slice(6))
+        } catch {
+          return
+        }
+        const handlers: StreamHandlers = {
+          onProgress,
+          pushToken: (token) => { tokens.push(token); onToken(token) },
+          onResult,
+          noteModel: (model) => { _modelUsed = model },
+          fireDone,
+          onError,
+          onCreditPaused,
+          onWebSearch,
+          onThinking: typeof onThinking === 'function' ? onThinking : undefined,
+          onCompacting,
+          onEditStart,
+          onEditEnd,
+          onEditLive,
+          onFileNeeded,
+          onFileCleared,
+          onAwsCli,
+          onAwsApproval,
+          onGitCli,
+          onGitApproval,
+          onGitStep,
+          onGitResult,
+          onLocalCli,
+          onLocalApproval,
+          onToolActivity,
+          onPreviewCheck,
+          onMcpApproval,
+          onMcpCall,
+          onSteer,
+          onTask,
+          onPlan,
+          onPhase,
+          onQaNote,
+          onQaDone,
+          setSteerLive: (live) => setSteerLive(controller, live),
+          getSendToServer: () => sendToServer,
+        }
+        try {
+          dispatchStreamChunk(chunk, handlers)
         } catch {}
       }
 
       // HTTP/SSE transport (also the fallback when the WS never opens).
+      const payload = { ...data, client_sent_at: Date.now() }
       const runViaFetch = () => {
         fetch(`${BASE}/chat/smart-stream`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', ...authHeaders() },
-          body: JSON.stringify(data),
+          body: JSON.stringify(payload),
           signal: controller.signal,
         }).then(async res => {
           if (!res.ok) {
@@ -805,7 +795,7 @@ export const api = {
       // WebSocket-first (removes Railway's 15-min transport wall); on a
       // connect-time failure only, transparently fall back to HTTP/SSE.
       if (typeof WebSocket !== 'undefined') {
-        streamViaWS('/chat/ws/smart-stream', data, controller, processLine, fireDone, runViaFetch,
+        streamViaWS('/chat/ws/smart-stream', payload, controller, processLine, fireDone, runViaFetch,
           (send) => { sendToServer = send })
       } else {
         runViaFetch()
@@ -994,7 +984,8 @@ export const api = {
               chunk.type === 'plan_ready' || chunk.type === 'plan_updated' ||
               chunk.type === 'plan_unchanged' || chunk.type === 'plan_locked' ||
               chunk.type === 'plan_coverage' || chunk.type === 'plan_missing' ||
-              chunk.type === 'plan_failed' || chunk.type === 'plan_step'
+              chunk.type === 'plan_failed' || chunk.type === 'plan_step' ||
+              chunk.type === 'plan_step_result'
             ) onPlan?.(chunk)
           } catch {}
         }

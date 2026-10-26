@@ -101,6 +101,25 @@ Supported platforms: **Debian Linux** and **macOS (Apple Silicon)**.
 
 ---
 
+## Let agents use your Mac
+
+The Docker app cannot run macOS commands by itself. `./docker-rebuild-local.sh` installs a small helper in your user session (`com.surgicalai.folder-helper`). It listens on `127.0.0.1:18765` and is the only process that runs commands or writes files on the Mac.
+
+Turn it on in **Settings → This Mac → Let agents use my computer**. It stays off until you do.
+
+What the agent can do, and when it asks:
+
+- Reads (`ls`, `cat`, `rg`, and listing a folder) run immediately inside the open folder.
+- Changes, installs, and network commands show an approval card. **Allow once** runs it this time. **Always allow** remembers that command prefix.
+- Deletes, shell scripts (`bash -lc`), dotfiles, and paths outside the open folder always ask. They cannot be set to Always allow.
+- `git`, `gh`, and `aws` keep their own tools. `sudo` is refused.
+
+The helper token is `~/.surgicalai/local-agent-token` (mode 0600). Each call is appended to `~/.surgicalai/local-agent.log` with the command path and exit code, not the file contents. Turn the setting off to remove the tool from new chats.
+
+The first time the helper touches Desktop, Documents, or Downloads, macOS asks for Files and Folders access for that folder. Allow it. Full Disk Access is not required.
+
+---
+
 ## Project Structure
 
 ```

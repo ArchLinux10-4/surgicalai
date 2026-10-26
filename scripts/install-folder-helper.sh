@@ -34,12 +34,19 @@ done
 STATE_DIR="$HOME/.surgicalai"
 mkdir -p "$STATE_DIR"
 TOKEN_FILE="$STATE_DIR/folder-helper-token"
+LOCAL_TOKEN_FILE="$STATE_DIR/local-agent-token"
 if [ ! -s "$TOKEN_FILE" ]; then
   umask 077
   "$PY" -c 'import secrets; print(secrets.token_urlsafe(32))' > "$TOKEN_FILE"
   chmod 600 "$TOKEN_FILE"
 fi
 chmod 600 "$TOKEN_FILE"
+if [ ! -s "$LOCAL_TOKEN_FILE" ]; then
+  umask 077
+  "$PY" -c 'import secrets; print(secrets.token_urlsafe(32))' > "$LOCAL_TOKEN_FILE"
+  chmod 600 "$LOCAL_TOKEN_FILE"
+fi
+chmod 600 "$LOCAL_TOKEN_FILE"
 
 LABEL="com.surgicalai.folder-helper"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
@@ -76,6 +83,8 @@ cat > "$PLIST" <<EOF
   <dict>
     <key>SURGICALAI_PICKER_TOKEN_FILE</key>
     <string>${TOKEN_FILE}</string>
+    <key>SURGICALAI_LOCAL_AGENT_TOKEN_FILE</key>
+    <string>${LOCAL_TOKEN_FILE}</string>
     <key>SURGICALAI_PICKER_PORT</key>
     <string>18765</string>
   </dict>

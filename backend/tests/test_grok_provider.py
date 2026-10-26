@@ -344,8 +344,9 @@ def test_natural_pipeline_claude_branch_above_is_unmodified():
     src = _pipeline_src()
     assert "_natural_use_claude = _is_claude_model(arch_model)" in src
     # The Claude streaming call must still be the Anthropic client, untouched.
-    idx = src.index("_natural_use_claude = _is_claude_model(arch_model)")
-    claude_block = src[idx:idx + 4000]
+    # Classification sits between the flag and the branch, so start at the branch.
+    idx = src.index("if _natural_use_claude:")
+    claude_block = src[idx:idx + 800]
     assert "aclient" in claude_block or "anthropic" in claude_block.lower()
 
 

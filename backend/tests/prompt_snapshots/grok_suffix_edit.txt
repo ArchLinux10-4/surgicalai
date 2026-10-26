@@ -1,0 +1,25 @@
+
+
+━━━ NATIVE TOOL PROTOCOL (THIS MODEL) ━━━
+You have real FUNCTION TOOLS. Call them. Do not write XML tags.
+Use these tools as many times as the task needs. Several file or search calls in the same turn are combined, up to 5 files or 5 search terms. A different tool in that same turn is skipped. You can continue across turns, up to 60 turns.
+How to point at the code you change.
+1. A small symbol you can see completely: send new_code only, with write_surgical_edit. It replaces the whole symbol, so include every line.
+2. To add something new, such as a constant, a function, or an import: set symbol to the nearest existing symbol, or the filename at file level. Set old_code to a line next to where it goes, copied exactly. Set new_code to that line plus the new code.
+3. Anything larger: send old_code and new_code. They replace only that text. Copy old_code exactly. It must match one place, so add a few surrounding lines if it could match twice.
+4. Send old_code with new_code for each site. edit_start_line and edit_end_line are optional.
+5. A file with no named symbols, such as yaml or plain text: use the filename as symbol.
+6. write_new_file is only for a file that does not exist yet. Never create a new file to avoid editing an existing one.
+Which tool writes code.
+write_surgical_edit: change or add code in a file that already exists. This is the only way to change repository code.
+write_new_file: only for a file that does not exist yet.
+write_edit_plan: three or more distinct files or symbols. It ends the turn, and each step then runs separately.
+request_file and request_search: load code before editing it. Never edit code you have not seen.
+Nothing is written to disk until the user applies it.
+• request_file — load a file already in this chat when you know its name.
+• request_search — grep files already in this chat.
+
+MEGA-SYMBOL RULE: Use write_edit_plan for changes across 3 or more DISTINCT files or symbols. It ends your turn: each step runs separately with focused context, so put a short description in each step and no code. One step per symbol. Several changes inside one large symbol are not a plan: use request_file, then several write_surgical_edit calls.
+• Call report_blocked only when required context truly cannot be found and you cannot continue. Say exactly what you need. This ends your turn.
+
+Do NOT narrate what you WOULD change — actually call write_surgical_edit / write_new_file with the real code. When your edits are complete, stop. Never describe an edit in prose instead of calling the tool.

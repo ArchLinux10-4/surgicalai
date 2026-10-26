@@ -75,12 +75,15 @@ def _safe_dlog(dlog: Optional[Callable], event: str, **kw) -> None:
         pass
 
 
-def shape_github_result(text: str, limit: int = 14000) -> str:
+def shape_github_result(text: str, limit: int | None = None) -> str:
     """Trim to `limit` chars without dropping a trailing '[TRUNCATED ...]' hint.
 
     Cuts the body and keeps the last footer line so a paged read_file still
     tells the model which start_line to request next.
     """
+    if limit is None:
+        from services.limits import GITHUB_READ_MAX_CHARS
+        limit = GITHUB_READ_MAX_CHARS
     try:
         text = "" if text is None else str(text)
         if len(text) <= limit:

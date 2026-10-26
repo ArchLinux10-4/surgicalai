@@ -206,6 +206,36 @@ def test_pipeline_only_adds_grok_branch_does_not_reorder_existing_branches():
     assert anthropic_idx < grok_idx < gemini_idx < openai_idx
 
 
+def test_model_did_not_respond_is_transient_and_fields_are_capped():
+    from services.grok_retry import grok_api_error_fields, grok_request_fields, is_transient_grok_error
+
+    err = Exception("Service temporarily unavailable. The model did not respond to this request.")
+    assert is_transient_grok_error(err)
+    assert not is_transient_grok_error(Exception("400 bad request — invalid parameter"))
+
+    class _API(Exception):
+        status_code = 503
+        request_id = "req_abc"
+        body = {"error": "x" * 800}
+
+    fields = grok_api_error_fields(_API("down"))
+    assert fields["status_code"] == 503
+    assert fields["request_id"] == "req_abc"
+    assert len(fields["error_body"]) <= 500
+
+    shape = grok_request_fields(
+        [{"role": "system", "content": "secret prompt"}, {"role": "user", "content": "hi"}],
+        {"stream": True, "tool_choice": "auto", "tools": [
+            {"type": "function", "function": {"name": "request_repo"}},
+        ]},
+        model="grok-4.7", mode="plan", turn=0,
+    )
+    assert shape["temperature_set"] is False
+    assert shape["tool_names"] == ["request_repo"]
+    assert shape["chars_by_role"]["system"] == len("secret prompt")
+    assert "secret prompt" not in str(shape)
+
+
 def test_api_retry_module_not_modified_for_grok_path():
     """This suite never imports api_retry.py's api_call_with_retry from
     grok_retry.py's runtime path — grok_retry.py re-implements its own

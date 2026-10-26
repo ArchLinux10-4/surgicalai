@@ -20,7 +20,6 @@ import {
   deriveStage,
   formatDuration,
   modelFamily,
-  rowsFromProgress,
   summarizeTrail,
 } from '../lib/toolActivity'
 
@@ -46,6 +45,7 @@ const KIND_CLASS: Record<ToolKind, string> = {
   qa: 'text-accent bg-accent/10',
   git: 'text-warning bg-warning/10',
   aws: 'text-warning bg-warning/10',
+  local: 'text-warning bg-warning/10',
   mcp: 'text-warning bg-warning/10',
   history: 'text-muted bg-overlay',
   preview: 'text-muted bg-overlay',
@@ -203,14 +203,16 @@ interface FeedProps {
   model?: string
   content?: string
   progress?: string
+  phaseLabel?: string
   isThinking?: boolean
   isBuildingEdit?: boolean
   compact?: boolean
   max?: number
+  wallMs?: number
 }
 
 function ToolActivityFeedInner({
-  mode, rows, startedAt, model, content, progress, isThinking, isBuildingEdit, compact, max,
+  mode, rows, startedAt, model, content, progress, phaseLabel, isThinking, isBuildingEdit, compact, max, wallMs,
 }: FeedProps) {
   const live = mode === 'live'
   const [open, setOpen] = useState(false)
@@ -218,10 +220,9 @@ function ToolActivityFeedInner({
   const [expanded, setExpanded] = useState<Record<string, boolean>>({})
 
   const source = useMemo(() => {
-    if (live && rows.length === 0) return rowsFromProgress(progress || '', startedAt || Date.now())
     if (max && rows.length > max) return rows.slice(rows.length - max)
     return rows
-  }, [live, rows, progress, startedAt, max])
+  }, [rows, max])
 
   const pinned = useMemo(() => {
     const ids = new Set<string>()
@@ -238,13 +239,15 @@ function ToolActivityFeedInner({
     && !source.some(row => row.status === 'running' || row.status === 'waiting')
   const stage = halted && !(content || '').trim()
     ? { label: 'Stopped', tone: 'think' as const }
-    : deriveStage({
-      rows: source,
-      content,
-      progress,
-      isThinking,
-      isBuildingEdit,
-    })
+    : (live && rows.length === 0 && phaseLabel)
+      ? { label: phaseLabel, tone: 'work' as const }
+      : deriveStage({
+        rows: source,
+        content,
+        progress,
+        isThinking,
+        isBuildingEdit,
+      })
   const { earlier, shown } = live
     ? partitionRows(source, content || '', pinned, earlierOpen)
     : { earlier: [] as ToolRow[], shown: source }
@@ -298,7 +301,7 @@ function ToolActivityFeedInner({
             onClick={() => setOpen(value => !value)}
           >
             <span aria-hidden>{open ? '▾' : '▸'}</span>
-            <span className="truncate">{summarizeTrail(rows)}</span>
+            <span className="truncate">{summarizeTrail(rows, wallMs)}</span>
           </button>
         )}
         {(live || open) && list}

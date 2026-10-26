@@ -3,7 +3,7 @@
  */
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { applyToolEvent, deriveStage, stopRunning, summarizeTrail } from './toolActivity.ts'
+import { applyToolEvent, deriveStage, stopRunning, summarizeTrail, turnWallMs } from './toolActivity.ts'
 import type { ToolActivityEvent, ToolRow } from '../types/index.ts'
 
 function row(partial: Partial<ToolRow> & Pick<ToolRow, 'id'>): ToolRow {
@@ -81,5 +81,12 @@ describe('summarizeTrail', () => {
     const text = summarizeTrail([missing])
     assert.equal(text, 'Used 1 tool')
     assert.equal(text.includes('NaN'), false)
+  })
+
+  it('uses the turn wall clock when tool timestamps only cover the last moment', () => {
+    const short = row({ id: 's', status: 'done', ms: 500, startedAt: 1_000, endedAt: 1_500 })
+    assert.equal(summarizeTrail([short]), 'Used 1 tool · 0.5s')
+    assert.equal(summarizeTrail([short], 99_000), 'Used 1 tool · 1m 39s')
+    assert.equal(turnWallMs('1970-01-01T00:01:40.000Z', [{ startedAt: 1_000 }]), 99_000)
   })
 })

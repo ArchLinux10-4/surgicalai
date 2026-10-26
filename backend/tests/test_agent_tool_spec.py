@@ -7,8 +7,12 @@ from services.agent_tool_spec import (
     DEFAULT_MAX_TURNS,
     MAX_FILES_PER_REQUEST,
     MAX_SEARCH_TERMS,
+    code_tools_text,
     history_text,
     limits_block,
+    local_text,
+    new_symbol_rule,
+    plan_step_lead,
     repo_text,
     scope_block,
 )
@@ -16,6 +20,7 @@ from services.edit_intent import build_xml_agent_instruction
 from services.grok_agent_tools import (
     TOOL_AWS_CLI,
     TOOL_GIT_CLI,
+    TOOL_LOCAL,
     TOOL_REPORT_BLOCKED,
     TOOL_REQUEST_FILE,
     TOOL_REQUEST_GITHUB,
@@ -59,6 +64,7 @@ _TOOL_NAMES = {
     TOOL_REQUEST_REPO,
     TOOL_AWS_CLI,
     TOOL_GIT_CLI,
+    TOOL_LOCAL,
     TOOL_REPORT_BLOCKED,
 }
 
@@ -76,6 +82,7 @@ _TAG_NAMES = {
     "repo_request",
     "aws_cli",
     "git_cli",
+    "local_cli",
     "blocked",
 }
 
@@ -88,6 +95,7 @@ _FLAG_KEYS = (
     "mcp_enabled",
     "repo_enabled",
     "git_enabled",
+    "local_enabled",
 )
 
 
@@ -159,6 +167,7 @@ def test_function_name_parity_across_modes_and_flags():
                     if k in (
                         "github_enabled", "history_enabled", "preview_enabled",
                         "websearch_enabled", "mcp_enabled", "repo_enabled",
+                        "local_enabled",
                     )
                 })
             )
@@ -250,11 +259,12 @@ def test_grok_prompt_has_no_tool_tags_and_no_ignore():
         + build_grok_system_suffix(
             "edit", github_enabled=True, history_enabled=True, repo_enabled=True,
             preview_enabled=True, websearch_enabled=True, mcp_enabled=True,
-            aws_enabled=True, git_enabled=True,
+            aws_enabled=True, git_enabled=True, local_enabled=True,
         )
         + build_grok_agent_instruction(
             "edit", github_enabled=True, history_enabled=True, repo_enabled=True,
             preview_enabled=True, websearch_enabled=True, mcp_enabled=True,
+            local_enabled=True,
         )
     )
     assert "IGNORE" not in text
@@ -262,6 +272,17 @@ def test_grok_prompt_has_no_tool_tags_and_no_ignore():
     # Grok to call the function instead. Every other tool tag stays out.
     leaked = _tags(text) - {"aws_cli"}
     assert leaked == set(), leaked
+
+
+def test_local_text_matches_both_forms():
+    tag = local_text("tag")
+    function = local_text("function")
+    for text in (tag, function):
+        assert "run_local" in text
+        assert "Ask and Plan can only read" in text
+        assert "No sudo" in text
+    assert "<local_cli>" in tag
+    assert "<" not in function
 
 
 def test_git_diff_is_described_for_both_forms():
@@ -308,6 +329,47 @@ def test_history_text_names_the_three_views():
         assert "diff_branches" in text
     assert "<history_request>" in history_text("tag")
     assert "<" not in history_text("function")
+
+
+def test_code_tools_text_matches_both_forms():
+    rule = new_symbol_rule()
+    for flags in (
+        {},
+        {"repo": True, "local": True, "git": True},
+    ):
+        tag = code_tools_text("tag", **flags)
+        function = code_tools_text("function", **flags)
+        assert "Which tool writes code." in tag and "Which tool writes code." in function
+        assert tag.count("\n") == function.count("\n")
+        assert ("<surgical_edit>" in tag) and ("write_surgical_edit" in function)
+        assert ("<new_file>" in tag) and ("write_new_file" in function)
+        assert ("<edit_plan>" in tag) and ("write_edit_plan" in function)
+        assert "Nothing is written to disk until the user applies it." in tag
+        assert "Nothing is written to disk until the user applies it." in function
+        if flags.get("repo"):
+            assert "read_repo_file" in tag and "read_repo_file" in function
+        else:
+            assert "read_repo_file" not in tag and "request_repo" not in function
+        if flags.get("local"):
+            assert "<local_cli>" in tag and "run_local" in function
+        else:
+            assert "run_local" not in function
+        if flags.get("git"):
+            assert "<git_cli>" in tag and "git_cli" in function
+        else:
+            assert "git_cli" not in function
+    assert NATURAL_SYSTEM.count(rule) == 1
+    assert _assemble_natural("gpt").count(rule) == 1
+    assert _assemble_natural("gemini").count(rule) == 1
+    grok = grok_natural_system() + build_grok_system_suffix("edit")
+    assert grok.count(rule) == 1
+    assert "To add something new" not in build_grok_system_suffix("ask")
+    assert "To add something new" not in build_grok_system_suffix("plan")
+    known = plan_step_lead("Header", "Header.tsx", True)
+    unknown = plan_step_lead("MODEL_CATALOG", "config.py", False)
+    assert known.startswith("Edit the symbol")
+    assert "is new" in unknown and rule in unknown
+    assert "Edit the symbol" not in unknown
 
 
 def test_limits_use_the_real_constants():

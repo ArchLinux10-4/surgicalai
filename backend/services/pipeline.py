@@ -8,6 +8,7 @@ Best Practice #2: Minimal footprint (surgeon only touches requested symbol)
 Best Practice #3: Verify before commit (confidence scoring + diff)
 """
 import ast
+import asyncio
 import copy
 import json
 import re
@@ -36,44 +37,22 @@ _DLOG_PATH = "/tmp/surgical_debug.jsonl"
 _DLOG_MAX_BYTES = 5 * 1024 * 1024   # 5 MB cap — rotate by truncating oldest half
 _DLOG_EXPIRE_DAYS = 7               # auto-expire DB entries older than this
 
+def _sse_line(obj) -> str:
+    """One SSE frame. Unknown types fail only when SURGICAL_DEBUG is set."""
+    from services.stream_events import check as _check_stream_event
+    _check_stream_event(obj)
+    return f"data: {json.dumps(obj)}\n\n"
+
+
 def _dlog(event: str, **kwargs):
-    """Append a structured debug record to the database (persistent) and /tmp file (fast fallback)."""
+    """Queue a debug record. The debug_events writer batches the insert.
+
+    A per-event connection here used to run on the event loop, inside the
+    token stream, and the chunks arrived in bursts.
+    """
     try:
-        ts = _dt.datetime.utcnow().isoformat() + "Z"
-        record = {"ts": ts, "event": event, **kwargs}
-        line = _json_mod.dumps(record, default=str) + "\n"
-
-        # ── Primary: write to database (survives deploys/restarts) ──
-        try:
-            from database import get_db_ctx
-            with get_db_ctx() as conn:
-                session_id = str(kwargs.get("session_id", ""))
-                user_id = str(kwargs.get("user_id", ""))
-                data_json = _json_mod.dumps(record, default=str)
-                conn.execute(
-                    "INSERT INTO debug_events (id, event, session_id, user_id, data, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (str(_uuid_dlog.uuid4()), event, session_id, user_id, data_json, ts),
-                )
-                # Probabilistic cleanup: ~1 in 50 calls, expire old entries
-                if _rnd_dlog.random() < 0.02:
-                    cutoff = (_dt.datetime.utcnow() - _dt.timedelta(days=_DLOG_EXPIRE_DAYS)).isoformat()
-                    conn.execute("DELETE FROM debug_events WHERE created_at < ?", (cutoff,))
-                conn.commit()
-        except Exception:
-            pass  # DB write failed — file fallback still works
-
-        # ── Secondary: write to /tmp file (backward compat + fast grep) ──
-        try:
-            if _os.path.exists(_DLOG_PATH) and _os.path.getsize(_DLOG_PATH) > _DLOG_MAX_BYTES:
-                with open(_DLOG_PATH, "r") as _f:
-                    _lines = _f.readlines()
-                with open(_DLOG_PATH, "w") as _f:
-                    _f.writelines(_lines[len(_lines)//2:])
-        except Exception:
-            pass
-        with open(_DLOG_PATH, "a") as _f:
-            _f.write(line)
+        from debug_events import emit
+        emit(event, **kwargs)
     except Exception:
         pass  # logging must NEVER crash the pipeline
 
@@ -1416,6 +1395,7 @@ from services.grok_agent_tools import (  # noqa: E402
     build_grok_system_suffix as _grok_build_system_suffix,
     build_grok_agent_instruction as _grok_build_agent_instruction,
     format_tool_call_progress as _grok_format_tool_progress,
+    aiter_sync as _grok_aiter_sync,
     extract_reasoning_delta as _grok_extract_reasoning_delta,
     summarize_translation_progress as _grok_summarize_translation_progress,
 )
@@ -1425,6 +1405,8 @@ from services.grok_agent_tools import (  # noqa: E402
 from services.grok_retry import (  # noqa: E402
     grok_chat_create_with_billing_guard as _grok_chat_create_with_billing_guard,
     GrokBillingCapError as _GrokBillingCapError,
+    grok_api_error_fields as _grok_api_error_fields,
+    grok_request_fields as _grok_request_fields,
 )
 # Gap D (OpenAI billing/quota-cap 429 pointlessly retried) — new file,
 # GPT-scoped, does NOT touch api_retry.py. Wired into _chat_create's shared
@@ -1666,7 +1648,8 @@ def _grep_relevant_sections(
     if not output_parts:
         return ""
 
-    matched_terms = ", ".join(f'"{t}"' for t in terms[:8])
+    from services.limits import MAX_SEARCH_TERMS as _search_cap
+    matched_terms = ", ".join(f'"{t}"' for t in terms[:_search_cap])
     header = (
         f"\nKEYWORD MATCH IN {file_name} "
         f"(searched for: {matched_terms}):\n"
@@ -1959,6 +1942,12 @@ async def _safe_claude_call(aclient_inst, *, model: str,
 # HTTP 200 with stop_reason "refusal", so it never raises — QA callers must
 # check for it explicitly or they would parse the refusal text as a verdict.
 _QA_REFUSAL_FALLBACK_MODEL = "claude-sonnet-5"
+
+# QA correction rounds. Module-level on purpose: the diff-first block reads
+# this before the old in-function assignment, and plan builds always take
+# that path. A local assigned later makes Python treat every read as local
+# and raises UnboundLocalError.
+MAX_QA_RETRIES = 2
 
 
 class _QARefusalError(ValueError):
@@ -4438,6 +4427,7 @@ def _ask_plan_build_tool_instructions(
     working_branch=None,
     repo_enabled: bool = False,
     git_enabled: bool = False,
+    local_enabled: bool = False,
 ) -> str:
     """
     Composes the Ask/Plan tool-instructions system-prompt block from
@@ -4500,6 +4490,10 @@ def _ask_plan_build_tool_instructions(
         from services.agent_tool_spec import git_cli_text as _git_cli_text
         tag_blocks.append(_git_cli_text("tag"))
 
+    if local_enabled:
+        from services.agent_tool_spec import local_text as _local_text
+        tag_blocks.append(_local_text("tag"))
+
     if websearch_enabled:
         tag_blocks.append(
             '<web_search_request>{"query": "what to look up", "reason": "why"}'
@@ -4519,7 +4513,7 @@ def _ask_plan_build_tool_instructions(
     from services.agent_tool_spec import scope_block as _scope_block
     _scope = _scope_block(
         session_files=has_files, repo=repo_enabled, github=gh_enabled,
-        web=websearch_enabled, git=git_enabled, form="tag",
+        web=websearch_enabled, git=git_enabled, local=local_enabled, form="tag",
     )
     if _scope:
         parts.append(_scope)
@@ -4547,6 +4541,7 @@ def _ask_plan_strip_tool_tags(text: str) -> str:
     text = re.sub(r'<history_request>.*?</history_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<aws_cli>.*?</aws_cli>', '', text, flags=re.DOTALL)
     text = re.sub(r'<git_cli>.*?</git_cli>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<local_cli>.*?</local_cli>', '', text, flags=re.DOTALL)
     text = re.sub(r'<web_search_request>.*?</web_search_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<mcp_request>.*?</mcp_request>', '', text, flags=re.DOTALL)
     text = re.sub(r'<repo_request>.*?</repo_request>', '', text, flags=re.DOTALL)
@@ -4657,9 +4652,10 @@ def _ask_plan_execute_tool_round(
                 )
                 if _seen is not None:
                     _seen[_gh_sig] = tool_round
+                from services.limits import GITHUB_READ_MAX_CHARS as _gh_read_cap
                 tool_parts.append(
                     f"GitHub {gr_parsed.get('tool')} result:\n"
-                    f"{shape_github_result(str(gr_result), 14000)}"
+                    f"{shape_github_result(str(gr_result), _gh_read_cap)}"
                 )
                 _dlog("ask_plan_github_executed", session_id=session_id, user_id=user_id,
                       tool_round=tool_round, tool=gr_parsed.get("tool"),
@@ -4733,6 +4729,8 @@ def _ask_plan_execute_tool_round(
     # applies the read-only gate, the three-command stop, and file capture.
     # Git is not run here. Ask/Plan loops call resolve_git_call, which
     # applies the read-only gate and the three-command stop.
+    # The local Mac tool is not run here. Ask/Plan loops call resolve_local_call,
+    # which applies the read-only gate and the three-command stop.
     return tool_parts
 
 
@@ -4911,9 +4909,18 @@ async def run_chat_stream(
             _git_tools = False
             _dlog("ask_plan_git_gate_error", session_id=session_id, user_id=user_id,
                   error=str(_git_gate_err)[:200])
+    _local_tools = False
+    if not _ask_plan_is_ollama:
+        try:
+            from services.local_exec import local_available as _local_on
+            _local_tools = bool(_local_on(user_id))
+        except Exception as _local_gate_err:
+            _local_tools = False
+            _dlog("ask_plan_local_gate_error", session_id=session_id, user_id=user_id,
+                  error=str(_local_gate_err)[:200])
     _ask_plan_tools_enabled = (
         (_ask_plan_has_files or _gh_nat_enabled or _aws_connected
-         or _oa_search_enabled or _ask_plan_mcp or _repo_tools)
+         or _oa_search_enabled or _ask_plan_mcp or _repo_tools or _local_tools)
         and not _ask_plan_is_ollama
     )
     _dlog("ask_plan_tools_gate_evaluated", session_id=session_id, user_id=user_id,
@@ -5003,7 +5010,8 @@ async def run_chat_stream(
             mcp_guidance=_ask_plan_mcp_guidance,
             working_branch=_gh_session_target,
             repo_enabled=_repo_tools,
-            git_enabled=_git_tools))
+            git_enabled=_git_tools,
+            local_enabled=_local_tools))
         _dlog("ask_plan_tools_enabled", session_id=session_id, user_id=user_id,
               model=chat_model, num_files=len(file_content_lookup),
               github_enabled=_gh_nat_enabled, known_repos=_gh_known_repos)
@@ -5082,7 +5090,7 @@ async def run_chat_stream(
 
     try:
         def sse(obj):
-            return f"data: {json.dumps(obj)}\n\n"
+            return _sse_line(obj)
 
         if _ask_plan_tools_enabled and (_is_grok_model(chat_model) or _is_gpt_model(chat_model)):
             # Native tools for Grok and GPT. Both narrate an XML tag instead of
@@ -5098,6 +5106,14 @@ async def run_chat_stream(
                 mode=_grok_ask_plan_effective_mode,
             )
             _grok_client = _get_client_for_model(chat_model, user_id, session_id=session_id)
+
+            def _grok_plan_chat_create(_client, model, messages, **_kwargs):
+                return _grok_chat_create_with_billing_guard(
+                    _client, model=model, messages=messages,
+                    dlog=_dlog, session_id=session_id or "", user_id=user_id or "",
+                    **_kwargs,
+                )
+
             async for _gchunk in _grok_run_ask_plan_native_stream(
                 client=_grok_client,
                 chat_model=chat_model,
@@ -5114,6 +5130,7 @@ async def run_chat_stream(
                 mcp_enabled=_ask_plan_mcp,
                 repo_enabled=_repo_tools,
                 git_enabled=_git_tools,
+                local_enabled=_local_tools,
                 openai_client=_oa_search_client,
                 web_search_sources=_web_search_sources_final,
                 client_inbox=client_inbox,
@@ -5121,7 +5138,7 @@ async def run_chat_stream(
                 symbol_maps_by_name=symbol_maps_by_name,
                 file_content_lookup=file_content_lookup,
                 execute_tool_round_fn=_ask_plan_execute_tool_round,
-                chat_create_fn=_chat_create,
+                chat_create_fn=_grok_plan_chat_create,
                 iter_chunks_fn=_iter_openai_stream_chunks,
                 max_rounds=_ASK_PLAN_MAX_ROUNDS,
                 deadline_s=_ASK_PLAN_DEADLINE_S,
@@ -5141,6 +5158,7 @@ async def run_chat_stream(
             _tool_round = 0
             _aws_calls = 0
             _git_calls = 0
+            _local_calls = 0
             _mcp_calls = 0
             _oa_budget = None
             if _ask_plan_websearch:
@@ -5197,6 +5215,10 @@ async def run_chat_stream(
                     re.search(r'<git_cli>\s*(.*?)\s*</git_cli>', _round_text, re.DOTALL)
                     if _git_tools else None
                 )
+                _local_match = (
+                    re.search(r'<local_cli>\s*(.*?)\s*</local_cli>', _round_text, re.DOTALL)
+                    if _local_tools else None
+                )
                 _wr_match = (
                     re.search(
                         r'<web_search_request>\s*(.*?)\s*</web_search_request>',
@@ -5213,13 +5235,13 @@ async def run_chat_stream(
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
                 _ask_plan_no_more_tools = (
                     not _sr_match and not _fr_match and not _gr_match and not _rr_match
-                    and not _hr_match and not _aws_match and not _git_match and not _wr_match
+                    and not _hr_match and not _aws_match and not _git_match and not _local_match and not _wr_match
                     and not _mcp_match
                 )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _git_match or _wr_match or _mcp_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _git_match or _local_match or _wr_match or _mcp_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5297,6 +5319,35 @@ async def run_chat_stream(
                     if _aws_done.get("counted"):
                         _aws_calls += 1
                     _tool_parts = [_aws_done.get("note") or ""]
+                    _end = _ask_tracker.end(_tool_parts[0])
+                    if _end:
+                        yield sse(_end)
+                elif _local_match:
+                    from services.local_exec import resolve_local_call as _resolve_local
+                    _local_done = {"note": "", "counted": False, "run": False}
+                    _ev = _ask_tracker.start("local", (_local_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
+                    async for _local_ev in _resolve_local(
+                        (_local_match.group(1) or "").strip(),
+                        mode or "ask",
+                        _local_calls,
+                        client_inbox,
+                        user_id=user_id,
+                        dlog=_dlog,
+                        session_id=session_id or "",
+                        root=((_repo_ctx or {}).get("root_path") or ""),
+                    ):
+                        if _local_ev.get("type") == "local_done":
+                            _local_done = _local_ev
+                        else:
+                            _o = _ask_tracker.observe(_local_ev)
+                            if _o:
+                                yield sse(_o)
+                            yield sse(_local_ev)
+                    if _local_done.get("counted"):
+                        _local_calls += 1
+                    _tool_parts = [_local_done.get("note") or ""]
                     _end = _ask_tracker.end(_tool_parts[0])
                     if _end:
                         yield sse(_end)
@@ -5396,7 +5447,8 @@ async def run_chat_stream(
                         hr=_hr_match, rr=_rr_match,
                     ):
                         yield sse(_ev)
-                    _tool_parts = _ask_plan_execute_tool_round(
+                    _tool_parts = await asyncio.to_thread(
+                        _ask_plan_execute_tool_round,
                         sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
                         hr_match=_hr_match, aws_match=None, rr_match=_rr_match,
                         symbol_maps_by_name=symbol_maps_by_name,
@@ -5549,6 +5601,7 @@ async def run_chat_stream(
             _tool_round = 0
             _aws_calls = 0
             _git_calls = 0
+            _local_calls = 0
             _mcp_calls = 0
             if steer_inbox is not None:
                 yield sse({"type": "steer_ready"})
@@ -5659,6 +5712,10 @@ async def run_chat_stream(
                     re.search(r'<git_cli>\s*(.*?)\s*</git_cli>', _round_text, re.DOTALL)
                     if _git_tools else None
                 )
+                _local_match = (
+                    re.search(r'<local_cli>\s*(.*?)\s*</local_cli>', _round_text, re.DOTALL)
+                    if _local_tools else None
+                )
                 _mcp_match = (
                     re.search(
                         r'<mcp_request>\s*(.*?)\s*</mcp_request>',
@@ -5669,12 +5726,12 @@ async def run_chat_stream(
                 _ask_plan_elapsed = time.time() - _ask_plan_t0
                 _ask_plan_no_more_tools = (
                     not _sr_match and not _fr_match and not _gr_match and not _rr_match
-                    and not _hr_match and not _aws_match and not _git_match and not _mcp_match
+                    and not _hr_match and not _aws_match and not _git_match and not _local_match and not _mcp_match
                 )
                 _ask_plan_round_cap_hit = _tool_round >= _ASK_PLAN_MAX_ROUNDS
                 _ask_plan_deadline_hit = _ask_plan_elapsed >= _ASK_PLAN_DEADLINE_S
                 if _ask_plan_no_more_tools or _ask_plan_round_cap_hit or _ask_plan_deadline_hit:
-                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _git_match or _mcp_match) else _round_text
+                    _clean_text = _ask_plan_strip_tool_tags(_round_text) if (_sr_match or _fr_match or _gr_match or _rr_match or _hr_match or _aws_match or _git_match or _local_match or _mcp_match) else _round_text
                     if not _clean_text.strip():
                         _clean_text = ("I looked at the available code but couldn't fully answer within "
                                        "my lookup budget — try asking about a more specific file or function.")
@@ -5755,6 +5812,35 @@ async def run_chat_stream(
                     _end = _ask_tracker.end(_tool_parts[0])
                     if _end:
                         yield sse(_end)
+                elif _local_match:
+                    from services.local_exec import resolve_local_call as _resolve_local
+                    _local_done = {"note": "", "counted": False, "run": False}
+                    _ev = _ask_tracker.start("local", (_local_match.group(1) or "").strip(), turn=_tool_round)
+                    if _ev:
+                        yield sse(_ev)
+                    async for _local_ev in _resolve_local(
+                        (_local_match.group(1) or "").strip(),
+                        mode or "ask",
+                        _local_calls,
+                        client_inbox,
+                        user_id=user_id,
+                        dlog=_dlog,
+                        session_id=session_id or "",
+                        root=((_repo_ctx or {}).get("root_path") or ""),
+                    ):
+                        if _local_ev.get("type") == "local_done":
+                            _local_done = _local_ev
+                        else:
+                            _o = _ask_tracker.observe(_local_ev)
+                            if _o:
+                                yield sse(_o)
+                            yield sse(_local_ev)
+                    if _local_done.get("counted"):
+                        _local_calls += 1
+                    _tool_parts = [_local_done.get("note") or ""]
+                    _end = _ask_tracker.end(_tool_parts[0])
+                    if _end:
+                        yield sse(_end)
                 elif _mcp_match:
                     from services.mcp_client import resolve_mcp_call as _resolve_mcp
                     _mcp_done = {"note": "", "counted": False}
@@ -5790,7 +5876,8 @@ async def run_chat_stream(
                         hr=_hr_match, rr=_rr_match,
                     ):
                         yield sse(_ev)
-                    _tool_parts = _ask_plan_execute_tool_round(
+                    _tool_parts = await asyncio.to_thread(
+                        _ask_plan_execute_tool_round,
                         sr_match=_sr_match, fr_match=_fr_match, gr_match=_gr_match,
                         hr_match=_hr_match, aws_match=None, rr_match=_rr_match,
                         symbol_maps_by_name=symbol_maps_by_name,
@@ -5841,9 +5928,18 @@ async def run_chat_stream(
                 if delta.content:
                     yield f"data: {json.dumps({'type': 'token', 'content': delta.content})}\n\n"
     except Exception as e:
+        _stream_err = {
+            "error_type": type(e).__name__,
+            "error": str(e)[:300],
+            "phase": "run_chat_stream",
+        }
+        try:
+            _stream_err.update(_grok_api_error_fields(e))
+            _stream_err["phase"] = "run_chat_stream"
+        except Exception:
+            pass
         _dlog("streaming_error",
-              error_type=type(e).__name__,
-              error=str(e)[:300], user_id=user_id, session_id=session_id)
+              user_id=user_id, session_id=session_id, **_stream_err)
         yield sse({"type": "error", "content": _friendly_error(e)})
 
     _done_payload = {"type": "done", "content": "", "model": _model_used}
@@ -8551,6 +8647,10 @@ def _extract_json_from_text(text: str) -> dict:
 
 # ---------------------------------------------------------------------------
 # Helper: run_qa_for_changes
+# Chat modes always call run_natural_pipeline_stream. routers/chat.py sets
+# _use_natural = True, so run_smart_pipeline_stream is not reachable from
+# Ask, Plan, Edit, or Agent. This helper is still used by
+# analyze_and_plan_stream (the surgical analyze route). Keep it.
 # ---------------------------------------------------------------------------
 
 async def run_qa_for_changes(
@@ -8668,7 +8768,7 @@ async def run_qa_for_changes(
         raw_text = ""
         try:
             aclient = AsyncAnthropic(api_key=anthropic_key)
-            _qa_model_legacy = "claude-sonnet-5-5"
+            _qa_model_legacy = get_setting("qa_model", "claude-sonnet-5-5") or "claude-sonnet-5-5"
             _dlog("qa_for_changes_call_config", model=_qa_model_legacy,
                   wrapper="safe_claude_call")
             response = await _safe_claude_call_refusal_fallback(
@@ -8771,7 +8871,7 @@ async def analyze_and_plan_stream(
 
     try:
         def sse(obj: dict) -> str:
-            return f"data: {json.dumps(obj)}\n\n"
+            return _sse_line(obj)
 
         # ------------------------------------------------------------------
         # Step 1: Parse file
@@ -10693,7 +10793,7 @@ async def _run_qa_for_new_file(file_result: dict, codebase_context: str, user_id
     try:
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _use_claude = True
-        _model = "claude-sonnet-5-5"  # QA runs on Sonnet 5.5 (faster, fewer tokens per task)
+        _model = get_setting("qa_model", "claude-sonnet-5-5") or "claude-sonnet-5-5"
     except Exception as _qc_key_err:
         _qa_aclient = None
         _use_claude = False
@@ -11509,11 +11609,11 @@ async def run_qa_agent(
     try:
         _qa_aclient = AsyncAnthropic(api_key=_get_anthropic_key(user_id))
         _qa_use_claude = True
-        _qa_model = "claude-sonnet-5-5"  # QA runs on Sonnet 5.5 (faster, fewer tokens per task)
+        _qa_model = get_setting("qa_model", "claude-sonnet-5-5") or "claude-sonnet-5-5"
     except Exception as _qa_key_err:
         _qa_aclient = None
         _qa_use_claude = False
-        _qa_model = "gpt-4.1"  # full GPT-4.1, not mini — QA must not be weakest link
+        _qa_model = get_setting("qa_model", "gpt-4.1") or "gpt-4.1"  # full GPT-4.1, not mini — QA must not be weakest link
         _dlog("qa_agent_claude_fallback",
               session_id=session_id, reason=str(_qa_key_err)[:120],
               fallback_model=_qa_model, user_id=user_id)
@@ -12257,6 +12357,52 @@ def _build_architect_checkpoint_resolved(edit_blocks_raw: list, new_file_blocks_
     return resolved
 
 
+def normalize_plan_new_file(raw: str, filename: str) -> str:
+    """Save a plan create step under the step's filename.
+
+    The model often wraps the file as JSON, and sometimes nests that JSON
+    again as the content string. The step name wins over any name inside
+    the body, including a name guessed from the plan text.
+    """
+    import json as _json
+
+    text = (raw or "").strip()
+    data = None
+    try:
+        data = _json.loads(text)
+    except Exception:
+        try:
+            data = _json.loads(_repair_json(text))
+        except Exception:
+            data = None
+    content = text
+    language = ""
+    summary = ""
+    if isinstance(data, dict):
+        inner = data.get("content")
+        content = inner if isinstance(inner, str) and inner.strip() else text
+        language = str(data.get("language") or "")
+        summary = str(data.get("summary") or "")
+    elif isinstance(data, str) and data.strip():
+        content = data
+    nested = content.strip()
+    if nested.startswith("{") and '"content"' in nested[:400]:
+        try:
+            again = _json.loads(nested)
+        except Exception:
+            again = None
+        if isinstance(again, dict) and isinstance(again.get("content"), str) and again["content"].strip():
+            content = again["content"]
+            language = language or str(again.get("language") or "")
+            summary = summary or str(again.get("summary") or "")
+    return _json.dumps({
+        "filename": filename,
+        "content": content,
+        "language": language,
+        "summary": summary,
+    })
+
+
 def _infer_new_file_from_raw(raw_content: str, user_request: str) -> dict | None:
     """
     Fallback for GPT models that write raw file content inside <new_file>
@@ -12600,7 +12746,7 @@ async def run_smart_pipeline_stream(
     import asyncio
 
     def sse(obj):
-        return f"data: {json.dumps(obj)}\n\n"
+        return _sse_line(obj)
 
     run_id = str(uuid.uuid4())
     _model_used = ""
@@ -14252,6 +14398,7 @@ USER REQUEST:
                 _oai_arch_extra_kwargs["reasoning_effort"] = "low"
 
             _OAI_ARCH_TIMEOUT = 120
+            start_time = time.time()
 
             if steer_inbox is not None:
                 yield sse({"type": "steer_ready"})
@@ -14280,7 +14427,7 @@ USER REQUEST:
 
                 _round_label = f" (search round {_oai_round}/{_OAI_REACT_MAX})" if _oai_round > 1 else ""
                 if _oai_round > 1:
-                    elapsed = int(time.time() - start_time) if 'start_time' in dir() else 0
+                    elapsed = int(time.time() - start_time)
                     yield sse({"type": "progress", "content": f"Architect thinking{_round_label}... ({elapsed}s)"})
 
                 _dlog("oai_tool_use_call_setup",
@@ -16086,7 +16233,7 @@ Rules for search_request:
 - You can also search for string literals: "Papa.parse", "jl-count-badge", "mode-comm"
 - Max 5 terms per request
 - Only request what you genuinely need — the code you're missing to write a correct edit
-- After receiving results, write your edits immediately
+- After receiving results, write the edit when you have what you need. Otherwise request more.
 - Do NOT search for things already shown in the context above
 
 ━━━ REQUESTING FILES BY NAME ━━━
@@ -16321,6 +16468,7 @@ For JSX, TSX, or HTML edits — BEFORE writing your edit block, do this:
 Failure to balance tags is the #1 cause of rejected edits. Count twice, emit once."""
 
 from services.agent_tool_spec import (
+    code_tools_text as _code_tools_text,
     edit_ladder as _edit_ladder,
     limits_block as _limits_block,
     DEFAULT_MAX_TURNS as _DEFAULT_MAX_TURNS,
@@ -16333,9 +16481,9 @@ def _natural_tag(family):
     heading = "━━━ EDITING EXISTING FILES ━━━\n"
     if after.startswith(heading):
         rest = after[len(heading):].lstrip("\n")
-        editing = heading + "\n" + _edit_ladder("tag", fam) + "\n\n" + rest
+        editing = heading + "\n" + _edit_ladder("tag", fam) + "\n\n" + _code_tools_text("tag") + "\n\n" + rest
     else:
-        editing = _edit_ladder("tag", fam) + "\n\n" + after
+        editing = _edit_ladder("tag", fam) + "\n\n" + _code_tools_text("tag") + "\n\n" + after
     return (
         _limits_block("tag", _DEFAULT_MAX_TURNS)
         + "\n\n"
@@ -16704,6 +16852,7 @@ def _build_symbol_correction(
 
     unresolved: list of dicts with keys: filename, symbol, new_code, description
     """
+    from services.agent_tool_spec import new_symbol_rule as _new_symbol_rule
     parts = [
         "Some of the symbols you referenced don't exist in the files. "
         "Here are the ACTUAL symbols available — please revise your edits to use these exact names:\n"
@@ -16713,6 +16862,22 @@ def _build_symbol_correction(
         filename = item.get("filename", "")
         bad_name = item.get("symbol", "")
         smap, _ = symbol_maps_by_name.get(filename, (None, None))
+        _known = False
+        if smap and getattr(smap, "symbols", None):
+            _known = any(
+                bad_name and bad_name in (getattr(s, "name", ""), getattr(s, "full_path", ""))
+                for s in smap.symbols
+            )
+        if not item.get("_snippet_reason") and not _known:
+            parts.append(
+                f"\n`{bad_name}` is not in {filename}. "
+                + _new_symbol_rule()
+                + (
+                    " Your old_code can stay when it is a line copied exactly from the file."
+                    if (item.get("old_code") or "").strip()
+                    else ""
+                )
+            )
 
         # Snippet edits: the symbol exists, but the supplied old_code did not
         # match. Guide Claude to fix the targeted snippet rather than telling it
@@ -17396,7 +17561,8 @@ def _resolve_search_multifile(
     result_parts = []
     seen_paths: set = set()
 
-    for term in terms[:8]:  # cap to avoid context explosion
+    from services.limits import MAX_SEARCH_TERMS as _search_cap
+    for term in terms[:_search_cap]:  # cap to avoid context explosion
         term_lower = term.lower()
         found_anything = False
 
@@ -17782,6 +17948,67 @@ async def _retry_truncated_newfile(
         return None
 
 
+class _PlanSymbolNotFound(Exception):
+    """The plan step's symbol is not in the file. Do not call the model."""
+
+
+class _PlanStepTimeout(Exception):
+    """One plan step's model call exceeded its timeout."""
+
+
+async def _execute_single_new_file(
+    aclient, model: str,
+    filename: str, description: str, user_request: str,
+    session_id: str = "", user_id: str = "",
+    max_wait_s: float = 120.0,
+) -> str | None:
+    """One <new_file> block for a plan step that creates a file."""
+    focused_system = (
+        "You are SurgicalAI. Write EXACTLY ONE <new_file> block.\n\n"
+        "<new_file>\n"
+        '{"filename": "...", "language": "...", "summary": "...", "content": "..."}\n'
+        "</new_file>\n\n"
+        "Write the complete file. No placeholders."
+    )
+    focused_user = (
+        f"Create `{filename}`.\n"
+        f"What it should do: {description}\n\n"
+        f"User's original request: {user_request}\n"
+    )
+    try:
+        chunks = []
+        async with asyncio.timeout(max(5.0, float(max_wait_s))):
+            async with aclient.messages.stream(
+                model=model,
+                max_tokens=_max_output_tokens(model),
+                system=focused_system,
+                messages=[{"role": "user", "content": focused_user}],
+            ) as stream:
+                async for piece in stream.text_stream:
+                    chunks.append(piece)
+        text = "".join(chunks)
+        start = text.find("<new_file>")
+        end = text.find("</new_file>")
+        if start != -1 and end != -1 and end > start:
+            raw = text[start + len("<new_file>"):end].strip()
+            _dlog("plan_create_success", session_id=session_id, user_id=user_id,
+                  filename=filename, raw_len=len(raw))
+            return raw
+        _dlog("plan_create_no_block", session_id=session_id, user_id=user_id,
+              filename=filename, response_preview=text[:200])
+        return None
+    except TimeoutError:
+        _dlog("plan_execute_timeout", session_id=session_id, user_id=user_id,
+              filename=filename, symbol=filename, timeout_sec=max_wait_s)
+        raise _PlanStepTimeout(filename)
+    except Exception as e:
+        _raise_if_anthropic_credit_error(
+            e, dlog=_dlog, session_id=session_id, user_id=user_id)
+        _dlog("plan_create_error", session_id=session_id, user_id=user_id,
+              filename=filename, error=str(e)[:300])
+        return None
+
+
 async def _execute_single_edit(
     aclient, model: str,
     filename: str, symbol_name: str, change_description: str,
@@ -17798,6 +18025,7 @@ async def _execute_single_edit(
     import json as _json
 
     # Build symbol index for this file
+    _symbol_in_index = False
     sym_index = ""
     if symbol_map and hasattr(symbol_map, "symbols") and symbol_map.symbols:
         sym_lines = []
@@ -17807,7 +18035,14 @@ async def _execute_single_edit(
                 f"  [{s.symbol_type.value}] {s.full_path:<45} "
                 f"L{s.start_line}\u2013{s.end_line}  ({size}L)"
             )
+            if symbol_name and symbol_name in (
+                getattr(s, "name", ""), getattr(s, "full_path", ""),
+            ):
+                _symbol_in_index = True
         sym_index = "SYMBOL INDEX:\n" + "\n".join(sym_lines) + "\n\n"
+
+    from services.agent_tool_spec import plan_step_lead as _plan_step_lead
+    _step_lead = _plan_step_lead(symbol_name, filename, _symbol_in_index)
 
     focused_system = (
         "You are SurgicalAI. Produce exactly ONE <surgical_edit> block for the requested change.\n\n"
@@ -17934,16 +18169,42 @@ async def _execute_single_edit(
                       term_hit=bool(_win.get("term_hit")),
                       terms=(_win.get("terms") or [])[:12])
         else:
-            # Symbol not found in map — show full content as fallback
-            file_display = file_content
-            _dlog("execute_task_no_window",
-                  session_id=session_id, user_id=user_id,
-                  filename=filename, symbol=symbol_name,
-                  total_lines=file_line_count,
-                  reason="symbol_not_found_in_map")
+            from services.plan_artifact import module_assignment_window, text_anchor_window
+            file_display = module_assignment_window(file_content, symbol_name)
+            if file_display:
+                _dlog("execute_task_assignment_window",
+                      session_id=session_id, user_id=user_id,
+                      filename=filename, symbol=symbol_name,
+                      total_lines=file_line_count)
+            else:
+                _anchor = text_anchor_window(file_content, symbol_name, change_description or "")
+                if not _anchor:
+                    _dlog("execute_task_no_window",
+                          session_id=session_id, user_id=user_id,
+                          filename=filename, symbol=symbol_name,
+                          total_lines=file_line_count,
+                          reason="symbol_not_found")
+                    raise _PlanSymbolNotFound(symbol_name)
+                file_display = _anchor["text"] + (
+                    f"\n\n`{symbol_name}` is text in this file, not a function. "
+                    "Put the exact current lines in old_code and the replacement in new_code."
+                )
+                if _anchor["other_lines"]:
+                    file_display += (
+                        f"\n\n`{_anchor['anchor']}` also appears on lines "
+                        + ", ".join(str(n) for n in _anchor["other_lines"])
+                        + ". Edit only the lines shown above."
+                    )
+                _dlog("execute_task_text_anchor_window",
+                      session_id=session_id, user_id=user_id,
+                      filename=filename, symbol=symbol_name,
+                      total_lines=file_line_count,
+                      anchor=_anchor["anchor"],
+                      window_start=_anchor["start"], window_end=_anchor["end"],
+                      other_lines=_anchor["other_lines"])
 
         focused_user = (
-            f"Edit the symbol `{symbol_name}` in `{filename}`.\n\n"
+            f"{_step_lead}\n\n"
             f"Change: {change_description}\n\n"
             f"User's original request: {user_request}\n\n"
             f"{sym_index}"
@@ -17954,12 +18215,43 @@ async def _execute_single_edit(
             "Produce exactly ONE <surgical_edit> block now."
         )
     else:
+        _small_body = file_content
+        _text_hint = ""
+        if not _symbol_in_index:
+            from services.plan_artifact import module_assignment_window, text_anchor_window
+            _small_body = module_assignment_window(file_content, symbol_name)
+            if not _small_body:
+                _anchor = text_anchor_window(file_content, symbol_name, change_description or "")
+                if not _anchor:
+                    _dlog("execute_task_no_window",
+                          session_id=session_id, user_id=user_id,
+                          filename=filename, symbol=symbol_name,
+                          total_lines=file_line_count,
+                          reason="symbol_not_found")
+                    raise _PlanSymbolNotFound(symbol_name)
+                _small_body = (
+                    file_content if file_line_count <= LARGE_FILE_WINDOW
+                    else _anchor["text"]
+                )
+                _text_hint = (
+                    f"`{symbol_name}` is text in this file, not a function. "
+                    f"It is on line {_anchor['line']}. "
+                    "Put the exact current lines in old_code and the replacement in new_code.\n\n"
+                )
+                _dlog("execute_task_text_anchor_window",
+                      session_id=session_id, user_id=user_id,
+                      filename=filename, symbol=symbol_name,
+                      total_lines=file_line_count,
+                      anchor=_anchor["anchor"],
+                      window_start=_anchor["start"], window_end=_anchor["end"],
+                      other_lines=_anchor["other_lines"])
         focused_user = (
-            f"Edit the symbol `{symbol_name}` in `{filename}`.\n\n"
+            f"{_step_lead}\n\n"
             f"Change: {change_description}\n\n"
             f"User's original request: {user_request}\n\n"
             f"{sym_index}"
-            f"File content:\n```\n{file_content}\n```\n\n"
+            f"File content:\n```\n{_small_body}\n```\n\n"
+            f"{_text_hint}"
             "Produce exactly ONE <surgical_edit> block now."
         )
 
@@ -18021,7 +18313,7 @@ async def _execute_single_edit(
               session_id=session_id, user_id=user_id,
               filename=filename, symbol=symbol_name,
               timeout_sec=SINGLE_EDIT_TIMEOUT)
-        return None
+        raise _PlanStepTimeout(f"{symbol_name} in {filename}")
 
     except Exception as e:
         # Session cb380321: credit exhaustion must NOT be swallowed as None
@@ -18119,7 +18411,7 @@ async def run_natural_pipeline_stream(
     import asyncio
 
     def sse(obj: dict) -> str:
-        return f"data: {json.dumps(obj)}\n\n"
+        return _sse_line(obj)
 
     _pipeline_t0 = time.time()
 
@@ -18296,11 +18588,19 @@ async def run_natural_pipeline_stream(
     # Conservative until the request is classified. A failure to classify
     # keeps the strict edit loop, so a real change is never dropped.
     _wants_edit = True
+    _agent_loop_done = False
+    _grok_loop_phase = "before_loop"
+    _agent_loop_turn = None
+    _grok_reasoning_text = ""
 
     try:
         _user_arch_model = get_setting("architect_model", _DEFAULT_ARCH_MODEL)
         arch_model = _user_arch_model
         _model_used = arch_model
+        _diff_first_sent = False
+        _qa_enabled = True
+        _qa_diff_first = False
+        _qa_auto_fix_rounds = 0
         _natural_use_claude = _is_claude_model(arch_model)
 
         # ── Claude-only web research (Edit/Agent mode, per-request opt-in) ──
@@ -18370,6 +18670,8 @@ async def run_natural_pipeline_stream(
         _dlog("edit_intent_classified",
               session_id=session_id, user_id=user_id,
               wants_edit=_wants_edit, is_agent_task=bool(is_agent_task))
+        from services.edit_intent import stop_after_command as _stop_after_command_fn
+        _stop_after_command = _stop_after_command_fn(user_request, _wants_edit)
 
         def _natural_done_payload(_dp_model_used):
             """Shared `done` payload builder for every exit point below — the
@@ -18601,6 +18903,23 @@ async def run_natural_pipeline_stream(
         if _aws_connected:
             TAG_DEFS["aws"] = {"open": "<aws_cli>", "close": "</aws_cli>"}
 
+        _local_tools = False
+        _local_guidance = ""
+        if not str(arch_model or "").startswith("ollama:"):
+            try:
+                from services.local_exec import local_available as _local_on
+                from services.agent_tool_spec import local_text as _local_text
+                _local_tools = bool(_local_on(user_id))
+                if _local_tools:
+                    TAG_DEFS["local"] = {"open": "<local_cli>", "close": "</local_cli>"}
+                    if not _is_grok_model(arch_model):
+                        _local_guidance = "\n" + _local_text("tag") + "\n"
+            except Exception as _local_nat_err:
+                _local_tools = False
+                _local_guidance = ""
+                _dlog("natural_local_setup_error", session_id=session_id, user_id=user_id,
+                      error=str(_local_nat_err)[:200])
+
         # ── History-search tag (Edit + Agent Mode) ──────────────────────────
         # Lets the agent/edit loop pull an OLDER/original version of a
         # session file from session_file_versions (already-existing,
@@ -18659,6 +18978,11 @@ async def run_natural_pipeline_stream(
             _dlog("mcp_gate_error", session_id=session_id, user_id=user_id,
                   error=str(_mcp_gate_err)[:200])
 
+        # A plan build stages every edit and reviews them once at the end.
+        # QA, the QA retry loop, the second Grok QA pass, and the preview
+        # gate stay off for that turn. A normal Edit or Agent turn is unchanged.
+        _plan_build = bool(plan_run_id or forced_edit_plan)
+
         # Preflight defaults to shadow: it logs, and does not reject edits,
         # until the setting is switched to enforce. Preview stays off until
         # preview_tool=on, and then only on Agent turns over the WebSocket.
@@ -18673,7 +18997,7 @@ async def run_natural_pipeline_stream(
             _preview_setting = (get_setting("preview_tool", "off") or "off").strip().lower()
         except Exception:
             _preview_setting = "off"
-        if _preview_setting == "on" and is_agent_task and client_inbox is not None:
+        if _preview_setting == "on" and is_agent_task and client_inbox is not None and not _plan_build:
             from services.preview_check import (
                 PREVIEW_TAG_CLOSE as _PREVIEW_CLOSE,
                 PREVIEW_TAG_OPEN as _PREVIEW_OPEN,
@@ -18742,6 +19066,7 @@ async def run_natural_pipeline_stream(
                     mcp_enabled=_natural_mcp,
                     repo_enabled=bool(_repo_ctx),
                     git_enabled=_git_tools,
+                    local_enabled=_local_tools,
                     dlog=_dlog, session_id=session_id, user_id=user_id)
                 _gpt_system_text += _grok_sys_suffix
                 _dlog("natural_grok_system_suffix_appended",
@@ -18874,6 +19199,8 @@ async def run_natural_pipeline_stream(
         # ---- Output contract (consumed verbatim by post-streaming cleanup below) ----
         edit_blocks_raw: list = []
         new_file_blocks_raw: list = []
+        _plan_answered_steps: list = []
+        _plan_created_steps: list = []
         edit_plan_data: list | None = None
         # Round7: at most one mega-symbol plan→surgical reroute per request.
         _mega_plan_reroute_count = 0
@@ -18974,12 +19301,16 @@ async def run_natural_pipeline_stream(
                           plan_after=len(edit_plan_data),
                           covered=[{"filename": a, "symbol": b} for a, b in list(_covered)[:20]])
 
-            full_response = (
-                "Resuming saved planned edits after Anthropic credits were restored."
-            )
+            if resume_pause_id:
+                full_response = (
+                    "Resuming saved planned edits after Anthropic credits were restored."
+                )
+                _plan_lead = f"Resuming {len(edit_plan_data)} saved plan step(s)..."
+            else:
+                full_response = "Building the saved plan."
+                _plan_lead = f"Building {len(edit_plan_data)} saved plan step(s)..."
             yield sse({"type": "token", "content": full_response + "\n\n"})
-            yield sse({"type": "progress",
-                       "content": f"Resuming {len(edit_plan_data)} saved plan step(s)..."})
+            yield sse({"type": "progress", "content": _plan_lead})
             _dlog("credit_pause_resume_short_circuit",
                   session_id=session_id, user_id=user_id,
                   pause_id=resume_pause_id,
@@ -19095,7 +19426,7 @@ async def run_natural_pipeline_stream(
         # freely use every stop tag. GPT's API only accepts the first four
         # (_agent_stop_seqs[:4] below). "preview" is last, so GPT captures it
         # in the stream parser instead of via a stop sequence, same as aws.
-        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "git", "preview", "repo"]
+        _stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "git", "local", "preview", "repo"]
         _agent_stop_seqs = (
             [TAG_DEFS[t]["close"] for t in _stop_tag_order if t in TAG_DEFS]
             if _tag_stop_enabled else []
@@ -19122,6 +19453,8 @@ async def run_natural_pipeline_stream(
                 return ("aws", (_block or "").strip())
             if _kind == "git":
                 return ("git", (_block or "").strip())
+            if _kind == "local":
+                return ("local", (_block or "").strip())
             if _kind == "preview":
                 return ("preview", (_block or "").strip())
             if _kind == "websearch":
@@ -19161,6 +19494,7 @@ async def run_natural_pipeline_stream(
                 _repo_text_fn("tag", _repo_ctx) + "\n" if _repo_ctx else ""
             ),
             git_guidance=_git_guidance,
+            local_guidance=_local_guidance,
         )
 
         # ── Grok-only: native-tool agent instruction (Claude/GPT keep the
@@ -19176,6 +19510,7 @@ async def run_natural_pipeline_stream(
                 websearch_enabled=_oa_search_enabled,
                 mcp_enabled=_natural_mcp,
                 repo_enabled=bool(_repo_ctx),
+                local_enabled=_local_tools,
                 dlog=_dlog, session_id=session_id, user_id=user_id)
 
         # Research is off, but the user clearly asked for a web search.
@@ -19256,7 +19591,20 @@ async def run_natural_pipeline_stream(
         _turn = 0
         _consecutive_empty_turns = 0
         _consecutive_text_only_turns = 0
+        _ran_terminal_tool = False
         _preflight_rounds = 0
+
+        def _terminal_followup(note: str) -> str:
+            text = note or ""
+            # The stop line is only for a bare command such as whoami.
+            # A change-verb anywhere in the message means the command was a lookup.
+            if _stop_after_command:
+                return text + "\nReport this result to the user and stop. Do not write code."
+            return (
+                text
+                + "\nThe user asked for a code change. "
+                "Write the edit from these lines. A command result is not the end of the task."
+            )
         _preflight_stash = {}
         _preflight_baseline = {}
         _preview_state = {"rounds": 0, "last_fp": None, "edit_hash": None}
@@ -19337,6 +19685,45 @@ async def run_natural_pipeline_stream(
                 content, break_pending=_prose_break_pending, needs_break=_prose_needs_break,
             )
             return content
+
+        _shown_prose = ""
+
+        def _partial_open_suffix_len(buf: str) -> int:
+            """Chars at the end of buf that are a proper prefix of an open tag.
+
+            The parser holds these back so a tag is never shown half-written.
+            A finished turn must still not emit that prefix.
+            """
+            opens = [td["open"] for td in TAG_DEFS.values() if td.get("open")]
+            if not buf or not opens:
+                return 0
+            limit = min(len(buf), max(len(op) for op in opens) - 1)
+            for n in range(limit, 0, -1):
+                suf = buf[-n:]
+                if "<" in suf and any(op.startswith(suf) for op in opens):
+                    return n
+            return 0
+
+        def _flush_prose():
+            """Emit prose the tag parser was still holding, then clear it.
+
+            Returns the token text, or None. Callers yield it. A turn that
+            ends inside a real tag (state != normal) is left for the
+            end-of-stream recovery. A trailing incomplete open tag is dropped
+            so `<file_re` never reaches the chat.
+            """
+            nonlocal normal_buf, _shown_prose
+            if state != "normal" or not normal_buf.strip():
+                return None
+            drop = _partial_open_suffix_len(normal_buf)
+            emit = normal_buf[:-drop] if drop else normal_buf
+            normal_buf = ""
+            if not emit.strip():
+                return None
+            # The no-edits notice treats non-empty normal_buf as "the user
+            # saw prose". Flushing clears that buffer, so keep a copy.
+            _shown_prose += emit
+            return _emit_prose(emit)
 
         from services.tool_activity import ToolTracker as _ToolTracker, note_at as _tool_note_at
         _tool_tracker = _ToolTracker(agent=arch_model, dlog=_dlog)
@@ -19428,6 +19815,9 @@ async def run_natural_pipeline_stream(
             _last_hb_ts = time.time()
             _last_silence_progress_ts = 0.0  # Grok UX: last Reasoning… progress emit
             _grok_thinking_open = False      # Grok UX: thinking_start issued, awaiting end
+            _grok_reasoning_text = ""
+            _grok_loop_phase = "model_stream"
+            _agent_loop_turn = _turn
             _last_stop_reason = None
             _matched_stop_seq = None
             _edits_before = len(edit_blocks_raw) + len(new_file_blocks_raw)
@@ -19615,7 +20005,7 @@ async def run_natural_pipeline_stream(
                                                 # starts with JSON ('[' or '{'). An AWS command
                                                 # starts with "aws" or "intent". context_tag_looks_real
                                                 # is that check. Anything else is prose.
-                                                if (_tag_name in ("search", "filereq", "github", "history", "aws", "git", "mcp")
+                                                if (_tag_name in ("search", "filereq", "github", "history", "aws", "git", "mcp", "local")
                                                         and not _ctx_shape_checked):
                                                     _ctx_stripped = tag_buf.lstrip()
                                                     if _ctx_stripped:
@@ -19651,7 +20041,7 @@ async def run_natural_pipeline_stream(
                                                 if _pd is not None:
                                                     edit_plan_data = _pd
                                                 _break_stream = True
-                                            elif _tag_name in ("search", "filereq", "github", "history", "aws", "git", "mcp"):
+                                            elif _tag_name in ("search", "filereq", "github", "history", "aws", "git", "mcp", "local"):
                                                 pending_tool = _capture_request(_tag_name, _content)
                                                 _break_stream = True
 
@@ -19826,6 +20216,7 @@ async def run_natural_pipeline_stream(
                         mcp_enabled=_natural_mcp,
                         repo_enabled=bool(_repo_ctx),
                         git_enabled=_git_tools,
+                        local_enabled=_local_tools,
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
                     # Plan-first gate decides tool_choice: forced write_edit_plan
@@ -19844,7 +20235,12 @@ async def run_natural_pipeline_stream(
                     _dlog("natural_grok_native_tools_attached",
                           session_id=session_id, user_id=user_id, turn=_turn,
                           tool_count=len(_grok_tools))
+                    _dlog("grok_request_built", session_id=session_id, user_id=user_id,
+                          **_grok_request_fields(
+                              _gpt_msgs, _gpt_call_kwargs, model=arch_model,
+                              mode=("agent" if is_agent_task else "edit"), turn=_turn))
 
+                _gpt_phase = "create"
                 for _attempt in range(3):
                     try:
                         # ── Gap #2: Grok billing-cap 429 must not be pointlessly
@@ -19852,6 +20248,7 @@ async def run_natural_pipeline_stream(
                         #    _chat_create — classify and raise immediately instead.
                         #    GPT/Claude/Gemini keep calling _chat_create unchanged. ──
                         if _is_grok_model(arch_model):
+                            _gpt_phase = "create"
                             _gpt_stream = _grok_chat_create_with_billing_guard(
                                 _gpt_client, model=arch_model,
                                 dlog=_dlog, session_id=session_id, user_id=user_id,
@@ -19863,12 +20260,15 @@ async def run_natural_pipeline_stream(
                                 session_id=session_id or "",
                                 **_gpt_call_kwargs,
                             )
-                        for _gpt_chunk in _iter_openai_stream_chunks(_gpt_stream, model=arch_model,
-                                                                      session_id=session_id, user_id=user_id):
+                        _gpt_phase = "stream"
+                        async for _gpt_chunk in _grok_aiter_sync(_iter_openai_stream_chunks(
+                                _gpt_stream, model=arch_model,
+                                session_id=session_id, user_id=user_id)):
                             _gpt_choice = _gpt_chunk.choices[0]
-                            if _gpt_choice.finish_reason:
-                                _last_stop_reason = _gpt_choice.finish_reason
-                                break
+                            # The last chunk often carries both finish_reason and
+                            # the final reasoning or tool delta. Read the delta
+                            # before leaving the loop.
+                            _gpt_finish = _gpt_choice.finish_reason
 
                             _gpt_stall_elapsed = time.time() - _round_t0
                             if (time.time() - _last_hb_ts) >= STREAMING_HEARTBEAT_S:
@@ -19937,9 +20337,8 @@ async def run_natural_pipeline_stream(
                                         _grok_thinking_open = True
                                         yield sse({"type": "thinking_start", "content": ""})
                                     yield sse({"type": "thinking", "content": _rc})
-                                    _dlog("grok_agent_reasoning_delta",
-                                          session_id=session_id, user_id=user_id,
-                                          turn=_turn, chars=len(_rc))
+                                    if len(_grok_reasoning_text) < 2000:
+                                        _grok_reasoning_text = (_grok_reasoning_text + _rc)[:2000]
 
                             if _gpt_delta and hasattr(_gpt_delta, "content") and _gpt_delta.content:
                                 text_chunk = _gpt_delta.content
@@ -20009,7 +20408,7 @@ async def run_natural_pipeline_stream(
                                             # Claude branch above — same proven bug, session
                                             # 71737af0: a model quoting its own tag syntax in
                                             # prose must not trap the rest of its real text). ──
-                                            if (_tag_name in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp")
+                                            if (_tag_name in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp", "local")
                                                     and not _ctx_shape_checked):
                                                 _ctx_stripped = tag_buf.lstrip()
                                                 if _ctx_stripped:
@@ -20044,7 +20443,7 @@ async def run_natural_pipeline_stream(
                                             if _pd is not None:
                                                 edit_plan_data = _pd
                                             _break_stream = True
-                                        elif _tag_name in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp"):
+                                        elif _tag_name in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp", "local"):
                                             pending_tool = _capture_request(_tag_name, _content)
                                             _break_stream = True
                                         state = "normal"
@@ -20086,6 +20485,9 @@ async def run_natural_pipeline_stream(
                                         for _lev in _live.feed(("grok", _gidx), _gkind, _gargs):
                                             yield sse(_lev)
 
+                            if _gpt_finish:
+                                _last_stop_reason = _gpt_finish
+                                break
                             if pending_tool is not None or edit_plan_data is not None:
                                 break
                         if _grok_thinking_open:
@@ -20094,14 +20496,53 @@ async def run_natural_pipeline_stream(
                         break  # success
 
                     except Exception as _gpt_err:
-                        if (("500" in str(_gpt_err) or "529" in str(_gpt_err)
-                                or "overloaded" in str(_gpt_err).lower())
-                                and _attempt < 2):
+                        _gpt_transient = (
+                            "500" in str(_gpt_err) or "529" in str(_gpt_err)
+                            or "overloaded" in str(_gpt_err).lower()
+                            or "temporarily unavailable" in str(_gpt_err).lower()
+                            or "did not respond" in str(_gpt_err).lower()
+                            or "service unavailable" in str(_gpt_err).lower()
+                        )
+                        if _is_grok_model(arch_model):
+                            _dlog("grok_round_api_error", session_id=session_id,
+                                  user_id=user_id, model=arch_model, turn=_turn,
+                                  mode=("agent" if is_agent_task else "edit"),
+                                  phase=_gpt_phase, **_grok_api_error_fields(_gpt_err))
+                        if _gpt_transient and _attempt < 2:
                             yield sse({"type": "progress",
                                        "content": f"Service busy — retrying ({_attempt+1}/3)..."})
                             await asyncio.sleep(5 * (_attempt + 1))
                             continue
+                        if _is_grok_model(arch_model):
+                            _dlog("grok_round_end", session_id=session_id, user_id=user_id,
+                                  model=arch_model, mode=("agent" if is_agent_task else "edit"),
+                                  turn=_turn, outcome="error",
+                                  elapsed_s=round(time.time() - _round_t0, 1),
+                                  text_chars=len(full_response),
+                                  thinking_chars=len(_grok_reasoning_text),
+                                  tool_names=[], finish_reason=_last_stop_reason,
+                                  phase=_gpt_phase)
                         raise
+
+                if _is_grok_model(arch_model):
+                    if _grok_reasoning_text:
+                        _dlog("grok_reasoning_preview", session_id=session_id,
+                              user_id=user_id, model=arch_model, turn=_turn,
+                              mode=("agent" if is_agent_task else "edit"),
+                              chars=len(_grok_reasoning_text),
+                              preview=_grok_reasoning_text[:400])
+                    _grok_round_names = []
+                    if _grok_tc_acc is not None and _grok_tc_acc.has_calls():
+                        _grok_round_names = [n for _, n, _ in _grok_tc_acc.peek()]
+                    _dlog("grok_round_end", session_id=session_id, user_id=user_id,
+                          model=arch_model, mode=("agent" if is_agent_task else "edit"),
+                          turn=_turn,
+                          outcome="tool" if _grok_round_names else "answer",
+                          elapsed_s=round(time.time() - _round_t0, 1),
+                          text_chars=len(full_response),
+                          thinking_chars=len(_grok_reasoning_text),
+                          tool_names=_grok_round_names,
+                          finish_reason=_last_stop_reason)
 
             # ── A governor tripped mid-turn — stop the loop, keep what we have ──
             if _streaming_starvation_abort:
@@ -20110,7 +20551,7 @@ async def run_natural_pipeline_stream(
             # ── Recover a context-request tag the stop_sequence halted before closing ──
             if pending_tool is None and state.startswith("in_"):
                 _uc = state[3:]
-                if _uc in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp"):
+                if _uc in ("search", "filereq", "github", "history", "aws", "git", "websearch", "mcp", "local"):
                     _ucm = re.search(
                         re.escape(TAG_DEFS[_uc]["open"]) + r"(.*)",
                         full_response, re.DOTALL)
@@ -20143,6 +20584,7 @@ async def run_natural_pipeline_stream(
 
             # ── Grok native tool-calls → existing producer variables ──────
             if _is_grok_model(arch_model) and _grok_tc_acc is not None and _grok_tc_acc.has_calls():
+                _grok_loop_phase = "translate"
                 _grok_calls = _grok_tc_acc.finalize()
 
                 # ── Gap #3: circuit breaker for a repeated identical no-op
@@ -20300,9 +20742,17 @@ async def run_natural_pipeline_stream(
 
             # ── Dispatch: run the requested tool, feed results back, continue ──
             if pending_tool is not None:
+                _held = _flush_prose()
+                if _held:
+                    yield sse({"type": "token", "content": _held})
                 _consecutive_empty_turns = 0
                 _assistant_echo = full_response or "(working…)"
                 _kind, _data = pending_tool
+                from services.tool_footer import tool_footer as _tool_footer
+                _grok_loop_phase = "dispatch"
+                _dlog("agent_tool_dispatch_start", session_id=session_id, user_id=user_id,
+                      turn=_turn, kind=_kind, arg_preview=str(_data)[:180],
+                      mode=("agent" if is_agent_task else "edit"))
                 _ev = _tool_tracker.start(_kind, _data, turn=_turn)
                 if _ev:
                     yield sse(_ev)
@@ -20310,7 +20760,7 @@ async def run_natural_pipeline_stream(
 
                 if _kind == "repo":
                     from services.repo_tools import execute_repo_tool as _exec_repo
-                    _repo_note = _exec_repo(
+                    _repo_note = await asyncio.to_thread(_exec_repo,
                         session_id, user_id,
                         _data if isinstance(_data, dict) else {"_invalid": str(_data)[:500]},
                         session_files=session_files,
@@ -20318,9 +20768,12 @@ async def run_natural_pipeline_stream(
                     )
                     _dlog("agent_repo_executed", session_id=session_id, user_id=user_id,
                           turn=_turn, note_len=len(_repo_note or ""))
+                    from services.tool_footer import tool_footer as _tool_footer
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
-                        {"role": "user", "content": _repo_note or "No repository result."},
+                        {"role": "user", "content": _tool_footer(
+                            "repo", _repo_note or "No repository result.",
+                        )},
                     ]
                     continue
 
@@ -20330,7 +20783,9 @@ async def run_natural_pipeline_stream(
                         feedback_text as _ws_feedback,
                         merge_sources as _ws_merge,
                         perform_search as _ws_perform,
+                        search_model as _ws_search_model,
                         sse_events as _ws_events,
+                        web_result_log_fields as _ws_log_fields,
                     )
                     _ws_req = _data if isinstance(_data, dict) else {"_invalid": str(_data)[:500]}
                     _ws_query = _ws_req.get("query") if isinstance(_ws_req.get("query"), str) else ""
@@ -20339,7 +20794,7 @@ async def run_natural_pipeline_stream(
                               session_id=session_id, user_id=user_id, turn=_turn)
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content": _ws_invalid},
+                            {"role": "user", "content": _tool_footer("web", _ws_invalid)},
                         ]
                         continue
                     _ws_status, _ws_note = ("disabled", "Web search is not available.")
@@ -20351,7 +20806,9 @@ async def run_natural_pipeline_stream(
                               status=_ws_status, query=_ws_query[:200])
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content": _ws_note or "Web search was not run."},
+                            {"role": "user", "content": _tool_footer(
+                                "web", _ws_note or "Web search was not run.",
+                            )},
                         ]
                         continue
                     _dlog("agent_web_search_requested",
@@ -20388,10 +20845,14 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id, turn=_turn,
                           query=_ws_query[:200],
                           source_count=len(_ws_result.get("sources") or []),
-                          error=(_ws_result.get("error") or "")[:200])
+                          error=(_ws_result.get("error") or "")[:200],
+                          **_ws_log_fields(_ws_result, _ws_search_model()))
+                    from services.tool_footer import tool_footer as _tool_footer
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
-                        {"role": "user", "content": _ws_feedback(_ws_query, _ws_result)},
+                        {"role": "user", "content": _tool_footer(
+                            "web", _ws_feedback(_ws_query, _ws_result),
+                        )},
                     ]
                     continue
 
@@ -20401,9 +20862,11 @@ async def run_natural_pipeline_stream(
                     if _mcp_raw.get("_invalid"):
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
+                            {"role": "user", "content": _tool_footer(
+                                "mcp",
                                 "That MCP request was not valid. "
-                                'Send {"server": "server-id", "tool": "tool-name", "arguments": {}}.'},
+                                'Send {"server": "server-id", "tool": "tool-name", "arguments": {}}.',
+                            )},
                         ]
                         continue
                     _mcp_done = {"note": "", "counted": False}
@@ -20420,9 +20883,12 @@ async def run_natural_pipeline_stream(
                             yield sse(_mcp_ev)
                     if _mcp_done.get("counted"):
                         _mcp_calls += 1
+                    from services.tool_footer import tool_footer as _tool_footer
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
-                        {"role": "user", "content": _mcp_done.get("note") or ""},
+                        {"role": "user", "content": _tool_footer(
+                            "mcp", _mcp_done.get("note") or "No MCP result.",
+                        )},
                     ]
                     continue
 
@@ -20439,11 +20905,13 @@ async def run_natural_pipeline_stream(
                               session_id=session_id, user_id=user_id, terms=raw_terms)
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
+                            {"role": "user", "content": _tool_footer(
+                                "search",
                                 "You've already searched for those terms — the results are "
                                 "earlier in this conversation. Use them, search for something "
                                 "different, request full files with <file_request>, or write "
-                                "your edits now."},
+                                "your edits now.",
+                            )},
                         ]
                         continue
                     yield sse({"type": "progress",
@@ -20460,13 +20928,15 @@ async def run_natural_pipeline_stream(
                         _filereq_hint = (
                             "\n\nThese are grep snippets (limited context). To see full file "
                             "contents for editing, emit a <file_request> with the filenames you need.")
+                    from services.tool_footer import tool_footer as _tool_footer
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
-                        {"role": "user", "content":
+                        {"role": "user", "content": _tool_footer(
+                            "search",
                             "Here are the search results"
                             + (f" ({reason})" if reason else "") + ":\n"
-                            + search_results + _filereq_hint
-                            + "\n\nRequest more context if you need it, or write your edits now."},
+                            + search_results + _filereq_hint,
+                        )},
                     ]
                     continue
 
@@ -20490,12 +20960,14 @@ async def run_natural_pipeline_stream(
                         requested_files.update(_cb_tripped)
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
+                            {"role": "user", "content": _tool_footer(
+                                "file",
                                 (f"You've requested {', '.join(_cb_tripped)} more than "
                                  f"{MAX_HARD_FILE_REQ_RETRIES} times this session. Stop "
                                  "re-asking for it — write your edits with the context you "
                                  "already have, or explain what's blocking you with "
-                                 "<blocked>…</blocked>.")},
+                                 "<blocked>…</blocked>."),
+                            )},
                         ]
                         continue
                     # A file is genuinely "fully loaded" only if it is tier-1
@@ -20532,7 +21004,7 @@ async def run_natural_pipeline_stream(
                               requested=fnames_req, tier1_overlap=_tier1_overlap)
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content": _redirect},
+                            {"role": "user", "content": _tool_footer("file", _redirect)},
                         ]
                         continue
                     # A same-name re-request is honored ONLY when the earlier copy
@@ -20567,13 +21039,15 @@ async def run_natural_pipeline_stream(
                               requested_files_count=len(requested_files))
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
+                            {"role": "user", "content": _tool_footer(
+                                "file",
                                 ("You've reached the file-request limit. Write your edits with "
                                  "the context you have, or explain what's blocking you with "
                                  "<blocked>…</blocked>."
                                  if _hit_total_limit
                                  else "Those files are already in your context above. Use them "
-                                 "and write your edits.")},
+                                 "and write your edits."),
+                            )},
                         ]
                         continue
                     yield sse({"type": "progress",
@@ -21055,12 +21529,14 @@ async def run_natural_pipeline_stream(
                           session_id=session_id, user_id=user_id, turn=_turn,
                           filenames=new_fnames,
                           found=[fn for fn in new_fnames if fn in requested_files])
+                    from services.tool_footer import tool_footer as _tool_footer
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
-                        {"role": "user", "content":
+                        {"role": "user", "content": _tool_footer(
+                            "file",
                             "Here are the files you requested:\n\n"
-                            + "\n\n".join(file_result_parts) + _missing_note
-                            + "\n\nRequest more if you need it, or write your edits now."},
+                            + "\n\n".join(file_result_parts) + _missing_note,
+                        )},
                     ]
                     continue
 
@@ -21081,6 +21557,7 @@ async def run_natural_pipeline_stream(
                                 yield sse(_o)
                             yield sse(_git_ev)
                     _streaming_t0 += float(_git_done.get("waited_s") or 0)
+                    _ran_terminal_tool = True
                     if _git_done.get("run") or _git_done.get("stop") or _git_done.get("steps"):
                         _git_ledger.append(_git_done)
                     _git_note = _git_done.get("note") or ""
@@ -21105,7 +21582,7 @@ async def run_natural_pipeline_stream(
                         continue
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
-                        {"role": "user", "content": _git_note + "\nContinue the task."},
+                        {"role": "user", "content": _terminal_followup(_git_note)},
                     ]
                     continue
 
@@ -21127,6 +21604,7 @@ async def run_natural_pipeline_stream(
                                 yield sse(_o)
                             yield sse(_aws_ev)
                     _streaming_t0 += float(_aws_done.get("waited_s") or 0)
+                    _ran_terminal_tool = True
                     _aws_note = _aws_done.get("note") or ""
                     if not _aws_done.get("run"):
                         if _aws_note == "The user rejected this command.":
@@ -21138,11 +21616,45 @@ async def run_natural_pipeline_stream(
                         continue
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
-                        {"role": "user", "content": _aws_note + "\nContinue the task."},
+                        {"role": "user", "content": _terminal_followup(_aws_note)},
                     ]
                     continue
 
-                if _kind == "preview":
+                if _kind == "local":
+                    from services.local_exec import resolve_local_call as _resolve_local
+                    _local_body = _data if isinstance(_data, str) else str(_data or "")
+                    _local_mode = "agent" if is_agent_task else "edit"
+                    _local_done = {"note": "", "run": False}
+                    async for _local_ev in _resolve_local(
+                        _local_body, _local_mode, 0, client_inbox,
+                        user_id=user_id, dlog=_dlog, session_id=session_id or "",
+                        root=((_repo_ctx or {}).get("root_path") or ""),
+                    ):
+                        if _local_ev.get("type") == "local_done":
+                            _local_done = _local_ev
+                        else:
+                            _o = _tool_tracker.observe(_local_ev)
+                            if _o:
+                                yield sse(_o)
+                            yield sse(_local_ev)
+                    _streaming_t0 += float(_local_done.get("waited_s") or 0)
+                    _ran_terminal_tool = True
+                    _local_note = _local_done.get("note") or ""
+                    if not _local_done.get("run"):
+                        if _local_note == "The user rejected this command.":
+                            _local_note += " Do not run it again unless they ask."
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content": _local_note},
+                        ]
+                        continue
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": _assistant_echo},
+                        {"role": "user", "content": _terminal_followup(_local_note)},
+                    ]
+                    continue
+
+                if _kind == "preview" and not _plan_build:
                     from services.preview_check import iter_preview_check as _iter_preview
                     _pv_note = ""
                     async for _pv_ev in _iter_preview(
@@ -21167,7 +21679,9 @@ async def run_natural_pipeline_stream(
                     )
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
-                        {"role": "user", "content": _pv_note or "[PREVIEW] unobserved"},
+                        {"role": "user", "content": _tool_footer(
+                            "preview", _pv_note or "[PREVIEW] unobserved",
+                        )},
                     ]
                     continue
 
@@ -21189,26 +21703,33 @@ async def run_natural_pipeline_stream(
                               attempts=_github_attempts)
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
+                            {"role": "user", "content": _tool_footer(
+                                "github",
                                 "You've reached the GitHub request limit. Write your edits with "
                                 "the information you have, or explain what's blocking you with "
-                                "<blocked>…</blocked>."},
+                                "<blocked>…</blocked>.",
+                            )},
                         ]
                         continue
                     if _gh_req.get("_error"):
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content": str(_gh_req["_error"])},
+                            {"role": "user", "content": _tool_footer(
+                                "github", str(_gh_req["_error"]),
+                            )},
                         ]
                         continue
                     if "_invalid" in _gh_req:
                         from services.github_context_tools import gh_error as _gh_error
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content": _gh_error(
-                                "bad_json",
-                                reason="the body was not valid JSON",
-                                example='{"tool":"list_prs","args":{"owner":"acme","repo":"app","state":"all"}}',
+                            {"role": "user", "content": _tool_footer(
+                                "github",
+                                _gh_error(
+                                    "bad_json",
+                                    reason="the body was not valid JSON",
+                                    example='{"tool":"list_prs","args":{"owner":"acme","repo":"app","state":"all"}}',
+                                ),
                             )},
                         ]
                         continue
@@ -21252,7 +21773,7 @@ async def run_natural_pipeline_stream(
                               session_id=session_id, user_id=user_id, tool=_gh_tool)
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content": _repeat},
+                            {"role": "user", "content": _tool_footer("github", _repeat)},
                         ]
                         continue
                     _gh_target = ""
@@ -21341,23 +21862,28 @@ async def run_natural_pipeline_stream(
                                 "\n\nAnswer the user now." if not _wants_edit
                                 else "\n\nYou have enough context. Answer or write the edits now."
                             )
+                        from services.limits import GITHUB_READ_MAX_CHARS as _gh_read_cap
+                        from services.tool_footer import tool_footer as _tool_footer
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
-                                f"GitHub {_gh_tool} result:\n{_shape_gh(str(_gh_result), 14000)}"
+                            {"role": "user", "content": _tool_footer(
+                                "github",
+                                f"GitHub {_gh_tool} result:\n{_shape_gh(str(_gh_result), _gh_read_cap)}"
                                 + _gh_note
-                                + _gh_nudge
-                                + "\n\nRequest more if you need it, or write your edits now."},
+                                + _gh_nudge,
+                            )},
                         ]
                     except Exception as _gh_err:
                         _dlog("agent_github_error",
                               session_id=session_id, user_id=user_id, error=str(_gh_err)[:300])
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
+                            {"role": "user", "content": _tool_footer(
+                                "github",
                                 f"GitHub request failed: {str(_gh_err)[:200]}. Write your edits "
                                 "with the context you have, or explain what's blocking you with "
-                                "<blocked>…</blocked>."},
+                                "<blocked>…</blocked>.",
+                            )},
                         ]
                     continue
 
@@ -21369,12 +21895,14 @@ async def run_natural_pipeline_stream(
                               raw_preview=_hist_req.get("_invalid", "")[:200])
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
+                            {"role": "user", "content": _tool_footer(
+                                "history",
                                 "Your <history_request> was not valid JSON (needs at least "
                                 "{\"filename\": \"...\"}). Optional: \"view\" (list or diff), "
                                 "\"version\" (a number, first, or last), \"compare_to\" "
                                 "(a version number), and \"query\". Emit a corrected "
-                                "<history_request>, or write your edits."},
+                                "<history_request>, or write your edits.",
+                            )},
                         ]
                         continue
                     _hist_fn = _hist_req.get("filename", "")
@@ -21398,12 +21926,14 @@ async def run_natural_pipeline_stream(
                                 _hist_body = _hist_result.get("content", "")
                         else:
                             _hist_body = _hist_result.get("message", "No history found.")
+                        from services.tool_footer import tool_footer as _tool_footer
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
-                                f"{_hist_body}\n\nRequest more history if you need it, or "
-                                "write your edits now using the CURRENT file content shown "
-                                "earlier in this conversation — not this historical content."},
+                            {"role": "user", "content": _tool_footer(
+                                "history",
+                                f"{_hist_body}\nUse the CURRENT file content shown "
+                                "earlier in this conversation, not this historical content.",
+                            )},
                         ]
                     except Exception as _hist_err:
                         _dlog("agent_history_error",
@@ -21411,10 +21941,12 @@ async def run_natural_pipeline_stream(
                               filename=_hist_fn, error=str(_hist_err)[:300])
                         current_messages = current_messages + [
                             {"role": "assistant", "content": _assistant_echo},
-                            {"role": "user", "content":
+                            {"role": "user", "content": _tool_footer(
+                                "history",
                                 f"History lookup failed: {str(_hist_err)[:200]}. Write your "
                                 "edits with the context you have, or explain what's blocking "
-                                "you with <blocked>…</blocked>."},
+                                "you with <blocked>…</blocked>.",
+                            )},
                         ]
                     continue
 
@@ -21550,20 +22082,25 @@ async def run_natural_pipeline_stream(
                         "Reply to the user's message in plain text. "
                         "Do not announce a mode."
                     )
+                from services.tool_footer import tool_footer as _tool_footer
                 current_messages = current_messages + [
                     {"role": "assistant", "content": "(no output)"},
-                    {"role": "user", "content": _empty_nudge},
+                    {"role": "user", "content": _tool_footer("nudge", _empty_nudge)},
                 ]
+                _held = _flush_prose()
+                if _held:
+                    yield sse({"type": "token", "content": _held})
                 continue
 
             # ── Text-only turn: model explained instead of editing ──
             # A question is done on the first prose answer. An edit request
             # still gets one nudge, then stops.
             if not _has_edits_or_plan and full_response.strip():
-                if not _wants_edit:
-                    _dlog("agent_loop_question_answer_exit",
-                          session_id=session_id, user_id=user_id, turn=_turn,
-                          response_len=len(full_response))
+                if not _wants_edit or (_ran_terminal_tool and _stop_after_command):
+                    _dlog(
+                        "agent_loop_terminal_answer_exit" if _ran_terminal_tool else "agent_loop_question_answer_exit",
+                        session_id=session_id, user_id=user_id, turn=_turn,
+                        response_len=len(full_response))
                     break
                 _consecutive_text_only_turns += 1
                 if _consecutive_text_only_turns >= 2:
@@ -21575,15 +22112,27 @@ async def run_natural_pipeline_stream(
                       session_id=session_id, user_id=user_id, turn=_turn,
                       response_len=len(full_response),
                       response_preview=full_response[:300])
-                current_messages = current_messages + [
-                    {"role": "assistant", "content": full_response},
-                    {"role": "user", "content":
+                if _is_grok_model(arch_model):
+                    _text_nudge = (
+                        "You described the change and did not call write_surgical_edit. "
+                        "Call write_surgical_edit now with the lines you already have. "
+                        "A short read is not a reason to stop."
+                    )
+                else:
+                    _text_nudge = (
                         "You wrote an explanation but did not produce any code changes. "
                         "You MUST produce edits now using <surgical_edit>, <new_file>, "
-                        "or <edit_plan> tags. Work with the context you already have — "
-                        "do not request more files or searches."},
+                        "or <edit_plan> tags. When you have the lines you need, write the edit."
+                    )
+                from services.tool_footer import tool_footer as _tool_footer
+                current_messages = current_messages + [
+                    {"role": "assistant", "content": full_response},
+                    {"role": "user", "content": _tool_footer("nudge", _text_nudge)},
                 ]
                 full_response = ""
+                _held = _flush_prose()
+                if _held:
+                    yield sse({"type": "token", "content": _held})
                 continue
 
             # ── Preflight gate ────────────────────────────────────────────
@@ -21675,6 +22224,7 @@ async def run_natural_pipeline_stream(
                         error=str(_pf_exc)[:300],
                     )
 
+            _agent_loop_done = True
             _dlog("agent_loop_done",
                   session_id=session_id, user_id=user_id, turn=_turn,
                   edit_blocks=len(edit_blocks_raw),
@@ -21862,9 +22412,10 @@ async def run_natural_pipeline_stream(
                       session_id=session_id, user_id=user_id,
                       state=state)
 
-        # Flush any normal text buffered
-        if state == "normal" and normal_buf.strip():
-            yield sse({"type": "token", "content": _emit_prose(normal_buf)})
+        # Flush any normal text the tag parser was still holding.
+        _held = _flush_prose()
+        if _held:
+            yield sse({"type": "token", "content": _held})
 
         if in_thinking:
             yield sse({"type": "thinking_end", "content": ""})
@@ -22260,11 +22811,11 @@ async def run_natural_pipeline_stream(
                   ],
                   pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
 
-            def _plan_step_event(filename: str, symbol: str, status: str):
+            def _plan_step_event(filename: str, symbol: str, status: str, reason: str = ""):
                 if not plan_run_id or not filename or not symbol:
                     return None
                 from services.plan_artifact import note_plan_step
-                task = note_plan_step(session_id, plan_run_id, filename, symbol, status)
+                task = note_plan_step(session_id, plan_run_id, filename, symbol, status, reason)
                 if not task:
                     return None
                 return sse({
@@ -22294,6 +22845,53 @@ async def run_natural_pipeline_stream(
 
             yield sse({"type": "progress",
                        "content": f"Executing {len(_effective_plan)} planned edit(s)..."})
+            _missing_plan_names = []
+            for _pi in _effective_plan:
+                _pfn = (_pi.get("filename") or "").strip()
+                if _pfn and not file_content_lookup_stream.get(_pfn):
+                    _missing_plan_names.append(_pfn)
+            if _missing_plan_names and session_id:
+                try:
+                    from services.repo_tools import session_repo as _session_repo
+                    _prepo = _session_repo(session_id)
+                except Exception:
+                    _prepo = None
+                if _prepo:
+                    from services.repo_apply import stage_planned_files as _stage_planned
+                    _staged = _stage_planned(
+                        session_id, user_id, _prepo, _missing_plan_names,
+                    )
+                    for _row in _staged:
+                        _req = _row["requested"]
+                        _fn = _row["filename"]
+                        _fc = _row.get("content") or ""
+                        _sf = {
+                            "id": _row.get("id") or "",
+                            "filename": _fn,
+                            "content": _fc,
+                            "file_type": _row.get("file_type") or "code",
+                        }
+                        for _key in {_req, _fn}:
+                            file_content_lookup_stream[_key] = _fc
+                            if _key not in symbol_maps_by_name:
+                                try:
+                                    symbol_maps_by_name[_key] = (parser.parse(_fc, _key), _sf)
+                                except Exception:
+                                    symbol_maps_by_name[_key] = (None, _sf)
+                        if not any(
+                            isinstance(sf, dict) and sf.get("filename") == _fn
+                            for sf in session_files
+                        ):
+                            session_files.append(_sf)
+                        _dlog("plan_file_staged_from_repo",
+                              session_id=session_id, user_id=user_id,
+                              requested=_req, filename=_fn,
+                              content_len=len(_fc))
+                    if _staged:
+                        yield sse({
+                            "type": "progress",
+                            "content": f"Loaded {len(_staged)} file(s) from the open folder.",
+                        })
             for plan_idx, plan_item in enumerate(_effective_plan):
                 # ── Pipeline deadline gate (session aaade983) ──────────────
                 # Stop starting NEW edits once we're over budget.  In aaade983
@@ -22330,15 +22928,55 @@ async def run_natural_pipeline_stream(
                     continue
 
                 p_content = file_content_lookup_stream.get(p_filename, "")
-                if not p_content:
-                    skipped_changes_struct.append({
-                        "filename": p_filename,
-                        "symbol": p_symbol,
-                        "reason": f"File not found in session: {p_filename}",
-                    })
-                    _ev = _plan_step_event(p_filename, p_symbol, "blocked")
+                if not p_content or plan_item.get("action") == "create":
+                    # A missing file, or a step marked create, is a new file.
+                    # It is not "file not found".
+                    yield sse({"type": "progress",
+                               "content": f"Creating {p_filename} ({plan_idx+1}/{len(edit_plan_data)})..."})
+                    _ev = _plan_step_event(p_filename, p_symbol, "running")
                     if _ev:
                         yield _ev
+                    _created = None
+                    _create_reason = ""
+                    try:
+                        if aclient is None:
+                            _create_reason = (
+                                f"Could not create {p_filename}. "
+                                "No model was available for a new file."
+                            )
+                        else:
+                            _budget_left = PIPELINE_DEADLINE_S - (time.time() - _pipeline_t0)
+                            _created = await _execute_single_new_file(
+                                aclient, "claude-sonnet-5",
+                                p_filename, p_description, user_request,
+                                session_id, user_id,
+                                max_wait_s=max(5.0, min(120.0, _budget_left)),
+                            )
+                    except _PlanStepTimeout:
+                        _create_reason = f"timed out creating {p_filename}"
+                        yield sse({"type": "progress",
+                                   "content": f"{p_filename} timed out before the new file was written."})
+                    except Exception as _create_err:
+                        _create_reason = f"Could not create {p_filename}: {str(_create_err)[:120]}"
+                    if _created:
+                        new_file_blocks_raw.append(normalize_plan_new_file(_created, p_filename))
+                        _plan_created_steps.append({"filename": p_filename, "symbol": p_symbol})
+                        yield sse({"type": "progress", "content": f"✅ {p_filename} created"})
+                        _ev = _plan_step_event(p_filename, p_symbol, "done")
+                        if _ev:
+                            yield _ev
+                    else:
+                        skipped_changes_struct.append({
+                            "filename": p_filename,
+                            "symbol": p_symbol,
+                            "reason": _create_reason or f"Could not create {p_filename}. The new file was not produced.",
+                        })
+                        _ev = _plan_step_event(
+                            p_filename, p_symbol, "blocked",
+                            _create_reason or f"Could not create {p_filename}.",
+                        )
+                        if _ev:
+                            yield _ev
                     _adv = _advance_plan_step_event()
                     if _adv:
                         yield _adv
@@ -22493,6 +23131,7 @@ async def run_natural_pipeline_stream(
 
                     if result_raw:
                         edit_blocks_raw.append(result_raw)
+                        _plan_answered_steps.append({"filename": p_filename, "symbol": p_symbol})
                         yield sse({"type": "progress",
                                    "content": f"✅ {p_symbol} complete"})
                         _ev = _plan_step_event(p_filename, p_symbol, "done")
@@ -22641,12 +23280,48 @@ async def run_natural_pipeline_stream(
                         })
                         yield sse({"type": "progress",
                                    "content": f"⚠️ {p_symbol} — no edit produced"})
-                        _ev = _plan_step_event(p_filename, p_symbol, "blocked")
+                        _ev = _plan_step_event(
+                            p_filename, p_symbol, "blocked",
+                            "Focused edit call produced no valid edit block",
+                        )
                         if _ev:
                             yield _ev
                         _adv = _advance_plan_step_event()
                         if _adv:
                             yield _adv
+
+                except _PlanSymbolNotFound:
+                    skipped_changes_struct.append({
+                        "filename": p_filename,
+                        "symbol": p_symbol,
+                        "reason": "symbol not found",
+                    })
+                    yield sse({"type": "progress",
+                               "content": f"Could not find {p_symbol} in {p_filename}."})
+                    _ev = _plan_step_event(p_filename, p_symbol, "blocked", "symbol not found")
+                    if _ev:
+                        yield _ev
+                    _adv = _advance_plan_step_event()
+                    if _adv:
+                        yield _adv
+
+                except _PlanStepTimeout:
+                    skipped_changes_struct.append({
+                        "filename": p_filename,
+                        "symbol": p_symbol,
+                        "reason": f"timed out editing {p_symbol} in {p_filename}",
+                    })
+                    yield sse({"type": "progress",
+                               "content": f"{p_symbol} in {p_filename} timed out."})
+                    _ev = _plan_step_event(
+                        p_filename, p_symbol, "blocked",
+                        f"timed out editing {p_symbol} in {p_filename}",
+                    )
+                    if _ev:
+                        yield _ev
+                    _adv = _advance_plan_step_event()
+                    if _adv:
+                        yield _adv
 
                 except _AnthropicCreditExhaustedError as _cred_err:
                     # Session cb380321: pause + persist remaining work instead of
@@ -22755,6 +23430,7 @@ async def run_natural_pipeline_stream(
                   credit_paused=_credit_pause_emitted)
             # If plan tasks ran but all failed, report the errors to the user
             if skipped_changes_struct:
+                from services.plan_artifact import plain_skip_reason as _plain_skip
                 _sk_detail = "\n".join(
                     f"• **{s.get('symbol', '?')}** in `{s.get('filename', '?')}`: {s.get('reason', 'unknown')}"
                     for s in skipped_changes_struct[:10]
@@ -22774,35 +23450,42 @@ async def run_natural_pipeline_stream(
                         "Remaining plan and any held Grok writes were persisted."
                     )
                 else:
-                    _fail_msg = (
-                        f"I planned {len(skipped_changes_struct)} change(s) but all of them failed:\n\n"
-                        f"{_sk_detail}\n\n"
-                        "This usually means the file is very large. Try pointing me at a specific "
-                        "section or symbol to edit, and I'll take a more focused approach."
-                    )
-                    _fail_summary = f"{len(skipped_changes_struct)} planned change(s) — all failed"
-                    _fail_reason = "All planned edits failed before producing any code."
+                    _lines = [_plain_skip(s) for s in skipped_changes_struct[:10]]
+                    _fail_msg = "\n".join(f"• {line}" for line in _lines)
+                    _fail_summary = _lines[0] if len(_lines) == 1 else "Some steps still need work"
+                    _fail_reason = ""
                 _fail_result = {
                     "intent": "edit",
                     "summary": _fail_summary,
                     "reasoning": _fail_reason,
                     "risks": [],
                     "skipped_changes": skipped_changes_struct,
+                    "failed_steps": [] if _credit_pause_emitted else [
+                        {
+                            "filename": s.get("filename") or "",
+                            "symbol": s.get("symbol") or "",
+                            "reason": _plain_skip(s),
+                        }
+                        for s in skipped_changes_struct[:10]
+                    ],
                     "changes_by_file": {},
                     "new_files": [],
                     "natural_text": _fail_msg,
                     "credit_paused": bool(_credit_pause_emitted),
                 }
+                if _plan_build and not _credit_pause_emitted:
+                    _fail_result["plan_review"] = True
                 yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(_fail_result)})
             elif not skipped_changes_struct:
                 # A question that was answered in prose is not a failed edit.
                 # The notice is only for a turn the user asked to change code.
-                if not _wants_edit:
-                    _dlog("no_edits_question_silent",
-                          session_id=session_id, user_id=user_id,
-                          response_len=len(full_response),
-                          normal_buf_len=len(normal_buf),
-                          turns_used=_turn)
+                if not _wants_edit or (_ran_terminal_tool and _stop_after_command):
+                    _dlog(
+                        "no_edits_terminal_silent" if _ran_terminal_tool else "no_edits_question_silent",
+                        session_id=session_id, user_id=user_id,
+                        response_len=len(full_response),
+                        normal_buf_len=len(normal_buf),
+                        turns_used=_turn)
                 else:
                     # Pick an honest, specific "no edits" notice. See
                     # pick_no_edits_notice docstring for the full proof (session
@@ -22813,7 +23496,8 @@ async def run_natural_pipeline_stream(
                     # equivalent to "the model showed you a plan."
                     _notice_event, _noedit_msg = pick_no_edits_notice(
                         _hit_agent_max_turns, bool(skipped_changes_struct),
-                        normal_buf, full_response, AGENT_MAX_TURNS,
+                        normal_buf if normal_buf.strip() else _shown_prose,
+                        full_response, AGENT_MAX_TURNS,
                     )
                     _dlog(_notice_event,
                           session_id=session_id, user_id=user_id,
@@ -24256,13 +24940,64 @@ async def run_natural_pipeline_stream(
                           had_line_numbers=bool(edit_start_line and edit_end_line),
                           user_id=user_id)
                 else:
-                    still_unresolved.append({
-                        "filename": filename,
-                        "symbol": symbol_name,
-                        "new_code": new_code,
-                        "description": description,
-                        "_raw": edit_raw,
-                    })
+                    _kept_new_symbol = False
+                    if not old_code and edit_start_line and edit_end_line and file_content:
+                        try:
+                            _ln_lines = file_content.splitlines(keepends=True)
+                            _ln_s, _ln_e = int(edit_start_line), int(edit_end_line)
+                            if 1 <= _ln_s <= _ln_e <= len(_ln_lines):
+                                old_code = "".join(_ln_lines[_ln_s - 1:_ln_e]).rstrip("\n")
+                                _dlog("new_symbol_old_code_from_lines",
+                                      session_id=session_id, user_id=user_id,
+                                      filename=filename, symbol=symbol_name,
+                                      edit_start_line=_ln_s, edit_end_line=_ln_e)
+                        except (TypeError, ValueError):
+                            pass
+                    if old_code and new_code is not None and file_content:
+                        _ns_old, _ns_ok, _ns_why = _locate_snippet_in_text(
+                            file_content, old_code,
+                        )
+                        if _ns_ok and _ns_old:
+                            from services.text_region_promotion import (
+                                new_symbol_region as _new_symbol_region,
+                            )
+                            _ns_sym, _ns_new, _ns_kept, _ns_reason = _new_symbol_region(
+                                file_content, _ns_old, new_code, filename, symbol_name,
+                            )
+                            if _ns_kept and _ns_sym is not None:
+                                edit_data["new_code"] = _ns_new
+                                edit_data.pop("old_code", None)
+                                edit_data.pop("edit_start_line", None)
+                                edit_data.pop("edit_end_line", None)
+                                _ns_key = (
+                                    filename,
+                                    f"{_ns_sym.name}:{_ns_sym.start_line}-{_ns_sym.end_line}",
+                                )
+                                _entry = {
+                                    "edit_data": edit_data,
+                                    "symbol": _ns_sym,
+                                    "sf_entry": sf_entry,
+                                    "file_content": file_content,
+                                    "filename": filename,
+                                }
+                                _resolved_by_symbol[_ns_key] = _entry
+                                resolved_edits.append(_entry)
+                                _resolved_raw_keys.add((filename, symbol_name))
+                                _dlog("new_symbol_file_level_kept",
+                                      session_id=session_id, user_id=user_id,
+                                      filename=filename, symbol=symbol_name,
+                                      anchor_line=_ns_sym.start_line,
+                                      reason=_ns_reason, locate=_ns_why)
+                                _kept_new_symbol = True
+                    if not _kept_new_symbol:
+                        still_unresolved.append({
+                            "filename": filename,
+                            "symbol": symbol_name,
+                            "new_code": new_code,
+                            "description": description,
+                            "old_code": old_code or "",
+                            "_raw": edit_raw,
+                        })
 
             if not still_unresolved or resolve_round >= MAX_SYMBOL_RETRIES:
                 if still_unresolved:
@@ -24995,24 +25730,31 @@ async def run_natural_pipeline_stream(
               user_id=user_id)
 
         _qa_t0 = time.time()
-        _dlog("qa_phase_start",
-              session_id=session_id, user_id=user_id,
-              change_count=len(resolved_edits),
-              resolution_duration_s=round(time.time() - _resolution_t0, 1),
-              pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
         if _phase_open == "edit":
             _end = _tool_tracker.end(f"Resolved {len(resolved_edits)} edit(s)")
             if _end:
                 yield sse(_end)
             _phase_open = None
-        _ev = _tool_tracker.phase(
-            "qa", "Running QA", "Ran QA",
-            f"{len(resolved_edits)} changes",
-        )
-        if _ev:
-            yield sse(_ev)
-            _phase_open = "qa"
-        yield sse({"type": "progress", "content": f"Running QA on {len(resolved_edits)} change(s)..."})
+        if _plan_build:
+            _dlog("plan_build_qa_off",
+                  session_id=session_id, user_id=user_id,
+                  change_count=len(resolved_edits),
+                  resolution_duration_s=round(time.time() - _resolution_t0, 1),
+                  pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
+        else:
+            _dlog("qa_phase_start",
+                  session_id=session_id, user_id=user_id,
+                  change_count=len(resolved_edits),
+                  resolution_duration_s=round(time.time() - _resolution_t0, 1),
+                  pipeline_elapsed_s=round(time.time() - _pipeline_t0, 1))
+            _ev = _tool_tracker.phase(
+                "qa", "Running QA", "Ran QA",
+                f"{len(resolved_edits)} changes",
+            )
+            if _ev:
+                yield sse(_ev)
+                _phase_open = "qa"
+            yield sse({"type": "progress", "content": f"Running QA on {len(resolved_edits)} change(s)..."})
 
         # Build shared context once — same view the architect had
         _qa_other_parts = []
@@ -25201,6 +25943,69 @@ async def run_natural_pipeline_stream(
         # clears the hard 8/10 gate), and let the already-deadline-aware retry
         # loop below break immediately so the result ships before the wall.
         _qa_over_budget = _pipeline_over_budget()
+        def _qa_flag(key: str, default: str) -> bool:
+            return str(get_setting(key, default) or default).strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+        _qa_enabled = _qa_flag("qa_enabled", "1")
+        _qa_diff_first = _qa_flag("qa_diff_first", "1") and _qa_enabled and not _plan_build
+        try:
+            _qa_auto_fix_rounds = int(get_setting("qa_auto_fix_rounds", "0") or 0)
+        except (TypeError, ValueError):
+            _qa_auto_fix_rounds = 0
+        if not _qa_diff_first:
+            _qa_auto_fix_rounds = MAX_QA_RETRIES
+        for cs in change_shells:
+            if not cs.get("change_id"):
+                cs["change_id"] = str(uuid.uuid4())
+        _diff_first_sent = False
+        if _qa_diff_first and change_shells and not new_file_blocks_raw:
+            _pending_files: dict = {}
+            for cs in change_shells:
+                _sym = cs["symbol"]
+                _sf = cs.get("sf_entry") or {}
+                _fid = (_sf.get("id") or "") if isinstance(_sf, dict) else ""
+                _fname = cs["filename"]
+                if _fname not in _pending_files:
+                    _pending_files[_fname] = {"filename": _fname, "file_id": _fid, "changes": []}
+                _stype = getattr(_sym, "symbol_type", None)
+                _pending_files[_fname]["changes"].append({
+                    "id": cs["change_id"],
+                    "symbol": {
+                        "name": getattr(_sym, "name", "") or "",
+                        "full_path": getattr(_sym, "full_path", "") or getattr(_sym, "name", "") or "",
+                        "symbol_type": getattr(_stype, "value", None) or "variable",
+                        "start_line": int(getattr(_sym, "start_line", 0) or 0),
+                        "end_line": int(getattr(_sym, "end_line", 0) or 0),
+                        "code": getattr(_sym, "code", "") or "",
+                    },
+                    "original_code": getattr(_sym, "code", "") or "",
+                    "new_code": cs.get("new_code") or "",
+                    "diff": cs.get("diff") or "",
+                    "description": cs.get("description") or "",
+                    "confidence": 8,
+                    "applied": False,
+                    "qa_result": None,
+                })
+            _pending_result = {
+                "intent": "edit",
+                "summary": "Review the diff. The check is still running.",
+                "reasoning": "",
+                "risks": [],
+                "skipped_changes": skipped_changes_struct,
+                "changes_by_file": _pending_files,
+                "new_files": [],
+                "natural_text": "",
+                "qa_status": "pending" if _qa_enabled else "off",
+            }
+            _dlog("smart_result_emitted",
+                  session_id=session_id, user_id=user_id,
+                  qa_status=_pending_result["qa_status"],
+                  changes_count=len(change_shells), early=True)
+            yield sse({"type": "smart_result", "model": _model_used,
+                       "content": json.dumps(_pending_result)})
+            _diff_first_sent = True
+        _skip_llm_qa = _qa_over_budget or _plan_build or not _qa_enabled
         if _qa_over_budget:
             _dlog("qa_skipped_over_budget",
                   session_id=session_id, user_id=user_id,
@@ -25211,7 +26016,7 @@ async def run_natural_pipeline_stream(
                        "content": "⏱️ Time budget reached — shipping resolved changes without final QA polish."})
 
         # Launch all QA calls concurrently (skipped entirely when over budget)
-        qa_tasks = [] if _qa_over_budget else [
+        qa_tasks = [] if _skip_llm_qa else [
             asyncio.create_task(run_qa_agent(
                 original_code=cs["qa_original_content"],  # intermediate state, not raw original
                 new_code=cs["new_code"],
@@ -25239,6 +26044,16 @@ async def run_natural_pipeline_stream(
             done_set, pending = await asyncio.wait(pending, timeout=20.0)
             if pending:
                 _qa_elapsed = int(time.time() - _qa_t0)
+                if _qa_elapsed >= 180:
+                    for _late in list(pending):
+                        _late.cancel()
+                    if pending:
+                        await asyncio.wait(pending)
+                    _dlog("qa_stage_time_budget", session_id=session_id,
+                          user_id=user_id, elapsed_s=_qa_elapsed,
+                          remaining=len(pending))
+                    pending = set()
+                    break
                 _qa_done_count = len(qa_tasks) - len(pending)
                 yield sse({"type": "progress",
                            "content": f"QA: {_qa_done_count}/{len(qa_tasks)} checks done… ({_qa_elapsed}s)"})
@@ -25252,26 +26067,37 @@ async def run_natural_pipeline_stream(
         for t in qa_tasks:
             try:
                 qa_results.append(t.result())
-            except Exception as _qa_task_err:
+            except (Exception, asyncio.CancelledError) as _qa_task_err:
+                _skipped = isinstance(_qa_task_err, asyncio.CancelledError)
                 _dlog("qa_task_collection_error",
                       session_id=session_id,
                       error_type=type(_qa_task_err).__name__,
                       error=str(_qa_task_err)[:300],
                       user_id=user_id)
                 qa_results.append({
-                    "verdict": "warning", "qa_score": 7,
-                    "summary": "QA could not run", "import_issues": [],
+                    "verdict": "skipped" if _skipped else "warning",
+                    "qa_score": None if _skipped else 7,
+                    "summary": "QA time budget reached" if _skipped else "QA could not run",
+                    "import_issues": [],
                     "downstream_risks": [], "type_errors": [],
                     "plan_deviation": "", "risk_verdicts": [],
+                    "machine_verified": False,
                 })
 
         # Over budget → no QA calls were launched; synthesize one accepting
         # verdict per resolved change so qa_results stays aligned with
         # change_shells and every change clears the hard 8/10 gate (aaade983).
-        if _qa_over_budget:
+        if _skip_llm_qa:
+            _qa_skip_summary = (
+                "QA is off for this plan build."
+                if _plan_build
+                else "QA is turned off."
+                if not _qa_enabled
+                else "QA skipped — pipeline deadline reached; shipping resolved change as-is."
+            )
             qa_results = [{
                 "verdict": "safe", "qa_score": 8,
-                "summary": "QA skipped — pipeline deadline reached; shipping resolved change as-is.",
+                "summary": _qa_skip_summary,
                 "import_issues": [], "downstream_risks": [], "type_errors": [],
                 "plan_deviation": "", "risk_verdicts": [],
             } for _ in change_shells]
@@ -25301,7 +26127,7 @@ async def run_natural_pipeline_stream(
             _has_sq_blocking = None
             _filter_sq = None
 
-        if _has_sq_blocking is not None and not _qa_over_budget:
+        if _has_sq_blocking is not None and not _skip_llm_qa:
             for _sq_i, _sq_cs in enumerate(change_shells):
                 _sq_new   = _sq_cs["new_code"]
                 _sq_orig  = _sq_cs["symbol"].code
@@ -25562,7 +26388,7 @@ async def run_natural_pipeline_stream(
         _tsc_round_best: dict = {}
         _tsc_round_cache: dict = {}
         for _tfname, _tidxs in _tsc_pre_groups.items():
-            if _qa_over_budget:
+            if _skip_llm_qa:
                 break
             _t_introduced, _t_by_idx = await _tsc_file_introduced_errors(
                 _tfname, _tidxs, _tsc_orig_cache, "pre_check")
@@ -25587,8 +26413,8 @@ async def run_natural_pipeline_stream(
         # ── QA retry loop — fix blocked changes before showing to user ────────
         # Triggers on verdict=="blocked" OR score<=5 with hard issues.
         # Sends QA findings back to Claude, re-runs QA on the fix.
+        # MAX_QA_RETRIES lives at module level. Do not reassign it here.
 
-        MAX_QA_RETRIES = 2
         # ── Correction history: track what each idx tried + why it was rejected ──
         # Key = change index, value = list of {round, code_preview, qa_summary}
         _correction_history: dict[int, list[dict]] = {}
@@ -25624,6 +26450,10 @@ async def run_natural_pipeline_stream(
         _mw_bonus_round_used = False
 
         for _qa_retry_round in range(MAX_QA_RETRIES + 1):
+            if _plan_build:
+                break
+            if _qa_diff_first and _qa_retry_round >= _qa_auto_fix_rounds:
+                break
             if _qa_retry_round >= MAX_QA_RETRIES:
                 # Beyond the normal budget: this iteration exists solely to run
                 # the collapse recovery for an idx that was brace-rejected on
@@ -28864,8 +29694,9 @@ async def run_natural_pipeline_stream(
         # 00:15:12 by the old per-change final gate).
         _tsc_final_cache: dict = {}
         _tsc_final_groups: dict = {}
-        for _ti, _tcs in enumerate(change_shells):
-            _tsc_final_groups.setdefault(_tcs["filename"], []).append(_ti)
+        if not _plan_build:
+            for _ti, _tcs in enumerate(change_shells):
+                _tsc_final_groups.setdefault(_tcs["filename"], []).append(_ti)
         for _tfname, _tidxs in _tsc_final_groups.items():
             _t_introduced, _t_by_idx = await _tsc_file_introduced_errors(
                 _tfname, _tidxs, _tsc_final_cache, "final_gate")
@@ -28892,7 +29723,10 @@ async def run_natural_pipeline_stream(
         # "final" QA round. It only ever escalates on a concrete, cited
         # defect; it never re-blocks on vague grounds (overcorrection-safe).
         # New file, isolated: does not touch run_qa_agent / run_qa_for_changes.
-        if _is_grok_model(arch_model):
+        _second_pass = str(get_setting("qa_grok_second_pass", "0") or "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+        if _second_pass and _is_grok_model(arch_model) and not _plan_build:
             _dlog("grok_second_qa_round_start",
                   session_id=session_id, user_id=user_id,
                   arch_model=arch_model, change_count=len(change_shells))
@@ -28995,6 +29829,14 @@ async def run_natural_pipeline_stream(
                           user_id=user_id)
 
         _GATE_MIN = 8
+        try:
+            _GATE_MIN = int(get_setting("qa_gate_min", "8") or 8)
+        except (TypeError, ValueError):
+            _GATE_MIN = 8
+        _dlog("qa_settings", session_id=session_id, user_id=user_id,
+              qa_enabled=_qa_enabled, qa_diff_first=_qa_diff_first,
+              qa_auto_fix_rounds=_qa_auto_fix_rounds, qa_gate_min=_GATE_MIN)
+        _plan_lint_texts: dict = {}
         for i, (cs, qa_dict) in enumerate(zip(change_shells, qa_results)):
             symbol = cs["symbol"]
             filename = cs["filename"]
@@ -29086,18 +29928,19 @@ async def run_natural_pipeline_stream(
                 machine_verified=bool(qa_dict.get("machine_verified")),
             )
 
-            verdict_icon = (
-                "\u2705" if qa_dict.get("verdict") == "safe"
-                else "\u26a0\ufe0f" if qa_dict.get("verdict") == "warning"
-                else "\U0001f6ab"
-            )
-            yield sse({
-                "type": "progress",
-                "content": (
-                    f"QA {verdict_icon} {qa_dict.get('summary', '')} "
-                    f"(score: {qa_dict.get('qa_score', '?')})"
-                ),
-            })
+            if not _plan_build:
+                verdict_icon = (
+                    "\u2705" if qa_dict.get("verdict") == "safe"
+                    else "\u26a0\ufe0f" if qa_dict.get("verdict") == "warning"
+                    else "\U0001f6ab"
+                )
+                yield sse({
+                    "type": "progress",
+                    "content": (
+                        f"QA {verdict_icon} {qa_dict.get('summary', '')} "
+                        f"(score: {qa_dict.get('qa_score', '?')})"
+                    ),
+                })
 
             _dlog("qa_gate_passed",
                   session_id=session_id,
@@ -29107,7 +29950,7 @@ async def run_natural_pipeline_stream(
                   score=_gs,
                   user_id=user_id)
             change = SurgicalChange(
-                id=str(uuid.uuid4()),
+                id=cs.get("change_id") or str(uuid.uuid4()),
                 symbol=symbol,
                 original_code=symbol.code,
                 new_code=cs["new_code"],
@@ -29115,7 +29958,7 @@ async def run_natural_pipeline_stream(
                 confidence=qa_dict.get("qa_score") or 9,
                 description=cs["description"],
                 applied=False,
-                qa_result=qa_result_obj,
+                qa_result=None if _plan_build else qa_result_obj,
                 # Companion file-level ops (e.g. import-line fixes from the
                 # correction loop) ride along after the sentinel symbol op;
                 # apply_change applies them to the same file in the same apply.
@@ -29153,7 +29996,20 @@ async def run_natural_pipeline_stream(
                     "file_id": _fid,
                     "changes": [],
                 }
-            changes_by_file[filename]["changes"].append(change.model_dump())
+            _dumped = change.model_dump()
+            if _plan_build:
+                _dumped.pop("qa_result", None)
+                _lint_text = cs.get("file_content") or ""
+                for _op in change.operations or []:
+                    _find = getattr(_op, "find", None)
+                    _repl = getattr(_op, "replace", None)
+                    if _find is None and isinstance(_op, dict):
+                        _find = _op.get("find")
+                        _repl = _op.get("replace")
+                    if _find and _find in _lint_text:
+                        _lint_text = _lint_text.replace(_find, _repl or "", 1)
+                _plan_lint_texts[filename] = _lint_text
+            changes_by_file[filename]["changes"].append(_dumped)
             summary_parts.append(cs["description"] or f"Updated {symbol.name} in {filename}")
 
         # ── Process new file blocks ───────────────────────────────────────
@@ -29260,32 +30116,36 @@ async def run_natural_pipeline_stream(
                     # Fall through: save as CSV fallback
                     filename = filename.rsplit(".", 1)[0] + ".csv"
 
-            # QA: check the new file against codebase context
-            codebase_ctx = _build_codebase_context_for_creator(symbol_maps_by_name)
-            try:
-                qa = await _run_qa_for_new_file(
-                    file_result={"filename": filename, "content": content,
-                                 "language": language, "summary": summary},
-                    codebase_context=codebase_ctx,
-                    user_id=user_id,
-                )
-                qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(
-                    qa.get("verdict", "safe"), "✅"
-                )
-                yield sse({"type": "progress",
-                           "content": f"{qa_icon} {filename} — {qa.get('summary', 'ready')}"})
-                file_data["qa_result"] = qa
-            except Exception:
-                yield sse({"type": "progress", "content": f"✅ {filename} ready"})
-                file_data["qa_result"] = {"verdict": "safe", "qa_score": 8}
+            # QA: check the new file against codebase context.
+            # A plan build does not run that check.
+            if not _plan_build:
+                codebase_ctx = _build_codebase_context_for_creator(symbol_maps_by_name)
+                try:
+                    qa = await _run_qa_for_new_file(
+                        file_result={"filename": filename, "content": content,
+                                     "language": language, "summary": summary},
+                        codebase_context=codebase_ctx,
+                        user_id=user_id,
+                    )
+                    qa_icon = {"safe": "✅", "warning": "⚠️", "blocked": "🚫"}.get(
+                        qa.get("verdict", "safe"), "✅"
+                    )
+                    yield sse({"type": "progress",
+                               "content": f"{qa_icon} {filename} — {qa.get('summary', 'ready')}"})
+                    file_data["qa_result"] = qa
+                except Exception:
+                    yield sse({"type": "progress", "content": f"✅ {filename} ready"})
+                    file_data["qa_result"] = {"verdict": "safe", "qa_score": 8}
 
-            new_files.append({
+            _new_row = {
                 "filename": filename,
                 "content": content,
                 "language": language,
                 "summary": summary,
-                "qa_result": file_data.get("qa_result", {}),
-            })
+            }
+            if not _plan_build:
+                _new_row["qa_result"] = file_data.get("qa_result", {})
+            new_files.append(_new_row)
             summary_parts.append(summary or f"Created {filename}")
 
         if not changes_by_file and not new_files:
@@ -29304,30 +30164,32 @@ async def run_natural_pipeline_stream(
                   skipped_changes=skipped_changes_struct[:10],
                   user_id=user_id)
             if edit_blocks_raw or new_file_blocks_raw:
-                _attempted = len(edit_blocks_raw) + len(new_file_blocks_raw)
-                _reasons = skipped_messages or [
-                    "The proposed edits could not be matched to the current code."
+                from services.plan_artifact import plain_skip_reason as _plain_skip
+                _skipped = skipped_changes_struct or [
+                    {"filename": "", "symbol": "", "reason": "unresolved"}
                 ]
-                _detail = "\n".join(f"• {m}" for m in _reasons[:10])
-                _plural = "them" if _attempted > 1 else "it"
-                _msg = (
-                    f"I drafted {_attempted} change(s) but couldn't safely apply {_plural} to "
-                    f"the current code, so nothing was shipped:\n\n{_detail}\n\n"
-                    "This usually means the target spot moved or the file is large enough that I "
-                    "need another pass. Tell me the specific area to focus on and I'll re-target it."
-                )
+                _lines = [_plain_skip(s) for s in _skipped[:10]]
+                _msg = "\n".join(f"• {line}" for line in _lines)
                 _fail_result = {
                     "intent": "edit",
-                    "summary": f"{_attempted} change(s) drafted — none could be applied",
-                    "reasoning": "Edits were produced but failed to resolve against the current code.",
-                    "risks": all_qa_risks,
-                    "skipped_changes": skipped_changes_struct or [
-                        {"filename": "", "symbol": "", "reason": "unresolved"}
+                    "summary": _lines[0] if len(_lines) == 1 else "Some edits still need work",
+                    "reasoning": "",
+                    "risks": [] if _plan_build else all_qa_risks,
+                    "skipped_changes": _skipped,
+                    "failed_steps": [
+                        {
+                            "filename": s.get("filename") or "",
+                            "symbol": s.get("symbol") or "",
+                            "reason": _plain_skip(s),
+                        }
+                        for s in _skipped[:10]
                     ],
                     "changes_by_file": {},
                     "new_files": [],
                     "natural_text": _msg,
                 }
+                if _plan_build:
+                    _fail_result["plan_review"] = True
                 _end = _finish_phase()
                 if _end:
                     yield sse(_end)
@@ -29350,16 +30212,56 @@ async def run_natural_pipeline_stream(
         _display_text = _re_strip.sub(r'<new_file>[\s\S]*$', '', _display_text)
         _display_text = _display_text.strip()
 
+        _lint_notes = []
+        if _plan_build and _plan_lint_texts:
+            try:
+                from services.linter_validator import validate_linters as _validate_linters
+                for _lfn, _ltext in _plan_lint_texts.items():
+                    for _err in (_validate_linters(_ltext, _lfn) or [])[:12]:
+                        _emsg = (_err or {}).get("message") or ""
+                        if _emsg:
+                            _lint_notes.append(f"{_lfn}: {_emsg}")
+            except Exception as _lint_err:
+                _dlog("plan_lint_error",
+                      session_id=session_id, user_id=user_id,
+                      error=str(_lint_err)[:200])
+        _file_n = len(changes_by_file) + len(new_files)
+        _step_done = sum(len(v.get("changes") or []) for v in changes_by_file.values()) + len(new_files)
+        _still = [
+            s for s in (skipped_changes_struct or [])
+            if not any(mark in str(s.get("reason") or "").lower()
+                       for mark in ("already", "no-op", "noop", "no change", "unchanged"))
+        ]
         result = {
             "intent": intent,
-            "summary": "; ".join(summary_parts[:3]),
-            "reasoning": "Changes from natural conversation",
-            "risks": all_qa_risks,
+            "summary": (
+                f"Built {_step_done} of {_step_done + len(_still)} steps across {_file_n} files"
+                if _plan_build
+                else "; ".join(summary_parts[:3])
+            ),
+            "reasoning": "" if _plan_build else "Changes from natural conversation",
+            "risks": [] if _plan_build else all_qa_risks,
             "skipped_changes": skipped_changes_struct,
             "changes_by_file": changes_by_file,
             "new_files": new_files,
-            "natural_text": _display_text,
+            "natural_text": "" if _plan_build else _display_text,
         }
+        if not _qa_enabled and not _plan_build:
+            result["qa_status"] = "off"
+        if _plan_build:
+            from services.plan_artifact import plain_skip_reason as _plain_skip
+            result["plan_review"] = True
+            result["lint_notes"] = _lint_notes
+            result["plan_answered_steps"] = list(_plan_answered_steps)
+            result["plan_created_steps"] = list(_plan_created_steps)
+            result["failed_steps"] = [
+                {
+                    "filename": s.get("filename") or "",
+                    "symbol": s.get("symbol") or "",
+                    "reason": _plain_skip(s),
+                }
+                for s in _still[:12]
+            ]
 
         _dlog("smart_result_emitted",
               session_id=session_id,
@@ -29371,13 +30273,51 @@ async def run_natural_pipeline_stream(
         _end = _finish_phase()
         if _end:
             yield sse(_end)
-        yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(result)})
+        if not _diff_first_sent:
+            yield sse({"type": "smart_result", "model": _model_used, "content": json.dumps(result)})
+        _qa_notes_out = []
+        for _qa_file in list(changes_by_file.values()):
+            for _qa_change in (_qa_file.get("changes") or []):
+                _qa = _qa_change.get("qa_result") or {}
+                if not _qa:
+                    continue
+                _note = {
+                    "type": "qa_note",
+                    "change_id": _qa_change.get("id") or "",
+                    "level": _qa.get("verdict") or "info",
+                    "message": (_qa.get("summary") or "")[:500],
+                    "machine_verified": bool(_qa.get("machine_verified")),
+                    "qa_result": _qa,
+                }
+                _qa_notes_out.append(_note)
+                yield sse(_note)
+        if _qa_notes_out or _diff_first_sent:
+            yield sse({"type": "qa_done", "risks": all_qa_risks})
+            _dlog("qa_notes_emitted", session_id=session_id, user_id=user_id,
+                  notes=len(_qa_notes_out))
         _dlog("pipeline_complete",
               session_id=session_id, user_id=user_id,
               pipeline_total_s=round(time.time() - _pipeline_t0, 1))
         yield sse(_natural_done_payload(_model_used))
 
-    except Exception as e:
+    except BaseException as e:
+        if not _agent_loop_done:
+            _abort = {
+                "error_type": type(e).__name__,
+                "error": str(e)[:300],
+                "phase": _grok_loop_phase,
+                "turn": _agent_loop_turn,
+            }
+            try:
+                _abort.update(_grok_api_error_fields(e))
+                _abort["phase"] = _grok_loop_phase
+                _abort["turn"] = _agent_loop_turn
+            except Exception:
+                pass
+            _dlog("agent_loop_aborted",
+                  session_id=session_id, user_id=user_id, **_abort)
+        if not isinstance(e, Exception) or isinstance(e, asyncio.CancelledError):
+            raise
         import traceback as _tb
         _dlog("execute_task_exception",
               session_id=session_id,
@@ -29385,4 +30325,8 @@ async def run_natural_pipeline_stream(
               error_type=type(e).__name__,
               traceback=_tb.format_exc()[-2000:],
               user_id=user_id)
-        yield f"data: {json.dumps({'type': 'error', 'content': _friendly_error(e)})}\n\n"
+        _shown = (
+            f"{_friendly_error(e)} "
+            f"[{type(e).__name__}; event execute_task_exception]"
+        )
+        yield f"data: {json.dumps({'type': 'error', 'content': _shown, 'error_type': type(e).__name__})}\n\n"

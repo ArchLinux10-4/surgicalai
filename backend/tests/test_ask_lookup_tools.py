@@ -65,7 +65,7 @@ def test_promise_to_check_is_not_the_final_answer_when_github_is_on():
     calls = []
     executed = []
 
-    def _chat_create(client, model=None, messages=None, temperature=None, tools=None, stream=None):
+    def _chat_create(client, model=None, messages=None, temperature=None, tools=None, stream=None, **_extra):
         calls.append({"tools": tools, "messages": list(messages or [])})
         return rounds[len(calls) - 1]
 
@@ -103,7 +103,7 @@ def test_a_real_answer_is_still_final():
         _Chunk(finish_reason="stop"),
     ]
 
-    def _chat_create(client, model=None, messages=None, temperature=None, tools=None, stream=None):
+    def _chat_create(client, model=None, messages=None, temperature=None, tools=None, stream=None, **_extra):
         return chunks
 
     agen = gapn.run_grok_ask_plan_native_stream(

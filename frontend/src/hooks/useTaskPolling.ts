@@ -49,7 +49,9 @@ export function useTaskPolling(sessionId: string | null | undefined) {
 
     const reconcile = (rows: any[]) => {
       if (!Array.isArray(rows) || rows.length === 0) return
-      const merged: AgentTask[] = rows
+      const agentRows = rows.filter((r) => (r.source || '') !== 'plan')
+      if (agentRows.length === 0) return
+      const merged: AgentTask[] = agentRows
         .slice()
         .sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))
         .map((r) => ({

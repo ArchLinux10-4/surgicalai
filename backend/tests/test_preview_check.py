@@ -35,7 +35,7 @@ def test_gpt_stop_window_does_not_include_preview():
 def test_pipeline_registers_the_preview_tag_and_the_receiver_allows_the_reply():
     pipeline = Path("services/pipeline.py").read_text()
     chat = Path("routers/chat.py").read_text()
-    assert '_stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "preview", "repo"]' in pipeline
+    assert '_stop_tag_order = ["search", "filereq", "github", "plan", "history", "aws", "git", "local", "preview", "repo"]' in pipeline
     assert 'if _kind == "preview"' in pipeline
     assert 'return ("preview", (_block or "").strip())' in pipeline
     assert "preview_check_response" in chat

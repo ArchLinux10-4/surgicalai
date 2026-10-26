@@ -808,12 +808,14 @@ def update_session_file(session_id: str, file_id: str, body: dict, request: Requ
             _dlog("session_file_update_conflict", session_id=session_id[:8] if session_id else None, file_id=file_id)
             raise HTTPException(status_code=409, detail="File was modified concurrently — please retry with fresh content")
         conn.commit()
+    written_to_disk = False
     try:
         from services.repo_apply import maybe_auto_apply
-        maybe_auto_apply(session_id, file_id)
+        auto = maybe_auto_apply(session_id, file_id) or {}
+        written_to_disk = bool(auto.get("ran") and auto.get("applied"))
     except Exception:
-        pass
-    return {"id": file_id, "lines": lines, "symbol_count": symbol_count, "ok": True}
+        written_to_disk = False
+    return {"id": file_id, "lines": lines, "symbol_count": symbol_count, "ok": True, "written_to_disk": written_to_disk}
 
 
 def _restore_content(conn, session_id: str, file_id: str, target_content: str,

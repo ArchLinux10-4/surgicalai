@@ -2,7 +2,7 @@
 import httpx
 import threading
 from fastapi import APIRouter, HTTPException, Request
-from models.schemas import SettingsUpdate, SettingsResponse
+from models.schemas import LocalAllowlistUpdate, SettingsUpdate, SettingsResponse
 from database import get_all_settings, set_setting, get_setting, set_user_api_key, get_user_api_key, _dlog, USE_POSTGRES
 from crypto_utils import encrypt_api_key, decrypt_api_key
 
@@ -20,6 +20,13 @@ from crypto_utils import encrypt_api_key, decrypt_api_key
 _ADMIN_ONLY_SETTINGS = {"workspace_path"}
 
 router = APIRouter()
+
+
+def _safe_rounds(raw) -> int:
+    try:
+        return max(0, int(raw if raw not in (None, "") else 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _get_user_id(request: Request) -> str:
@@ -65,6 +72,10 @@ def get_settings(request: Request):
         ollama_model=s.get("ollama_model", "qwen2.5-coder:7b"),
         web_search_enabled=s.get("web_search_enabled", "false").lower() == "true",
         git_agent_tools=get_setting("git_agent_tools", "false").lower() == "true",
+        local_agent_tools=get_setting("local_agent_tools", "false").lower() == "true",
+        qa_enabled=str(s.get("qa_enabled", "1")).strip().lower() in ("1", "true", "yes", "on"),
+        qa_auto_fix_rounds=_safe_rounds(s.get("qa_auto_fix_rounds", "0")),
+        qa_diff_first=str(s.get("qa_diff_first", "1")).strip().lower() in ("1", "true", "yes", "on"),
         is_hosted=USE_POSTGRES,
     )
 
@@ -113,6 +124,33 @@ def _open_directory_dialog(result: dict) -> None:
     """
     from services.folder_picker import open_directory_dialog
     open_directory_dialog(result, "Select SurgicalAI workspace folder")
+
+
+@router.get("/local-agent")
+def local_agent_status(request: Request):
+    """Whether the Mac helper is up, and the commands this user always allows."""
+    from services.folder_picker import helper_reachable
+    from services.local_exec import load_allowlist, local_agent_enabled
+    user_id = _get_user_id(request)
+    return {
+        "enabled": local_agent_enabled(),
+        "helper": bool(helper_reachable()),
+        "rules": [" ".join(rule) for rule in load_allowlist(user_id)],
+    }
+
+
+@router.put("/local-allowlist")
+def replace_local_allowlist(body: LocalAllowlistUpdate, request: Request):
+    from services.local_exec import save_allowlist
+    raw = body.rules
+    rules = []
+    if isinstance(raw, list):
+        for item in raw:
+            parts = str(item or "").split()
+            if parts:
+                rules.append(parts)
+    save_allowlist(_get_user_id(request), rules)
+    return {"ok": True, "rules": [" ".join(rule) for rule in rules]}
 
 
 @router.post("/browse-directory")

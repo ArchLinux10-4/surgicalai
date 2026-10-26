@@ -25,6 +25,10 @@ class SettingsUpdate(BaseModel):
     # services/claude_web_search.py for the tool this enables.
     web_search_enabled: Optional[bool] = None
     git_agent_tools: Optional[bool] = None
+    local_agent_tools: Optional[bool] = None
+    qa_enabled: Optional[bool] = None
+    qa_auto_fix_rounds: Optional[int] = None
+    qa_diff_first: Optional[bool] = None
 
 
 class SettingsResponse(BaseModel):
@@ -44,6 +48,14 @@ class SettingsResponse(BaseModel):
     ollama_model: str = "qwen2.5-coder:7b"
     web_search_enabled: bool = False
     git_agent_tools: bool = False
+    local_agent_tools: bool = False
+    qa_enabled: bool = True
+    qa_auto_fix_rounds: int = 0
+    qa_diff_first: bool = True
+
+
+class LocalAllowlistUpdate(BaseModel):
+    rules: list[str] = []
     is_hosted: bool = False
 
 
@@ -224,9 +236,32 @@ class SurgicalChange(BaseModel):
     original_code: str
     new_code: str
     diff: str
-    confidence: int
+    confidence: int = 8
     description: str
     applied: bool = False
+
+    @validator('confidence', pre=True, always=True)
+    def _confidence_present(cls, v):
+        # Diff-first cards are shown before a score exists. A missing score
+        # must not make Apply fail validation.
+        if v is None or v == '':
+            return 8
+        return v
+
+    @validator('symbol', pre=True)
+    def _symbol_present(cls, v):
+        # The early diff frame only sends name and full_path. Apply can still
+        # land the edit from original_code, so fill the rest instead of 422.
+        if not isinstance(v, dict):
+            return v
+        sym = dict(v)
+        sym.setdefault('symbol_type', 'variable')
+        sym.setdefault('start_line', 0)
+        sym.setdefault('end_line', 0)
+        sym.setdefault('code', '')
+        if not sym.get('name'):
+            sym['name'] = (sym.get('full_path') or 'edit').split('.')[-1] or 'edit'
+        return sym
     surgeon_notes: List[str] = []
     qa_result: Optional[QAResult] = None
     # v3.4.0: search-and-replace operations (primary apply path)

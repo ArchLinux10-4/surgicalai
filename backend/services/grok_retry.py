@@ -42,6 +42,7 @@ nothing here touches the Claude/GPT/Gemini paths, which continue to call
 ``_chat_create`` -> ``api_call_with_retry`` completely unchanged.
 """
 
+import json
 import time
 
 try:  # pragma: no cover - import shape differs only by cwd, mirrors grok_agent_tools.py
@@ -71,6 +72,7 @@ _TRANSIENT_CODES = {429, 500, 502, 503, 529}
 _TRANSIENT_KEYWORDS = (
     "overloaded", "rate_limit", "rate limit",
     "connection", "timeout", "529", "503",
+    "temporarily unavailable", "did not respond", "service unavailable",
 )
 
 # Same backoff shape as api_call_with_retry's default, for behavioral parity.
@@ -122,6 +124,92 @@ def _is_429(exc: Exception) -> bool:
             pass
     msg = str(exc).lower()
     return "429" in msg or "rate_limit" in msg or "rate limit" in msg or "too many requests" in msg
+
+
+def is_transient_grok_error(exc: Exception) -> bool:
+    """True for a Grok error the billing guard and the plan stream may retry.
+
+    Includes xAI's no-status stream failure "Service temporarily unavailable.
+    The model did not respond to this request.", which carries no HTTP code.
+    """
+    return _is_transient(exc)
+
+
+def grok_api_error_fields(exc: Exception) -> dict:
+    """Status, body, and request id for a dlog line. Never raises. No secrets."""
+    status = _status_code(exc)
+    body = _extract_error_body(exc)
+    if not isinstance(body, str):
+        try:
+            body = json.dumps(body, default=str)
+        except Exception:
+            body = str(body)
+    request_id = getattr(exc, "request_id", None) or ""
+    if not request_id:
+        response = getattr(exc, "response", None)
+        headers = getattr(response, "headers", None) if response is not None else None
+        if headers is not None:
+            try:
+                request_id = (
+                    headers.get("x-request-id")
+                    or headers.get("x-requestid")
+                    or ""
+                )
+            except Exception:
+                request_id = ""
+    return {
+        "error_type": type(exc).__name__,
+        "status_code": status,
+        "error_body": str(body)[:500],
+        "request_id": str(request_id)[:120],
+        "error": str(exc)[:300],
+    }
+
+
+def _message_chars(content) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if content is None:
+        return 0
+    try:
+        return len(json.dumps(content, default=str))
+    except Exception:
+        return len(str(content))
+
+
+def grok_request_fields(messages, kwargs, *, model: str, mode: str, turn) -> dict:
+    """Shape of a Grok chat request. Character counts only — never the text."""
+    kw = dict(kwargs or {})
+    msg_list = list(messages if messages is not None else kw.get("messages") or [])
+    chars_by_role = {}
+    for msg in msg_list:
+        if not isinstance(msg, dict):
+            chars_by_role["?"] = chars_by_role.get("?", 0) + _message_chars(msg)
+            continue
+        role = str(msg.get("role") or "?")
+        chars_by_role[role] = chars_by_role.get(role, 0) + _message_chars(msg.get("content"))
+    tools = kw.get("tools") or []
+    names = []
+    for tool in tools:
+        fn = (tool or {}).get("function") if isinstance(tool, dict) else None
+        names.append((fn or {}).get("name") or "?")
+    return {
+        "model": model,
+        "mode": mode,
+        "turn": turn,
+        "stream": bool(kw.get("stream")),
+        "temperature_set": "temperature" in kw,
+        "temperature": kw.get("temperature"),
+        "tool_choice": kw.get("tool_choice"),
+        "max_tokens": kw.get("max_tokens"),
+        "max_completion_tokens": kw.get("max_completion_tokens"),
+        "stop_set": kw.get("stop") is not None,
+        "message_count": len(msg_list),
+        "chars_by_role": chars_by_role,
+        "tool_count": len(list(tools)),
+        "tool_names": names,
+        "kwarg_keys": sorted(k for k in kw.keys() if k != "messages"),
+    }
 
 
 def _is_transient(exc: Exception) -> bool:

@@ -3,6 +3,7 @@ import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { SurgicalChange, ImpactAnalysis } from '../types'
 import { toast } from '../lib/toast'
+import { applyChanges as runApply } from '../hooks/useApplyChange'
 import { DiffView } from './DiffView'
 import { Bolt, Cancel, CheckCircle, KeyboardArrowDown, KeyboardArrowRight, Warning } from '@mui/icons-material';
 
@@ -170,12 +171,14 @@ export function SurgicalPanel() {
     if (!activeFile) return
     setApplying(changeId)
     try {
-      const result = await api.surgical.apply({
-        file_path: activeFile.path,
-        change_id: changeId,
-        changes: changes,
-        file_content: activeFile.content,
+      const outcome = await runApply({
+        filename: activeFile.path,
+        sessionId: activeSessions || undefined,
+        changes: changes.filter(c => c.id === changeId),
+        fileContent: activeFile.content,
+        mode: 'one',
       })
+      const result = outcome.raw
       setActiveFile({ ...activeFile, content: result.new_content })
       setAppliedIds(prev => new Set([...prev, changeId]))
       // Cloud mode: file was uploaded (not on server disk) — offer download
@@ -212,12 +215,14 @@ export function SurgicalPanel() {
     if (toApply.length === 0) return
     setApplying('all')
     try {
-      const result = await api.surgical.applyAll({
-        file_path: activeFile.path,
-        change_id: toApply[0].id,
+      const outcome = await runApply({
+        filename: activeFile.path,
+        sessionId: activeSessions || undefined,
         changes: toApply,
-        file_content: activeFile.content,
+        fileContent: activeFile.content,
+        mode: 'all',
       })
+      const result = outcome.raw
       // Cloud mode: file was uploaded (not on server disk) — offer download
       if (!result.backup_path) {
         const blob = new Blob([result.new_content], { type: 'text/plain' })

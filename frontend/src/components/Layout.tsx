@@ -4,6 +4,7 @@ import { ChatPanel } from './ChatPanel'
 import { CodePanel } from './CodePanel'
 import { ElementPickerPanel } from './ElementPickerPanel'
 import { AwsTerminalDock } from './AwsTerminalDock'
+import { LocalTerminalDock } from './LocalTerminalDock'
 import { GitTerminalDock } from './GitTerminalDock'
 import { McpApprovalCard } from './McpApprovalCard'
 import { PreviewProbe } from './PreviewProbe'
@@ -159,7 +160,7 @@ export function Layout() {
         className={`flex flex-col min-h-0 bg-base overflow-hidden ${
           (activeFile || elementPickerOpen)
             ? 'flex-shrink-0 border-r border-border'
-            : 'flex-1 transition-all duration-200'
+            : 'flex-1 transition-[width] duration-200'
         }`}
         style={(activeFile || elementPickerOpen) ? { width: chatWidth } : undefined}
       >
@@ -197,6 +198,7 @@ export function Layout() {
       </div>
       <McpApprovalCard />
       <GitTerminalDock />
+      <LocalTerminalDock />
       <AwsTerminalDock />
       </div>
     </div>

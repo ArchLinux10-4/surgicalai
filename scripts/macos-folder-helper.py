@@ -19,6 +19,11 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import local_agent_core as local_agent
+
 PICKER_PORT = 18765
 _DIALOG_TIMEOUT_S = 110
 _dialog_lock = threading.Lock()
@@ -64,6 +69,28 @@ def read_token():
             return handle.read().strip()
     except OSError:
         return ""
+
+
+def local_token_path():
+    override = (os.environ.get("SURGICALAI_LOCAL_AGENT_TOKEN_FILE") or "").strip()
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".surgicalai", "local-agent-token")
+
+
+def read_local_token():
+    try:
+        with open(local_token_path(), "r", encoding="utf-8") as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def local_log_path():
+    override = (os.environ.get("SURGICALAI_LOCAL_AGENT_LOG") or "").strip()
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".surgicalai", "local-agent.log")
 
 
 def _authorized(presented, expected):
@@ -135,33 +162,66 @@ class PickerHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self):
-        if self.path.split("?", 1)[0] != "/health":
-            self._send(404, {"error": "not found"})
-            return
-        self._send(200, {"ok": True})
+    def _bound_port(self):
+        return int(self.server.server_address[1])
 
-    def do_POST(self):
-        if self.path.split("?", 1)[0] != "/pick":
-            self._send(404, {"error": "not found"})
-            return
-        if not _authorized(self.headers.get("X-SurgicalAI-Picker-Token", ""), read_token()):
-            self._send(401, {"error": "unauthorized"})
-            return
+    def _gate(self, require_json):
+        port = self._bound_port()
+        if not local_agent.host_allowed(self.headers.get("Host", ""), port):
+            return 403, {"error": "forbidden host"}
+        if not local_agent.origin_allowed(self.headers.get("Origin", "")):
+            return 403, {"error": "forbidden origin"}
+        if require_json and not local_agent.content_type_ok(self.headers.get("Content-Type", "")):
+            return 415, {"error": "content type must be application/json"}
+        return 0, None
+
+    def _read_json(self, limit):
         try:
             length = int(self.headers.get("Content-Length") or "0")
         except ValueError:
             length = 0
-        if length < 0 or length > 4096:
-            self._send(400, {"error": "body too large"})
-            return
+        if length < 0 or length > limit:
+            return None, 413, {"error": "body too large"}
         raw = self.rfile.read(length) if length else b"{}"
         try:
             body = json.loads(raw.decode("utf-8") or "{}")
             if not isinstance(body, dict):
                 raise ValueError("body must be an object")
         except (ValueError, UnicodeError):
-            self._send(400, {"error": "invalid json"})
+            return None, 400, {"error": "invalid json"}
+        return body, 0, None
+
+    def do_GET(self):
+        if self.path.split("?", 1)[0] != "/health":
+            self._send(404, {"error": "not found"})
+            return
+        status, payload = self._gate(False)
+        if status:
+            self._send(status, payload)
+            return
+        self._send(200, {"ok": True})
+
+    def do_POST(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/pick":
+            self._post_pick()
+            return
+        if path in ("/exec", "/read", "/write", "/list"):
+            self._post_local(path)
+            return
+        self._send(404, {"error": "not found"})
+
+    def _post_pick(self):
+        status, payload = self._gate(True)
+        if status:
+            self._send(status, payload)
+            return
+        if not _authorized(self.headers.get("X-SurgicalAI-Picker-Token", ""), read_token()):
+            self._send(401, {"error": "unauthorized"})
+            return
+        body, status, payload = self._read_json(4096)
+        if status:
+            self._send(status, payload)
             return
         default_path = str(body.get("default_path") or "")
         if "\x00" in default_path or not os.path.isdir(default_path):
@@ -170,6 +230,52 @@ class PickerHandler(BaseHTTPRequestHandler):
             default_path = os.path.realpath(default_path)
         result = choose_folder(_clean_prompt(body.get("prompt")), default_path)
         status = int(result.pop("status", 200))
+        self._send(status, result)
+
+    def _post_local(self, path):
+        status, payload = self._gate(True)
+        if status:
+            self._send(status, payload)
+            return
+        if not _authorized(self.headers.get("X-SurgicalAI-Local-Token", ""), read_local_token()):
+            self._send(401, {"error": "unauthorized"})
+            return
+        body, status, payload = self._read_json(local_agent.MAX_BODY_BYTES)
+        if status:
+            self._send(status, payload)
+            return
+        try:
+            if path == "/exec":
+                result = local_agent.run_exec(
+                    body.get("argv"),
+                    str(body.get("cwd") or ""),
+                    body.get("timeout_s"),
+                )
+                audit_path = str(body.get("cwd") or "")
+            elif path == "/read":
+                result = local_agent.read_file(body.get("path"), body.get("offset"), body.get("limit"))
+                audit_path = str(body.get("path") or "")
+            elif path == "/write":
+                result = local_agent.write_file(
+                    body.get("path"),
+                    body.get("content"),
+                    str(body.get("expected_sha") or ""),
+                )
+                audit_path = str(body.get("path") or "")
+            else:
+                result = local_agent.list_dir(body.get("path"))
+                audit_path = str(body.get("path") or "")
+        except Exception:
+            self._send(500, {"error": "the helper could not run that action"})
+            return
+        status = int(result.pop("status", 200))
+        local_agent.audit(local_log_path(), {
+            "endpoint": path,
+            "path": audit_path[:180],
+            "exit_code": result.get("exit_code"),
+            "duration_ms": result.get("duration_ms"),
+            "status": status,
+        })
         self._send(status, result)
 
 

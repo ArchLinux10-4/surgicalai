@@ -16,6 +16,7 @@ import { AccountTree, Add, AttachFile, AutoFixHigh, Biotech, Bolt, BugReport, Cl
 import { VoiceButton } from './VoiceButton'
 import { validateFileSize } from '../utils/fileValidation'
 import { splitPendingChanges } from '../lib/diffChange'
+import { applyChanges as runApply } from '../hooks/useApplyChange'
 
 // ── Strip internal protocol tags from model output ────────────────────────────
 function stripInternalTags(text: string, streaming = false): string {
@@ -124,11 +125,15 @@ function ApplyAllButton({ messages, sessionId, sessionFiles, setSessionFiles }: 
           if (applyChanges.length === 0) continue
           try {
             const current = await api.sessionFiles.get(sessionId, fd.file_id)
-            const applied = await api.surgical.applyAll({
-              file_path: fd.filename,
+            const outcome = await runApply({
+              sessionId,
+              filename: fd.filename,
+              fileId: fd.file_id,
               changes: applyChanges,
-              file_content: current.content,
+              fileContent: current.content,
+              mode: 'all',
             })
+            const applied = outcome.raw
             if (applied.modified_content) {
               await api.sessionFiles.update(sessionId, fd.file_id, applied.modified_content)
               appliedFiles++

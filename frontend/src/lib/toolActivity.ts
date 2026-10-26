@@ -6,7 +6,7 @@ import type { ToolActivityEvent, ToolKind, ToolRow, ToolStatus } from '../types/
 
 const KINDS = new Set<ToolKind>([
   'file', 'search', 'repo', 'github', 'history', 'preview', 'web',
-  'git', 'aws', 'mcp', 'edit', 'qa', 'step',
+  'git', 'aws', 'mcp', 'edit', 'qa', 'step', 'local',
 ])
 const PHASE_KINDS = new Set<ToolKind>(['step', 'edit', 'qa'])
 const MAX_ROWS = 40
@@ -149,7 +149,18 @@ function rowMs(row: ToolRow): number | null {
   return null
 }
 
-export function summarizeTrail(rows: ToolRow[]): string {
+export function turnWallMs(
+  createdAt: string | undefined,
+  rows: { startedAt?: number }[],
+): number | undefined {
+  const end = Date.parse(createdAt || '')
+  const starts = rows.map(row => row.startedAt || 0).filter(n => n > 0)
+  if (!Number.isFinite(end) || starts.length === 0) return undefined
+  const wall = end - Math.min(...starts)
+  return wall > 0 ? wall : undefined
+}
+
+export function summarizeTrail(rows: ToolRow[], wallMs?: number): string {
   const counted = rows.filter(row => row.id !== OMITTED_ID && !PHASE_KINDS.has(row.kind))
   let total = 0
   let known = false
@@ -160,7 +171,20 @@ export function summarizeTrail(rows: ToolRow[]): string {
     total += ms
     known = true
   }
-  const duration = known ? formatDuration(total) : ''
+  let wallStart = Infinity
+  let wallEnd = 0
+  let haveWall = false
+  for (const row of rows) {
+    if (row.id === OMITTED_ID) continue
+    if (row.startedAt > 0 && typeof row.endedAt === 'number' && row.endedAt >= row.startedAt) {
+      wallStart = Math.min(wallStart, row.startedAt)
+      wallEnd = Math.max(wallEnd, row.endedAt)
+      haveWall = true
+    }
+  }
+  const span = haveWall ? wallEnd - wallStart : (known ? total : 0)
+  const shown = wallMs && wallMs > span ? wallMs : span
+  const duration = shown >= 100 ? formatDuration(shown) : ''
   if (counted.length === 0) return duration ? `Finished in ${duration}` : 'Finished'
   const noun = counted.length === 1 ? 'tool' : 'tools'
   return duration ? `Used ${counted.length} ${noun} · ${duration}` : `Used ${counted.length} ${noun}`
@@ -190,7 +214,7 @@ export function deriveStage(input: {
   }
   if (input.isBuildingEdit || input.writingLive) return { label: 'Writing the change', tone: 'write' }
   if ((input.content || '').trim()) return { label: 'Writing the reply', tone: 'write' }
-  if (input.isThinking) return { label: 'Reasoning', tone: 'think' }
+  if (input.isThinking) return { label: 'Thinking', tone: 'think' }
   const progress = stripLeadingEmoji((input.progress || '').trim())
   if (progress && progress !== 'Thinking...' && progress !== 'Thinking') {
     return { label: progress, tone: 'think' }
@@ -206,19 +230,6 @@ export function modelFamily(id?: string): { name: string; family: 'claude' | 'gp
   if (model.startsWith('gemini')) return { name: 'Gemini', family: 'gemini' }
   if (model.startsWith('ollama')) return { name: 'Local', family: 'local' }
   return { name: 'SurgicalAI', family: 'unknown' }
-}
-
-export function rowsFromProgress(progress: string, now: number): ToolRow[] {
-  const label = stripLeadingEmoji((progress || '').trim())
-  if (!label || label === 'Thinking...' || label === 'Thinking') return []
-  return [{
-    id: 'legacy-progress',
-    kind: 'step',
-    label,
-    doneLabel: label,
-    status: 'running',
-    startedAt: now,
-  }]
 }
 
 export function hydrateToolRows(raw: unknown): ToolRow[] {

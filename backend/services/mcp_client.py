@@ -19,13 +19,14 @@ import secrets
 import time
 from typing import Any, Optional
 
+from services.limits import MCP_MAX_CHARS as MAX_RESULT_CHARS
+
 CONNECT_TIMEOUT_S = 8
 # npx and uvx cold starts can miss the URL connect budget.
 STDIO_CONNECT_TIMEOUT_S = 45
 CALL_TIMEOUT_S = 25
 APPROVAL_TIMEOUT_S = 180
 MAX_SERVERS = 8
-MAX_RESULT_CHARS = 6000
 MAX_CALLS = 8
 MAX_TOOL_PAGES = 20
 INSTALL_HINT = (
@@ -474,7 +475,8 @@ def format_result(server_id: str, tool: str, text: str, nonce: Optional[str] = N
     if room < 0:
         return (prefix + suffix)[:MAX_RESULT_CHARS]
     if len(body) > room:
-        body = body[:room]
+        note = "\nOutput was cut. Ask for a narrower call if you need the rest."
+        body = body[: max(0, room - len(note))] + note
     return prefix + body + suffix
 
 

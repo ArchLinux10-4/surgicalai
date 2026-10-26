@@ -71,6 +71,85 @@ def _language(filename: str) -> str:
     return _get_language(filename)
 
 
+_PLAN_SKIP_DIRS = {
+    ".git", "node_modules", "__pycache__", ".surgicalai_backups",
+    "dist", "build", ".next", "venv", ".venv", "target",
+}
+
+
+def _planned_rel(root: str, filename: str) -> str | None:
+    """A file under root for this plan step, or None when it is not there.
+
+    An exact relative path wins. A bare name is used only when exactly one
+    file in the folder has that name. The walk skips dependency and build
+    directories and stops after a few thousand names so a huge folder cannot
+    stall the request.
+    """
+    rel = (filename or "").replace("\\", "/").strip().lstrip("/")
+    if not rel or any(part == ".." for part in rel.split("/")):
+        return None
+    try:
+        target = resolve_inside(root, rel)
+    except HTTPException:
+        return None
+    if target.is_file():
+        return rel
+    if "/" in rel:
+        return None
+    found: list[str] = []
+    seen = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [
+            d for d in dirnames
+            if d not in _PLAN_SKIP_DIRS and not d.startswith(".")
+        ]
+        for name in filenames:
+            seen += 1
+            if seen > 8000:
+                return found[0] if len(found) == 1 else None
+            if name != rel:
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                if os.path.isfile(full) and os.path.getsize(full) <= 1_000_000:
+                    found.append(os.path.relpath(full, root))
+            except OSError:
+                continue
+            if len(found) > 1:
+                return None
+    return found[0] if len(found) == 1 else None
+
+
+def stage_planned_files(session_id: str, user_id: str, repo: dict, filenames: list) -> list:
+    """Copy planned files from the open folder into the chat. Does not write disk."""
+    root = (repo or {}).get("root_path") or ""
+    repo_id = (repo or {}).get("id") or ""
+    if not root or not repo_id:
+        return []
+    out = []
+    seen = set()
+    for raw in filenames or []:
+        name = str(raw or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        rel = _planned_rel(root, name)
+        if not rel:
+            continue
+        try:
+            row = stage_path(session_id, user_id, repo_id, rel)
+        except HTTPException:
+            continue
+        out.append({
+            "requested": name,
+            "filename": row.get("filename") or rel,
+            "content": row.get("content") or "",
+            "id": row.get("id") or "",
+            "file_type": row.get("file_type") or "code",
+        })
+    return out
+
+
 def stage_path(session_id: str, user_id: str, repo_id: str, rel_path: str) -> dict:
     """Copy one repository file into session_files. Does not write to disk."""
     repo = get_owned(user_id, repo_id)

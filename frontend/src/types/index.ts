@@ -1,4 +1,4 @@
-export type ToolKind = 'file' | 'search' | 'repo' | 'github' | 'history' | 'preview' | 'web' | 'git' | 'aws' | 'mcp' | 'edit' | 'qa' | 'step'
+export type ToolKind = 'file' | 'search' | 'repo' | 'github' | 'history' | 'preview' | 'web' | 'git' | 'aws' | 'mcp' | 'edit' | 'qa' | 'step' | 'local'
 export type ToolStatus = 'running' | 'waiting' | 'done' | 'failed' | 'stopped'
 
 export interface ToolActivityEvent {
@@ -357,6 +357,10 @@ export interface PlanTask {
   run_id?: string
   verdict?: string | null
   result_summary?: string
+  added?: number
+  removed?: number
+  diff?: string
+  delivered?: boolean
 }
 
 export interface AgentTask {
@@ -383,8 +387,12 @@ export interface SmartResult {
     file_id: string
     changes: SurgicalChange[]
   }>
-  skipped_changes?: { symbol: string; reason: string }[]
+  skipped_changes?: { symbol: string; filename?: string; reason: string }[]
   new_files?: NewFile[]
   /** Set when chat.py safety_net saved Apply cards after SSE disconnect. */
   recovered?: boolean
+  /** Plan build: one review, no QA scores. */
+  plan_review?: boolean
+  lint_notes?: string[]
+  failed_steps?: { filename: string; symbol: string; reason: string }[]
 }

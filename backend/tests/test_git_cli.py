@@ -617,6 +617,19 @@ def test_push_files_refuses_the_default_branch(monkeypatch):
     assert g.default_branch_push_block("feature", "main") == ""
 
 
+def test_wiring_matches_local():
+    pipeline = Path(_BACKEND, "services", "pipeline.py").read_text(encoding="utf-8")
+    native = Path(_BACKEND, "services", "grok_ask_plan_native.py").read_text(encoding="utf-8")
+    steering = Path(_BACKEND, "services", "steering.py").read_text(encoding="utf-8")
+    assert pipeline.count("resolve_local_call") == pipeline.count("resolve_aws_call")
+    assert pipeline.count("resolve_local_call as") == pipeline.count("resolve_aws_call as")
+    assert pipeline.count("resolve_local_call as") >= 3
+    assert "resolve_local_call" in native
+    assert "local_cli_response" in steering
+    assert '_streaming_t0 += float(_local_done.get("waited_s") or 0)' in pipeline
+    assert '"local"' in pipeline[pipeline.find("Recover a context-request tag"):pipeline.find("Recover a context-request tag") + 500]
+
+
 def test_wiring_matches_aws():
     pipeline = Path(_BACKEND, "services", "pipeline.py").read_text(encoding="utf-8")
     native = Path(_BACKEND, "services", "grok_ask_plan_native.py").read_text(encoding="utf-8")

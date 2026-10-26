@@ -18,6 +18,7 @@ CLIENT_MESSAGE_TYPES = frozenset({
     "file_response",
     "aws_cli_response",
     "git_cli_response",
+    "local_cli_response",
     "preview_check_response",
     "mcp_call_response",
 })

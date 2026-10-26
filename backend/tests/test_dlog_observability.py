@@ -15,6 +15,7 @@ Isolated temp-HOME SQLite DB, mirroring the pattern used by the other tests.
 import os
 import sys
 import json
+import time
 import tempfile
 import importlib
 from pathlib import Path
@@ -42,6 +43,7 @@ import debug_events  # noqa: E402
 def _events(event=None, like=None):
     """Return debug_events rows (as parsed dicts) optionally filtered by exact
     event name or a LIKE prefix on the event column."""
+    debug_events.flush()
     with database.get_db_ctx() as conn:
         if event is not None:
             rows = conn.execute(
@@ -69,6 +71,7 @@ def _events(event=None, like=None):
 
 
 def _count(event):
+    debug_events.flush()
     with database.get_db_ctx() as conn:
         row = conn.execute(
             "SELECT COUNT(*) AS c FROM debug_events WHERE event = ?", (event,)
@@ -91,6 +94,17 @@ def test_emit_reentrancy_guard_skips_db_when_already_emitting():
         debug_events._state.in_progress = False
     after = _count("nested_probe")
     assert after == before, "reentrant emit must not write a DB row"
+
+
+def test_emit_enqueue_returns_quickly_and_flush_writes_the_rows():
+    ev = "queue_probe_" + os.urandom(3).hex()
+    started = time.perf_counter()
+    for i in range(2000):
+        debug_events.emit(ev, i=i)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 1.0, elapsed
+    debug_events.flush()
+    assert _count(ev) == 2000
 
 
 def test_emit_writes_exactly_one_row_despite_lifecycle_dlogs():

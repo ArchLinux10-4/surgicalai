@@ -686,6 +686,9 @@ def apply_changes_to_file(
             # so it stays correct even if the error text changes later.
             _new_code = getattr(change, "new_code", None) or ""
             _already_applied = bool(_new_code.strip()) and _new_code in current_content
+            if _already_applied:
+                _dlog("apply_idempotency_fallback", symbol=_c_sym,
+                      change_id=getattr(change, "id", None))
             _dlog("apply_all_change_failed", symbol=_c_sym,
                   change_id=getattr(change, "id", None),
                   reason=str(e),
@@ -694,6 +697,7 @@ def apply_changes_to_file(
                 "change_id": getattr(change, "id", None),
                 "symbol": _c_sym,
                 "reason": str(e),
+                "code": "already_applied" if _already_applied else "anchor_not_found",
                 "already_applied": _already_applied,
             })
 
@@ -743,8 +747,17 @@ def apply_changes_to_file(
 
     # Write final content only when file exists on disk
     if on_disk:
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(current_content)
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(current_content)
+        except OSError as exc:
+            failed_changes.append({
+                "change_id": None,
+                "symbol": file_path,
+                "reason": str(exc)[:200],
+                "code": "write_failed",
+                "already_applied": False,
+            })
         return SurgicalApplyResponse(
             file_path=file_path,
             new_content=current_content,

@@ -293,6 +293,12 @@ export function NewFileCard({ result, sessionId }: NewFileCardProps) {
           <span className="text-[11px] font-semibold text-muted/80 uppercase tracking-wider">
             {newFiles.length === 1 ? 'New file' : `${newFiles.length} new files`}
           </span>
+          {((result as any).qa_status === 'pending') && (
+            <span className="text-[10px] px-2 py-0.5 rounded-full border border-border text-muted">Checking</span>
+          )}
+          {((result as any).qa_status === 'unfinished') && (
+            <span className="text-[10px] px-2 py-0.5 rounded-full border border-warning/40 text-warning">QA unfinished</span>
+          )}
           {savedFiles.size > 0 && (
             <span className="text-[10px] px-2 py-0.5 rounded-full bg-success/20 text-success border border-success/30 font-medium">
               {savedFiles.size} saved

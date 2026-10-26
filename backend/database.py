@@ -4,6 +4,7 @@ Set DATABASE_URL env var to use PostgreSQL. Falls back to SQLite.
 """
 import os
 import json
+import random
 import uuid
 import hashlib
 import time
@@ -62,6 +63,11 @@ def _dlog(event: str, **kwargs):
         # _dlog again; that inner call is detected as reentrant and degrades
         # to the /tmp line only, so we never recurse into a second DB write.
         try:
+            # db_open / db_close fire on every connection, including the
+            # debug writer's own. Sampling keeps them out of the table.
+            if event in ("db_open", "db_close", "db_close_after_exception"):
+                if random.random() >= 0.02 and int(kwargs.get("open_connections") or 0) < 20:
+                    return
             import debug_events as _debug_events
             _debug_events.emit(event, **kwargs)
         except Exception:
@@ -220,6 +226,9 @@ def get_db():
             DB_DIR.mkdir(parents=True, exist_ok=True)
             conn = sqlite3.connect(str(DB_PATH))
             conn.row_factory = sqlite3.Row
+            # NORMAL is safe with WAL and avoids an fsync on every debug insert.
+            # Postgres is unchanged: this pragma is SQLite-only.
+            conn.execute("PRAGMA synchronous=NORMAL")
     except Exception as e:
         _dlog("db_open_failed", driver=("postgres" if USE_POSTGRES else "sqlite"),
               error=str(e), elapsed_ms=round((time.monotonic() - t0) * 1000, 1))
@@ -747,6 +756,7 @@ def _seed_defaults_sqlite(cur):
         # Claude-only web research (Ask/Plan mode). New, additive, off by
         # default — see services/claude_web_search.py.
         "web_search_enabled": "false",
+        "local_agent_tools": "false",
     }
     for k, v in defaults.items():
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
@@ -1178,6 +1188,7 @@ def _seed_defaults_postgres(conn):
         # Claude-only web research (Ask/Plan mode). New, additive, off by
         # default — see services/claude_web_search.py.
         "web_search_enabled": "false",
+        "local_agent_tools": "false",
     }
     for k, v in defaults.items():
         conn.execute(

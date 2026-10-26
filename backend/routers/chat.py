@@ -143,7 +143,9 @@ _PLAN_DIRECTIVE = (
     "{\"steps\": [{\"filename\": \"exact file name\", \"symbol\": "
     "\"function/class/component\", \"description\": \"what to change\"}]}\n"
     "```\n"
-    "Every planned edit needs filename + symbol. Code examples in the Steps "
+    "A step that creates a file which does not exist yet sets "
+    "\"action\": \"create\". Its symbol may be the filename. "
+    "Every other step needs filename + symbol. Code examples in the Steps "
     "section are prose illustrations for the Implement path — they are NOT "
     "the machine fence. Stay in Plan and the user can tell you what to change; "
     "emit a FULL replacement fence."
@@ -737,6 +739,9 @@ def get_messages(session_id: str, request: Request):
                 _tt = _meta.get("tool_trail")
                 if isinstance(_tt, list) and _tt:
                     d["_tools"] = _tt
+                _th = _meta.get("thinking_text")
+                if isinstance(_th, str) and _th.strip():
+                    d["_thinking"] = _th
             except Exception:
                 pass
         content = d.get("content", "")
@@ -1177,7 +1182,9 @@ async def implement_plan(body: dict, request: Request):
         latest_plan_run,
         forced_edit_plan_from_run,
         compute_plan_coverage,
+        coverage_after_crash,
         apply_coverage_to_run,
+        release_unshipped_plan_steps,
         serialize_plan_task,
         plan_run_phase,
         plan_build_user_request,
@@ -1206,47 +1213,137 @@ async def implement_plan(body: dict, request: Request):
     if not plan_steps:
         raise HTTPException(status_code=400, detail="Plan has no executable steps")
 
-    with get_db_ctx() as conn:
-        sess_row = conn.execute(
-            "SELECT session_summary FROM chat_sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        session_summary = (
-            (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "")
-            or ""
-        )
-        history = conn.execute(
-            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
-            "AND content NOT LIKE ? ORDER BY created_at ASC",
-            (session_id, "__COMPACTION_EVENT__:%"),
-        ).fetchall()
-        conversation_history = [
-            {"role": r["role"], "content": r["content"]} for r in history
-        ]
-        file_rows = conn.execute(
-            "SELECT id, filename, content, language, lines, symbol_count, "
-            "file_type, created_at, updated_at FROM session_files "
-            "WHERE session_id = ? ORDER BY created_at ASC",
-            (session_id,),
-        ).fetchall()
-        session_files = [dict(r) for r in file_rows]
-        project_memory = _load_effective_memory(conn, session_id)
-        from services.user_memory import attach_user_memory
-        project_memory = attach_user_memory(project_memory, current_user_id, session_id, "")
-        conn.commit()
+    def _load_impl_context():
+        with get_db_ctx() as conn:
+            sess_row = conn.execute(
+                "SELECT session_summary FROM chat_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            session_summary = (
+                (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "")
+                or ""
+            )
+            history = conn.execute(
+                "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
+                "AND content NOT LIKE ? ORDER BY created_at ASC",
+                (session_id, "__COMPACTION_EVENT__:%"),
+            ).fetchall()
+            conversation_history = [
+                {"role": r["role"], "content": r["content"]} for r in history
+            ]
+            file_rows = conn.execute(
+                "SELECT id, filename, content, language, lines, symbol_count, "
+                "file_type, created_at, updated_at FROM session_files "
+                "WHERE session_id = ? ORDER BY created_at ASC",
+                (session_id,),
+            ).fetchall()
+            session_files = [dict(r) for r in file_rows]
+            project_memory = _load_effective_memory(conn, session_id)
+            from services.user_memory import attach_user_memory
+            project_memory = attach_user_memory(project_memory, current_user_id, session_id, "")
+            conn.commit()
+        return {
+            "session_summary": session_summary,
+            "conversation_history": conversation_history,
+            "session_files": session_files,
+            "project_memory": project_memory,
+        }
+
+    _loaded_impl = await asyncio.to_thread(_load_impl_context)
+    session_summary = _loaded_impl["session_summary"]
+    conversation_history = _loaded_impl["conversation_history"]
+    session_files = _loaded_impl["session_files"]
+    project_memory = _loaded_impl["project_memory"]
 
     if not session_files:
         raise HTTPException(status_code=400, detail="Session has no files to implement against")
 
+    def _diff_line_counts(diff: str) -> tuple[int, int]:
+        added = removed = 0
+        for line in (diff or "").splitlines():
+            if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+                continue
+            if line.startswith("+"):
+                added += 1
+            elif line.startswith("-"):
+                removed += 1
+        return added, removed
+
+    def _plan_step_result_events(parsed: dict) -> list[dict]:
+        events = []
+        changes_by_file = parsed.get("changes_by_file") if isinstance(parsed, dict) else None
+        if isinstance(changes_by_file, dict):
+            for filename, fd in changes_by_file.items():
+                changes = []
+                name = filename
+                if isinstance(fd, dict):
+                    name = fd.get("filename") or filename
+                    changes = fd.get("changes") or []
+                elif isinstance(fd, list):
+                    changes = fd
+                for change in changes:
+                    if not isinstance(change, dict):
+                        continue
+                    symbol = change.get("symbol")
+                    if isinstance(symbol, dict):
+                        symbol = symbol.get("name") or symbol.get("full_path") or ""
+                    diff = str(change.get("diff") or "")
+                    added, removed = _diff_line_counts(diff)
+                    if not diff:
+                        added = len(str(change.get("new_code") or "").splitlines())
+                        removed = len(str(change.get("original_code") or "").splitlines())
+                    events.append({
+                        "type": "plan_step_result",
+                        "run_id": run_id,
+                        "filename": name,
+                        "symbol": str(symbol or ""),
+                        "added": added,
+                        "removed": removed,
+                        "diff": diff[:8000],
+                    })
+        for created in (parsed.get("new_files") or []) if isinstance(parsed, dict) else []:
+            if not isinstance(created, dict):
+                continue
+            filename = str(created.get("filename") or "")
+            events.append({
+                "type": "plan_step_result",
+                "run_id": run_id,
+                "filename": filename,
+                "symbol": filename,
+                "added": len(str(created.get("content") or "").splitlines()),
+                "removed": 0,
+                "diff": "",
+            })
+        return events
+
     user_request = plan_build_user_request(session_id, plan_steps)
     _activated = activate_first_plan_step(session_id, run_id)
+
+    _dlog("plan_implement_start", session_id=session_id, user_id=current_user_id,
+          run_id=run_id, steps=len(plan_steps))
 
     async def stream_implement():
         import json as _json
         collected_tokens = []
         result_content = None
+        checkpoint_content = None
+        error_message = None
+        recovered_from_checkpoint = False
         from services.tool_activity import ToolTrail as _ToolTrail
         _impl_trail = _ToolTrail()
+        _impl_thinking: list = []
+
+        def _finish_log(tasks, *, failed: bool):
+            statuses = [(t.get("status") or "") for t in (tasks or [])]
+            _dlog(
+                "plan_implement_error" if failed else "plan_implement_finish",
+                session_id=session_id, user_id=current_user_id, run_id=run_id,
+                done=statuses.count("done"), blocked=statuses.count("blocked"),
+                pending=statuses.count("pending"),
+                smart_result=bool(result_content),
+                error=(error_message or "")[:300],
+            )
+
         try:
             yield "data: " + _json.dumps({
                 "type": "plan_updated",
@@ -1275,11 +1372,35 @@ async def implement_plan(body: dict, request: Request):
                             collected_tokens.append(data.get("content", ""))
                         elif chunk_type == "smart_result":
                             result_content = data.get("content", "")
+                        elif chunk_type == "checkpoint":
+                            _ckpt = data.get("content") or ""
+                            if _ckpt:
+                                checkpoint_content = _ckpt
+                        elif chunk_type == "error":
+                            error_message = data.get("content") or error_message
                         elif chunk_type == "tool_activity":
                             _impl_trail.observe(data)
+                        elif chunk_type == "thinking":
+                            _piece = data.get("content") or ""
+                            if _piece and sum(len(p) for p in _impl_thinking) < 20000:
+                                _impl_thinking.append(_piece)
                     except Exception:
                         pass
                 yield chunk
+
+            if not result_content and checkpoint_content:
+                _recovered = recovered_result_from_checkpoint(
+                    checkpoint_content,
+                    summary="Recovered the edits finished before the build crashed.",
+                    reasoning=error_message or "Build crashed after a checkpoint.",
+                )
+                if _recovered:
+                    result_content = _json.dumps(_recovered)
+                    recovered_from_checkpoint = True
+                    yield "data: " + _json.dumps({
+                        "type": "smart_result",
+                        "content": result_content,
+                    }) + "\n\n"
 
             parsed = {}
             if result_content:
@@ -1287,18 +1408,41 @@ async def implement_plan(body: dict, request: Request):
                     parsed = _json.loads(result_content)
                 except Exception:
                     parsed = {}
-            coverage = compute_plan_coverage(
-                plan_steps, parsed if isinstance(parsed, dict) else {},
-            )
-            updated = apply_coverage_to_run(session_id, run_id, coverage)
-            phase = plan_run_phase(updated)
-            yield "data: " + _json.dumps({
-                "type": "plan_coverage",
-                "run_id": run_id,
-                "phase": phase,
-                "coverage": coverage,
-                "tasks": [serialize_plan_task(t) for t in updated],
-            }) + "\n\n"
+            if not isinstance(parsed, dict):
+                parsed = {}
+
+            if error_message and not result_content:
+                updated = release_unshipped_plan_steps(
+                    session_id, run_id, error_message[:300],
+                )
+                phase = plan_run_phase(updated)
+                _finish_log(updated, failed=True)
+                yield "data: " + _json.dumps({
+                    "type": "plan_failed",
+                    "run_id": run_id,
+                    "phase": phase if phase in ("ready", "blocked") else "ready",
+                    "error": error_message[:300],
+                    "tasks": [serialize_plan_task(t) for t in updated],
+                }) + "\n\n"
+            else:
+                for _step_ev in _plan_step_result_events(parsed):
+                    yield "data: " + _json.dumps(_step_ev) + "\n\n"
+                if error_message and recovered_from_checkpoint:
+                    coverage = coverage_after_crash(
+                        plan_steps, parsed, f"Build crashed: {error_message[:220]}",
+                    )
+                else:
+                    coverage = compute_plan_coverage(plan_steps, parsed)
+                updated = apply_coverage_to_run(session_id, run_id, coverage)
+                phase = plan_run_phase(updated)
+                _finish_log(updated, failed=False)
+                yield "data: " + _json.dumps({
+                    "type": "plan_coverage",
+                    "run_id": run_id,
+                    "phase": phase,
+                    "coverage": coverage,
+                    "tasks": [serialize_plan_task(t) for t in updated],
+                }) + "\n\n"
 
             natural_text = "".join(collected_tokens).strip()
             with get_db_ctx() as db:
@@ -1313,7 +1457,7 @@ async def implement_plan(body: dict, request: Request):
                         f"{_json.dumps({'natural': natural_text, 'result': _res_obj})}"
                     )
                 else:
-                    content = natural_text or "(plan implement finished)"
+                    content = natural_text or (error_message or "(plan implement finished)")
                 db.execute(
                     "INSERT INTO chat_messages (id, session_id, role, content, metadata) "
                     "VALUES (?, ?, ?, ?, ?)",
@@ -1322,25 +1466,27 @@ async def implement_plan(body: dict, request: Request):
                          "mode": "plan_implement",
                          "plan_run_id": run_id,
                          **({"tool_trail": _impl_trail.rows()} if _impl_trail.rows() else {}),
+                         **({"thinking_text": "".join(_impl_thinking)[:20000]}
+                            if "".join(_impl_thinking).strip() else {}),
                      })),
                 )
                 db.commit()
         except Exception as e:
+            error_message = str(e)[:300]
             _dlog("plan_implement_error", session_id=session_id,
-                  user_id=current_user_id, run_id=run_id, error=str(e)[:300])
+                  user_id=current_user_id, run_id=run_id, error=error_message)
             try:
-                from services.plan_artifact import revert_plan_after_implement_error
-                updated = revert_plan_after_implement_error(session_id, run_id, str(e)[:300])
+                updated = release_unshipped_plan_steps(session_id, run_id, error_message)
                 yield "data: " + _json.dumps({
                     "type": "plan_failed",
                     "run_id": run_id,
                     "phase": "ready",
-                    "error": str(e)[:300],
+                    "error": error_message,
                     "tasks": [serialize_plan_task(t) for t in updated],
                 }) + "\n\n"
             except Exception:
                 pass
-            yield f"data: {_json.dumps({'type': 'error', 'content': str(e)[:300]})}\n\n"
+            yield f"data: {_json.dumps({'type': 'error', 'content': error_message})}\n\n"
         yield "data: " + _json.dumps({"type": "done", "content": ""}) + "\n\n"
 
     return StreamingResponse(
@@ -1384,6 +1530,9 @@ async def smart_stream(req: dict, request: Request):
     # affecting other sessions or Ask/Plan's separate toggle. Claude uses
     # services/claude_web_search.py. GPT and Grok use services/openai_web_search.py.
     _enable_web_research = bool(req.get("enable_web_research", False))
+    _qa_retry = bool(req.get("qa_retry", False)) or str(message or "").lstrip().lower().startswith("qa failed for")
+    if _qa_retry:
+        _enable_web_research = False
     if session_id:
         set_setting(f"web_search_research_session_{session_id}",
                     "true" if _enable_web_research else "false")
@@ -1396,69 +1545,126 @@ async def smart_stream(req: dict, request: Request):
     if not has_openai and not has_anthropic and get_setting("ollama_enabled") != "true":
         raise HTTPException(status_code=401, detail="No AI backend configured. Go to Settings.")
 
-    with get_db_ctx() as conn:
+    _accept_t0 = time.time()
+    _client_sent = req.get("client_sent_at")
+    _client_gap = None
+    try:
+        if _client_sent:
+            _client_gap = round(time.time() * 1000 - float(_client_sent), 1)
+    except (TypeError, ValueError):
+        _client_gap = None
+    _dlog("smart_stream_accepted", session_id=session_id, user_id=current_user_id,
+          mode=mode, msg_len=len(message or ""), client_gap_ms=_client_gap)
 
-        # Save user message
-        msg_id = str(uuid.uuid4())
-        conn.execute(
-            "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
-            (msg_id, session_id, "user", message)
-        )
+    def _load_turn_context():
+        """Load this turn off the event loop so a large history cannot stall the next Send."""
+        nonlocal message
+        _marks = {"thread_enter_s": round(time.time() - _accept_t0, 3)}
 
-        # Load session_summary
-        sess_row = conn.execute(
-            "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-        session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
+        def _mark(name):
+            _marks[name] = round(time.time() - _accept_t0, 3)
 
-        # Get conversation history — only uncompacted messages.
-        # Compaction-event marker rows (__COMPACTION_EVENT__:{json}) are a UI-only
-        # audit record and must never reach the model as raw JSON — excluded here
-        # at the SQL source so it can't leak regardless of downstream pipeline path.
-        history = conn.execute(
-            "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
-            "AND content NOT LIKE ? ORDER BY created_at ASC",
-            (session_id, "__COMPACTION_EVENT__:%")
-        ).fetchall()
-        conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
+        with get_db_ctx() as conn:
+
+            # Save user message
+            msg_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO chat_messages (id, session_id, role, content) VALUES (?, ?, ?, ?)",
+                (msg_id, session_id, "user", message)
+            )
+            _mark("after_insert")
+
+            # Load session_summary
+            sess_row = conn.execute(
+                "SELECT session_summary FROM chat_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            session_summary = (sess_row["session_summary"] if sess_row and sess_row["session_summary"] else "") or ""
+
+            # Get conversation history — only uncompacted messages.
+            # Compaction-event marker rows (__COMPACTION_EVENT__:{json}) are a UI-only
+            # audit record and must never reach the model as raw JSON — excluded here
+            # at the SQL source so it can't leak regardless of downstream pipeline path.
+            history = conn.execute(
+                "SELECT role, content FROM chat_messages WHERE session_id = ? AND is_compacted = 0 "
+                "AND content NOT LIKE ? ORDER BY created_at ASC",
+                (session_id, "__COMPACTION_EVENT__:%")
+            ).fetchall()
+            conversation_history = [{"role": r["role"], "content": r["content"]} for r in history]
+            _history_count = len(conversation_history)
+            _mark("after_history")
+
+            # Token-aware compaction trigger: estimate tokens from loaded history.
+            # See _estimate_history_tokens() for why this must use cleaned content.
+            _history_tokens = _estimate_history_tokens(conversation_history)
+            needs_compaction = _history_tokens > HISTORY_TOKEN_BUDGET
+
+            # Load session files
+            file_rows = conn.execute(
+                "SELECT id, filename, content, language, lines, symbol_count, file_type, created_at, updated_at FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
+                (session_id,)
+            ).fetchall()
+            session_files = [dict(r) for r in file_rows]
+            _mark("after_files")
+
+            # File-awareness hint: prepend attached file list to user message so
+            # all models (including smaller ones) notice files immediately.
+            if session_files:
+                _fnames = [f['filename'] for f in session_files]
+                _file_hint = (f"[{len(_fnames)} file(s) attached: {', '.join(_fnames)}. "
+                              "Use them only if relevant to the question.]")
+                message = f"{_file_hint}\n\n{message}"
+
+            # Project memory — GLOBAL team conventions (every prompt) + any per-session memory
+            project_memory = _load_effective_memory(conn, session_id)
+            from services.user_memory import attach_user_memory
+            _mark("after_memory")
+            project_memory = attach_user_memory(project_memory, current_user_id, session_id, message)
+            _mark("after_user_memory")
+
+            conn.commit()
+            _mark("after_commit")
+
+        # Log after the write lock is released. A debug insert while this
+        # transaction is open waits on SQLite and stalls the turn.
+        _dlog("turn_context_stages", session_id=session_id, user_id=current_user_id,
+              **_marks)
         _dlog("history_loaded_excludes_compaction_marker", session_id=session_id,
-              msg_count=len(conversation_history))
-
-        # Token-aware compaction trigger: estimate tokens from loaded history.
-        # See _estimate_history_tokens() for why this must use cleaned content.
-        _history_tokens = _estimate_history_tokens(conversation_history)
-        needs_compaction = _history_tokens > HISTORY_TOKEN_BUDGET
+              msg_count=_history_count)
         _dlog("compaction_check", session_id=session_id,
               history_tokens=_history_tokens, budget=HISTORY_TOKEN_BUDGET,
-              msg_count=len(conversation_history), needs_compaction=needs_compaction)
+              msg_count=_history_count, needs_compaction=needs_compaction)
 
-        # Load session files
-        file_rows = conn.execute(
-            "SELECT id, filename, content, language, lines, symbol_count, file_type, created_at, updated_at FROM session_files WHERE session_id = ? ORDER BY created_at ASC",
-            (session_id,)
-        ).fetchall()
-        session_files = [dict(r) for r in file_rows]
+        return {
+            "message": message,
+            "session_summary": session_summary,
+            "conversation_history": conversation_history,
+            "session_files": session_files,
+            "project_memory": project_memory,
+            "needs_compaction": needs_compaction,
+        }
 
-        # File-awareness hint: prepend attached file list to user message so
-        # all models (including smaller ones) notice files immediately.
-        if session_files:
-            _fnames = [f['filename'] for f in session_files]
-            _file_hint = (f"[{len(_fnames)} file(s) attached: {', '.join(_fnames)}. "
-                          "Use them only if relevant to the question.]")
-            message = f"{_file_hint}\n\n{message}"
-
-        # Project memory — GLOBAL team conventions (every prompt) + any per-session memory
-        project_memory = _load_effective_memory(conn, session_id)
-        from services.user_memory import attach_user_memory
-        project_memory = attach_user_memory(project_memory, current_user_id, session_id, message)
-
-        conn.commit()
+    _loaded = await asyncio.to_thread(_load_turn_context)
+    message = _loaded["message"]
+    session_summary = _loaded["session_summary"]
+    conversation_history = _loaded["conversation_history"]
+    session_files = _loaded["session_files"]
+    project_memory = _loaded["project_memory"]
+    needs_compaction = _loaded["needs_compaction"]
+    _dlog("smart_stream_context_ready", session_id=session_id, user_id=current_user_id,
+          duration_s=round(time.time() - _accept_t0, 3),
+          history_msgs=len(conversation_history), files=len(session_files))
 
     async def stream_and_save():
         import json as _json
 
+        def _phase_done_line() -> str:
+            return "data: " + _json.dumps({"type": "phase", "phase": "done"}) + "\n\n"
+
         collected_tokens = []
+        _thinking_parts: list = []
         result_content = None
+        _qa_notes: list = []
+        _qa_risks = None
         # Latest resolution checkpoint from the pipeline (session e4e9d098):
         # resolved edits emitted BEFORE risky long waits, so a disconnect
         # doesn't vaporize completed work.
@@ -1555,6 +1761,7 @@ async def smart_stream(req: dict, request: Request):
                 _mode_messages.append({"role": "user", "content": _directive})
 
             _mode_collected = []
+            _mode_thinking: list = []
             _mode_error = False
             _mode_model = None  # captured from run_chat_stream's `done` event
             _mode_web_search_sources: list = []  # Ask/Plan sources — Claude, GPT, or Grok
@@ -1605,17 +1812,28 @@ async def smart_stream(req: dict, request: Request):
                 ):
                     # run_chat_stream emits token / thinking_* / done / error —
                     # all already handled by the smart-stream frontend consumer.
+                    _forward_done = False
                     if _mchunk.startswith("data: "):
                         try:
                             _md = _json.loads(_mchunk[6:])
                             _mt = _md.get("type")
                             if _mt == "token":
                                 _mode_collected.append(_md.get("content", ""))
+                            elif _mt == "thinking":
+                                _piece = _md.get("content") or ""
+                                if _piece and sum(len(p) for p in _mode_thinking) < 20000:
+                                    _mode_thinking.append(_piece)
+                            elif _mt == "progress":
+                                from services.stream_events import phase_for_progress as _phase_for
+                                _ph = _phase_for(_md.get("content") or "")
+                                if _ph:
+                                    yield "data: " + _json.dumps({"type": "phase", "phase": _ph}) + "\n\n"
                             elif _mt == "tool_activity":
                                 _mode_trail.observe(_md)
                             elif _mt == "error":
                                 _mode_error = True
                             elif _mt == "done":
+                                _forward_done = True
                                 if _md.get("model"):
                                     # run_chat_stream doesn't log which backend it
                                     # resolved; capture it here so an empty/short
@@ -1657,6 +1875,7 @@ async def smart_stream(req: dict, request: Request):
                                                       user_id=current_user_id,
                                                       reason=("not_allowed" if _pq else "invalid"))
                                             _plan_needs_retry = True
+                                            _forward_done = False
                                             continue
                                     else:
                                         _plan_event = _persist_plan_event(_early)
@@ -1664,6 +1883,8 @@ async def smart_stream(req: dict, request: Request):
                                             yield "data: " + _json.dumps(_plan_event) + "\n\n"
                         except Exception:
                             pass
+                    if _forward_done:
+                        yield _phase_done_line()
                     yield _mchunk
 
                 if _plan_needs_retry and not _mode_error and _eff_mode == "plan":
@@ -1688,6 +1909,7 @@ async def smart_stream(req: dict, request: Request):
                             client_inbox=getattr(request.state, "client_inbox", None),
                             steer_inbox=getattr(request.state, "steer_inbox", None),
                         ):
+                            _repair_done = False
                             if _rchunk.startswith("data: "):
                                 try:
                                     _rd = _json.loads(_rchunk[6:])
@@ -1699,6 +1921,7 @@ async def smart_stream(req: dict, request: Request):
                                     elif _rt == "error":
                                         _mode_error = True
                                     elif _rt == "done":
+                                        _repair_done = True
                                         if _rd.get("model"):
                                             _mode_model = _rd.get("model")
                                         if _rd.get("web_search_sources"):
@@ -1712,11 +1935,14 @@ async def smart_stream(req: dict, request: Request):
                                             }) + "\n\n"
                                 except Exception:
                                     pass
+                            if _repair_done:
+                                yield _phase_done_line()
                             yield _rchunk
                     except Exception as _re:
                         _dlog("sse_plan_fence_retry_error", session_id=session_id,
                               user_id=current_user_id, error=str(_re))
                         yield "data: " + _json.dumps({"type": "plan_missing"}) + "\n\n"
+                        yield _phase_done_line()
                         yield "data: " + _json.dumps({"type": "done", "content": ""}) + "\n\n"
             except Exception as _me:
                 _mode_error = True
@@ -1724,6 +1950,7 @@ async def smart_stream(req: dict, request: Request):
                       user_id=current_user_id, mode=mode, error=str(_me))
                 yield "data: " + _json.dumps({"type": "error", "content":
                     "Sorry — that request could not be completed. Please try again."}) + "\n\n"
+                yield _phase_done_line()
                 yield "data: " + _json.dumps({"type": "done", "content": ""}) + "\n\n"
 
             # Persist the assistant answer (tagged with the mode for later replay).
@@ -1737,6 +1964,9 @@ async def smart_stream(req: dict, request: Request):
                             _mode_metadata["web_search_sources"] = _mode_web_search_sources
                         if _mode_trail.rows():
                             _mode_metadata["tool_trail"] = _mode_trail.rows()
+                        _mode_think = "".join(_mode_thinking)[:20000]
+                        if _mode_think.strip():
+                            _mode_metadata["thinking_text"] = _mode_think
                         if _eff_mode == "plan":
                             _mode_metadata["mode"] = "plan"
                             if _plan_event and _plan_event.get("run_id"):
@@ -2031,6 +2261,7 @@ async def smart_stream(req: dict, request: Request):
                 _pipe_kwargs["steer_inbox"] = getattr(
                     request.state, "steer_inbox", None)
             async for chunk in _with_heartbeat(_pipeline(**_pipe_kwargs)):
+                _emit_phase_done = False
                 if chunk.startswith("data: "):
                     try:
                         data = _json.loads(chunk[6:])
@@ -2039,11 +2270,26 @@ async def smart_stream(req: dict, request: Request):
                             collected_tokens.append(data.get("content", ""))
                         elif chunk_type == "smart_result":
                             result_content = data.get("content", "")
+                        elif chunk_type == "qa_note":
+                            _qa_notes.append(data)
+                        elif chunk_type == "qa_done":
+                            _qa_risks = data.get("risks") or []
                         elif chunk_type == "checkpoint":
                             checkpoint_content = data.get("content", "")
                         elif chunk_type == "tool_activity":
                             _single_pass_trail.observe(data)
+                        elif chunk_type == "thinking":
+                            _piece = data.get("content") or ""
+                            if _piece and sum(len(p) for p in _thinking_parts) < 20000:
+                                _thinking_parts.append(_piece)
+                        elif chunk_type == "progress":
+                            from services.stream_events import phase_for_progress as _phase_for
+                            _ph = _phase_for(data.get("content") or "")
+                            if _ph:
+                                yield "data: " + _json.dumps({"type": "phase", "phase": _ph}) + "\n\n"
                         elif chunk_type in ("done", "error"):
+                            if chunk_type == "done":
+                                _emit_phase_done = True
                             # Pipeline's own done/error chunk is the source of
                             # truth for which model actually ran; only fall
                             # back to the configured architect model if the
@@ -2063,6 +2309,9 @@ async def smart_stream(req: dict, request: Request):
 
                                 if result_content:
                                     parsed_result = _json.loads(result_content)
+                                    if _qa_notes or _qa_risks is not None:
+                                        from services.qa_notes import merge_qa_notes as _merge_qa
+                                        parsed_result = _merge_qa(parsed_result, _qa_notes, _qa_risks)
 
                                     # Change 1: Surface QA warnings in the chat bubble text so
                                     # users see them in conversation flow, not only behind "Review".
@@ -2103,6 +2352,9 @@ async def smart_stream(req: dict, request: Request):
                                           source_count=len(_single_pass_ws_sources))
                                 if _single_pass_trail.rows():
                                     _single_pass_metadata["tool_trail"] = _single_pass_trail.rows()
+                                _thinking_text = "".join(_thinking_parts)[:20000]
+                                if _thinking_text.strip():
+                                    _single_pass_metadata["thinking_text"] = _thinking_text
                                 db.execute(
                                     "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
                                     (resp_id, session_id, "assistant", saved_content,
@@ -2119,6 +2371,8 @@ async def smart_stream(req: dict, request: Request):
                                     schedule_memory_update(current_user_id, session_id, message, natural_text)
                     except Exception as _save_err:
                         print(f"[STREAM] DB save failed: {_save_err}")
+                if _emit_phase_done:
+                    yield _phase_done_line()
                 yield chunk
         finally:
             if not _saved:
@@ -2130,6 +2384,32 @@ async def smart_stream(req: dict, request: Request):
                       path="single_pass", total_duration_s=round(time.time() - _stream_t0, 1))
             # Safety net: if stream ended without done/error (crash, timeout,
             # client disconnect), persist whatever tokens were collected.
+            if not _saved and result_content:
+                try:
+                    from services.qa_notes import merge_qa_notes as _merge_qa
+                    _pending = _json.loads(result_content)
+                    if isinstance(_pending, dict):
+                        _pending = _merge_qa(_pending, _qa_notes, _qa_risks)
+                        if _pending.get("qa_status") == "pending":
+                            _pending["qa_status"] = "unfinished"
+                        with get_db_ctx() as db:
+                            _rec_text = ("".join(collected_tokens).strip() or _pending.get("natural_text") or "")
+                            _rec_saved = "__NATURAL_AND_RESULT__:" + _json.dumps({
+                                "text": _rec_text,
+                                "result": _pending,
+                            })
+                            db.execute(
+                                "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
+                                (str(uuid.uuid4()), session_id, "assistant", _rec_saved,
+                                 _json.dumps({
+                                     "model": _resolved_model or _arch_model,
+                                     "qa_status": _pending.get("qa_status") or "unfinished",
+                                 })),
+                            )
+                            db.commit()
+                            _saved = True
+                except Exception as _qa_save_err:
+                    print(f"[STREAM] Pending QA save failed: {_qa_save_err}")
             if not _saved and (collected_tokens or checkpoint_content):
                 try:
                     with get_db_ctx() as db:
@@ -2340,7 +2620,7 @@ def _build_prior_work_context(session_id, run_id, current_seq):
     return ctx
 
 
-def _save_task_message(session_id, natural_text, parsed, model="", web_search_sources=None, tool_trail=None):
+def _save_task_message(session_id, natural_text, parsed, model="", web_search_sources=None, tool_trail=None, thinking_text=""):
     """Persist a task's assistant message (natural text + optional diff result).
 
     web_search_sources : v1.7 research checkbox — this task's Claude
@@ -2377,12 +2657,58 @@ def _save_task_message(session_id, natural_text, parsed, model="", web_search_so
                   source_count=len(web_search_sources))
         if tool_trail:
             _task_msg_metadata["tool_trail"] = tool_trail
+        if thinking_text and str(thinking_text).strip():
+            _task_msg_metadata["thinking_text"] = str(thinking_text)[:20000]
         db.execute(
             "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
             (rid, session_id, "assistant", saved, json.dumps(_task_msg_metadata)),
         )
         db.execute("UPDATE chat_sessions SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (session_id,))
         db.commit()
+
+
+def recovered_result_from_checkpoint(
+    checkpoint_content: str,
+    *,
+    fallback_text: str = "",
+    summary: str = "",
+    reasoning: str = "",
+) -> dict | None:
+    """smart_result body from a checkpoint that carries changes_by_file.
+
+    None when the checkpoint is missing, unparseable, or has no edits.
+    Does not write to the database.
+    """
+    if not checkpoint_content:
+        return None
+    try:
+        ckpt = json.loads(checkpoint_content)
+    except Exception:
+        return None
+    cbf = ckpt.get("changes_by_file") if isinstance(ckpt, dict) else None
+    if not isinstance(cbf, dict) or not cbf:
+        return None
+    rec_n = sum(len(v.get("changes", [])) for v in cbf.values() if isinstance(v, dict))
+    if rec_n <= 0:
+        return None
+    rec_text = (
+        ((fallback_text or "").strip() + ("\n\n" if (fallback_text or "").strip() else ""))
+        + "⚡ **Connection was interrupted** before I could finish, but I recovered "
+        + f"{rec_n} completed edit(s) below — review and apply them, or Resume "
+          "remaining agent tasks after applying."
+    ).strip()
+    return {
+        "intent": "edit",
+        "summary": summary or f"Recovered {rec_n} edit(s) from an interrupted agent task",
+        "reasoning": reasoning or "Recovered from a connection interruption mid agent task.",
+        "risks": [],
+        "skipped_changes": [],
+        "changes_by_file": cbf,
+        "new_files": [],
+        "natural_text": rec_text,
+        "recovered": True,
+        "format_version": ckpt.get("format_version"),
+    }
 
 
 def _persist_structured_checkpoint_recovery(
@@ -2409,34 +2735,20 @@ def _persist_structured_checkpoint_recovery(
         _dlog(dlog_event + "_parse_error", session_id=session_id, user_id=user_id,
               error=str(e)[:200])
         return out
-    cbf = ckpt.get("changes_by_file") if isinstance(ckpt, dict) else None
-    if not cbf:
-        return out
     try:
-        rec_n = sum(len(v.get("changes", [])) for v in cbf.values() if isinstance(v, dict))
-        if rec_n <= 0:
+        rec_result = recovered_result_from_checkpoint(
+            checkpoint_content, fallback_text=fallback_text,
+        )
+        if not rec_result:
             return out
-        rec_text = (
-            ((fallback_text or "").strip() + ("\n\n" if (fallback_text or "").strip() else ""))
-            + "⚡ **Connection was interrupted** before I could finish, but I recovered "
-            + f"{rec_n} completed edit(s) below — review and apply them, or Resume "
-              "remaining agent tasks after applying."
-        ).strip()
-        rec_result = {
-            "intent": "edit",
-            "summary": f"Recovered {rec_n} edit(s) from an interrupted agent task",
-            "reasoning": "Recovered from a connection interruption mid agent task.",
-            "risks": [],
-            "skipped_changes": [],
-            "changes_by_file": cbf,
-            "new_files": [],
-            "natural_text": rec_text,
-            "recovered": True,
-        }
+        cbf = rec_result["changes_by_file"]
+        rec_n = sum(len(v.get("changes", [])) for v in cbf.values() if isinstance(v, dict))
+        rec_text = rec_result.get("natural_text") or ""
         _save_task_message(session_id, rec_text, rec_result, model=model or "")
         out["saved"] = True
         out["recovered_changes"] = rec_n
-        out["format_version"] = ckpt.get("format_version")
+        out["format_version"] = rec_result.get("format_version")
+        out["result"] = rec_result
         _dlog(
             dlog_event,
             session_id=session_id,
@@ -2638,6 +2950,8 @@ async def execute_task(req: dict, request: Request):
               request_len=len(_task_request))
 
         collected, result_content, poll, aborted = [], None, 0, False
+        _qa_notes: list = []
+        _qa_risks = None
         _think_parts: list = []  # accumulated extended-thinking text for this task
         _task_model = ""  # captured from this task's own done chunk
         _task_ws_sources: list = []  # v1.7 research checkbox — this task's web-search sources, if any
@@ -2683,6 +2997,10 @@ async def execute_task(req: dict, request: Request):
                             _guard_state["collected_tokens"] = collected
                         elif _ct == "smart_result":
                             result_content = _d.get("content", "")
+                        elif _ct == "qa_note":
+                            _qa_notes.append(_d)
+                        elif _ct == "qa_done":
+                            _qa_risks = _d.get("risks") or []
                         elif _ct == "checkpoint":
                             # Capture for disconnect safety net (parity with
                             # smart_stream ~1389). Not forwarded as UI noise.
@@ -2707,7 +3025,8 @@ async def execute_task(req: dict, request: Request):
                             # silently dropped by this filter.
                             _tc = _d.get("content", "")
                             if _tc:
-                                _think_parts.append(_tc)
+                                if sum(len(p) for p in _think_parts) < 20000:
+                                    _think_parts.append(_tc)
                                 yield _sse({"type": "task_thinking", "id": task_id, "content": _tc})
                         elif _ct == "error":
                             yield _sse({"type": "task_progress", "id": task_id, "content": "⚠️ " + _d.get("content", "")})
@@ -2760,6 +3079,10 @@ async def execute_task(req: dict, request: Request):
                 parsed = json.loads(result_content)
             except Exception:
                 parsed = None
+            if isinstance(parsed, dict) and (_qa_notes or _qa_risks is not None):
+                from services.qa_notes import merge_qa_notes as _merge_qa
+                parsed = _merge_qa(parsed, _qa_notes, _qa_risks)
+                result_content = json.dumps(parsed)
 
         # ── Credit-pause halt (cb380321 / Agent gap C1) ────────────────────
         # Do NOT mark done/no_edits and continue the queue. Leave siblings
@@ -2793,12 +3116,14 @@ async def execute_task(req: dict, request: Request):
                     _rp["credit_paused"] = True
                     _save_task_message(session_id, natural_text, _rp, model=_task_model,
                                         web_search_sources=_task_ws_sources,
-                                        tool_trail=_task_trail.rows() or None)
+                                        tool_trail=_task_trail.rows() or None,
+                                        thinking_text="".join(_think_parts))
                     yield _sse({"type": "smart_result", "content": json.dumps(_rp)})
                 elif natural_text:
                     _save_task_message(session_id, natural_text, None, model=_task_model,
                                         web_search_sources=_task_ws_sources,
-                                        tool_trail=_task_trail.rows() or None)
+                                        tool_trail=_task_trail.rows() or None,
+                                        thinking_text="".join(_think_parts))
             except Exception:
                 pass
             update_task(
@@ -2830,7 +3155,8 @@ async def execute_task(req: dict, request: Request):
         score, worst = _eval_task_result(parsed) if parsed else (None, "safe")
         _save_task_message(session_id, natural_text, parsed, model=_task_model,
                             web_search_sources=_task_ws_sources,
-                            tool_trail=_task_trail.rows() or None)
+                            tool_trail=_task_trail.rows() or None,
+                            thinking_text="".join(_think_parts))
 
         # Non-code ("answer") tasks edit nothing → skip the QA verdict gate.
         _is_answer = task.get("kind") == "answer"
@@ -3352,8 +3678,11 @@ async def resume_credit_pause(pause_id: str, request: Request):
         import json as _json
         collected_tokens = []
         result_content = None
+        _qa_notes: list = []
+        _qa_risks = None
         _resolved_model = ""
         _ok = False
+        _resume_thinking: list = []
         from services.tool_activity import ToolTrail as _ToolTrail
         _resume_trail = _ToolTrail()
         try:
@@ -3382,6 +3711,14 @@ async def resume_credit_pause(pause_id: str, request: Request):
                             collected_tokens.append(data.get("content", ""))
                         elif chunk_type == "smart_result":
                             result_content = data.get("content", "")
+                            if _qa_notes or _qa_risks is not None:
+                                try:
+                                    from services.qa_notes import merge_qa_notes as _merge_qa
+                                    _parsed_live = _json.loads(result_content)
+                                    if isinstance(_parsed_live, dict):
+                                        result_content = _json.dumps(_merge_qa(_parsed_live, _qa_notes, _qa_risks))
+                                except Exception:
+                                    pass
                             # Only count as success if we actually produced edits
                             # (credit_paused smart_result is a soft failure).
                             try:
@@ -3398,6 +3735,14 @@ async def resume_credit_pause(pause_id: str, request: Request):
                             _ok = False
                         elif chunk_type == "tool_activity":
                             _resume_trail.observe(data)
+                        elif chunk_type == "qa_note":
+                            _qa_notes.append(data)
+                        elif chunk_type == "qa_done":
+                            _qa_risks = data.get("risks") or []
+                        elif chunk_type == "thinking":
+                            _piece = data.get("content") or ""
+                            if _piece and sum(len(p) for p in _resume_thinking) < 20000:
+                                _resume_thinking.append(_piece)
                         elif chunk_type in ("done", "error"):
                             _resolved_model = data.get("model") or _resolved_model
                             if chunk_type == "done" and result_content:
@@ -3410,6 +3755,14 @@ async def resume_credit_pause(pause_id: str, request: Request):
 
             # Persist assistant turn (mirrors smart-stream's natural+result save)
             natural_text = "".join(collected_tokens).strip()
+            if result_content and (_qa_notes or _qa_risks is not None):
+                try:
+                    from services.qa_notes import merge_qa_notes as _merge_qa
+                    _parsed_live = _json.loads(result_content)
+                    if isinstance(_parsed_live, dict):
+                        result_content = _json.dumps(_merge_qa(_parsed_live, _qa_notes, _qa_risks))
+                except Exception:
+                    pass
             with get_db_ctx() as db:
                 resp_id = str(uuid.uuid4())
                 if result_content:
@@ -3426,7 +3779,11 @@ async def resume_credit_pause(pause_id: str, request: Request):
                 db.execute(
                     "INSERT INTO chat_messages (id, session_id, role, content, metadata) VALUES (?, ?, ?, ?, ?)",
                     (resp_id, session_id, "assistant", content,
-                     json.dumps({"tool_trail": _resume_trail.rows()} if _resume_trail.rows() else {})),
+                     json.dumps({
+                         **({"tool_trail": _resume_trail.rows()} if _resume_trail.rows() else {}),
+                         **({"thinking_text": "".join(_resume_thinking)[:20000]}
+                            if "".join(_resume_thinking).strip() else {}),
+                     })),
                 )
                 db.commit()
         except Exception as e:

@@ -155,6 +155,30 @@ interface AppState {
     reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string }) => boolean
   } | null
   setGitApproval: (value: AppState['gitApproval']) => void
+  localTerminalLines: {
+    sessionId: string
+    command: string
+    stdout: string
+    stderr: string
+    exit_code: number
+    level?: string
+    title?: string
+    target?: string
+  }[]
+  pushLocalTerminalLine: (line: AppState['localTerminalLines'][number]) => void
+  // Live SSE reply. Not persisted and not cloned — the closure belongs to the
+  // stream that asked for approval.
+  localApproval: {
+    sessionId: string
+    command: string
+    level?: string
+    title?: string
+    target?: string
+    summary?: string
+    cwd?: string
+    reply: (resp: { action: 'approve' | 'reject' | 'edit'; command?: string; always?: boolean }) => boolean
+  } | null
+  setLocalApproval: (value: AppState['localApproval']) => void
   gitSteps: { sessionId: string; name: string; ok: boolean; detail: string }[]
   pushGitStep: (step: AppState['gitSteps'][number]) => void
   clearGitRun: (sessionId: string) => void
@@ -249,6 +273,8 @@ interface AppState {
   beginToolActivity: (sessionId: string) => void
   applyToolActivity: (sessionId: string, ev: ToolActivityEvent) => void
   stopToolActivity: (sessionId: string) => void
+  qaNotes: Record<string, Record<string, any>>
+  setQaNote: (sessionId: string, changeId: string, qa: any) => void
 
   // Multi-file
   multiFileMode: boolean
@@ -409,7 +435,12 @@ export const useAppStore = create<AppState>((set) => ({
     // Guard: drop messages that belong to a different session (prevents
     // cross-session bleed when the user switches tabs mid-stream)
     if (m.session_id && state.activeSessions && m.session_id !== state.activeSessions) return {}
-    return { messages: [...state.messages, m] }
+    const sessions = state.sessions.map((session) =>
+      session.id === m.session_id
+        ? { ...session, message_count: (session.message_count || 0) + 1 }
+        : session,
+    )
+    return { messages: [...state.messages, m], sessions }
   }),
   setLoading: (isLoading) => set({ isLoading }),
 
@@ -431,6 +462,12 @@ export const useAppStore = create<AppState>((set) => ({
   })),
   gitApproval: null,
   setGitApproval: (gitApproval) => set({ gitApproval }),
+  localTerminalLines: [],
+  pushLocalTerminalLine: (line) => set((s) => ({
+    localTerminalLines: [...s.localTerminalLines, line].slice(-40),
+  })),
+  localApproval: null,
+  setLocalApproval: (localApproval) => set({ localApproval }),
   gitSteps: [],
   pushGitStep: (step) => set((s) => ({
     gitSteps: [...s.gitSteps, step].slice(-20),
@@ -523,19 +560,31 @@ export const useAppStore = create<AppState>((set) => ({
     const { [sessionId]: _edits, ...liveRest } = state.liveEdits
     const { [sessionId]: _order, ...orderRest } = state.liveEditOrder
     const { [sessionId]: _tools, ...toolRest } = state.toolActivity || {}
+    const { [sessionId]: _notes, ...noteRest } = state.qaNotes || {}
     const display = state.activeSessions === sessionId
       ? { isStreaming: false, streamingMessage: '', streamProgress: '' }
       : {}
-    return { streamingSessions: rest, liveEdits: liveRest, liveEditOrder: orderRest, toolActivity: toolRest, ...display }
+    return { streamingSessions: rest, liveEdits: liveRest, liveEditOrder: orderRest, toolActivity: toolRest, qaNotes: noteRest, ...display }
   }),
 
   liveEdits: {},
   liveEditOrder: {},
   toolActivity: {},
-  beginToolActivity: (sessionId) => set((state) => ({
-    toolActivity: {
-      ...state.toolActivity,
-      [sessionId]: { startedAt: Date.now(), rows: [] },
+  qaNotes: {},
+  beginToolActivity: (sessionId) => set((state) => {
+    const { [sessionId]: _old, ...rest } = state.qaNotes || {}
+    return {
+      qaNotes: rest,
+      toolActivity: {
+        ...state.toolActivity,
+        [sessionId]: { startedAt: Date.now(), rows: [] },
+      },
+    }
+  }),
+  setQaNote: (sessionId, changeId, qa) => set((state) => ({
+    qaNotes: {
+      ...state.qaNotes,
+      [sessionId]: { ...(state.qaNotes[sessionId] || {}), [changeId]: qa },
     },
   })),
   applyToolActivity: (sessionId, ev) => set((state) => {
@@ -687,6 +736,23 @@ export const useAppStore = create<AppState>((set) => ({
       })
       return
     }
+    if (t === 'plan_step_result') {
+      set((s) => ({
+        planTasks: s.planTasks.map((task) => {
+          const sameFile = (task.filename || '') === (event.filename || '')
+          const sameSymbol = (task.symbol || '') === (event.symbol || '')
+          if (!sameFile || !sameSymbol) return task
+          return {
+            ...task,
+            added: Number(event.added) || 0,
+            removed: Number(event.removed) || 0,
+            diff: typeof event.diff === 'string' ? event.diff : '',
+            delivered: true,
+          }
+        }),
+      }))
+      return
+    }
     if (t === 'plan_questions') {
       set({ pendingPlanQuestions: normalizeQuestions(event.questions) })
       return
@@ -698,11 +764,30 @@ export const useAppStore = create<AppState>((set) => ({
       docPatch.planVersion = Number(event.version)
     }
     if (t === 'plan_ready' || t === 'plan_updated' || t === 'plan_coverage' || t === 'plan_failed') {
-      set({
-        planRunId: event.run_id || null,
-        planTasks: Array.isArray(event.tasks) ? event.tasks : [],
-        planPhase: event.phase || (t === 'plan_failed' ? 'ready' : 'ready'),
-        ...docPatch,
+      set((s) => {
+        const incoming = Array.isArray(event.tasks) ? event.tasks : []
+        const planTasks = (t === 'plan_coverage' || t === 'plan_failed')
+          ? incoming.map((task: any) => {
+              const prev = s.planTasks.find((old) =>
+                (old.filename || '') === (task.filename || '') &&
+                (old.symbol || '') === (task.symbol || ''),
+              )
+              if (!prev?.delivered) return task
+              return {
+                ...task,
+                added: prev.added,
+                removed: prev.removed,
+                diff: prev.diff,
+                delivered: true,
+              }
+            })
+          : incoming
+        return {
+          planRunId: event.run_id || null,
+          planTasks,
+          planPhase: event.phase || (t === 'plan_failed' ? 'ready' : 'ready'),
+          ...docPatch,
+        }
       })
       return
     }
