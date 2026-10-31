@@ -177,7 +177,7 @@ function authHeaders(): Record<string, string> {
  *  carries the JWT as `?token=` because browsers cannot attach Authorization
  *  headers to a WebSocket handshake (and the HTTP auth middleware does not run
  *  for WS scopes — the backend re-auths from this same query param). */
-function wsUrl(path: string): string {
+export function wsUrl(path: string): string {
   const apiRoot = (import.meta.env.VITE_API_URL ?? '') || window.location.origin
   const wsRoot = apiRoot.replace(/^http/i, 'ws') // http→ws, https→wss
   const token = getAuthToken() ?? ''
@@ -335,7 +335,7 @@ function errorText(detail: unknown, status: number): string {
   return `HTTP ${status}`
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+export async function request<T>(path: string, options?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}${path}`, {
     headers: { 'Content-Type': 'application/json', ...authHeaders(), ...options?.headers },
     ...options,
@@ -408,6 +408,57 @@ export const api = {
     browseDirectory: () => request<any>('/settings/browse-directory', { method: 'POST' }),
     localAgent: () => request<{ enabled: boolean; helper: boolean; rules: string[] }>('/settings/local-agent'),
     saveLocalAllowlist: (rules: string[]) => request('/settings/local-allowlist', { method: 'PUT', body: JSON.stringify({ rules }) }),
+    ollamaCatalog: (baseUrl: string) =>
+      request<{
+        reachable: boolean
+        base_url: string
+        models: {
+          id: string
+          label: string
+          description: string
+          uncensored: boolean
+          size_gb: number
+          installed: boolean
+        }[]
+      }>(`/settings/ollama/catalog?base_url=${encodeURIComponent(baseUrl)}`),
+    ollamaPull: async (
+      name: string,
+      baseUrl: string,
+      onProgress: (p: { status: string; digest?: string; total?: number; completed?: number }) => void,
+      signal?: AbortSignal,
+    ): Promise<void> => {
+      const res = await fetch(`${BASE}/settings/ollama/pull`, {
+        method: 'POST',
+        signal,
+        headers: { 'Content-Type': 'application/json', ...authHeaders() },
+        body: JSON.stringify({ name, base_url: baseUrl }),
+      })
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ detail: res.statusText }))
+        throw new Error(err.detail || `HTTP ${res.status}`)
+      }
+      const reader = res.body!.getReader()
+      const dec = new TextDecoder()
+      let buf = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        const lines = buf.split('\n')
+        buf = lines.pop() ?? ''
+        for (const line of lines) {
+          if (!line.trim()) continue
+          let evt: any
+          try {
+            evt = JSON.parse(line)
+          } catch {
+            continue
+          }
+          if (evt.error) throw new Error(evt.error)
+          onProgress(evt)
+        }
+      }
+    },
   },
   chat: {
     createSession: (data: any) => request<any>('/chat/sessions', { method: 'POST', body: JSON.stringify(data) }),
@@ -1004,7 +1055,7 @@ export const api = {
   },
 
   sessionFiles: {
-    upload: (sessionId: string, data: { filename: string; content: string; language?: string; origin?: 'uploaded' | 'created' }) =>
+    upload: (sessionId: string, data: { filename: string; content: string; language?: string; origin?: 'uploaded' | 'created'; base64_data?: string; file_type?: string }) =>
       request<any>(`/chat/${sessionId}/files`, { method: 'POST', body: JSON.stringify(data) }),
     /** Multipart upload — sends raw bytes, server converts HEIC→JPEG.
      *  Works on iOS Chrome / WKWebView where base64/canvas paths fail. */
@@ -1114,67 +1165,6 @@ export const api = {
           confirm_password: confirmPassword,
         }),
       }),
-  },
-
-  // Element Picker — local-install only (server hides these behind is_hosted;
-  // see routers/element_picker.py). Attaches to the user's own already-running
-  // Chrome via CDP (playwright connectOverCDP), never launches/downloads one.
-  elementPicker: {
-    status: () => request<{ available: boolean; connected: boolean; cdp_url?: string | null; page_url?: string | null }>('/element-picker/status'),
-    /** One-click launch: starts a dedicated picker-profile Chrome window with
-     *  the debug port open (no-ops if one is already listening). Never
-     *  touches the user's everyday Chrome window/profile. */
-    launch: (cdpUrl: string) =>
-      request<{ launched: boolean; already_running: boolean }>('/element-picker/launch', {
-        method: 'POST',
-        body: JSON.stringify({ cdp_url: cdpUrl }),
-      }),
-    connect: (cdpUrl: string) =>
-      request<{ connected: boolean; cdp_url: string | null; page_url: string | null }>('/element-picker/connect', {
-        method: 'POST',
-        body: JSON.stringify({ cdp_url: cdpUrl }),
-      }),
-    screenshot: () => request<{ image_base64: string; mime_type: string }>('/element-picker/screenshot'),
-    pick: (x: number, y: number) =>
-      request<{ tag: string; id: string | null; className: string | null; text: string; outerHTML: string; rect: { x: number; y: number; width: number; height: number } }>(
-        '/element-picker/pick',
-        { method: 'POST', body: JSON.stringify({ x, y }) }
-      ),
-    disconnect: () => request<{ connected: boolean }>('/element-picker/disconnect', { method: 'POST' }),
-    /** hard=true bypasses the browser cache (Ctrl/Cmd+Shift+R equivalent) —
-     *  the fix for frontend dev loops where a plain reload keeps showing
-     *  stale JS/CSS served with cache-friendly headers. */
-    reload: (hard: boolean) =>
-      request<{ connected: boolean; cdp_url: string | null; page_url: string | null }>('/element-picker/reload', {
-        method: 'POST',
-        body: JSON.stringify({ hard }),
-      }),
-    /** Live hover-highlight (official CDP `Overlay.setInspectMode` — the
-     *  same mechanism Chrome DevTools' own "inspect element" uses). Chrome
-     *  paints the highlight itself, so it shows up for free in the
-     *  existing screencast frames — no extra rendering here. Must only be
-     *  enabled while Pick mode is active (see ElementPickerPanel.tsx). */
-    setInspectMode: (enabled: boolean) =>
-      request<{ connected: boolean }>('/element-picker/inspect-mode', {
-        method: 'POST',
-        body: JSON.stringify({ enabled }),
-      }),
-    /** WS URL for the live-view screencast (see routers/element_picker.py
-     *  ws/stream). Carries the JWT as `?token=` — same convention as the
-     *  chat WS transport, since the HTTP auth middleware doesn't run for
-     *  WebSocket scopes. `w`/`h`/`dpr` tell the backend the panel's real
-     *  pixel size so the screencast is captured sharp on HiDPI screens
-     *  instead of a fixed low-res frame stretched to fill a bigger box. */
-    wsStreamUrl: (opts?: { w?: number; h?: number; dpr?: number }) => {
-      const base = wsUrl('/element-picker/ws/stream')
-      if (!opts) return base
-      const qp = new URLSearchParams()
-      if (opts.w) qp.set('w', String(Math.round(opts.w)))
-      if (opts.h) qp.set('h', String(Math.round(opts.h)))
-      if (opts.dpr) qp.set('dpr', String(opts.dpr))
-      const extra = qp.toString()
-      return extra ? `${base}&${extra}` : base
-    },
   },
 
   context: {

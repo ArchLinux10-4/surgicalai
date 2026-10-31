@@ -14,8 +14,8 @@ _DLOG_PATH = "/tmp/syntax_validator_dlog.jsonl"
 
 
 def _dlog(event: str, **kwargs):
-    """Same pattern as element_picker.py's _dlog: logger + flat-file,
-    never raises. Added so any future false-positive/false-negative in
+    """Logger plus a flat file, same idea as the database debug log.
+    Never raises. Added so any future false-positive/false-negative in
     this module (session ff34af1d class of bug) leaves a trace instead
     of silently altering QA scores with no evidence."""
     try:

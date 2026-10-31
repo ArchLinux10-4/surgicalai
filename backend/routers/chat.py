@@ -535,6 +535,7 @@ async def _compact_session(session_id: str, user_id: str) -> tuple[str, int]:
                 new_chunk_summary = resp.content[0].text if resp.content else ""
                 used_model = "claude-sonnet-5"
             elif openai_key:
+                from services.pipeline import rename_openai_max_tokens
                 client = _openai_mod.AsyncOpenAI(api_key=openai_key)
                 resp = await client.chat.completions.create(
                     model="gpt-4.1-mini",
@@ -542,7 +543,9 @@ async def _compact_session(session_id: str, user_id: str) -> tuple[str, int]:
                         {"role": "system", "content": compact_prompt},
                         {"role": "user", "content": turns_text}
                     ],
-                    max_tokens=SUMMARY_MAX_TOKENS,
+                    **rename_openai_max_tokens(
+                        {"max_tokens": SUMMARY_MAX_TOKENS}, "gpt-4.1-mini",
+                    ),
                 )
                 new_chunk_summary = resp.choices[0].message.content or ""
                 used_model = "gpt-4.1-mini"
@@ -595,6 +598,7 @@ async def _compact_session(session_id: str, user_id: str) -> tuple[str, int]:
                         )
                         meta_summary = meta_resp.content[0].text if meta_resp.content else ""
                     else:
+                        from services.pipeline import rename_openai_max_tokens
                         client2 = _openai_mod.AsyncOpenAI(api_key=openai_key)
                         meta_resp = await client2.chat.completions.create(
                             model="gpt-4.1-mini",
@@ -602,7 +606,9 @@ async def _compact_session(session_id: str, user_id: str) -> tuple[str, int]:
                                 {"role": "system", "content": meta_prompt},
                                 {"role": "user", "content": new_summary}
                             ],
-                            max_tokens=SUMMARY_META_MAX_TOKENS,
+                            **rename_openai_max_tokens(
+                                {"max_tokens": SUMMARY_META_MAX_TOKENS}, "gpt-4.1-mini",
+                            ),
                         )
                         meta_summary = meta_resp.choices[0].message.content or ""
                     if meta_summary.strip():
@@ -2853,9 +2859,7 @@ async def execute_task(req: dict, request: Request):
             (session_id,)
         ).fetchall()
         session_files = [dict(r) for r in file_rows]
-        project_memory = _load_effective_memory(conn, session_id)
-        from services.user_memory import attach_user_memory
-        project_memory = attach_user_memory(project_memory, current_user_id, session_id, "")
+        project_memory_base = _load_effective_memory(conn, session_id)
 
     async def stream_one_task():
         _t0 = time.time()
@@ -2968,12 +2972,26 @@ async def execute_task(req: dict, request: Request):
             )
             _dlog("execute_task_web_research_flag", session_id=session_id,
                   task_id=task_id, web_search_enabled=_task_web_search_enabled)
+            from services.user_memory import attach_user_memory, schedule_memory_update
+            _task_text = "\n".join(
+                p for p in (task.get("title"), task.get("detail")) if p
+            )
+            _task_memory = attach_user_memory(
+                project_memory_base, current_user_id, session_id, _task_text,
+            )
+
+            def _remember_task(reply: str) -> None:
+                if (reply or "").strip():
+                    schedule_memory_update(
+                        current_user_id, session_id, _task_text, reply,
+                    )
+
             async for chunk in _with_heartbeat(run_natural_pipeline_stream(
                 session_files=session_files,
                 user_request=_task_request,
                 conversation_history=conversation_history,
                 session_id=session_id,
-                project_memory=project_memory,
+                project_memory=_task_memory,
                 session_summary=session_summary,
                 user_id=current_user_id,
                 client_inbox=getattr(request.state, "client_inbox", None),
@@ -3118,12 +3136,14 @@ async def execute_task(req: dict, request: Request):
                                         web_search_sources=_task_ws_sources,
                                         tool_trail=_task_trail.rows() or None,
                                         thinking_text="".join(_think_parts))
+                    _remember_task(natural_text)
                     yield _sse({"type": "smart_result", "content": json.dumps(_rp)})
                 elif natural_text:
                     _save_task_message(session_id, natural_text, None, model=_task_model,
                                         web_search_sources=_task_ws_sources,
                                         tool_trail=_task_trail.rows() or None,
                                         thinking_text="".join(_think_parts))
+                    _remember_task(natural_text)
             except Exception:
                 pass
             update_task(
@@ -3157,6 +3177,7 @@ async def execute_task(req: dict, request: Request):
                             web_search_sources=_task_ws_sources,
                             tool_trail=_task_trail.rows() or None,
                             thinking_text="".join(_think_parts))
+        _remember_task(natural_text)
 
         # Non-code ("answer") tasks edit nothing → skip the QA verdict gate.
         _is_answer = task.get("kind") == "answer"

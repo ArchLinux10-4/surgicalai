@@ -47,12 +47,88 @@ class OfflineModelError(Exception):
     """Raised when the local model fails or hangs after retries."""
 
 
+def resolve_offline_model() -> str:
+    """The model the picker chose, else the ollama_model setting."""
+    picked = (get_setting("architect_model", "") or "").strip()
+    if picked.startswith("ollama:"):
+        name = picked[len("ollama:"):].strip()
+        if name:
+            return name
+    return get_setting("ollama_model", DEFAULT_MODEL)
+
+
 def get_offline_config() -> dict:
     return {
         "base_url": get_setting("ollama_base_url", DEFAULT_BASE_URL),
-        "model": get_setting("ollama_model", DEFAULT_MODEL),
+        "model": resolve_offline_model(),
         "num_ctx": int(get_setting("ollama_num_ctx", str(DEFAULT_NUM_CTX)) or DEFAULT_NUM_CTX),
     }
+
+
+def _request_extras(model: str) -> dict:
+    return {"think": False} if "qwen3" in (model or "").lower() else {}
+
+
+_THINK_BLOCK_RE = re.compile(r"<think>.*?<\/think>\s*", re.DOTALL)
+_THINK_OPEN_TAIL_RE = re.compile(r"<think>.*$", re.DOTALL)
+
+
+_THINK_CLOSE_RE = re.compile(r"</think>\s*")
+
+
+def _strip_think(text: str) -> str:
+    text = _THINK_BLOCK_RE.sub("", text or "")
+    text = _THINK_OPEN_TAIL_RE.sub("", text)
+    return _THINK_CLOSE_RE.sub("", text)
+
+
+class ThinkStripper:
+    OPEN, CLOSE = "<think>", "</think>"
+
+    def __init__(self):
+        self._buf = ""
+        self._inside = False
+
+    def _partial(self, tag: str) -> int:
+        for n in range(min(len(tag) - 1, len(self._buf)), 0, -1):
+            if tag.startswith(self._buf[-n:]):
+                return n
+        return 0
+
+    def feed(self, delta: str) -> str:
+        self._buf += delta or ""
+        out = []
+        while True:
+            if self._inside:
+                i = self._buf.find(self.CLOSE)
+                if i == -1:
+                    keep = self._partial(self.CLOSE)
+                    self._buf = self._buf[len(self._buf) - keep:] if keep else ""
+                    break
+                self._buf = self._buf[i + len(self.CLOSE):].lstrip("\n")
+                self._inside = False
+            else:
+                i_open = self._buf.find(self.OPEN)
+                i_close = self._buf.find(self.CLOSE)
+                if i_close != -1 and (i_open == -1 or i_close < i_open):
+                    out.append(self._buf[:i_close])
+                    self._buf = self._buf[i_close + len(self.CLOSE):].lstrip("\n")
+                    continue
+                if i_open == -1:
+                    keep = max(self._partial(self.OPEN), self._partial(self.CLOSE))
+                    emit = self._buf[: len(self._buf) - keep] if keep else self._buf
+                    out.append(emit)
+                    self._buf = self._buf[len(emit):]
+                    break
+                out.append(self._buf[:i_open])
+                self._buf = self._buf[i_open + len(self.OPEN):]
+                self._inside = True
+        return "".join(out)
+
+    def flush(self) -> str:
+        rest = "" if self._inside else self._buf
+        self._buf = ""
+        return rest
 
 
 def is_offline_mode_enabled() -> bool:
@@ -101,6 +177,7 @@ async def ollama_chat_once(
             "num_predict": predict_budget,
         },
     }
+    payload.update(_request_extras(cfg["model"]))
 
     last_err = None
     for attempt in range(MAX_RETRIES + 1):
@@ -114,7 +191,7 @@ async def ollama_chat_once(
                 data = resp.json()
                 raw = (data.get("message") or {}).get("content", "")
                 done_reason = data.get("done_reason", "stop")
-                content = _strip_template_leaks(raw)
+                content = _strip_template_leaks(_strip_think(raw))
                 return {
                     "content": content,
                     "truncated": done_reason == "length",
@@ -167,6 +244,7 @@ async def ollama_chat_stream(
             "num_predict": predict_budget,
         },
     }
+    payload.update(_request_extras(cfg["model"]))
 
     import json as _json
 
@@ -176,6 +254,7 @@ async def ollama_chat_stream(
         ) as client:
             async with client.stream("POST", f"{cfg['base_url']}/api/chat", json=payload) as resp:
                 resp.raise_for_status()
+                strip = ThinkStripper()
                 async for line in resp.aiter_lines():
                     if not line:
                         continue
@@ -185,9 +264,17 @@ async def ollama_chat_stream(
                         continue
                     delta = (chunk.get("message") or {}).get("content", "")
                     if delta:
-                        yield delta
+                        cleaned = strip.feed(delta)
+                        if cleaned:
+                            yield cleaned
                     if chunk.get("done"):
+                        tail = strip.flush()
+                        if tail:
+                            yield tail
                         return
+                tail = strip.flush()
+                if tail:
+                    yield tail
     except (httpx.TimeoutException, httpx.ConnectError) as e:
         raise OfflineModelError(
             f"Ollama did not respond within {REQUEST_TIMEOUT_S}s at {cfg['base_url']}. "

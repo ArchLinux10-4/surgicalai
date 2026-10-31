@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
@@ -10,7 +10,7 @@ import { clientLog } from '../lib/clientLog'
 import { AwsConnectModal, shortAwsCli } from './AwsConnectModal'
 import { McpPanel } from './McpPanel'
 import { RepositoryManager } from './Repositories'
-import { AttachMoney, BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
+import { AttachMoney, BugReport, CheckCircle, Close, Code, DarkMode, ErrorOutline, FolderOpen, GitHub, Group, InfoOutlined, LightMode, Lock, Memory, OpenInNew, Psychology, Tune, Visibility, VisibilityOff, VpnKey } from '@mui/icons-material';
 
 type Tab = 'api' | 'models' | 'workspace' | 'editor' | 'users' | 'github' | 'vercel' | 'aws' | 'railway' | 'mcp' | 'security' | 'debug'
 
@@ -83,6 +83,21 @@ export function SettingsModal() {
   // immediately, without needing a page reload.
   const { availableModels: models, refreshModels } = useAppStore()
   const [browsingDir, setBrowsingDir] = useState(false)
+  const [ollamaCatalog, setOllamaCatalog] = useState<{
+    reachable: boolean
+    base_url: string
+    models: {
+      id: string
+      label: string
+      description: string
+      uncensored: boolean
+      size_gb: number
+      installed: boolean
+    }[]
+  } | null>(null)
+  const [pulls, setPulls] = useState<Record<string, { pct: number; status: string }>>({})
+  const [pullError, setPullError] = useState('')
+  const pullAbortRef = useRef<Record<string, AbortController>>({})
 
   // Security tab — change password
   const [pwCurrent, setPwCurrent]         = useState('')
@@ -120,6 +135,90 @@ export function SettingsModal() {
   const [localHelper, setLocalHelper] = useState<boolean | null>(null)
 
   const { theme, setTheme } = useThemeStore()
+
+  const ollamaSettingsDirty =
+    form.ollama_enabled !== (settings as any)?.ollama_enabled ||
+    form.ollama_base_url !== ((settings as any)?.ollama_base_url || 'http://localhost:11434')
+
+  const fetchOllamaCatalog = useCallback(async () => {
+    if (!form.ollama_enabled || settings?.is_hosted) return
+    try {
+      const cat = await api.settings.ollamaCatalog(form.ollama_base_url)
+      setOllamaCatalog(cat)
+    } catch {
+      setOllamaCatalog(null)
+    }
+  }, [form.ollama_enabled, form.ollama_base_url, settings?.is_hosted])
+
+  useEffect(() => {
+    if (tab !== 'models' || !form.ollama_enabled || settings?.is_hosted) return
+    const t = window.setTimeout(() => {
+      fetchOllamaCatalog()
+    }, 500)
+    return () => window.clearTimeout(t)
+  }, [tab, form.ollama_enabled, form.ollama_base_url, settings?.is_hosted, fetchOllamaCatalog])
+
+  useEffect(() => {
+    if (!settingsOpen) {
+      Object.values(pullAbortRef.current).forEach((c) => c.abort())
+      pullAbortRef.current = {}
+    }
+    return () => {
+      Object.values(pullAbortRef.current).forEach((c) => c.abort())
+      pullAbortRef.current = {}
+    }
+  }, [settingsOpen])
+
+  const startOllamaPull = async (modelId: string) => {
+    setPullError('')
+    const ac = new AbortController()
+    pullAbortRef.current[modelId] = ac
+    const layerProgress: Record<string, { total: number; completed: number }> = {}
+    setPulls((p) => ({ ...p, [modelId]: { pct: 0, status: 'Starting…' } }))
+    try {
+      await api.settings.ollamaPull(
+        modelId,
+        form.ollama_base_url,
+        (evt) => {
+          if (evt.digest && evt.total != null && evt.completed != null) {
+            layerProgress[evt.digest] = { total: evt.total, completed: evt.completed }
+            const layers = Object.values(layerProgress)
+            const main = layers.reduce(
+              (best, cur) => (cur.total > best.total ? cur : best),
+              { total: 0, completed: 0 },
+            )
+            const pct = main.total > 0 ? Math.round((100 * main.completed) / main.total) : 0
+            setPulls((p) => ({
+              ...p,
+              [modelId]: { pct: evt.status === 'success' ? 100 : pct, status: evt.status },
+            }))
+          } else {
+            setPulls((p) => ({
+              ...p,
+              [modelId]: {
+                pct: evt.status === 'success' ? 100 : p[modelId]?.pct ?? 0,
+                status: evt.status,
+              },
+            }))
+          }
+        },
+        ac.signal,
+      )
+      await fetchOllamaCatalog()
+      await refreshModels()
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') {
+        setPullError(e?.message || String(e))
+      }
+    } finally {
+      delete pullAbortRef.current[modelId]
+      setPulls((p) => {
+        const next = { ...p }
+        delete next[modelId]
+        return next
+      })
+    }
+  }
 
   useEffect(() => {
     if (settings) {
@@ -782,15 +881,14 @@ export function SettingsModal() {
                 </div>
 
                 <div className="mt-6 pt-5 border-t border-border">
-                  <SectionHeader title="Offline Mode" subtitle="Run fully locally via Ollama — no data leaves your machine" />
+                  <OfflineModeHelp />
                   <label className="flex items-start gap-3 cursor-pointer group mt-3">
                     <input type="checkbox" checked={form.ollama_enabled} onChange={(e) => upd('ollama_enabled')(e.target.checked)}
                       className="mt-0.5 accent-accent" />
                     <div>
-                      <div className="text-sm font-medium text-ink">Enable offline mode (Qwen2.5-Coder via Ollama)</div>
+                      <div className="text-sm font-medium text-ink">Enable offline mode (local models via Ollama)</div>
                       <div className="text-xs text-muted mt-0.5">
-                        Used when no cloud API key is configured. Plain chat plus single-file rewrites only —
-                        no agent mode / multi-step tasks, since local 7B models aren't reliable at those yet.
+                        Plain chat and single-file edits. Hover the info icon for how to run a model, including the uncensored one.
                       </div>
                     </div>
                   </label>
@@ -807,6 +905,76 @@ export function SettingsModal() {
                           placeholder="qwen2.5-coder:7b"
                           className="w-full bg-overlay border border-border rounded-lg px-3 py-2 text-sm text-ink" />
                       </Field>
+                      {!settings?.is_hosted && (
+                        <div className="space-y-3">
+                          <div className="text-xs font-medium text-ink">Local models</div>
+                          {ollamaCatalog && !ollamaCatalog.reachable && form.ollama_base_url.includes('localhost') && (
+                            <div className="text-xs text-muted">
+                              Can&apos;t reach Ollama. If SurgicalAI runs in Docker, use{' '}
+                              <code className="font-mono bg-overlay px-1 rounded">http://host.docker.internal:11434</code>{' '}
+                              and make sure Ollama is running.
+                            </div>
+                          )}
+                          {ollamaSettingsDirty && (
+                            <div className="text-xs text-muted">Save settings first to download models.</div>
+                          )}
+                          <div className="text-xs text-faint">
+                            Closing Settings pauses the download. Download again to resume.
+                          </div>
+                          {pullError && <div className="text-xs text-red-500">{pullError}</div>}
+                          {(ollamaCatalog?.models ?? []).map((m) => {
+                            const pulling = pulls[m.id]
+                            return (
+                              <div
+                                key={m.id}
+                                className="bg-overlay border border-border rounded-lg p-3 space-y-2"
+                              >
+                                <div className="flex items-start justify-between gap-2">
+                                  <div>
+                                    <div className="text-sm font-medium text-ink flex items-center gap-2">
+                                      {m.label}
+                                      {m.uncensored && (
+                                        <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-accent/20 text-accent">
+                                          Uncensored
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="text-xs text-muted mt-0.5">{m.description}</div>
+                                    <div className="text-xs text-faint mt-0.5">~{m.size_gb} GB</div>
+                                  </div>
+                                  <div className="shrink-0">
+                                    {m.installed && !pulling ? (
+                                      <span className="text-xs text-green-600">Installed</span>
+                                    ) : pulling ? (
+                                      <span className="text-xs text-muted">{pulling.pct}%</span>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        disabled={ollamaSettingsDirty}
+                                        onClick={() => startOllamaPull(m.id)}
+                                        className="btn-primary px-3 py-1 text-xs disabled:opacity-50"
+                                      >
+                                        Download
+                                      </button>
+                                    )}
+                                  </div>
+                                </div>
+                                {pulling && (
+                                  <div className="h-1.5 bg-border rounded overflow-hidden">
+                                    <div
+                                      className="h-full bg-accent transition-all"
+                                      style={{ width: `${pulling.pct}%` }}
+                                    />
+                                  </div>
+                                )}
+                                {pulling && (
+                                  <div className="text-[10px] text-faint truncate">{pulling.status}</div>
+                                )}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
                       <div className="text-xs text-faint">
                         Requires Ollama running locally with the model pulled (<code className="font-mono bg-overlay px-1 rounded">ollama pull qwen2.5-coder:7b</code>).
                       </div>
@@ -1322,6 +1490,53 @@ function SecurityPanel(props: SecurityPanelProps) {
         <div className={`flex items-center gap-1.5 ${pwHasDigit ? 'text-green-400' : ''}`}>
           {pwHasDigit ? '\u2713' : '\u00B7'} One number
         </div>
+      </div>
+    </div>
+  )
+}
+
+function OfflineModeHelp() {
+  return (
+    <div className="group/help mb-1">
+      <div className="flex items-center gap-1.5">
+        <div className="text-sm font-bold text-ink">Offline Mode</div>
+        <button
+          type="button"
+          aria-label="How offline mode works"
+          className="text-faint hover:text-ink"
+        >
+          <InfoOutlined sx={{ fontSize: 16 }} />
+        </button>
+      </div>
+      <div className="text-xs text-muted mt-0.5">Run fully locally via Ollama — no data leaves your machine</div>
+      <div
+        role="tooltip"
+        className="hidden group-hover/help:block group-focus-within/help:block mt-2 rounded-lg border border-border bg-surface p-3 text-xs text-muted space-y-2"
+      >
+        <p className="font-medium text-ink">How to run a local model</p>
+        <ol className="list-decimal pl-4 space-y-1">
+          <li>Turn on offline mode.</li>
+          <li>
+            If SurgicalAI runs in Docker, set the URL to{' '}
+            <span className="font-mono text-ink">http://host.docker.internal:11434</span>.
+            {' '}localhost points at the container, not this Mac. Ollama has to be running.
+          </li>
+          <li>Save Settings, then download a model below if it is not installed yet.</li>
+          <li>In the chat model picker, choose the model. That choice is what runs.</li>
+        </ol>
+        <p>
+          <span className="text-ink">Qwen2.5-Coder 7B</span> is the fast code model.
+          {' '}<span className="text-ink">Qwen3 14B Uncensored</span> is the general model with the usual refusals removed. It can still refuse sometimes. About 10.5 GB to download, and about 12 GB of GPU memory while chatting.
+        </p>
+        <p>
+          The Model box is only the fallback. With offline mode on, a cloud model left selected does not run — chats use that fallback, which starts as Qwen2.5-Coder 7B.
+        </p>
+        <p>
+          To use a cloud model again, turn offline mode off and pick that model in the chat picker.
+        </p>
+        <p>
+          Offline mode is plain chat and single-file edits. Agent mode and multi-step tasks are not available. Closing Settings pauses a download; press Download again to resume.
+        </p>
       </div>
     </div>
   )

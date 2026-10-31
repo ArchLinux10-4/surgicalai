@@ -148,6 +148,7 @@ export interface FileContent {
   language: string
   size: number
   lines: number
+  revealLine?: number
 }
 
 export interface SymbolInfo {

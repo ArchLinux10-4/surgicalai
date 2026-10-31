@@ -2189,6 +2189,26 @@ def _friendly_error(e: Exception) -> str:
     return f"Something went wrong. Please try again in a moment. *(Detail: {short})*"
 
 
+def rename_openai_max_tokens(kwargs: dict, model: str = "") -> dict:
+    """Move max_tokens onto max_completion_tokens. Mutates and returns kwargs.
+
+    Same conversion _chat_create uses. Does not add temperature, cache
+    headers, or retries. Safe for every OpenAI chat.completions call.
+    """
+    if "max_tokens" not in kwargs:
+        return kwargs
+    if "max_completion_tokens" not in kwargs:
+        kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
+        _dlog("chat_create_max_tokens_renamed",
+              model=model, max_completion_tokens=kwargs["max_completion_tokens"])
+    else:
+        _popped = kwargs.pop("max_tokens")
+        _dlog("chat_create_max_tokens_dropped",
+              model=model, dropped=_popped,
+              kept_max_completion_tokens=kwargs["max_completion_tokens"])
+    return kwargs
+
+
 def _chat_create(client: OpenAI, model: str, messages: list, temperature: float = 0.3, session_id: str = "", **kwargs):
     """Wrapper around client.chat.completions.create that drops temperature
     for reasoning models and injects reasoning_effort when configured.
@@ -2221,16 +2241,7 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
     # OpenAI deprecated max_tokens; newer models (GPT-4.1+, o-series, GPT-5.x)
     # require max_completion_tokens instead.  _chat_create is ONLY used with the
     # OpenAI SDK, so this conversion is always safe.
-    if "max_tokens" in kwargs:
-        if "max_completion_tokens" not in kwargs:
-            kwargs["max_completion_tokens"] = kwargs.pop("max_tokens")
-            _dlog("chat_create_max_tokens_renamed",
-                  model=model, max_completion_tokens=kwargs["max_completion_tokens"])
-        else:
-            _popped = kwargs.pop("max_tokens")
-            _dlog("chat_create_max_tokens_dropped",
-                  model=model, dropped=_popped,
-                  kept_max_completion_tokens=kwargs["max_completion_tokens"])
+    rename_openai_max_tokens(kwargs, model)
     # Reasoning models (GPT-5.x, o-series) do not support the `stop` parameter.
     # Strip it centrally so no call site can accidentally trigger the 400 error.
     if base_model in NO_TEMPERATURE_MODELS and "stop" in kwargs:
@@ -5107,12 +5118,19 @@ async def run_chat_stream(
             )
             _grok_client = _get_client_for_model(chat_model, user_id, session_id=session_id)
 
-            def _grok_plan_chat_create(_client, model, messages, **_kwargs):
-                return _grok_chat_create_with_billing_guard(
-                    _client, model=model, messages=messages,
-                    dlog=_dlog, session_id=session_id or "", user_id=user_id or "",
-                    **_kwargs,
-                )
+            if _is_gpt_model(chat_model):
+                def _plan_chat_create(_client, model, messages, **_kwargs):
+                    return _chat_create(
+                        _client, model, messages,
+                        session_id=session_id or "", **_kwargs,
+                    )
+            else:
+                def _plan_chat_create(_client, model, messages, **_kwargs):
+                    return _grok_chat_create_with_billing_guard(
+                        _client, model=model, messages=messages,
+                        dlog=_dlog, session_id=session_id or "", user_id=user_id or "",
+                        **_kwargs,
+                    )
 
             async for _gchunk in _grok_run_ask_plan_native_stream(
                 client=_grok_client,
@@ -5138,7 +5156,7 @@ async def run_chat_stream(
                 symbol_maps_by_name=symbol_maps_by_name,
                 file_content_lookup=file_content_lookup,
                 execute_tool_round_fn=_ask_plan_execute_tool_round,
-                chat_create_fn=_grok_plan_chat_create,
+                chat_create_fn=_plan_chat_create,
                 iter_chunks_fn=_iter_openai_stream_chunks,
                 max_rounds=_ASK_PLAN_MAX_ROUNDS,
                 deadline_s=_ASK_PLAN_DEADLINE_S,
@@ -19012,6 +19030,16 @@ async def run_natural_pipeline_stream(
                 _preview_enabled = True
                 _dlog("natural_preview_tag_registered",
                       session_id=session_id, user_id=user_id)
+        _browser_note = None
+        try:
+            from services.inapp_browser import (
+                browser_enabled as _browser_enabled_fn,
+                model_browser_summary as _browser_summary,
+            )
+            _browser_note = _browser_summary() if _browser_enabled_fn() else None
+        except Exception:
+            _browser_note = None
+        _browser_tool = bool(_browser_note)
 
         # ── Debug: confirm quality rules and project memory reached the prompt ──
         _total_sys_chars = sum(b.get("text", "") if isinstance(b, dict) else b for b in system_prompt if isinstance(b, dict)) if False else sum(len(b["text"]) for b in system_prompt if isinstance(b, dict) and "text" in b)
@@ -19067,6 +19095,8 @@ async def run_natural_pipeline_stream(
                     repo_enabled=bool(_repo_ctx),
                     git_enabled=_git_tools,
                     local_enabled=_local_tools,
+                    browser_enabled=_browser_tool,
+                    browser_note=_browser_note or "",
                     dlog=_dlog, session_id=session_id, user_id=user_id)
                 _gpt_system_text += _grok_sys_suffix
                 _dlog("natural_grok_system_suffix_appended",
@@ -19469,6 +19499,12 @@ async def run_natural_pipeline_stream(
                 from services.repo_tools import parse_repo_request as _parse_repo
                 _rd = _parse_repo(_block)
                 return ("repo", _rd if _rd is not None else {"_invalid": (_block or "")[:500]})
+            if _kind == "browser":
+                try:
+                    _bd = json.loads(_block) if (_block or "").strip() else {}
+                except Exception:
+                    _bd = {}
+                return ("browser", _bd if isinstance(_bd, dict) else {})
             return None
 
         # ---- Unified instruction: every tool is legal on every turn, no phase wall ----
@@ -19496,6 +19532,8 @@ async def run_natural_pipeline_stream(
             git_guidance=_git_guidance,
             local_guidance=_local_guidance,
         )
+        if _browser_note:
+            _AGENT_INSTRUCTION += "\n" + _browser_note + "\n"
 
         # ── Grok-only: native-tool agent instruction (Claude/GPT keep the
         #    XML suffix above unchanged). ──
@@ -19511,6 +19549,8 @@ async def run_natural_pipeline_stream(
                 mcp_enabled=_natural_mcp,
                 repo_enabled=bool(_repo_ctx),
                 local_enabled=_local_tools,
+                browser_enabled=_browser_tool,
+                browser_note=_browser_note or "",
                 dlog=_dlog, session_id=session_id, user_id=user_id)
 
         # Research is off, but the user clearly asked for a web search.
@@ -19584,6 +19624,8 @@ async def run_natural_pipeline_stream(
 
         _grok_native_turn = None  # cross-turn: set after a Grok native tool turn,
                                   # consumed at the top of the next turn
+        _browser_image_msg = None  # screenshot follows the tool text, after normalize
+        _browser_reads = 0
         _grok_loop_history: list = []  # cross-turn: no-op tool-call repeat
                                   # signatures for the circuit breaker (gap #3)
                                   # — NOT reset per-turn like _grok_blocked/
@@ -19774,6 +19816,22 @@ async def run_natural_pipeline_stream(
                     current_messages, _grok_native_turn, dlog=_dlog,
                     session_id=session_id, user_id=user_id)
                 _grok_native_turn = None
+            if _browser_image_msg is not None:
+                if _natural_use_claude and isinstance(_browser_image_msg.get("content"), list):
+                    _claude_parts = []
+                    for _part in _browser_image_msg["content"]:
+                        if _part.get("type") == "image_url":
+                            _url = (_part.get("image_url") or {}).get("url") or ""
+                            _data = _url.split(",", 1)[-1]
+                            _claude_parts.append({
+                                "type": "image",
+                                "source": {"type": "base64", "media_type": "image/jpeg", "data": _data},
+                            })
+                        else:
+                            _claude_parts.append(_part)
+                    _browser_image_msg = {"role": "user", "content": _claude_parts}
+                current_messages = current_messages + [_browser_image_msg]
+                _browser_image_msg = None
 
             # ── Governor: total wall-clock / pipeline budget (honest termination) ──
             _loop_elapsed = time.time() - _streaming_t0
@@ -20217,6 +20275,7 @@ async def run_natural_pipeline_stream(
                         repo_enabled=bool(_repo_ctx),
                         git_enabled=_git_tools,
                         local_enabled=_local_tools,
+                        browser_enabled=_browser_tool,
                         dlog=_dlog, session_id=session_id, user_id=user_id)
                     _gpt_call_kwargs["tools"] = _grok_tools
                     # Plan-first gate decides tool_choice: forced write_edit_plan
@@ -21651,6 +21710,42 @@ async def run_natural_pipeline_stream(
                     current_messages = current_messages + [
                         {"role": "assistant", "content": _assistant_echo},
                         {"role": "user", "content": _terminal_followup(_local_note)},
+                    ]
+                    continue
+
+                if _kind == "browser":
+                    from services.tool_footer import tool_footer as _tool_footer
+                    if _browser_reads >= 10:
+                        current_messages = current_messages + [
+                            {"role": "assistant", "content": _assistant_echo},
+                            {"role": "user", "content": _tool_footer(
+                                "browser",
+                                "You've reached the browser read limit for this turn. "
+                                "Use what you already saw, or ask the user.",
+                            )},
+                        ]
+                        continue
+                    from services.inapp_browser import session as _browser_session
+                    _bro_text = "Browser is not available."
+                    try:
+                        _tab = None
+                        if isinstance(_data, dict) and _data.get("tab") is not None:
+                            _tab = int(_data.get("tab"))
+                        _bro = await _browser_session.read_for_model(tab=_tab)
+                        _bro_text = _bro["text"]
+                        _browser_reads += 1
+                        if _bro.get("image_jpeg_b64"):
+                            _browser_image_msg = {"role": "user", "content": [
+                                {"type": "text", "text": f"Screenshot of browser tab {_bro['tab']} ({_bro['url']})."},
+                                {"type": "image_url", "image_url": {
+                                    "url": "data:image/jpeg;base64," + _bro["image_jpeg_b64"],
+                                }},
+                            ]}
+                    except Exception as _bx:
+                        _bro_text = f"Browser is not available: {_bx}"
+                    current_messages = current_messages + [
+                        {"role": "assistant", "content": _assistant_echo},
+                        {"role": "user", "content": _tool_footer("browser", _bro_text)},
                     ]
                     continue
 

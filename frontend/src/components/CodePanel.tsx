@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react'
+import React, { useState, useRef, useCallback, useEffect } from 'react'
 import { useAppStore } from '../stores/appStore'
 import { api } from '../api/client'
 import { toast } from '../lib/toast'
@@ -151,10 +151,19 @@ export function CodePanel() {
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
   const [content, setContent] = useState<string>('')
+  const editorRef = useRef<any>(null)
 
   React.useEffect(() => {
     if (activeFile) setContent(activeFile.content)
   }, [activeFile?.path])
+
+  useEffect(() => {
+    const line = activeFile?.revealLine
+    const editor = editorRef.current
+    if (!line || !editor) return
+    editor.revealLineInCenter(line)
+    editor.setPosition({ lineNumber: line, column: 1 })
+  }, [activeFile?.path, activeFile?.revealLine])
 
   // Handle file opened via drag-drop or upload button
   const handleLocalFile = useCallback((name: string, fileContent: string, language: string) => {
@@ -268,6 +277,14 @@ export function CodePanel() {
             language={activeFile.language}
             value={content}
             onChange={(v) => setContent(v || '')}
+            onMount={(editor) => {
+              editorRef.current = editor
+              const line = activeFile?.revealLine
+              if (line) {
+                editor.revealLineInCenter(line)
+                editor.setPosition({ lineNumber: line, column: 1 })
+              }
+            }}
             theme="vs-dark"
             options={{
               fontSize: settings?.font_size || 14,

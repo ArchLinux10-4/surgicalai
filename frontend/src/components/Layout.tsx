@@ -2,7 +2,6 @@ import React, { useState, useCallback, useRef } from 'react'
 import { Sidebar } from './Sidebar'
 import { ChatPanel } from './ChatPanel'
 import { CodePanel } from './CodePanel'
-import { ElementPickerPanel } from './ElementPickerPanel'
 import { AwsTerminalDock } from './AwsTerminalDock'
 import { LocalTerminalDock } from './LocalTerminalDock'
 import { GitTerminalDock } from './GitTerminalDock'
@@ -17,8 +16,8 @@ import { ImageStudio } from './ImageStudio'
 const SIDEBAR_MIN_PX = 264   // 44px rail + 220px panel — current default
 const SIDEBAR_MAX_PX = Math.round(SIDEBAR_MIN_PX * 1.4)  // +40% = ~370px
 
-// Chat panel width constants (used when a file or the Element Picker is
-// docked beside it) — same min/max-clamped drag convention as the sidebar
+// Chat panel width when a file is docked beside it. Same drag convention
+// as the sidebar, on the opposite edge.
 // above, just on the opposite edge. Min keeps the composer/message bubbles
 // usable; max leaves at least ~30% of a typical 1280px window for the
 // docked pane so it's never squeezed to nothing.
@@ -38,12 +37,10 @@ function loadChatWidth(): number {
 export function Layout() {
   const activeFile = useAppStore(s => s.activeFile)
   const sidebarPinned = useAppStore(s => s.sidebarPinned)
-  // Element Picker docks into the same third-pane slot CodePanel uses below
-  // — one main view beside chat at a time, same convention Cursor's own
-  // in-app Browser pane follows. It takes precedence over an open file
-  // rather than stacking a fourth column, matching the "keep it simple,
-  // one thing docked beside chat" decision from user feedback.
-  const elementPickerOpen = useAppStore(s => s.elementPickerModalOpen)
+  const browserOpen = useAppStore(s => s.browserOpen)
+  const hosted = useAppStore(s => !!s.settings?.is_hosted)
+  const showBrowser = browserOpen && !hosted
+  const dockFile = !!activeFile && !showBrowser
   const { isAuthenticated } = useAuthStore()
   // Default to max width — the panel was too cramped at the minimum.
   // Users can still drag it narrower via the resize handle.
@@ -148,30 +145,22 @@ export function Layout() {
 
       <div className="flex flex-col flex-1 min-w-0 min-h-0">
       <div className="flex flex-1 min-h-0 min-w-0">
-      {/* Chat — expands to fill all space when no file/picker pane is docked.
-          Width comes from the drag-resizable `chatWidth` state (not a fixed
-          Tailwind width) whenever a third pane is docked, same idea as the
-          sidebar's own resizable width above; the `transition-all` is
-          suppressed mid-drag (via the dragging check below is unnecessary
-          here since width is only set on mouseup-free `next` per move —
-          keeping the transition off during active drags avoids the resize
-          feeling laggy/rubber-banded behind the mouse). */}
+      {/* Chat fills the window while the browser tab is open. A file docks
+          beside chat only after the browser is closed. */}
       <section
         className={`flex flex-col min-h-0 bg-base overflow-hidden ${
-          (activeFile || elementPickerOpen)
+          dockFile
             ? 'flex-shrink-0 border-r border-border'
             : 'flex-1 transition-[width] duration-200'
         }`}
-        style={(activeFile || elementPickerOpen) ? { width: chatWidth } : undefined}
+        style={dockFile ? { width: chatWidth } : undefined}
       >
         <ChatPanel />
         <PreviewProbe />
       </section>
 
-      {/* Drag handle — boundary between chat and whichever third pane is
-          docked (CodePanel or Element Picker). Same visual language as the
-          sidebar's own handle for consistency. */}
-      {(activeFile || elementPickerOpen) && (
+      {/* Drag handle between chat and an open file. */}
+      {dockFile && (
         <div
           onMouseDown={onChatDragStart}
           className="w-1 flex-shrink-0 cursor-col-resize z-10 relative
@@ -186,11 +175,7 @@ export function Layout() {
         </div>
       )}
 
-      {/* Third pane — Element Picker takes priority over an open code file
-          (one main view beside chat at a time, not a stacked fourth column) */}
-      {elementPickerOpen ? (
-        <ElementPickerPanel />
-      ) : activeFile ? (
+      {dockFile ? (
         <section className="flex-1 flex flex-col bg-base min-w-0 min-h-0">
           <CodePanel />
         </section>

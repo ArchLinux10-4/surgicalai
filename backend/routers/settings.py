@@ -1,7 +1,9 @@
 """Settings & API key management router — per-user encrypted key storage."""
+import json
 import httpx
 import threading
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from models.schemas import LocalAllowlistUpdate, SettingsUpdate, SettingsResponse
 from database import get_all_settings, set_setting, get_setting, set_user_api_key, get_user_api_key, _dlog, USE_POSTGRES
 from crypto_utils import encrypt_api_key, decrypt_api_key
@@ -106,6 +108,8 @@ def update_settings(req: SettingsUpdate, request: Request):
             del updates[admin_key]
 
     for key, val in updates.items():
+        if key == "ollama_enabled":
+            val = "true" if str(val).lower() in ("1", "true", "yes", "on") else "false"
         if key == "workspace_path":
             old_val = get_setting("workspace_path", "")
             _dlog("settings_workspace_path_changed", user_id=user_id, old_value=old_val, new_value=str(val))
@@ -499,6 +503,93 @@ def gemini_status(request: Request):
     user_id = _get_user_id(request)
     key = _resolve_api_key(user_id, "gemini")
     return {"configured": bool(key)}
+
+
+_PULLS: set[str] = set()
+
+
+def _local_only() -> None:
+    if USE_POSTGRES:
+        raise HTTPException(status_code=404, detail="Not available on hosted deployments.")
+
+
+def _ollama_base(raw) -> str:
+    base = ((raw or get_setting("ollama_base_url", "http://localhost:11434")) or "").strip().rstrip("/")
+    if not base.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Ollama URL must start with http:// or https://")
+    return base
+
+
+@router.get("/ollama/catalog")
+def ollama_catalog(base_url: str = ""):
+    _local_only()
+    from services.offline.ollama_models import CATALOG
+
+    base = _ollama_base(base_url)
+    installed, reachable = {}, False
+    try:
+        r = httpx.get(f"{base}/api/tags", timeout=3)
+        r.raise_for_status()
+        reachable = True
+        for m in r.json().get("models", []):
+            installed[str(m.get("name", "")).lower()] = round(m.get("size", 0) / 1e9, 1)
+    except Exception:
+        pass
+    return {
+        "reachable": reachable,
+        "base_url": base,
+        "models": [
+            {
+                "id": m.id,
+                "label": m.label,
+                "description": m.description,
+                "uncensored": m.uncensored,
+                "size_gb": m.size_gb,
+                "installed": m.id.lower() in installed,
+            }
+            for m in CATALOG
+        ],
+    }
+
+
+@router.post("/ollama/pull")
+async def ollama_pull(body: dict):
+    _local_only()
+    from services.offline.ollama_models import lookup
+
+    entry = lookup(str((body or {}).get("name", "")))
+    if entry is None:
+        raise HTTPException(status_code=400, detail="Unknown model.")
+    base = _ollama_base((body or {}).get("base_url"))
+    if entry.id in _PULLS:
+        raise HTTPException(status_code=409, detail="That model is already downloading.")
+
+    async def relay():
+        _PULLS.add(entry.id)
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(None, connect=10)) as c:
+                async with c.stream(
+                    "POST",
+                    f"{base}/api/pull",
+                    json={"model": entry.id, "stream": True},
+                ) as r:
+                    if r.status_code != 200:
+                        text = (await r.aread()).decode("utf-8", "replace")[:300]
+                        yield json.dumps({"error": f"Ollama returned {r.status_code}: {text}"}) + "\n"
+                        return
+                    async for line in r.aiter_lines():
+                        if line:
+                            yield line + "\n"
+        except Exception as exc:
+            yield json.dumps({"error": f"Could not reach Ollama at {base}: {exc}"}) + "\n"
+        finally:
+            _PULLS.discard(entry.id)
+
+    return StreamingResponse(
+        relay(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.post("/test-ollama")
