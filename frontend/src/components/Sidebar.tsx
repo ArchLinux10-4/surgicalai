@@ -12,7 +12,7 @@ import { VercelPanel } from './VercelPanel'
 import { RailwayPanel } from './RailwayPanel'
 import { AwsTerminalPanel } from './AwsTerminalPanel'
 import { useThemeStore } from '../stores/themeStore'
-import { Add, AdsClick, Chat, CloudOff, Close, Code, CreateNewFolder, DarkMode, Delete, Description, Download, Edit, FileUpload, FolderOpen, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, MoreHoriz, Palette, Psychology, PushPin, Search, Settings } from '@mui/icons-material';
+import { Add, Chat, CloudOff, Close, Code, CreateNewFolder, DarkMode, Delete, Description, Download, Edit, FileUpload, FolderOpen, GitHub, KeyboardArrowDown, KeyboardArrowLeft, KeyboardArrowRight, LightMode, Logout, MoreHoriz, Palette, Psychology, Public, PushPin, Search, Settings } from '@mui/icons-material';
 import { FileFilterTabs, NewBadge, FileKindGlyph, matchesFileFilter, fileCounts, isCreatedFile, isEditedFile, DiffStatsBadge } from '../lib/fileClassify'
 import { applyStagedToFiles, latestStagedEdits, stagedCountsFor } from '../lib/stagedFiles'
 import { DownloadSessionButton } from './DownloadSessionButton'
@@ -1161,13 +1161,9 @@ const RAIL_ITEMS: { id: TabId; icon: any; label: string; tooltip: string }[] = [
   { id: 'railway',  icon: RailwayIcon,        label: 'Railway', tooltip: 'Railway Services' },
   { id: 'context',  icon: Psychology,         label: 'Memory', tooltip: 'Global Memory' },
 ]
-// Element Picker docks into the third-pane slot beside chat (see
-// ElementPickerPanel / Layout.tsx) — same convention as opening a code file,
-// not a tiny sliding sidebar strip, since it needs to show a real, sizeable,
-// interactive browser feed. Local-install only: a Chrome CDP connection can
-// never reach the user's laptop from a hosted (Vercel/Railway) deploy, so
-// the button itself is hidden there (same precedent as Import Folder's
-// `canImportFolder` gate).
+// The in-app browser opens as its own tab in the main column (local install
+// only). A hosted deploy cannot reach the user's machine, so the button is
+// hidden there.
 
 // ── Vercel icon (inline SVG) ──────────────────────────────────────────────────
 function AwsIcon({ size = 16 }: { size?: number }) {
@@ -1233,10 +1229,21 @@ export function Sidebar() {
   const {
     sidebarTab, setSidebarTab, setSettingsOpen, sessionFiles, sidebarPanelOpen, setSidebarPanelOpen,
     imageStudioOpen, setImageStudioOpen, sidebarPinned: pinned, setSidebarPinned: persistPinned,
-    settings, setElementPickerModalOpen,
+    settings, setBrowserOpen, browserOpen,
   } = useAppStore()
   const { theme, toggleTheme } = useThemeStore()
   const { user, logout } = useAuthStore()
+
+  useEffect(() => {
+    if (settings?.is_hosted) return
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || !e.shiftKey || e.key.toLowerCase() !== 'b') return
+      e.preventDefault()
+      setBrowserOpen(!useAppStore.getState().browserOpen)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [settings?.is_hosted, setBrowserOpen])
 
   // Offline Mode (local Ollama model) has no internet access to Vercel/Railway's
   // cloud APIs by design — rather than let those panels spin/error against a
@@ -1409,15 +1416,16 @@ export function Sidebar() {
           <Palette sx={{ fontSize: 17 }} />
         </button>
 
-        {/* Element Picker — docks beside chat like an open file (see
-            ElementPickerPanel / Layout.tsx). Local-install only. */}
+        {/* In-app browser — local install only. Fills the main column. */}
         {!settings?.is_hosted && (
           <button
-            onClick={() => setElementPickerModalOpen(true)}
-            title="Pick Element"
-            className="relative flex items-center justify-center w-8 h-8 rounded-lg text-muted hover:text-ink hover:bg-overlay transition-all"
+            onClick={() => setBrowserOpen(!browserOpen)}
+            title="Browser"
+            className={`relative flex items-center justify-center w-8 h-8 rounded-lg transition-all ${
+              browserOpen ? 'bg-accent/15 text-accent' : 'text-muted hover:text-ink hover:bg-overlay'
+            }`}
           >
-            <AdsClick sx={{ fontSize: 17 }} />
+            <Public sx={{ fontSize: 17 }} />
           </button>
         )}
 

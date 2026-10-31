@@ -515,3 +515,13 @@ def test_every_public_fn_logs():
                      "grok_translate_done", "grok_system_suffix_built",
                      "grok_agent_instruction_built"):
         assert expected in events, f"missing log {expected}"
+
+
+def test_read_browser_is_off_unless_enabled_and_maps_to_browser_kind():
+    off = {t["function"]["name"] for t in gat.build_grok_agent_tools("agent")}
+    on = {t["function"]["name"] for t in gat.build_grok_agent_tools("ask", browser_enabled=True)}
+    assert "read_browser" not in off
+    assert "read_browser" in on
+    kind, body = gat._context_body("read_browser", {"tab": 1})
+    assert kind == "browser"
+    assert json.loads(body) == {"tab": 1}

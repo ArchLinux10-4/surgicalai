@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useCallback, Component } from 'react'
-import { useAppStore, type PickedElementRef, type LiveEditCardState } from '../stores/appStore'
+import { useAppStore, type BrowserShot, type PickedElementRef, type LiveEditCardState } from '../stores/appStore'
 import { api, type SteerStream } from '../api/client'
 import { toast } from '../lib/toast'
 import { InlineDiffCard } from './InlineDiffCard'
@@ -23,6 +23,8 @@ import { refreshRepoBranch } from './GitTerminalDock'
 import { AgentMissionControl } from './AgentMissionControl'
 import { PlanTracker, requestPlanBuild } from './PlanTracker'
 import { PlanPane } from './PlanPane'
+import { BrowserTab } from '../browser/BrowserTab'
+import { BrowserApplyReload } from '../browser/BrowserApplyReload'
 import { planStatusBadge, planTabKey, shouldQueueAfterStart } from '../lib/planTab'
 import { PlanQuestionsCard } from './PlanQuestionsCard'
 import { normalizeQuestions } from '../lib/planQuestions'
@@ -1238,20 +1240,39 @@ function EmptyState({ onUpload }: { onUpload: () => void }) {
 const PICKED_CTX_START = '\n\n<!--PICKED_ELEMENTS_CONTEXT-->\n'
 const PICKED_CTX_END = '\n<!--/PICKED_ELEMENTS_CONTEXT-->'
 
-function appendPickedElementsContext(text: string, elements: PickedElementRef[]): string {
-  if (elements.length === 0) return text
+function appendPickedElementsContext(text: string, elements: PickedElementRef[], shots: BrowserShot[] = []): string {
+  if (elements.length === 0 && shots.length === 0) return text
   const blocks = elements.map((el, i) => {
     const snippet = el.outerHTML.length > 800 ? el.outerHTML.slice(0, 800) + '…' : el.outerHTML
     const label = el.elId ? ` id="${el.elId}"` : ''
+    const computed = el.computed
+      ? `Computed: ${Object.entries(el.computed).slice(0, 12).map(([k, v]) => `${k}: ${v}`).join('; ')}`
+      : null
+    const react = el.react?.component
+      ? `React component: ${el.react.component}${el.react.file ? ` (${el.react.file}${el.react.line ? ':' + el.react.line : ''})` : ''}`
+      : null
+    const source = el.source?.length
+      ? `Source candidates: ${el.source.slice(0, 3).map((hit) => `${hit.file}:${hit.line}`).join(', ')}`
+      : null
+    const edits = el.styleEdits && Object.keys(el.styleEdits).length
+      ? `Style edits: ${Object.entries(el.styleEdits).map(([k, v]) => `${k}: ${v}`).join('; ')}`
+      : null
     return [
       `Element ${i + 1}${el.pageUrl ? ` (from ${el.pageUrl})` : ''}: <${el.tag}${label}>`,
+      el.cssPath ? `CSS path: ${el.cssPath}` : null,
+      react,
+      computed,
+      source,
+      edits,
       '```html',
       snippet,
       '```',
       el.text ? `Visible text: "${el.text.slice(0, 200)}"` : null,
     ].filter(Boolean).join('\n')
   })
-  return `${text}${PICKED_CTX_START}${blocks.join('\n\n')}${PICKED_CTX_END}`
+  const shotLines = shots.map((shot) => `Browser screenshot attached: ${shot.filename} (${shot.pageUrl})`)
+  const body = [blocks.join('\n\n'), shotLines.join('\n')].filter(Boolean).join('\n\n')
+  return `${text}${PICKED_CTX_START}${body}${PICKED_CTX_END}`
 }
 
 interface ParsedPickedElementCtx { tag: string; idLabel: string; text?: string; snippet: string }
@@ -1267,7 +1288,7 @@ function parsePickedElementsFromContent(content: string): { visibleText: string;
   if (endIdx === -1) return { visibleText: content, elements: [] }
   const visibleText = content.slice(0, startIdx)
   const raw = content.slice(startIdx + PICKED_CTX_START.length, endIdx)
-  const elements = raw.split('\n\n').map((block) => {
+  const elements = raw.split('\n\n').filter((block) => !block.startsWith('Browser screenshot attached:')).map((block) => {
     const tagMatch = block.match(/^Element \d+(?: \(from [^)]*\))?: <([a-zA-Z0-9-]+)/)
     const idMatch = block.match(/ id="([^"]*)"/)
     const textMatch = block.match(/Visible text: "([^"]*)"/)
@@ -1327,7 +1348,8 @@ export function ChatPanel() {
     applyPlanEvent, clearPlanTracker, setPlanTasks, setPlanRunId, setPlanPhase,
     pendingPlanQuestions,
     pendingChatInput, setPendingChatInput,
-    pickedElements, clearPickedElements,
+    browserOpen, setBrowserOpen, composerAppend,
+    pickedElements, clearPickedElements, browserShots, clearBrowserShots,
     availableModels, refreshModels,
   } = useAppStore()
   const [provisionalEdits, setProvisionalEdits] = useState<Record<string, any>>({})
@@ -1419,6 +1441,15 @@ export function ChatPanel() {
     }
   }, [pendingChatInput])
 
+  const composerAppendSeen = useRef<string | null>(null)
+  useEffect(() => {
+    if (!composerAppend || composerAppendSeen.current === composerAppend.id) return
+    composerAppendSeen.current = composerAppend.id
+    setInput((prev) => prev.trim() ? `${prev.replace(/\s+$/, '')}\n${composerAppend.text}` : composerAppend.text)
+    useAppStore.setState({ composerAppend: null })
+    setTimeout(() => textareaRef.current?.focus(), 80)
+  }, [composerAppend])
+
   // Resize the composer immediately when expand/collapse is toggled, so any
   // existing text reflows to fit the new max-height right away.
   useEffect(() => {
@@ -1473,6 +1504,8 @@ export function ChatPanel() {
   const hasPlan = planPhase !== 'idle' && (planTasks.length > 0 || !!(planMarkdown || '').trim())
   const [planTabHidden, setPlanTabHidden] = useState(false)
   const [chatView, setChatView] = useState<'chat' | 'plan'>('chat')
+  const hosted = !!settings?.is_hosted
+  const view: 'chat' | 'plan' | 'browser' = browserOpen && !hosted ? 'browser' : chatView
   useEffect(() => {
     if (!activeSessions) return
     try {
@@ -3145,6 +3178,7 @@ export function ChatPanel() {
     setPasteUndo(null)
     useAppStore.getState().clearPastedBlocks(draftKey)
     if (pickedElements.length > 0) clearPickedElements()
+    if (browserShots.length > 0) clearBrowserShots()
     if (textareaRef.current) textareaRef.current.style.height = 'auto'
   }
 
@@ -3154,7 +3188,7 @@ export function ChatPanel() {
     const typed = (overrideText !== undefined ? overrideText : input).trim()
     const blocks = overrideText !== undefined ? [] : pastedBlocks
     if (!typed && blocks.length === 0) return
-    const storedText = overrideText !== undefined ? typed : appendPickedElementsContext(typed, pickedElements)
+    const storedText = overrideText !== undefined ? typed : appendPickedElementsContext(typed, pickedElements, browserShots)
     const payload = serializePastedBlocks(storedText, blocks)
     clientLog('chat_handle_send_invoked', { isOverride: overrideText !== undefined, isStreaming, mode, length: payload.length }, activeSessions || '')
 
@@ -3211,7 +3245,7 @@ export function ChatPanel() {
     jumpToBottom(scrollContainerRef.current)
     const sessionId = await ensureSession()
     launchFresh(sessionId, payload, messages.length === 0)
-  }, [input, isStreaming, settings, activeSessions, pastedBlocks, pickedElements, doStream, fileRequest, draftKey, messages.length, launchFresh, jumpToBottom])
+  }, [input, isStreaming, settings, activeSessions, pastedBlocks, pickedElements, browserShots, doStream, fileRequest, draftKey, messages.length, launchFresh, jumpToBottom])
 
   // handleSend's identity changes with the draft and stream state. Message is
   // memoized on onRetryWithQA, so a fresh callback would re-render every row
@@ -3278,6 +3312,11 @@ export function ChatPanel() {
   }
 
   const hasFiles = sessionFiles.length > 0
+  const hiddenComposerFileIds = new Set<string>([
+    ...browserShots.map((shot) => shot.fileId),
+    ...pickedElements.flatMap((el) => el.screenshotFileId ? [el.screenshotFileId] : []),
+  ])
+  const trayFiles = sessionFiles.filter((file) => !hiddenComposerFileIds.has(file.id))
 
   // Clarifying-question card: live SSE event first, else derived from the last
   // saved message (reload). Plan mode only — answers go out as a Plan turn, so
@@ -3325,39 +3364,62 @@ export function ChatPanel() {
           <span className="text-sm font-semibold text-ink">
             SurgicalAI
           </span>
-          {hasPlan && !planTabHidden && (
+          {((hasPlan && !planTabHidden) || !hosted) && (
             <div className="flex items-center gap-0.5 ml-1">
               <button
                 type="button"
-                onClick={() => setChatView('chat')}
-                className={`text-[12px] font-semibold px-2 py-0.5 rounded-md ${chatView === 'chat' ? 'bg-overlay text-ink' : 'text-muted hover:text-ink'}`}
+                onClick={() => { setBrowserOpen(false); setChatView('chat') }}
+                className={`text-[12px] font-semibold px-2 py-0.5 rounded-md ${view === 'chat' ? 'bg-overlay text-ink' : 'text-muted hover:text-ink'}`}
               >
                 Chat
               </button>
-              <button
-                type="button"
-                onClick={() => setChatView('plan')}
-                className={`text-[12px] font-semibold px-2 py-0.5 rounded-md inline-flex items-center gap-1 ${chatView === 'plan' ? 'bg-overlay text-ink' : 'text-muted hover:text-ink'}`}
-              >
-                Plan
-                {planStatusBadge(planPhase, planTasks) && (
-                  <span className="text-[10px] font-medium text-accent">{planStatusBadge(planPhase, planTasks)}</span>
-                )}
-              </button>
-              <button
-                type="button"
-                onClick={closePlanTab}
-                title="Close plan"
-                className="text-[12px] text-muted hover:text-ink px-1"
-              >
-                ×
-              </button>
+              {hasPlan && !planTabHidden && (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => { setBrowserOpen(false); setChatView('plan') }}
+                    className={`text-[12px] font-semibold px-2 py-0.5 rounded-md inline-flex items-center gap-1 ${view === 'plan' ? 'bg-overlay text-ink' : 'text-muted hover:text-ink'}`}
+                  >
+                    Plan
+                    {planStatusBadge(planPhase, planTasks) && (
+                      <span className="text-[10px] font-medium text-accent">{planStatusBadge(planPhase, planTasks)}</span>
+                    )}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={closePlanTab}
+                    title="Close plan"
+                    className="text-[12px] text-muted hover:text-ink px-1"
+                  >
+                    ×
+                  </button>
+                </>
+              )}
+              {!hosted && (
+                <button
+                  type="button"
+                  onClick={() => setBrowserOpen(true)}
+                  className={`text-[12px] font-semibold px-2 py-0.5 rounded-md ${view === 'browser' ? 'bg-overlay text-ink' : 'text-muted hover:text-ink'}`}
+                >
+                  Browser
+                </button>
+              )}
+              {view === 'browser' && (
+                <button
+                  type="button"
+                  onClick={() => setBrowserOpen(false)}
+                  title="Close browser"
+                  className="text-[12px] text-muted hover:text-ink px-1"
+                >
+                  ×
+                </button>
+              )}
             </div>
           )}
           {hasPlan && planTabHidden && (
             <button
               type="button"
-              onClick={openPlanTab}
+              onClick={() => { setBrowserOpen(false); openPlanTab() }}
               className="text-[12px] font-semibold px-2 py-0.5 rounded-md text-muted hover:text-ink border border-border"
             >
               Plan
@@ -3452,7 +3514,11 @@ export function ChatPanel() {
         </div>
       )}
 
-      {hasPlan && chatView === 'plan' && !planTabHidden ? (
+      {!hosted && <BrowserApplyReload />}
+
+      {view === 'browser' ? (
+        <BrowserTab />
+      ) : hasPlan && chatView === 'plan' && !planTabHidden ? (
         <PlanPane placement="tab" />
       ) : (
       <div ref={scrollContainerRef} className="flex-1 min-h-0 overflow-y-auto" style={{ overflowAnchor: 'none' }}>
@@ -3594,6 +3660,8 @@ export function ChatPanel() {
       </div>
       )}
 
+      {view !== 'browser' && (
+      <>
       {/* Apply All — single click to apply every pending change across all files */}
       {activeSessions && !isStreaming && (
         <div className="px-3 pt-2 flex-shrink-0">
@@ -3609,10 +3677,10 @@ export function ChatPanel() {
       {/* Input area */}
       <div className="border-t border-border p-3 flex-shrink-0 bg-base/50">
         {/* Session file drawer — single docked source of truth atop the composer */}
-        {activeSessions && hasFiles && (
+        {activeSessions && trayFiles.length > 0 && (
           <SessionFilesTray
             sessionId={activeSessions}
-            sessionFiles={sessionFiles}
+            sessionFiles={trayFiles}
             onAddFiles={() => fileInputRef.current?.click()}
             onRemove={removeFile}
           />
@@ -3623,7 +3691,6 @@ export function ChatPanel() {
           </div>
         )}
 
-        <PickedElementsTray />
         <QueuedMessagesTray
           items={steerQueue}
           paused={steerPaused}
@@ -3761,6 +3828,7 @@ export function ChatPanel() {
             onSave={(id, text) => useAppStore.getState().updatePastedBlock(draftKey, id, text)}
             onConvert={convertPastedToText}
           />
+          <PickedElementsTray />
           <textarea
             ref={textareaRef}
             value={input}
@@ -3978,6 +4046,8 @@ export function ChatPanel() {
           </div>
         </div>
       </div>
+      </>
+      )}
     </div>
   )
 }

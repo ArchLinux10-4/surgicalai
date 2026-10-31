@@ -94,8 +94,9 @@ def load_user_memory_block(user_id: str, session_id: str, current_message: str) 
     parts = []
     if memory:
         parts.append(
-            "USER MEMORY (this user only; earlier chats, not the current transcript; "
-            "may be unrelated to this project; apply only if asked):\n"
+            "USER MEMORY (this account, every chat including a folder or repository; "
+            "earlier chats, not the current transcript). "
+            "Use a fact when it bears on the request. Do not recite unrelated facts:\n"
             + memory
         )
     if lines:
@@ -167,14 +168,15 @@ async def _extract_and_save(user_id: str, session_id: str, user_text: str, assis
             new_text = resp.content[0].text if resp.content else ""
         elif openai_key:
             import openai
+            from services.pipeline import rename_openai_max_tokens
             client = openai.AsyncOpenAI(api_key=openai_key)
             resp = await client.chat.completions.create(
                 model="gpt-4.1-mini",
-                max_tokens=800,
                 messages=[
                     {"role": "system", "content": _EXTRACT_SYSTEM},
                     {"role": "user", "content": turn},
                 ],
+                **rename_openai_max_tokens({"max_tokens": 800}, "gpt-4.1-mini"),
             )
             new_text = resp.choices[0].message.content or ""
         else:

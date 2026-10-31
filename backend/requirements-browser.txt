@@ -1,0 +1,3 @@
+# Chromium driver for the local in-app browser.
+# The Dockerfile installs this file. Railway/nixpacks never reads it.
+playwright>=1.60

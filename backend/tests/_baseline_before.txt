@@ -16,8 +16,4 @@ tests/test_qa_symbol_granularity.py::test_dead_intermediate_machinery_removed
 tests/test_value_const_indexing.py::test_small_scalars_are_skipped
 
 Errors:
-tests/test_element_picker_local_only.py::TestElementPickerServiceReal::test_connect_reports_connected
-tests/test_element_picker_local_only.py::TestElementPickerServiceReal::test_reconnect_same_url_is_noop
-tests/test_element_picker_local_only.py::TestElementPickerServiceReal::test_screenshot_returns_nonempty_jpeg_bytes
-tests/test_element_picker_local_only.py::TestElementPickerServiceReal::test_pick_returns_element_at_heading
-tests/test_element_picker_local_only.py::TestElementPickerServiceReal::test_disconnect_clears_state_but_chrome_survives
+(picker suite removed — replaced by the local in-app browser)

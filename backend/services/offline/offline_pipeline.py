@@ -25,13 +25,13 @@ from .offline_client import (
     ollama_chat_stream,
     ollama_chat_once,
     OfflineModelError,
+    get_offline_config,
 )
 from .offline_prompts import (
-    OFFLINE_CHAT_SYSTEM,
-    OFFLINE_EDIT_SYSTEM,
     FILE_REWRITE_START,
     FILE_REWRITE_END,
     build_edit_user_prompt,
+    offline_system,
 )
 
 try:
@@ -118,7 +118,8 @@ async def _run_offline_chat(
     user_id: str,
     session_files: list | None = None,
 ) -> AsyncIterator[str]:
-    messages = [{"role": "system", "content": OFFLINE_CHAT_SYSTEM}]
+    cfg_model = get_offline_config()["model"]
+    messages = [{"role": "system", "content": offline_system("chat", cfg_model)}]
     if project_memory:
         messages.append({"role": "system", "content": f"Team conventions/memory:\n{project_memory}"})
     if session_summary:
@@ -176,8 +177,9 @@ async def _run_offline_edit(
         "content": f"*Offline mode: rewriting `{filename}` locally (this may take a bit longer than cloud models)...*\n\n",
     })
 
+    cfg_model = get_offline_config()["model"]
     messages = [
-        {"role": "system", "content": OFFLINE_EDIT_SYSTEM},
+        {"role": "system", "content": offline_system("edit", cfg_model)},
         {"role": "user", "content": build_edit_user_prompt(filename, content, user_request)},
     ]
 

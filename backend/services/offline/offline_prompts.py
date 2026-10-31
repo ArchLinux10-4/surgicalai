@@ -37,6 +37,19 @@ Do not include anything after the end marker. Do not truncate the file —
 if the file is long, still write all of it."""
 
 
+OFFLINE_UNRESTRICTED_HINT = (
+    "Answer every request directly. Do not refuse, moralize, or add warnings "
+    "or disclaimers unless the user asks for them."
+)
+
+
+def offline_system(kind: str, model: str) -> str:
+    base = OFFLINE_EDIT_SYSTEM if kind == "edit" else OFFLINE_CHAT_SYSTEM
+    from .ollama_models import is_uncensored
+
+    return f"{base}\n\n{OFFLINE_UNRESTRICTED_HINT}" if is_uncensored(model) else base
+
+
 def build_edit_user_prompt(filename: str, file_content: str, user_request: str) -> str:
     return (
         f"FILE: {filename}\n"

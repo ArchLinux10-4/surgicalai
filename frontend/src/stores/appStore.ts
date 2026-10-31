@@ -333,17 +333,24 @@ interface AppState {
   // Pending chat input — set from sidebar components (e.g. deploy watcher)
   pendingChatInput: string | null
   setPendingChatInput: (msg: string | null) => void
+  composerAppend: { id: string; text: string } | null
+  appendToComposer: (text: string) => void
 
-  // Element Picker — full-screen live-view modal + picked-element chips.
-  // Chips are additive context above the composer (mirrors SessionFilesTray),
-  // never injected into the visible draft text — kept separate so the
-  // textarea itself needs zero changes (see PickedElementsTray.tsx).
-  elementPickerModalOpen: boolean
-  setElementPickerModalOpen: (open: boolean) => void
+  // Local in-app browser. The tab fills the main column. Hidden when hosted.
+  browserOpen: boolean
+  setBrowserOpen: (open: boolean) => void
+
+  // Picked-element chips and browser screenshot pills. Rendered inside the
+  // composer card; folded into the outgoing message at send time.
   pickedElements: PickedElementRef[]
   addPickedElement: (el: PickedElementRef) => void
+  updatePickedElement: (id: string, patch: Partial<PickedElementRef>) => void
   removePickedElement: (id: string) => void
   clearPickedElements: () => void
+  browserShots: BrowserShot[]
+  addBrowserShot: (shot: BrowserShot) => void
+  removeBrowserShot: (id: string) => void
+  clearBrowserShots: () => void
 
   pastedBySession: Record<string, PastedBlock[]>
   addPastedBlock: (sessionKey: string, block: PastedBlock) => void
@@ -373,6 +380,14 @@ export interface SteerQueueItem {
   status: 'queued' | 'sending'
 }
 
+export interface BrowserShot {
+  id: string
+  fileId: string
+  filename: string
+  thumb: string
+  pageUrl: string
+}
+
 export interface PickedElementRef {
   id: string
   tag: string
@@ -381,6 +396,16 @@ export interface PickedElementRef {
   text: string
   outerHTML: string
   pageUrl: string | null
+  cssPath?: string
+  xpath?: string
+  rect?: { x: number; y: number; width: number; height: number }
+  computed?: Record<string, string>
+  react?: { component?: string; file?: string; line?: number; owners?: string[] } | null
+  screenshot?: string
+  screenshotFileId?: string
+  source?: { file: string; line: number; score: number; file_id?: string }[]
+  styleEdits?: Record<string, string>
+  token?: string
 }
 
 export const useAppStore = create<AppState>((set) => ({
@@ -804,17 +829,31 @@ export const useAppStore = create<AppState>((set) => ({
 
   pendingChatInput: null,
   setPendingChatInput: (pendingChatInput) => set({ pendingChatInput }),
+  composerAppend: null,
+  appendToComposer: (text) => set({ composerAppend: { id: `${Date.now()}-${Math.random()}`, text } }),
 
-  elementPickerModalOpen: false,
-  setElementPickerModalOpen: (elementPickerModalOpen) => set({ elementPickerModalOpen }),
+  browserOpen: false,
+  setBrowserOpen: (browserOpen) => set({ browserOpen }),
+
   pickedElements: [],
   addPickedElement: (el) => set((s) => (
     s.pickedElements.some(p => p.id === el.id)
       ? s
       : { pickedElements: [...s.pickedElements, el] }
   )),
+  updatePickedElement: (id, patch) => set((s) => ({
+    pickedElements: s.pickedElements.map((p) => p.id === id ? { ...p, ...patch } : p),
+  })),
   removePickedElement: (id) => set((s) => ({ pickedElements: s.pickedElements.filter(p => p.id !== id) })),
   clearPickedElements: () => set({ pickedElements: [] }),
+  browserShots: [],
+  addBrowserShot: (shot) => set((s) => (
+    s.browserShots.some(p => p.id === shot.id)
+      ? s
+      : { browserShots: [...s.browserShots, shot] }
+  )),
+  removeBrowserShot: (id) => set((s) => ({ browserShots: s.browserShots.filter(p => p.id !== id) })),
+  clearBrowserShots: () => set({ browserShots: [] }),
 
   pastedBySession: {},
   addPastedBlock: (sessionKey, block) => set((s) => {

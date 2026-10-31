@@ -55,6 +55,8 @@ def test_memory_block_excludes_other_users_and_null_owner(mem_db):
     block = load_user_memory_block("A", current, "hello")
     assert "Auth work" in block
     assert "uses postgres" in block
+    assert "apply only if asked" not in block
+    assert "every chat including a folder" in block
     assert "Billing" not in block
     assert "Legacy" not in block
     assert "current session summary" not in block

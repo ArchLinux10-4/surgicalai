@@ -378,3 +378,19 @@ def test_plan_request_matches_edit_and_retries_a_dead_stream():
                for event, kw in logged)
     assert any(event == "grok_ask_plan_native_end" and kw.get("reason") == "answer"
                for event, kw in logged)
+
+
+def test_ask_plan_kwargs_keep_max_tokens_for_grok():
+    kwargs = gapn._ask_plan_call_kwargs("grok-4", [], lambda *_a, **_k: None, "s", "u")
+    assert "max_tokens" in kwargs
+    assert "max_completion_tokens" not in kwargs
+
+
+def test_openai_rename_drops_max_tokens_for_luna():
+    from services.pipeline import rename_openai_max_tokens
+    renamed = rename_openai_max_tokens(
+        {"max_tokens": 1200, "stream": True, "tools": []}, "gpt-5.6-luna",
+    )
+    assert renamed["max_completion_tokens"] == 1200
+    assert "max_tokens" not in renamed
+    assert renamed["stream"] is True
