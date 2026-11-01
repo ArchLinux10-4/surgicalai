@@ -412,6 +412,7 @@ export const api = {
       request<{
         reachable: boolean
         base_url: string
+        detail?: string
         models: {
           id: string
           label: string

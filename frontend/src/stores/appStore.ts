@@ -45,6 +45,7 @@ export interface AvailableModel {
   description?: string
   cost?: number
   provider?: string
+  installed?: boolean
 }
 
 export interface PreviewBundlePayload {

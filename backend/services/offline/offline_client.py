@@ -20,8 +20,11 @@ Every mitigation here is evidence-based (see OFFLINE_MODE.md for sources):
 from __future__ import annotations
 
 import re
+import socket
 import time
+from pathlib import Path
 from typing import AsyncIterator, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
 
@@ -47,6 +50,78 @@ class OfflineModelError(Exception):
     """Raised when the local model fails or hangs after retries."""
 
 
+_LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+OLLAMA_UNREACHABLE_DETAIL = (
+    "Ollama is not answering. Open the Ollama app on this Mac. Stay on the SurgicalAI page. "
+    "If the Ollama app is open and this still fails, quit it and start it with "
+    "OLLAMA_HOST=0.0.0.0:11434 so Docker can reach it."
+)
+
+
+def resolve_ollama_base_url(raw: Optional[str], *, inside_docker: Optional[bool] = None) -> str:
+    """Return the URL to call. Inside Docker, a loopback host is reached as
+    host.docker.internal for this request only. The saved setting is not changed.
+    """
+    base = (raw or DEFAULT_BASE_URL).strip().rstrip("/")
+    docker = Path("/.dockerenv").is_file() if inside_docker is None else inside_docker
+    if not docker or not base.lower().startswith(("http://", "https://")):
+        return base
+    parts = urlsplit(base)
+    host = (parts.hostname or "").lower()
+    if host not in _LOOPBACK_HOSTS:
+        return base
+    port = f":{parts.port}" if parts.port else ""
+    user = ""
+    if parts.username:
+        user = parts.username
+        if parts.password:
+            user += f":{parts.password}"
+        user += "@"
+    rewritten = urlunsplit((
+        parts.scheme,
+        f"{user}host.docker.internal{port}",
+        parts.path,
+        parts.query,
+        parts.fragment,
+    ))
+    return rewritten.rstrip("/")
+
+
+def _ipv4_for(host: str) -> Optional[str]:
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)
+    except socket.gaierror:
+        return None
+    for info in infos:
+        addr = info[4][0]
+        if addr:
+            return addr
+    return None
+
+
+def ollama_connect_url(raw: Optional[str], *, inside_docker: Optional[bool] = None) -> str:
+    """URL used for the HTTP call. Inside Docker, host.docker.internal is pinned
+    to IPv4. That name also has an IPv6 address this machine cannot route, and a
+    failed v6 attempt is reported as 'network unreachable' even when IPv4 works.
+    """
+    base = resolve_ollama_base_url(raw, inside_docker=inside_docker)
+    parts = urlsplit(base)
+    if (parts.hostname or "").lower() != "host.docker.internal":
+        return base
+    ip = _ipv4_for("host.docker.internal")
+    if not ip:
+        return base
+    port = f":{parts.port}" if parts.port else ""
+    user = ""
+    if parts.username:
+        user = parts.username
+        if parts.password:
+            user += f":{parts.password}"
+        user += "@"
+    return urlunsplit((parts.scheme, f"{user}{ip}{port}", parts.path, parts.query, parts.fragment)).rstrip("/")
+
+
 def resolve_offline_model() -> str:
     """The model the picker chose, else the ollama_model setting."""
     picked = (get_setting("architect_model", "") or "").strip()
@@ -59,7 +134,7 @@ def resolve_offline_model() -> str:
 
 def get_offline_config() -> dict:
     return {
-        "base_url": get_setting("ollama_base_url", DEFAULT_BASE_URL),
+        "base_url": ollama_connect_url(get_setting("ollama_base_url", DEFAULT_BASE_URL)),
         "model": resolve_offline_model(),
         "num_ctx": int(get_setting("ollama_num_ctx", str(DEFAULT_NUM_CTX)) or DEFAULT_NUM_CTX),
     }

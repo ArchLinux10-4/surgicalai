@@ -2485,7 +2485,8 @@ def _should_use_ollama(model: Optional[str] = None, user_id: str = "") -> bool:
 
 def _ollama_chat(messages: list, model: str, stream: bool = False):
     """Call Ollama API."""
-    base_url = get_setting("ollama_base_url", "http://localhost:11434")
+    from services.offline.offline_client import ollama_connect_url
+    base_url = ollama_connect_url(get_setting("ollama_base_url", "http://localhost:11434"))
     ollama_model = model.replace("ollama:", "") if model.startswith("ollama:") else get_setting("ollama_model", "qwen2.5-coder:7b")
 
     payload = {
@@ -5539,7 +5540,8 @@ async def run_chat_stream(
                     yield f"data: {json.dumps({'type': 'token', 'content': delta.content})}\n\n"
         elif _should_use_ollama(chat_model):
             # ── Ollama streaming with <think> tag parsing for reasoning models ──
-            base_url = get_setting("ollama_base_url", "http://localhost:11434")
+            from services.offline.offline_client import ollama_connect_url
+            base_url = ollama_connect_url(get_setting("ollama_base_url", "http://localhost:11434"))
             ollama_model = chat_model.replace("ollama:", "") if chat_model.startswith("ollama:") else get_setting("ollama_model", "qwen2.5-coder:7b")
             in_thinking = False
             with httpx.stream("POST", f"{base_url}/api/chat", json={"model": ollama_model, "messages": all_messages, "stream": True}, timeout=120) as resp:
@@ -12882,7 +12884,8 @@ Be warm, friendly, and encouraging. You're helping a person build something real
                 return
             elif _should_use_ollama(chat_model):
                 # ── Ollama streaming with <think> tag parsing ──
-                base_url = get_setting("ollama_base_url", "http://localhost:11434")
+                from services.offline.offline_client import ollama_connect_url
+                base_url = ollama_connect_url(get_setting("ollama_base_url", "http://localhost:11434"))
                 ollama_model = chat_model.replace("ollama:", "") if chat_model.startswith("ollama:") else get_setting("ollama_model", "qwen2.5-coder:7b")
                 in_thinking = False
                 with httpx.stream("POST", f"{base_url}/api/chat",

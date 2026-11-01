@@ -319,26 +319,20 @@ def get_available_models(request: Request):
     s = get_all_settings()
     if s.get("ollama_enabled", "false").lower() == "true":
         base_url = s.get("ollama_base_url", "http://localhost:11434")
-        ollama_models = []
+        from services.offline.offline_client import ollama_connect_url
+        call_url = ollama_connect_url(base_url)
+        from services.offline.ollama_models import offline_model_choices
+        installed_names = None
         try:
-            resp = httpx.get(f"{base_url}/api/tags", timeout=3)
+            resp = httpx.get(f"{call_url}/api/tags", timeout=3)
             resp.raise_for_status()
-            for m in resp.json().get("models", []):
-                name = m.get("name", "unknown")
-                size_gb = round(m.get("size", 0) / 1e9, 1)
-                ollama_models.append({
-                    "id": f"ollama:{name}", "name": f"{name}", "role": "architect",
-                    "description": f"Local model ({size_gb} GB) — free, private, no API key",
-                    "provider": "ollama", "cost": 0,
-                })
+            installed_names = [m.get("name", "") for m in resp.json().get("models", [])]
         except Exception:
-            # Ollama unreachable — show configured default as fallback
-            fallback = s.get("ollama_model", "qwen2.5-coder:7b")
-            ollama_models = [
-                {"id": f"ollama:{fallback}", "name": f"{fallback}", "role": "architect",
-                 "description": "Local model via Ollama (offline — could not reach Ollama to list models)",
-                 "provider": "ollama", "cost": 0},
-            ]
+            installed_names = None
+        ollama_models = offline_model_choices(installed_names)
+        if installed_names is None:
+            for model in ollama_models:
+                model["description"] = "Ollama is not answering. Open the Ollama app on this Mac. " + model["description"]
         return {
             "models": ollama_models,
             "pipeline_modes": [
@@ -514,10 +508,16 @@ def _local_only() -> None:
 
 
 def _ollama_base(raw) -> str:
+    """The saved Ollama URL. Not rewritten. Callers that open a connection use _ollama_call_base."""
     base = ((raw or get_setting("ollama_base_url", "http://localhost:11434")) or "").strip().rstrip("/")
     if not base.lower().startswith(("http://", "https://")):
         raise HTTPException(status_code=400, detail="Ollama URL must start with http:// or https://")
     return base
+
+
+def _ollama_call_base(raw) -> str:
+    from services.offline.offline_client import ollama_connect_url
+    return ollama_connect_url(_ollama_base(raw))
 
 
 @router.get("/ollama/catalog")
@@ -525,7 +525,8 @@ def ollama_catalog(base_url: str = ""):
     _local_only()
     from services.offline.ollama_models import CATALOG
 
-    base = _ollama_base(base_url)
+    saved = _ollama_base(base_url)
+    base = _ollama_call_base(base_url)
     installed, reachable = {}, False
     try:
         r = httpx.get(f"{base}/api/tags", timeout=3)
@@ -535,9 +536,11 @@ def ollama_catalog(base_url: str = ""):
             installed[str(m.get("name", "")).lower()] = round(m.get("size", 0) / 1e9, 1)
     except Exception:
         pass
+    from services.offline.offline_client import OLLAMA_UNREACHABLE_DETAIL
     return {
         "reachable": reachable,
-        "base_url": base,
+        "base_url": saved,
+        "detail": "" if reachable else OLLAMA_UNREACHABLE_DETAIL,
         "models": [
             {
                 "id": m.id,
@@ -560,7 +563,8 @@ async def ollama_pull(body: dict):
     entry = lookup(str((body or {}).get("name", "")))
     if entry is None:
         raise HTTPException(status_code=400, detail="Unknown model.")
-    base = _ollama_base((body or {}).get("base_url"))
+    saved = _ollama_base((body or {}).get("base_url"))
+    base = _ollama_call_base((body or {}).get("base_url"))
     if entry.id in _PULLS:
         raise HTTPException(status_code=409, detail="That model is already downloading.")
 
@@ -581,7 +585,7 @@ async def ollama_pull(body: dict):
                         if line:
                             yield line + "\n"
         except Exception as exc:
-            yield json.dumps({"error": f"Could not reach Ollama at {base}: {exc}"}) + "\n"
+            yield json.dumps({"error": f"Could not reach Ollama at {saved}: {exc}"}) + "\n"
         finally:
             _PULLS.discard(entry.id)
 
@@ -595,11 +599,13 @@ async def ollama_pull(body: dict):
 @router.post("/test-ollama")
 def test_ollama(body: dict = None):
     """Test Ollama connectivity."""
-    base_url = (body or {}).get("base_url") or get_setting("ollama_base_url", "http://localhost:11434")
+    saved = (body or {}).get("base_url") or get_setting("ollama_base_url", "http://localhost:11434")
+    from services.offline.offline_client import ollama_connect_url
+    base_url = ollama_connect_url(saved)
     try:
         resp = httpx.get(f"{base_url}/api/tags", timeout=5)
         resp.raise_for_status()
         models = [m["name"] for m in resp.json().get("models", [])]
-        return {"ok": True, "models": models, "message": f"Connected to Ollama at {base_url}"}
+        return {"ok": True, "models": models, "message": f"Connected to Ollama at {saved}"}
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"Cannot connect to Ollama: {str(e)}")

@@ -1351,6 +1351,7 @@ export function ChatPanel() {
     browserOpen, setBrowserOpen, composerAppend,
     pickedElements, clearPickedElements, browserShots, clearBrowserShots,
     availableModels, refreshModels,
+    setSettingsOpen, setSettingsInitialTab,
   } = useAppStore()
   const [provisionalEdits, setProvisionalEdits] = useState<Record<string, any>>({})
   const setProvisionalEdit = (sid: string, result: any) => {
@@ -1921,7 +1922,7 @@ export function ChatPanel() {
   useEffect(() => {
     clientLog('chat_panel_models_load_started', {})
     refreshModels()
-  }, [])
+  }, [settings?.ollama_enabled])
 
   const stopStream = (sessionId?: string) => {
     cancelStreamFrames()
@@ -3440,7 +3441,7 @@ export function ChatPanel() {
           <div className="relative">
             <button
               onClick={() => setModelPickerOpen(v => !v)}
-              className="text-[11px] font-mono text-muted/70 hover:text-accent bg-overlay/40 hover:bg-overlay px-1.5 py-0.5 rounded transition-colors leading-none flex items-center gap-1"
+              className="text-[11px] font-mono text-muted/70 hover:text-accent bg-overlay/40 hover:bg-overlay px-1.5 py-0.5 rounded transition-colors leading-none flex items-center gap-1 max-w-[180px]"
               title={
                 agentRequiresClaudeForCurrentModel
                   ? `${settings?.architect_model || 'claude-sonnet-4-6'} — Agent Mode requires a Claude model. This will silently run as a normal single-pass edit instead of multi-agent tasks.`
@@ -3450,7 +3451,15 @@ export function ChatPanel() {
               {agentRequiresClaudeForCurrentModel && (
                 <Warning sx={{ fontSize: 11 }} className="text-warning" />
               )}
-              {settings?.architect_model || 'claude-sonnet-4-6'}
+              <span className="truncate">
+                {settings?.ollama_enabled
+                  ? (availableModels.find(m => m.id === (
+                      settings.architect_model?.startsWith('ollama:')
+                        ? settings.architect_model
+                        : `ollama:${settings.ollama_model || 'qwen2.5-coder:7b'}`
+                    ))?.name || (settings.ollama_model || 'qwen2.5-coder:7b'))
+                  : (settings?.architect_model || 'claude-sonnet-4-6')}
+              </span>
               <span className="text-[9px]">▾</span>
             </button>
             {modelPickerOpen && (
@@ -3467,20 +3476,35 @@ export function ChatPanel() {
                     const locked = isGpt && effectiveMode === 'agent'
                     const lockLabel = 'Needs Claude'
                     const lockTitle = `Agent Mode requires a Claude model. Selecting ${m.id} would silently run as a normal single-pass edit instead of multi-agent tasks.`
+                    const offlineSelected = settings?.ollama_enabled
+                      ? m.id === (settings.architect_model?.startsWith('ollama:')
+                        ? settings.architect_model
+                        : `ollama:${settings.ollama_model || 'qwen2.5-coder:7b'}`)
+                      : settings?.architect_model === m.id
                     return (
                       <button
                         key={m.id}
-                        onClick={() => { if (!locked) handleModelChange(m.id) }}
+                        onClick={() => {
+                          if (locked) return
+                          handleModelChange(m.id)
+                          if (settings?.ollama_enabled && m.installed === false) {
+                            setSettingsInitialTab('models')
+                            setSettingsOpen(true)
+                          }
+                        }}
                         disabled={locked}
                         title={locked ? lockTitle : undefined}
                         className={`w-full text-left px-3 py-1.5 text-[12px] transition-colors ${
                           locked
                             ? 'opacity-45 cursor-not-allowed select-none'
                             : 'hover:bg-overlay'
-                        } ${settings?.architect_model === m.id ? 'text-accent font-medium' : 'text-ink'}`}
+                        } ${offlineSelected ? 'text-accent font-medium' : 'text-ink'}`}
                       >
                         <div className="font-mono flex items-center gap-1">
-                          {m.id}
+                          {m.provider === 'ollama' ? m.name : m.id}
+                          {m.provider === 'ollama' && m.installed === false && (
+                            <span className="ml-auto text-[9px] uppercase tracking-wide text-muted shrink-0">Not downloaded</span>
+                          )}
                           <ModelCostIndicator cost={m.cost} />
                           {locked && (
                             <span className="ml-auto flex items-center gap-0.5 text-[9px] uppercase tracking-wide text-muted shrink-0">

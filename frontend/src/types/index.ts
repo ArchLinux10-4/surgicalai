@@ -242,6 +242,8 @@ export interface AppSettings {
   openai_api_key_set: boolean
   anthropic_api_key_set: boolean
   ollama_enabled?: boolean
+  ollama_base_url?: string
+  ollama_model?: string
   architect_model: string
   surgeon_model: string
   temperature_architect: number
