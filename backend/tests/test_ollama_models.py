@@ -12,7 +12,41 @@ if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))
 
 from routers import settings as settings_router
-from services.offline.ollama_models import lookup
+from services.offline import offline_client
+from services.offline.offline_client import ollama_connect_url, resolve_ollama_base_url
+from services.offline.ollama_models import lookup, offline_model_choices
+
+
+def test_resolve_ollama_base_url_rewrites_loopback_only_inside_docker():
+    assert resolve_ollama_base_url("http://localhost:11434", inside_docker=True) == "http://host.docker.internal:11434"
+    assert resolve_ollama_base_url("http://127.0.0.1:11434/", inside_docker=True) == "http://host.docker.internal:11434"
+    assert resolve_ollama_base_url("http://[::1]:11434", inside_docker=True) == "http://host.docker.internal:11434"
+    assert resolve_ollama_base_url("http://192.168.1.9:11434", inside_docker=True) == "http://192.168.1.9:11434"
+    assert resolve_ollama_base_url("http://127.0.0.1:11434", inside_docker=False) == "http://127.0.0.1:11434"
+
+
+def test_connect_url_pins_docker_host_to_ipv4(monkeypatch):
+    monkeypatch.setattr(offline_client, "_ipv4_for", lambda host: "192.0.2.10")
+    assert ollama_connect_url("http://127.0.0.1:11434", inside_docker=True) == "http://192.0.2.10:11434"
+    monkeypatch.setattr(offline_client, "_ipv4_for", lambda host: None)
+    assert ollama_connect_url("http://localhost:11434", inside_docker=True) == "http://host.docker.internal:11434"
+    assert ollama_connect_url("http://127.0.0.1:11434", inside_docker=False) == "http://127.0.0.1:11434"
+
+
+def test_offline_picker_lists_catalog_when_nothing_is_installed():
+    choices = offline_model_choices([])
+    ids = [m["id"] for m in choices]
+    assert "ollama:qwen2.5-coder:7b" in ids
+    assert any(not m["installed"] for m in choices)
+    assert len(choices) >= 2
+
+
+def test_offline_picker_marks_installed_and_keeps_extra_local_models():
+    choices = offline_model_choices(["qwen2.5-coder:7b", "llama3.2:3b"])
+    by_id = {m["id"]: m for m in choices}
+    assert by_id["ollama:qwen2.5-coder:7b"]["installed"] is True
+    assert by_id["ollama:llama3.2:3b"]["installed"] is True
+    assert by_id["ollama:hf.co/RootMonsteR/Qwen3-14B-Abliterated-GGUF:Q5_K_M"]["installed"] is False
 
 
 def test_lookup_known_and_unknown():
@@ -35,6 +69,8 @@ def test_ollama_catalog_installed_and_unreachable(monkeypatch):
 
     out = settings_router.ollama_catalog("http://127.0.0.1:11434")
     assert out["reachable"] is True
+    assert out["base_url"] == "http://127.0.0.1:11434"
+    assert out["detail"] == ""
     by_id = {m["id"]: m for m in out["models"]}
     assert by_id["qwen2.5-coder:7b"]["installed"] is True
     assert by_id["hf.co/RootMonsteR/Qwen3-14B-Abliterated-GGUF:Q5_K_M"]["installed"] is False
@@ -45,6 +81,9 @@ def test_ollama_catalog_installed_and_unreachable(monkeypatch):
     monkeypatch.setattr(settings_router.httpx, "get", fail_get)
     out2 = settings_router.ollama_catalog("http://127.0.0.1:11434")
     assert out2["reachable"] is False
+    assert out2["base_url"] == "http://127.0.0.1:11434"
+    assert "Open the Ollama app" in out2["detail"]
+    assert "host.docker.internal" not in out2["detail"]
 
 
 def test_ollama_pull_unknown_400(monkeypatch):

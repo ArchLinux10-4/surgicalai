@@ -86,6 +86,7 @@ export function SettingsModal() {
   const [ollamaCatalog, setOllamaCatalog] = useState<{
     reachable: boolean
     base_url: string
+    detail?: string
     models: {
       id: string
       label: string
@@ -908,11 +909,9 @@ export function SettingsModal() {
                       {!settings?.is_hosted && (
                         <div className="space-y-3">
                           <div className="text-xs font-medium text-ink">Local models</div>
-                          {ollamaCatalog && !ollamaCatalog.reachable && form.ollama_base_url.includes('localhost') && (
+                          {ollamaCatalog && !ollamaCatalog.reachable && (
                             <div className="text-xs text-muted">
-                              Can&apos;t reach Ollama. If SurgicalAI runs in Docker, use{' '}
-                              <code className="font-mono bg-overlay px-1 rounded">http://host.docker.internal:11434</code>{' '}
-                              and make sure Ollama is running.
+                              {ollamaCatalog.detail || 'Ollama is not answering. Open the Ollama app on this Mac. Stay on the SurgicalAI page.'}
                             </div>
                           )}
                           {ollamaSettingsDirty && (
@@ -1517,9 +1516,8 @@ function OfflineModeHelp() {
         <ol className="list-decimal pl-4 space-y-1">
           <li>Turn on offline mode.</li>
           <li>
-            If SurgicalAI runs in Docker, set the URL to{' '}
-            <span className="font-mono text-ink">http://host.docker.internal:11434</span>.
-            {' '}localhost points at the container, not this Mac. Ollama has to be running.
+            Leave the Ollama URL as the loopback address already in the field, unless Ollama is on another port.
+            SurgicalAI keeps running at the same page you opened. The app reaches Ollama on this Mac by itself.
           </li>
           <li>Save Settings, then download a model below if it is not installed yet.</li>
           <li>In the chat model picker, choose the model. That choice is what runs.</li>
