@@ -394,6 +394,7 @@ _MODEL_MAX_OUTPUT = {
     "claude-opus-4-7": 128000,
     "claude-opus-4-6": 128000,
     "claude-sonnet-4-6": 128000,
+    "claude-haiku-5-5": 128000,
 }
 _MAX_OUTPUT_DEFAULT = 64000
 
@@ -488,6 +489,7 @@ NO_TEMPERATURE_MODELS = {
     "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
     "gpt-5.5", "gpt-5.5-pro",
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra",
     "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
     "o1", "o1-mini", "o1-preview", "o3", "o3-mini", "o4-mini",
 }
@@ -502,9 +504,13 @@ REASONING_EFFORT_MODELS = {
     "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
     "gpt-5.5", "gpt-5.5-pro",
     "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra",
     "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
     "o3", "o3-mini", "o4-mini",
 }
+
+# GPT-6.2 Astra/Sol: tool calling requires Responses API; none effort is rejected.
+_GPT62_MODELS = ("gpt-6.2-astra", "gpt-6.2-sol")
 
 # GPT-6 Sol/Luna: Chat Completions function calling only works with
 # reasoning_effort="none" (official model pages). Astra has no "none" level.
@@ -1477,12 +1483,15 @@ _THINKING_EXCLUDED_MODELS = ("claude-opus-4-7", "claude-opus-4-8")
 _ADAPTIVE_THINKING_MODELS = (
     "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-opus-4-6",
     "claude-sonnet-4-6", "claude-sonnet-5-5", "claude-sonnet-5", "claude-fable-5",
+    "claude-haiku-5-5",
 )
 
 # Opus 5.5, Fable 5.1 and Sonnet 5.5 reject tool_choice type "any"/"tool" with
 # a 400 (docs: Migrating to Claude Opus 5.5 / Sonnet 5.5). Use auto + strict
 # instead. Opus 5 and Sonnet 5 (without -5) still accept forced tool choice.
-_NO_FORCED_TOOL_CHOICE_MODELS = ("claude-opus-5-5", "claude-fable-5-1", "claude-sonnet-5-5")
+_NO_FORCED_TOOL_CHOICE_MODELS = (
+    "claude-opus-5-5", "claude-fable-5-2", "claude-fable-5-1", "claude-sonnet-5-5",
+)
 
 # 4-6 generation models support adaptive thinking and effort, but NOT 'xhigh'.
 # Supported levels: max, high, medium, low.  Sending effort='xhigh' returns 400.
@@ -2298,6 +2307,9 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
             kwargs["reasoning_effort"] = "none"
             _dlog("gpt6_sol_luna_tools_force_none_effort",
                   model=model, previous_effort=_prev_re)
+        if base_model in _GPT62_MODELS and kwargs.get("reasoning_effort") == "none":
+            kwargs["reasoning_effort"] = "low"
+            _dlog("gpt62_none_effort_rewritten", model=model, effort="low")
         _dlog("chat_create_reasoning_model",
               model=model, base_model=base_model,
               reasoning_effort=kwargs.get("reasoning_effort", "<not set>"),
@@ -2306,6 +2318,21 @@ def _chat_create(client: OpenAI, model: str, messages: list, temperature: float 
               stream=kwargs.get("stream", False),
               gpt_hardened=_gpt_hardened)
         _is_stream = bool(kwargs.get("stream", False))
+        _must_responses_for_tools = (
+            not _is_stream
+            and base_model in _GPT62_MODELS
+            and kwargs.get("tools")
+            and _gh_responses_create is not None
+        )
+        if _must_responses_for_tools:
+            _shim = _gh_responses_create(client, model, messages, kwargs,
+                                         api_call_with_retry, _dlog)
+            if _shim is None:
+                raise RuntimeError(
+                    f"{base_model} requires the Responses API for tool use; "
+                    "request mapping failed — check logs for gpt_responses_*."
+                )
+            return _shim
         # Phase 3 (flag: gpt_responses_api, default OFF): route non-stream calls
         # to the Responses API via a chat-completions-shaped shim. Any mapping
         # or API problem returns None and we fall back to Chat Completions.

@@ -227,8 +227,10 @@ def get_available_models(request: Request):
     # Verified against the live Anthropic key via /v1 probe — only IDs the
     # account actually accepts are listed (others 404 at request time).
     # Newest first. Confirmed against docs.anthropic.com models overview
-    # (Fable 5.1, Opus 5.5, Opus 5, Sonnet 5, Haiku 4.5 + legacy 4.x).
+    # (Fable 5.2, Fable 5.1, Opus 5.5, Haiku 5.5, Haiku 4.5 + legacy 4.x).
     claude_models = [
+        {"id": "claude-fable-5-2", "name": "Claude Fable 5.2", "role": "architect",
+         "description": "Demanding long-horizon agents — ⚠️ Premium ($8/$40 per M tokens)", "provider": "anthropic", "cost": 4},
         {"id": "claude-fable-5-1", "name": "Claude Fable 5.1", "role": "architect",
          "description": "Most capable — long-horizon agents — ⚠️ Premium ($10/$50 per M tokens)", "provider": "anthropic", "cost": 4},
         {"id": "claude-opus-5-5", "name": "Claude Opus 5.5", "role": "architect",
@@ -255,6 +257,8 @@ def get_available_models(request: Request):
          "description": "Opus 4.5 — deep reasoning for involved edits", "provider": "anthropic", "cost": 3},
         {"id": "claude-opus-4-1", "name": "Claude Opus 4.1", "role": "architect",
          "description": "Earlier Opus — solid for complex changes", "provider": "anthropic", "cost": 3},
+        {"id": "claude-haiku-5-5", "name": "Claude Haiku 5.5", "role": "architect",
+         "description": "Fastest — high-volume latency-sensitive work (from $0.10/$0.50 per M tokens)", "provider": "anthropic", "cost": 1},
         {"id": "claude-haiku-4-5", "name": "Claude Haiku 4.5", "role": "architect",
          "description": "Fastest Claude — great for quick edits and simple changes", "provider": "anthropic", "cost": 1},
     ]
@@ -266,6 +270,12 @@ def get_available_models(request: Request):
         # Newest first. GPT-6 ids from developers.openai.com/api/docs/models.
         # Keep GPT-5.5 / 5.6 Sol·Terra·Luna selectable.
         openai_models = [
+            {"id": "gpt-6.2-astra", "name": "GPT-6.2 Astra", "role": "architect",
+             "description": "Most capable GPT — hardest end-to-end work ($10/$50 per M tokens)", "provider": "openai", "cost": 4},
+            {"id": "gpt-6.2-sol", "name": "GPT-6.2 Sol", "role": "architect",
+             "description": "Everyday coding & agents — Responses API for tools ($2/$10)", "provider": "openai", "cost": 2},
+            {"id": "gpt-6.1-terra", "name": "GPT-6.1 Terra", "role": "architect",
+             "description": "Visual reasoning, computer use, clear writing ($2/$10)", "provider": "openai", "cost": 2},
             {"id": "gpt-6-astra", "name": "GPT-6 Astra", "role": "architect",
              "description": "Most capable GPT — hardest end-to-end work ($10/$50)", "provider": "openai", "cost": 4},
             {"id": "gpt-6-sol", "name": "GPT-6 Sol", "role": "architect",
