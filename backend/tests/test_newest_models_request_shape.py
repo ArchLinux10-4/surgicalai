@@ -49,6 +49,7 @@ def _load_helpers():
 def test_rejects_forced_tool_choice_only_for_55_and_fable_51():
     h = _load_helpers()
     assert h["rejects"]("claude-opus-5-5") is True
+    assert h["rejects"]("claude-fable-5-2") is True
     assert h["rejects"]("claude-fable-5-1") is True
     assert h["rejects"]("claude-opus-5") is False
     assert h["rejects"]("claude-opus-4-8") is False
@@ -115,16 +116,41 @@ def test_adaptive_thinking_and_128k_for_opus5_family():
     assert h["adaptive"]("claude-opus-5") is True
     assert h["adaptive"]("claude-opus-5-5") is True
     assert h["adaptive"]("claude-fable-5-1") is True
+    assert h["adaptive"]("claude-fable-5-2") is True
     assert h["max_out"]("claude-opus-5") == 128000
     assert h["max_out"]("claude-opus-5-5") == 128000
     assert h["max_out"]("claude-fable-5-1") == 128000
+    assert h["max_out"]("claude-fable-5-2") == 128000
+
+
+def test_haiku_55_adaptive_not_forced_tools():
+    h = _load_helpers()
+    assert h["adaptive"]("claude-haiku-5-5") is True
+    assert h["max_out"]("claude-haiku-5-5") == 128000
+    assert h["rejects"]("claude-haiku-5-5") is False
+    assert h["adaptive"]("claude-haiku-4-5") is False
 
 
 def test_gpt6_in_reasoning_allowlists():
     h = _load_helpers()
-    for mid in ("gpt-6-astra", "gpt-6-sol", "gpt-6-luna"):
+    for mid in (
+        "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra",
+        "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
+    ):
         assert mid in h["no_temp"]
         assert mid in h["effort"]
+    for mid in ("gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra"):
+        assert mid not in h["sol_luna"]
     assert "gpt-6-sol" in h["sol_luna"]
     assert "gpt-6-luna" in h["sol_luna"]
     assert "gpt-6-astra" not in h["sol_luna"]
+
+
+def test_gpt62_none_effort_rewrite_in_chat_create_source():
+    src = pathlib.Path(__file__).parent.parent.joinpath(
+        "services", "pipeline.py"
+    ).read_text(encoding="utf-8")
+    assert "_GPT62_MODELS" in src
+    assert "gpt62_none_effort_rewritten" in src
+    assert 'kwargs["reasoning_effort"] = "low"' in src
+    assert "_must_responses_for_tools" in src

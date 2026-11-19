@@ -98,19 +98,33 @@ def test_settings_lists_newest_claude_and_gpt6():
     src = _settings_src()
     by_id = {m["id"]: m for m in _extract_model_dicts(src)}
     for mid in (
-        "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5",
+        "claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5",
+        "claude-haiku-5-5", "claude-haiku-4-5",
+        "gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.1-terra",
         "gpt-6-astra", "gpt-6-sol", "gpt-6-luna",
     ):
         assert mid in by_id, f"missing {mid}"
+    assert by_id["claude-fable-5-2"]["cost"] == 4
+    assert by_id["claude-haiku-5-5"]["cost"] == 1
+    assert "$8/$40" in src
+    assert "Haiku 5.5" in src
+    assert by_id["gpt-6.2-astra"]["cost"] == 4
+    assert by_id["gpt-6.2-sol"]["cost"] == 2
+    assert by_id["gpt-6.1-terra"]["cost"] == 2
     assert by_id["gpt-6-astra"]["cost"] == 4
     assert by_id["gpt-6-sol"]["cost"] == 2
     assert by_id["gpt-6-luna"]["cost"] == 1
     assert by_id["gpt-6-astra"]["provider"] == "openai"
     # Newest Claude first.
+    assert src.index('"claude-fable-5-2"') < src.index('"claude-fable-5-1"')
     assert src.index('"claude-fable-5-1"') < src.index('"claude-opus-5-5"')
     assert src.index('"claude-opus-5-5"') < src.index('"claude-opus-5"')
     assert src.index('"claude-opus-5"') < src.index('"claude-fable-5"')
-    # Newest GPT-6 before GPT-5.x.
+    assert src.index('"claude-haiku-5-5"') < src.index('"claude-haiku-4-5"')
+    # Newest GPT-6.x before older GPT-6 and GPT-5.x.
+    assert src.index('"gpt-6.2-astra"') < src.index('"gpt-6.2-sol"')
+    assert src.index('"gpt-6.2-sol"') < src.index('"gpt-6.1-terra"')
+    assert src.index('"gpt-6.1-terra"') < src.index('"gpt-6-astra"')
     assert src.index('"gpt-6-astra"') < src.index('"gpt-5.5"')
 
 
@@ -127,6 +141,7 @@ def test_pipeline_adaptive_and_128k_cover_opus5_family():
     assert "_NO_FORCED_TOOL_CHOICE_MODELS" in src
     assert '"claude-opus-5-5"' in src
     assert '"claude-fable-5-1"' in src
+    assert '"claude-fable-5-2"' in src
     assert "def _claude_tool_choice_kwargs" in src
     assert "def _rejects_forced_tool_choice" in src
 
@@ -142,9 +157,14 @@ def test_pipeline_gpt6_in_reasoning_sets_and_sol_luna_tools_gate():
         m = re.search(rf"{block_name}\s*=\s*\{{([^}}]+)\}}", src, flags=re.DOTALL)
         assert m, f"{block_name} not found"
         body = m.group(1)
+        assert "gpt-6.2-astra" in body
+        assert "gpt-6.2-sol" in body
+        assert "gpt-6.1-terra" in body
         assert "gpt-6-astra" in body
         assert "gpt-6-sol" in body
         assert "gpt-6-luna" in body
+    assert "_GPT62_MODELS" in src
+    assert "gpt62_none_effort_rewritten" in src
 
 
 def test_forced_tool_sites_use_helper():
