@@ -28,7 +28,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Chromium. Do not install requirements-local.txt here: mcp needs a newer
 # pydantic than requirements.txt pins, and Railway never builds this image.
 COPY backend/requirements-browser.txt ./
-RUN pip install --no-cache-dir -r requirements-browser.txt \
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends libatomic1 \
+ && pip install --no-cache-dir -r requirements-browser.txt \
  && playwright install --with-deps chromium \
  && rm -rf /var/lib/apt/lists/*
 ENV SURGICALAI_IN_DOCKER=1
